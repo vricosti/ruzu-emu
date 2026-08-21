@@ -417,9 +417,10 @@
   timeline-safe staging pool, device-aware direct format mapping and SPIR-V-to-MSL translation
   with explicit Metal resource indices. Shader-recompiler SPIR-V now compiles through MSL into
   native `MTLLibrary`/`MTLFunction` objects, and native render/compute pipeline states are keyed,
-  compiled and cache-tested.
-- Current prerequisite: implement automatic direct resource-binding allocation, then the Metal
-  buffer/texture cache runtimes. This requires native
+  compiled and cache-tested. Direct resource bindings are reflected per module, compacted into
+  independent Metal namespaces, device-limit checked and retained as the runtime shader ABI.
+- Current prerequisite: implement the Metal buffer/texture cache runtimes and make draw/dispatch
+  consume the retained shader binding layout. This requires native
   UInt8/quad index conversion, encoder-consumable buffer bindings, non-native format conversion,
   ImageId/ImageViewId lifecycle integration and tick-deferred resource destruction. Native
   buffer/image upload, download, image copy and framebuffer attachment ownership are implemented

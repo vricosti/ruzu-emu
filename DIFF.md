@@ -4487,6 +4487,16 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   sample count, topology, alpha-to-coverage/one and rasterization state. Metal compiles these into
   `MTLRenderPipelineState`; compute shaders compile into `MTLComputePipelineState`. Native tests
   verify both states are created from shader-recompiler programs and reused by their cache keys.
+- `MetalShaderBindingLayout` reflects Eden's SPIR-V descriptor order but compacts it into Metal's
+  independent buffer, texture and sampler namespaces. A grouped CBUF/SSBO descriptor may advance
+  Eden's Vulkan binding by `count` while declaring one scalar SPIR-V resource; Metal therefore
+  allocates one argument for that reflected resource. True SPIR-V descriptor arrays consume their
+  literal element count. Push constants reserve `buffer(0)` before ordinary buffers, and the
+  retained module exposes the exact layout that the draw/dispatch encoder must bind.
+- Runtime-sized and specialization-constant descriptor arrays, aliased resource classes and MSL
+  auxiliary buffers fail compilation explicitly. Direct bindings are validated against the
+  selected Apple-family buffer/texture/sampler limits instead of allowing SPIRV-Cross to emit an
+  out-of-range Metal argument.
 
 ### Unintentional differences (to fix)
 

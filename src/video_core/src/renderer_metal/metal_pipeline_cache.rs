@@ -405,8 +405,8 @@ mod tests {
         let words = emit_spirv(program, cache.profile(), &RuntimeInfo::default());
         compile_native_shader(
             cache.device().device(),
+            cache.device().profile(),
             &words,
-            &[],
             &MetalShaderCompileOptions::default(),
         )
         .expect("test shader must compile")

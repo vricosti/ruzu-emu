@@ -3360,7 +3360,11 @@ impl SpirvEmitContext {
             }
             ShaderStage::Fragment => {
                 for index in 0..8 {
-                    if !info.stores_frag_color[index] && !self.profile.need_declared_frag_colors {
+                    let need_dual_source = self.runtime_info.dual_source_blend && index <= 1;
+                    if !need_dual_source
+                        && !info.stores_frag_color[index]
+                        && !self.profile.need_declared_frag_colors
+                    {
                         continue;
                     }
                     let output_type = match self.runtime_info.frag_color_types[index] {
@@ -3369,12 +3373,33 @@ impl SpirvEmitContext {
                         _ => self.f32_vec4_type,
                     };
                     let id = self.define_output(output_type, None, None, None);
-                    self.builder.decorate(
-                        id,
-                        spirv::Decoration::Location,
-                        vec![Operand::LiteralBit32(index as u32)],
-                    );
-                    self.builder.name(id, format!("frag_color{index}"));
+                    if self.runtime_info.dual_source_blend && index <= 1 {
+                        self.builder.decorate(
+                            id,
+                            spirv::Decoration::Location,
+                            vec![Operand::LiteralBit32(0)],
+                        );
+                        self.builder.decorate(
+                            id,
+                            spirv::Decoration::Index,
+                            vec![Operand::LiteralBit32(index as u32)],
+                        );
+                        self.builder.name(
+                            id,
+                            if index == 0 {
+                                "frag_color0"
+                            } else {
+                                "frag_color0_secondary"
+                            },
+                        );
+                    } else {
+                        self.builder.decorate(
+                            id,
+                            spirv::Decoration::Location,
+                            vec![Operand::LiteralBit32(index as u32)],
+                        );
+                        self.builder.name(id, format!("frag_color{index}"));
+                    }
                     self.frag_color[index] = id;
                     self.output_vars.insert(index as u32, id);
                 }
@@ -6650,6 +6675,49 @@ mod tests {
             .filter(|inst| inst.class.opcode == spirv::Op::Store)
             .count();
         assert_eq!(stores, 2);
+    }
+
+    #[test]
+    fn fragment_dual_source_outputs_share_location_and_use_distinct_indices() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.stores_frag_color[0] = true;
+        program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo {
+            dual_source_blend: true,
+            ..RuntimeInfo::default()
+        };
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let primary = ctx.frag_color[0];
+        let secondary = ctx.frag_color[1];
+        assert_ne!(primary, 0);
+        assert_ne!(secondary, 0);
+        for (id, index) in [(primary, 0), (secondary, 1)] {
+            assert!(ctx.builder.module_ref().annotations.iter().any(|annotation| {
+                matches!(
+                    annotation.operands.as_slice(),
+                    [
+                        Operand::IdRef(target),
+                        Operand::Decoration(spirv::Decoration::Location),
+                        Operand::LiteralBit32(0)
+                    ] if *target == id
+                )
+            }));
+            assert!(ctx.builder.module_ref().annotations.iter().any(|annotation| {
+                matches!(
+                    annotation.operands.as_slice(),
+                    [
+                        Operand::IdRef(target),
+                        Operand::Decoration(spirv::Decoration::Index),
+                        Operand::LiteralBit32(value)
+                    ] if *target == id && *value == index
+                )
+            }));
+        }
     }
 
     #[test]

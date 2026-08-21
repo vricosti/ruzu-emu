@@ -401,6 +401,31 @@
   payload instead of System V lane registers. Native `LDR Q`, `STR Q`, `LDXP`
   and `STXP` execution regressions pass, both native and MinGW checks pass, and
   the touched files emit no warning in either check.
+## 2026-08-21 — native Metal renderer for macOS
+
+- Status: implementing prerequisites on `dev/metal-renderer-macos`.
+- Interrupted slice: construct `RendererMetal` / `RasterizerMetal` and run a
+  commercial title through a visible race using Metal directly.
+- Confirmed structural constraint: Eden has no native Metal backend. Its
+  `RendererBase`, `RasterizerInterface`, Maxwell state and common cache
+  lifecycles remain authoritative, but Vulkan render passes, layouts,
+  descriptors and barriers cannot be transliterated into Metal concepts.
+- Completed prerequisites: native Metal device/queue ownership with a runtime capability profile,
+  generation-independent fallback policies, batched command scheduling with monotonic completion
+  ticks and exclusive encoder ownership, CAMetalLayer presentation, shared and private buffers,
+  private images, aspect-correct per-subresource image views, samplers, an upstream-ordered
+  timeline-safe staging pool, device-aware direct format mapping and SPIR-V-to-MSL translation
+  with explicit Metal resource indices.
+- Current prerequisite: implement the Metal buffer/texture cache runtimes. This requires native
+  UInt8/quad index conversion, encoder-consumable buffer bindings, non-native format conversion,
+  ImageId/ImageViewId lifecycle integration and tick-deferred resource destruction. Native
+  buffer/image upload, download, image copy and framebuffer attachment ownership are implemented
+  and GPU-round-trip tested.
+- Forbidden shortcut: the new backend must not contain Vulkan/MoltenVK/OpenGL
+  objects or delegate rasterization to another backend.
+- Resume condition: once those services are implemented and verified, wire
+  `RasterizerMetal`, then `RendererMetal`, and validate visible content in a
+  race as recorded in `GOAL.md`.
 
 ## 2026-08-21 — NCM content-service parity
 

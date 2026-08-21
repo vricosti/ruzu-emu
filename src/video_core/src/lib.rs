@@ -39,6 +39,8 @@ pub mod rasterizer;
 pub mod rasterizer_download_area;
 pub mod rasterizer_interface;
 pub mod renderer_base;
+#[cfg(target_os = "macos")]
+pub mod renderer_metal;
 pub mod renderer_null;
 pub mod renderer_opengl;
 pub mod renderer_vulkan;

@@ -5,10 +5,16 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBlitCommandEncoder, MTLBuffer, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLDevice, MTLResourceOptions, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+};
 use thiserror::Error;
 
+use crate::surface::{bytes_per_block, PixelFormat};
+
 use super::metal_device::MetalDevice;
+use super::metal_format::surface_format;
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 
 #[derive(Debug, Error)]
@@ -23,6 +29,12 @@ pub enum MetalBufferError {
     },
     #[error(transparent)]
     Scheduler(#[from] MetalSchedulerError),
+    #[error("pixel format {0:?} cannot be represented by a native Metal buffer texture")]
+    UnsupportedTextureFormat(PixelFormat),
+    #[error("Metal texture-buffer offset {offset} is not aligned to {alignment} bytes")]
+    TextureOffsetAlignment { offset: usize, alignment: usize },
+    #[error("Metal failed to create a texture-buffer view")]
+    TextureViewCreationFailed,
 }
 
 /// A shared-storage allocation usable by both the guest upload path and Metal.
@@ -102,6 +114,48 @@ impl MetalBuffer {
 
     pub(crate) fn retained_handle(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
         self.buffer.clone()
+    }
+
+    /// Materialize a Maxwell texel-buffer descriptor as a native Metal
+    /// texture-buffer view. The view retains the parent buffer allocation.
+    pub fn new_texture_view(
+        &self,
+        device: &MetalDevice,
+        format: PixelFormat,
+        offset: usize,
+        size: usize,
+        writable: bool,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, MetalBufferError> {
+        self.checked_range(offset, size)?;
+        let metal_format = surface_format(format)
+            .filter(|format| !format.requires_conversion)
+            .ok_or(MetalBufferError::UnsupportedTextureFormat(format))?;
+        let alignment = device
+            .device()
+            .minimumTextureBufferAlignmentForPixelFormat(metal_format.pixel_format)
+            .max(1);
+        if offset % alignment != 0 {
+            return Err(MetalBufferError::TextureOffsetAlignment { offset, alignment });
+        }
+        let bytes_per_element = bytes_per_block(format).max(1) as usize;
+        let element_count = size.div_ceil(bytes_per_element).max(1);
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::TypeTextureBuffer);
+        descriptor.setPixelFormat(metal_format.pixel_format);
+        unsafe {
+            descriptor.setWidth(element_count);
+        }
+        descriptor.setUsage(
+            MTLTextureUsage::ShaderRead
+                | if writable {
+                    MTLTextureUsage::ShaderWrite
+                } else {
+                    MTLTextureUsage::Unknown
+                },
+        );
+        self.buffer
+            .newTextureWithDescriptor_offset_bytesPerRow(&descriptor, offset, 0)
+            .ok_or(MetalBufferError::TextureViewCreationFailed)
     }
 
     pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), MetalBufferError> {

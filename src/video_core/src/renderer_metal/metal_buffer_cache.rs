@@ -57,7 +57,7 @@ pub struct MetalIndexBinding {
     pub index_type: MTLIndexType,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MetalGraphicsBufferBindings {
     pub uniform_buffers: [Vec<MetalBufferBinding>; base::NUM_STAGES as usize],
     pub storage_buffers: [Vec<MetalBufferBinding>; base::NUM_STAGES as usize],
@@ -65,7 +65,7 @@ pub struct MetalGraphicsBufferBindings {
     pub image_buffers: Vec<MetalTexelBufferBinding>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MetalComputeBufferBindings {
     pub uniform_buffers: Vec<MetalBufferBinding>,
     pub storage_buffers: Vec<MetalBufferBinding>,
@@ -285,6 +285,10 @@ impl BufferCacheRuntime {
 
     pub fn compute_bindings(&self) -> &MetalComputeBufferBindings {
         &self.compute
+    }
+
+    pub fn null_buffer(&self) -> Arc<MetalBuffer> {
+        Arc::clone(&self.null_buffer)
     }
 
     fn bind_buffer(

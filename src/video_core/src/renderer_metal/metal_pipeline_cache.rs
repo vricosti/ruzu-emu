@@ -418,6 +418,10 @@ impl MetalRenderPipeline {
     pub fn state(&self) -> &ProtocolObject<dyn MTLRenderPipelineState> {
         &self.state
     }
+
+    pub fn retained_state(&self) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
+        self.state.clone()
+    }
 }
 
 pub struct MetalComputePipeline {
@@ -769,6 +773,18 @@ impl MetalPipelineCache {
             .depth_stencil_states
             .get(&key)
             .expect("depth/stencil state inserted above"))
+    }
+
+    pub fn retained_depth_stencil_state(
+        &mut self,
+        key: MetalDepthStencilKey,
+    ) -> Result<Retained<ProtocolObject<dyn MTLDepthStencilState>>, MetalPipelineError> {
+        self.get_or_create_depth_stencil_state(key)?;
+        Ok(self
+            .depth_stencil_states
+            .get(&key)
+            .expect("depth/stencil state inserted above")
+            .clone())
     }
 
     pub fn get_or_create_compute_pipeline(

@@ -68,6 +68,18 @@ pub struct MetalShaderSource {
     pub execution_model: spirv_cross2::spirv::ExecutionModel,
 }
 
+/// Backend-neutral input to Apple's native MSL compiler.
+///
+/// Today this artifact is produced by SPIRV-Cross. A direct shader-recompiler
+/// MSL backend can produce the same source/binding contract without changing
+/// the Metal pipeline, rasterizer, or cache owners.
+#[derive(Debug, Clone)]
+pub struct MetalShaderArtifact {
+    pub source: MetalShaderSource,
+    pub bindings: MetalShaderBindingLayout,
+    pub entry_point: String,
+}
+
 /// SPIRV-Cross policy for the baseline Apple7 renderer.
 ///
 /// MSL 2.3 is available on the minimum supported Apple Silicon macOS release.
@@ -556,6 +568,23 @@ pub fn compile_native_shader(
 ) -> Result<MetalShaderModule, MetalShaderError> {
     let bindings = reflect_direct_resource_bindings(words, profile)?;
     let source = compile_spirv_to_msl_with_layout(words, &bindings, options)?;
+    compile_native_msl_artifact(
+        device,
+        MetalShaderArtifact {
+            source,
+            bindings,
+            entry_point: "main0".to_owned(),
+        },
+    )
+}
+
+/// Compile an already-lowered MSL artifact into the native objects retained
+/// by the pipeline cache. This is the stable boundary for a future direct
+/// Maxwell-IR-to-MSL emitter.
+pub fn compile_native_msl_artifact(
+    device: &ProtocolObject<dyn MTLDevice>,
+    artifact: MetalShaderArtifact,
+) -> Result<MetalShaderModule, MetalShaderError> {
     let compile_options = MTLCompileOptions::new();
     compile_options.setLanguageVersion(MTLLanguageVersion::Version2_3);
     if objc2::available!(macos = 15.0, ..) {
@@ -564,19 +593,19 @@ pub fn compile_native_shader(
         #[allow(deprecated)]
         compile_options.setFastMathEnabled(false);
     }
-    let source_string = NSString::from_str(&source.source);
+    let source_string = NSString::from_str(&artifact.source.source);
     let library = device
         .newLibraryWithSource_options_error(&source_string, Some(&compile_options))
         .map_err(|error| {
             MetalShaderError::LibraryCompile(error.localizedDescription().to_string())
         })?;
-    let entry_point = NSString::from_str("main0");
+    let entry_point = NSString::from_str(&artifact.entry_point);
     let function = library
         .newFunctionWithName(&entry_point)
-        .ok_or_else(|| MetalShaderError::MissingEntryPoint("main0".to_owned()))?;
+        .ok_or_else(|| MetalShaderError::MissingEntryPoint(artifact.entry_point.clone()))?;
     Ok(MetalShaderModule {
-        source,
-        bindings,
+        source: artifact.source,
+        bindings: artifact.bindings,
         library,
         function,
     })

@@ -1150,3 +1150,10 @@
 - The existing Vulkan compiler path was only mechanically parameterized by `Profile` and `HostTranslateInfo`; Vulkan retains the same stage compiler, order, and outputs. Metal does not construct or invoke Vulkan runtime objects.
 - Interrupted slice remains `MetalRasterizer`: consume shader binding layouts together with the common buffer/texture cache state, construct the complete native render-pipeline descriptor, and encode draws in Eden `PrepareDraw`/`ConfigureImpl` order.
 - Exact next prerequisite: add vertex-layout and Maxwell fixed-state conversion to `MetalPipelineCache`, because Metal bakes those states into `MTLRenderPipelineState` and cannot encode a correct guest draw with the current partial key.
+
+## 2026-08-21 — Native Metal rasterizer ownership
+
+- Completed prerequisite: `MetalRasterizer` now owns one stable scheduler, staging pool, pipeline cache, shader cache, common buffer cache, and common texture cache. Construction and destruction preserve Eden's service order and drain the native queue.
+- Completed lifecycle: create/bind/release channel reaches every currently owned cache under the shared buffer/texture lock order, and binding installs the channel GPU-memory adapter used by common-buffer address resolution.
+- The type is intentionally not exposed through `RasterizerInterface` while required behavior is absent; this avoids converting missing draw/cache/query methods into callable stubs.
+- Resume condition: complete fixed-state and vertex-layout conversion in `metal_pipeline_cache.rs`, then implement descriptor/resource preparation and render-command encoding in this owner before wiring the renderer frontend.

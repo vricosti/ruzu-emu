@@ -3218,7 +3218,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: `Pair128` is `repr(C)`, compile-time asserted to size 16/alignment 8, and every field is
   initialized before it crosses the trampoline boundary.
-
 ## 2026-08-21 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `src/dynarmic/src/dynarmic/ir/opcodes.inc`
 
 ### Intentional differences
@@ -3570,7 +3569,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this optimizer rewrites internal SSA and defines no serialized structure.
-
 ## 2026-08-21 — `src/core/src/file_sys/content_archive.rs` vs Eden `src/core/file_sys/{content_archive.h,content_archive.cpp}`
 
 ### Intentional differences
@@ -3848,7 +3846,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this changes only warning policy for test helpers.
-
 ## 2026-08-21 — `core/src/hle/kernel/k_session.rs` vs Eden `core/hle/kernel/k_session.{h,cpp}`
 
 ### Intentional differences
@@ -4367,6 +4364,39 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust computes the remaining duration before calling `Event::wait_for`; Eden passes the equivalent
   absolute `steady_clock` deadline to `WaitUntil`.
 
+### Unintentional differences (to fix)
+
+- None in this slice. Room validation, backend data ordering, verify-UID propagation, immediate
+  first update, 15-second cadence, error callbacks, 404 re-registration, stop/delete ordering,
+  running-state definition, and credential-update guard now match Eden.
+
+### Missing items
+
+- None in `AnnounceMultiplayerSession`'s declared API or worker lifecycle.
+
+### Binary layout verification
+
+- N/A: announcement state is host-only and is submitted through the typed backend interface.
+
+## 2026-08-21 — `src/network/src/room_member.rs` vs `src/network/room_member.h` (default join-argument import audit)
+
+### Intentional differences
+
+- Rust has no default function arguments, so callers pass `NO_PREFERRED_IP` explicitly to `join`
+  and `send_join_request`; the constant remains owned by `room.rs`, matching Eden's `room.h`.
+
+### Unintentional differences (to fix)
+
+- None. The unused local import was dead code and did not provide Eden's declaration-level default.
+
+### Missing items
+
+- None in the preferred-address argument behavior.
+
+### Binary layout verification
+
+- N/A: this change only removes an unused import.
+
 ## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_cryptography.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_cryptography.cpp` (AES operations)
 
 ### Intentional differences
@@ -4426,6 +4456,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Resolved by the 2026-08-26 allocator passes recorded below: all image and buffer factories now
   return VMA-backed owners, and GPU allocation tracking is wired to the ported logger.
 
+- Eden reports `MemoryCommit`, image, and buffer allocations/deallocations through `GPULogger` when
+  GPU memory tracking is active. Ruzu does not yet have the corresponding GPU logging subsystem.
+- Ruzu's raw-handle `create_image`, `create_buffer`, and `create_mapped_buffer` compatibility paths
+  still use dedicated Vulkan allocations. Eden returns owning VMA-backed `vk::Image`/`vk::Buffer`
+  wrappers; `create_owned_buffer` already uses VMA but the remaining callers have not all migrated.
 ## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_data_processing.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (masked shifts)
 
 ### Intentional differences
@@ -4470,6 +4505,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   synchronization around the complete `ChannelSetupCaches` value.
 
 ## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c}` and `src/video_core/build.rs` vs `src/video_core/host1x/ffmpeg.{h,cpp}`
+## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/ffmpeg.rs` and `ffmpeg_shim.c` vs `src/video_core/host1x/ffmpeg.h` and `.cpp`
 
 ### Intentional differences
 
@@ -4501,7 +4537,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - N/A: all libav structures are allocated and accessed by the C shim compiled against the active
   FFmpeg headers; Rust exchanges only opaque pointers, primitive values, and borrowed byte spans.
 
-## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs `src/video_core/renderer_vulkan/present/fsr.h` and `.cpp`
+## 2026-08-21 — `src/video_core/src/renderer_metal/{metal_device,metal_buffer,metal_format,metal_image,metal_image_view,metal_layer,metal_scheduler,metal_presenter,metal_shader,metal_staging_buffer_pool,metal_sampler}.rs` vs Eden renderer ownership
 
 ### Intentional differences
 
@@ -4586,6 +4622,69 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   would only retain dead code.
 - The Rust callback adapter uses `Option<bool>` to represent Eden's compile-time distinction
   between callbacks returning `bool` and callbacks returning `void`.
+- Eden has no native Metal renderer. These files are a macOS platform extension under the same
+  conceptual ownership as Eden's `RendererBase`, renderer-specific scheduler and presentation
+  services; they do not replace or modify the read-only Eden tree.
+- `MetalScheduler` records directly into serial `MTLCommandBuffer` objects. It preserves Eden's
+  guest operation order but does not reproduce Vulkan command pools, image layouts, render-pass
+  objects or descriptor sets because those concepts are not native Metal synchronization or
+  binding primitives.
+- The frontend already owns a `CAMetalLayer` for MoltenVK. `MetalLayer` retains that exact object
+  and confines renderer access to the GPU thread instead of creating a second view hierarchy.
+- Shader-recompiler SPIR-V is retained as backend-neutral compiler output and translated to MSL
+  with explicit independent Metal buffer/texture/sampler indices. No Vulkan runtime object is
+  involved in this translation.
+- Apple Silicon buffer allocations use shared unified memory with Metal-managed hazard tracking;
+  images use private textures. Guest formats are mapped directly to `MTLPixelFormat`, and formats
+  without a byte-compatible representation carry an explicit conversion requirement rather than
+  falling back silently.
+- `MetalStagingBufferPool` preserves Eden's 128 MiB upload-stream ownership, 256-byte alignment,
+  16 timeline-stamped regions, reusable dedicated upload/download allocations, three size-class
+  caches, round-robin `TickFrame` reclamation and explicit deferred-release lifecycle. The
+  scheduler is passed per operation instead of stored by reference because a Rust renderer can
+  move after construction. `MetalScheduler` batches operations into one active native command
+  buffer and assigns monotonic completion ticks in submission order; synchronous submissions
+  first commit the active batch.
+- `MetalImageView` preserves the per-image-view variants created by Eden's Vulkan backend (1D and
+  array, 2D/rect and array, 3D, cube and cube array), subresource ranges and component swizzles.
+  The implementation uses native Metal texture views and declares `PixelFormatView` on the owner
+  image instead of translating Vulkan image-view structures.
+- `MetalSampler` preserves Eden's normal, default-anisotropy, forced-nearest and non-comparison
+  sampler ownership and creation conditions. Metal's three native border colors preserve Eden's
+  fallback selection; the exact Maxwell color and mirror-once-border requirement remain attached
+  to the sampler for mandatory shader emulation because Metal has no custom-border-color API.
+- Scheduler polling treats both `Completed` and `Error` as terminal. This preserves Eden's device
+  error propagation while preventing a failed Metal command buffer from permanently blocking the
+  ordered completion queue.
+- `MetalDeviceProfile` queries the actual `MTLDevice` family, argument-buffer/read-write tiers,
+  compressed-format support, sample counts, memory/threadgroup limits and shader/pipeline
+  capabilities. Backend policy never infers features from Apple marketing generation names.
+- Capability policy is evaluated from the captured profile: argument binding selects direct,
+  Tier 1 or Tier 2 resources; MSAA selects only a reported sample count; storage images require a
+  reported read/write tier; cache budgeting derives from `recommendedMaxWorkingSetSize`. Calls
+  introduced after macOS 11 are guarded by runtime OS availability, so a newer SDK does not send
+  an unavailable selector to an older Apple Silicon system.
+- `MetalScheduler` is the sole owner of active blit, compute and render encoders. It preserves
+  Eden's `RequestOutsideRenderPassOperationContext`/`EndRenderPass` ordering while expressing the
+  native Metal invariant that only one encoder may be active on a command buffer. Consecutive
+  transfers share one blit encoder; changing operation class or flushing ends it explicitly.
+- `MetalImage::upload_memory` and `download_memory` consume the common `BufferImageCopy` model,
+  preserving Eden's subresource/layer iteration and operation ordering. Native Metal row/image
+  pitches are calculated in format blocks, ranges are validated before encoding, and transfers
+  are recorded through the scheduler-owned blit encoder. A native GPU round-trip test verifies
+  shared staging to private texture and back.
+- `MetalTextureCacheRuntime::copy_image` owns native image-to-image copies, matching Eden method
+  ownership. It validates formats, samples, mip bounds, 3D depth and array layers before encoding;
+  a GPU test verifies upload, image copy and download ordering in one scheduler batch.
+- `MetalFramebuffer` retains the exact `MetalImageView` objects selected by `RenderTargets` and
+  materializes a `MTLRenderPassDescriptor` with persistent LOAD/STORE attachments. Sparse MRT
+  slots remain sparse in Metal while `num_color_buffers` counts actual attachments as Eden does.
+- Metal multisample textures require one mip and some Apple GPUs expose only 1x/2x/4x. The owner
+  records the guest sample count but allocates the highest supported count not exceeding it; this
+  is the native fallback replacing Vulkan's guaranteed sample-count conversion.
+- A combined `Depth32Float_Stencil8` texture is itself the Metal depth sampling view; Apple Metal
+  rejects a cast to `Depth32Float`. Stencil sampling uses the legal `X32_Stencil8` view. This is the
+  native equivalent of Eden's separate aspect views rather than a literal format cast.
 
 ### Resolved differences
 
@@ -4602,6 +4701,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's `DebugUtilsMessenger` owns both the Vulkan handle and the `ash` extension loader needed
   to destroy it. This is the RAII counterpart of Eden's `vk::DebugUtilsMessenger`, whose instance
   dispatch table is retained by the wrapper internally.
+- None in the implemented native device, buffer/image/view allocation, format mapping, layer,
+  command-buffer, staging and drawable ownership slice after correcting the initial mistaken
+  assumption that `MTLTextureUsage::Unknown` represented all usages.
 
 ### Missing items
 

@@ -1,30 +1,15 @@
-# Current goal — Luigi's Mansion 3 runtime parity
+# Native Metal Renderer for macOS
 
-Bring Ruzu's Vulkan execution of *Luigi's Mansion 3* to the same performance and stability level as Eden, while preserving the strict structural and behavioral porting parity defined in `AGENTS.md`.
+Implement a renderer on a dedicated branch that uses Apple's Metal API directly on macOS.
 
-## Current symptoms
+The implementation must not route rendering through Vulkan, MoltenVK, OpenGL, or another graphics API compatibility layer. Eden remains the source of truth for Maxwell guest semantics, operation ordering, cache lifecycle, and renderer ownership. Metal-specific resource binding, synchronization, pipeline, render-pass, and presentation behavior must be implemented with native Metal concepts.
 
-- Gameplay can fall to about 10 FPS.
-- Earlier runs exhibited missing or crackling voices and sound effects, frozen cinematics, black loading screens, crashes, and Vulkan out-of-device-memory failures.
-- The current instrumented run shows repeated texture-cache growth and collection cycles. Active image estimates can exceed 4 GiB; after collection they fall sharply, while Vulkan heap usage decreases later in large allocator-sized steps.
-- Buffer-cache residency remains comparatively small (roughly 70–153 MiB), so it is not the primary VRAM consumer in the observed run.
+The goal is complete only when:
 
-## Active investigation
+- the Metal renderer can be selected and initialized on macOS;
+- ruzu and ruzu-cmd compile with the Metal backend;
+- Mario Kart 8 Deluxe boots with that backend;
+- the game reaches a race; and
+- visible game content is rendered during the race.
 
-1. Compare the complete texture-cache garbage-collection and Vulkan resource-lifetime paths against Eden, including ordering, LRU iteration limits, deferred destruction, scheduler ticks, and memory accounting.
-2. Measure the CPU time and Vulkan memory retained by texture collection so the 10 FPS regression is attributed to evidence rather than inference.
-3. Remove Rust-only behavioral or ownership divergences responsible for texture churn, excessive collection work, command-buffer instability, or resource retention.
-4. Rebuild and run Luigi's Mansion 3 through the affected cinematic and gameplay sequences without a time limit, checking audio, image progression, crashes, VRAM use, and frame rate.
-5. Remove temporary diagnostics once the cause is verified, add focused regression tests, reread the matching Eden headers and implementations line by line, and update `DIFF.md`.
-
-## Confirmed correction in the current worktree
-
-`TextureCache::RunGarbageCollector` no longer stops the entire aggressive LRU scan as soon as usage crosses below the critical threshold. It now follows Eden by reducing the remaining iteration quota and continuing. A focused regression test covers this transition.
-
-## Completion criteria
-
-- Luigi's Mansion 3 reaches and runs gameplay without freezing, crashing, black-screening, or losing voices and sound effects.
-- Performance is comparable to Eden in the same scene and configuration; the current approximately 10 FPS result is not acceptable.
-- Vulkan memory remains within the device budget without pathological texture eviction/recreation cycles.
-- Every retained implementation change has focused coverage where practical and a corresponding `DIFF.md` audit entry.
-- Relevant focused tests, `cargo test -p video_core`, formatting checks, and the release build pass.
+Do not stop at a clear-screen, presentation-only, null-rasterizer, Vulkan-backed, or otherwise partial compatibility implementation.

@@ -24,6 +24,13 @@ libc = "0.2"
 smallvec = { version = "1", features = ["const_generics"] }
 rxbyak = { path = "../../externals/rxbyak" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-metal.workspace = true
+objc2-quartz-core.workspace = true
+objc2-foundation.workspace = true
+spirv-cross2.workspace = true
+
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"

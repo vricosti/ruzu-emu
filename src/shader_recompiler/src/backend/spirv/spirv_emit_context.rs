@@ -6668,6 +6668,49 @@ mod tests {
     }
 
     #[test]
+    fn fragment_dual_source_outputs_share_location_and_use_distinct_indices() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.stores_frag_color[0] = true;
+        program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo {
+            dual_source_blend: true,
+            ..RuntimeInfo::default()
+        };
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let primary = ctx.frag_color[0];
+        let secondary = ctx.frag_color[1];
+        assert_ne!(primary, 0);
+        assert_ne!(secondary, 0);
+        for (id, index) in [(primary, 0), (secondary, 1)] {
+            assert!(ctx.builder.module_ref().annotations.iter().any(|annotation| {
+                matches!(
+                    annotation.operands.as_slice(),
+                    [
+                        Operand::IdRef(target),
+                        Operand::Decoration(spirv::Decoration::Location),
+                        Operand::LiteralBit32(0)
+                    ] if *target == id
+                )
+            }));
+            assert!(ctx.builder.module_ref().annotations.iter().any(|annotation| {
+                matches!(
+                    annotation.operands.as_slice(),
+                    [
+                        Operand::IdRef(target),
+                        Operand::Decoration(spirv::Decoration::Index),
+                        Operand::LiteralBit32(value)
+                    ] if *target == id && *value == index
+                )
+            }));
+        }
+    }
+
+    #[test]
     fn tessellation_patch_outputs_preserve_upstream_outer_level_order() {
         let mut program = ir::Program::new(ShaderStage::TessellationControl);
         program.blocks.push(Block::new());

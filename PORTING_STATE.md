@@ -863,7 +863,6 @@
   regressions and the prior closed-reply regression pass, post-implementation
   upstream re-verification is complete, `ARCHI_CHOICES.md` documents the Rust
   adaptation, and the release build succeeds. Runtime validation remains.
-
 ## 2026-08-21 — interrupted real-VFS file-reference parity
 
 - Interrupted slice: port Eden's retained `IOFile` references, LRU eviction, trait-level open/create
@@ -876,7 +875,6 @@
 - Status: prerequisite implemented and verified; the VFS slice resumed and both retained-handle
   and root-escape regressions pass. Full `core` validation is currently red on three unrelated,
   independently reproducible `k_process` tests; the VFS-focused tests remain green.
-
 ## 2026-08-21 — interrupted rdynarmic warning cleanup on scalar FCMEQ parity
 
 - Interrupted slice: classify and remove unused x64 vector fallback warnings after checking each
@@ -1018,7 +1016,6 @@
   manager sets over the shared dynamic pool, reserves all but 64 remaining pages for page tables,
   publishes both `KSystemResource` owners, and default processes retain the matching resource.
   The original reserved-page warning and its structural debt are resolved.
-
 ## 2026-08-22 — system-settings persistence interrupted by format-default prerequisites
 
 - Interrupted slice: use `SETTINGS_MAGIC` and `SETTINGS_VERSION` by porting
@@ -1131,3 +1128,9 @@
   data like Eden and pushes it through the shared `System` owner. Focused coverage verifies the
   producer-to-system transfer and command registration.
 - Status: completed and re-verified for the home-menu/general-channel warning slice.
+
+## 2026-08-21 — Native Metal buffer-cache runtime
+
+- Added `renderer_metal/metal_buffer_cache.rs` as the Metal-owned counterpart of Eden `renderer_vulkan/vk_buffer_cache.{h,cpp}`.
+- Implemented common-cache buffer allocation, usage/tick tracking, staging allocation, ordered copy/clear operations, null bindings, vertex/index/uniform/storage/texel/transform-feedback binding state, `uint8` index expansion, and indexed/non-indexed quad emulation.
+- The next slice is the native rasterizer owner. It must consume this runtime state together with `MetalShaderBindingLayout`; it must not create a second CPU-address-keyed buffer store.

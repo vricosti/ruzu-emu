@@ -799,7 +799,9 @@ pub(super) fn compile_graphics_stages_from_file_environments(
     Some(compiled_stages)
 }
 
-fn stage_infos_from_compiled(compiled_stages: &[Option<CompiledShader>; 5]) -> [ShaderInfo; 5] {
+pub(crate) fn stage_infos_from_compiled(
+    compiled_stages: &[Option<CompiledShader>; 5],
+) -> [ShaderInfo; 5] {
     std::array::from_fn(|index| {
         compiled_stages[index]
             .as_ref()

@@ -8,11 +8,18 @@
 
 use std::num::NonZeroU32;
 
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLCompileOptions, MTLDevice, MTLFunction, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+};
 use spirv_cross2::compile::msl::{
     BindTarget, CompilerOptions, MetalPlatform, MslVersion, ResourceBinding,
 };
 use spirv_cross2::targets::Msl;
 use spirv_cross2::{Compiler, Module, SpirvCrossError};
+use thiserror::Error;
 
 /// Explicit mapping from one SPIR-V descriptor to Metal resource indices.
 ///
@@ -34,10 +41,81 @@ pub struct MetalShaderSource {
     pub execution_model: spirv_cross2::spirv::ExecutionModel,
 }
 
+/// SPIRV-Cross policy for the baseline Apple7 renderer.
+///
+/// MSL 2.3 is available on the minimum supported Apple Silicon macOS release.
+/// Later language features are enabled only after the device profile and the
+/// native compiler version are advanced together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalShaderCompileOptions {
+    pub argument_buffers: bool,
+    pub fixed_subgroup_size: u32,
+    pub enable_frag_depth_builtin: bool,
+    pub enable_frag_stencil_ref_builtin: bool,
+    pub enable_frag_output_mask: u32,
+}
+
+impl Default for MetalShaderCompileOptions {
+    fn default() -> Self {
+        Self {
+            // Direct bindings are the first complete runtime ABI. Enabling
+            // argument buffers requires a matching CPU-side argument encoder.
+            argument_buffers: false,
+            fixed_subgroup_size: 32,
+            enable_frag_depth_builtin: true,
+            enable_frag_stencil_ref_builtin: true,
+            enable_frag_output_mask: u32::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum MetalShaderError {
+    #[error(transparent)]
+    Translation(#[from] SpirvCrossError),
+    #[error("Metal failed to compile MSL: {0}")]
+    LibraryCompile(String),
+    #[error("Metal library does not contain entry point {0}")]
+    MissingEntryPoint(String),
+}
+
+/// Native shader objects retained for the lifetime of a Metal pipeline.
+pub struct MetalShaderModule {
+    source: MetalShaderSource,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    function: Retained<ProtocolObject<dyn MTLFunction>>,
+}
+
+impl MetalShaderModule {
+    pub fn source(&self) -> &MetalShaderSource {
+        &self.source
+    }
+
+    pub fn library(&self) -> &ProtocolObject<dyn MTLLibrary> {
+        &self.library
+    }
+
+    pub fn function(&self) -> &ProtocolObject<dyn MTLFunction> {
+        &self.function
+    }
+}
+
 /// Translate shader-recompiler SPIR-V to native MSL.
 pub fn compile_spirv_to_msl(
     words: &[u32],
     resource_bindings: &[MetalResourceBinding],
+) -> Result<MetalShaderSource, SpirvCrossError> {
+    compile_spirv_to_msl_with_options(
+        words,
+        resource_bindings,
+        &MetalShaderCompileOptions::default(),
+    )
+}
+
+pub fn compile_spirv_to_msl_with_options(
+    words: &[u32],
+    resource_bindings: &[MetalResourceBinding],
+    metal_options: &MetalShaderCompileOptions,
 ) -> Result<MetalShaderSource, SpirvCrossError> {
     let module = Module::from_words(words);
     let mut compiler = Compiler::<Msl>::new(module)?;
@@ -59,13 +137,55 @@ pub fn compile_spirv_to_msl(
     let mut options = CompilerOptions::default();
     options.version = MslVersion::new(2, 3, 0);
     options.platform = MetalPlatform::MacOS;
-    options.argument_buffers = false;
+    options.argument_buffers = metal_options.argument_buffers;
+    options.texture_buffer_native = true;
+    options.fixed_subgroup_size = metal_options.fixed_subgroup_size;
+    options.enable_frag_depth_builtin = metal_options.enable_frag_depth_builtin;
+    options.enable_frag_stencil_ref_builtin = metal_options.enable_frag_stencil_ref_builtin;
+    options.enable_frag_output_mask = metal_options.enable_frag_output_mask;
+    options.pad_fragment_output_components = true;
+    options.manual_helper_invocation_updates = true;
+    options.readwrite_texture_fences = true;
+    options.agx_manual_cube_grad_fixup = true;
+    options.force_fragment_with_side_effects_execution = true;
     // Maxwell SPIR-V already uses the Vulkan/Metal [0, w] depth convention.
     options.common.fixup_clipspace = false;
     let artifact = compiler.compile(&options)?;
     Ok(MetalShaderSource {
         source: artifact.as_ref().to_owned(),
         execution_model,
+    })
+}
+
+/// Translate a shader-recompiler module and compile it with Apple's native
+/// Metal compiler. `main0` is SPIRV-Cross's stable entry-point name.
+pub fn compile_native_shader(
+    device: &ProtocolObject<dyn MTLDevice>,
+    words: &[u32],
+    resource_bindings: &[MetalResourceBinding],
+    options: &MetalShaderCompileOptions,
+) -> Result<MetalShaderModule, MetalShaderError> {
+    let source = compile_spirv_to_msl_with_options(words, resource_bindings, options)?;
+    let compile_options = MTLCompileOptions::new();
+    compile_options.setLanguageVersion(MTLLanguageVersion::Version2_3);
+    if objc2::available!(macos = 15.0, ..) {
+        compile_options.setMathMode(MTLMathMode::Safe);
+    } else {
+        #[allow(deprecated)]
+        compile_options.setFastMathEnabled(false);
+    }
+    let source_string = NSString::from_str(&source.source);
+    let library = device
+        .newLibraryWithSource_options_error(&source_string, Some(&compile_options))
+        .map_err(|error| MetalShaderError::LibraryCompile(error.localizedDescription().to_string()))?;
+    let entry_point = NSString::from_str("main0");
+    let function = library
+        .newFunctionWithName(&entry_point)
+        .ok_or_else(|| MetalShaderError::MissingEntryPoint("main0".to_owned()))?;
+    Ok(MetalShaderModule {
+        source,
+        library,
+        function,
     })
 }
 
@@ -79,6 +199,7 @@ mod tests {
     use shader_recompiler::stage::Stage;
 
     use super::*;
+    use crate::renderer_metal::metal_device::MetalDevice;
 
     #[test]
     fn translates_recompiler_vertex_spirv_to_msl() {
@@ -93,5 +214,28 @@ mod tests {
         );
         assert!(msl.source.contains("vertex"));
         assert!(msl.source.contains("main0"));
+    }
+
+    #[test]
+    fn compiles_recompiler_vertex_spirv_to_native_metal_function() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = Program::new(Stage::VertexB);
+        program.blocks.push(Block::new());
+        let words = emit_spirv(&program, &Profile::default(), &RuntimeInfo::default());
+
+        let shader = compile_native_shader(
+            device.device(),
+            &words,
+            &[],
+            &MetalShaderCompileOptions::default(),
+        )
+        .expect("recompiler SPIR-V must compile as a native Metal function");
+
+        assert_eq!(
+            shader.source().execution_model,
+            spirv_cross2::spirv::ExecutionModel::Vertex
+        );
+        assert!(!shader.library().functionNames().is_empty());
+        assert_eq!(shader.function().name().to_string(), "main0");
     }
 }

@@ -50,6 +50,12 @@ pub struct MetalDeviceProfile {
     pub max_threads_per_threadgroup: (usize, usize, usize),
     pub max_threadgroup_memory_length: usize,
     pub max_argument_buffer_sampler_count: usize,
+    pub max_vertex_attributes: u32,
+    pub max_buffer_bindings_per_stage: u32,
+    pub max_texture_bindings_per_stage: u32,
+    pub max_sampler_bindings_per_stage: u32,
+    pub max_color_render_targets: u32,
+    pub max_argument_buffer_samplers_per_stage: u32,
     pub argument_buffers_tier: MTLArgumentBuffersTier,
     pub read_write_texture_tier: MTLReadWriteTextureTier,
     pub supports_raster_order_groups: bool,
@@ -79,6 +85,39 @@ pub enum MetalArgumentBindingModel {
     Tier2ArgumentBuffers,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetalFamilyLimits {
+    max_vertex_attributes: u32,
+    max_buffer_bindings_per_stage: u32,
+    max_texture_bindings_per_stage: u32,
+    max_sampler_bindings_per_stage: u32,
+    max_color_render_targets: u32,
+    max_argument_buffer_samplers_per_stage: u32,
+}
+
+fn family_limits(highest_apple_family: Option<u8>) -> MetalFamilyLimits {
+    MetalFamilyLimits {
+        max_vertex_attributes: 31,
+        max_buffer_bindings_per_stage: 31,
+        max_texture_bindings_per_stage: if highest_apple_family.is_some_and(|family| family >= 6)
+        {
+            128
+        } else if highest_apple_family.is_some_and(|family| family >= 4) {
+            96
+        } else {
+            31
+        },
+        max_sampler_bindings_per_stage: 16,
+        max_color_render_targets: 8,
+        max_argument_buffer_samplers_per_stage: match highest_apple_family {
+            Some(9..) => 500_000,
+            Some(7..) => 996,
+            Some(6) => 128,
+            _ => 16,
+        },
+    }
+}
+
 impl MetalDeviceProfile {
     fn query(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let highest_apple_family = [
@@ -101,6 +140,11 @@ impl MetalDeviceProfile {
             objc2::available!(macos = 13.0, ..) && device.supportsFamily(MTLGPUFamily::Metal3);
         let supports_metal4_family =
             objc2::available!(macos = 26.0, ..) && device.supportsFamily(MTLGPUFamily::Metal4);
+        // Apple publishes these implementation limits by GPU family rather
+        // than through individual MTLDevice selectors. All Apple Silicon
+        // devices are Apple7 or newer; direct binding limits remain stable,
+        // while Tier 2 argument-buffer sampler capacity grows at Apple9.
+        let family_limits = family_limits(highest_apple_family);
         Self {
             architecture_name: if objc2::available!(macos = 14.0, ..) {
                 device.architecture().name().to_string()
@@ -118,6 +162,13 @@ impl MetalDeviceProfile {
             max_threads_per_threadgroup: (max_threads.width, max_threads.height, max_threads.depth),
             max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),
             max_argument_buffer_sampler_count: device.maxArgumentBufferSamplerCount(),
+            max_vertex_attributes: family_limits.max_vertex_attributes,
+            max_buffer_bindings_per_stage: family_limits.max_buffer_bindings_per_stage,
+            max_texture_bindings_per_stage: family_limits.max_texture_bindings_per_stage,
+            max_sampler_bindings_per_stage: family_limits.max_sampler_bindings_per_stage,
+            max_color_render_targets: family_limits.max_color_render_targets,
+            max_argument_buffer_samplers_per_stage: family_limits
+                .max_argument_buffer_samplers_per_stage,
             argument_buffers_tier: device.argumentBuffersSupport(),
             read_write_texture_tier: device.readWriteTextureSupport(),
             supports_raster_order_groups: device.areRasterOrderGroupsSupported(),
@@ -252,6 +303,8 @@ mod tests {
         profile.read_write_texture_tier = MTLReadWriteTextureTier::TierNone;
         profile.sample_counts = [true, true, true, false, false];
         profile.recommended_max_working_set_size = 1_000;
+        profile.highest_apple_family = Some(7);
+        profile.max_argument_buffer_samplers_per_stage = 996;
 
         assert_eq!(
             profile.argument_binding_model(),
@@ -260,6 +313,7 @@ mod tests {
         assert!(!profile.supports_read_write_textures());
         assert_eq!(profile.best_supported_sample_count(16), 4);
         assert_eq!(profile.recommended_resource_budget(), 800);
+        assert_eq!(profile.max_argument_buffer_samplers_per_stage, 996);
     }
 
     #[test]
@@ -269,6 +323,8 @@ mod tests {
         profile.max_argument_buffer_sampler_count = 96;
         profile.read_write_texture_tier = MTLReadWriteTextureTier::Tier2;
         profile.sample_counts = [true, true, true, true, true];
+        profile.highest_apple_family = Some(10);
+        profile.max_argument_buffer_samplers_per_stage = 500_000;
 
         assert_eq!(
             profile.argument_binding_model(),
@@ -276,5 +332,18 @@ mod tests {
         );
         assert!(profile.supports_read_write_textures());
         assert_eq!(profile.best_supported_sample_count(16), 16);
+        assert_eq!(profile.max_argument_buffer_samplers_per_stage, 500_000);
+    }
+
+    #[test]
+    fn family_limits_distinguish_m1_and_m5_without_marketing_names() {
+        let apple7 = family_limits(Some(7));
+        let apple10 = family_limits(Some(10));
+
+        assert_eq!(apple7.max_buffer_bindings_per_stage, 31);
+        assert_eq!(apple7.max_texture_bindings_per_stage, 128);
+        assert_eq!(apple7.max_sampler_bindings_per_stage, 16);
+        assert_eq!(apple7.max_argument_buffer_samplers_per_stage, 996);
+        assert_eq!(apple10.max_argument_buffer_samplers_per_stage, 500_000);
     }
 }

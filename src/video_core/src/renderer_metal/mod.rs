@@ -8,6 +8,7 @@
 //! with Metal concepts rather than translating Vulkan objects mechanically.
 
 pub mod metal_buffer;
+pub mod metal_buffer_cache;
 pub mod metal_device;
 pub mod metal_format;
 pub mod metal_framebuffer;

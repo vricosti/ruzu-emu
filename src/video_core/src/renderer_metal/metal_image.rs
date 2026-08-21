@@ -53,6 +53,7 @@ pub struct MetalImage {
     layers: u32,
     samples: u32,
     guest_samples: u32,
+    allocation_tick: u64,
 }
 
 impl MetalImage {
@@ -115,6 +116,7 @@ impl MetalImage {
             layers,
             samples,
             guest_samples: info.num_samples,
+            allocation_tick: 0,
         })
     }
 
@@ -156,6 +158,14 @@ impl MetalImage {
 
     pub fn image_type(&self) -> ImageType {
         self.image_type
+    }
+
+    pub fn set_allocation_tick(&mut self, allocation_tick: u64) {
+        self.allocation_tick = allocation_tick;
+    }
+
+    pub fn allocation_tick(&self) -> u64 {
+        self.allocation_tick
     }
 
     /// Port of Eden `Image::UploadMemory` for byte-compatible Metal formats.

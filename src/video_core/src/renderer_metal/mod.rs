@@ -14,6 +14,7 @@ pub mod metal_framebuffer;
 pub mod metal_image;
 pub mod metal_image_view;
 pub mod metal_layer;
+pub mod metal_pipeline_cache;
 pub mod metal_presenter;
 pub mod metal_sampler;
 pub mod metal_scheduler;

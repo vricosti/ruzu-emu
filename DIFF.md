@@ -4392,6 +4392,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's `&mut self` mutation methods exclude concurrent `&self` lookups at the type boundary, so
   it does not retain Eden's inner `config_mutex`; the cache owners must provide any cross-thread
   synchronization around the complete `ChannelSetupCaches` value.
+
 ## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/ffmpeg.rs` and `ffmpeg_shim.c` vs `src/video_core/host1x/ffmpeg.h` and `.cpp`
 
 ### Intentional differences
@@ -4400,7 +4401,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `RuzuFfmpegDecoder`; the Rust wrapper therefore does not duplicate that codec or hold a
   self-referential borrow into `DecodeApi::decoder`.
 
-## 2026-08-21 — `src/video_core/src/renderer_metal/{metal_device,metal_buffer,metal_format,metal_image,metal_image_view,metal_layer,metal_scheduler,metal_presenter,metal_shader,metal_staging_buffer_pool,metal_sampler}.rs` vs Eden renderer ownership
+## 2026-08-21 — `src/video_core/src/renderer_metal/{metal_device,metal_buffer,metal_format,metal_image,metal_image_view,metal_layer,metal_scheduler,metal_presenter,metal_shader,metal_pipeline_cache,metal_staging_buffer_pool,metal_sampler}.rs` vs Eden renderer ownership
 
 ### Intentional differences
 
@@ -4441,6 +4442,13 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `MetalDeviceProfile` queries the actual `MTLDevice` family, argument-buffer/read-write tiers,
   compressed-format support, sample counts, memory/threadgroup limits and shader/pipeline
   capabilities. Backend policy never infers features from Apple marketing generation names.
+- Direct resource-binding limits which Metal does not expose through individual selectors are
+  derived from Apple's published GPU-family tables: Apple7 (M1) through Apple10 (M5) expose 31
+  buffers, 128 textures, 16 samplers, 31 vertex attributes and 8 color render targets per stage.
+  Tier-2 argument-buffer sampler capacity remains family-specific (996 on Apple7/8 and 500,000 on
+  Apple9/10). A focused family-policy test verifies the M1/M5 distinction without matching device
+  names; sample counts remain queried individually with `supportsTextureSampleCount` rather than
+  inferred from those tables.
 - Capability policy is evaluated from the captured profile: argument binding selects direct,
   Tier 1 or Tier 2 resources; MSAA selects only a reported sample count; storage images require a
   reported read/write tier; cache budgeting derives from `recommendedMaxWorkingSetSize`. Calls
@@ -4467,6 +4475,18 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - A combined `Depth32Float_Stencil8` texture is itself the Metal depth sampling view; Apple Metal
   rejects a cast to `Depth32Float`. Stencil sampling uses the legal `X32_Stencil8` view. This is the
   native equivalent of Eden's separate aspect views rather than a literal format cast.
+- `MetalPipelineCache` owns `Shader::Profile`, `HostTranslateInfo`, render-pipeline keys and
+  render/compute pipeline maps, matching Eden `PipelineCache` ownership. `metal_shader.rs` owns the
+  backend module build corresponding to `vk_shader_util.cpp`: shader-recompiler SPIR-V is translated
+  by SPIRV-Cross, then compiled to retained native `MTLLibrary`/`MTLFunction` objects.
+- The initial compiler ABI deliberately targets MSL 2.3, direct resource bindings and a fixed
+  32-lane subgroup. Device features which require a newer MSL language or an argument-buffer runtime
+  remain disabled even when newer silicon reports them; profile flags describe the complete usable
+  compiler/runtime path, not silicon in isolation.
+- `MetalRenderPipelineKey` retains all eight color formats and blend states, depth/stencil formats,
+  sample count, topology, alpha-to-coverage/one and rasterization state. Metal compiles these into
+  `MTLRenderPipelineState`; compute shaders compile into `MTLComputePipelineState`. Native tests
+  verify both states are created from shader-recompiler programs and reused by their cache keys.
 
 ### Unintentional differences (to fix)
 

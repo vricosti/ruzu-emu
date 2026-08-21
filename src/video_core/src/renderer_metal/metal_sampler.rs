@@ -137,10 +137,22 @@ impl MetalSampler {
         &self.sampler
     }
 
+    pub(crate) fn retained_handle(&self) -> Retained<ProtocolObject<dyn MTLSamplerState>> {
+        self.sampler.clone()
+    }
+
     pub fn handle_with_default_anisotropy(&self) -> &ProtocolObject<dyn MTLSamplerState> {
         self.sampler_default_anisotropy
             .as_deref()
             .unwrap_or(&self.sampler)
+    }
+
+    pub(crate) fn retained_handle_with_default_anisotropy(
+        &self,
+    ) -> Retained<ProtocolObject<dyn MTLSamplerState>> {
+        self.sampler_default_anisotropy
+            .clone()
+            .unwrap_or_else(|| self.sampler.clone())
     }
 
     pub fn has_added_anisotropy(&self) -> bool {
@@ -151,12 +163,28 @@ impl MetalSampler {
         self.sampler_nearest.as_deref().unwrap_or(&self.sampler)
     }
 
+    pub(crate) fn retained_handle_with_nearest_filter(
+        &self,
+    ) -> Retained<ProtocolObject<dyn MTLSamplerState>> {
+        self.sampler_nearest
+            .clone()
+            .unwrap_or_else(|| self.sampler.clone())
+    }
+
     pub fn has_linear_filtering(&self) -> bool {
         self.sampler_nearest.is_some()
     }
 
     pub fn handle_without_depth_comparison(&self) -> &ProtocolObject<dyn MTLSamplerState> {
         self.sampler_noncompare.as_deref().unwrap_or(&self.sampler)
+    }
+
+    pub(crate) fn retained_handle_without_depth_comparison(
+        &self,
+    ) -> Retained<ProtocolObject<dyn MTLSamplerState>> {
+        self.sampler_noncompare
+            .clone()
+            .unwrap_or_else(|| self.sampler.clone())
     }
 
     pub fn has_depth_comparison(&self) -> bool {

@@ -211,6 +211,13 @@ impl MetalImageView {
         self.image_views[texture_type as usize].as_deref()
     }
 
+    pub(crate) fn retained_handle(
+        &self,
+        texture_type: TextureType,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+        self.image_views[texture_type as usize].clone()
+    }
+
     pub fn render_target(&self) -> &ProtocolObject<dyn MTLTexture> {
         &self.render_target
     }

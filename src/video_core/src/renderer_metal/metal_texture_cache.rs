@@ -14,14 +14,16 @@ use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::BufferCacheAsyncBuffer;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use shader_recompiler::shader_info::TextureType;
 use crate::texture_cache::image_base::ImageBase;
 use crate::texture_cache::image_view_base::ImageViewBase;
 use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::{
-    TextureCacheBase as CommonTextureCache, TextureCacheParams,
+    DescriptorSyncRegs, ImageViewInOut, TextureCacheBase as CommonTextureCache,
+    TextureCacheParams,
 };
 use crate::texture_cache::types::{
-    BufferImageCopy, ImageCopy, ImageId, ImageType, ImageViewId, NULL_IMAGE_VIEW_ID,
+    BufferImageCopy, ImageCopy, ImageId, ImageType, ImageViewId, SamplerId, NULL_IMAGE_VIEW_ID,
     NULL_SAMPLER_ID, NUM_RT,
 };
 
@@ -560,6 +562,93 @@ impl MetalTextureCache {
             .runtime_mut()
             .tick_frame()
             .unwrap_or_else(|error| panic!("Metal texture-cache frame tick failed: {error}"));
+    }
+
+    pub fn synchronize_graphics_descriptors(&mut self, regs: DescriptorSyncRegs) {
+        self.base.synchronize_graphics_descriptors(regs);
+    }
+
+    pub fn fill_image_views(
+        &mut self,
+        views: &mut [ImageViewInOut],
+        compute: bool,
+        blacklist: bool,
+    ) {
+        self.base.fill_image_views(views, compute, blacklist);
+    }
+
+    pub fn get_sampler_id(&mut self, index: u32, compute: bool) -> SamplerId {
+        self.base.get_sampler_id(index, compute)
+    }
+
+    pub fn sampler(&self, sampler_id: SamplerId) -> Option<&MetalSampler> {
+        if !sampler_id.is_valid() {
+            return None;
+        }
+        self.base.slot_samplers[sampler_id].backend.as_ref()
+    }
+
+    pub fn image_view(&self, view_id: ImageViewId) -> Option<&MetalImageView> {
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            return None;
+        }
+        self.base.slot_image_views[view_id]
+            .backend
+            .as_ref()
+            .and_then(MetalCachedImageView::image)
+    }
+
+    pub fn retained_image_view(
+        &self,
+        view_id: ImageViewId,
+        texture_type: TextureType,
+    ) -> Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLTexture>>>
+    {
+        self.image_view(view_id)?.retained_handle(texture_type)
+    }
+
+    pub fn framebuffer_image_view(
+        &mut self,
+        config: &crate::framebuffer_config::FramebufferConfig,
+        cpu_addr: u64,
+    ) -> Option<(
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLTexture>>,
+        u32,
+        u32,
+    )> {
+        let framebuffer = self.base.try_find_framebuffer_image_view(config, cpu_addr)?;
+        <MetalTextureCacheParams as TextureCacheParams>::prepare_image_view(
+            &mut self.base,
+            framebuffer.view_id,
+            false,
+            false,
+        );
+        let view = self.image_view(framebuffer.view_id)?;
+        Some((
+            view.retained_render_target(),
+            framebuffer.view.size.width,
+            framebuffer.view.size.height,
+        ))
+    }
+
+    pub fn image_view_buffer_info(
+        &self,
+        view_id: ImageViewId,
+    ) -> Option<(u64, u32, crate::surface::PixelFormat)> {
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            return None;
+        }
+        let view = self.base.slot_image_views[view_id].backend.as_ref()?;
+        let base = view.base();
+        base.is_buffer().then(|| {
+            (
+                base.gpu_addr,
+                base.size
+                    .width
+                    .wrapping_mul(crate::surface::bytes_per_block(base.format)),
+                base.format,
+            )
+        })
     }
 }
 

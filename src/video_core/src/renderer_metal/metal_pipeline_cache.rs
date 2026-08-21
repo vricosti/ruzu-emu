@@ -8,21 +8,28 @@
 //! device wrapper or the rasterizer.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLComputePipelineState,
-    MTLDevice as _, MTLPixelFormat, MTLPrimitiveTopologyClass, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState,
+    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLComputePipelineState, MTLDevice as _,
+    MTLPixelFormat, MTLPrimitiveTopologyClass, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
 };
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::profile::Profile;
 use spirv_cross2::spirv::ExecutionModel;
 use thiserror::Error;
 
+use crate::engines::draw_manager::Maxwell3DDrawView;
+use crate::renderer_vulkan::fixed_pipeline_state::DynamicFeatures;
+use crate::renderer_vulkan::graphics_pipeline::{GraphicsPipelineCache, GraphicsPipelineKey};
+use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
+
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
-use super::metal_shader::MetalShaderModule;
+use super::metal_shader::{
+    compile_native_shader, MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
+};
 
 const SPIRV_1_5: u32 = 0x0001_0500;
 const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
@@ -117,7 +124,9 @@ pub fn make_host_translate_info(device: &MetalDeviceProfile) -> HostTranslateInf
         max_descriptor_set_input_attachements: device.max_color_render_targets,
         support_float64: false,
         support_float16: true,
-        support_int64: device.highest_apple_family.is_some_and(|family| family >= 3),
+        support_int64: device
+            .highest_apple_family
+            .is_some_and(|family| family >= 3),
         needs_demote_reorder: false,
         support_snorm_render_buffer: true,
         support_viewport_index_layer: false,
@@ -161,6 +170,8 @@ impl MetalColorAttachmentState {
 pub struct MetalRenderPipelineKey {
     pub vertex_shader_hash: u64,
     pub fragment_shader_hash: u64,
+    /// Hash of the complete shader runtime variant (`GraphicsPipelineKey`).
+    pub shader_variant_hash: u64,
     pub color_attachments: [MetalColorAttachmentState; 8],
     pub depth_format: MTLPixelFormat,
     pub stencil_format: MTLPixelFormat,
@@ -176,6 +187,7 @@ impl MetalRenderPipelineKey {
         Self {
             vertex_shader_hash,
             fragment_shader_hash,
+            shader_variant_hash: 0,
             color_attachments: [MetalColorAttachmentState::disabled(); 8],
             depth_format: MTLPixelFormat::Invalid,
             stencil_format: MTLPixelFormat::Invalid,
@@ -208,6 +220,31 @@ pub struct MetalComputePipeline {
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
+#[derive(Clone)]
+pub struct MetalGraphicsShaderStages {
+    key: GraphicsPipelineKey,
+    vertex: Arc<MetalShaderModule>,
+    fragment: Option<Arc<MetalShaderModule>>,
+}
+
+impl MetalGraphicsShaderStages {
+    pub fn key(&self) -> &GraphicsPipelineKey {
+        &self.key
+    }
+
+    pub fn variant_hash(&self) -> u64 {
+        self.key.hash_value()
+    }
+
+    pub fn vertex(&self) -> &MetalShaderModule {
+        &self.vertex
+    }
+
+    pub fn fragment(&self) -> Option<&MetalShaderModule> {
+        self.fragment.as_deref()
+    }
+}
+
 impl MetalComputePipeline {
     pub fn shader_hash(&self) -> u64 {
         self.shader_hash
@@ -231,6 +268,12 @@ pub enum MetalPipelineError {
     RenderPipeline(String),
     #[error("Metal failed to create compute pipeline: {0}")]
     ComputePipeline(String),
+    #[error("graphics shader translation did not produce a vertex stage")]
+    MissingVertexStage,
+    #[error("native Metal pipeline lowering for {0} is not implemented")]
+    UnsupportedGraphicsStage(&'static str),
+    #[error(transparent)]
+    Shader(#[from] MetalShaderError),
 }
 
 pub struct MetalPipelineCache {
@@ -239,6 +282,9 @@ pub struct MetalPipelineCache {
     host_info: HostTranslateInfo,
     render_pipelines: HashMap<MetalRenderPipelineKey, MetalRenderPipeline>,
     compute_pipelines: HashMap<u64, MetalComputePipeline>,
+    graphics_shader_modules: HashMap<GraphicsPipelineKey, MetalGraphicsShaderStages>,
+    graphics_key: GraphicsPipelineKey,
+    dynamic_features: DynamicFeatures,
 }
 
 impl MetalPipelineCache {
@@ -251,6 +297,12 @@ impl MetalPipelineCache {
             host_info,
             render_pipelines: HashMap::new(),
             compute_pipelines: HashMap::new(),
+            graphics_shader_modules: HashMap::new(),
+            graphics_key: GraphicsPipelineKey::default(),
+            // Metal state not represented by a dynamic encoder command stays
+            // in the fixed key. Start with every Vulkan-only dynamic feature
+            // disabled, then opt in only when the Metal rasterizer owns it.
+            dynamic_features: DynamicFeatures::default(),
         }
     }
 
@@ -264,6 +316,77 @@ impl MetalPipelineCache {
 
     pub fn host_info(&self) -> &HostTranslateInfo {
         &self.host_info
+    }
+
+    /// Port of Eden `PipelineCache::CurrentGraphicsPipeline` up through
+    /// shader discovery, translation, and backend module creation.
+    pub fn current_graphics_shaders(
+        &mut self,
+        draw: &mut Maxwell3DDrawView<'_>,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Result<Option<MetalGraphicsShaderStages>, MetalPipelineError> {
+        if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
+            return Ok(None);
+        }
+        self.graphics_key
+            .fixed_state
+            .refresh(draw, &self.dynamic_features);
+        let key = self.graphics_key.clone();
+        if !self.graphics_shader_modules.contains_key(&key) {
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
+            let Some(compiled) = GraphicsPipelineCache::compile_graphics_stages_from_environments(
+                &self.profile,
+                &self.host_info,
+                &key,
+                &mut environments,
+            ) else {
+                return Ok(None);
+            };
+            if compiled[1].is_some() {
+                return Err(MetalPipelineError::UnsupportedGraphicsStage(
+                    "tessellation control",
+                ));
+            }
+            if compiled[2].is_some() {
+                return Err(MetalPipelineError::UnsupportedGraphicsStage(
+                    "tessellation evaluation",
+                ));
+            }
+            if compiled[3].is_some() {
+                return Err(MetalPipelineError::UnsupportedGraphicsStage("geometry"));
+            }
+            let vertex = compiled[0]
+                .as_ref()
+                .ok_or(MetalPipelineError::MissingVertexStage)?;
+            let vertex = Arc::new(compile_native_shader(
+                self.device.device(),
+                self.device.profile(),
+                &vertex.spirv_words,
+                &MetalShaderCompileOptions::default(),
+            )?);
+            let fragment = compiled[4]
+                .as_ref()
+                .map(|fragment| {
+                    compile_native_shader(
+                        self.device.device(),
+                        self.device.profile(),
+                        &fragment.spirv_words,
+                        &MetalShaderCompileOptions::default(),
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?;
+            self.graphics_shader_modules.insert(
+                key.clone(),
+                MetalGraphicsShaderStages {
+                    key: key.clone(),
+                    vertex,
+                    fragment,
+                },
+            );
+        }
+        Ok(self.graphics_shader_modules.get(&key).cloned())
     }
 
     pub fn get_or_create_render_pipeline(
@@ -286,7 +409,11 @@ impl MetalPipelineCache {
                 });
             }
         }
-        if !self.device.profile().supports_sample_count(key.sample_count) {
+        if !self
+            .device
+            .profile()
+            .supports_sample_count(key.sample_count)
+        {
             return Err(MetalPipelineError::UnsupportedSampleCount(key.sample_count));
         }
         if !self.render_pipelines.contains_key(&key) {
@@ -352,13 +479,8 @@ impl MetalPipelineCache {
                 .map_err(|error| {
                     MetalPipelineError::ComputePipeline(error.localizedDescription().to_string())
                 })?;
-            self.compute_pipelines.insert(
-                shader_hash,
-                MetalComputePipeline {
-                    shader_hash,
-                    state,
-                },
-            );
+            self.compute_pipelines
+                .insert(shader_hash, MetalComputePipeline { shader_hash, state });
         }
         Ok(self
             .compute_pipelines
@@ -378,9 +500,7 @@ mod tests {
     use shader_recompiler::stage::Stage;
 
     use super::*;
-    use crate::renderer_metal::metal_shader::{
-        compile_native_shader, MetalShaderCompileOptions,
-    };
+    use crate::renderer_metal::metal_shader::{compile_native_shader, MetalShaderCompileOptions};
 
     #[test]
     fn native_profile_matches_direct_metal_binding_model() {
@@ -398,10 +518,7 @@ mod tests {
         assert_eq!(cache.host_info().min_ssbo_alignment, 4);
     }
 
-    fn compile_test_shader(
-        cache: &MetalPipelineCache,
-        program: &Program,
-    ) -> MetalShaderModule {
+    fn compile_test_shader(cache: &MetalPipelineCache, program: &Program) -> MetalShaderModule {
         let words = emit_spirv(program, cache.profile(), &RuntimeInfo::default());
         compile_native_shader(
             cache.device().device(),
@@ -468,6 +585,15 @@ mod tests {
             .state() as *const _;
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn render_pipeline_key_keeps_shader_runtime_variants_distinct() {
+        let base = MetalRenderPipelineKey::new(0x1111, 0x2222);
+        let mut variant = base;
+        variant.shader_variant_hash = 0x3333;
+
+        assert_ne!(base, variant);
     }
 
     #[test]

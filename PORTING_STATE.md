@@ -1143,3 +1143,10 @@
 - Exact next prerequisite: the rasterizer-owned descriptor consumer must combine `MetalShaderBindingLayout`, `MetalCommonBufferCache` binding state, and `MetalTextureCache` `ImageViewId`/`SamplerId` payloads on one render or compute encoder. It must also own concrete null buffer/texture bindings and materialize buffer image views at the final cache offset.
 - Deferred prerequisites that do not block the initial native-resolution draw path: the Metal blit/compute helper for format conversion, scaling, reinterpretation, and partial/reverse-MSAA copies; sampler border-color emulation; async downloads and applet capture.
 - Resume condition: implement the resource-binding owner in `renderer_metal/metal_rasterizer.rs`, then port Eden rasterizer draw preparation/order without introducing an alternate image or buffer identity map.
+
+## 2026-08-21 — Native Metal live graphics-shader lookup
+
+- Completed prerequisite: `MetalPipelineCache::current_graphics_shaders` now mirrors Eden `PipelineCache::CurrentGraphicsPipeline` through stage refresh, complete fixed-state keying, environment collection, exact shared stage translation, and cached native Metal shader-module creation.
+- The existing Vulkan compiler path was only mechanically parameterized by `Profile` and `HostTranslateInfo`; Vulkan retains the same stage compiler, order, and outputs. Metal does not construct or invoke Vulkan runtime objects.
+- Interrupted slice remains `MetalRasterizer`: consume shader binding layouts together with the common buffer/texture cache state, construct the complete native render-pipeline descriptor, and encode draws in Eden `PrepareDraw`/`ConfigureImpl` order.
+- Exact next prerequisite: add vertex-layout and Maxwell fixed-state conversion to `MetalPipelineCache`, because Metal bakes those states into `MTLRenderPipelineState` and cannot encode a correct guest draw with the current partial key.

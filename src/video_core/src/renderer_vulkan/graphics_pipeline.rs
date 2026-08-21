@@ -1875,7 +1875,12 @@ impl GraphicsPipelineCache {
         runtime: GraphicsPipelineRuntime,
         pipeline_statistics: Option<Arc<PipelineStatistics>>,
     ) -> Option<GraphicsPipeline> {
-        let compiled_stages = self.compile_graphics_stages_from_environments(key, environments)?;
+        let compiled_stages = Self::compile_graphics_stages_from_environments(
+            &self.profile,
+            &self.host_info,
+            key,
+            environments,
+        )?;
 
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
         shader_notify.mark_shader_building();
@@ -1917,7 +1922,12 @@ impl GraphicsPipelineCache {
         runtime: GraphicsPipelineRuntime,
         pipeline_statistics: Option<Arc<PipelineStatistics>>,
     ) -> Option<GraphicsPipeline> {
-        let compiled_stages = self.compile_graphics_stages_from_environments(key, environments)?;
+        let compiled_stages = Self::compile_graphics_stages_from_environments(
+            &self.profile,
+            &self.host_info,
+            key,
+            environments,
+        )?;
 
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
         shader_notify.mark_shader_building();
@@ -1940,8 +1950,9 @@ impl GraphicsPipelineCache {
     /// Maxwell exposes six program slots because VertexA and VertexB merge
     /// into one Vulkan vertex stage. The remaining slots map directly to the
     /// four following Vulkan graphics stages.
-    fn compile_graphics_stages_from_environments(
-        &self,
+    pub(crate) fn compile_graphics_stages_from_environments(
+        profile: &Profile,
+        host_info: &HostTranslateInfo,
         key: &GraphicsPipelineKey,
         environments: &mut GraphicsEnvironments,
     ) -> Option<[Option<CompiledShader>; NUM_VK_GRAPHICS_STAGES]> {
@@ -1997,10 +2008,10 @@ impl GraphicsPipelineCache {
                     &vertex_b_code,
                     vertex_b_offset,
                     vertex_b,
-                    &self.profile,
+                    profile,
                     &vertex_runtime_info,
                     &mut bindings,
-                    &self.host_info,
+                    host_info,
                 );
             if dump_guest_shaders {
                 vertex_a
@@ -2012,7 +2023,9 @@ impl GraphicsPipelineCache {
             }
             compiled
         } else {
-            let compiled = self.compile_stage_from_environment(
+            let compiled = Self::compile_stage_from_environment(
+                profile,
+                host_info,
                 environments,
                 1,
                 &mut bindings,
@@ -2037,7 +2050,9 @@ impl GraphicsPipelineCache {
                 .shader_stage();
             let stage_index = shader_stage_to_graphics_info_index(stage)?;
             let runtime_info = make_runtime_info(key, stage, previous_stage_info.as_ref());
-            let compiled = self.compile_stage_from_environment(
+            let compiled = Self::compile_stage_from_environment(
+                profile,
+                host_info,
                 environments,
                 program_index,
                 &mut bindings,
@@ -2224,7 +2239,8 @@ impl GraphicsPipelineCache {
     }
 
     fn compile_stage_from_environment(
-        &self,
+        profile: &Profile,
+        host_info: &HostTranslateInfo,
         environments: &mut GraphicsEnvironments,
         stage_index: usize,
         bindings: &mut Bindings,
@@ -2255,10 +2271,10 @@ impl GraphicsPipelineCache {
             &code,
             base_offset,
             env,
-            &self.profile,
+            profile,
             runtime_info,
             bindings,
-            &self.host_info,
+            host_info,
         );
         Some(compiled)
     }

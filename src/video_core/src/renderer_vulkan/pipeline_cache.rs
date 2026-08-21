@@ -370,9 +370,9 @@ fn fill_transform_feedback_runtime_info(info: &mut RuntimeInfo, state: &FixedPip
 
 /// Port of `MakeRuntimeInfo` in Eden `vk_pipeline_cache.cpp`.
 #[derive(Clone, Copy)]
-struct RuntimeInfoDeviceFeatures {
-    transform_feedback: bool,
-    molten_vk: bool,
+pub(crate) struct RuntimeInfoDeviceFeatures {
+    pub(crate) transform_feedback: bool,
+    pub(crate) molten_vk: bool,
 }
 
 fn make_runtime_info_with_features(
@@ -550,6 +550,25 @@ pub(super) fn compile_graphics_stages_from_environments(
     key: &GraphicsPipelineKey,
     environments: &mut GraphicsEnvironments,
 ) -> Option<[Option<CompiledShader>; 5]> {
+    compile_graphics_stages_from_environments_with_features(
+        profile,
+        host_info,
+        key,
+        environments,
+        RuntimeInfoDeviceFeatures {
+            transform_feedback: device.is_ext_transform_feedback_supported(),
+            molten_vk: device.is_molten_vk(),
+        },
+    )
+}
+
+pub(crate) fn compile_graphics_stages_from_environments_with_features(
+    profile: &Profile,
+    host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey,
+    environments: &mut GraphicsEnvironments,
+    device_features: RuntimeInfoDeviceFeatures,
+) -> Option<[Option<CompiledShader>; 5]> {
     let uses_vertex_a = key.unique_hashes[0] != 0;
     let uses_vertex_b = key.unique_hashes[1] != 0;
     if !uses_vertex_b {
@@ -626,7 +645,13 @@ pub(super) fn compile_graphics_stages_from_environments(
         let runtime_info = {
             let program = programs[program_index].as_ref()?;
             let previous_program = previous_stage_index.and_then(|index| programs[index].as_ref());
-            make_runtime_info(&programs, key, program, previous_program, device)
+            make_runtime_info_with_features(
+                &programs,
+                key,
+                program,
+                previous_program,
+                device_features,
+            )
         };
         let program = programs[program_index].as_mut()?;
         convert_legacy_to_generic(program, &runtime_info);

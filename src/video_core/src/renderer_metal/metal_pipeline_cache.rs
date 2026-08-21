@@ -15,14 +15,18 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLComputePipelineState, MTLDevice as _,
     MTLPixelFormat, MTLPrimitiveTopologyClass, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
+    MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::profile::Profile;
+use shader_recompiler::shader_info::Info as ShaderInfo;
 use spirv_cross2::spirv::ExecutionModel;
 use thiserror::Error;
 
 use crate::engines::draw_manager::Maxwell3DDrawView;
+use crate::engines::maxwell_3d::{VertexAttribSize, VertexAttribType};
 use crate::renderer_vulkan::fixed_pipeline_state::DynamicFeatures;
+use crate::renderer_vulkan::fixed_pipeline_state::FixedPipelineState;
 use crate::renderer_vulkan::graphics_pipeline::{GraphicsPipelineCache, GraphicsPipelineKey};
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 
@@ -150,6 +154,123 @@ pub struct MetalColorAttachmentState {
     pub write_mask: MTLColorWriteMask,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalVertexAttributeState {
+    pub format: MTLVertexFormat,
+    pub offset: u16,
+    pub buffer_index: u8,
+}
+
+impl MetalVertexAttributeState {
+    pub const fn disabled() -> Self {
+        Self {
+            format: MTLVertexFormat::Invalid,
+            offset: 0,
+            buffer_index: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalVertexBufferLayoutState {
+    pub stride: u16,
+    pub step_function: MTLVertexStepFunction,
+    pub step_rate: u32,
+    pub buffer_index: u8,
+    pub enabled: bool,
+}
+
+impl MetalVertexBufferLayoutState {
+    pub const fn disabled() -> Self {
+        Self {
+            stride: 0,
+            step_function: MTLVertexStepFunction::PerVertex,
+            step_rate: 1,
+            buffer_index: 0,
+            enabled: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalVertexInputState {
+    pub attributes: [MetalVertexAttributeState; 32],
+    pub layouts: [MetalVertexBufferLayoutState; 32],
+}
+
+impl Default for MetalVertexInputState {
+    fn default() -> Self {
+        Self {
+            attributes: [MetalVertexAttributeState::disabled(); 32],
+            layouts: [MetalVertexBufferLayoutState::disabled(); 32],
+        }
+    }
+}
+
+impl MetalVertexInputState {
+    fn from_fixed_state(
+        fixed_state: &FixedPipelineState,
+        vertex_info: &ShaderInfo,
+        first_vertex_buffer: u32,
+        max_buffer_bindings: u32,
+    ) -> Result<Self, MetalPipelineError> {
+        let mut result = Self::default();
+        let mut source_to_metal = [None; 32];
+        let mut next_buffer = first_vertex_buffer;
+        for (attribute_index, attribute) in fixed_state.attributes.iter().enumerate() {
+            if !attribute.is_enabled() || !vertex_info.loads.generic_any(attribute_index) {
+                continue;
+            }
+            let source_buffer = attribute.buffer() as usize;
+            let metal_buffer = if let Some(index) = source_to_metal[source_buffer] {
+                index
+            } else {
+                if next_buffer >= max_buffer_bindings {
+                    return Err(MetalPipelineError::VertexBufferBindingLimit {
+                        requested: next_buffer + 1,
+                        limit: max_buffer_bindings,
+                    });
+                }
+                let index = next_buffer as u8;
+                source_to_metal[source_buffer] = Some(index);
+                next_buffer += 1;
+                index
+            };
+            let attrib_type = VertexAttribType::from_raw(attribute.attrib_type());
+            let attrib_size = VertexAttribSize::from_raw(attribute.attrib_size());
+            let format = metal_vertex_format(attrib_type, attrib_size).ok_or(
+                MetalPipelineError::UnsupportedVertexFormat {
+                    attrib_type,
+                    attrib_size,
+                },
+            )?;
+            result.attributes[attribute_index] = MetalVertexAttributeState {
+                format,
+                offset: attribute.offset() as u16,
+                buffer_index: metal_buffer,
+            };
+        }
+        for (source_buffer, metal_buffer) in source_to_metal.into_iter().enumerate() {
+            let Some(buffer_index) = metal_buffer else {
+                continue;
+            };
+            let divisor = fixed_state.binding_divisors[source_buffer];
+            result.layouts[source_buffer] = MetalVertexBufferLayoutState {
+                stride: fixed_state.vertex_strides[source_buffer],
+                step_function: if divisor == 0 {
+                    MTLVertexStepFunction::PerVertex
+                } else {
+                    MTLVertexStepFunction::PerInstance
+                },
+                step_rate: divisor.max(1),
+                buffer_index,
+                enabled: true,
+            };
+        }
+        Ok(result)
+    }
+}
+
 impl MetalColorAttachmentState {
     pub const fn disabled() -> Self {
         Self {
@@ -172,6 +293,7 @@ pub struct MetalRenderPipelineKey {
     pub fragment_shader_hash: u64,
     /// Hash of the complete shader runtime variant (`GraphicsPipelineKey`).
     pub shader_variant_hash: u64,
+    pub vertex_input: MetalVertexInputState,
     pub color_attachments: [MetalColorAttachmentState; 8],
     pub depth_format: MTLPixelFormat,
     pub stencil_format: MTLPixelFormat,
@@ -188,6 +310,7 @@ impl MetalRenderPipelineKey {
             vertex_shader_hash,
             fragment_shader_hash,
             shader_variant_hash: 0,
+            vertex_input: MetalVertexInputState::default(),
             color_attachments: [MetalColorAttachmentState::disabled(); 8],
             depth_format: MTLPixelFormat::Invalid,
             stencil_format: MTLPixelFormat::Invalid,
@@ -224,6 +347,7 @@ pub struct MetalComputePipeline {
 pub struct MetalGraphicsShaderStages {
     key: GraphicsPipelineKey,
     vertex: Arc<MetalShaderModule>,
+    vertex_info: ShaderInfo,
     fragment: Option<Arc<MetalShaderModule>>,
 }
 
@@ -272,6 +396,13 @@ pub enum MetalPipelineError {
     MissingVertexStage,
     #[error("native Metal pipeline lowering for {0} is not implemented")]
     UnsupportedGraphicsStage(&'static str),
+    #[error("Metal has no native vertex format for {attrib_type:?} {attrib_size:?}")]
+    UnsupportedVertexFormat {
+        attrib_type: VertexAttribType,
+        attrib_size: VertexAttribSize,
+    },
+    #[error("Metal vertex buffer binding limit exceeded: requested {requested}, limit {limit}")]
+    VertexBufferBindingLimit { requested: u32, limit: u32 },
     #[error(transparent)]
     Shader(#[from] MetalShaderError),
 }
@@ -359,6 +490,7 @@ impl MetalPipelineCache {
             let vertex = compiled[0]
                 .as_ref()
                 .ok_or(MetalPipelineError::MissingVertexStage)?;
+            let vertex_info = vertex.info.clone();
             let vertex = Arc::new(compile_native_shader(
                 self.device.device(),
                 self.device.profile(),
@@ -382,6 +514,7 @@ impl MetalPipelineCache {
                 MetalGraphicsShaderStages {
                     key: key.clone(),
                     vertex,
+                    vertex_info,
                     fragment,
                 },
             );
@@ -429,6 +562,8 @@ impl MetalPipelineCache {
             }
             descriptor.setDepthAttachmentPixelFormat(key.depth_format);
             descriptor.setStencilAttachmentPixelFormat(key.stencil_format);
+            let vertex_descriptor = make_vertex_descriptor(&key.vertex_input);
+            descriptor.setVertexDescriptor(Some(&vertex_descriptor));
 
             let attachments = descriptor.colorAttachments();
             for (index, state) in key.color_attachments.iter().enumerate() {
@@ -460,6 +595,18 @@ impl MetalPipelineCache {
             .expect("pipeline inserted above"))
     }
 
+    pub fn make_vertex_input_state(
+        &self,
+        stages: &MetalGraphicsShaderStages,
+    ) -> Result<MetalVertexInputState, MetalPipelineError> {
+        MetalVertexInputState::from_fixed_state(
+            &stages.key.fixed_state,
+            &stages.vertex_info,
+            stages.vertex.bindings().buffer_count,
+            self.device.profile().max_buffer_bindings_per_stage,
+        )
+    }
+
     pub fn get_or_create_compute_pipeline(
         &mut self,
         shader_hash: u64,
@@ -489,6 +636,132 @@ impl MetalPipelineCache {
     }
 }
 
+fn make_vertex_descriptor(state: &MetalVertexInputState) -> Retained<MTLVertexDescriptor> {
+    let descriptor = MTLVertexDescriptor::vertexDescriptor();
+    let attributes = descriptor.attributes();
+    for (index, attribute) in state.attributes.iter().enumerate() {
+        if attribute.format == MTLVertexFormat::Invalid {
+            continue;
+        }
+        let target = unsafe { attributes.objectAtIndexedSubscript(index) };
+        target.setFormat(attribute.format);
+        unsafe {
+            target.setOffset(attribute.offset as usize);
+            target.setBufferIndex(attribute.buffer_index as usize);
+        }
+    }
+    let layouts = descriptor.layouts();
+    for layout in state.layouts.iter().filter(|layout| layout.enabled) {
+        let target = unsafe { layouts.objectAtIndexedSubscript(layout.buffer_index as usize) };
+        unsafe {
+            target.setStride(layout.stride as usize);
+            target.setStepRate(layout.step_rate as usize);
+        }
+        target.setStepFunction(layout.step_function);
+    }
+    descriptor
+}
+
+fn metal_vertex_format(
+    mut attrib_type: VertexAttribType,
+    size: VertexAttribSize,
+) -> Option<MTLVertexFormat> {
+    if attrib_type == VertexAttribType::UScaled {
+        attrib_type = VertexAttribType::UInt;
+    } else if attrib_type == VertexAttribType::SScaled {
+        attrib_type = VertexAttribType::SInt;
+    }
+    let format = match (attrib_type, size) {
+        (VertexAttribType::UNorm, VertexAttribSize::R8 | VertexAttribSize::A8) => {
+            MTLVertexFormat::UCharNormalized
+        }
+        (VertexAttribType::UNorm, VertexAttribSize::R8G8 | VertexAttribSize::G8R8) => {
+            MTLVertexFormat::UChar2Normalized
+        }
+        (VertexAttribType::UNorm, VertexAttribSize::R8G8B8) => MTLVertexFormat::UChar3Normalized,
+        (VertexAttribType::UNorm, VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8) => {
+            MTLVertexFormat::UChar4Normalized
+        }
+        (VertexAttribType::UNorm, VertexAttribSize::R16) => MTLVertexFormat::UShortNormalized,
+        (VertexAttribType::UNorm, VertexAttribSize::R16G16) => MTLVertexFormat::UShort2Normalized,
+        (VertexAttribType::UNorm, VertexAttribSize::R16G16B16) => {
+            MTLVertexFormat::UShort3Normalized
+        }
+        (VertexAttribType::UNorm, VertexAttribSize::R16G16B16A16) => {
+            MTLVertexFormat::UShort4Normalized
+        }
+        (VertexAttribType::UNorm, VertexAttribSize::A2B10G10R10) => {
+            MTLVertexFormat::UInt1010102Normalized
+        }
+        (VertexAttribType::SNorm, VertexAttribSize::R8 | VertexAttribSize::A8) => {
+            MTLVertexFormat::CharNormalized
+        }
+        (VertexAttribType::SNorm, VertexAttribSize::R8G8 | VertexAttribSize::G8R8) => {
+            MTLVertexFormat::Char2Normalized
+        }
+        (VertexAttribType::SNorm, VertexAttribSize::R8G8B8) => MTLVertexFormat::Char3Normalized,
+        (VertexAttribType::SNorm, VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8) => {
+            MTLVertexFormat::Char4Normalized
+        }
+        (VertexAttribType::SNorm, VertexAttribSize::R16) => MTLVertexFormat::ShortNormalized,
+        (VertexAttribType::SNorm, VertexAttribSize::R16G16) => MTLVertexFormat::Short2Normalized,
+        (VertexAttribType::SNorm, VertexAttribSize::R16G16B16) => MTLVertexFormat::Short3Normalized,
+        (VertexAttribType::SNorm, VertexAttribSize::R16G16B16A16) => {
+            MTLVertexFormat::Short4Normalized
+        }
+        (VertexAttribType::SNorm, VertexAttribSize::A2B10G10R10) => {
+            MTLVertexFormat::Int1010102Normalized
+        }
+        (VertexAttribType::UInt, VertexAttribSize::R8 | VertexAttribSize::A8) => {
+            MTLVertexFormat::UChar
+        }
+        (VertexAttribType::UInt, VertexAttribSize::R8G8 | VertexAttribSize::G8R8) => {
+            MTLVertexFormat::UChar2
+        }
+        (VertexAttribType::UInt, VertexAttribSize::R8G8B8) => MTLVertexFormat::UChar3,
+        (VertexAttribType::UInt, VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8) => {
+            MTLVertexFormat::UChar4
+        }
+        (VertexAttribType::UInt, VertexAttribSize::R16) => MTLVertexFormat::UShort,
+        (VertexAttribType::UInt, VertexAttribSize::R16G16) => MTLVertexFormat::UShort2,
+        (VertexAttribType::UInt, VertexAttribSize::R16G16B16) => MTLVertexFormat::UShort3,
+        (VertexAttribType::UInt, VertexAttribSize::R16G16B16A16) => MTLVertexFormat::UShort4,
+        (VertexAttribType::UInt, VertexAttribSize::R32) => MTLVertexFormat::UInt,
+        (VertexAttribType::UInt, VertexAttribSize::R32G32) => MTLVertexFormat::UInt2,
+        (VertexAttribType::UInt, VertexAttribSize::R32G32B32) => MTLVertexFormat::UInt3,
+        (VertexAttribType::UInt, VertexAttribSize::R32G32B32A32) => MTLVertexFormat::UInt4,
+        (VertexAttribType::SInt, VertexAttribSize::R8 | VertexAttribSize::A8) => {
+            MTLVertexFormat::Char
+        }
+        (VertexAttribType::SInt, VertexAttribSize::R8G8 | VertexAttribSize::G8R8) => {
+            MTLVertexFormat::Char2
+        }
+        (VertexAttribType::SInt, VertexAttribSize::R8G8B8) => MTLVertexFormat::Char3,
+        (VertexAttribType::SInt, VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8) => {
+            MTLVertexFormat::Char4
+        }
+        (VertexAttribType::SInt, VertexAttribSize::R16) => MTLVertexFormat::Short,
+        (VertexAttribType::SInt, VertexAttribSize::R16G16) => MTLVertexFormat::Short2,
+        (VertexAttribType::SInt, VertexAttribSize::R16G16B16) => MTLVertexFormat::Short3,
+        (VertexAttribType::SInt, VertexAttribSize::R16G16B16A16) => MTLVertexFormat::Short4,
+        (VertexAttribType::SInt, VertexAttribSize::R32) => MTLVertexFormat::Int,
+        (VertexAttribType::SInt, VertexAttribSize::R32G32) => MTLVertexFormat::Int2,
+        (VertexAttribType::SInt, VertexAttribSize::R32G32B32) => MTLVertexFormat::Int3,
+        (VertexAttribType::SInt, VertexAttribSize::R32G32B32A32) => MTLVertexFormat::Int4,
+        (VertexAttribType::Float, VertexAttribSize::R16) => MTLVertexFormat::Half,
+        (VertexAttribType::Float, VertexAttribSize::R16G16) => MTLVertexFormat::Half2,
+        (VertexAttribType::Float, VertexAttribSize::R16G16B16) => MTLVertexFormat::Half3,
+        (VertexAttribType::Float, VertexAttribSize::R16G16B16A16) => MTLVertexFormat::Half4,
+        (VertexAttribType::Float, VertexAttribSize::R32) => MTLVertexFormat::Float,
+        (VertexAttribType::Float, VertexAttribSize::R32G32) => MTLVertexFormat::Float2,
+        (VertexAttribType::Float, VertexAttribSize::R32G32B32) => MTLVertexFormat::Float3,
+        (VertexAttribType::Float, VertexAttribSize::R32G32B32A32) => MTLVertexFormat::Float4,
+        (VertexAttribType::Float, VertexAttribSize::B10G11R11) => MTLVertexFormat::FloatRG11B10,
+        _ => return None,
+    };
+    Some(format)
+}
+
 #[cfg(test)]
 mod tests {
     use shader_recompiler::backend::emit_spirv;
@@ -516,6 +789,119 @@ mod tests {
         assert_eq!(cache.host_info().max_descriptor_set_sampled_images, 128);
         assert_eq!(cache.host_info().max_descriptor_set_uniform_buffers, 31);
         assert_eq!(cache.host_info().min_ssbo_alignment, 4);
+    }
+
+    fn enable_vertex_attribute(
+        state: &mut FixedPipelineState,
+        info: &mut ShaderInfo,
+        attribute: usize,
+        source_buffer: u32,
+        offset: u32,
+        attrib_type: VertexAttribType,
+        size: VertexAttribSize,
+    ) {
+        let target = &mut state.attributes[attribute];
+        target.set_enabled(true);
+        target.set_buffer(source_buffer);
+        target.set_offset(offset);
+        target.set_type(attrib_type.to_raw());
+        target.set_size(size.to_raw());
+        info.loads.set(
+            shader_recompiler::ir::value::Attribute::generic(attribute as u32, 0).0 as usize,
+            true,
+        );
+    }
+
+    #[test]
+    fn vertex_input_compacts_used_streams_after_shader_buffers() {
+        let mut state = FixedPipelineState::default();
+        let mut info = ShaderInfo::default();
+        state.vertex_strides[7] = 24;
+        state.binding_divisors[7] = 3;
+        enable_vertex_attribute(
+            &mut state,
+            &mut info,
+            3,
+            7,
+            8,
+            VertexAttribType::Float,
+            VertexAttribSize::R32G32,
+        );
+
+        let vertex = MetalVertexInputState::from_fixed_state(&state, &info, 4, 31).unwrap();
+
+        assert_eq!(vertex.attributes[3].format, MTLVertexFormat::Float2);
+        assert_eq!(vertex.attributes[3].offset, 8);
+        assert_eq!(vertex.attributes[3].buffer_index, 4);
+        assert_eq!(vertex.layouts[7].buffer_index, 4);
+        assert_eq!(vertex.layouts[7].stride, 24);
+        assert_eq!(
+            vertex.layouts[7].step_function,
+            MTLVertexStepFunction::PerInstance
+        );
+        assert_eq!(vertex.layouts[7].step_rate, 3);
+    }
+
+    #[test]
+    fn vertex_input_reuses_one_metal_slot_for_shared_source_stream() {
+        let mut state = FixedPipelineState::default();
+        let mut info = ShaderInfo::default();
+        enable_vertex_attribute(
+            &mut state,
+            &mut info,
+            1,
+            5,
+            0,
+            VertexAttribType::UNorm,
+            VertexAttribSize::R8G8B8A8,
+        );
+        enable_vertex_attribute(
+            &mut state,
+            &mut info,
+            9,
+            5,
+            4,
+            VertexAttribType::Float,
+            VertexAttribSize::R32,
+        );
+
+        let vertex = MetalVertexInputState::from_fixed_state(&state, &info, 6, 31).unwrap();
+
+        assert_eq!(vertex.attributes[1].buffer_index, 6);
+        assert_eq!(vertex.attributes[9].buffer_index, 6);
+        assert_eq!(
+            vertex
+                .layouts
+                .iter()
+                .filter(|layout| layout.enabled)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn vertex_input_rejects_shader_and_vertex_buffer_namespace_overflow() {
+        let mut state = FixedPipelineState::default();
+        let mut info = ShaderInfo::default();
+        enable_vertex_attribute(
+            &mut state,
+            &mut info,
+            0,
+            0,
+            0,
+            VertexAttribType::Float,
+            VertexAttribSize::R32,
+        );
+
+        let error = MetalVertexInputState::from_fixed_state(&state, &info, 31, 31)
+            .expect_err("vertex buffers must not overlap Metal's binding limit");
+        assert!(matches!(
+            error,
+            MetalPipelineError::VertexBufferBindingLimit {
+                requested: 32,
+                limit: 31
+            }
+        ));
     }
 
     fn compile_test_shader(cache: &MetalPipelineCache, program: &Program) -> MetalShaderModule {

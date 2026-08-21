@@ -1157,3 +1157,16 @@
 - Completed lifecycle: create/bind/release channel reaches every currently owned cache under the shared buffer/texture lock order, and binding installs the channel GPU-memory adapter used by common-buffer address resolution.
 - The type is intentionally not exposed through `RasterizerInterface` while required behavior is absent; this avoids converting missing draw/cache/query methods into callable stubs.
 - Resume condition: complete fixed-state and vertex-layout conversion in `metal_pipeline_cache.rs`, then implement descriptor/resource preparation and render-command encoding in this owner before wiring the renderer frontend.
+
+## 2026-08-21 — Native Metal vertex-input pipeline state
+
+- Completed prerequisite: `MetalPipelineCache` now converts only the Maxwell attributes actually
+  consumed by the compiled vertex shader, matching Eden's `stage_infos[0].loads.Generic(index)`
+  filter and `MaxwellToVK::VertexFormat` behavior.
+- Metal vertex streams are compacted after the native shader's buffer resources because Metal uses
+  one vertex-stage buffer namespace for both. The source-to-native map is part of the render
+  pipeline key and is covered by focused limit, divisor, and shared-stream tests.
+- Interrupted slice remains native draw encoding in `MetalRasterizer`.
+- Exact next prerequisite: finish the render-pipeline key from the active framebuffer and Maxwell
+  fixed state, then bind common-buffer vertex/index/resource state using the retained Metal slot
+  maps before issuing a draw on the rasterizer-owned scheduler.

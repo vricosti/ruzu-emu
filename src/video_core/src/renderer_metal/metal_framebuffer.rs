@@ -5,7 +5,9 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction, MTLTexture};
+use objc2_metal::{
+    MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor, MTLStoreAction, MTLTexture,
+};
 use thiserror::Error;
 
 use crate::surface::{get_format_type, SurfaceType};
@@ -90,7 +92,10 @@ impl MetalFramebuffer {
                     has_depth = true;
                     has_stencil = true;
                     depth_attachment = view.retained_depth_view();
-                    stencil_attachment = view.retained_stencil_view();
+                    // Metal requires both attachments to use the combined
+                    // depth/stencil format while rendering. The stencil-only
+                    // aspect view is reserved for sampling.
+                    stencil_attachment = Some(view.retained_render_target());
                 }
                 _ => {}
             }
@@ -162,6 +167,26 @@ impl MetalFramebuffer {
 
     pub fn num_color_buffers(&self) -> u32 {
         self.num_color_buffers
+    }
+
+    pub fn color_formats(&self) -> [MTLPixelFormat; NUM_RT] {
+        std::array::from_fn(|index| {
+            self.color_attachments[index]
+                .as_ref()
+                .map_or(MTLPixelFormat::Invalid, |texture| texture.pixelFormat())
+        })
+    }
+
+    pub fn depth_format(&self) -> MTLPixelFormat {
+        self.depth_attachment
+            .as_ref()
+            .map_or(MTLPixelFormat::Invalid, |texture| texture.pixelFormat())
+    }
+
+    pub fn stencil_format(&self) -> MTLPixelFormat {
+        self.stencil_attachment
+            .as_ref()
+            .map_or(MTLPixelFormat::Invalid, |texture| texture.pixelFormat())
     }
 
     pub fn has_depth(&self) -> bool {
@@ -237,5 +262,65 @@ mod tests {
         let descriptor = framebuffer.render_pass_descriptor();
         let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(2) };
         assert!(attachment.texture().is_some());
+    }
+
+    #[test]
+    fn combined_depth_stencil_uses_one_render_attachment_format() {
+        let device = MetalDevice::new().unwrap();
+        let info = ImageInfo {
+            format: PixelFormat::D32FloatS8Uint,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image = MetalImage::new(&device, &info).unwrap();
+        let view_info =
+            ImageViewInfo::for_render_target(ImageViewType::E2D, info.format, Default::default());
+        let mut base = Box::new(ImageViewBase::new(
+            &view_info,
+            &info,
+            SlotId { index: 2 },
+            0x2000,
+        ));
+        let view = MetalImageView::new(NonNull::from(base.as_mut()), &image).unwrap();
+        let framebuffer = MetalFramebuffer::new(
+            [None; NUM_RT],
+            Some(&view),
+            &RenderTargets {
+                size: Extent2D {
+                    width: 64,
+                    height: 64,
+                },
+                ..RenderTargets::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            framebuffer.depth_format(),
+            MTLPixelFormat::Depth32Float_Stencil8
+        );
+        assert_eq!(framebuffer.stencil_format(), framebuffer.depth_format());
+        let descriptor = framebuffer.render_pass_descriptor();
+        assert_eq!(
+            descriptor
+                .depthAttachment()
+                .texture()
+                .unwrap()
+                .pixelFormat(),
+            descriptor
+                .stencilAttachment()
+                .texture()
+                .unwrap()
+                .pixelFormat()
+        );
     }
 }

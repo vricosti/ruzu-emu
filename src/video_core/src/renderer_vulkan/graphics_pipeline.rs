@@ -1796,7 +1796,7 @@ impl GraphicsPipeline {
     }
 }
 
-fn buffer_cache_metadata(
+pub(crate) fn buffer_cache_metadata(
     stage_infos: &[ShaderInfo; 5],
 ) -> ([u32; NUM_STAGES as usize], UniformBufferSizes) {
     let mut masks = [0u32; NUM_STAGES as usize];
@@ -1809,7 +1809,7 @@ fn buffer_cache_metadata(
     (masks, sizes)
 }
 
-fn stage_infos_from_compiled(
+pub(crate) fn stage_infos_from_compiled(
     compiled_stages: &[Option<CompiledShader>; NUM_VK_GRAPHICS_STAGES],
 ) -> [ShaderInfo; NUM_VK_GRAPHICS_STAGES] {
     std::array::from_fn(|index| {

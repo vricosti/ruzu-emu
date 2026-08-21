@@ -1170,3 +1170,18 @@
 - Exact next prerequisite: finish the render-pipeline key from the active framebuffer and Maxwell
   fixed state, then bind common-buffer vertex/index/resource state using the retained Metal slot
   maps before issuing a draw on the rasterizer-owned scheduler.
+
+## 2026-08-21 — Native Metal render and depth/stencil pipeline state
+
+- Completed prerequisite: `MetalRenderPipelineKey` now owns framebuffer formats/sample count,
+  Maxwell blend/write-mask state, topology class, multisample alpha controls, rasterization enable,
+  and the compiled vertex-input descriptor.
+- Completed prerequisite: `MetalPipelineCache` now caches native `MTLDepthStencilState` objects with
+  exact Maxwell comparison/stencil operations and front/back read/write masks. Combined
+  depth/stencil framebuffers use one Metal render-attachment format for both aspects.
+- Validation: all 11 focused Metal pipeline-cache tests pass, including native render/compute
+  pipeline creation and the new depth/stencil regressions.
+- Interrupted slice remains native draw encoding in `MetalRasterizer`.
+- Exact next prerequisite: consume `MetalShaderBindingLayout`, common buffer bindings, common texture
+  cache image/sampler slots, the render/depth pipeline states, and the vertex-stream remap in Eden's
+  `ConfigureImpl` ordering before recording indexed/non-indexed draws on `MetalScheduler`.

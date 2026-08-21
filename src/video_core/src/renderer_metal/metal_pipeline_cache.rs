@@ -13,9 +13,11 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLComputePipelineState, MTLDevice as _,
+    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCompareFunction,
+    MTLComputePipelineState, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice as _,
     MTLPixelFormat, MTLPrimitiveTopologyClass, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
-    MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
+    MTLStencilDescriptor, MTLStencilOperation, MTLVertexDescriptor, MTLVertexFormat,
+    MTLVertexStepFunction,
 };
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::profile::Profile;
@@ -23,14 +25,21 @@ use shader_recompiler::shader_info::Info as ShaderInfo;
 use spirv_cross2::spirv::ExecutionModel;
 use thiserror::Error;
 
+use crate::buffer_cache::buffer_cache_base::{UniformBufferSizes, NUM_STAGES};
 use crate::engines::draw_manager::Maxwell3DDrawView;
-use crate::engines::maxwell_3d::{VertexAttribSize, VertexAttribType};
+use crate::engines::maxwell_3d::{
+    BlendEquation, BlendFactor, ComparisonOp, DepthStencilInfo, PrimitiveTopology, StencilOp,
+    VertexAttribSize, VertexAttribType,
+};
 use crate::renderer_vulkan::fixed_pipeline_state::DynamicFeatures;
 use crate::renderer_vulkan::fixed_pipeline_state::FixedPipelineState;
-use crate::renderer_vulkan::graphics_pipeline::{GraphicsPipelineCache, GraphicsPipelineKey};
+use crate::renderer_vulkan::graphics_pipeline::{
+    buffer_cache_metadata, stage_infos_from_compiled, GraphicsPipelineCache, GraphicsPipelineKey,
+};
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
+use super::metal_framebuffer::MetalFramebuffer;
 use super::metal_shader::{
     compile_native_shader, MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
 };
@@ -328,6 +337,79 @@ pub struct MetalRenderPipeline {
     state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalStencilFaceState {
+    pub compare: MTLCompareFunction,
+    pub stencil_fail: MTLStencilOperation,
+    pub depth_fail: MTLStencilOperation,
+    pub depth_stencil_pass: MTLStencilOperation,
+    pub read_mask: u32,
+    pub write_mask: u32,
+}
+
+impl Default for MetalStencilFaceState {
+    fn default() -> Self {
+        Self {
+            compare: MTLCompareFunction::Always,
+            stencil_fail: MTLStencilOperation::Keep,
+            depth_fail: MTLStencilOperation::Keep,
+            depth_stencil_pass: MTLStencilOperation::Keep,
+            read_mask: u32::MAX,
+            write_mask: u32::MAX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalDepthStencilKey {
+    pub depth_compare: MTLCompareFunction,
+    pub depth_write_enabled: bool,
+    pub stencil_enabled: bool,
+    pub front: MetalStencilFaceState,
+    pub back: MetalStencilFaceState,
+}
+
+impl MetalDepthStencilKey {
+    fn from_fixed_state(fixed: &FixedPipelineState, live: &DepthStencilInfo) -> Self {
+        let dynamic = &fixed.dynamic_state;
+        let depth_test_enabled = dynamic.depth_test_enable();
+        let front = dynamic.front_stencil();
+        let back = dynamic.back_stencil();
+        let back_live = if live.stencil_two_side {
+            live.back
+        } else {
+            live.front
+        };
+        Self {
+            // Metal has no separate depth-test enable. `Always` plus disabled
+            // writes is the exact disabled-test behavior.
+            depth_compare: if depth_test_enabled {
+                metal_comparison(dynamic.depth_test_func())
+            } else {
+                MTLCompareFunction::Always
+            },
+            depth_write_enabled: depth_test_enabled && dynamic.depth_write_enable(),
+            stencil_enabled: dynamic.stencil_enable(),
+            front: MetalStencilFaceState {
+                compare: metal_comparison(front.test_func(dynamic.raw2)),
+                stencil_fail: metal_stencil_operation(front.action_stencil_fail(dynamic.raw2)),
+                depth_fail: metal_stencil_operation(front.action_depth_fail(dynamic.raw2)),
+                depth_stencil_pass: metal_stencil_operation(front.action_depth_pass(dynamic.raw2)),
+                read_mask: live.front.func_mask,
+                write_mask: live.front.write_mask,
+            },
+            back: MetalStencilFaceState {
+                compare: metal_comparison(back.test_func(dynamic.raw2)),
+                stencil_fail: metal_stencil_operation(back.action_stencil_fail(dynamic.raw2)),
+                depth_fail: metal_stencil_operation(back.action_depth_fail(dynamic.raw2)),
+                depth_stencil_pass: metal_stencil_operation(back.action_depth_pass(dynamic.raw2)),
+                read_mask: back_live.func_mask,
+                write_mask: back_live.write_mask,
+            },
+        }
+    }
+}
+
 impl MetalRenderPipeline {
     pub fn key(&self) -> &MetalRenderPipelineKey {
         &self.key
@@ -347,8 +429,10 @@ pub struct MetalComputePipeline {
 pub struct MetalGraphicsShaderStages {
     key: GraphicsPipelineKey,
     vertex: Arc<MetalShaderModule>,
-    vertex_info: ShaderInfo,
     fragment: Option<Arc<MetalShaderModule>>,
+    stage_infos: Arc<[ShaderInfo; 5]>,
+    enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
+    uniform_buffer_sizes: UniformBufferSizes,
 }
 
 impl MetalGraphicsShaderStages {
@@ -366,6 +450,18 @@ impl MetalGraphicsShaderStages {
 
     pub fn fragment(&self) -> Option<&MetalShaderModule> {
         self.fragment.as_deref()
+    }
+
+    pub fn stage_infos(&self) -> &[ShaderInfo; 5] {
+        &self.stage_infos
+    }
+
+    pub fn enabled_uniform_buffer_masks(&self) -> &[u32; NUM_STAGES as usize] {
+        &self.enabled_uniform_buffer_masks
+    }
+
+    pub fn uniform_buffer_sizes(&self) -> &UniformBufferSizes {
+        &self.uniform_buffer_sizes
     }
 }
 
@@ -392,6 +488,8 @@ pub enum MetalPipelineError {
     RenderPipeline(String),
     #[error("Metal failed to create compute pipeline: {0}")]
     ComputePipeline(String),
+    #[error("Metal failed to create a depth/stencil state")]
+    DepthStencilState,
     #[error("graphics shader translation did not produce a vertex stage")]
     MissingVertexStage,
     #[error("native Metal pipeline lowering for {0} is not implemented")]
@@ -412,6 +510,8 @@ pub struct MetalPipelineCache {
     profile: Profile,
     host_info: HostTranslateInfo,
     render_pipelines: HashMap<MetalRenderPipelineKey, MetalRenderPipeline>,
+    depth_stencil_states:
+        HashMap<MetalDepthStencilKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     compute_pipelines: HashMap<u64, MetalComputePipeline>,
     graphics_shader_modules: HashMap<GraphicsPipelineKey, MetalGraphicsShaderStages>,
     graphics_key: GraphicsPipelineKey,
@@ -427,6 +527,7 @@ impl MetalPipelineCache {
             profile,
             host_info,
             render_pipelines: HashMap::new(),
+            depth_stencil_states: HashMap::new(),
             compute_pipelines: HashMap::new(),
             graphics_shader_modules: HashMap::new(),
             graphics_key: GraphicsPipelineKey::default(),
@@ -487,10 +588,12 @@ impl MetalPipelineCache {
             if compiled[3].is_some() {
                 return Err(MetalPipelineError::UnsupportedGraphicsStage("geometry"));
             }
+            let stage_infos = stage_infos_from_compiled(&compiled);
+            let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
+                buffer_cache_metadata(&stage_infos);
             let vertex = compiled[0]
                 .as_ref()
                 .ok_or(MetalPipelineError::MissingVertexStage)?;
-            let vertex_info = vertex.info.clone();
             let vertex = Arc::new(compile_native_shader(
                 self.device.device(),
                 self.device.profile(),
@@ -514,8 +617,10 @@ impl MetalPipelineCache {
                 MetalGraphicsShaderStages {
                     key: key.clone(),
                     vertex,
-                    vertex_info,
                     fragment,
+                    stage_infos: Arc::new(stage_infos),
+                    enabled_uniform_buffer_masks,
+                    uniform_buffer_sizes,
                 },
             );
         }
@@ -601,10 +706,69 @@ impl MetalPipelineCache {
     ) -> Result<MetalVertexInputState, MetalPipelineError> {
         MetalVertexInputState::from_fixed_state(
             &stages.key.fixed_state,
-            &stages.vertex_info,
+            &stages.stage_infos[0],
             stages.vertex.bindings().buffer_count,
             self.device.profile().max_buffer_bindings_per_stage,
         )
+    }
+
+    pub fn make_render_pipeline_key(
+        &self,
+        stages: &MetalGraphicsShaderStages,
+        framebuffer: &MetalFramebuffer,
+    ) -> Result<MetalRenderPipelineKey, MetalPipelineError> {
+        let fixed = &stages.key.fixed_state;
+        let mut key =
+            MetalRenderPipelineKey::new(stages.key.unique_hashes[1], stages.key.unique_hashes[5]);
+        key.shader_variant_hash = stages.variant_hash();
+        key.vertex_input = self.make_vertex_input_state(stages)?;
+        let color_formats = framebuffer.color_formats();
+        key.color_attachments = std::array::from_fn(|index| {
+            metal_color_attachment(fixed.attachments[index], color_formats[index])
+        });
+        key.depth_format = framebuffer.depth_format();
+        key.stencil_format = framebuffer.stencil_format();
+        key.sample_count = framebuffer.samples();
+        key.topology = metal_topology_class(fixed.topology());
+        key.alpha_to_coverage = fixed.alpha_to_coverage_enabled();
+        key.alpha_to_one = fixed.alpha_to_one_enabled();
+        key.rasterization_enabled = fixed.dynamic_state.rasterize_enable();
+        Ok(key)
+    }
+
+    pub fn make_depth_stencil_key(
+        &self,
+        stages: &MetalGraphicsShaderStages,
+        live: &DepthStencilInfo,
+    ) -> MetalDepthStencilKey {
+        MetalDepthStencilKey::from_fixed_state(&stages.key.fixed_state, live)
+    }
+
+    pub fn get_or_create_depth_stencil_state(
+        &mut self,
+        key: MetalDepthStencilKey,
+    ) -> Result<&ProtocolObject<dyn MTLDepthStencilState>, MetalPipelineError> {
+        if !self.depth_stencil_states.contains_key(&key) {
+            let descriptor = MTLDepthStencilDescriptor::new();
+            descriptor.setDepthCompareFunction(key.depth_compare);
+            descriptor.setDepthWriteEnabled(key.depth_write_enabled);
+            if key.stencil_enabled {
+                let front = make_stencil_descriptor(key.front);
+                let back = make_stencil_descriptor(key.back);
+                descriptor.setFrontFaceStencil(Some(&front));
+                descriptor.setBackFaceStencil(Some(&back));
+            }
+            let state = self
+                .device
+                .device()
+                .newDepthStencilStateWithDescriptor(&descriptor)
+                .ok_or(MetalPipelineError::DepthStencilState)?;
+            self.depth_stencil_states.insert(key, state);
+        }
+        Ok(self
+            .depth_stencil_states
+            .get(&key)
+            .expect("depth/stencil state inserted above"))
     }
 
     pub fn get_or_create_compute_pipeline(
@@ -636,6 +800,43 @@ impl MetalPipelineCache {
     }
 }
 
+fn make_stencil_descriptor(state: MetalStencilFaceState) -> Retained<MTLStencilDescriptor> {
+    let descriptor = MTLStencilDescriptor::new();
+    descriptor.setStencilCompareFunction(state.compare);
+    descriptor.setStencilFailureOperation(state.stencil_fail);
+    descriptor.setDepthFailureOperation(state.depth_fail);
+    descriptor.setDepthStencilPassOperation(state.depth_stencil_pass);
+    descriptor.setReadMask(state.read_mask);
+    descriptor.setWriteMask(state.write_mask);
+    descriptor
+}
+
+fn metal_comparison(comparison: ComparisonOp) -> MTLCompareFunction {
+    match comparison {
+        ComparisonOp::Never => MTLCompareFunction::Never,
+        ComparisonOp::Less => MTLCompareFunction::Less,
+        ComparisonOp::Equal => MTLCompareFunction::Equal,
+        ComparisonOp::LessEqual => MTLCompareFunction::LessEqual,
+        ComparisonOp::Greater => MTLCompareFunction::Greater,
+        ComparisonOp::NotEqual => MTLCompareFunction::NotEqual,
+        ComparisonOp::GreaterEqual => MTLCompareFunction::GreaterEqual,
+        ComparisonOp::Always => MTLCompareFunction::Always,
+    }
+}
+
+fn metal_stencil_operation(operation: StencilOp) -> MTLStencilOperation {
+    match operation {
+        StencilOp::Keep => MTLStencilOperation::Keep,
+        StencilOp::Zero => MTLStencilOperation::Zero,
+        StencilOp::Replace => MTLStencilOperation::Replace,
+        StencilOp::IncrSat => MTLStencilOperation::IncrementClamp,
+        StencilOp::DecrSat => MTLStencilOperation::DecrementClamp,
+        StencilOp::Invert => MTLStencilOperation::Invert,
+        StencilOp::Incr => MTLStencilOperation::IncrementWrap,
+        StencilOp::Decr => MTLStencilOperation::DecrementWrap,
+    }
+}
+
 fn make_vertex_descriptor(state: &MetalVertexInputState) -> Retained<MTLVertexDescriptor> {
     let descriptor = MTLVertexDescriptor::vertexDescriptor();
     let attributes = descriptor.attributes();
@@ -660,6 +861,82 @@ fn make_vertex_descriptor(state: &MetalVertexInputState) -> Retained<MTLVertexDe
         target.setStepFunction(layout.step_function);
     }
     descriptor
+}
+
+fn metal_color_attachment(
+    attachment: crate::renderer_vulkan::fixed_pipeline_state::BlendingAttachment,
+    format: MTLPixelFormat,
+) -> MetalColorAttachmentState {
+    let [red, green, blue, alpha] = attachment.mask();
+    let mut write_mask = MTLColorWriteMask::None;
+    write_mask.set(MTLColorWriteMask::Red, red);
+    write_mask.set(MTLColorWriteMask::Green, green);
+    write_mask.set(MTLColorWriteMask::Blue, blue);
+    write_mask.set(MTLColorWriteMask::Alpha, alpha);
+    MetalColorAttachmentState {
+        format,
+        blending_enabled: attachment.is_enabled(),
+        source_rgb: metal_blend_factor(attachment.source_rgb_factor()),
+        destination_rgb: metal_blend_factor(attachment.dest_rgb_factor()),
+        rgb_operation: metal_blend_operation(attachment.equation_rgb()),
+        source_alpha: metal_blend_factor(attachment.source_alpha_factor()),
+        destination_alpha: metal_blend_factor(attachment.dest_alpha_factor()),
+        alpha_operation: metal_blend_operation(attachment.equation_alpha()),
+        write_mask,
+    }
+}
+
+fn metal_blend_operation(equation: BlendEquation) -> MTLBlendOperation {
+    match equation {
+        BlendEquation::Add => MTLBlendOperation::Add,
+        BlendEquation::Subtract => MTLBlendOperation::Subtract,
+        BlendEquation::ReverseSubtract => MTLBlendOperation::ReverseSubtract,
+        BlendEquation::Min => MTLBlendOperation::Min,
+        BlendEquation::Max => MTLBlendOperation::Max,
+    }
+}
+
+fn metal_blend_factor(factor: BlendFactor) -> MTLBlendFactor {
+    match factor {
+        BlendFactor::Zero => MTLBlendFactor::Zero,
+        BlendFactor::One => MTLBlendFactor::One,
+        BlendFactor::SrcColor => MTLBlendFactor::SourceColor,
+        BlendFactor::OneMinusSrcColor => MTLBlendFactor::OneMinusSourceColor,
+        BlendFactor::SrcAlpha => MTLBlendFactor::SourceAlpha,
+        BlendFactor::OneMinusSrcAlpha => MTLBlendFactor::OneMinusSourceAlpha,
+        BlendFactor::DstAlpha => MTLBlendFactor::DestinationAlpha,
+        BlendFactor::OneMinusDstAlpha => MTLBlendFactor::OneMinusDestinationAlpha,
+        BlendFactor::DstColor => MTLBlendFactor::DestinationColor,
+        BlendFactor::OneMinusDstColor => MTLBlendFactor::OneMinusDestinationColor,
+        BlendFactor::SrcAlphaSaturate => MTLBlendFactor::SourceAlphaSaturated,
+        BlendFactor::Src1Color => MTLBlendFactor::Source1Color,
+        BlendFactor::OneMinusSrc1Color => MTLBlendFactor::OneMinusSource1Color,
+        BlendFactor::Src1Alpha => MTLBlendFactor::Source1Alpha,
+        BlendFactor::OneMinusSrc1Alpha => MTLBlendFactor::OneMinusSource1Alpha,
+        BlendFactor::ConstantColor => MTLBlendFactor::BlendColor,
+        BlendFactor::OneMinusConstantColor => MTLBlendFactor::OneMinusBlendColor,
+        BlendFactor::ConstantAlpha => MTLBlendFactor::BlendAlpha,
+        BlendFactor::OneMinusConstantAlpha => MTLBlendFactor::OneMinusBlendAlpha,
+    }
+}
+
+fn metal_topology_class(topology: PrimitiveTopology) -> MTLPrimitiveTopologyClass {
+    match topology {
+        PrimitiveTopology::Points | PrimitiveTopology::Patches => MTLPrimitiveTopologyClass::Point,
+        PrimitiveTopology::Lines
+        | PrimitiveTopology::LineLoop
+        | PrimitiveTopology::LineStrip
+        | PrimitiveTopology::LinesAdjacency
+        | PrimitiveTopology::LineStripAdjacency => MTLPrimitiveTopologyClass::Line,
+        PrimitiveTopology::Triangles
+        | PrimitiveTopology::TriangleStrip
+        | PrimitiveTopology::TriangleFan
+        | PrimitiveTopology::Quads
+        | PrimitiveTopology::QuadStrip
+        | PrimitiveTopology::Polygon
+        | PrimitiveTopology::TrianglesAdjacency
+        | PrimitiveTopology::TriangleStripAdjacency => MTLPrimitiveTopologyClass::Triangle,
+    }
 }
 
 fn metal_vertex_format(
@@ -902,6 +1179,121 @@ mod tests {
                 limit: 31
             }
         ));
+    }
+
+    #[test]
+    fn color_attachment_preserves_maxwell_blend_and_write_mask() {
+        let mut attachment =
+            crate::renderer_vulkan::fixed_pipeline_state::BlendingAttachment::default();
+        attachment.set_mask(true, false, true, false);
+        attachment.set_enabled(true);
+        attachment.set_equation_rgb(BlendEquation::ReverseSubtract);
+        attachment.set_equation_alpha(BlendEquation::Max);
+        attachment.set_source_rgb_factor(BlendFactor::SrcAlpha);
+        attachment.set_dest_rgb_factor(BlendFactor::OneMinusSrcAlpha);
+        attachment.set_source_alpha_factor(BlendFactor::ConstantAlpha);
+        attachment.set_dest_alpha_factor(BlendFactor::OneMinusConstantAlpha);
+
+        let metal = metal_color_attachment(attachment, MTLPixelFormat::RGBA8Unorm);
+
+        assert_eq!(metal.format, MTLPixelFormat::RGBA8Unorm);
+        assert!(metal.blending_enabled);
+        assert_eq!(metal.rgb_operation, MTLBlendOperation::ReverseSubtract);
+        assert_eq!(metal.alpha_operation, MTLBlendOperation::Max);
+        assert_eq!(metal.source_rgb, MTLBlendFactor::SourceAlpha);
+        assert_eq!(metal.destination_rgb, MTLBlendFactor::OneMinusSourceAlpha);
+        assert_eq!(metal.source_alpha, MTLBlendFactor::BlendAlpha);
+        assert_eq!(metal.destination_alpha, MTLBlendFactor::OneMinusBlendAlpha);
+        assert_eq!(
+            metal.write_mask,
+            MTLColorWriteMask::Red | MTLColorWriteMask::Blue
+        );
+    }
+
+    #[test]
+    fn depth_stencil_key_preserves_masks_and_two_sided_operations() {
+        let mut fixed = FixedPipelineState::default();
+        fixed.dynamic_state.set_depth_test_enable(true);
+        fixed.dynamic_state.set_depth_write_enable(true);
+        fixed
+            .dynamic_state
+            .set_depth_test_func(ComparisonOp::GreaterEqual);
+        fixed.dynamic_state.set_stencil_enable(true);
+        fixed.dynamic_state.set_stencil_face(
+            0,
+            StencilOp::Replace,
+            StencilOp::IncrSat,
+            StencilOp::Decr,
+            ComparisonOp::Less,
+        );
+        fixed.dynamic_state.set_stencil_face(
+            12,
+            StencilOp::Zero,
+            StencilOp::Invert,
+            StencilOp::Incr,
+            ComparisonOp::NotEqual,
+        );
+        let mut live = DepthStencilInfo::default();
+        live.stencil_two_side = true;
+        live.front.func_mask = 0x12;
+        live.front.write_mask = 0x34;
+        live.back.func_mask = 0x56;
+        live.back.write_mask = 0x78;
+
+        let key = MetalDepthStencilKey::from_fixed_state(&fixed, &live);
+
+        assert_eq!(key.depth_compare, MTLCompareFunction::GreaterEqual);
+        assert!(key.depth_write_enabled);
+        assert!(key.stencil_enabled);
+        assert_eq!(key.front.compare, MTLCompareFunction::Less);
+        assert_eq!(key.front.stencil_fail, MTLStencilOperation::Replace);
+        assert_eq!(key.front.depth_fail, MTLStencilOperation::IncrementClamp);
+        assert_eq!(
+            key.front.depth_stencil_pass,
+            MTLStencilOperation::DecrementWrap
+        );
+        assert_eq!((key.front.read_mask, key.front.write_mask), (0x12, 0x34));
+        assert_eq!(key.back.compare, MTLCompareFunction::NotEqual);
+        assert_eq!(key.back.stencil_fail, MTLStencilOperation::Zero);
+        assert_eq!(key.back.depth_fail, MTLStencilOperation::Invert);
+        assert_eq!(
+            key.back.depth_stencil_pass,
+            MTLStencilOperation::IncrementWrap
+        );
+        assert_eq!((key.back.read_mask, key.back.write_mask), (0x56, 0x78));
+    }
+
+    #[test]
+    fn disabled_depth_test_cannot_write_depth_on_metal() {
+        let mut fixed = FixedPipelineState::default();
+        fixed.dynamic_state.set_depth_test_enable(false);
+        fixed.dynamic_state.set_depth_write_enable(true);
+        fixed.dynamic_state.set_depth_test_func(ComparisonOp::Never);
+
+        let key = MetalDepthStencilKey::from_fixed_state(&fixed, &DepthStencilInfo::default());
+
+        assert_eq!(key.depth_compare, MTLCompareFunction::Always);
+        assert!(!key.depth_write_enabled);
+    }
+
+    #[test]
+    fn topology_class_matches_metal_pipeline_classes() {
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::Points),
+            MTLPrimitiveTopologyClass::Point
+        );
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::LineStrip),
+            MTLPrimitiveTopologyClass::Line
+        );
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::Quads),
+            MTLPrimitiveTopologyClass::Triangle
+        );
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::Patches),
+            MTLPrimitiveTopologyClass::Point
+        );
     }
 
     fn compile_test_shader(cache: &MetalPipelineCache, program: &Program) -> MetalShaderModule {

@@ -1134,3 +1134,12 @@
 - Added `renderer_metal/metal_buffer_cache.rs` as the Metal-owned counterpart of Eden `renderer_vulkan/vk_buffer_cache.{h,cpp}`.
 - Implemented common-cache buffer allocation, usage/tick tracking, staging allocation, ordered copy/clear operations, null bindings, vertex/index/uniform/storage/texel/transform-feedback binding state, `uint8` index expansion, and indexed/non-indexed quad emulation.
 - The next slice is the native rasterizer owner. It must consume this runtime state together with `MetalShaderBindingLayout`; it must not create a second CPU-address-keyed buffer store.
+
+## 2026-08-21 — Native Metal typed texture-cache integration
+
+- Completed prerequisite: `MetalTextureCacheParams` now binds native images, views, samplers, framebuffers, scheduler, and staging allocations to the shared `TextureCacheBase`. The backend no longer needs a parallel CPU-address-keyed render-target store.
+- Completed transfer slice: byte-compatible uploads/copies preserve common `ImageCopy` ordering, and full color MSAA-to-single-sample copies use a native Metal render-pass resolve. Focused native GPU tests cover copy and resolve readback.
+- Interrupted slice: construct `MetalRasterizer` and encode Maxwell draw/dispatch work.
+- Exact next prerequisite: the rasterizer-owned descriptor consumer must combine `MetalShaderBindingLayout`, `MetalCommonBufferCache` binding state, and `MetalTextureCache` `ImageViewId`/`SamplerId` payloads on one render or compute encoder. It must also own concrete null buffer/texture bindings and materialize buffer image views at the final cache offset.
+- Deferred prerequisites that do not block the initial native-resolution draw path: the Metal blit/compute helper for format conversion, scaling, reinterpretation, and partial/reverse-MSAA copies; sampler border-color emulation; async downloads and applet capture.
+- Resume condition: implement the resource-binding owner in `renderer_metal/metal_rasterizer.rs`, then port Eden rasterizer draw preparation/order without introducing an alternate image or buffer identity map.

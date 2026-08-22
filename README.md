@@ -81,7 +81,7 @@ a standalone Rust crate in its own right:
 | Crate | Ports | Upstream |
 |---|---|---|
 | [**rxbyak**](https://github.com/vricosti/rxbyak) | Xbyak, a C++ JIT assembler — x86-64 machine-code encoding, bit-identical to upstream | [herumi/xbyak](https://github.com/herumi/xbyak) |
-| [**rdynarmic**](https://github.com/vricosti/rdynarmic) | dynarmic, an ARM dynamic recompiler — AArch32 and AArch64 frontends, x86-64 and ARM64 backends, ~650 IR opcodes | [lioncash/dynarmic](https://github.com/lioncash/dynarmic) |
+| **rdynarmic**| dynarmic, an ARM dynamic recompiler — AArch32 and AArch64 frontends, x86-64 and ARM64 backends, ~650 IR opcodes | [lioncash/dynarmic](https://github.com/lioncash/dynarmic) |
 
 rdynarmic's ARM32 and ARM64 translation is validated by **differential fuzzing
 against the C++ dynarmic oracle**: the same instruction encodings are fed to

@@ -24,6 +24,7 @@ pub mod fsr;
 pub mod gpu;
 pub mod gpu_context;
 pub mod gpu_thread;
+pub mod graphics_shader_runtime;
 pub mod guest_memory;
 pub mod host1x;
 pub mod host_shaders;

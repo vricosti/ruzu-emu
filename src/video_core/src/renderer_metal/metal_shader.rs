@@ -25,9 +25,9 @@ use thiserror::Error;
 use shader_recompiler::backend::msl::MslError;
 use shader_recompiler::backend::msl::MslVersion;
 pub use shader_recompiler::backend::msl::{
-    MslBindingLayout as MetalShaderBindingLayout, MslResourceBinding as MetalResourceBinding,
-    MslResourceKind as MetalResourceKind, MslShaderArtifact as MetalShaderArtifact,
-    MslShaderSource as MetalShaderSource,
+    MslBindingLayout as MetalShaderBindingLayout, MslExecutionInfo as MetalExecutionInfo,
+    MslResourceBinding as MetalResourceBinding, MslResourceKind as MetalResourceKind,
+    MslShaderArtifact as MetalShaderArtifact, MslShaderSource as MetalShaderSource,
 };
 use shader_recompiler::ir::Program;
 use shader_recompiler::profile::Profile;
@@ -49,6 +49,7 @@ pub struct MetalShaderCompileOptions {
     pub enable_frag_depth_builtin: bool,
     pub enable_frag_stencil_ref_builtin: bool,
     pub enable_frag_output_mask: u32,
+    pub compute_workgroup_size: Option<[u32; 3]>,
 }
 
 impl Default for MetalShaderCompileOptions {
@@ -62,6 +63,7 @@ impl Default for MetalShaderCompileOptions {
             enable_frag_depth_builtin: true,
             enable_frag_stencil_ref_builtin: true,
             enable_frag_output_mask: u32::MAX,
+            compute_workgroup_size: None,
         }
     }
 }
@@ -71,6 +73,13 @@ impl MetalShaderCompileOptions {
         Self {
             language_version: profile.msl_language_version,
             ..Self::default()
+        }
+    }
+
+    pub fn for_compute_device(profile: &MetalDeviceProfile, workgroup_size: [u32; 3]) -> Self {
+        Self {
+            compute_workgroup_size: Some(workgroup_size),
+            ..Self::for_device(profile)
         }
     }
 }
@@ -122,6 +131,8 @@ pub enum DirectMslValidationError {
     StageMismatch { direct: Stage, active: Stage },
     #[error("direct MSL resource ABI differs from the active SPIR-V/MSL resource ABI")]
     BindingLayoutMismatch,
+    #[error("direct MSL execution metadata differs from the active SPIR-V/MSL metadata")]
+    ExecutionInfoMismatch,
 }
 
 /// Native shader objects retained for the lifetime of a Metal pipeline.
@@ -130,6 +141,7 @@ pub struct MetalShaderModule {
     source: MetalShaderSource,
     bindings: MetalShaderBindingLayout,
     language_version: MslVersion,
+    execution: MetalExecutionInfo,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     function: Retained<ProtocolObject<dyn MTLFunction>>,
 }
@@ -145,6 +157,10 @@ impl MetalShaderModule {
 
     pub fn language_version(&self) -> MslVersion {
         self.language_version
+    }
+
+    pub fn execution(&self) -> MetalExecutionInfo {
+        self.execution
     }
 
     pub fn library(&self) -> &ProtocolObject<dyn MTLLibrary> {
@@ -584,6 +600,9 @@ pub fn compile_native_shader(
             bindings,
             entry_point: "main0".to_owned(),
             language_version: options.language_version,
+            execution: MetalExecutionInfo {
+                workgroup_size: options.compute_workgroup_size,
+            },
         },
     )
 }
@@ -596,6 +615,7 @@ pub fn compile_native_msl_artifact(
     artifact: MetalShaderArtifact,
 ) -> Result<MetalShaderModule, MetalShaderError> {
     let language_version = artifact.language_version;
+    let execution = artifact.execution;
     let compile_options = MTLCompileOptions::new();
     compile_options.setLanguageVersion(metal_language_version(artifact.language_version)?);
     if objc2::available!(macos = 15.0, ..) {
@@ -618,6 +638,7 @@ pub fn compile_native_msl_artifact(
         source: artifact.source,
         bindings: artifact.bindings,
         language_version,
+        execution,
         library,
         function,
     })
@@ -678,6 +699,9 @@ pub fn validate_direct_msl_against_active_module(
     }
     if artifact.bindings != *active.bindings() {
         return Err(DirectMslValidationError::BindingLayoutMismatch);
+    }
+    if artifact.execution != active.execution() {
+        return Err(DirectMslValidationError::ExecutionInfoMismatch);
     }
     Ok(compile_native_msl_artifact(device, artifact)?)
 }
@@ -800,6 +824,29 @@ mod tests {
             .expect("direct MSL must compile as a native Metal function");
 
         assert_eq!(shader.source().stage, Stage::Fragment);
+        assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
+    fn compiles_direct_msl_compute_artifact_with_workgroup_metadata() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = empty_program(Stage::Compute);
+        program.workgroup_size = [8, 4, 2];
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+            },
+        )
+        .expect("minimal compute IR must lower directly to MSL");
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct compute MSL must compile as a native Metal function");
+
+        assert_eq!(shader.source().stage, Stage::Compute);
+        assert_eq!(shader.execution().workgroup_size, Some([8, 4, 2]));
         assert_eq!(shader.function().name().to_string(), "main0");
     }
 

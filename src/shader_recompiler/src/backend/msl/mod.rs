@@ -87,6 +87,11 @@ pub struct MslShaderSource {
     pub stage: Stage,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MslExecutionInfo {
+    pub workgroup_size: Option<[u32; 3]>,
+}
+
 /// MSL source plus the complete ABI required by its native entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MslShaderArtifact {
@@ -94,6 +99,7 @@ pub struct MslShaderArtifact {
     pub bindings: MslBindingLayout,
     pub entry_point: String,
     pub language_version: MslVersion,
+    pub execution: MslExecutionInfo,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

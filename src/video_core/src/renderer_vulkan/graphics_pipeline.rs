@@ -16,20 +16,17 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::buffer_cache::buffer_cache_base::{
-    BufferCacheRuntime, UniformBufferSizes, NUM_GRAPHICS_UNIFORM_BUFFERS, NUM_STAGES,
-};
+#[cfg(test)]
+use crate::buffer_cache::buffer_cache_base::NUM_GRAPHICS_UNIFORM_BUFFERS;
+use crate::buffer_cache::buffer_cache_base::{BufferCacheRuntime, UniformBufferSizes, NUM_STAGES};
 use crate::engines::draw_manager::Maxwell3DDrawView;
-use crate::engines::maxwell_3d::{
-    ComparisonOp, CullFace, PrimitiveTopology, VertexAttribSize, VertexAttribType,
-};
+use crate::engines::maxwell_3d::{CullFace, VertexAttribSize, VertexAttribType};
 use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
 use crate::shader_cache::{GraphicsEnvironments, NUM_PROGRAMS};
 use crate::shader_notify::ShaderNotifyHandle;
 use crate::surface::{
-    is_pixel_format_integer, is_pixel_format_signed_integer, pixel_format_from_depth_format,
-    pixel_format_from_render_target_format, PixelFormat,
+    pixel_format_from_depth_format, pixel_format_from_render_target_format, PixelFormat,
 };
 use crate::texture_cache::texture_cache_base::ImageViewInOut;
 use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
@@ -38,9 +35,6 @@ use crate::textures::texture::MsaaMode;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
 use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
-use shader_recompiler::runtime_info::{
-    AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
-};
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 use shader_recompiler::{CompiledShader, Profile, RuntimeInfo, ShaderStage};
 use smallvec::SmallVec;
@@ -1799,14 +1793,7 @@ impl GraphicsPipeline {
 pub(crate) fn buffer_cache_metadata(
     stage_infos: &[ShaderInfo; 5],
 ) -> ([u32; NUM_STAGES as usize], UniformBufferSizes) {
-    let mut masks = [0u32; NUM_STAGES as usize];
-    let mut sizes = [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
-    for stage in 0..NUM_STAGES as usize {
-        let info = &stage_infos[stage];
-        masks[stage] = info.constant_buffer_mask;
-        sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
-    }
-    (masks, sizes)
+    crate::graphics_shader_runtime::buffer_cache_metadata(stage_infos)
 }
 
 pub(crate) fn stage_infos_from_compiled(
@@ -1956,117 +1943,34 @@ impl GraphicsPipelineCache {
         key: &GraphicsPipelineKey,
         environments: &mut GraphicsEnvironments,
     ) -> Option<[Option<CompiledShader>; NUM_VK_GRAPHICS_STAGES]> {
+        let translated =
+            crate::graphics_shader_runtime::translate_graphics_stages_from_environments(
+                host_info,
+                &key.fixed_state,
+                &key.unique_hashes,
+                graphics_pipeline_key_cache_hash(key),
+                environments,
+            )?;
         let mut bindings = Bindings::default();
         let mut compiled_stages: [Option<CompiledShader>; NUM_VK_GRAPHICS_STAGES] =
             Default::default();
-
-        let uses_vertex_a = environment_has_stage(environments, 0);
-        let uses_vertex_b = environment_has_stage(environments, 1);
-        let dump_guest_shaders = *common::settings::values().dump_guest_shaders.get_value();
-        let pipeline_hash = graphics_pipeline_key_cache_hash(key);
-        if !uses_vertex_b {
-            return None;
-        }
-
-        let vertex_runtime_info = make_runtime_info(key, ShaderStage::VertexB, None);
-        let vertex = if uses_vertex_a {
-            let (vertex_a, vertex_b) = two_mut(&mut environments.envs, 0, 1)?;
-            if vertex_a
-                .generic_environment()
-                .cached_code_slice()
-                .is_empty()
-                && vertex_a.generic_environment_mut().analyze().is_none()
-            {
-                return None;
-            }
-            if vertex_b
-                .generic_environment()
-                .cached_code_slice()
-                .is_empty()
-                && vertex_b.generic_environment_mut().analyze().is_none()
-            {
-                return None;
-            }
-            let vertex_a_code = vertex_a
-                .generic_environment()
-                .cached_instruction_slice()
-                .to_vec();
-            let vertex_b_code = vertex_b
-                .generic_environment()
-                .cached_instruction_slice()
-                .to_vec();
-            if vertex_a_code.is_empty() || vertex_b_code.is_empty() {
-                return None;
-            }
-            let vertex_a_offset = vertex_a.generic_environment().cached_instruction_start();
-            let vertex_b_offset = vertex_b.generic_environment().cached_instruction_start();
-            let compiled =
-                shader_recompiler::compile_dual_vertex_shader_from_env_with_bindings_and_host_info(
-                    &vertex_a_code,
-                    vertex_a_offset,
-                    vertex_a,
-                    &vertex_b_code,
-                    vertex_b_offset,
-                    vertex_b,
-                    profile,
-                    &vertex_runtime_info,
-                    &mut bindings,
-                    host_info,
-                );
-            if dump_guest_shaders {
-                vertex_a
-                    .generic_environment_mut()
-                    .dump(pipeline_hash, key.unique_hashes[0]);
-                vertex_b
-                    .generic_environment_mut()
-                    .dump(pipeline_hash, key.unique_hashes[1]);
-            }
-            compiled
-        } else {
-            let compiled = Self::compile_stage_from_environment(
-                profile,
-                host_info,
-                environments,
-                1,
-                &mut bindings,
-                &vertex_runtime_info,
-            )?;
-            if dump_guest_shaders {
-                environments.envs[1]
-                    .generic_environment_mut()
-                    .dump(pipeline_hash, key.unique_hashes[1]);
-            }
-            compiled
-        };
-        let mut previous_stage_info = Some(vertex.info.clone());
-        compiled_stages[0] = Some(vertex);
-
-        for program_index in 2..NUM_PROGRAMS {
-            if !environment_has_stage(environments, program_index) {
+        for (index, translated_stage) in translated.into_iter().enumerate() {
+            let Some(translated_stage) = translated_stage else {
                 continue;
-            }
-            let stage = environments.envs[program_index]
-                .generic_environment()
-                .shader_stage();
-            let stage_index = shader_stage_to_graphics_info_index(stage)?;
-            let runtime_info = make_runtime_info(key, stage, previous_stage_info.as_ref());
-            let compiled = Self::compile_stage_from_environment(
+            };
+            let stage = translated_stage.program.stage;
+            let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+                &translated_stage.program,
                 profile,
-                host_info,
-                environments,
-                program_index,
+                &translated_stage.runtime_info,
                 &mut bindings,
-                &runtime_info,
-            )?;
-            if dump_guest_shaders {
-                environments.envs[program_index]
-                    .generic_environment_mut()
-                    .dump(pipeline_hash, key.unique_hashes[program_index]);
-            }
-            previous_stage_info = Some(compiled.info.clone());
-            compiled_stages[stage_index] = Some(compiled);
+            );
+            compiled_stages[index] = Some(CompiledShader {
+                spirv_words,
+                info: translated_stage.program.info,
+                stage,
+            });
         }
-
         Some(compiled_stages)
     }
 
@@ -2238,47 +2142,6 @@ impl GraphicsPipelineCache {
         Some(pipeline)
     }
 
-    fn compile_stage_from_environment(
-        profile: &Profile,
-        host_info: &HostTranslateInfo,
-        environments: &mut GraphicsEnvironments,
-        stage_index: usize,
-        bindings: &mut Bindings,
-        runtime_info: &RuntimeInfo,
-    ) -> Option<CompiledShader> {
-        if stage_index >= NUM_PROGRAMS {
-            return None;
-        }
-        if !environment_has_stage(environments, stage_index) {
-            return None;
-        }
-        let env = &mut environments.envs[stage_index];
-        if env.generic_environment().cached_code_slice().is_empty()
-            && (!env.generic_environment().has_runtime_gpu_memory_owner()
-                || env.generic_environment_mut().analyze().is_none())
-        {
-            return None;
-        }
-        let code = env
-            .generic_environment()
-            .cached_instruction_slice()
-            .to_vec();
-        if code.is_empty() {
-            return None;
-        }
-        let base_offset = env.generic_environment().cached_instruction_start();
-        let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
-            &code,
-            base_offset,
-            env,
-            profile,
-            runtime_info,
-            bindings,
-            host_info,
-        );
-        Some(compiled)
-    }
-
     fn create_shader_module(&self, spirv_words: &[u32]) -> Option<vk::ShaderModule> {
         let create_info = vk::ShaderModuleCreateInfo::builder()
             .code(spirv_words)
@@ -2315,6 +2178,7 @@ impl GraphicsPipelineCache {
     }
 }
 
+#[cfg(test)]
 fn environment_has_stage(environments: &GraphicsEnvironments, stage_index: usize) -> bool {
     environments
         .env_ptrs
@@ -2484,152 +2348,12 @@ fn make_runtime_info(
     stage: ShaderStage,
     previous_program: Option<&ShaderInfo>,
 ) -> RuntimeInfo {
-    let fixed_state = &key.fixed_state;
-    let mut info = RuntimeInfo::default();
-    if let Some(previous_program) = previous_program {
-        info.previous_stage_stores = previous_program.stores.clone();
-        info.previous_stage_legacy_stores_mapping = previous_program.legacy_stores_mapping.clone();
-    } else {
-        info.previous_stage_stores.mask.fill(u64::MAX);
-    }
-    match stage {
-        ShaderStage::VertexB => {
-            let has_geometry = key.unique_hashes[4] != 0;
-            if !has_geometry {
-                if fixed_state.topology() == PrimitiveTopology::Points {
-                    info.fixed_state_point_size = Some(f32::from_bits(fixed_state.point_size));
-                }
-                if fixed_state.xfb_enabled() {
-                    fill_transform_feedback_runtime_info(&mut info, fixed_state);
-                }
-                info.convert_depth_mode = fixed_state.ndc_minus_one_to_one();
-            }
-            for (index, attrib) in fixed_state.attributes.iter().enumerate() {
-                info.generic_input_types[index] = if fixed_state.dynamic_vertex_input() {
-                    attribute_type_from_dynamic_state(fixed_state.dynamic_attribute_type(index))
-                } else {
-                    cast_attribute_type_from_state(*attrib)
-                };
-            }
-        }
-        ShaderStage::TessellationEval => {
-            info.tess_clockwise = fixed_state.tessellation_clockwise();
-            info.tess_primitive = tess_primitive_from_state(fixed_state.tessellation_primitive());
-            info.tess_spacing = tess_spacing_from_state(fixed_state.tessellation_spacing());
-        }
-        ShaderStage::Geometry => {
-            if fixed_state.xfb_enabled() {
-                fill_transform_feedback_runtime_info(&mut info, fixed_state);
-            }
-            info.convert_depth_mode = fixed_state.ndc_minus_one_to_one();
-        }
-        ShaderStage::Fragment => {
-            info.alpha_test_func =
-                Some(compare_function_from_maxwell(fixed_state.alpha_test_func()));
-            info.alpha_test_reference = f32::from_bits(fixed_state.alpha_test_ref);
-            info.dual_source_blend = fixed_state.attachment0_dual_source_blend();
-            for (index, &format) in fixed_state.color_formats.iter().enumerate() {
-                if format == 0 {
-                    info.frag_color_types[index] = AttributeType::Float;
-                    continue;
-                }
-                let pixel_format = pixel_format_from_render_target_format(format as u32);
-                info.frag_color_types[index] = if is_pixel_format_signed_integer(pixel_format) {
-                    AttributeType::SignedInt
-                } else if is_pixel_format_integer(pixel_format) {
-                    AttributeType::UnsignedInt
-                } else {
-                    AttributeType::Float
-                };
-            }
-        }
-        _ => {}
-    }
-    info.input_topology = input_topology_from_state(fixed_state.topology());
-    info.force_early_z = fixed_state.early_z();
-    info.y_negate = fixed_state.y_negate();
-    info
-}
-
-fn fill_transform_feedback_runtime_info(info: &mut RuntimeInfo, fixed_state: &FixedPipelineState) {
-    let (varyings, count) =
-        crate::transform_feedback::make_transform_feedback_varyings(&fixed_state.xfb_state);
-    info.xfb_varyings = varyings
-        .iter()
-        .map(
-            |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
-                buffer: varying.buffer,
-                stream: varying.stream,
-                stride: varying.stride,
-                offset: varying.offset,
-                components: varying.components,
-            },
-        )
-        .collect();
-    info.xfb_count = count;
-}
-
-fn attribute_type_from_dynamic_state(value: u32) -> AttributeType {
-    match value {
-        0 => AttributeType::Disabled,
-        1 => AttributeType::Float,
-        2 => AttributeType::SignedInt,
-        3 => AttributeType::UnsignedInt,
-        _ => AttributeType::Disabled,
-    }
-}
-
-fn tess_primitive_from_state(value: u32) -> TessPrimitive {
-    match value {
-        0 => TessPrimitive::Isolines,
-        1 => TessPrimitive::Triangles,
-        2 => TessPrimitive::Quads,
-        _ => TessPrimitive::Triangles,
-    }
-}
-
-fn tess_spacing_from_state(value: u32) -> TessSpacing {
-    match value {
-        0 => TessSpacing::Equal,
-        1 => TessSpacing::FractionalOdd,
-        2 => TessSpacing::FractionalEven,
-        _ => TessSpacing::Equal,
-    }
-}
-
-fn compare_function_from_maxwell(op: ComparisonOp) -> CompareFunction {
-    match op {
-        ComparisonOp::Never => CompareFunction::Never,
-        ComparisonOp::Less => CompareFunction::Less,
-        ComparisonOp::Equal => CompareFunction::Equal,
-        ComparisonOp::LessEqual => CompareFunction::LessThanEqual,
-        ComparisonOp::Greater => CompareFunction::Greater,
-        ComparisonOp::NotEqual => CompareFunction::NotEqual,
-        ComparisonOp::GreaterEqual => CompareFunction::GreaterThanEqual,
-        ComparisonOp::Always => CompareFunction::Always,
-    }
-}
-
-fn input_topology_from_state(topology: PrimitiveTopology) -> InputTopology {
-    match topology {
-        PrimitiveTopology::Points => InputTopology::Points,
-        PrimitiveTopology::Lines | PrimitiveTopology::LineLoop | PrimitiveTopology::LineStrip => {
-            InputTopology::Lines
-        }
-        PrimitiveTopology::LinesAdjacency | PrimitiveTopology::LineStripAdjacency => {
-            InputTopology::LinesAdjacency
-        }
-        PrimitiveTopology::TrianglesAdjacency | PrimitiveTopology::TriangleStripAdjacency => {
-            InputTopology::TrianglesAdjacency
-        }
-        PrimitiveTopology::Triangles
-        | PrimitiveTopology::TriangleStrip
-        | PrimitiveTopology::TriangleFan
-        | PrimitiveTopology::Quads
-        | PrimitiveTopology::QuadStrip
-        | PrimitiveTopology::Polygon
-        | PrimitiveTopology::Patches => InputTopology::Triangles,
-    }
+    crate::graphics_shader_runtime::make_runtime_info(
+        &key.fixed_state,
+        &key.unique_hashes,
+        stage,
+        previous_program,
+    )
 }
 
 fn two_mut<T>(slice: &mut [T], lhs: usize, rhs: usize) -> Option<(&mut T, &mut T)> {
@@ -2647,24 +2371,6 @@ fn two_mut<T>(slice: &mut [T], lhs: usize, rhs: usize) -> Option<(&mut T, &mut T
 
 fn graphics_pipeline_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
     key.hash_value()
-}
-
-fn cast_attribute_type_from_state(
-    attrib: super::fixed_pipeline_state::VertexAttribute,
-) -> AttributeType {
-    if !attrib.is_enabled() {
-        return AttributeType::Disabled;
-    }
-    match VertexAttribType::from_raw(attrib.attrib_type()) {
-        VertexAttribType::Invalid => AttributeType::Disabled,
-        VertexAttribType::SNorm | VertexAttribType::UNorm | VertexAttribType::Float => {
-            AttributeType::Float
-        }
-        VertexAttribType::SInt => AttributeType::SignedInt,
-        VertexAttribType::UInt => AttributeType::UnsignedInt,
-        VertexAttribType::UScaled => AttributeType::UnsignedScaled,
-        VertexAttribType::SScaled => AttributeType::SignedScaled,
-    }
 }
 
 fn shader_stage_to_graphics_info_index(stage: ShaderStage) -> Option<usize> {
@@ -2844,6 +2550,9 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::PrimitiveTopology;
     use ash::vk::Handle;
+    use shader_recompiler::runtime_info::{
+        CompareFunction, InputTopology, TessPrimitive, TessSpacing,
+    };
     use std::mem::ManuallyDrop;
 
     #[test]

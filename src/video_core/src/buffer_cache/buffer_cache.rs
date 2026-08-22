@@ -1672,6 +1672,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.slot_buffers[buffer_id].raw_handle()
     }
 
+    /// Borrow the backend-owned buffer selected by a cache id.
+    ///
+    /// This is the typed counterpart of `resolve_backend_buffer_raw` for
+    /// backends such as Metal whose command encoder requires the native object
+    /// rather than an integer handle.
+    pub fn backend_buffer(&self, buffer_id: BufferId) -> Option<&P::Buffer> {
+        self.slot_buffers
+            .contains(buffer_id)
+            .then(|| &self.slot_buffers[buffer_id])
+    }
+
     // -----------------------------------------------------------------------
     // Public API — buffer operations retry loop
     // -----------------------------------------------------------------------

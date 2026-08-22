@@ -12,18 +12,21 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2_metal::{
-    MTLCullMode, MTLPrimitiveType, MTLRenderCommandEncoder, MTLScissorRect, MTLViewport,
-    MTLWinding,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCullMode, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLScissorRect, MTLSize, MTLViewport, MTLWinding,
 };
 use thiserror::Error;
 
-use crate::buffer_cache::buffer_cache_base::{DeviceMemoryAccess, GpuMemoryAccess};
+use crate::buffer_cache::buffer_cache_base::{
+    DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
+};
 use crate::cache_types::CacheType;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::engines::draw_manager::{
     Maxwell3DClearView, Maxwell3DDrawTextureView, Maxwell3DDrawView,
 };
+use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_3d::{CullFace, FrontFace, PrimitiveTopology};
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
@@ -41,6 +44,9 @@ use super::metal_blit_helper::{
     MetalClearParameters,
 };
 use super::metal_buffer_cache::{BufferCacheRuntime, MetalCommonBufferCache};
+use super::metal_compute_pipeline::{
+    bind_compute_resources, configure_compute_resources, MetalComputePipelineError,
+};
 use super::metal_device::MetalDevice;
 use super::metal_framebuffer::{MetalFramebufferClear, MetalFramebufferError};
 use super::metal_graphics_pipeline::{
@@ -78,11 +84,18 @@ pub enum MetalRasterizerError {
     #[error(transparent)]
     GraphicsPipeline(#[from] MetalGraphicsPipelineError),
     #[error(transparent)]
+    ComputePipeline(#[from] MetalComputePipelineError),
+    #[error(transparent)]
     Framebuffer(#[from] MetalFramebufferError),
     #[error(transparent)]
     Blit(#[from] MetalBlitError),
     #[error("Metal does not support Maxwell primitive topology {0:?}")]
     UnsupportedTopology(PrimitiveTopology),
+    #[error("Metal compute workgroup {requested:?} exceeds the native limit {maximum:?}")]
+    UnsupportedComputeWorkgroup {
+        requested: [u32; 3],
+        maximum: (usize, usize, usize),
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -988,6 +1001,109 @@ impl MetalRasterizer {
                 },
             )?;
         }
+        Ok(())
+    }
+
+    /// Port of Eden `RasterizerVulkan::DispatchCompute` using one native
+    /// Metal compute encoder in the scheduler's guest-order command buffer.
+    pub fn dispatch_compute(
+        &mut self,
+        dispatch: &DispatchCall,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        let Some(pipeline) = self
+            .pipeline_cache
+            .current_compute_pipeline(&mut self.shader_cache)?
+        else {
+            return Ok(());
+        };
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return Ok(());
+        };
+        let read_gpu = |address: u64, output: &mut [u8]| {
+            memory_manager.lock().read_block_unsafe(address, output);
+        };
+        let buffer_cache_mutex: *const _ = Arc::as_ptr(&self.common_buffer_cache.mutex);
+        let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(
+            buffer_cache_mutex,
+            texture_cache_mutex,
+            _buffer_cache_guard,
+            _texture_cache_guard
+        );
+        let prepared = configure_compute_resources(
+            &self.device,
+            &pipeline,
+            dispatch,
+            self.common_buffer_cache.as_mut(),
+            self.texture_cache.as_mut(),
+            read_gpu,
+        )?;
+
+        let workgroup = pipeline.key().workgroup_size;
+        let maximum = self.device.profile().max_threads_per_threadgroup;
+        let total_threads = workgroup
+            .iter()
+            .fold(1u64, |total, value| total.saturating_mul(*value as u64));
+        if workgroup[0] as usize > maximum.0
+            || workgroup[1] as usize > maximum.1
+            || workgroup[2] as usize > maximum.2
+            || total_threads > pipeline.state().maxTotalThreadsPerThreadgroup() as u64
+        {
+            return Err(MetalRasterizerError::UnsupportedComputeWorkgroup {
+                requested: workgroup,
+                maximum,
+            });
+        }
+        let threads_per_threadgroup = MTLSize {
+            width: workgroup[0].max(1) as usize,
+            height: workgroup[1].max(1) as usize,
+            depth: workgroup[2].max(1) as usize,
+        };
+        let pipeline_state = pipeline.retained_state();
+
+        if let Some(indirect_address) = dispatch.indirect_compute_address {
+            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
+                indirect_address,
+                12,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DiscardWrite,
+            );
+            let Some(indirect_buffer) = self
+                .common_buffer_cache
+                .backend_buffer(buffer_id)
+                .map(|buffer| buffer.handle())
+            else {
+                return Ok(());
+            };
+            self.scheduler.with_compute_encoder(|encoder| unsafe {
+                encoder.setComputePipelineState(&pipeline_state);
+                bind_compute_resources(encoder, &prepared);
+                encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    indirect_buffer.handle(),
+                    offset as usize,
+                    threads_per_threadgroup,
+                );
+            })?;
+            return Ok(());
+        }
+
+        let grid = &dispatch.launch_description;
+        let threadgroups_per_grid = MTLSize {
+            width: grid.grid_dim_x as usize,
+            height: grid.grid_dim_y as usize,
+            depth: grid.grid_dim_z as usize,
+        };
+        self.scheduler.with_compute_encoder(|encoder| {
+            encoder.setComputePipelineState(&pipeline_state);
+            bind_compute_resources(encoder, &prepared);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                threadgroups_per_grid,
+                threads_per_threadgroup,
+            );
+        })?;
         Ok(())
     }
 

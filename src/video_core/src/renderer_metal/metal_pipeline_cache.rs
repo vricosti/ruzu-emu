@@ -8,6 +8,7 @@
 //! device wrapper or the rasterizer.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -22,10 +23,13 @@ use objc2_metal::{
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::profile::Profile;
 use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::{backend::bindings::Bindings, RuntimeInfo};
 use spirv_cross2::spirv::ExecutionModel;
 use thiserror::Error;
 
-use crate::buffer_cache::buffer_cache_base::{UniformBufferSizes, NUM_STAGES};
+use crate::buffer_cache::buffer_cache_base::{
+    ComputeUniformBufferSizes, UniformBufferSizes, NUM_STAGES,
+};
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, DepthStencilInfo, PrimitiveTopology, StencilOp,
@@ -37,6 +41,7 @@ use crate::renderer_vulkan::graphics_pipeline::{
     buffer_cache_metadata, stage_infos_from_compiled, GraphicsPipelineCache, GraphicsPipelineKey,
 };
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
+use crate::shader_environment::ComputeEnvironment;
 
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
 use super::metal_framebuffer::MetalFramebuffer;
@@ -424,8 +429,19 @@ impl MetalRenderPipeline {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalComputePipelineKey {
+    pub unique_hash: u64,
+    pub shared_memory_size: u32,
+    pub workgroup_size: [u32; 3],
+}
+
+#[derive(Clone)]
 pub struct MetalComputePipeline {
-    shader_hash: u64,
+    key: MetalComputePipelineKey,
+    info: Arc<ShaderInfo>,
+    uniform_buffer_sizes: Arc<ComputeUniformBufferSizes>,
+    shader: Arc<MetalShaderModule>,
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
@@ -436,7 +452,7 @@ pub struct MetalGraphicsShaderStages {
     fragment: Option<Arc<MetalShaderModule>>,
     stage_infos: Arc<[ShaderInfo; 5]>,
     enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
-    uniform_buffer_sizes: UniformBufferSizes,
+    uniform_buffer_sizes: Arc<UniformBufferSizes>,
 }
 
 impl MetalGraphicsShaderStages {
@@ -471,11 +487,31 @@ impl MetalGraphicsShaderStages {
 
 impl MetalComputePipeline {
     pub fn shader_hash(&self) -> u64 {
-        self.shader_hash
+        self.key.unique_hash
+    }
+
+    pub fn key(&self) -> MetalComputePipelineKey {
+        self.key
+    }
+
+    pub fn info(&self) -> &ShaderInfo {
+        &self.info
+    }
+
+    pub fn uniform_buffer_sizes(&self) -> &ComputeUniformBufferSizes {
+        &self.uniform_buffer_sizes
+    }
+
+    pub fn shader(&self) -> &MetalShaderModule {
+        &self.shader
     }
 
     pub fn state(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         &self.state
+    }
+
+    pub fn retained_state(&self) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
+        self.state.clone()
     }
 }
 
@@ -492,6 +528,8 @@ pub enum MetalPipelineError {
     RenderPipeline(String),
     #[error("Metal failed to create compute pipeline: {0}")]
     ComputePipeline(String),
+    #[error("shader translation failed: {0}")]
+    ShaderTranslation(String),
     #[error("Metal failed to create a depth/stencil state")]
     DepthStencilState,
     #[error("graphics shader translation did not produce a vertex stage")]
@@ -509,6 +547,60 @@ pub enum MetalPipelineError {
     Shader(#[from] MetalShaderError),
 }
 
+static SHADER_EXCEPTION_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+thread_local! {
+    static IN_SHADER_EXCEPTION_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn shader_exception_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    use shader_recompiler::exception::{
+        InvalidArgument, LogicError, NotImplementedException, RuntimeError, ShaderException,
+    };
+
+    if let Some(error) = payload.downcast_ref::<ShaderException>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<LogicError>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<RuntimeError>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<NotImplementedException>() {
+        Some(error.to_string())
+    } else {
+        payload
+            .downcast_ref::<InvalidArgument>()
+            .map(ToString::to_string)
+    }
+}
+
+/// Rust equivalent of Eden's typed `Shader::Exception` catches. Panics that
+/// are not shader compiler exceptions remain fatal and are resumed unchanged.
+fn catch_shader_exception<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T,
+{
+    SHADER_EXCEPTION_HOOK_INSTALL.call_once(|| {
+        let previous = take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let is_shader_exception = shader_exception_message(info.payload()).is_some();
+            if !IN_SHADER_EXCEPTION_SCOPE.with(std::cell::Cell::get) || !is_shader_exception {
+                previous(info);
+            }
+        }));
+    });
+
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(true));
+    let result = catch_unwind(AssertUnwindSafe(f));
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(false));
+    match result {
+        Ok(value) => Ok(value),
+        Err(payload) => match shader_exception_message(payload.as_ref()) {
+            Some(message) => Err(message),
+            None => resume_unwind(payload),
+        },
+    }
+}
+
 pub struct MetalPipelineCache {
     device: MetalDevice,
     profile: Profile,
@@ -516,7 +608,7 @@ pub struct MetalPipelineCache {
     render_pipelines: HashMap<MetalRenderPipelineKey, MetalRenderPipeline>,
     depth_stencil_states:
         HashMap<MetalDepthStencilKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
-    compute_pipelines: HashMap<u64, MetalComputePipeline>,
+    compute_pipelines: HashMap<MetalComputePipelineKey, MetalComputePipeline>,
     graphics_shader_modules: HashMap<GraphicsPipelineKey, MetalGraphicsShaderStages>,
     graphics_key: GraphicsPipelineKey,
     dynamic_features: DynamicFeatures,
@@ -624,7 +716,7 @@ impl MetalPipelineCache {
                     fragment,
                     stage_infos: Arc::new(stage_infos),
                     enabled_uniform_buffer_masks,
-                    uniform_buffer_sizes,
+                    uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
                 },
             );
         }
@@ -798,7 +890,12 @@ impl MetalPipelineCache {
                 actual: shader.source().execution_model,
             });
         }
-        if !self.compute_pipelines.contains_key(&shader_hash) {
+        let key = MetalComputePipelineKey {
+            unique_hash: shader_hash,
+            shared_memory_size: 0,
+            workgroup_size: [1; 3],
+        };
+        if !self.compute_pipelines.contains_key(&key) {
             let state = self
                 .device
                 .device()
@@ -806,13 +903,113 @@ impl MetalPipelineCache {
                 .map_err(|error| {
                     MetalPipelineError::ComputePipeline(error.localizedDescription().to_string())
                 })?;
-            self.compute_pipelines
-                .insert(shader_hash, MetalComputePipeline { shader_hash, state });
+            self.compute_pipelines.insert(
+                key,
+                MetalComputePipeline {
+                    key,
+                    info: Arc::new(ShaderInfo::default()),
+                    uniform_buffer_sizes: Arc::new([0; 8]),
+                    shader: Arc::new(shader.clone()),
+                    state,
+                },
+            );
         }
         Ok(self
             .compute_pipelines
-            .get(&shader_hash)
+            .get(&key)
             .expect("pipeline inserted above"))
+    }
+
+    /// Port of Eden `PipelineCache::CurrentComputePipeline` through native
+    /// MSL module and `MTLComputePipelineState` creation.
+    pub fn current_compute_pipeline(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Result<Option<MetalComputePipeline>, MetalPipelineError> {
+        let (unique_hash, shader_size) = {
+            let Some(shader) = shared_cache.compute_shader() else {
+                return Ok(None);
+            };
+            (shader.unique_hash, shader.size_bytes)
+        };
+        let Some(kepler_compute) = shared_cache.current_kepler_compute() else {
+            return Ok(None);
+        };
+        let qmd = kepler_compute.launch_description();
+        let key = MetalComputePipelineKey {
+            unique_hash,
+            shared_memory_size: qmd.shared_alloc,
+            workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
+        };
+        if !self.compute_pipelines.contains_key(&key) {
+            let Some(gpu_memory) = shared_cache.current_gpu_memory() else {
+                return Ok(None);
+            };
+            let mut environment =
+                ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
+            environment
+                .generic_environment_mut()
+                .set_cached_size(shader_size);
+            let code = environment
+                .generic_environment()
+                .cached_instruction_slice()
+                .to_vec();
+            let base_offset = environment.generic_environment().cached_instruction_start();
+            if code.is_empty() {
+                return Ok(None);
+            }
+
+            let (program, spirv_words) = catch_shader_exception(|| {
+                let runtime_info = RuntimeInfo::default();
+                let mut program =
+                    shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                        &code,
+                        base_offset,
+                        &mut environment,
+                        &self.host_info,
+                    );
+                shader_recompiler::frontend::translate_program::convert_legacy_to_generic(
+                    &mut program,
+                    &runtime_info,
+                );
+                let mut bindings = Bindings::default();
+                let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+                    &program,
+                    &self.profile,
+                    &runtime_info,
+                    &mut bindings,
+                );
+                (program, spirv_words)
+            })
+            .map_err(MetalPipelineError::ShaderTranslation)?;
+            let info = Arc::new(program.info);
+            let shader = Arc::new(compile_native_shader(
+                self.device.device(),
+                self.device.profile(),
+                &spirv_words,
+                &MetalShaderCompileOptions::default(),
+            )?);
+            let state = self
+                .device
+                .device()
+                .newComputePipelineStateWithFunction_error(shader.function())
+                .map_err(|error| {
+                    MetalPipelineError::ComputePipeline(error.localizedDescription().to_string())
+                })?;
+            let mut uniform_buffer_sizes = [0; 8];
+            uniform_buffer_sizes.copy_from_slice(&info.constant_buffer_used_sizes[..8]);
+            self.compute_pipelines.insert(
+                key,
+                MetalComputePipeline {
+                    key,
+                    info,
+                    uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
+                    shader,
+                    state,
+                },
+            );
+        }
+        Ok(self.compute_pipelines.get(&key).cloned())
     }
 }
 
@@ -1409,5 +1606,66 @@ mod tests {
             .state() as *const _;
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cloned_compute_pipeline_keeps_uniform_sizes_at_a_stable_address() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut cache = MetalPipelineCache::new(device);
+        let mut program = Program::new(Stage::Compute);
+        program.blocks.push(Block::new());
+        Emitter::new(&mut program, 0).epilogue();
+        let shader = compile_test_shader(&cache, &program);
+        let pipeline = cache
+            .get_or_create_compute_pipeline(0x4444, &shader)
+            .expect("native compute pipeline must compile")
+            .clone();
+        let cloned = pipeline.clone();
+
+        assert_eq!(
+            pipeline.uniform_buffer_sizes() as *const _,
+            cloned.uniform_buffer_sizes() as *const _
+        );
+    }
+
+    #[test]
+    fn compute_pipeline_key_includes_qmd_runtime_dimensions() {
+        let base = MetalComputePipelineKey {
+            unique_hash: 0x1234,
+            shared_memory_size: 0x100,
+            workgroup_size: [8, 4, 1],
+        };
+        assert_ne!(
+            base,
+            MetalComputePipelineKey {
+                shared_memory_size: 0x200,
+                ..base
+            }
+        );
+        assert_ne!(
+            base,
+            MetalComputePipelineKey {
+                workgroup_size: [16, 4, 1],
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn shader_exception_scope_catches_only_shader_exceptions() {
+        let shader_result = catch_shader_exception(|| {
+            std::panic::panic_any(shader_recompiler::exception::NotImplementedException::new(
+                "Metal compute test",
+            ));
+        });
+        assert_eq!(
+            shader_result.unwrap_err(),
+            "Metal compute test is not implemented"
+        );
+
+        let ordinary = std::panic::catch_unwind(|| {
+            let _: Result<(), String> = catch_shader_exception(|| panic!("ordinary panic"));
+        });
+        assert!(ordinary.is_err(), "non-shader panics must not be swallowed");
     }
 }

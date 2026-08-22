@@ -142,6 +142,7 @@ pub enum MetalShaderError {
 }
 
 /// Native shader objects retained for the lifetime of a Metal pipeline.
+#[derive(Clone)]
 pub struct MetalShaderModule {
     source: MetalShaderSource,
     bindings: MetalShaderBindingLayout,

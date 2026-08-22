@@ -10,6 +10,7 @@
 pub mod metal_blit_helper;
 pub mod metal_buffer;
 pub mod metal_buffer_cache;
+pub mod metal_compute_pipeline;
 pub mod metal_device;
 pub mod metal_format;
 pub mod metal_framebuffer;

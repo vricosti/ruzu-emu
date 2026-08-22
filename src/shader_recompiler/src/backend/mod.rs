@@ -12,6 +12,7 @@
 pub mod bindings;
 pub mod glasm;
 pub mod glsl;
+pub mod msl;
 pub mod spirv;
 
 use crate::ir;

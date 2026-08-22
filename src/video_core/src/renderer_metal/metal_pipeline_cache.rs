@@ -694,7 +694,7 @@ impl MetalPipelineCache {
                 self.device.device(),
                 self.device.profile(),
                 &vertex.spirv_words,
-                &MetalShaderCompileOptions::default(),
+                &MetalShaderCompileOptions::for_device(self.device.profile()),
             )?);
             let fragment = compiled[4]
                 .as_ref()
@@ -703,7 +703,7 @@ impl MetalPipelineCache {
                         self.device.device(),
                         self.device.profile(),
                         &fragment.spirv_words,
-                        &MetalShaderCompileOptions::default(),
+                        &MetalShaderCompileOptions::for_device(self.device.profile()),
                     )
                     .map(Arc::new)
                 })
@@ -987,7 +987,7 @@ impl MetalPipelineCache {
                 self.device.device(),
                 self.device.profile(),
                 &spirv_words,
-                &MetalShaderCompileOptions::default(),
+                &MetalShaderCompileOptions::for_device(self.device.profile()),
             )?);
             let state = self
                 .device

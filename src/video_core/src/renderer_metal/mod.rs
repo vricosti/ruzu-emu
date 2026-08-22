@@ -7,6 +7,7 @@
 //! rasterizer ownership boundaries while implementing the backend operations
 //! with Metal concepts rather than translating Vulkan objects mechanically.
 
+pub mod metal_blit_helper;
 pub mod metal_buffer;
 pub mod metal_buffer_cache;
 pub mod metal_device;

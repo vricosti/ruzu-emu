@@ -4,6 +4,25 @@ This file contains only active differences confirmed in the current source tree 
 `~/Dev/emulators/zuyu`. Implementation history, diagnostics, commands, runtime logs, and audit
 procedures are intentionally omitted.
 
+## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
+
+### Intentional differences
+- Rust represents upstream `Kernel::KThread*` backend/frontend arguments as stable numeric thread
+  identifiers. Kernel thread ownership remains in the process registries, avoiding non-owning raw
+  pointers across the debugger connection thread.
+- Rust traits replace the C++ virtual base classes. The eventual frontend/backend wiring passes the
+  backend explicitly rather than constructing a self-referential Rust object.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None in the action enum or declared backend/frontend operations.
+
+### Binary layout verification
+- N/A: these interfaces are not serialized. A focused test verifies the complete action set and its
+  upstream declaration order.
+
 ## Kernel
 
 ### Unintentional differences (to fix)

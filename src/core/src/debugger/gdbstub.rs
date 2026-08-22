@@ -37,7 +37,7 @@ impl GdbStub {
     /// Create a new GDB stub.
     ///
     /// Corresponds to upstream `GDBStub::GDBStub`.
-    pub fn new(_backend: &dyn DebuggerBackend, is_64bit: bool) -> Self {
+    pub fn new(is_64bit: bool) -> Self {
         let arch: Box<dyn GdbStubArch> = if is_64bit {
             Box::new(GdbStubA64)
         } else {
@@ -55,11 +55,11 @@ impl GdbStub {
 }
 
 impl DebuggerFrontend for GdbStub {
-    fn connected(&mut self) {
+    fn connected(&mut self, _backend: &mut dyn DebuggerBackend) {
         // Nothing to do on connection
     }
 
-    fn stopped(&mut self, thread_id: u64) {
+    fn stopped(&mut self, _backend: &mut dyn DebuggerBackend, thread_id: u64) {
         // Upstream: SendReply(arch->ThreadStatus(thread, GDB_STUB_SIGTRAP));
         // Without a system reference we cannot look up the thread's context here.
         // The reply will be generated when the backend provides thread context.
@@ -68,11 +68,17 @@ impl DebuggerFrontend for GdbStub {
         log::debug!("GDB stopped reply: {}", reply);
     }
 
-    fn shutting_down(&mut self) {
+    fn shutting_down(&mut self, _backend: &mut dyn DebuggerBackend) {
         // Nothing to do on shutdown
     }
 
-    fn watchpoint(&mut self, thread_id: u64, _watch_addr: u64, watch_type: u8) {
+    fn watchpoint(
+        &mut self,
+        _backend: &mut dyn DebuggerBackend,
+        thread_id: u64,
+        _watch_addr: u64,
+        watch_type: u8,
+    ) {
         // Upstream sends a stop reply with watchpoint details.
         // watch_type: 2=write, 3=read, 4=access
         let ctx = ThreadContext::default();
@@ -80,7 +86,11 @@ impl DebuggerFrontend for GdbStub {
         log::debug!("GDB watchpoint reply (type {}): {}", watch_type, reply);
     }
 
-    fn client_data(&mut self, data: &[u8]) -> Vec<DebuggerAction> {
+    fn client_data(
+        &mut self,
+        _backend: &mut dyn DebuggerBackend,
+        data: &[u8],
+    ) -> Vec<DebuggerAction> {
         let mut actions = Vec::new();
         self.current_command.extend_from_slice(data);
 
@@ -175,7 +185,7 @@ impl GdbStub {
         } else if command_str == "c" {
             actions.push(DebuggerAction::Continue);
         } else if command_str == "s" {
-            actions.push(DebuggerAction::StepThreadLocked);
+            actions.push(DebuggerAction::StepThread);
         }
     }
 

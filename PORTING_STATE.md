@@ -9,9 +9,12 @@
 - Exact missing prerequisite: Ruzu's `DebuggerBackend` exposes only opaque numeric thread IDs and
   its `Debugger` never constructs a `GdbStub`; the frontend has no `System`, debug-process memory,
   thread list/context, socket reply path, or cache-invalidation path required by Eden's handlers.
+- Prerequisite progress: `DebuggerAction` now has Eden's exact `Interrupt`, `Continue`,
+  `ContinueThreads`, `StepThread`, and `ShutdownEmulation` contract; the former Rust-only locked/
+  unlocked step split was removed.
 - Required next action: port the debugger backend/frontend ownership and connection wiring in
-  `debugger_interface.rs` and `debugger.rs`, verify those matching files, then resume the GDB command
-  handlers. Deleting or merely allowing the warned members would hide functional parity debt.
+  `debugger.rs`, verify that matching file, then resume the GDB command handlers. Deleting or merely
+  allowing the warned members would hide functional parity debt.
 
 ## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
 

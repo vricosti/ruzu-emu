@@ -13,12 +13,26 @@ pub enum DebuggerAction {
     Interrupt,
     /// Resume emulation.
     Continue,
-    /// Step the currently-active thread without resuming others.
-    StepThreadLocked,
-    /// Step the currently-active thread and resume others.
-    StepThreadUnlocked,
+    /// Resume only the threads selected by the frontend.
+    ContinueThreads,
+    /// Step the active thread and resume only the threads selected by the frontend.
+    StepThread,
     /// Shut down the emulator.
     ShutdownEmulation,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DebuggerAction;
+
+    #[test]
+    fn debugger_actions_match_upstream_order() {
+        assert_eq!(DebuggerAction::Interrupt as usize, 0);
+        assert_eq!(DebuggerAction::Continue as usize, 1);
+        assert_eq!(DebuggerAction::ContinueThreads as usize, 2);
+        assert_eq!(DebuggerAction::StepThread as usize, 3);
+        assert_eq!(DebuggerAction::ShutdownEmulation as usize, 4);
+    }
 }
 
 /// Backend interface for the debugger (network I/O and thread management).
@@ -45,18 +59,28 @@ pub trait DebuggerBackend {
 /// Corresponds to upstream `Core::DebuggerFrontend`.
 pub trait DebuggerFrontend {
     /// Called after the client has successfully connected to the port.
-    fn connected(&mut self);
+    fn connected(&mut self, backend: &mut dyn DebuggerBackend);
 
     /// Called when emulation has stopped.
-    fn stopped(&mut self, thread_id: u64);
+    fn stopped(&mut self, backend: &mut dyn DebuggerBackend, thread_id: u64);
 
     /// Called when emulation is shutting down.
-    fn shutting_down(&mut self);
+    fn shutting_down(&mut self, backend: &mut dyn DebuggerBackend);
 
     /// Called when emulation has stopped on a watchpoint.
-    fn watchpoint(&mut self, thread_id: u64, watch_addr: u64, watch_type: u8);
+    fn watchpoint(
+        &mut self,
+        backend: &mut dyn DebuggerBackend,
+        thread_id: u64,
+        watch_addr: u64,
+        watch_type: u8,
+    );
 
     /// Called when new data is asynchronously received on the client socket.
     /// Returns a list of actions to perform.
-    fn client_data(&mut self, data: &[u8]) -> Vec<DebuggerAction>;
+    fn client_data(
+        &mut self,
+        backend: &mut dyn DebuggerBackend,
+        data: &[u8],
+    ) -> Vec<DebuggerAction>;
 }

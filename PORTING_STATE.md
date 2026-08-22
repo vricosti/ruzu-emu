@@ -80,6 +80,18 @@
   scheduler-test baseline; none of the new watchpoint tests failed.
 - Status: CPU stepping, breakpoint notification and A32/A64 watchpoint generation prerequisites are
   complete. Resume the interrupted `gdbstub.rs` command-dispatcher warning slice.
+- GDB dispatcher resumed, then interrupted by its module-discovery prerequisite: Eden's `qOffsets`
+  and `qXfer:libraries:read` handlers require `arm/debug.cpp::{FindModules,GetModuleEnd,
+  FindMainModuleEntrypoint}`, while the Rust counterparts still return an empty map, the input base
+  and zero. The process page-table query and code-region APIs now exist, so port these methods in
+  `arm/debug.rs`, verify their memory-region walk and module-path parsing, then resume `gdbstub.rs`.
+- Module-discovery prerequisite completed: `arm/debug.rs` now walks every page-table region, reads
+  the upstream 0x208-byte module-path record after executable Code/AliasCode regions, strips both
+  directory separators, computes the text/rodata/data end and falls back to the process code-region
+  start. The duplicate empty symbolication walker and unsafe opaque process/thread casts were also
+  removed. Both focused module-discovery/entrypoint regressions and `cargo check -p core` pass.
+- Status: resume `gdbstub.rs`; module enumeration and offset queries now have their upstream-owned
+  prerequisite.
 
 ## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
 

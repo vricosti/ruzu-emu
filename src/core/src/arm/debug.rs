@@ -7,25 +7,11 @@
 use crate::arm::arm_interface::ThreadContext;
 use crate::hardware_properties;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
-use std::collections::BTreeMap;
-
-// The opaque types below serve as forward declarations matching upstream's
-// `Kernel::KThread*` and `Kernel::KProcess*`. At runtime, pointers to real
-// `hle::kernel::k_thread::KThread` / `hle::kernel::k_process::KProcess`
-// are transmuted through these types to avoid circular dependencies.
-
-/// Opaque type representing Kernel::KThread (forward declaration).
-pub struct KThread {
-    _private: (),
-}
-
-/// Opaque type representing Kernel::KProcess (forward declaration).
-pub struct KProcess {
-    _private: (),
-}
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_thread::KThread;
 
 /// Module map: base address -> module name
-pub type Modules = BTreeMap<u64, String>;
+pub use crate::loader::loader::Modules;
 
 /// Backtrace entry, matching upstream `Core::BacktraceEntry`.
 #[derive(Debug, Clone, Default)]
@@ -96,27 +82,15 @@ fn range_fits_memory_info(
     permission != KMemoryPermission::NONE && !permission.contains(KMemoryPermission::NOT_MAPPED)
 }
 
-/// Helper: transmute opaque KProcess to real KProcess.
-/// SAFETY: The caller must ensure the pointer actually points to a real KProcess.
-unsafe fn real_process(opaque: &KProcess) -> &crate::hle::kernel::k_process::KProcess {
-    &*(opaque as *const KProcess as *const crate::hle::kernel::k_process::KProcess)
-}
-
-/// Helper: transmute opaque KThread to real KThread.
-unsafe fn real_thread(opaque: &KThread) -> &crate::hle::kernel::k_thread::KThread {
-    &*(opaque as *const KThread as *const crate::hle::kernel::k_thread::KThread)
-}
-
 /// Get the name of a thread from its nnsdk thread type structure.
 ///
 /// Corresponds to upstream `Core::GetThreadName` (debug.cpp).
 /// Reads from TLS to find the nnsdk thread type and extract its name.
 pub fn get_thread_name(thread: &KThread) -> Option<String> {
-    let real = unsafe { real_thread(thread) };
-    let parent = real.parent.as_ref()?.upgrade()?;
+    let parent = thread.parent.as_ref()?.upgrade()?;
     let process = parent.lock().unwrap();
     let is_64bit = process.is_64bit();
-    let tls_addr = real.tls_address.get();
+    let tls_addr = thread.tls_address.get();
     if tls_addr == 0 {
         return None;
     }
@@ -127,7 +101,7 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
     // then reads version and name pointer from the thread type struct.
     if is_64bit {
         let thread_type_addr = mem.read_64(tls_addr + 0x1F8);
-        let argument_thread_type = real.get_argument() as u64;
+        let argument_thread_type = thread.get_argument() as u64;
         if argument_thread_type != 0 && thread_type_addr != argument_thread_type {
             return None;
         }
@@ -155,7 +129,7 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
         Some(String::from_utf8_lossy(&name).to_string())
     } else {
         let thread_type_addr = mem.read_32(tls_addr + 0x1FC) as u64;
-        let argument_thread_type = real.get_argument() as u64;
+        let argument_thread_type = thread.get_argument() as u64;
         if argument_thread_type != 0 && thread_type_addr != argument_thread_type {
             return None;
         }
@@ -187,8 +161,7 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
 /// Corresponds to upstream `Core::GetThreadWaitReason`.
 pub fn get_thread_wait_reason(thread: &KThread) -> &'static str {
     use crate::hle::kernel::k_thread::ThreadWaitReasonForDebugging;
-    let real = unsafe { real_thread(thread) };
-    match real.wait_reason_for_debugging {
+    match thread.wait_reason_for_debugging {
         ThreadWaitReasonForDebugging::Sleep => "Sleep",
         ThreadWaitReasonForDebugging::Ipc => "IPC",
         ThreadWaitReasonForDebugging::Synchronization => "Synchronization",
@@ -203,8 +176,7 @@ pub fn get_thread_wait_reason(thread: &KThread) -> &'static str {
 /// Corresponds to upstream `Core::GetThreadState`.
 pub fn get_thread_state(thread: &KThread) -> String {
     use crate::hle::kernel::k_thread::ThreadState;
-    let real = unsafe { real_thread(thread) };
-    let state = real.get_state();
+    let state = thread.get_state();
     match state {
         ThreadState::INITIALIZED => "Initialized".to_string(),
         ThreadState::WAITING => {
@@ -222,27 +194,96 @@ pub fn get_thread_state(thread: &KThread) -> String {
 /// Walks the page table looking for executable Code sections, reads MOD0
 /// headers to extract module path names.
 pub fn find_modules(process: &KProcess) -> Modules {
-    let real = unsafe { real_process(process) };
-    let memory = real.get_shared_memory();
-    let mem = memory.read().unwrap();
-    let _is_64bit = real.is_64bit();
+    const PATH_LENGTH_MAX: usize = 0x200;
+    const MODULE_PATH_SIZE: usize = 8 + PATH_LENGTH_MAX;
 
-    // Upstream iterates memory regions via page table query_info().
-    // KProcessPageTable::query_info is not fully wired yet.
-    // Return empty for now — the backtrace will show raw addresses.
-    // When page table query is available, this should walk Code regions
-    // and extract MOD0 module names.
-    drop(mem);
-    Modules::new()
+    let mut modules = Modules::new();
+    let mut current_address = 0usize;
+
+    loop {
+        let memory_info = process
+            .page_table
+            .query_info(current_address)
+            .expect("process page-table query must succeed");
+        let base_address = memory_info.get_address();
+        let size = memory_info.get_size();
+
+        if memory_info.get_permission() == KMemoryPermission::USER_READ_EXECUTE
+            && matches!(
+                memory_info.get_state(),
+                KMemoryState::CODE | KMemoryState::ALIAS_CODE
+            )
+        {
+            let mut module_path = [0u8; MODULE_PATH_SIZE];
+            let path_address = base_address.wrapping_add(size) as u64;
+            if read_process_memory(process, path_address, &mut module_path) {
+                let zero = u32::from_le_bytes(module_path[0..4].try_into().unwrap());
+                let path_length = i32::from_le_bytes(module_path[4..8].try_into().unwrap());
+                if zero == 0 && path_length > 0 {
+                    let path = &mut module_path[8..];
+                    path[PATH_LENGTH_MAX - 1] = 0;
+                    let path_end = usize::min(PATH_LENGTH_MAX, path_length as usize);
+                    let mut path_start = 0;
+                    for (index, byte) in path[..path_end].iter().copied().enumerate() {
+                        if byte == 0 {
+                            break;
+                        }
+                        if byte == b'/' || byte == b'\\' {
+                            path_start = index + 1;
+                        }
+                    }
+                    modules.insert(
+                        base_address as u64,
+                        String::from_utf8_lossy(&path[path_start..path_end]).into_owned(),
+                    );
+                }
+            }
+        }
+
+        let next_address = base_address.wrapping_add(size);
+        if next_address <= current_address {
+            break;
+        }
+        current_address = next_address;
+    }
+
+    modules
 }
 
 /// Get the end address of a module starting at `base`.
 /// Corresponds to upstream `Core::GetModuleEnd`.
 pub fn get_module_end(process: &KProcess, base: u64) -> u64 {
-    let _real = unsafe { real_process(process) };
-    // Upstream walks consecutive memory regions: .text (r-x) → .rodata (r--) → .data (rw-).
-    // Requires page table query_info.
-    base
+    let mut current_address = base as usize;
+
+    let text = process
+        .page_table
+        .query_info(current_address)
+        .expect("module text page-table query must succeed");
+    current_address = text.get_address().wrapping_add(text.get_size());
+    if text.get_state() != KMemoryState::CODE
+        || text.get_permission() != KMemoryPermission::USER_READ_EXECUTE
+    {
+        return current_address.wrapping_sub(1) as u64;
+    }
+
+    let rodata = process
+        .page_table
+        .query_info(current_address)
+        .expect("module rodata page-table query must succeed");
+    current_address = rodata.get_address().wrapping_add(rodata.get_size());
+    if rodata.get_state() != KMemoryState::CODE
+        || rodata.get_permission() != KMemoryPermission::USER_READ
+    {
+        return current_address.wrapping_sub(1) as u64;
+    }
+
+    let data = process
+        .page_table
+        .query_info(current_address)
+        .expect("module data page-table query must succeed");
+    data.get_address()
+        .wrapping_add(data.get_size())
+        .wrapping_sub(1) as u64
 }
 
 /// Find the entrypoint of the main module.
@@ -256,8 +297,22 @@ pub fn find_main_module_entrypoint(process: &KProcess) -> u64 {
         *modules.keys().next().unwrap()
     } else {
         // Upstream: falls back to code region start.
-        0
+        process.page_table.get_code_region_start().get()
     }
+}
+
+fn read_process_memory(process: &KProcess, address: u64, output: &mut [u8]) -> bool {
+    if let Some(memory) = process.get_memory() {
+        return memory.lock().unwrap().read_block(address, output);
+    }
+
+    let memory = process.get_shared_memory();
+    let memory = memory.read().unwrap();
+    if !memory.is_valid_range(address, output.len()) {
+        return false;
+    }
+    output.copy_from_slice(&memory.read_bytes(address, output.len()));
+    true
 }
 
 /// Invalidate instruction cache range across all CPU cores.
@@ -337,11 +392,16 @@ pub fn get_backtrace_from_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{can_walk_frame_record, range_fits_memory_info};
+    use super::{
+        can_walk_frame_record, find_main_module_entrypoint, find_modules, get_module_end,
+        range_fits_memory_info,
+    };
     use crate::hle::kernel::k_memory_block::{
         KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryInfo, KMemoryPermission,
         KMemoryState,
     };
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_typed_address::KProcessAddress;
 
     #[test]
     fn can_walk_frame_record_rejects_zero_and_misaligned_pointers() {
@@ -390,13 +450,89 @@ mod tests {
 
         assert!(!range_fits_memory_info(0x2000, 8, &info));
     }
+
+    fn module_process() -> KProcess {
+        const BASE: usize = 0x20_0000;
+        let mut process = KProcess::new();
+        process.allocate_code_memory(BASE as u64, 0x10_000);
+
+        let manager = process
+            .page_table
+            .get_base_mut()
+            .get_memory_block_manager_mut();
+        manager.update(
+            BASE,
+            1,
+            KMemoryState::CODE,
+            KMemoryPermission::USER_READ_EXECUTE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        manager.update(
+            BASE + 0x1000,
+            1,
+            KMemoryState::CODE,
+            KMemoryPermission::USER_READ,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        manager.update(
+            BASE + 0x2000,
+            1,
+            KMemoryState::CODE_DATA,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let path = b"sdmc:/switch/freebrick/freebrick.nro";
+        let mut module_path = [0u8; 0x208];
+        module_path[4..8].copy_from_slice(&(path.len() as i32).to_le_bytes());
+        module_path[8..8 + path.len()].copy_from_slice(path);
+        process
+            .process_memory
+            .write()
+            .unwrap()
+            .write_block((BASE + 0x1000) as u64, &module_path);
+
+        process
+    }
+
+    #[test]
+    fn module_discovery_reads_name_after_executable_region() {
+        let process = module_process();
+
+        assert_eq!(
+            find_modules(&process).get(&0x20_0000).map(String::as_str),
+            Some("freebrick.nro")
+        );
+        assert_eq!(get_module_end(&process, 0x20_0000), 0x20_2fff);
+        assert_eq!(find_main_module_entrypoint(&process), 0x20_0000);
+    }
+
+    #[test]
+    fn main_module_entrypoint_falls_back_to_code_region_start() {
+        let mut process = KProcess::new();
+        process.page_table.configure_address_space(
+            KProcessAddress::new(0),
+            0x1_0000_0000,
+            32,
+        );
+        process
+            .page_table
+            .set_code_region(KProcessAddress::new(0x60_0000), 0x10_000);
+
+        assert_eq!(find_main_module_entrypoint(&process), 0x60_0000);
+    }
 }
 
 /// Get a backtrace from a thread.
 /// Corresponds to upstream `Core::GetBacktrace`.
 pub fn get_backtrace(thread: &KThread) -> Vec<BacktraceEntry> {
-    let real = unsafe { real_thread(thread) };
-    let ctx = &real.thread_context;
+    let ctx = &thread.thread_context;
     let arm_ctx = ThreadContext {
         r: ctx.r,
         fp: ctx.fp,
@@ -410,7 +546,7 @@ pub fn get_backtrace(thread: &KThread) -> Vec<BacktraceEntry> {
         fpsr: ctx.fpsr,
         tpidr: ctx.tpidr,
     };
-    if let Some(parent) = real.parent.as_ref().and_then(|w| w.upgrade()) {
+    if let Some(parent) = thread.parent.as_ref().and_then(|w| w.upgrade()) {
         let process = parent.lock().unwrap();
         get_backtrace_from_context(&process, &arm_ctx)
     } else {
@@ -425,7 +561,7 @@ fn symbolicate_backtrace(
     out: &mut Vec<BacktraceEntry>,
     is_64: bool,
 ) {
-    let modules = find_modules_for_process(process);
+    let modules = find_modules(process);
     let segment_base = SEGMENT_BASES[is_64 as usize];
 
     for entry in out.iter_mut() {
@@ -446,13 +582,4 @@ fn symbolicate_backtrace(
 
         // Symbol lookup would go here via symbols::get_symbol_name.
     }
-}
-
-fn find_modules_for_process(process: &crate::hle::kernel::k_process::KProcess) -> Modules {
-    let memory = process.get_shared_memory();
-    let mem = memory.read().unwrap();
-    let _is_64bit = process.is_64bit();
-
-    drop(mem);
-    Modules::new()
 }

@@ -7981,3 +7981,26 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: this formats a remote-protocol reply and introduces no payload structure.
+
+## 2026-08-22 — `src/core/src/arm/debug.rs` vs Eden `src/core/arm/debug.{h,cpp}` module discovery
+
+### Intentional differences
+- Rust page-table queries return `Option` and are asserted with `expect` where Eden uses `R_ASSERT`.
+  Isolated tests can read the process-memory fallback when the runtime `Memory` bridge is absent.
+- Module path bytes are converted lossily to Rust UTF-8 strings; valid UTF-8 and ASCII paths retain
+  Eden's exact basename and declared-length behavior.
+
+### Unintentional differences (to fix)
+- `FindModules`, `GetModuleEnd` and the no-module entrypoint fallback previously returned empty or
+  placeholder values. They now reproduce Eden's complete region walk, state/permission checks,
+  module-path record parsing, three-segment end calculation and code-region fallback.
+- The file previously invented opaque process/thread types and duplicated an empty module walker for
+  symbolication. It now uses the owning kernel types and the single upstream-equivalent function.
+
+### Missing items
+- Existing backtrace symbol names are still not resolved/demangled because Ruzu has no counterpart
+  for Eden `common/demangle.{h,cpp}`; this is independent of the GDB module-enumeration prerequisite.
+
+### Binary layout verification
+- PASS: the module path record is decoded as upstream's `u32`, `s32`, and 0x200-byte path in its
+  exact 0x208-byte little-endian layout; focused coverage reads a real record from process memory.

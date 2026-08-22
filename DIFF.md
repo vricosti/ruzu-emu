@@ -7143,3 +7143,23 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - PASS: flag bases and values remain unchanged (`u32` for window transform, `u16` for poll events).
+
+## 2026-08-22 — exhaustive value handling in `k_page_table_base.rs`, VI scaling, and `internal_network/sockets.rs` vs Eden counterparts
+
+### Intentional differences
+- Eden's `OperationType` switch ends in `UNREACHABLE`; Rust's closed enum makes the equivalent
+  single-address `operate` match exhaustive at compile time, so an unreachable wildcard is omitted.
+- POSIX platforms may define `EWOULDBLOCK` and `EAGAIN` to the same number. Ruzu uses one guarded
+  match arm so both names map to `Errno::Again` without an unreachable-pattern diagnostic.
+
+### Unintentional differences (to fix)
+- VI previously transmuted an arbitrary IPC `u32` into `NintendoScaleMode`, which is undefined
+  behavior for values outside 0..=4 and made its fallback arm illusory. `from_raw` now rejects such
+  values before enum construction and returns `ResultOperationFailed`, matching Eden's `default`.
+
+### Missing items
+- None for these value-domain checks.
+
+### Binary layout verification
+- PASS: `NintendoScaleMode` remains `repr(u32)` with values 0 through 4; the new conversion does not
+  alter its representation. `OperationType` discriminants and native errno values are unchanged.

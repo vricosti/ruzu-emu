@@ -1473,13 +1473,6 @@ impl KPageTableBase {
 
                 0
             }
-            _ => {
-                log::error!(
-                    "KPageTableBase::Operate: unhandled operation {:?}",
-                    operation
-                );
-                svc_results::RESULT_INVALID_STATE.get_inner_value()
-            }
         }
     }
 

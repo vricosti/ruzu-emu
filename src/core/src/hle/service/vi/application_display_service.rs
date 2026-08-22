@@ -436,8 +436,7 @@ impl IApplicationDisplayService {
             mode_val
         );
 
-        let mode = unsafe { std::mem::transmute::<u32, NintendoScaleMode>(mode_val) };
-        match convert_scaling_mode(mode) {
+        match NintendoScaleMode::from_raw(mode_val).and_then(convert_scaling_mode) {
             Some(converted) => {
                 let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
@@ -603,7 +602,6 @@ pub fn convert_scaling_mode(mode: NintendoScaleMode) -> Option<ConvertedScaleMod
         NintendoScaleMode::ScaleToWindow => Some(ConvertedScaleMode::ScaleToWindow),
         NintendoScaleMode::ScaleAndCrop => Some(ConvertedScaleMode::ScaleAndCrop),
         NintendoScaleMode::PreserveAspectRatio => Some(ConvertedScaleMode::PreserveAspectRatio),
-        _ => None,
     }
 }
 

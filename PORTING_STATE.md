@@ -10,6 +10,12 @@
 - Resume condition: add the persistent font shared-memory object to `KernelCore`, initialize it
   with Eden's owner/user permissions and lifetime, verify it, then make both `pl:*` services return
   that kernel object and remove their redundant allocation/cache path.
+- Prerequisite result: `KernelCore` now owns and initializes the persistent font object before IRS,
+  exposes its stable object ID and owner, and releases it before IRS during shutdown.
+- Resumed result: `IPlatformServiceManager::GetSharedMemoryNativeHandle` now copies its complete font
+  blob into that kernel object on every call, registers that same object with the caller, and no
+  longer owns a per-service cache or performs the duplicate caller lookup that caused the warning.
+- Status: prerequisite and resumed platform-service slice completed and re-verified.
 
 ## 2026-08-22 — Application display-version warning interrupted by metadata prerequisite
 

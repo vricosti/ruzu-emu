@@ -4,14 +4,12 @@
 //! Port of zuyu/src/core/hle/service/ns/platform_service_manager.cpp/.h
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-
 use crate::core::SystemRef;
 use crate::file_sys::system_archive::data::{
     font_chinese_simplified, font_chinese_traditional, font_extended_chinese_simplified,
     font_korean, font_nintendo_extended, font_standard,
 };
-use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
+use crate::hle::kernel::k_shared_memory::KSharedMemory;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -71,6 +69,18 @@ fn shared_font_priority_count(
     .into_iter()
     .min()
     .unwrap_or(0)
+}
+
+fn copy_shared_font_bytes(shared_font_bytes: &[u8], shared_memory: &KSharedMemory) -> bool {
+    let dst = shared_memory.get_pointer_mut(0);
+    if dst.is_null() {
+        return false;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(shared_font_bytes.as_ptr(), dst, shared_font_bytes.len());
+    }
+    true
 }
 
 const SHARED_FONTS: [(FontArchives, &[u8]); 7] = [
@@ -418,7 +428,6 @@ pub struct IPlatformServiceManager {
     service_name: &'static str,
     shared_font_bytes: Vec<u8>,
     shared_font_regions: Vec<FontRegion>,
-    shared_memory: Mutex<Option<(u64, Arc<KSharedMemory>)>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -431,7 +440,6 @@ impl IPlatformServiceManager {
             service_name,
             shared_font_bytes,
             shared_font_regions,
-            shared_memory: Mutex::new(None),
             handlers: build_handler_map(&[
                 (0, Some(Self::request_load_handler), "RequestLoad"),
                 (1, Some(Self::get_load_state_handler), "GetLoadState"),
@@ -472,48 +480,6 @@ impl IPlatformServiceManager {
             .unwrap_or(EMPTY_REGION)
     }
 
-    fn create_shared_memory_object(
-        &self,
-        ctx: &HLERequestContext,
-    ) -> Option<(u64, Arc<KSharedMemory>)> {
-        let thread = ctx.get_thread()?;
-        let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
-
-        let system_ptr =
-            self.system.get() as *const crate::core::System as *mut crate::core::System;
-        let device_memory_ptr = unsafe { (*system_ptr).device_memory() as *const _ };
-        let kernel = unsafe { (*system_ptr).kernel_mut()? };
-
-        let mut shmem = KSharedMemory::new();
-        if shmem
-            .initialize(
-                unsafe { &*device_memory_ptr },
-                kernel.memory_manager_mut(),
-                MemoryPermission::Read,
-                MemoryPermission::Read,
-                SHARED_FONT_MEM_SIZE as usize,
-            )
-            .is_error()
-        {
-            return None;
-        }
-
-        let dst = shmem.get_pointer_mut(0);
-        if dst.is_null() {
-            return None;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.shared_font_bytes.as_ptr(),
-                dst,
-                self.shared_font_bytes.len(),
-            );
-        }
-
-        let object_id = kernel.create_new_object_id() as u64;
-        Some((object_id, Arc::new(shmem)))
-    }
-
     // ---------------- Business-logic methods ----------------
     // Mirror upstream's `Result Method(Out<T>, In<T>, ...)` signatures.
 
@@ -546,29 +512,20 @@ impl IPlatformServiceManager {
         RESULT_SUCCESS
     }
 
-    /// Resolve or create the font shared-memory object and register it with the
-    /// caller's process. The IPC layer creates the copy handle from the returned
-    /// object id, matching upstream `OutCopyHandle<KSharedMemory>`.
+    /// Copy the font blob into the kernel-owned shared-memory object and register
+    /// it with the caller's process. The IPC layer creates the copy handle from
+    /// the returned object id, matching upstream `OutCopyHandle<KSharedMemory>`.
     fn get_shared_memory_native_handle(&self, ctx: &mut HLERequestContext) -> Option<u64> {
         log::info!("pl:u GetSharedMemoryNativeHandle begin");
         let object_id = (|| -> Option<u64> {
+            let (object_id, shared_memory) = self.system.get().kernel()?.get_font_shared_mem()?;
+            if !copy_shared_font_bytes(&self.shared_font_bytes, &shared_memory) {
+                log::error!("pl:u GetSharedMemoryNativeHandle font shared memory is unavailable");
+                return None;
+            }
+
             let thread = ctx.get_thread()?;
             let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
-
-            let (object_id, shared_memory) = {
-                let mut cached = self.shared_memory.lock().unwrap();
-                if cached.is_none() {
-                    log::info!("pl:u GetSharedMemoryNativeHandle creating shared memory");
-                    *cached = self.create_shared_memory_object(ctx);
-                    if cached.is_none() {
-                        log::error!(
-                            "pl:u GetSharedMemoryNativeHandle create_shared_memory_object returned None"
-                        );
-                    }
-                }
-                cached.as_ref()?.clone()
-            };
-
             let mut process = parent.lock().unwrap();
             process.register_shared_memory_object(object_id, shared_memory);
             Some(object_id)
@@ -725,6 +682,42 @@ impl ServiceFramework for IPlatformServiceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_memory::{dram_memory_map, DeviceMemory};
+    use crate::hle::kernel::k_memory_manager::{KMemoryManager, Pool};
+    use crate::hle::kernel::k_shared_memory::MemoryPermission;
+
+    #[test]
+    fn shared_font_copy_overwrites_the_complete_kernel_buffer() {
+        const MEMORY_SIZE: usize = 0x400_0000;
+        let device_memory = DeviceMemory::with_size(MEMORY_SIZE);
+        let mut memory_manager = KMemoryManager::new();
+        memory_manager.initialize_pool(Pool::SECURE, dram_memory_map::BASE, MEMORY_SIZE);
+        let mut shared_memory = KSharedMemory::new();
+        assert!(shared_memory
+            .initialize(
+                &device_memory,
+                &mut memory_manager,
+                MemoryPermission::None,
+                MemoryPermission::Read,
+                SHARED_FONT_MEM_SIZE as usize,
+            )
+            .is_success());
+
+        let (blob, _) = build_shared_font_blob();
+        unsafe {
+            std::ptr::write_bytes(
+                shared_memory.get_pointer_mut(0),
+                0xa5,
+                SHARED_FONT_MEM_SIZE as usize,
+            );
+        }
+
+        assert!(copy_shared_font_bytes(&blob, &shared_memory));
+        let copied = unsafe {
+            std::slice::from_raw_parts(shared_memory.get_pointer(0), SHARED_FONT_MEM_SIZE as usize)
+        };
+        assert_eq!(copied, blob);
+    }
 
     #[test]
     fn shared_font_blob_builds_seven_regions() {

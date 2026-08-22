@@ -7340,3 +7340,26 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: the object owns raw shared pages rather than a serialized structure. A focused test verifies
   the exact allocation size and stable object identity across repeated initialization.
+
+## 2026-08-22 — `src/core/src/hle/service/ns/platform_service_manager.rs` vs Eden `src/core/hle/service/ns/platform_service_manager.{h,cpp}`
+
+### Intentional differences
+- Rust registers the kernel object's stable ID and `Arc<KSharedMemory>` with the caller process so
+  its IPC layer can translate the deferred copy object into a process handle. Eden's intrusive
+  kernel object and CMIF `OutCopyHandle` perform the equivalent registration during serialization.
+- The direct full-buffer copy is extracted into a file-local helper so it can be tested against a
+  real `KSharedMemory` without constructing a complete emulator system.
+
+### Unintentional differences (to fix)
+- `GetSharedMemoryNativeHandle` previously allocated and cached a separate shared memory in each
+  `pl:*` service, used incorrect owner permission `Read`, and redundantly resolved the caller twice.
+  It now copies the complete font blob into `KernelCore::GetFontSharedMem()` on every request and
+  returns that single kernel-owned object, matching Eden.
+
+### Missing items
+- None for font-buffer copying, shared-object ownership, caller registration, or returned handle
+  identity in `GetSharedMemoryNativeHandle`.
+
+### Binary layout verification
+- PASS: the copied region remains exactly `0x1100000` bytes. A focused test pre-fills the complete
+  kernel buffer and verifies that the service copy overwrites it byte-for-byte with the font blob.

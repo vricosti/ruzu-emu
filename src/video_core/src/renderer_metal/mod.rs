@@ -27,5 +27,6 @@ pub mod metal_sampler;
 pub mod metal_scheduler;
 pub mod metal_shader;
 pub mod metal_staging_buffer_pool;
+pub mod metal_state_tracker;
 pub mod metal_texture_cache;
 pub mod renderer_metal;

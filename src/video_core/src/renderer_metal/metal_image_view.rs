@@ -88,7 +88,7 @@ impl MetalImageView {
                     layer_count.map_or(slices, |count| NSRange::new(slices.location, count));
                 unsafe {
                     image
-                        .handle()
+                        .view_source(texture_type)
                         .newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
                             format,
                             metal_type,
@@ -148,10 +148,17 @@ impl MetalImageView {
         };
 
         let render_target = if view.is_render_target() && render_format != format {
-            unsafe {
+            let source = if image.image_type() == crate::texture_cache::types::ImageType::E3D
+                && sampled_render_target.textureType() != MTLTextureType::Type3D
+            {
                 image
-                    .handle()
-                    .newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                    .slice_handle()
+                    .expect("3D images must own slice-compatible Metal storage")
+            } else {
+                image.handle()
+            };
+            unsafe {
+                source.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
                         render_format,
                         sampled_render_target.textureType(),
                         levels,

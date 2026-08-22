@@ -316,6 +316,35 @@ fn setup_dirty_vertex_bindings(tables: &mut DirtyTables) {
     }
 }
 
+/// Install the dirty-register tables consumed by `FixedPipelineState` and the
+/// Vulkan dynamic-state tracker.
+///
+/// The native Metal backend intentionally reuses `FixedPipelineState`, so it
+/// must install the same register-to-flag mapping. Keeping the mapping here
+/// preserves the single owner corresponding to Eden's `vk_state_tracker.cpp`.
+pub(crate) fn setup_pipeline_state_dirty_tables(tables: &mut DirtyTables) {
+    setup_dirty_flags(tables);
+    setup_dirty_viewports(tables);
+    setup_dirty_scissors(tables);
+    setup_dirty_depth_bias(tables);
+    setup_dirty_blend_constants(tables);
+    setup_dirty_depth_bounds(tables);
+    setup_dirty_stencil_properties(tables);
+    setup_dirty_line_width(tables);
+    setup_dirty_cull_mode(tables);
+    setup_dirty_state_enable(tables);
+    set(tables, 0, DEPTH_TEST_FUNC, dirty::DEPTH_COMPARE_OP);
+    set(tables, 0, FRONT_FACE, dirty::FRONT_FACE);
+    set(tables, 0, WINDOW_ORIGIN, dirty::FRONT_FACE);
+    setup_dirty_stencil_op(tables);
+    setup_dirty_blending(tables);
+    setup_dirty_viewport_swizzles(tables);
+    setup_dirty_vertex_attributes(tables);
+    setup_dirty_vertex_bindings(tables);
+    set(tables, 0, LOGIC_OP + 1, dirty::LOGIC_OP);
+    setup_raster_modes(tables);
+}
+
 /// Backing store for dirty flags — a simple boolean array.
 /// Port of `Tegra::Engines::Maxwell3D::DirtyState::Flags`.
 pub type DirtyFlags = [bool; 256];
@@ -422,26 +451,7 @@ impl StateTracker {
         for table in tables.iter_mut() {
             table.fill(crate::dirty_flags::flags::NULL_ENTRY);
         }
-        setup_dirty_flags(tables);
-        setup_dirty_viewports(tables);
-        setup_dirty_scissors(tables);
-        setup_dirty_depth_bias(tables);
-        setup_dirty_blend_constants(tables);
-        setup_dirty_depth_bounds(tables);
-        setup_dirty_stencil_properties(tables);
-        setup_dirty_line_width(tables);
-        setup_dirty_cull_mode(tables);
-        setup_dirty_state_enable(tables);
-        set(tables, 0, DEPTH_TEST_FUNC, dirty::DEPTH_COMPARE_OP);
-        set(tables, 0, FRONT_FACE, dirty::FRONT_FACE);
-        set(tables, 0, WINDOW_ORIGIN, dirty::FRONT_FACE);
-        setup_dirty_stencil_op(tables);
-        setup_dirty_blending(tables);
-        setup_dirty_viewport_swizzles(tables);
-        setup_dirty_vertex_attributes(tables);
-        setup_dirty_vertex_bindings(tables);
-        set(tables, 0, LOGIC_OP + 1, dirty::LOGIC_OP);
-        setup_raster_modes(tables);
+        setup_pipeline_state_dirty_tables(tables);
     }
 
     /// Port of `StateTracker::ChangeChannel`.

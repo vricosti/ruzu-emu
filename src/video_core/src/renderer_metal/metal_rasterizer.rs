@@ -62,6 +62,7 @@ use super::metal_pipeline_cache::MetalPipelineError;
 use super::metal_query_cache::{MetalQueryCache, MetalQueryCacheError};
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 use super::metal_staging_buffer_pool::{MetalStagingBufferError, MetalStagingBufferPool};
+use super::metal_state_tracker::MetalStateTracker;
 use super::metal_texture_cache::MetalTextureCache;
 
 macro_rules! lock_two_reentrant_mutexes {
@@ -350,6 +351,7 @@ pub struct MetalRasterizer {
     common_buffer_cache: Box<MetalCommonBufferCache>,
     texture_cache: Box<MetalTextureCache>,
     query_cache: MetalQueryCache,
+    state_tracker: MetalStateTracker,
     fence_manager: MetalFenceManager,
     blit_image: MetalBlitHelper,
     accelerate_dma: AccelerateDMA,
@@ -390,6 +392,7 @@ impl MetalRasterizer {
         let shader_cache = ShaderCache::new(device_memory);
         let pipeline_cache = MetalPipelineCache::new(device.clone());
         let query_cache = MetalQueryCache::new(&device)?;
+        let state_tracker = MetalStateTracker::new();
         let fence_manager = MetalFenceManager::new(false);
         let blit_image = MetalBlitHelper::new(&device)?;
         let accelerate_dma = AccelerateDMA::new(common_buffer_cache.as_mut());
@@ -403,6 +406,7 @@ impl MetalRasterizer {
             common_buffer_cache,
             texture_cache,
             query_cache,
+            state_tracker,
             fence_manager,
             blit_image,
             accelerate_dma,
@@ -469,6 +473,7 @@ impl MetalRasterizer {
         self.texture_cache.create_channel(channel);
         self.common_buffer_cache.create_channel(channel);
         self.shader_cache.create_channel(channel);
+        self.state_tracker.setup_tables(channel);
     }
 
     /// Port of Eden `RasterizerVulkan::BindChannel` for the caches currently
@@ -481,6 +486,8 @@ impl MetalRasterizer {
         self.texture_cache.bind_to_channel(channel.bind_id);
         self.common_buffer_cache.bind_to_channel(channel.bind_id);
         self.shader_cache.bind_to_channel(channel.bind_id);
+        self.state_tracker.change_channel(channel);
+        self.state_tracker.invalidate_state(channel);
         self.channel_memory_manager = self
             .channel_caches
             .current_channel_state()
@@ -505,6 +512,7 @@ impl MetalRasterizer {
         self.texture_cache.erase_channel(channel_id);
         self.common_buffer_cache.erase_channel(channel_id);
         self.shader_cache.erase_channel(channel_id);
+        self.state_tracker.release_channel(channel_id);
         self.channel_memory_manager = self
             .channel_caches
             .current_channel_state()

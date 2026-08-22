@@ -40,7 +40,6 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
                     p,
                     thread.get_user_disable_count(),
                     thread.get_thread_id(),
-                    thread.get_current_core(),
                     thread.is_termination_requested(),
                     thread.scheduler_lock_ptr,
                 )
@@ -51,7 +50,6 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
             parent_arc,
             user_disable_count,
             thread_id,
-            thread_core,
             is_termination_requested,
             scheduler_lock_ptr,
         )) = snapshot

@@ -7223,3 +7223,20 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: condition-variable ownership and queues are host kernel state; no raw payload layout changes.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_interrupt_manager.rs` vs Eden `src/core/hle/kernel/k_interrupt_manager.{h,cpp}`
+
+### Intentional differences
+- Ruzu snapshots the current thread fields before acquiring scheduler and process locks to preserve
+  its host-mutex order. Eden accesses the embedded kernel objects directly under its scheduler lock.
+
+### Unintentional differences (to fix)
+- The snapshot included `KThread::current_core`, although both Eden and Ruzu use the interrupt's
+  `core_id` for the pinned-thread lookup and pin operation. The unused field read is removed.
+
+### Missing items
+- None for interrupt-core selection: clear, pinned-thread lookup, pinning, and schedule request all
+  continue to use the `core_id` argument supplied by the physical core.
+
+### Binary layout verification
+- N/A: the removed tuple element was temporary host state and was never serialized.

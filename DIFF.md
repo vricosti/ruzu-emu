@@ -7382,3 +7382,23 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: no serialized or raw-memory payload changes. A focused state test verifies that release
   frees the acquired slot without replacing its existing fence.
+
+## 2026-08-22 — `src/core/src/hle/service/nvnflinger/buffer_queue_producer.rs` vs Eden `src/core/hle/service/nvnflinger/buffer_queue_producer.cpp`
+
+### Intentional differences
+- Rust turns Eden's fatal `UNIMPLEMENTED_IF_MSG` and `ASSERT_MSG` paths into explicit panics because
+  it does not use Eden's assertion macros.
+
+### Unintentional differences (to fix)
+- The Connect-listener panic helper accepted but ignored the transaction code even though Eden's
+  listener diagnostic does not include it; the dead parameter is removed.
+- The generic unsupported-transaction panic previously supplied `name` and `code` in reverse order.
+  It now reports the numeric transaction first and its symbolic name second.
+
+### Missing items
+- Producer-listener parcel decoding remains intentionally unimplemented exactly where Eden raises
+  `UNIMPLEMENTED_IF_MSG`.
+
+### Binary layout verification
+- N/A: only fatal diagnostics changed. Focused tests verify the exact listener and unsupported
+  transaction messages.

@@ -88,11 +88,11 @@ fn trace_dequeue_return_for_present(seq: u64, status: Status, slot: i32, flags: 
 fn stop_unimplemented_transact(code: u32, name: &str) -> ! {
     panic!(
         "BufferQueueProducer::transact unimplemented transaction {} ({})",
-        name, code
+        code, name
     );
 }
 
-fn stop_unimplemented_connect_listener(code: u32) -> ! {
+fn stop_unimplemented_connect_listener() -> ! {
     panic!("BufferQueueProducer::transact Connect listener is unimplemented");
 }
 
@@ -1284,7 +1284,7 @@ impl IBinder for BufferQueueProducer {
                 let producer_controlled_by_app = parcel_in.read::<u8>() != 0;
 
                 if enable_listener {
-                    stop_unimplemented_connect_listener(code);
+                    stop_unimplemented_connect_listener();
                 }
 
                 let (new_status, output) = self.connect(None, api, producer_controlled_by_app);
@@ -1653,8 +1653,8 @@ pub fn dump_bqp_slot_profile() {
 mod tests {
     use common::math_util::Rectangle;
 
-    use crate::hle::service::kernel_helpers::ServiceContext;
     use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::service::kernel_helpers::ServiceContext;
     use crate::hle::service::nvdrv::core::container::Container;
 
     use super::super::buffer_item::BufferItem;
@@ -1662,6 +1662,16 @@ mod tests {
     use super::super::graphic_buffer_producer::QueueBufferInput;
     use super::super::pixel_format::PixelFormat;
     use super::*;
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(message) => (*message).to_owned(),
+                Err(_) => "non-string panic".to_owned(),
+            },
+        }
+    }
 
     struct TestConsumerListener;
 
@@ -2193,7 +2203,10 @@ mod tests {
             IBinder::transact(&producer, 6, &parcel, &mut reply, 0);
         }));
 
-        assert!(result.is_err());
+        assert_eq!(
+            panic_message(result.unwrap_err()),
+            "BufferQueueProducer::transact unimplemented transaction 6 (AttachBuffer)"
+        );
     }
 
     #[test]
@@ -2221,6 +2234,9 @@ mod tests {
             IBinder::transact(&producer, 10, &parcel, &mut reply, 0);
         }));
 
-        assert!(result.is_err());
+        assert_eq!(
+            panic_message(result.unwrap_err()),
+            "BufferQueueProducer::transact Connect listener is unimplemented"
+        );
     }
 }

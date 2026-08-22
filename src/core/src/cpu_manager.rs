@@ -7,7 +7,6 @@
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
 use crate::hle::kernel::k_interrupt_manager;
-use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::kernel::KernelCore;
 use common::fiber::Fiber;
@@ -753,7 +752,7 @@ impl CpuManager {
         // this guest thread exists. `arm_interfaces` entries are populated once
         // during process init and never change afterwards, so holding raw
         // pointers into them is sound for the thread's lifetime.
-        let (parent_arc, is_64bit, cached_jits): (
+        let (_process_owner, is_64bit, cached_jits): (
             _,
             bool,
             [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
@@ -793,7 +792,6 @@ impl CpuManager {
                 Self::run_guest_thread_once(
                     kernel,
                     physical_core,
-                    &parent_arc,
                     &thread_arc,
                     is_64bit,
                     &cached_jits,
@@ -835,7 +833,6 @@ impl CpuManager {
     fn run_guest_thread_once(
         kernel: &KernelCore,
         physical_core: &super::hle::kernel::physical_core::PhysicalCore,
-        process: &Arc<ProcessLock>,
         thread_arc: &Arc<KThreadLock>,
         is_64bit: bool,
         cached_jits: &[Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
@@ -1829,7 +1826,7 @@ impl CpuManager {
                 // Single-core path: one host thread, no contention. Fetch the
                 // JIT per-iteration (matches upstream's RunThread) — the
                 // multi-core caching optimization above is unnecessary here.
-                let (parent_arc, is_64bit, cached_jits) = {
+                let (_process_owner, is_64bit, cached_jits) = {
                     let parent_weak = {
                         let thread = thread_arc.lock().unwrap();
                         match thread.parent.as_ref() {
@@ -1860,7 +1857,6 @@ impl CpuManager {
                 Self::run_guest_thread_once(
                     kernel,
                     physical_core,
-                    &parent_arc,
                     &thread_arc,
                     is_64bit,
                     &cached_jits,

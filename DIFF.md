@@ -7083,3 +7083,25 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: the reusable vectors are host-only storage. Their requested lengths still come directly from
   the IPC write descriptors, and a focused test verifies resize and deterministic clearing.
+
+## 2026-08-22 — `src/core/src/cpu_manager.rs` and `src/core/src/hle/kernel/k_scheduler.rs` vs Eden `cpu_manager.{h,cpp}` and `k_scheduler.{h,cpp}`
+
+### Intentional differences
+- Ruzu's CPU loop passes a cached per-core JIT table into its `run_guest_thread_once` adaptation;
+  the retained `_process_owner` `Arc` keeps those raw pointers valid without locking the process on
+  every inner-loop iteration. Eden follows raw owner pointers from `KThread` in `PhysicalCore`.
+- `wait_for_next_runnable_thread` is a Rust polling fallback around the scheduler priority queue;
+  Eden's fiber switch loop waits through its scheduler/idle-thread lifecycle instead.
+
+### Unintentional differences (to fix)
+- The process owner was redundantly passed into `run_guest_thread_once` after the cached-JIT change,
+  although the callee never read it. Ownership now remains explicitly in each caller only.
+- The Rust-only runnable-thread polling helper accepted a current-thread ID that never influenced
+  selection. The dead parameter and its forwarding were removed.
+
+### Missing items
+- This slice does not change the already documented Rust scheduler/fiber adaptations; it only
+  removes parameters with no control-flow, lifetime, or selection role.
+
+### Binary layout verification
+- N/A: these are host execution-loop signatures and do not define serialized guest data.

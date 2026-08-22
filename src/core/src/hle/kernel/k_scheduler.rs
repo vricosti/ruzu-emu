@@ -2724,11 +2724,7 @@ impl KScheduler {
         woke_any
     }
 
-    pub fn wait_for_next_runnable_thread(
-        &mut self,
-        process: &Arc<ProcessLock>,
-        current_thread_id: u64,
-    ) -> u64 {
+    pub fn wait_for_next_runnable_thread(&mut self, process: &Arc<ProcessLock>) -> u64 {
         loop {
             // Upstream does not have the scheduler proactively deliver sleep
             // timer expirations by polling thread-local deadlines here.
@@ -3309,7 +3305,7 @@ impl KScheduler {
         if self.exit_thread_if_termination_requested(process, current_thread_id) {
             self.request_schedule();
         }
-        let next_thread_id = self.wait_for_next_runnable_thread(process, current_thread_id);
+        let next_thread_id = self.wait_for_next_runnable_thread(process);
         process
             .lock()
             .unwrap()

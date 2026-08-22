@@ -6853,3 +6853,27 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: `LocationName` remains 0x24 bytes and `SteadyClockTimePoint` remains 0x18 bytes. Focused
   round-trip coverage includes a negative signed time point and a nonzero homebrew test UUID.
+
+## 2026-08-22 — `src/core/src/hle/service/hid/hid_debug_server.rs` vs Eden `src/core/hle/service/hid/hid_debug_server.{h,cpp}`
+
+### Intentional differences
+- Eden stores `shared_ptr` children inside `ResourceManager`. Ruzu retains the existing
+  `Arc<Mutex<_>>` resource split and passes the shared `TouchResource`/`TouchScreenDriver` to the
+  matching child operation; method ownership and operation order remain in `hid_debug_server.rs`.
+- Eden's CMIF templates unwrap arguments and output parameters. Ruzu uses local typed CMIF
+  handlers, including the map-alias `TouchState` input buffer and the aligned `(u32, u64)` request.
+- `TouchScreen::IsActive` and `Gesture::IsActive` return their infallible boolean directly in the
+  current Rust ownership adaptation. Eden returns `ResultSuccess` plus an output boolean; the
+  service still evaluates both calls in Eden's order before combining their values.
+
+### Unintentional differences (to fix)
+- None remain in this file after the post-implementation comparison.
+
+### Missing items
+- None: all nine methods owned by Eden's `IHidDebugServer` are implemented, and all 158 command
+  IDs/names have matching implemented-versus-null registration state.
+
+### Binary layout verification
+- PASS: `TouchState` is 0x28 bytes, `AutoPilotState` is 0x288 bytes, and
+  `TouchScreenConfigurationForNx` is 0x10 bytes. Focused tests also cover the exact command IDs,
+  active-handler set, and touch/gesture restart-then-stop lifecycle.

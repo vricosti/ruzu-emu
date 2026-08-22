@@ -79,9 +79,10 @@ fn all_shader_stage_bits() -> u32 {
 
 /// Build the shader-recompiler profile owned by `MetalPipelineCache`.
 ///
-/// These flags describe the complete SPIR-V -> SPIRV-Cross -> MSL 2.3 path,
-/// not merely silicon features. A device feature remains disabled until the
-/// selected MSL version and the runtime binding ABI can consume it.
+/// These flags describe the complete shader translation and native Metal
+/// compilation path, not merely silicon features. A device feature remains
+/// disabled until the negotiated MSL version and runtime binding ABI can
+/// consume it.
 pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
     let apple_family = device.highest_apple_family.unwrap_or_default();
     Profile {
@@ -105,8 +106,8 @@ pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
         support_viewport_mask: false,
         support_typeless_image_loads: false,
         support_demote_to_helper_invocation: true,
-        // Apple9 exposes 64-bit atomics, but their MSL language support is
-        // newer than the baseline 2.3 compiler selected by metal_shader.rs.
+        // Some recent Apple families expose 64-bit atomics, but the native
+        // MSL resource/atomic backend does not implement their ABI yet.
         support_int64_atomics: false,
         support_shared_int64_atomics: false,
         support_derivative_control: true,

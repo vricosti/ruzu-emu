@@ -1009,6 +1009,120 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_half_and_int64_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let mut program = empty_program(Stage::VertexB);
+        program.info.uses_fp16 = true;
+        program.info.uses_fp16_denorms_preserve = true;
+        let block = &mut program.blocks[0];
+        let add16 = block.append_new_inst(
+            Opcode::FPAdd16,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0x4000)],
+        );
+        block.inst_mut(add16).flags = FpControl {
+            no_contraction: true,
+            ..Default::default()
+        }
+        .to_u32();
+        block.append_new_inst(Opcode::FPNeg16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(Opcode::FPAbs16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(
+            Opcode::FPMul16,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0x4000)],
+        );
+        block.append_new_inst(
+            Opcode::FPFma16,
+            vec![
+                Value::ImmF16(0x3C00),
+                Value::ImmF16(0x4000),
+                Value::ImmF16(0x4200),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::FPClamp16,
+            vec![
+                Value::ImmF16(0x4000),
+                Value::ImmF16(0x0000),
+                Value::ImmF16(0x3C00),
+            ],
+        );
+        block.append_new_inst(Opcode::FPRoundEven16, vec![Value::ImmF16(0x3E00)]);
+        block.append_new_inst(
+            Opcode::FPUnordNotEqual16,
+            vec![Value::ImmF16(0x7E00), Value::ImmF16(0x3C00)],
+        );
+        block.append_new_inst(Opcode::ConvertS16F16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(Opcode::ConvertS32F16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(Opcode::ConvertU16F16, vec![Value::ImmF16(0x3C00)]);
+        block.append_new_inst(Opcode::ConvertU32F16, vec![Value::ImmF16(0x3C00)]);
+        block.append_new_inst(Opcode::ConvertF16F32, vec![Value::ImmF32(1.0)]);
+        block.append_new_inst(Opcode::ConvertF32F16, vec![Value::ImmF16(0x3C00)]);
+        block.append_new_inst(Opcode::ConvertF16S8, vec![Value::ImmU32(0xFF)]);
+        block.append_new_inst(Opcode::ConvertF16S16, vec![Value::ImmU32(0xFFFF)]);
+        block.append_new_inst(Opcode::ConvertF16S32, vec![Value::ImmU32(u32::MAX)]);
+        block.append_new_inst(Opcode::ConvertF16U8, vec![Value::ImmU32(0xFF)]);
+        block.append_new_inst(Opcode::ConvertF16U16, vec![Value::ImmU32(0xFFFF)]);
+        block.append_new_inst(Opcode::ConvertF16U32, vec![Value::ImmU32(u32::MAX)]);
+        if profile.support_int64 {
+            program.info.uses_int64 = true;
+            block.append_new_inst(
+                Opcode::IAdd64,
+                vec![Value::ImmU64(u64::MAX), Value::ImmU64(1)],
+            );
+            block.append_new_inst(Opcode::ISub64, vec![Value::ImmU64(7), Value::ImmU64(2)]);
+            block.append_new_inst(Opcode::INeg64, vec![Value::ImmU64(1)]);
+            block.append_new_inst(Opcode::IAbs64, vec![Value::ImmU64(u64::MAX)]);
+            block.append_new_inst(
+                Opcode::ShiftLeftLogical64,
+                vec![Value::ImmU64(1), Value::ImmU32(63)],
+            );
+            block.append_new_inst(
+                Opcode::ShiftRightLogical64,
+                vec![Value::ImmU64(u64::MAX), Value::ImmU32(4)],
+            );
+            block.append_new_inst(
+                Opcode::ShiftRightArithmetic64,
+                vec![Value::ImmU64(u64::MAX), Value::ImmU32(4)],
+            );
+            block.append_new_inst(
+                Opcode::SelectU64,
+                vec![Value::ImmU1(true), Value::ImmU64(1), Value::ImmU64(2)],
+            );
+            block.append_new_inst(Opcode::ConvertS64F16, vec![Value::ImmF16(0xBC00)]);
+            block.append_new_inst(Opcode::ConvertS64F32, vec![Value::ImmF32(-1.0)]);
+            block.append_new_inst(Opcode::ConvertU64F16, vec![Value::ImmF16(0x3C00)]);
+            block.append_new_inst(Opcode::ConvertU64F32, vec![Value::ImmF32(1.0)]);
+            block.append_new_inst(Opcode::ConvertU64U32, vec![Value::ImmU32(7)]);
+            block.append_new_inst(Opcode::ConvertU32U64, vec![Value::ImmU64(7)]);
+            block.append_new_inst(Opcode::ConvertF16S64, vec![Value::ImmU64(u64::MAX)]);
+            block.append_new_inst(Opcode::ConvertF16U64, vec![Value::ImmU64(7)]);
+            block.append_new_inst(Opcode::ConvertF32S64, vec![Value::ImmU64(u64::MAX)]);
+            block.append_new_inst(Opcode::ConvertF32U64, vec![Value::ImmU64(7)]);
+        }
+
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &profile,
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+            },
+        )
+        .expect("native half/int64 IR must lower directly to MSL when supported");
+        assert!(artifact.source.source.contains("half v_0_0 = spvFAdd("));
+        if profile.support_int64 {
+            assert!(artifact.source.source.contains("ulong v_0_20 ="));
+        }
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct half/int64 MSL must compile as a native Metal function");
+
+        assert_eq!(shader.source().stage, Stage::VertexB);
+        assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
     fn direct_bindings_compact_independent_metal_namespaces() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let profile = make_shader_profile(device.profile());

@@ -38,6 +38,16 @@ pub fn emit_binary(
     context.emit_binary(program, inst_ref, inst, Type::U32, operator)
 }
 
+pub fn emit_binary_64(
+    context: &mut MslEmitContext,
+    program: &crate::ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    operator: &'static str,
+) -> Result<(), MslError> {
+    context.emit_binary(program, inst_ref, inst, Type::U64, operator)
+}
+
 fn emit_binary_with_flags(
     context: &mut MslEmitContext,
     program: &crate::ir::Program,
@@ -127,6 +137,15 @@ pub fn emit_ineg_32(
     context.define(inst_ref, Type::U32, format!("0u - ({value})"), false)
 }
 
+pub fn emit_ineg_64(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(inst_ref, Type::U64, format!("0ul - ({value})"), false)
+}
+
 pub fn emit_iabs_32(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
@@ -137,6 +156,20 @@ pub fn emit_iabs_32(
         inst_ref,
         Type::U32,
         format!("as_type<uint>(abs(as_type<int>({value})))"),
+        false,
+    )
+}
+
+pub fn emit_iabs_64(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(
+        inst_ref,
+        Type::U64,
+        format!("as_type<ulong>(abs(as_type<long>({value})))"),
         false,
     )
 }
@@ -152,6 +185,21 @@ pub fn emit_shift_right_arithmetic_32(
         inst_ref,
         Type::U32,
         format!("as_type<uint>(as_type<int>({value}) >> ({shift}))"),
+        false,
+    )
+}
+
+pub fn emit_shift_right_arithmetic_64(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let shift = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    context.define(
+        inst_ref,
+        Type::U64,
+        format!("as_type<ulong>(as_type<long>({value}) >> ({shift}))"),
         false,
     )
 }

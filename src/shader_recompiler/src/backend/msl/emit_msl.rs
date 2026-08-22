@@ -33,7 +33,10 @@ fn varying_mask_has_only_position(mask: &[u64; 8]) -> bool {
     })
 }
 
-fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static str> {
+fn first_unsupported_program_feature(
+    program: &ir::Program,
+    profile: &Profile,
+) -> Option<&'static str> {
     let info = &program.info;
 
     if program.local_memory_size != 0 {
@@ -127,15 +130,16 @@ fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static s
     {
         return Some("stage built-ins");
     }
-    if info.uses_fp16
-        || info.uses_fp64
-        || info.uses_fp16_denorms_flush
-        || info.uses_fp16_denorms_preserve
-        || info.uses_fp32_denorms_flush
+    if info.uses_fp64 {
+        return Some("64-bit floating point");
+    }
+    if info.uses_int64 && !profile.support_int64 {
+        return Some("64-bit integers on the selected Metal device");
+    }
+    if info.uses_fp32_denorms_flush
         || info.uses_fp32_denorms_preserve
         || info.uses_int8
         || info.uses_int16
-        || info.uses_int64
         || info.uses_image_1d
         || info.uses_sampled_1d
         || info.uses_sparse_residency
@@ -185,6 +189,8 @@ fn emit_inst(
         Opcode::Identity => context.emit_identity(program, inst_ref, inst),
         Opcode::SelectU1 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U1),
         Opcode::SelectU32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U32),
+        Opcode::SelectU64 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U64),
+        Opcode::SelectF16 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::F16),
         Opcode::SelectF32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::F32),
         Opcode::BitCastU32F32 => emit_msl_bitwise_conversion::emit_bitcast(
             context,
@@ -205,20 +211,33 @@ fn emit_inst(
         Opcode::LogicalXor => emit_msl_logical::emit_binary(context, inst_ref, inst, "!="),
         Opcode::LogicalNot => emit_msl_logical::emit_not(context, inst_ref, inst),
         Opcode::IAdd32 => emit_msl_integer::emit_iadd_32(context, program, inst_ref, inst),
+        Opcode::IAdd64 => emit_msl_integer::emit_binary_64(context, program, inst_ref, inst, "+"),
         Opcode::ISub32 => emit_msl_integer::emit_isub_32(context, program, inst_ref, inst),
+        Opcode::ISub64 => emit_msl_integer::emit_binary_64(context, program, inst_ref, inst, "-"),
         Opcode::IMul32 => emit_msl_integer::emit_imul_32(context, program, inst_ref, inst),
         Opcode::SDiv32 => emit_msl_integer::emit_sdiv_32(context, inst_ref, inst),
         Opcode::UDiv32 => emit_msl_integer::emit_udiv_32(context, program, inst_ref, inst),
         Opcode::INeg32 => emit_msl_integer::emit_ineg_32(context, inst_ref, inst),
+        Opcode::INeg64 => emit_msl_integer::emit_ineg_64(context, inst_ref, inst),
         Opcode::IAbs32 => emit_msl_integer::emit_iabs_32(context, inst_ref, inst),
+        Opcode::IAbs64 => emit_msl_integer::emit_iabs_64(context, inst_ref, inst),
         Opcode::ShiftLeftLogical32 => {
             emit_msl_integer::emit_binary(context, program, inst_ref, inst, "<<")
+        }
+        Opcode::ShiftLeftLogical64 => {
+            emit_msl_integer::emit_binary_64(context, program, inst_ref, inst, "<<")
         }
         Opcode::ShiftRightLogical32 => {
             emit_msl_integer::emit_binary(context, program, inst_ref, inst, ">>")
         }
+        Opcode::ShiftRightLogical64 => {
+            emit_msl_integer::emit_binary_64(context, program, inst_ref, inst, ">>")
+        }
         Opcode::ShiftRightArithmetic32 => {
             emit_msl_integer::emit_shift_right_arithmetic_32(context, inst_ref, inst)
+        }
+        Opcode::ShiftRightArithmetic64 => {
+            emit_msl_integer::emit_shift_right_arithmetic_64(context, inst_ref, inst)
         }
         Opcode::BitwiseAnd32 => {
             emit_msl_integer::emit_bitwise_with_flags(context, program, inst_ref, inst, "&")
@@ -274,6 +293,43 @@ fn emit_inst(
         }
         Opcode::UGreaterThanEqual => {
             emit_msl_integer::emit_comparison(context, inst_ref, inst, ">=", false)
+        }
+        Opcode::FPAbs16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "fabs")
+        }
+        Opcode::FPNeg16 => {
+            emit_msl_floating_point::emit_unary_operator_16(context, inst_ref, inst, "-")
+        }
+        Opcode::FPAdd16 => {
+            emit_msl_floating_point::emit_fp_add_16(context, program, inst_ref, inst)
+        }
+        Opcode::FPMul16 => {
+            emit_msl_floating_point::emit_fp_mul_16(context, program, inst_ref, inst)
+        }
+        Opcode::FPFma16 => emit_msl_floating_point::emit_fp_fma_16(context, inst_ref, inst),
+        Opcode::FPMin16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "min")
+        }
+        Opcode::FPMax16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "max")
+        }
+        Opcode::FPSaturate16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "saturate")
+        }
+        Opcode::FPClamp16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "clamp")
+        }
+        Opcode::FPRoundEven16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "rint")
+        }
+        Opcode::FPFloor16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "floor")
+        }
+        Opcode::FPCeil16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "ceil")
+        }
+        Opcode::FPTrunc16 => {
+            emit_msl_floating_point::emit_intrinsic_16(context, inst_ref, inst, "trunc")
         }
         Opcode::FPAdd32 => {
             emit_msl_floating_point::emit_fp_add_32(context, program, inst_ref, inst)
@@ -370,10 +426,87 @@ fn emit_inst(
             emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, ">=")
         }
         Opcode::FPIsNan32 => emit_msl_floating_point::emit_is_nan_32(context, inst_ref, inst),
+        Opcode::FPOrdEqual16 => {
+            emit_msl_floating_point::emit_ordered_comparison_16(context, inst_ref, inst, "==")
+        }
+        Opcode::FPOrdNotEqual16 => {
+            emit_msl_floating_point::emit_ordered_comparison_16(context, inst_ref, inst, "!=")
+        }
+        Opcode::FPOrdLessThan16 => {
+            emit_msl_floating_point::emit_ordered_comparison_16(context, inst_ref, inst, "<")
+        }
+        Opcode::FPOrdGreaterThan16 => {
+            emit_msl_floating_point::emit_ordered_comparison_16(context, inst_ref, inst, ">")
+        }
+        Opcode::FPOrdLessThanEqual16 => {
+            emit_msl_floating_point::emit_ordered_comparison_16(context, inst_ref, inst, "<=")
+        }
+        Opcode::FPOrdGreaterThanEqual16 => {
+            emit_msl_floating_point::emit_ordered_comparison_16(context, inst_ref, inst, ">=")
+        }
+        Opcode::FPUnordEqual16 => {
+            emit_msl_floating_point::emit_unordered_comparison_16(context, inst_ref, inst, "==")
+        }
+        Opcode::FPUnordNotEqual16 => {
+            emit_msl_floating_point::emit_unordered_comparison_16(context, inst_ref, inst, "!=")
+        }
+        Opcode::FPUnordLessThan16 => {
+            emit_msl_floating_point::emit_unordered_comparison_16(context, inst_ref, inst, "<")
+        }
+        Opcode::FPUnordGreaterThan16 => {
+            emit_msl_floating_point::emit_unordered_comparison_16(context, inst_ref, inst, ">")
+        }
+        Opcode::FPUnordLessThanEqual16 => {
+            emit_msl_floating_point::emit_unordered_comparison_16(context, inst_ref, inst, "<=")
+        }
+        Opcode::FPUnordGreaterThanEqual16 => {
+            emit_msl_floating_point::emit_unordered_comparison_16(context, inst_ref, inst, ">=")
+        }
+        Opcode::FPIsNan16 => emit_msl_floating_point::emit_is_nan_16(context, inst_ref, inst),
+        Opcode::ConvertS16F16 => emit_msl_convert::emit_convert_s16_f16(context, inst_ref, inst),
+        Opcode::ConvertS32F16 => emit_msl_convert::emit_convert_s32_f16(context, inst_ref, inst),
+        Opcode::ConvertS64F16 | Opcode::ConvertS64F32 => {
+            emit_msl_convert::emit_convert_s64_float(context, inst_ref, inst)
+        }
         Opcode::ConvertS32F32 => emit_msl_convert::emit_convert_s32_f32(context, inst_ref, inst),
+        Opcode::ConvertU16F16 => emit_msl_convert::emit_convert_u16_f16(context, inst_ref, inst),
+        Opcode::ConvertU32F16 => emit_msl_convert::emit_convert_u32_f16(context, inst_ref, inst),
+        Opcode::ConvertU64F16 | Opcode::ConvertU64F32 => {
+            emit_msl_convert::emit_convert_u64_float(context, inst_ref, inst)
+        }
         Opcode::ConvertU32F32 => emit_msl_convert::emit_convert_u32_f32(context, inst_ref, inst),
+        Opcode::ConvertU64U32 => emit_msl_convert::emit_convert_u64_u32(context, inst_ref, inst),
+        Opcode::ConvertU32U64 => emit_msl_convert::emit_convert_u32_u64(context, inst_ref, inst),
+        Opcode::ConvertF16F32 => emit_msl_convert::emit_convert_f16_f32(context, inst_ref, inst),
+        Opcode::ConvertF32F16 => emit_msl_convert::emit_convert_f32_f16(context, inst_ref, inst),
+        Opcode::ConvertF16S8 => {
+            emit_msl_convert::emit_convert_f16_signed(context, inst_ref, inst, 8)
+        }
+        Opcode::ConvertF16S16 => {
+            emit_msl_convert::emit_convert_f16_signed(context, inst_ref, inst, 16)
+        }
+        Opcode::ConvertF16S32 => {
+            emit_msl_convert::emit_convert_f16_signed(context, inst_ref, inst, 32)
+        }
+        Opcode::ConvertF16S64 => {
+            emit_msl_convert::emit_convert_f16_signed(context, inst_ref, inst, 64)
+        }
+        Opcode::ConvertF16U8 => {
+            emit_msl_convert::emit_convert_f16_unsigned(context, inst_ref, inst, 8)
+        }
+        Opcode::ConvertF16U16 => {
+            emit_msl_convert::emit_convert_f16_unsigned(context, inst_ref, inst, 16)
+        }
+        Opcode::ConvertF16U32 => {
+            emit_msl_convert::emit_convert_f16_unsigned(context, inst_ref, inst, 32)
+        }
+        Opcode::ConvertF16U64 => {
+            emit_msl_convert::emit_convert_f16_unsigned(context, inst_ref, inst, 64)
+        }
         Opcode::ConvertF32S32 => emit_msl_convert::emit_convert_f32_s32(context, inst_ref, inst),
+        Opcode::ConvertF32S64 => emit_msl_convert::emit_convert_f32_s64(context, inst_ref, inst),
         Opcode::ConvertF32U32 => emit_msl_convert::emit_convert_f32_u32(context, inst_ref, inst),
+        Opcode::ConvertF32U64 => emit_msl_convert::emit_convert_f32_u64(context, inst_ref, inst),
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -442,12 +575,12 @@ pub fn emit_msl(
 
 pub fn emit_msl_with_options(
     program: &ir::Program,
-    _profile: &Profile,
+    profile: &Profile,
     _runtime_info: &RuntimeInfo,
     options: &MslOptions,
 ) -> Result<MslShaderArtifact, MslError> {
     let mut context = MslEmitContext::new(program, options)?;
-    if let Some(feature) = first_unsupported_program_feature(program) {
+    if let Some(feature) = first_unsupported_program_feature(program, profile) {
         return Err(MslError::UnsupportedProgramFeature(feature));
     }
     if program.syntax_list.is_empty() {
@@ -547,16 +680,113 @@ mod tests {
     #[test]
     fn rejects_unported_ir_instead_of_emitting_a_fallback() {
         let mut program = empty_program(Stage::Fragment);
-        program.blocks[0].append_new_inst(Opcode::IAdd64, vec![Value::ImmU32(1), Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(Opcode::UndefU32, vec![]);
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
             Err(MslError::UnsupportedOpcode {
                 block: 0,
                 inst: 0,
-                opcode: Opcode::IAdd64,
+                opcode: Opcode::UndefU32,
             })
         );
+    }
+
+    #[test]
+    fn gates_native_int64_on_the_selected_metal_profile() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_int64 = true;
+        program.blocks[0].append_new_inst(Opcode::IAdd64, vec![Value::ImmU64(1), Value::ImmU64(2)]);
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "64-bit integers on the selected Metal device"
+            ))
+        );
+
+        let profile = Profile {
+            support_int64: true,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("ulong v_0_0 = (0x0000000000000001ul) + (0x0000000000000002ul);"));
+    }
+
+    #[test]
+    fn emits_native_half_and_int64_scalar_families() {
+        let mut program = empty_program(Stage::VertexB);
+        program.info.uses_fp16 = true;
+        program.info.uses_fp16_denorms_preserve = true;
+        program.info.uses_int64 = true;
+        let block = &mut program.blocks[0];
+        let add64 = block.append_new_inst(
+            Opcode::IAdd64,
+            vec![Value::ImmU64(0xFEDC_BA98_7654_3210), Value::ImmU64(1)],
+        );
+        block.append_new_inst(
+            Opcode::ShiftRightArithmetic64,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: add64,
+                }),
+                Value::ImmU32(4),
+            ],
+        );
+        block.append_new_inst(Opcode::IAbs64, vec![Value::ImmU64(u64::MAX)]);
+        let add16 = block.append_new_inst(
+            Opcode::FPAdd16,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0x4000)],
+        );
+        block.inst_mut(add16).flags = crate::ir::types::FpControl {
+            no_contraction: true,
+            ..Default::default()
+        }
+        .to_u32();
+        block.append_new_inst(
+            Opcode::FPFma16,
+            vec![
+                Value::ImmF16(0x3C00),
+                Value::ImmF16(0x4000),
+                Value::ImmF16(0x4200),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::FPUnordEqual16,
+            vec![Value::ImmF16(0x7E00), Value::ImmF16(0x3C00)],
+        );
+        block.append_new_inst(Opcode::ConvertF16S8, vec![Value::ImmU32(0xFF)]);
+        block.append_new_inst(Opcode::ConvertS16F16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(Opcode::ConvertU16F16, vec![Value::ImmF16(0x3C00)]);
+        block.append_new_inst(Opcode::ConvertF16F32, vec![Value::ImmF32(f32::NAN)]);
+        block.append_new_inst(Opcode::ConvertF32U64, vec![Value::ImmU64(7)]);
+
+        let profile = Profile {
+            support_int64: true,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("ulong v_0_0 = (0xFEDCBA9876543210ul) +"));
+        assert!(source.contains("as_type<ulong>(as_type<long>(v_0_0) >>"));
+        assert!(source.contains("as_type<ulong>(abs(as_type<long>(0xFFFFFFFFFFFFFFFFul)))"));
+        assert!(source.contains(
+            "half v_0_3 = spvFAdd(as_type<half>(ushort(0x3C00u)), as_type<half>(ushort(0x4000u)));"
+        ));
+        assert!(source.contains("half v_0_4 = fma("));
+        assert!(source.contains("isnan(as_type<half>(ushort(0x7E00u)))"));
+        assert!(source.contains("half v_0_6 = half((as_type<int>"));
+        assert!(source
+            .contains("uint v_0_7 = as_type<uint>(int(short(as_type<half>(ushort(0xBC00u)))));"));
+        assert!(source.contains("uint v_0_8 = uint(ushort(as_type<half>(ushort(0x3C00u))));"));
+        assert!(source.contains(
+            "half v_0_9 = isnan(half(as_type<float>(0x7FC00000u))) ? as_type<half>(ushort(0u)) : half(as_type<float>(0x7FC00000u));"
+        ));
+        assert!(source.contains("float v_0_10 = float(0x0000000000000007ul);"));
     }
 
     #[test]

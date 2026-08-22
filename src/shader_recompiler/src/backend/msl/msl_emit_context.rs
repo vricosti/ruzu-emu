@@ -96,6 +96,8 @@ impl MslEmitContext {
         match ty {
             Type::U1 => Ok("bool"),
             Type::U32 => Ok("uint"),
+            Type::U64 => Ok("ulong"),
+            Type::F16 => Ok("half"),
             Type::F32 => Ok("float"),
             _ => Err(MslError::UnsupportedType(ty)),
         }
@@ -140,6 +142,8 @@ impl MslEmitContext {
             }
             Value::ImmU1(value) => Ok(if *value { "true" } else { "false" }.to_owned()),
             Value::ImmU32(value) => Ok(format!("0x{value:08X}u")),
+            Value::ImmU64(value) => Ok(format!("0x{value:016X}ul")),
+            Value::ImmF16(value) => Ok(format!("as_type<half>(ushort(0x{value:04X}u))")),
             Value::ImmF32(value) => Ok(format!("as_type<float>(0x{:08X}u)", value.to_bits())),
             other => Err(MslError::UnsupportedValue {
                 block: inst_ref.block,
@@ -215,7 +219,7 @@ impl MslEmitContext {
         self.define(inst_ref, ty, expression, false)
     }
 
-    pub fn emit_fma_32(&mut self, inst_ref: InstRef, inst: &Inst) -> Result<(), MslError> {
+    pub fn emit_fma(&mut self, inst_ref: InstRef, inst: &Inst, ty: Type) -> Result<(), MslError> {
         let a = self.value_expression(inst.arg(0), inst_ref, 0)?;
         let b = self.value_expression(inst.arg(1), inst_ref, 1)?;
         let c = self.value_expression(inst.arg(2), inst_ref, 2)?;
@@ -226,7 +230,7 @@ impl MslEmitContext {
         } else {
             format!("fma({a}, {b}, {c})")
         };
-        self.define(inst_ref, Type::F32, expression, false)
+        self.define(inst_ref, ty, expression, false)
     }
 
     pub fn emit_identity(

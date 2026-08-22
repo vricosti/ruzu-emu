@@ -17,7 +17,9 @@ use crate::buffer_cache::buffer_cache_base::{
     self as base, BufferCacheAsyncBuffer, BufferCacheBuffer, BufferCopy, HostBindings,
 };
 use crate::buffer_cache::usage_tracker::UsageTracker;
-use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
+use crate::engines::maxwell_3d::{
+    IndexFormat, PrimitiveTopology, MAX_CONST_BUFFER_SIZE,
+};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::PixelFormat;
 
@@ -262,7 +264,6 @@ impl BufferCacheRuntime {
     pub fn begin_graphics_bindings(&mut self) {
         self.binding_target = BindingTarget::Graphics;
         self.graphics = MetalGraphicsBufferBindings::default();
-        self.vertex_bindings.fill(None);
         self.transform_feedback_bindings.clear();
     }
 
@@ -804,7 +805,15 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         size: u32,
         write: &mut dyn FnMut(&mut [u8]),
     ) -> bool {
-        let mut staging = self.upload_staging_buffer(size as u64);
+        let scheduler_ptr = self.scheduler;
+        let mut staging = self
+            .staging_pool()
+            .request_upload_buffer_with_binding_span(
+                unsafe { scheduler_ptr.as_ptr().as_mut().unwrap() },
+                size as usize,
+                MAX_CONST_BUFFER_SIZE,
+            )
+            .expect("Metal mapped uniform staging allocation failed");
         write(staging.mapped_span_mut());
         self.graphics.uniform_buffers[stage].push(MetalBufferBinding {
             buffer: Arc::clone(&staging.buffer),
@@ -989,5 +998,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 0xffff, 9, 3]
         );
+    }
+
+    #[test]
+    fn beginning_graphics_bindings_preserves_non_dirty_vertex_bindings() {
+        let (_device, _scheduler, _staging_pool, mut runtime) = runtime();
+        runtime.vertex_bindings[0] = Some(MetalVertexBinding {
+            buffer: Arc::clone(&runtime.null_buffer),
+            offset: 0,
+            size: 4,
+            stride: 4,
+        });
+
+        runtime.begin_graphics_bindings();
+
+        assert!(runtime.vertex_bindings[0].is_some());
     }
 }

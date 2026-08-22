@@ -28,9 +28,7 @@ use crate::renderer_vulkan::pipeline_helper::{
 };
 use crate::surface::{get_format_type, is_pixel_format_integer, PixelFormat, SurfaceType};
 use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageViewInOut};
-use crate::texture_cache::types::{
-    ImageViewId, SamplerId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID,
-};
+use crate::texture_cache::types::{ImageViewId, SamplerId, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID};
 use crate::textures::texture::texture_pair;
 
 use super::metal_buffer::MetalBuffer;
@@ -409,17 +407,20 @@ pub fn configure_compute_resources(
                 .get(view_cursor)
                 .ok_or(MetalComputePipelineError::ViewOutOfRange(view_cursor))?
                 .id;
-            let image_view = texture_cache.image_view(view_id);
-            let texture = image_view.and_then(|view| view.retained_handle(descriptor.texture_type));
-            let format = image_view.map_or(PixelFormat::Invalid, |view| view.base().format);
-            let supports_anisotropy =
-                image_view.is_some_and(|view| view.base().supports_anisotropy());
-            let supports_depth_comparison = image_view.is_some_and(|view| {
-                matches!(
-                    get_format_type(view.base().format),
-                    SurfaceType::Depth | SurfaceType::DepthStencil
-                )
-            });
+            let (format, supports_anisotropy, supports_depth_comparison) = texture_cache
+                .image_view(view_id)
+                .map_or((PixelFormat::Invalid, false, false), |view| {
+                    (
+                        view.base().format,
+                        view.base().supports_anisotropy(),
+                        matches!(
+                            get_format_type(view.base().format),
+                            SurfaceType::Depth | SurfaceType::DepthStencil
+                        ),
+                    )
+                });
+            let texture =
+                texture_cache.prepare_retained_image_view(view_id, descriptor.texture_type, false);
             let sampler_id = *handles
                 .samplers
                 .get(sampler_cursor)
@@ -463,17 +464,11 @@ pub fn configure_compute_resources(
                 .get(view_cursor)
                 .ok_or(MetalComputePipelineError::ViewOutOfRange(view_cursor))?
                 .id;
-            if descriptor.is_written && view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
-                let image_id = texture_cache.base.slot_image_views[view_id].image_id;
-                if image_id.is_valid() && image_id != NULL_IMAGE_ID {
-                    texture_cache.base.mark_modification_by_id(image_id);
-                }
-            }
-            textures.push(
-                texture_cache
-                    .image_view(view_id)
-                    .and_then(|view| view.retained_handle(descriptor.texture_type)),
-            );
+            textures.push(texture_cache.prepare_retained_image_view(
+                view_id,
+                descriptor.texture_type,
+                descriptor.is_written,
+            ));
             descriptor_rescaled |= texture_cache.base.is_rescaling_image_view(view_id);
             view_cursor += 1;
         }

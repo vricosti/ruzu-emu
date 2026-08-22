@@ -114,7 +114,7 @@ impl RendererMetal {
             let _guard = unsafe { (*mutex).lock() };
             cache
                 .framebuffer_image_view(framebuffer, framebuffer_addr)
-                .map(|(texture, _, _)| texture)
+                .map(|(texture, _, _, _)| texture)
         });
 
         let Some(source) = source else {

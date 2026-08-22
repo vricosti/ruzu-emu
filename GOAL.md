@@ -1,15 +1,65 @@
-# Native Metal Renderer for macOS
+# Direct Maxwell IR to MSL Backend
 
-Implement a renderer on a dedicated branch that uses Apple's Metal API directly on macOS.
+Implémenter un backend natif MSL pour le renderer Metal de ruzu, générant directement du MSL depuis l’IR
+  Maxwell du `shader_recompiler`, sans passer par SPIR-V ni SPIRV-Cross.
 
-The implementation must not route rendering through Vulkan, MoltenVK, OpenGL, or another graphics API compatibility layer. Eden remains the source of truth for Maxwell guest semantics, operation ordering, cache lifecycle, and renderer ownership. Metal-specific resource binding, synchronization, pipeline, render-pass, and presentation behavior must be implemented with native Metal concepts.
+  Objectifs impératifs :
 
-The goal is complete only when:
+  - Conserver le frontend Maxwell et l’IR communs existants.
+  - Ajouter un backend MSL dédié dans `shader_recompiler`, avec une structure parallèle au backend SPIR-V
+  lorsque pertinent.
+  - Ne pas dupliquer la traduction Maxwell ni les analyses/passes communes.
+  - Concevoir les interfaces afin que les métadonnées de shaders, bindings, ressources, attributs et execution modes restent partagées entre SPIR-V et MSL.
+  - Brancher le backend MSL uniquement sur le renderer Metal.
+  - Conserver le backend SPIR-V pour Vulkan et comme oracle de comparaison pendant la migration.
+  - Supprimer la dépendance SPIRV-Cross du chemin Metal uniquement lorsque le backend MSL couvre réellement
+  tous les shaders utilisés.
+  - Préserver les ABI de ressources attendues par `metal_graphics_pipeline.rs` et `metal_compute_pipeline.rs`, ou les faire évoluer explicitement avec leurs consommateurs.
+  - Respecter la sémantique Maxwell pour les types, conversions, précision, `NoContraction`, contrôle de flux, discard/demote, atomiques, images, samplers, CBUF, SSBO, mémoire locale/partagée, attributs et sorties.
+  - Ne pas remplacer les fonctionnalités manquantes par des stubs, valeurs par défaut silencieuses ou shaders
+  de secours.
 
-- the Metal renderer can be selected and initialized on macOS;
-- ruzu and ruzu-cmd compile with the Metal backend;
-- Mario Kart 8 Deluxe boots with that backend;
-- the game reaches a race; and
-- visible game content is rendered during the race.
+  Procéder par étapes vérifiables :
 
-Do not stop at a clear-screen, presentation-only, null-rasterizer, Vulkan-backed, or otherwise partial compatibility implementation.
+  1. Auditer le chemin actuel complet :
+     Maxwell ISA → IR → SPIR-V → SPIRV-Cross → MSL → compilation Metal.
+  2. Identifier précisément les interfaces réutilisables et les dépendances SPIR-V actuellement exposées au
+  renderer Metal.
+  3. Définir les structures propres au backend MSL : contexte d’émission, gestion des valeurs SSA, types,
+  déclarations, fonctions, ressources, interfaces d’entrée/sortie et metadata.
+  4. Porter d’abord un shader minimal vertex/fragment, puis compute.
+  5. Ajouter progressivement toutes les familles d’opcodes et interfaces nécessaires, sans casser Vulkan.
+  6. Comparer pour chaque shader le MSL direct avec le MSL produit actuellement par SPIRV-Cross, puis comparer le rendu et les résultats GPU.
+  7. Ajouter des tests déterministes pour les types, expressions, contrôle de flux, bindings, images,
+  atomiques et entry points.
+  8. Ajouter un mode temporaire de validation capable de compiler les deux chemins et de journaliser les
+  divergences, sans instrumentation coûteuse par défaut.
+  9. Une fois la couverture complète validée, faire du MSL direct le chemin par défaut du renderer Metal et
+  retirer SPIRV-Cross de ce chemin.
+
+  Contraintes :
+
+  - Travailler sur une branche dédiée issue de `origin/main`.
+  - Examiner le code Eden en lecture seule pour préserver les contrats du frontend et de l’IR, même si Eden ne
+  possède pas de backend MSL direct.
+  - Préserver l’ownership des méthodes et séparer les fichiers selon les composants correspondants du backend
+  SPIR-V.
+  - Ne pas introduire une seconde IR ou une architecture spécifique Metal qui obligerait à réécrire les
+  optimisations communes.
+  - Corriger immédiatement toute petite divergence confirmée avec les contrats existants.
+  - Faire des commits cohérents et poussables après chaque tranche fonctionnelle.
+  - Recompiler `ruzu` et `ruzu-cmd` après chaque étape importante.
+  - Tester au minimum les homebrews existants, STK et MK8D, puis vérifier l’absence de régression Vulkan.
+  - Ne pas déclarer le travail terminé tant que les shaders graphics et compute utilisés par les tests passent
+  sans fallback SPIR-V.
+
+  Critères de fin :
+
+  - Le renderer Metal ne génère et ne consomme plus de SPIR-V.
+  - Aucun appel à SPIRV-Cross n’existe dans son chemin normal.
+  - Vulkan continue d’utiliser le backend SPIR-V sans régression.
+  - Les pipelines graphics et compute Metal sont générés directement depuis l’IR.
+  - Les tests du `shader_recompiler` et de `video_core` passent.
+  - Les titres de validation démarrent et rendent correctement.
+  - Les performances de compilation et d’exécution sont mesurées avant/après.
+  - Les limitations restantes sont explicitement identifiées, sans fallback ou dette masquée.

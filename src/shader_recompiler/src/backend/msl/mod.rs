@@ -10,6 +10,7 @@
 
 pub mod emit_msl;
 mod emit_msl_bitwise_conversion;
+mod emit_msl_context_get_set;
 mod emit_msl_convert;
 mod emit_msl_floating_point;
 mod emit_msl_integer;
@@ -133,6 +134,8 @@ pub enum MslError {
     },
     #[error("MSL emission does not implement shader attribute {0}")]
     UnsupportedAttribute(u32),
+    #[error("MSL emission references undeclared constant buffer {0}")]
+    MissingConstantBuffer(u32),
     #[error("MSL emission does not implement {opcode} at block {block} instruction {inst}")]
     UnsupportedOpcode {
         block: u32,
@@ -142,4 +145,6 @@ pub enum MslError {
 }
 
 pub use emit_msl::emit_msl;
+pub use emit_msl::emit_msl_with_bindings;
 pub use emit_msl::emit_msl_with_options;
+pub use emit_msl::emit_msl_with_options_and_bindings;

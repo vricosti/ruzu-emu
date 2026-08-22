@@ -48,7 +48,8 @@ use crate::shader_environment::ComputeEnvironment;
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
 use super::metal_framebuffer::MetalFramebuffer;
 use super::metal_shader::{
-    compile_native_shader, validate_direct_msl_against_active_module, MetalShaderCompileOptions,
+    compile_native_shader, validate_direct_msl_against_active_module,
+    validate_direct_msl_against_active_module_with_bindings, MetalShaderCompileOptions,
     MetalShaderError, MetalShaderModule,
 };
 
@@ -710,19 +711,20 @@ impl MetalPipelineCache {
                 buffer_cache_metadata(&stage_infos);
             let emitted = catch_shader_exception(|| {
                 let mut bindings = Bindings::default();
-                let mut emitted: [Option<(TranslatedGraphicsShader, Vec<u32>)>;
+                let mut emitted: [Option<(TranslatedGraphicsShader, Vec<u32>, Bindings)>;
                     NUM_GRAPHICS_STAGES] = Default::default();
                 for (index, translated_stage) in translated.into_iter().enumerate() {
                     let Some(translated_stage) = translated_stage else {
                         continue;
                     };
+                    let binding_base = bindings.clone();
                     let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
                         &translated_stage.program,
                         &self.profile,
                         &translated_stage.runtime_info,
                         &mut bindings,
                     );
-                    emitted[index] = Some((translated_stage, spirv_words));
+                    emitted[index] = Some((translated_stage, spirv_words, binding_base));
                 }
                 emitted
             })
@@ -731,7 +733,7 @@ impl MetalPipelineCache {
             let mut vertex = None;
             let mut fragment = None;
             for emitted_stage in emitted.into_iter().flatten() {
-                let (translated_stage, spirv_words) = emitted_stage;
+                let (translated_stage, spirv_words, mut direct_bindings) = emitted_stage;
                 let active = Arc::new(compile_native_shader(
                     self.device.device(),
                     self.device.profile(),
@@ -739,12 +741,13 @@ impl MetalPipelineCache {
                     &MetalShaderCompileOptions::for_device(self.device.profile()),
                 )?);
                 if validate_direct_msl_enabled() {
-                    match validate_direct_msl_against_active_module(
+                    match validate_direct_msl_against_active_module_with_bindings(
                         self.device.device(),
                         &translated_stage.program,
                         &self.profile,
                         &translated_stage.runtime_info,
                         &active,
+                        &mut direct_bindings,
                     ) {
                         Ok(_) => log::info!(
                             "Direct MSL validation passed for {:?} graphics shader in pipeline 0x{:016X}",

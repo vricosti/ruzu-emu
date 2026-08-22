@@ -9,30 +9,40 @@
 
 use std::collections::HashMap;
 
+use crate::backend::bindings::Bindings;
 use crate::ir::instruction::Inst;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
+use crate::profile::Profile;
 use crate::stage::Stage;
 
 use super::{
-    MslBindingLayout, MslError, MslExecutionInfo, MslOptions, MslShaderArtifact, MslShaderSource,
-    MslVersion,
+    MslBindingLayout, MslError, MslExecutionInfo, MslOptions, MslResourceBinding, MslResourceKind,
+    MslShaderArtifact, MslShaderSource, MslVersion,
 };
 
 pub struct MslEmitContext {
     stage: Stage,
     source: String,
     definitions: HashMap<InstRef, String>,
+    constant_buffers: HashMap<u32, String>,
+    bindings: MslBindingLayout,
     returns_output: bool,
     uses_no_contraction_add: bool,
     uses_no_contraction_mul: bool,
     uses_no_contraction_fma: bool,
     language_version: MslVersion,
     execution: MslExecutionInfo,
+    has_broken_robust: bool,
 }
 
 impl MslEmitContext {
-    pub fn new(program: &crate::ir::Program, options: &MslOptions) -> Result<Self, MslError> {
+    pub fn new(
+        program: &crate::ir::Program,
+        profile: &Profile,
+        options: &MslOptions,
+        binding_counters: &mut Bindings,
+    ) -> Result<Self, MslError> {
         let stage = program.stage;
         match stage {
             Stage::VertexA => return Err(MslError::UnmergedVertexA),
@@ -42,6 +52,38 @@ impl MslEmitContext {
             }
         }
 
+        let mut bindings = MslBindingLayout::default();
+        let mut constant_buffers = HashMap::new();
+        let mut parameters = Vec::new();
+        let binding_counter = if profile.unified_descriptor_binding {
+            &mut binding_counters.unified
+        } else {
+            &mut binding_counters.uniform_buffer
+        };
+        for descriptor in &program.info.constant_buffer_descriptors {
+            if descriptor.count != 1 {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "constant buffer descriptor indexing",
+                ));
+            }
+            let descriptor_binding = *binding_counter;
+            *binding_counter += descriptor.count;
+            let buffer_index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.resources.push(MslResourceBinding {
+                descriptor_set: 0,
+                binding: descriptor_binding,
+                kind: MslResourceKind::UniformBuffer,
+                buffer_index,
+                texture_index: 0,
+                sampler_index: 0,
+                count: None,
+            });
+            let name = format!("c{}", descriptor.index);
+            parameters.push(format!("constant uint4* {name} [[buffer({buffer_index})]]"));
+            constant_buffers.insert(descriptor.index, name);
+        }
+        let parameters = parameters.join(", ");
         let mut source = String::new();
         let returns_output = match stage {
             Stage::VertexB => {
@@ -49,7 +91,9 @@ impl MslEmitContext {
                     "struct MslVertexOut {\n",
                     "    float4 position [[position]];\n",
                     "};\n\n",
-                    "vertex MslVertexOut main0() {\n",
+                ));
+                source.push_str(&format!("vertex MslVertexOut main0({parameters}) {{\n"));
+                source.push_str(concat!(
                     "    MslVertexOut output = {};\n",
                     "    output.position = float4(0.0f);\n",
                 ));
@@ -62,16 +106,18 @@ impl MslEmitContext {
                         source.push_str(&format!("    float4 color{index} [[color({index})]];\n"));
                     }
                 }
-                source.push_str("};\n\nfragment MslFragmentOut main0() {\n");
+                source.push_str(&format!(
+                    "}};\n\nfragment MslFragmentOut main0({parameters}) {{\n"
+                ));
                 source.push_str("    MslFragmentOut output = {};\n");
                 true
             }
             Stage::Fragment => {
-                source.push_str("fragment void main0() {\n");
+                source.push_str(&format!("fragment void main0({parameters}) {{\n"));
                 false
             }
             Stage::Compute => {
-                source.push_str("kernel void main0() {\n");
+                source.push_str(&format!("kernel void main0({parameters}) {{\n"));
                 false
             }
             _ => unreachable!("stage was validated above"),
@@ -81,6 +127,8 @@ impl MslEmitContext {
             stage,
             source,
             definitions: HashMap::new(),
+            constant_buffers,
+            bindings,
             returns_output,
             uses_no_contraction_add: false,
             uses_no_contraction_mul: false,
@@ -89,6 +137,7 @@ impl MslEmitContext {
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
             },
+            has_broken_robust: profile.has_broken_robust,
         })
     }
 
@@ -99,8 +148,56 @@ impl MslEmitContext {
             Type::U64 => Ok("ulong"),
             Type::F16 => Ok("half"),
             Type::F32 => Ok("float"),
+            Type::U32x2 => Ok("uint2"),
             _ => Err(MslError::UnsupportedType(ty)),
         }
+    }
+
+    pub fn constant_buffer_element_expression(
+        &self,
+        inst_ref: InstRef,
+        binding: u32,
+        offset: &Value,
+        element_offset: u32,
+    ) -> Result<String, MslError> {
+        let name = self
+            .constant_buffers
+            .get(&binding)
+            .ok_or(MslError::MissingConstantBuffer(binding))?;
+        let offset_expression = self.value_expression(offset, inst_ref, 1)?;
+        let vector_index = match offset {
+            Value::ImmU32(offset) => format!("{}u", offset / 16),
+            _ => format!("(({offset_expression}) >> 4u)"),
+        };
+        let vector = if self.has_broken_robust && !matches!(offset, Value::ImmU32(_)) {
+            format!("(({vector_index}) <= 0x0000FFFFu ? {name}[{vector_index}] : uint4(0u))")
+        } else {
+            format!("{name}[{vector_index}]")
+        };
+        let component = match offset {
+            Value::ImmU32(offset) => format!("{}u", (offset / 4) % 4 + element_offset),
+            _ if element_offset == 0 => {
+                format!("((({offset_expression}) >> 2u) & 3u)")
+            }
+            _ => format!("((((({offset_expression}) >> 2u) & 3u)) + {element_offset}u)"),
+        };
+        Ok(format!("{vector}[{component}]"))
+    }
+
+    pub fn bit_offset_expression(
+        &self,
+        inst_ref: InstRef,
+        offset: &Value,
+        width: u32,
+    ) -> Result<String, MslError> {
+        let expression = self.value_expression(offset, inst_ref, 1)?;
+        Ok(match (offset, width) {
+            (Value::ImmU32(offset), 8) => format!("{}u", (offset % 4) * 8),
+            (Value::ImmU32(offset), 16) => format!("{}u", ((offset / 2) % 2) * 16),
+            (_, 8) => format!("((({expression}) << 3u) & 24u)"),
+            (_, 16) => format!("((({expression}) << 3u) & 16u)"),
+            _ => unreachable!("CBUF extraction width must be 8 or 16"),
+        })
     }
 
     fn unsupported_value_name(value: &Value) -> &'static str {
@@ -314,7 +411,7 @@ impl MslEmitContext {
                 source,
                 stage: self.stage,
             },
-            bindings: MslBindingLayout::default(),
+            bindings: self.bindings,
             entry_point: "main0".to_owned(),
             language_version: self.language_version,
             execution: self.execution,

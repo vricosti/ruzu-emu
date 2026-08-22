@@ -6,6 +6,7 @@
 //! The file boundary follows Eden's `backend/glsl/emit_glsl.{h,cpp}`. MSL is
 //! a new target backend, so there is no upstream MSL source to mirror.
 
+use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::SyntaxNode;
@@ -14,6 +15,7 @@ use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
 use super::emit_msl_bitwise_conversion;
+use super::emit_msl_context_get_set;
 use super::emit_msl_convert;
 use super::emit_msl_floating_point;
 use super::emit_msl_integer;
@@ -71,24 +73,17 @@ fn first_unsupported_program_feature(
     {
         return Some("stage inputs or outputs");
     }
-    if !info.constant_buffer_descriptors.is_empty()
-        || !info.storage_buffers_descriptors.is_empty()
+    if !info.storage_buffers_descriptors.is_empty()
         || !info.texture_buffer_descriptors.is_empty()
         || !info.image_buffer_descriptors.is_empty()
         || !info.texture_descriptors.is_empty()
         || !info.image_descriptors.is_empty()
-        || info.constant_buffer_mask != 0
-        || info
-            .constant_buffer_used_sizes
-            .iter()
-            .any(|size| *size != 0)
-        || info.used_constant_buffer_types != 0
         || info.used_storage_buffer_types != 0
-        || info.used_indirect_cbuf_types != 0
-        || info.nvn_buffer_base != 0
-        || info.nvn_buffer_used != 0
     {
         return Some("resource bindings");
+    }
+    if !info.constant_buffer_descriptors.is_empty() && profile.support_descriptor_aliasing {
+        return Some("descriptor-aliasing constant buffers");
     }
     if info.uses_patches.iter().any(|used| *used) {
         return Some("tessellation patches");
@@ -138,8 +133,6 @@ fn first_unsupported_program_feature(
     }
     if info.uses_fp32_denorms_flush
         || info.uses_fp32_denorms_preserve
-        || info.uses_int8
-        || info.uses_int16
         || info.uses_image_1d
         || info.uses_sampled_1d
         || info.uses_sparse_residency
@@ -507,6 +500,13 @@ fn emit_inst(
         Opcode::ConvertF32S64 => emit_msl_convert::emit_convert_f32_s64(context, inst_ref, inst),
         Opcode::ConvertF32U32 => emit_msl_convert::emit_convert_f32_u32(context, inst_ref, inst),
         Opcode::ConvertF32U64 => emit_msl_convert::emit_convert_f32_u64(context, inst_ref, inst),
+        Opcode::GetCbufU8
+        | Opcode::GetCbufS8
+        | Opcode::GetCbufU16
+        | Opcode::GetCbufS16
+        | Opcode::GetCbufU32
+        | Opcode::GetCbufF32
+        | Opcode::GetCbufU32x2 => emit_msl_context_get_set::emit_get_cbuf(context, inst_ref, inst),
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -570,7 +570,14 @@ pub fn emit_msl(
     profile: &Profile,
     runtime_info: &RuntimeInfo,
 ) -> Result<MslShaderArtifact, MslError> {
-    emit_msl_with_options(program, profile, runtime_info, &MslOptions::default())
+    let mut bindings = Bindings::default();
+    emit_msl_with_options_and_bindings(
+        program,
+        profile,
+        runtime_info,
+        &MslOptions::default(),
+        &mut bindings,
+    )
 }
 
 pub fn emit_msl_with_options(
@@ -579,10 +586,36 @@ pub fn emit_msl_with_options(
     _runtime_info: &RuntimeInfo,
     options: &MslOptions,
 ) -> Result<MslShaderArtifact, MslError> {
-    let mut context = MslEmitContext::new(program, options)?;
+    let mut bindings = Bindings::default();
+    emit_msl_with_options_and_bindings(program, profile, _runtime_info, options, &mut bindings)
+}
+
+pub fn emit_msl_with_bindings(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_with_options_and_bindings(
+        program,
+        profile,
+        runtime_info,
+        &MslOptions::default(),
+        bindings,
+    )
+}
+
+pub fn emit_msl_with_options_and_bindings(
+    program: &ir::Program,
+    profile: &Profile,
+    _runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
     if let Some(feature) = first_unsupported_program_feature(program, profile) {
         return Err(MslError::UnsupportedProgramFeature(feature));
     }
+    let mut context = MslEmitContext::new(program, profile, options, bindings)?;
     if program.syntax_list.is_empty() {
         for block_index in 0..program.blocks.len() as u32 {
             emit_block(&mut context, program, block_index)?;
@@ -605,6 +638,7 @@ pub fn emit_msl_with_options(
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::msl::MslResourceKind;
     use crate::ir::basic_block::Block;
     use crate::ir::emitter::Emitter;
     use crate::ir::opcodes::Opcode;
@@ -802,16 +836,158 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_resources_even_without_instructions() {
+    fn rejects_unported_storage_resources_even_without_instructions() {
         let mut program = empty_program(Stage::Fragment);
-        program
-            .info
-            .constant_buffer_descriptors
-            .push(crate::shader_info::ConstantBufferDescriptor { index: 0, count: 1 });
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: false,
+            },
+        );
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
             Err(MslError::UnsupportedProgramFeature("resource bindings"))
+        );
+    }
+
+    #[test]
+    fn emits_non_aliasing_constant_buffer_loads_and_direct_binding_abi() {
+        let mut program = empty_program(Stage::Fragment);
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 3, count: 1 });
+        program.info.constant_buffer_mask = 1 << 3;
+        program.info.constant_buffer_used_sizes[3] = 64;
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        program.info.used_constant_buffer_types = crate::ir::Type::U8 as u32
+            | crate::ir::Type::U16 as u32
+            | crate::ir::Type::U32 as u32
+            | crate::ir::Type::F32 as u32
+            | crate::ir::Type::U32x2 as u32;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::GetCbufU8, vec![Value::ImmU32(3), Value::ImmU32(5)]);
+        block.append_new_inst(Opcode::GetCbufS16, vec![Value::ImmU32(3), Value::ImmU32(6)]);
+        block.append_new_inst(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(3), Value::ImmU32(20)],
+        );
+        block.append_new_inst(
+            Opcode::GetCbufF32,
+            vec![Value::ImmU32(3), Value::ImmU32(24)],
+        );
+        block.append_new_inst(
+            Opcode::GetCbufU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(8)],
+        );
+
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let mut bindings = Bindings {
+            unified: 7,
+            ..Bindings::default()
+        };
+        let artifact =
+            emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
+                .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("fragment void main0(constant uint4* c3 [[buffer(0)]])"));
+        assert!(source.contains("extract_bits(c3[0u][1u], 8u, 8u)"));
+        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(c3[0u][1u]), 16u, 16u))"));
+        assert!(source.contains("uint v_0_2 = c3[1u][1u];"));
+        assert!(source.contains("float v_0_3 = as_type<float>(c3[1u][2u]);"));
+        assert!(source.contains("uint2 v_0_4 = uint2(c3[0u][2u], c3[0u][3u]);"));
+        assert_eq!(bindings.unified, 8);
+        assert_eq!(artifact.bindings.buffer_count, 1);
+        assert_eq!(artifact.bindings.resources.len(), 1);
+        assert_eq!(artifact.bindings.resources[0].descriptor_set, 0);
+        assert_eq!(artifact.bindings.resources[0].binding, 7);
+        assert_eq!(
+            artifact.bindings.resources[0].kind,
+            MslResourceKind::UniformBuffer
+        );
+        assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
+        assert_eq!(artifact.bindings.resources[0].count, None);
+    }
+
+    #[test]
+    fn dynamic_constant_buffer_offsets_follow_the_upstream_uint4_path() {
+        let mut program = empty_program(Stage::Compute);
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 2, count: 1 });
+        let offset = program.blocks[0]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(16), Value::ImmU32(4)]);
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32,
+            vec![
+                Value::ImmU32(2),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: offset,
+                }),
+            ],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("uint v_0_1 = c2[((v_0_0) >> 4u)][(((v_0_0) >> 2u) & 3u)];"));
+    }
+
+    #[test]
+    fn shared_binding_counters_preserve_graphics_stage_descriptor_order() {
+        let mut vertex = empty_program(Stage::VertexB);
+        vertex
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 0, count: 1 });
+        let mut fragment = empty_program(Stage::Fragment);
+        fragment
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 1, count: 1 });
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let mut bindings = Bindings::default();
+
+        let vertex =
+            emit_msl_with_bindings(&vertex, &profile, &RuntimeInfo::default(), &mut bindings)
+                .unwrap();
+        let fragment =
+            emit_msl_with_bindings(&fragment, &profile, &RuntimeInfo::default(), &mut bindings)
+                .unwrap();
+
+        assert_eq!(vertex.bindings.resources[0].binding, 0);
+        assert_eq!(fragment.bindings.resources[0].binding, 1);
+        assert_eq!(vertex.bindings.resources[0].buffer_index, 0);
+        assert_eq!(fragment.bindings.resources[0].buffer_index, 0);
+        assert_eq!(bindings.unified, 2);
+    }
+
+    #[test]
+    fn rejects_constant_buffer_descriptor_indexing_without_a_silent_alias() {
+        let mut program = empty_program(Stage::Fragment);
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 0, count: 2 });
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "constant buffer descriptor indexing"
+            ))
         );
     }
 

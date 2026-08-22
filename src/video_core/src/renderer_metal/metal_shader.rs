@@ -22,6 +22,7 @@ use spirv_cross2::targets::Msl;
 use spirv_cross2::{Compiler, Module, SpirvCrossError};
 use thiserror::Error;
 
+use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::backend::msl::MslError;
 use shader_recompiler::backend::msl::MslVersion;
 pub use shader_recompiler::backend::msl::{
@@ -36,11 +37,12 @@ use shader_recompiler::stage::Stage;
 
 use super::metal_device::MetalDeviceProfile;
 
-/// SPIRV-Cross policy for the baseline Apple7 renderer.
+/// Metal shader compilation policy.
 ///
-/// MSL 2.3 is available on the minimum supported Apple Silicon macOS release.
-/// Later language features are enabled only after the device profile and the
-/// native compiler version are advanced together.
+/// MSL 2.3 is the compatibility floor, not a backend ceiling. The device
+/// profile selects the newest language version available on the running
+/// macOS release; backend features still require their matching device
+/// capability in addition to the language version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetalShaderCompileOptions {
     pub language_version: MslVersion,
@@ -683,13 +685,33 @@ pub fn validate_direct_msl_against_active_module(
     runtime_info: &RuntimeInfo,
     active: &MetalShaderModule,
 ) -> Result<MetalShaderModule, DirectMslValidationError> {
-    let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+    let mut bindings = Bindings::default();
+    validate_direct_msl_against_active_module_with_bindings(
+        device,
+        program,
+        profile,
+        runtime_info,
+        active,
+        &mut bindings,
+    )
+}
+
+pub fn validate_direct_msl_against_active_module_with_bindings(
+    device: &ProtocolObject<dyn MTLDevice>,
+    program: &Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    active: &MetalShaderModule,
+    bindings: &mut Bindings,
+) -> Result<MetalShaderModule, DirectMslValidationError> {
+    let artifact = shader_recompiler::backend::msl::emit_msl_with_options_and_bindings(
         program,
         profile,
         runtime_info,
         &shader_recompiler::backend::msl::MslOptions {
             language_version: active.language_version(),
         },
+        bindings,
     )?;
     if artifact.source.stage != active.source().stage {
         return Err(DirectMslValidationError::StageMismatch {
@@ -1194,5 +1216,120 @@ mod tests {
 
         assert_eq!(direct.source().stage, Stage::VertexB);
         assert_eq!(direct.bindings(), active.bindings());
+    }
+
+    #[test]
+    fn compiles_and_validates_direct_constant_buffer_msl() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let mut program = empty_program(Stage::Fragment);
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 3, count: 1 });
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        program.info.used_constant_buffer_types = shader_recompiler::ir::Type::U8 as u32
+            | shader_recompiler::ir::Type::U16 as u32
+            | shader_recompiler::ir::Type::U32 as u32
+            | shader_recompiler::ir::Type::F32 as u32
+            | shader_recompiler::ir::Type::U32x2 as u32;
+        program.blocks[0]
+            .append_new_inst(Opcode::GetCbufU8, vec![Value::ImmU32(3), Value::ImmU32(5)]);
+        program.blocks[0]
+            .append_new_inst(Opcode::GetCbufS16, vec![Value::ImmU32(3), Value::ImmU32(6)]);
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(3), Value::ImmU32(20)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufF32,
+            vec![Value::ImmU32(3), Value::ImmU32(24)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(8)],
+        );
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .unwrap();
+
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .unwrap();
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(direct.bindings().resources.len(), 1);
+        assert_eq!(
+            direct.bindings().resources[0].kind,
+            MetalResourceKind::UniformBuffer
+        );
+        assert!(direct
+            .source()
+            .source
+            .contains("constant uint4* c3 [[buffer(0)]]"));
+    }
+
+    #[test]
+    fn validates_direct_constant_buffer_bindings_across_graphics_stages() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let mut vertex = empty_program(Stage::VertexB);
+        vertex
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        let mut fragment = empty_program(Stage::Fragment);
+        fragment
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 1, count: 1 });
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let options = MetalShaderCompileOptions::for_device(device.profile());
+        let mut spirv_bindings = Bindings::default();
+        let mut direct_bindings = Bindings::default();
+
+        for (expected_binding, program) in [vertex, fragment].iter().enumerate() {
+            let spirv = shader_recompiler::backend::emit_spirv_with_bindings(
+                program,
+                &profile,
+                &runtime_info,
+                &mut spirv_bindings,
+            );
+            let active =
+                compile_native_shader(device.device(), device.profile(), &spirv, &options).unwrap();
+            let direct = validate_direct_msl_against_active_module_with_bindings(
+                device.device(),
+                program,
+                &profile,
+                &runtime_info,
+                &active,
+                &mut direct_bindings,
+            )
+            .unwrap();
+
+            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(
+                direct.bindings().resources[0].binding,
+                expected_binding as u32
+            );
+        }
+        assert_eq!(spirv_bindings.unified, 2);
+        assert_eq!(direct_bindings.unified, 2);
     }
 }

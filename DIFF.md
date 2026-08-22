@@ -6925,3 +6925,25 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: `GetSecondarySave` writes a deterministic 0x20-byte output with the `[u64; 3]` at offset
   8; `GetDataInfo` writes exactly 0x38 zero bytes. Focused tests cover the layouts, exact handler
   table, implemented/null states, and all upstream stub outputs.
+
+## 2026-08-22 — `src/core/src/hle/service/ns/ecommerce_interface.rs` and `service_getter_interface.rs` vs Eden NS counterparts
+
+### Intentional differences
+- Eden supplies `Core::System&` solely to the e-commerce interface's C++ `ServiceFramework` base.
+  The Rust dispatcher obtains system state from the IPC context, so the concrete child stores no
+  duplicate `SystemRef` and its getter constructs the stateless interface without one.
+- Eden's typed `Out<SharedPointer<IECommerceInterface>>` wrapper is a direct Rust return plus a
+  thin IPC handler that installs the child as a moved interface object.
+
+### Unintentional differences (to fix)
+- `IServiceGetterInterface` still has null handlers for the other getters except commands 7992
+  and 7998. Several corresponding Rust modules are only command/data sketches rather than usable
+  `ServiceFramework` owners, so completing them requires a separate structural NS slice.
+
+### Missing items
+- None in `IECommerceInterface`: all seven upstream commands remain registered as null handlers.
+  Command 7992 now constructs and returns that exact child interface as Eden does.
+
+### Binary layout verification
+- N/A: this slice exchanges only a moved service interface and defines no raw payload.
+  Focused tests cover the seven-entry child table and command 7992 registration.

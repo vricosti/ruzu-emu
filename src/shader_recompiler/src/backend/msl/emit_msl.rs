@@ -15,9 +15,11 @@ use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
 use super::emit_msl_bitwise_conversion;
+use super::emit_msl_composite;
 use super::emit_msl_context_get_set;
 use super::emit_msl_convert;
 use super::emit_msl_floating_point;
+use super::emit_msl_image;
 use super::emit_msl_integer;
 use super::emit_msl_logical;
 use super::emit_msl_memory;
@@ -79,7 +81,6 @@ fn first_unsupported_program_feature(
     }
     if !info.texture_buffer_descriptors.is_empty()
         || !info.image_buffer_descriptors.is_empty()
-        || !info.texture_descriptors.is_empty()
         || !info.image_descriptors.is_empty()
     {
         return Some("resource bindings");
@@ -182,6 +183,37 @@ fn emit_inst(
             Ok(())
         }
         Opcode::Identity => context.emit_identity(program, inst_ref, inst),
+        Opcode::CompositeConstructU32x2
+        | Opcode::CompositeConstructU32x3
+        | Opcode::CompositeConstructU32x4
+        | Opcode::CompositeConstructF16x2
+        | Opcode::CompositeConstructF16x3
+        | Opcode::CompositeConstructF16x4
+        | Opcode::CompositeConstructF32x2
+        | Opcode::CompositeConstructF32x3
+        | Opcode::CompositeConstructF32x4 => {
+            emit_msl_composite::emit_construct(context, inst_ref, inst)
+        }
+        Opcode::CompositeExtractU32x2
+        | Opcode::CompositeExtractU32x3
+        | Opcode::CompositeExtractU32x4
+        | Opcode::CompositeExtractF16x2
+        | Opcode::CompositeExtractF16x3
+        | Opcode::CompositeExtractF16x4
+        | Opcode::CompositeExtractF32x2
+        | Opcode::CompositeExtractF32x3
+        | Opcode::CompositeExtractF32x4 => {
+            emit_msl_composite::emit_extract(context, inst_ref, inst)
+        }
+        Opcode::CompositeInsertU32x2
+        | Opcode::CompositeInsertU32x3
+        | Opcode::CompositeInsertU32x4
+        | Opcode::CompositeInsertF16x2
+        | Opcode::CompositeInsertF16x3
+        | Opcode::CompositeInsertF16x4
+        | Opcode::CompositeInsertF32x2
+        | Opcode::CompositeInsertF32x3
+        | Opcode::CompositeInsertF32x4 => emit_msl_composite::emit_insert(context, inst_ref, inst),
         Opcode::SelectU1 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U1),
         Opcode::SelectU32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U32),
         Opcode::SelectU64 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U64),
@@ -523,6 +555,9 @@ fn emit_inst(
         | Opcode::WriteStorage32
         | Opcode::WriteStorage64
         | Opcode::WriteStorage128 => emit_msl_memory::emit_write_storage(context, inst_ref, inst),
+        Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
+            emit_msl_image::emit_image_sample(context, inst_ref, inst)
+        }
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -658,9 +693,11 @@ mod tests {
     use crate::ir::basic_block::Block;
     use crate::ir::emitter::Emitter;
     use crate::ir::opcodes::Opcode;
+    use crate::ir::types::TextureInstInfo;
     use crate::ir::value::Value;
     use crate::profile::Profile;
     use crate::runtime_info::RuntimeInfo;
+    use crate::shader_info::{TextureDescriptor, TextureType};
     use crate::stage::Stage;
 
     use super::*;
@@ -668,6 +705,53 @@ mod tests {
     fn empty_program(stage: Stage) -> ir::Program {
         let mut program = ir::Program::new(stage);
         program.blocks.push(Block::new());
+        program
+    }
+
+    fn sampled_texture_program(count: u32, explicit_lod: bool) -> ir::Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count,
+            size_shift: 0,
+        });
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        );
+        let opcode = if explicit_lod {
+            Opcode::ImageSampleExplicitLod
+        } else {
+            Opcode::ImageSampleImplicitLod
+        };
+        let sample = program.blocks[0].append_new_inst(
+            opcode,
+            vec![
+                Value::ImmU32(count.saturating_sub(1)),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::ImmF32(1.0),
+                Value::Void,
+            ],
+        );
+        program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
         program
     }
 
@@ -725,6 +809,83 @@ mod tests {
         assert_eq!(artifact.source.stage, Stage::Compute);
         assert!(artifact.source.source.contains("kernel void main0()"));
         assert_eq!(artifact.execution.workgroup_size, Some([8, 4, 2]));
+    }
+
+    #[test]
+    fn emits_native_color2d_sample_and_descriptor_array_bindings() {
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(
+            &sampled_texture_program(2, true),
+            &profile,
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+
+        assert!(artifact
+            .source
+            .source
+            .contains("array<texture2d<float>, 2> tex0 [[texture(0)]]"));
+        assert!(artifact
+            .source
+            .source
+            .contains("array<sampler, 2> samp0 [[sampler(0)]]"));
+        assert!(artifact.source.source.contains(
+            "float4 v_0_1 = tex0[0x00000001u].sample(samp0[0x00000001u], v_0_0, level(as_type<float>(0x3F800000u)));"
+        ));
+        assert_eq!(artifact.bindings.texture_count, 2);
+        assert_eq!(artifact.bindings.sampler_count, 2);
+        assert_eq!(artifact.bindings.resources.len(), 1);
+        assert_eq!(
+            artifact.bindings.resources[0].kind,
+            MslResourceKind::SampledImage
+        );
+        assert_eq!(artifact.bindings.resources[0].binding, 0);
+        assert_eq!(
+            artifact.bindings.resources[0].count,
+            std::num::NonZeroU32::new(2)
+        );
+    }
+
+    #[test]
+    fn emits_fragment_implicit_lod_without_level_argument() {
+        let artifact = emit_msl(
+            &sampled_texture_program(1, false),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+
+        assert!(artifact
+            .source
+            .source
+            .contains("float4 v_0_1 = tex0.sample(samp0, v_0_0);"));
+    }
+
+    #[test]
+    fn rejects_unported_sample_operands_instead_of_dropping_them() {
+        let mut program = sampled_texture_program(1, true);
+        program.blocks[0].inst_mut(1).args[3] = Value::ImmU32(1);
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature("texture sample offset"))
+        );
+
+        program.blocks[0].inst_mut(1).args[3] = Value::Void;
+        program.blocks[0].inst_mut(1).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            has_lod_clamp: true,
+            ..Default::default()
+        }
+        .to_u32();
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature("texture LOD clamp"))
+        );
     }
 
     #[test]

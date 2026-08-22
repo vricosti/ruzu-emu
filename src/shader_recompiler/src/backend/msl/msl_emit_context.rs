@@ -14,6 +14,7 @@ use crate::ir::instruction::Inst;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
+use crate::shader_info::{TextureDescriptor, TextureType};
 use crate::stage::Stage;
 
 use super::{
@@ -27,6 +28,7 @@ pub struct MslEmitContext {
     definitions: HashMap<InstRef, String>,
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
+    textures: Vec<MslTextureDefinition>,
     bindings: MslBindingLayout,
     returns_output: bool,
     uses_no_contraction_add: bool,
@@ -36,6 +38,15 @@ pub struct MslEmitContext {
     language_version: MslVersion,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MslTextureDefinition {
+    texture_name: String,
+    sampler_name: String,
+    texture_type: TextureType,
+    count: u32,
+    is_integer: bool,
 }
 
 impl MslEmitContext {
@@ -57,6 +68,7 @@ impl MslEmitContext {
         let mut bindings = MslBindingLayout::default();
         let mut constant_buffers = HashMap::new();
         let mut storage_buffers = HashMap::new();
+        let mut textures = Vec::new();
         let mut parameters = Vec::new();
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
@@ -113,6 +125,22 @@ impl MslEmitContext {
             }
             storage_index += descriptor.count;
         }
+        let binding_counter = if profile.unified_descriptor_binding {
+            &mut binding_counters.unified
+        } else {
+            &mut binding_counters.texture
+        };
+        for (descriptor_index, descriptor) in program.info.texture_descriptors.iter().enumerate() {
+            let definition = Self::define_texture(
+                descriptor_index as u32,
+                descriptor,
+                *binding_counter,
+                &mut bindings,
+                &mut parameters,
+            )?;
+            textures.push(definition);
+            *binding_counter += 1;
+        }
         let parameters = parameters.join(", ");
         let mut source = String::new();
         let returns_output = match stage {
@@ -159,6 +187,7 @@ impl MslEmitContext {
             definitions: HashMap::new(),
             constant_buffers,
             storage_buffers,
+            textures,
             bindings,
             returns_output,
             uses_no_contraction_add: false,
@@ -173,7 +202,7 @@ impl MslEmitContext {
         })
     }
 
-    fn type_name(ty: Type) -> Result<&'static str, MslError> {
+    pub(crate) fn type_name(ty: Type) -> Result<&'static str, MslError> {
         match ty {
             Type::U1 => Ok("bool"),
             Type::U32 => Ok("uint"),
@@ -181,9 +210,138 @@ impl MslEmitContext {
             Type::F16 => Ok("half"),
             Type::F32 => Ok("float"),
             Type::U32x2 => Ok("uint2"),
+            Type::U32x3 => Ok("uint3"),
             Type::U32x4 => Ok("uint4"),
+            Type::F16x2 => Ok("half2"),
+            Type::F16x3 => Ok("half3"),
+            Type::F16x4 => Ok("half4"),
+            Type::F32x2 => Ok("float2"),
+            Type::F32x3 => Ok("float3"),
+            Type::F32x4 => Ok("float4"),
             _ => Err(MslError::UnsupportedType(ty)),
         }
+    }
+
+    fn define_texture(
+        descriptor_index: u32,
+        descriptor: &TextureDescriptor,
+        descriptor_binding: u32,
+        bindings: &mut MslBindingLayout,
+        parameters: &mut Vec<String>,
+    ) -> Result<MslTextureDefinition, MslError> {
+        if descriptor.texture_type != TextureType::Color2D {
+            return Err(MslError::UnsupportedProgramFeature(
+                "sampled texture type other than Color2D",
+            ));
+        }
+        if descriptor.is_depth {
+            return Err(MslError::UnsupportedProgramFeature(
+                "depth texture descriptor",
+            ));
+        }
+        if descriptor.is_multisample {
+            return Err(MslError::UnsupportedProgramFeature(
+                "multisample texture descriptor",
+            ));
+        }
+        if descriptor.count == 0 {
+            return Err(MslError::UnsupportedProgramFeature(
+                "zero-sized texture descriptor array",
+            ));
+        }
+
+        let texture_index = bindings.texture_count;
+        let sampler_index = bindings.sampler_count;
+        bindings.texture_count += descriptor.count;
+        bindings.sampler_count += descriptor.count;
+        bindings.resources.push(MslResourceBinding {
+            descriptor_set: 0,
+            binding: descriptor_binding,
+            kind: MslResourceKind::SampledImage,
+            buffer_index: 0,
+            texture_index,
+            sampler_index,
+            count: (descriptor.count > 1)
+                .then(|| std::num::NonZeroU32::new(descriptor.count).unwrap()),
+        });
+
+        let texture_name = format!("tex{descriptor_index}");
+        let sampler_name = format!("samp{descriptor_index}");
+        let component = if descriptor.is_integer {
+            "uint"
+        } else {
+            "float"
+        };
+        let texture_type = format!("texture2d<{component}>");
+        if descriptor.count > 1 {
+            parameters.push(format!(
+                "array<{texture_type}, {}> {texture_name} [[texture({texture_index})]]",
+                descriptor.count
+            ));
+            parameters.push(format!(
+                "array<sampler, {}> {sampler_name} [[sampler({sampler_index})]]",
+                descriptor.count
+            ));
+        } else {
+            parameters.push(format!(
+                "{texture_type} {texture_name} [[texture({texture_index})]]"
+            ));
+            parameters.push(format!(
+                "sampler {sampler_name} [[sampler({sampler_index})]]"
+            ));
+        }
+        Ok(MslTextureDefinition {
+            texture_name,
+            sampler_name,
+            texture_type: descriptor.texture_type,
+            count: descriptor.count,
+            is_integer: descriptor.is_integer,
+        })
+    }
+
+    pub fn stage(&self) -> Stage {
+        self.stage
+    }
+
+    pub fn validate_texture(
+        &self,
+        info: crate::ir::types::TextureInstInfo,
+    ) -> Result<(), MslError> {
+        let definition = self
+            .textures
+            .get(info.descriptor_index as usize)
+            .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
+        if definition.texture_type != TextureType::from_u8(info.texture_type) {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture instruction/descriptor type mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn texture_expressions(
+        &self,
+        info: crate::ir::types::TextureInstInfo,
+        index: &Value,
+        inst_ref: InstRef,
+    ) -> Result<(String, String, bool), MslError> {
+        let definition = self
+            .textures
+            .get(info.descriptor_index as usize)
+            .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
+        if definition.count == 1 {
+            return Ok((
+                definition.texture_name.clone(),
+                definition.sampler_name.clone(),
+                definition.is_integer,
+            ));
+        }
+        let index = self.value_expression(index, inst_ref, 0)?;
+        Ok((
+            format!("{}[{index}]", definition.texture_name),
+            format!("{}[{index}]", definition.sampler_name),
+            definition.is_integer,
+        ))
     }
 
     pub fn constant_buffer_element_expression(

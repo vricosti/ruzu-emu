@@ -734,7 +734,7 @@ mod tests {
     use shader_recompiler::ir::basic_block::Block;
     use shader_recompiler::ir::emitter::Emitter;
     use shader_recompiler::ir::opcodes::Opcode;
-    use shader_recompiler::ir::types::FpControl;
+    use shader_recompiler::ir::types::{FpControl, TextureInstInfo};
     use shader_recompiler::ir::value::{InstRef, Value};
     use shader_recompiler::ir::Program;
     use shader_recompiler::profile::Profile;
@@ -771,6 +771,84 @@ mod tests {
             size_shift: 0,
         });
         program.info.uses_rescaling_uniform = true;
+        program
+    }
+
+    fn sampled_texture_program(texture_count: u32) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: texture_count,
+            size_shift: 0,
+        });
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.0)],
+        );
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeInsertF32x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::ImmF32(0.75),
+                Value::ImmU32(1),
+            ],
+        );
+        let sample = program.blocks[0].append_new_inst(
+            Opcode::ImageSampleExplicitLod,
+            vec![
+                Value::ImmU32(texture_count.saturating_sub(1)),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::ImmF32(1.0),
+                Value::Void,
+            ],
+        );
+        program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.info.stores_frag_color[0] = true;
+        for component in 0..4 {
+            let extracted = program.blocks[0].append_new_inst(
+                Opcode::CompositeExtractF32x4,
+                vec![
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: sample,
+                    }),
+                    Value::ImmU32(component),
+                ],
+            );
+            program.blocks[0].append_new_inst(
+                Opcode::SetFragColor,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(component),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: extracted,
+                    }),
+                ],
+            );
+        }
         program
     }
 
@@ -1216,6 +1294,43 @@ mod tests {
 
         assert_eq!(direct.source().stage, Stage::VertexB);
         assert_eq!(direct.bindings(), active.bindings());
+    }
+
+    #[test]
+    fn compiles_and_validates_direct_sampled_texture_msl() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let program = sampled_texture_program(2);
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::default(),
+        )
+        .expect("active sampled-texture SPIR-V/MSL must compile");
+        assert!(active.source().source.contains(".sample("));
+        assert!(active.source().source.contains("level(1.0)"));
+
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct sampled-texture MSL must compile with the same ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(direct.bindings().texture_count, 2);
+        assert_eq!(direct.bindings().sampler_count, 2);
+        assert!(direct
+            .source()
+            .source
+            .contains("array<texture2d<float>, 2> tex0"));
     }
 
     #[test]

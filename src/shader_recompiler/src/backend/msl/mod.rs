@@ -10,9 +10,11 @@
 
 pub mod emit_msl;
 mod emit_msl_bitwise_conversion;
+mod emit_msl_composite;
 mod emit_msl_context_get_set;
 mod emit_msl_convert;
 mod emit_msl_floating_point;
+mod emit_msl_image;
 mod emit_msl_integer;
 mod emit_msl_logical;
 mod emit_msl_memory;
@@ -139,6 +141,8 @@ pub enum MslError {
     MissingConstantBuffer(u32),
     #[error("MSL emission references undeclared storage buffer {0}")]
     MissingStorageBuffer(u32),
+    #[error("MSL emission references undeclared sampled texture {0}")]
+    MissingTexture(u32),
     #[error("MSL emission does not implement {opcode} at block {block} instruction {inst}")]
     UnsupportedOpcode {
         block: u32,

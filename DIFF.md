@@ -6901,3 +6901,27 @@ vs Eden `display_list.h` and `layer_list.h`
 - N/A: the service exchanges scalar CMIF outputs and a copy handle, with no raw aggregate payload.
   Focused tests cover the exact handler table and pending/available/clear state transition through
   the shared manager.
+
+## 2026-08-22 — `src/core/src/hle/service/olsc/remote_storage_controller.rs` and `olsc_service_for_system_service.rs` vs Eden OLSC counterparts
+
+### Intentional differences
+- Eden passes `Core::System&` to every child because it belongs to the C++ `ServiceFramework`
+  base. Ruzu's framework obtains system state from each IPC context, so the remote controller has
+  no duplicate concrete-service `SystemRef`; its parent constructs the otherwise stateless child
+  without downcasting merely to recover that unused value.
+- The typed CMIF template outputs of `GetSecondarySave` are represented by a private `repr(C)`
+  adapter containing the boolean, explicit zero padding, and three `u64` values. This preserves
+  the template's alignment while keeping the upstream method itself as the behavior owner.
+
+### Unintentional differences (to fix)
+- The broader pre-existing `IOlscServiceForSystemService` table and method parity were not part of
+  this warning slice and still require a complete dedicated audit.
+
+### Missing items
+- None in `IRemoteStorageController`: all 30 registered IDs/names and all three upstream methods
+  are present; commands 18 and 27 deliberately share `GetDataInfo` as in Eden.
+
+### Binary layout verification
+- PASS: `GetSecondarySave` writes a deterministic 0x20-byte output with the `[u64; 3]` at offset
+  8; `GetDataInfo` writes exactly 0x38 zero bytes. Focused tests cover the layouts, exact handler
+  table, implemented/null states, and all upstream stub outputs.

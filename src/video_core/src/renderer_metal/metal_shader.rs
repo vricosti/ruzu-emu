@@ -930,6 +930,27 @@ mod tests {
             ],
         );
         block.append_new_inst(
+            Opcode::BitFieldInsert,
+            vec![
+                Value::ImmU32(0xFFFF_0000),
+                Value::ImmU32(0x1234_5678),
+                Value::ImmU32(4),
+                Value::ImmU32(8),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::BitFieldSExtract,
+            vec![
+                Value::ImmU32(0x8000_0000),
+                Value::ImmU32(8),
+                Value::ImmU32(16),
+            ],
+        );
+        block.append_new_inst(Opcode::BitReverse32, vec![Value::ImmU32(1)]);
+        block.append_new_inst(Opcode::BitCount32, vec![Value::ImmU32(0xF0F0_0000)]);
+        block.append_new_inst(Opcode::FindSMsb32, vec![Value::ImmU32(u32::MAX)]);
+        block.append_new_inst(Opcode::FindUMsb32, vec![Value::ImmU32(0)]);
+        block.append_new_inst(
             Opcode::LogicalXor,
             vec![Value::ImmU1(true), Value::ImmU1(false)],
         );

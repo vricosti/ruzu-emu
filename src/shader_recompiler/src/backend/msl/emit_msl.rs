@@ -230,6 +230,21 @@ fn emit_inst(
             emit_msl_integer::emit_bitwise_with_flags(context, program, inst_ref, inst, "^")
         }
         Opcode::BitwiseNot32 => emit_msl_integer::emit_not_32(context, inst_ref, inst),
+        Opcode::BitFieldInsert => emit_msl_integer::emit_bit_field_insert(context, inst_ref, inst),
+        Opcode::BitFieldSExtract => {
+            emit_msl_integer::emit_bit_field_extract(context, inst_ref, inst, true)
+        }
+        Opcode::BitFieldUExtract => {
+            emit_msl_integer::emit_bit_field_extract(context, inst_ref, inst, false)
+        }
+        Opcode::BitReverse32 => {
+            emit_msl_integer::emit_unary_intrinsic_32(context, inst_ref, inst, "reverse_bits")
+        }
+        Opcode::BitCount32 => {
+            emit_msl_integer::emit_unary_intrinsic_32(context, inst_ref, inst, "popcount")
+        }
+        Opcode::FindSMsb32 => emit_msl_integer::emit_find_msb_32(context, inst_ref, inst, true),
+        Opcode::FindUMsb32 => emit_msl_integer::emit_find_msb_32(context, inst_ref, inst, false),
         Opcode::SMin32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "min", true),
         Opcode::UMin32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "min", false),
         Opcode::SMax32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "max", true),
@@ -709,6 +724,46 @@ mod tests {
         assert!(source.contains("float v_0_2 = as_type<float>(v_0_1);"));
         assert!(source.contains("uint v_0_3 = as_type<uint>(int(as_type<float>(0xC0000000u)));"));
         assert!(source.contains("float v_0_4 = float(as_type<int>(0xFFFFFFFEu));"));
+    }
+
+    #[test]
+    fn emits_bitfield_operations_and_maxwell_msb_sentinels() {
+        let mut program = empty_program(Stage::VertexB);
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let extract = emitter.bit_field_s_extract(
+                Value::ImmU32(0x8000_0000),
+                Value::ImmU32(8),
+                Value::ImmU32(16),
+            );
+            emitter.get_zero_from_op(extract);
+            emitter.get_sign_from_op(extract);
+            emitter.bit_field_insert(
+                Value::ImmU32(0xFFFF_0000),
+                Value::ImmU32(0x1234_5678),
+                Value::ImmU32(4),
+                Value::ImmU32(8),
+            );
+            emitter.bit_reverse_32(Value::ImmU32(1));
+            emitter.bit_count_32(Value::ImmU32(0xF0F0_0000));
+            emitter.find_s_msb_32(Value::ImmU32(u32::MAX));
+            emitter.find_u_msb_32(Value::ImmU32(0));
+        }
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains(
+            "as_type<uint>(extract_bits(as_type<int>(0x80000000u), 0x00000008u, 0x00000010u))"
+        ));
+        assert!(source.contains("bool v_0_1 = (v_0_0) == 0u;"));
+        assert!(source.contains("bool v_0_2 = as_type<int>(v_0_0) < 0;"));
+        assert!(source.contains("insert_bits(0xFFFF0000u, 0x12345678u, 0x00000004u, 0x00000008u)"));
+        assert!(source.contains("reverse_bits(0x00000001u)"));
+        assert!(source.contains("popcount(0xF0F00000u)"));
+        assert!(source.contains(
+            "31u - clz((as_type<int>(0xFFFFFFFFu) < 0 ? ~(0xFFFFFFFFu) : (0xFFFFFFFFu)))"
+        ));
+        assert!(source.contains("31u - clz(0x00000000u)"));
     }
 
     #[test]

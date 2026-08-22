@@ -175,6 +175,66 @@ pub fn emit_not_32(
     context.define(inst_ref, Type::U32, format!("~({value})"), false)
 }
 
+pub fn emit_bit_field_insert(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let base = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let insert = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let offset = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let count = context.value_expression(inst.arg(3), inst_ref, 3)?;
+    context.define(
+        inst_ref,
+        Type::U32,
+        format!("insert_bits({base}, {insert}, {offset}, {count})"),
+        false,
+    )
+}
+
+pub fn emit_bit_field_extract(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    signed: bool,
+) -> Result<(), MslError> {
+    let base = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let offset = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let count = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let expression = if signed {
+        format!("as_type<uint>(extract_bits(as_type<int>({base}), {offset}, {count}))")
+    } else {
+        format!("extract_bits({base}, {offset}, {count})")
+    };
+    context.define(inst_ref, Type::U32, expression, false)?;
+    set_zero_sign_flags(context, inst_ref, inst)
+}
+
+pub fn emit_unary_intrinsic_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    intrinsic: &'static str,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(inst_ref, Type::U32, format!("{intrinsic}({value})"), false)
+}
+
+pub fn emit_find_msb_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    signed: bool,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let operand = if signed {
+        format!("(as_type<int>({value}) < 0 ? ~({value}) : ({value}))")
+    } else {
+        value
+    };
+    context.define(inst_ref, Type::U32, format!("31u - clz({operand})"), false)
+}
+
 pub fn emit_min_max(
     context: &mut MslEmitContext,
     inst_ref: InstRef,

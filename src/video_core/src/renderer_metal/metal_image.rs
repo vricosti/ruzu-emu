@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::surface::PixelFormat;
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::types::{BufferImageCopy, ImageType};
+use shader_recompiler::shader_info::TextureType;
 
 use super::metal_buffer::MetalBuffer;
 use super::metal_device::MetalDevice;
@@ -45,6 +46,7 @@ pub enum MetalImageError {
 
 pub struct MetalImage {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    slice_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     guest_format: PixelFormat,
     image_type: ImageType,
     format: MetalFormat,
@@ -106,8 +108,41 @@ impl MetalImage {
                 depth,
                 format: info.format,
             })?;
+        // Vulkan's 3D images are created with
+        // VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT. Metal cannot reinterpret a
+        // 3D texture as a 2D-array view, so keep equivalent slice-compatible
+        // storage beside the native 3D texture.
+        let slice_texture = if info.image_type == ImageType::E3D {
+            let descriptor = MTLTextureDescriptor::new();
+            descriptor.setTextureType(MTLTextureType::Type2DArray);
+            descriptor.setPixelFormat(format.pixel_format);
+            unsafe {
+                descriptor.setWidth(width as usize);
+                descriptor.setHeight(height as usize);
+                descriptor.setDepth(1);
+                descriptor.setMipmapLevelCount(levels as usize);
+                descriptor.setSampleCount(1);
+                descriptor.setArrayLength(depth as usize);
+            }
+            descriptor.setStorageMode(MTLStorageMode::Private);
+            descriptor.setUsage(texture_usage(device.profile(), info.format));
+            Some(
+                device
+                    .device()
+                    .newTextureWithDescriptor(&descriptor)
+                    .ok_or(MetalImageError::AllocationFailed {
+                        width,
+                        height,
+                        depth,
+                        format: info.format,
+                    })?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             texture,
+            slice_texture,
             guest_format: info.format,
             image_type: info.image_type,
             format,
@@ -126,6 +161,19 @@ impl MetalImage {
 
     pub(crate) fn retained_handle(&self) -> Retained<ProtocolObject<dyn MTLTexture>> {
         self.texture.clone()
+    }
+
+    pub fn slice_handle(&self) -> Option<&ProtocolObject<dyn MTLTexture>> {
+        self.slice_texture.as_deref()
+    }
+
+    pub fn view_source(&self, texture_type: TextureType) -> &ProtocolObject<dyn MTLTexture> {
+        if self.image_type == ImageType::E3D && texture_type != TextureType::Color3D {
+            self.slice_handle()
+                .expect("3D images must own slice-compatible Metal storage")
+        } else {
+            self.handle()
+        }
     }
 
     pub fn format(&self) -> MetalFormat {
@@ -177,9 +225,13 @@ impl MetalImage {
         copies: &[BufferImageCopy],
     ) -> Result<(), MetalImageError> {
         let native_copies = self.native_buffer_copies(source, base_offset, copies)?;
+        let slice_copies = self
+            .slice_texture
+            .as_ref()
+            .map(|_| expand_3d_buffer_copies_to_slices(&native_copies));
         scheduler.request_outside_render_pass_operation_context();
         scheduler.with_blit_encoder(|encoder| {
-            for copy in native_copies {
+            for copy in &native_copies {
                 unsafe {
                     encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                         source.handle(),
@@ -192,6 +244,91 @@ impl MetalImage {
                         copy.level,
                         copy.origin,
                     );
+                }
+            }
+            if let (Some(texture), Some(copies)) = (&self.slice_texture, slice_copies.as_ref()) {
+                for copy in copies {
+                    unsafe {
+                        encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            source.handle(),
+                            copy.buffer_offset,
+                            copy.bytes_per_row,
+                            copy.bytes_per_image,
+                            copy.size,
+                            texture,
+                            copy.slice,
+                            copy.level,
+                            copy.origin,
+                        );
+                    }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Upload bytes already converted to the native Metal texel layout.
+    ///
+    /// Depth24/stencil8 guest images use four bytes per texel, while Apple
+    /// GPUs expose only `Depth32Float_Stencil8` (eight bytes per texel). The
+    /// texture cache performs that CPU conversion before calling this method.
+    pub fn upload_converted_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        source: &MetalBuffer,
+        base_offset: usize,
+        copies: &[BufferImageCopy],
+        bytes_per_texel: usize,
+    ) -> Result<(), MetalImageError> {
+        if !self.format.requires_conversion {
+            return Err(MetalImageError::InvalidCopy(
+                "converted upload requested for a native format",
+            ));
+        }
+        let native_copies = self.native_buffer_copies_with_layout(
+            source,
+            base_offset,
+            copies,
+            1,
+            1,
+            bytes_per_texel,
+        )?;
+        let slice_copies = self
+            .slice_texture
+            .as_ref()
+            .map(|_| expand_3d_buffer_copies_to_slices(&native_copies));
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.with_blit_encoder(|encoder| {
+            for copy in &native_copies {
+                unsafe {
+                    encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        source.handle(),
+                        copy.buffer_offset,
+                        copy.bytes_per_row,
+                        copy.bytes_per_image,
+                        copy.size,
+                        self.handle(),
+                        copy.slice,
+                        copy.level,
+                        copy.origin,
+                    );
+                }
+            }
+            if let (Some(texture), Some(copies)) = (&self.slice_texture, slice_copies.as_ref()) {
+                for copy in copies {
+                    unsafe {
+                        encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            source.handle(),
+                            copy.buffer_offset,
+                            copy.bytes_per_row,
+                            copy.bytes_per_image,
+                            copy.size,
+                            texture,
+                            copy.slice,
+                            copy.level,
+                            copy.origin,
+                        );
+                    }
                 }
             }
         })?;
@@ -240,6 +377,25 @@ impl MetalImage {
         let block_width = crate::surface::default_block_width(self.guest_format).max(1) as usize;
         let block_height = crate::surface::default_block_height(self.guest_format).max(1) as usize;
         let bytes_per_block = crate::surface::bytes_per_block(self.guest_format).max(1) as usize;
+        self.native_buffer_copies_with_layout(
+            buffer,
+            base_offset,
+            copies,
+            block_width,
+            block_height,
+            bytes_per_block,
+        )
+    }
+
+    fn native_buffer_copies_with_layout(
+        &self,
+        buffer: &MetalBuffer,
+        base_offset: usize,
+        copies: &[BufferImageCopy],
+        block_width: usize,
+        block_height: usize,
+        bytes_per_block: usize,
+    ) -> Result<Vec<NativeBufferImageCopy>, MetalImageError> {
         let mut result = Vec::new();
         for copy in copies {
             let level = usize::try_from(copy.image_subresource.base_level)
@@ -368,6 +524,33 @@ struct NativeBufferImageCopy {
     origin: MTLOrigin,
 }
 
+fn expand_3d_buffer_copies_to_slices(
+    copies: &[NativeBufferImageCopy],
+) -> Vec<NativeBufferImageCopy> {
+    copies
+        .iter()
+        .flat_map(|copy| {
+            (0..copy.size.depth).map(move |depth| NativeBufferImageCopy {
+                buffer_offset: copy.buffer_offset + depth * copy.bytes_per_image,
+                bytes_per_row: copy.bytes_per_row,
+                bytes_per_image: copy.bytes_per_image,
+                size: MTLSize {
+                    width: copy.size.width,
+                    height: copy.size.height,
+                    depth: 1,
+                },
+                slice: copy.origin.z + depth,
+                level: copy.level,
+                origin: MTLOrigin {
+                    x: copy.origin.x,
+                    y: copy.origin.y,
+                    z: 0,
+                },
+            })
+        })
+        .collect()
+}
+
 fn checked_origin(copy: &BufferImageCopy) -> Result<MTLOrigin, MetalImageError> {
     Ok(MTLOrigin {
         x: usize::try_from(copy.image_offset.x)
@@ -448,6 +631,38 @@ mod tests {
             .expect("array image allocation");
         assert_eq!(image.layers(), 6);
         assert_eq!(image.handle().textureType(), MTLTextureType::Type2DArray);
+    }
+
+    #[test]
+    fn creates_slice_compatible_storage_for_3d_images() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let image = MetalImage::new(
+            &device,
+            &ImageInfo {
+                format: PixelFormat::B10G11R11Float,
+                image_type: ImageType::E3D,
+                resources: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+                size: Extent3D {
+                    width: 16,
+                    height: 8,
+                    depth: 4,
+                },
+                ..ImageInfo::default()
+            },
+        )
+        .expect("3D image allocation");
+
+        assert_eq!(
+            image.view_source(TextureType::Color3D).textureType(),
+            MTLTextureType::Type3D
+        );
+        assert_eq!(
+            image.view_source(TextureType::Color2D).textureType(),
+            MTLTextureType::Type2DArray
+        );
     }
 
     #[test]

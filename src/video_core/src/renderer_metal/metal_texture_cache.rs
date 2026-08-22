@@ -26,6 +26,7 @@ use crate::texture_cache::types::{
     BufferImageCopy, ImageCopy, ImageId, ImageType, ImageViewId, SamplerId, NULL_IMAGE_VIEW_ID,
     NULL_SAMPLER_ID, NUM_RT,
 };
+use crate::surface::PixelFormat;
 
 use super::metal_buffer::MetalBuffer;
 use super::metal_device::MetalDevice;
@@ -413,12 +414,45 @@ impl TextureCacheParams for MetalTextureCacheParams {
             .backend
             .take()
             .expect("Metal image backend must be materialized");
-        let result = image.upload_memory(
-            cache.runtime_mut().scheduler(),
-            &staging.buffer,
-            staging.offset,
-            copies,
-        );
+        let result = match image.guest_format() {
+            PixelFormat::D24UnormS8Uint | PixelFormat::S8UintD24Unorm => {
+                let converted_size = converted_depth_stencil_size(copies);
+                let mut converted = cache
+                    .runtime_mut()
+                    .upload_staging_buffer(converted_size, false);
+                match converted.as_mut() {
+                    Ok(converted) => {
+                        let converted_copies = convert_depth24_stencil8_upload(
+                            image.guest_format(),
+                            staging.mapped_span(),
+                            converted.mapped_span_mut(),
+                            copies,
+                        );
+                        match converted_copies {
+                            Ok(converted_copies) => image.upload_converted_memory(
+                                cache.runtime_mut().scheduler(),
+                                &converted.buffer,
+                                converted.offset,
+                                &converted_copies,
+                                8,
+                            ),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => {
+                        cache.slot_images[image_id].backend = Some(image);
+                        log::error!("Metal depth/stencil staging allocation failed: {error}");
+                        return;
+                    }
+                }
+            }
+            _ => image.upload_memory(
+                cache.runtime_mut().scheduler(),
+                &staging.buffer,
+                staging.offset,
+                copies,
+            ),
+        };
         cache.slot_images[image_id].backend = Some(image);
         if let Err(error) = result {
             log::error!("Metal image upload failed for {}: {error}", image_id.index);
@@ -508,6 +542,95 @@ impl TextureCacheParams for MetalTextureCacheParams {
             );
         }
     }
+}
+
+fn converted_depth_stencil_size(copies: &[BufferImageCopy]) -> usize {
+    copies
+        .iter()
+        .map(|copy| {
+            let row_texels = if copy.buffer_row_length == 0 {
+                copy.image_extent.width
+            } else {
+                copy.buffer_row_length
+            } as usize;
+            let rows = if copy.buffer_image_height == 0 {
+                copy.image_extent.height
+            } else {
+                copy.buffer_image_height
+            } as usize;
+            let planes = if copy.image_extent.depth > 1 {
+                copy.image_extent.depth as usize
+            } else {
+                copy.image_subresource.num_layers.max(1) as usize
+            };
+            row_texels
+                .saturating_mul(rows)
+                .saturating_mul(planes)
+                .saturating_mul(8)
+        })
+        .sum()
+}
+
+fn convert_depth24_stencil8_upload(
+    format: PixelFormat,
+    input: &[u8],
+    output: &mut [u8],
+    copies: &[BufferImageCopy],
+) -> Result<Vec<BufferImageCopy>, super::metal_image::MetalImageError> {
+    let mut output_offset = 0usize;
+    let mut converted_copies = Vec::with_capacity(copies.len());
+    for copy in copies {
+        let row_texels = if copy.buffer_row_length == 0 {
+            copy.image_extent.width
+        } else {
+            copy.buffer_row_length
+        } as usize;
+        let rows = if copy.buffer_image_height == 0 {
+            copy.image_extent.height
+        } else {
+            copy.buffer_image_height
+        } as usize;
+        let planes = if copy.image_extent.depth > 1 {
+            copy.image_extent.depth as usize
+        } else {
+            copy.image_subresource.num_layers.max(1) as usize
+        };
+        let texels = row_texels.saturating_mul(rows).saturating_mul(planes);
+        let input_size = texels.saturating_mul(4);
+        let output_size = texels.saturating_mul(8);
+        let input_end = copy.buffer_offset.saturating_add(input_size);
+        let output_end = output_offset.saturating_add(output_size);
+        if input_end > input.len() || output_end > output.len() {
+            return Err(super::metal_image::MetalImageError::InvalidCopy(
+                "converted depth/stencil staging range",
+            ));
+        }
+        for (source, destination) in input[copy.buffer_offset..input_end]
+            .chunks_exact(4)
+            .zip(output[output_offset..output_end].chunks_exact_mut(8))
+        {
+            let packed = u32::from_le_bytes(source.try_into().unwrap());
+            let (depth, stencil) = match format {
+                PixelFormat::D24UnormS8Uint => (packed & 0x00ff_ffff, packed >> 24),
+                PixelFormat::S8UintD24Unorm => (packed >> 8, packed & 0xff),
+                _ => {
+                    return Err(super::metal_image::MetalImageError::InvalidCopy(
+                        "unsupported depth/stencil conversion format",
+                    ));
+                }
+            };
+            destination[..4]
+                .copy_from_slice(&((depth as f32) / 16_777_215.0).to_le_bytes());
+            destination[4] = stencil as u8;
+            destination[5..].fill(0);
+        }
+        let mut converted = *copy;
+        converted.buffer_offset = output_offset;
+        converted.buffer_size = output_size;
+        converted_copies.push(converted);
+        output_offset = output_end;
+    }
+    Ok(converted_copies)
 }
 
 #[repr(transparent)]
@@ -625,7 +748,7 @@ impl MetalTextureCache {
         );
         let view = self.image_view(framebuffer.view_id)?;
         Some((
-            view.retained_render_target(),
+            view.retained_handle(TextureType::Color2D)?,
             framebuffer.view.size.width,
             framebuffer.view.size.height,
         ))
@@ -988,5 +1111,61 @@ mod tests {
         assert!(result
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 0, 0, 255]));
+    }
+
+    fn depth_stencil_copy() -> BufferImageCopy {
+        BufferImageCopy {
+            buffer_size: 8,
+            buffer_row_length: 2,
+            buffer_image_height: 1,
+            image_extent: Extent3D {
+                width: 2,
+                height: 1,
+                depth: 1,
+            },
+            ..BufferImageCopy::default()
+        }
+    }
+
+    fn assert_converted_depth_stencil(format: PixelFormat, packed: [u32; 2]) {
+        let input = packed
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut output = vec![0; 16];
+        let copies = convert_depth24_stencil8_upload(
+            format,
+            &input,
+            &mut output,
+            &[depth_stencil_copy()],
+        )
+        .unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].buffer_offset, 0);
+        assert_eq!(copies[0].buffer_size, 16);
+        let first_depth = f32::from_le_bytes(output[0..4].try_into().unwrap());
+        let second_depth = f32::from_le_bytes(output[8..12].try_into().unwrap());
+        assert_eq!(first_depth, 0.0);
+        assert_eq!(second_depth, 1.0);
+        assert_eq!(output[4], 0x12);
+        assert_eq!(output[12], 0xab);
+        assert_eq!(&output[5..8], &[0, 0, 0]);
+        assert_eq!(&output[13..16], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn converts_d24s8_guest_words_to_metal_depth32_stencil8() {
+        assert_converted_depth_stencil(
+            PixelFormat::D24UnormS8Uint,
+            [0x1200_0000, 0xabff_ffff],
+        );
+    }
+
+    #[test]
+    fn converts_s8d24_guest_words_to_metal_depth32_stencil8() {
+        assert_converted_depth_stencil(
+            PixelFormat::S8UintD24Unorm,
+            [0x0000_0012, 0xffff_ffab],
+        );
     }
 }

@@ -6947,3 +6947,63 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: this slice exchanges only a moved service interface and defines no raw payload.
   Focused tests cover the seven-entry child table and command 7992 registration.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/core/container.rs` vs Eden `src/core/hle/service/nvdrv/core/container.{h,cpp}`
+
+### Intentional differences
+- `Container` is a cloneable Rust handle whose `Arc`-owned NvMap, syncpoint manager, device-file
+  data, and session store remain shared. This models the borrowed `NvCore::Container&` retained by
+  Eden's NVDEC/VIC base without a raw pointer or a second copy of the state.
+- Eden exposes mutable `Host1xDeviceFile()` access. Ruzu keeps that state private and exposes the
+  operation-shaped `take_accumulated_syncpoint`/`recycle_syncpoint` pair, preserving
+  the constructor/destructor FIFO ordering while preventing unrelated mutation.
+- Session process pointers are `Weak<ProcessLock>` and session state is mutex-protected. Missing or
+  inactive sessions return `None` instead of relying on Eden's unchecked deque indexing.
+- Ruzu releases the session mutex around `NvMap::unmap_all_handles` because that path re-enters the
+  shared Rust session store; the observable teardown order remains unmap handles, release the
+  preallocated area, deactivate the session, unregister the ASID, then recycle the ID.
+
+### Unintentional differences (to fix)
+- No remaining difference was found in the shared-handle and accumulated-syncpoint behavior
+  changed by this slice.
+
+### Missing items
+- None in the `Container` interface used by NVDEC/VIC: session ownership, NvMap/syncpoint access,
+  and accumulated-syncpoint take/return behavior are available through Rust ownership adapters.
+
+### Binary layout verification
+- N/A: `Container` and `Session` are internal ownership objects and are never serialized as raw
+  guest payloads. A focused test verifies that a cloned handle resolves the exact same process
+  session.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_nvdec_common.rs`, `nvhost_nvdec.rs`, and `nvhost_vic.rs` vs Eden counterparts
+
+### Intentional differences
+- Rust composition replaces C++ inheritance: both concrete devices forward `query_event` to the
+  common owner, while each concrete file retains its own ioctl table exactly where Eden defines it.
+- The upstream-only `submit_timeout`, `nvmap_fd`, and `device_syncpoints` state and the unused
+  `IoctlSubmitCommandBuffer`/`IocGetIdParams` declarations are omitted. Eden never reads any of
+  them, and `SetNVMAPfd`/`SetSubmitTimeout` still log and return success exactly as observable by
+  the guest.
+- Malformed submissions are rejected safely: an absent session/process memory/Host1x returns
+  `InvalidState`, non-positive command-buffer word counts are skipped, and a shorter fence array
+  does not cause unchecked indexing. Eden assumes all of those invariants.
+- Ruzu emits optional host1x trace records and converts each command list to native `u32` values
+  because its Host1x interface accepts `Vec<u32>` rather than Eden's moved `CpuGuestMemory` view.
+
+### Unintentional differences (to fix)
+- The eager command-list snapshot noted above cannot preserve Eden's lazy guest-memory view if the
+  guest mutates that memory before Host1x consumes it. Correcting that requires a dedicated Host1x
+  queue/interface ownership change and is not safe to fold into this warning-removal slice.
+
+### Missing items
+- None in the ioctl/query-event surface: NVDEC exposes commands 0x01, 0x02, 0x03, 0x07, 0x09,
+  0x0A, 0x23 and H/0x01; VIC exposes 0x01, 0x02, 0x03, 0x09, 0x0A and H/0x01. `GetClkRate`
+  writes 614400000/0, and unknown query events return no event.
+
+### Binary layout verification
+- PASS: every live fixed/variable ioctl payload has `repr(C)` and an exact size assertion:
+  `IoctlSetNvmapFD` 0x4, `IoctlSubmit` 0x10, `CommandBuffer` 0xC, `Reloc` 0x10,
+  `SyncptIncr` 0x14, syncpoint/waitbase/clock-rate and map entries 0x8, and map parameters 0xC.
+  Focused tests cover clock-rate serialization, concrete-device routing, `num_entries` bounds, and
+  syncpoint recycling.

@@ -1,5 +1,39 @@
 # Porting State
 
+## 2026-08-22 — GDB warning slice interrupted by debugger-backend prerequisite
+
+- Active slice: resolve the unused reply constants, breakpoint map, no-ack state, architecture
+  state, escape helper, and breakpoint enum in `debugger/gdbstub.rs`.
+- Finding: these are not dead upstream. Eden uses them in packet replies, memory access,
+  breakpoint/watchpoint insertion/removal, feature negotiation, and no-ack mode.
+- Exact missing prerequisite: Ruzu's `DebuggerBackend` exposes only opaque numeric thread IDs and
+  its `Debugger` never constructs a `GdbStub`; the frontend has no `System`, debug-process memory,
+  thread list/context, socket reply path, or cache-invalidation path required by Eden's handlers.
+- Required next action: port the debugger backend/frontend ownership and connection wiring in
+  `debugger_interface.rs` and `debugger.rs`, verify those matching files, then resume the GDB command
+  handlers. Deleting or merely allowing the warned members would hide functional parity debt.
+
+## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
+
+- Status: interrupted before consuming the callback table fields in `hle/service/jit/jit.rs`.
+- Interrupted slice: port `JITU::CreateJitEnvironment`, `IJitEnvironment::LoadPlugin`, and the
+  callback execution paths that read every `GuestCallbacks` member.
+- Exact missing prerequisite: `hle/service/jit/jit_code_memory.rs` cannot implement Eden's random
+  owner mapping because Ruzu's `KCodeMemory` is not retained as a typed handle object. The code
+  memory SVC currently records only an opaque ID and directly edits the current page table instead
+  of calling `KCodeMemory::{Map,Unmap,MapToOwner,UnmapFromOwner}`. Its initializer also fabricates a
+  page group from a virtual address instead of using `LockForCodeMemory`.
+- Required next action: restore `KCodeMemory` page-group, owner, registry, SVC dispatch, and
+  finalization parity in their kernel-owned Rust counterparts; verify that prerequisite against
+  Eden before implementing `jit_code_memory.rs` and resuming `jit.rs`.
+- Prerequisite result: `KCodeMemory` now retains its owner and physical page group, locks and
+  clears source pages, maps/unmaps the group with Eden's states and permissions, and restores the
+  source on finalization. `KProcess` retains typed code-memory objects for opaque handle-table
+  IDs, both AArch32 and AArch64 generated dispatch layouts call the real SVC handlers, and invalid
+  operation values return `ResultInvalidEnumValue` without an unsafe enum conversion.
+- Status: kernel code-memory prerequisite completed and re-verified; `jit_code_memory.rs` may now
+  resume.
+
 ## 2026-08-22 — PlatformServiceManager warning interrupted by kernel font-memory prerequisite
 
 - Active slice: remove the unused caller-process lookup in

@@ -4,7 +4,10 @@
 //!
 //! SVC handlers for code memory operations.
 
+use std::sync::{Arc, Mutex};
+
 use crate::core::System;
+use crate::hle::kernel::k_code_memory::{CodeMemoryOperation as KCodeMemoryOperation, KCodeMemory};
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
@@ -56,27 +59,45 @@ pub fn create_code_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    // Verify that the region is in range.
     let process_arc = system.current_process_arc();
-    let mut process = process_arc.lock().unwrap();
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
-    if !process.page_table.contains(addr_kpa, size as usize) {
+    if !process_arc
+        .lock()
+        .unwrap()
+        .page_table
+        .contains(addr_kpa, size as usize)
+    {
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    // Upstream: KCodeMemory::Create, Initialize, Register, add to handle table.
-    // Use a unique object ID for the code memory in the handle table.
-    static NEXT_CODE_MEM_ID: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0xC000_0000);
-    let code_mem_id = NEXT_CODE_MEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let code_mem_id = system
+        .kernel()
+        .expect("CreateCodeMemory requires an initialized kernel")
+        .create_new_object_id() as u64;
+    let code_memory = Arc::new(Mutex::new(KCodeMemory::new()));
 
-    // Add to handle table.
+    let result = code_memory.lock().unwrap().initialize(
+        system.device_memory(),
+        &process_arc,
+        addr_kpa,
+        size as usize,
+    );
+    if result != RESULT_SUCCESS {
+        return result;
+    }
+
+    let mut process = process_arc.lock().unwrap();
     match process.handle_table.add(code_mem_id) {
         Ok(h) => {
             *out = h;
+            process.register_code_memory_object(code_mem_id, code_memory);
         }
         Err(_) => {
             *out = 0;
+            code_memory
+                .lock()
+                .unwrap()
+                .finalize_with_owner(&mut process);
             return RESULT_OUT_OF_HANDLES;
         }
     }
@@ -91,7 +112,7 @@ pub fn create_code_memory(
 pub fn control_code_memory(
     system: &System,
     code_memory_handle: Handle,
-    operation: CodeMemoryOperation,
+    operation: u32,
     address: u64,
     size: u64,
     perm: MemoryPermission,
@@ -115,19 +136,29 @@ pub fn control_code_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    // Get the code memory from its handle.
     let process_arc = system.current_process_arc();
-    let mut process = process_arc.lock().unwrap();
-    let _object_id = match process.handle_table.get_object(code_memory_handle) {
-        Some(id) => id,
-        None => return RESULT_INVALID_HANDLE,
+    let code_memory = {
+        let process = process_arc.lock().unwrap();
+        let object_id = match process.handle_table.get_object(code_memory_handle) {
+            Some(id) => id,
+            None => return RESULT_INVALID_HANDLE,
+        };
+        match process.get_code_memory_by_object_id(object_id) {
+            Some(code_memory) => code_memory,
+            None => return RESULT_INVALID_HANDLE,
+        }
     };
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
 
-    // Perform the operation based on CodeMemoryOperation variant.
+    let operation = match KCodeMemoryOperation::try_from(operation) {
+        Ok(operation) => operation,
+        Err(result) => return result,
+    };
+
     match operation {
-        CodeMemoryOperation::Map => {
+        KCodeMemoryOperation::Map => {
+            let mut process = process_arc.lock().unwrap();
             // Check that the region is in range.
             if !process.page_table.can_contain(
                 addr_kpa,
@@ -142,18 +173,13 @@ pub fn control_code_memory(
                 return RESULT_INVALID_NEW_MEMORY_PERMISSION;
             }
 
-            // Upstream: code_mem->Map(address, size)
-            // Map the memory using the page table.
-            let result = process.page_table.map_memory(
-                addr_kpa,
-                addr_kpa, // Self-map for code memory
-                size as usize,
-            );
-            if result != 0 {
-                return ResultCode::new(result);
-            }
+            return code_memory
+                .lock()
+                .unwrap()
+                .map(&mut process, addr_kpa, size as usize);
         }
-        CodeMemoryOperation::Unmap => {
+        KCodeMemoryOperation::Unmap => {
+            let mut process = process_arc.lock().unwrap();
             // Check that the region is in range.
             if !process.page_table.can_contain(
                 addr_kpa,
@@ -168,17 +194,19 @@ pub fn control_code_memory(
                 return RESULT_INVALID_NEW_MEMORY_PERMISSION;
             }
 
-            // Upstream: code_mem->Unmap(address, size)
-            let result = process
-                .page_table
-                .unmap_memory(addr_kpa, addr_kpa, size as usize);
-            if result != 0 {
-                return ResultCode::new(result);
-            }
+            return code_memory
+                .lock()
+                .unwrap()
+                .unmap(&mut process, addr_kpa, size as usize);
         }
-        CodeMemoryOperation::MapToOwner => {
+        KCodeMemoryOperation::MapToOwner => {
+            let owner = match code_memory.lock().unwrap().get_owner() {
+                Some(owner) => owner,
+                None => return RESULT_INVALID_STATE,
+            };
+            let mut owner = owner.lock().unwrap();
             // Check that the region is in range.
-            if !process.page_table.can_contain(
+            if !owner.page_table.can_contain(
                 addr_kpa,
                 size as usize,
                 crate::hle::kernel::k_memory_block::KMemoryState::GENERATED_CODE,
@@ -191,21 +219,21 @@ pub fn control_code_memory(
                 return RESULT_INVALID_NEW_MEMORY_PERMISSION;
             }
 
-            // Upstream: code_mem->MapToOwner(address, size, perm)
-            let k_perm = crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(
-                perm as u8,
+            return code_memory.lock().unwrap().map_to_owner(
+                &mut owner,
+                addr_kpa,
+                size as usize,
+                perm,
             );
-            let result =
-                process
-                    .page_table
-                    .set_process_memory_permission(addr_kpa, size as usize, k_perm);
-            if result != 0 {
-                return ResultCode::new(result);
-            }
         }
-        CodeMemoryOperation::UnmapFromOwner => {
+        KCodeMemoryOperation::UnmapFromOwner => {
+            let owner = match code_memory.lock().unwrap().get_owner() {
+                Some(owner) => owner,
+                None => return RESULT_INVALID_STATE,
+            };
+            let mut owner = owner.lock().unwrap();
             // Check that the region is in range.
-            if !process.page_table.can_contain(
+            if !owner.page_table.can_contain(
                 addr_kpa,
                 size as usize,
                 crate::hle::kernel::k_memory_block::KMemoryState::GENERATED_CODE,
@@ -218,17 +246,11 @@ pub fn control_code_memory(
                 return RESULT_INVALID_NEW_MEMORY_PERMISSION;
             }
 
-            // Upstream: code_mem->UnmapFromOwner(address, size)
-            let result = process.page_table.set_process_memory_permission(
+            return code_memory.lock().unwrap().unmap_from_owner(
+                &mut owner,
                 addr_kpa,
                 size as usize,
-                crate::hle::kernel::k_memory_block::KMemoryPermission::NONE,
             );
-            if result != 0 {
-                return ResultCode::new(result);
-            }
         }
     }
-
-    RESULT_SUCCESS
 }

@@ -644,6 +644,10 @@ impl KPageTableBase {
         &mut self.m_memory_block_manager
     }
 
+    pub fn get_block_info_manager(&self) -> Option<Arc<KBlockInfoManager>> {
+        self.m_block_info_manager.clone()
+    }
+
     // -- Region resolution matching upstream GetRegionAddress/GetRegionSize --
 
     /// Get the start address for a memory region by SVC memory state.
@@ -6873,41 +6877,46 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::LockForCodeMemory`.
     pub fn lock_for_code_memory(
         &mut self,
+        out: &mut super::k_page_group::KPageGroup,
         addr: usize,
         size: usize,
-        perm: KMemoryPermission,
     ) -> u32 {
-        let mut paddr = 0u64;
         self.lock_memory_and_open(
+            Some(out),
             None,
-            Some(&mut paddr),
             addr,
             size,
-            KMemoryState::FLAG_CAN_CODE_ALIAS,
-            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryState::FLAG_CAN_CODE_MEMORY,
+            KMemoryState::FLAG_CAN_CODE_MEMORY,
             KMemoryPermission::from_bits_truncate(0xFF),
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::from_bits_truncate(0xFF),
             KMemoryAttribute::NONE,
-            perm,
+            KMemoryPermission::KERNEL_READ_WRITE | KMemoryPermission::NOT_MAPPED,
             KMemoryAttribute::LOCKED,
         )
     }
 
     /// Unlock memory for code memory operations.
     /// Matches upstream `KPageTableBase::UnlockForCodeMemory`.
-    pub fn unlock_for_code_memory(&mut self, addr: usize, size: usize) -> u32 {
-        self.unlock_memory(
+    pub fn unlock_for_code_memory(
+        &mut self,
+        addr: usize,
+        size: usize,
+        pg: &super::k_page_group::KPageGroup,
+    ) -> u32 {
+        self.unlock_memory_impl(
             addr,
             size,
-            KMemoryState::FLAG_CAN_CODE_ALIAS,
-            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryState::FLAG_CAN_CODE_MEMORY,
+            KMemoryState::FLAG_CAN_CODE_MEMORY,
             KMemoryPermission::NONE,
             KMemoryPermission::NONE,
             KMemoryAttribute::from_bits_truncate(0xFF),
             KMemoryAttribute::LOCKED,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::LOCKED,
+            Some(pg),
         )
     }
 

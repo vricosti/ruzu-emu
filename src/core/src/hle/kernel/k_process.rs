@@ -557,6 +557,7 @@ pub struct KProcess {
     pub shared_memory_infos: BTreeMap<usize, KSharedMemoryInfo>,
     pub transfer_memory_objects:
         BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
+    pub code_memory_objects: BTreeMap<u64, Arc<Mutex<super::k_code_memory::KCodeMemory>>>,
     pub sync_object: SynchronizationObjectState,
     pub self_reference: Option<Weak<ProcessLock>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
@@ -688,6 +689,7 @@ impl KProcess {
             shared_memory_objects: BTreeMap::new(),
             shared_memory_infos: BTreeMap::new(),
             transfer_memory_objects: BTreeMap::new(),
+            code_memory_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
             self_reference: None,
             scheduler: None,
@@ -2799,6 +2801,10 @@ impl KProcess {
         for object_id in transfer_memory_object_ids {
             self.unregister_transfer_memory_object_by_object_id(object_id);
         }
+        let code_memory_object_ids: Vec<u64> = self.code_memory_objects.keys().copied().collect();
+        for object_id in code_memory_object_ids {
+            self.unregister_code_memory_object_by_object_id(object_id);
+        }
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
@@ -3064,6 +3070,29 @@ impl KProcess {
         self.transfer_memory_objects.get(&object_id).cloned()
     }
 
+    pub fn register_code_memory_object(
+        &mut self,
+        object_id: u64,
+        code_memory: Arc<Mutex<super::k_code_memory::KCodeMemory>>,
+    ) {
+        self.code_memory_objects.insert(object_id, code_memory);
+    }
+
+    pub fn unregister_code_memory_object_by_object_id(&mut self, object_id: u64) {
+        if let Some(code_memory) = self.code_memory_objects.remove(&object_id) {
+            if Arc::strong_count(&code_memory) == 1 {
+                code_memory.lock().unwrap().finalize_with_owner(self);
+            }
+        }
+    }
+
+    pub fn get_code_memory_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_code_memory::KCodeMemory>>> {
+        self.code_memory_objects.get(&object_id).cloned()
+    }
+
     pub fn register_light_session_object(
         &mut self,
         object_id: u64,
@@ -3122,6 +3151,9 @@ impl KProcess {
             }
             if self.transfer_memory_objects.contains_key(&object_id) {
                 self.unregister_transfer_memory_object_by_object_id(object_id);
+            }
+            if self.code_memory_objects.contains_key(&object_id) {
+                self.unregister_code_memory_object_by_object_id(object_id);
             }
             self.device_address_space_objects.remove(&object_id);
         }

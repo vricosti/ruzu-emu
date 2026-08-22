@@ -7429,3 +7429,103 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: the level-information structure is asserted to have Eden's size `0x18` and alignment `0x4`.
   Focused tests verify failed-initialization cleanup/retry and the uninitialized `GetSize` bit pattern.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_base.rs` and `k_process_page_table.rs` vs Eden `src/core/hle/kernel/k_page_table_base.{h,cpp}` and `k_process_page_table.h`
+
+### Intentional differences
+- Rust forwards through the composed `KProcessPageTable::base` member; Eden inherits
+  `KProcessPageTable` from `KPageTableBase`.
+
+### Unintentional differences (to fix)
+- `LockForCodeMemory` previously returned a physical address, accepted a caller-selected
+  permission, and tested `FlagCanCodeAlias`. It now fills and opens the caller's page group,
+  tests `FlagCanCodeMemory`, and installs `KernelReadWrite | NotMapped` exactly like Eden.
+- `UnlockForCodeMemory` previously omitted the page-group identity check and used
+  `FlagCanCodeAlias`. It now forwards the exact page group into `UnlockMemory` and restores the
+  source under `FlagCanCodeMemory`.
+- The process-page-table wrapper previously omitted both code-memory forwarding methods and the
+  block-info-manager accessor needed to construct an owner-matched page group.
+
+### Missing items
+- None for the `LockForCodeMemory` and `UnlockForCodeMemory` dependency slice.
+
+### Binary layout verification
+- N/A: these methods operate on existing page groups and memory-block state; no serialized payload
+  changed.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_code_memory.rs` vs Eden `src/core/hle/kernel/k_code_memory.{h,cpp}`
+
+### Intentional differences
+- `Arc<ProcessLock>` represents Eden's explicitly opened owner-process reference, and the outer
+  `Mutex<KCodeMemory>` used by the typed object registry represents `m_lock`.
+- Methods receive an already locked mutable current/owner process where needed so Rust never
+  recursively locks the non-reentrant process mutex.
+- `Drop` invokes `Finalize` only for initialized objects; Eden's auto-object lifecycle invokes
+  `Finalize` before destruction under the same precondition.
+
+### Unintentional differences (to fix)
+- The former implementation fabricated physical pages from the guest virtual address and never
+  retained its owner. Initialization now obtains the owner page table's block-info manager, locks
+  the real source mapping, clears every physical byte to `0xFF`, retains the owner, and records the
+  source address and size in Eden's order.
+- `Map`, `Unmap`, `MapToOwner`, and `UnmapFromOwner` previously only toggled booleans. They now map
+  the retained page group with `CodeOut/UserReadWrite` or `GeneratedCode/UserRead{Execute}` and
+  preserve Eden's size and duplicate-map validation.
+- Finalization now conditionally unlocks the original source, closes and finalizes its page group,
+  and releases its owner reference in upstream order.
+
+### Missing items
+- None for `KCodeMemory` initialization, mapping, accessors, and finalization behavior.
+
+### Binary layout verification
+- N/A: `KCodeMemory` is an internal ownership object rather than a raw guest payload. Focused tests
+  verify the page count, physical `0xFF` fill, memory states, permissions, and lock restoration.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` code-memory ownership
+
+### Intentional differences
+- Ruzu's generic handle table stores opaque object IDs, so `KProcess` retains a typed
+  `Arc<Mutex<KCodeMemory>>` registry beside its existing typed kernel-object registries. Eden's
+  handle table and global auto-object container retain typed intrusive pointers directly.
+- Removing the final handle finalizes immediately only when no external Rust owner exists; an
+  external `Arc` retains the object and its strong owner-process reference like Eden's `Open`.
+
+### Unintentional differences (to fix)
+- Code-memory handles previously had no corresponding typed object and process teardown could not
+  finalize their source mappings. Registration, lookup, last-handle removal, and process-finalize
+  cleanup now preserve that lifecycle.
+
+### Missing items
+- None for process-owned lookup and release of code-memory handle objects.
+
+### Binary layout verification
+- N/A: the registry is host-only ownership state and does not alter `KProcess` guest ABI data.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_code_memory.rs` and `svc_dispatch.rs` vs Eden `src/core/hle/kernel/svc/svc_code_memory.cpp` and generated `svc.cpp`
+
+### Intentional differences
+- Rust heap allocation and `Arc` ownership replace Eden's slab `Create/Register/Open/Close`
+  mechanics; object IDs still come from `KernelCore` and handle-table insertion remains the
+  publication point.
+- Raw operation values are converted with fallible `TryFrom` because transmuting an invalid guest
+  integer into a Rust enum would be undefined behavior. Conversion occurs after basic validation
+  and handle lookup, preserving Eden's error precedence.
+
+### Unintentional differences (to fix)
+- `CreateCodeMemory` previously inserted only a synthetic opaque ID and never initialized an
+  object. It now creates, initializes, registers, and publishes the typed `KCodeMemory`, with
+  failure cleanup before returning.
+- `ControlCodeMemory` previously edited current-process permissions directly and never used the
+  retained physical pages or owner. Every operation now validates the matching address space and
+  delegates to the corresponding `KCodeMemory` method.
+- Both AArch32 SVCs previously returned unconditional stub success, while AArch64 fell through the
+  generic stub arm. Both dispatch tables now use Eden's generated register layouts, including the
+  split 64-bit address and size in `ControlCodeMemory64From32`.
+
+### Missing items
+- None for code-memory SVC validation, object lookup, operation dispatch, or 32/64-bit argument
+  marshalling.
+
+### Binary layout verification
+- PASS: focused dispatch coverage verifies the generated AArch32 and AArch64 input/output register
+  positions; operation discriminants remain `0..=3` with unknown values rejected explicitly.

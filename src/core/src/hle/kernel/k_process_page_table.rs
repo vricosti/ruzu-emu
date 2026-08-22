@@ -561,6 +561,26 @@ impl KProcessPageTable {
             .unlock_for_transfer_memory(addr.get() as usize, size, pg)
     }
 
+    pub fn lock_for_code_memory(
+        &mut self,
+        out_pg: &mut super::k_page_group::KPageGroup,
+        addr: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base
+            .lock_for_code_memory(out_pg, addr.get() as usize, size)
+    }
+
+    pub fn unlock_for_code_memory(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+        pg: &super::k_page_group::KPageGroup,
+    ) -> u32 {
+        self.base
+            .unlock_for_code_memory(addr.get() as usize, size, pg)
+    }
+
     // -- IPC memory locking --
 
     pub fn lock_for_ipc_user_buffer(
@@ -753,6 +773,12 @@ impl KProcessPageTable {
 
     pub fn get_base_mut(&mut self) -> &mut KPageTableBase {
         &mut self.base
+    }
+
+    pub fn get_block_info_manager(
+        &self,
+    ) -> Option<Arc<super::k_dynamic_resource_manager::KBlockInfoManager>> {
+        self.base.get_block_info_manager()
     }
 
     // -- Compatibility setters (used during process load before InitializeForProcess) --

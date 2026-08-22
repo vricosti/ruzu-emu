@@ -7037,3 +7037,27 @@ vs Eden `display_list.h` and `layer_list.h`
   0x4-byte `IoctlBindChannel`; `VaRegion` is 0x18 and `IoctlGetVaRegions` is 0x40. Focused tests
   cover tracked/untracked unmap behavior, the inline-region copy bound, and existing allocation,
   mapping, sparse, remap, free, and channel-binding behavior.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs`, `nvdevice.rs`, `nvdrv.rs`, and `nvdrv_interface.rs` vs Eden counterparts
+
+### Intentional differences
+- Rust exposes the persistent readable event as `Arc<Mutex<KReadableEvent>>` instead of returning
+  Eden's owning `KEvent*`; copying that shared handle into the IPC object table preserves the same
+  event identity and waiter state.
+- The host-action closure captures the slot's atomic status and readable-event handle directly.
+  Eden captures `this` and the slot, but Rust cannot lock the event-table mutex from this callback
+  because `RegisterHostAction` may invoke it synchronously while `IocCtrlEventWait` holds that mutex.
+- Optional event trace records add diagnostics without changing event status, handle, or IPC output.
+
+### Unintentional differences (to fix)
+- The warning-triggering process/scheduler owner adapter was dead: neither weak field was read and
+  the live host-action callback already signals `KReadableEvent` directly. It has been removed from
+  all four layers, restoring Eden's direct `QueryEvent` path.
+
+### Missing items
+- None for queried-event ownership or signalling. The callback retains and signals the same
+  persistent readable event returned by `QueryEvent`.
+
+### Binary layout verification
+- PASS: `SyncpointEventValue` remains a 4-byte raw value and this cleanup does not alter any ioctl
+  payload. A focused test verifies allocated-event decoding and matching-syncpoint lookup.

@@ -5,9 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 
@@ -53,15 +51,5 @@ pub trait NvDevice {
     /// into the caller handle table. The Rust port returns the persistent readable event directly.
     fn query_event(&self, _event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         None
-    }
-
-    /// Rust-only adapter: records the owning guest process/scheduler for a queried persistent
-    /// event so asynchronous callbacks can wake the same waiters after the handle is copied.
-    fn register_query_event_owner(
-        &self,
-        _event_id: u32,
-        _process: Arc<ProcessLock>,
-        _scheduler: Arc<Mutex<KScheduler>>,
-    ) {
     }
 }

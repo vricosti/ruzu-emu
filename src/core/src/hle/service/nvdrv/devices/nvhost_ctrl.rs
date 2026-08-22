@@ -6,12 +6,9 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::syncpoint_manager::SyncpointManager;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
@@ -63,12 +60,6 @@ struct InternalEvent {
     assigned_value: u32,
     registered: bool,
     wait_handle: Option<u64>,
-    owner: Option<QueriedEventOwner>,
-}
-
-struct QueriedEventOwner {
-    process: Weak<ProcessLock>,
-    scheduler: Weak<Mutex<KScheduler>>,
 }
 
 impl Default for InternalEvent {
@@ -81,7 +72,6 @@ impl Default for InternalEvent {
             assigned_value: 0,
             registered: false,
             wait_handle: None,
-            owner: None,
         }
     }
 }
@@ -323,7 +313,6 @@ impl NvHostCtrl {
         event.assigned_syncpt = 0;
         event.assigned_value = 0;
         event.wait_handle = None;
-        event.owner = None;
         *mask |= 1u64 << event_id;
         let object_id = event
             .readable_event
@@ -354,39 +343,7 @@ impl NvHostCtrl {
         event.assigned_value = 0;
         event.wait_handle = None;
         event.fails = 0;
-        event.owner = None;
         *mask &= !(1u64 << event_id);
-    }
-
-    fn signal_event_from_slot(events: &Arc<Mutex<Vec<InternalEvent>>>, slot: u32) {
-        let (readable_event, assigned_syncpt, assigned_value, status) = {
-            let events_guard = events.lock().unwrap();
-            let event = &events_guard[slot as usize];
-            (
-                event.readable_event.clone(),
-                event.assigned_syncpt,
-                event.assigned_value,
-                event.status.load(Ordering::Acquire),
-            )
-        };
-
-        if let Some(readable_event) = readable_event {
-            let object_id = {
-                let mut readable_event = readable_event.lock().unwrap();
-                let object_id = readable_event.object_id;
-                readable_event.signal_from_host();
-                object_id
-            };
-            Self::trace_event_record(
-                12,
-                slot,
-                slot,
-                assigned_syncpt,
-                assigned_value,
-                status,
-                object_id,
-            );
-        }
     }
 
     fn free_event_locked(
@@ -1114,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn host_action_signal_is_latched_before_query_owner_registration() {
+    fn query_event_returns_registered_event_for_matching_syncpoint() {
         let system = System::new_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
         let syncpoints = SyncpointManager::new();
@@ -1123,16 +1080,12 @@ mod tests {
         {
             let mut events_guard = ctrl.events.lock().unwrap();
             let mut mask = ctrl.events_mask.lock().unwrap();
-            ctrl.create_nv_event(&mut events_guard, &mut mask, 0);
-            events_guard[0].assigned_syncpt = 1;
+            ctrl.create_nv_event(&mut events_guard, &mut mask, 3);
+            events_guard[3].assigned_syncpt = 7;
         }
 
-        NvHostCtrl::signal_event_from_slot(&ctrl.events, 0);
-
-        let readable = ctrl
-            .query_event(0)
-            .expect("registered NV event should be queryable");
-        assert!(readable.lock().unwrap().is_signaled());
+        let encoded_event_id = 3 | (7 << 16) | (1 << 28);
+        assert!(ctrl.query_event(encoded_event_id).is_some());
 
         std::mem::forget(system);
     }
@@ -1276,33 +1229,5 @@ impl NvDevice for NvHostCtrl {
         );
         log::error!("Slot:{}, SyncpointID:{}, requested", slot, syncpoint_id);
         None
-    }
-
-    fn register_query_event_owner(
-        &self,
-        event_id: u32,
-        process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
-    ) {
-        let desired_event = SyncpointEventValue { raw: event_id };
-        let allocated = desired_event.event_allocated();
-        let slot = if allocated {
-            desired_event.partial_slot()
-        } else {
-            desired_event.slot() as u32
-        };
-
-        if slot >= MAX_NV_EVENTS {
-            return;
-        }
-
-        let mut events = self.events.lock().unwrap();
-        let event = &mut events[slot as usize];
-        if event.registered {
-            event.owner = Some(QueriedEventOwner {
-                process: Arc::downgrade(&process),
-                scheduler: Arc::downgrade(&scheduler),
-            });
-        }
     }
 }

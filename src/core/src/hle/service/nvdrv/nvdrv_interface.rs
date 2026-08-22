@@ -12,7 +12,6 @@ use super::core::container::SessionId;
 use super::nvdata::*;
 use super::nvdrv::Module;
 use crate::hle::kernel::k_process::ProcessLock;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -444,17 +443,6 @@ impl NvdrvInterface {
         }
 
         result
-    }
-
-    pub fn register_query_event_owner(
-        &self,
-        fd: DeviceFD,
-        event_id: u32,
-        process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
-    ) {
-        self.nvdrv
-            .register_query_event_owner(fd, event_id, process, scheduler);
     }
 
     /// Port of NVDRV::SetAruid
@@ -1044,19 +1032,6 @@ impl NvdrvService {
         let event_id = rp.pop_u32();
         let interface = service.interface.lock().unwrap();
         let (nv_result, maybe_event) = interface.query_event(fd, event_id);
-        if maybe_event.is_some() {
-            if let Some(thread) = ctx.get_thread() {
-                let owner = {
-                    let thread_guard = thread.lock().unwrap();
-                    let process = thread_guard.parent.as_ref().and_then(|p| p.upgrade());
-                    let scheduler = thread_guard.scheduler.as_ref().and_then(|s| s.upgrade());
-                    process.zip(scheduler)
-                };
-                if let Some((process, scheduler)) = owner {
-                    interface.register_query_event_owner(fd, event_id, process, scheduler);
-                }
-            }
-        }
         drop(interface);
         match (nv_result, maybe_event) {
             (NvResult::Success, Some(event)) => {

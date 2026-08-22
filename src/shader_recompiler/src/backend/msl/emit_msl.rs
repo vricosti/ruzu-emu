@@ -13,6 +13,125 @@ use crate::runtime_info::RuntimeInfo;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslShaderArtifact};
 
+fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static str> {
+    let info = &program.info;
+
+    if program.local_memory_size != 0 {
+        return Some("local memory");
+    }
+    if program.shared_memory_size != 0 {
+        return Some("shared memory");
+    }
+    if program.workgroup_size != [1, 1, 1] {
+        return Some("workgroup size");
+    }
+    if program.output_vertices != 0 || program.invocations != 1 {
+        return Some("geometry execution modes");
+    }
+    if program.is_geometry_passthrough {
+        return Some("geometry passthrough");
+    }
+    if info.loads.mask.iter().any(|word| *word != 0)
+        || info.stores.mask.iter().any(|word| *word != 0)
+        || info.passthrough.mask.iter().any(|word| *word != 0)
+        || info.loads_indexed_attributes
+        || info.stores_indexed_attributes
+        || info.stores_frag_color.iter().any(|store| *store)
+        || info.stores_sample_mask
+        || info.stores_frag_depth
+        || info.stores_tess_level_outer
+        || info.stores_tess_level_inner
+        || !info.legacy_stores_mapping.is_empty()
+    {
+        return Some("stage inputs or outputs");
+    }
+    if !info.constant_buffer_descriptors.is_empty()
+        || !info.storage_buffers_descriptors.is_empty()
+        || !info.texture_buffer_descriptors.is_empty()
+        || !info.image_buffer_descriptors.is_empty()
+        || !info.texture_descriptors.is_empty()
+        || !info.image_descriptors.is_empty()
+        || info.constant_buffer_mask != 0
+        || info
+            .constant_buffer_used_sizes
+            .iter()
+            .any(|size| *size != 0)
+        || info.used_constant_buffer_types != 0
+        || info.used_storage_buffer_types != 0
+        || info.used_indirect_cbuf_types != 0
+        || info.nvn_buffer_base != 0
+        || info.nvn_buffer_used != 0
+    {
+        return Some("resource bindings");
+    }
+    if info.uses_patches.iter().any(|used| *used) {
+        return Some("tessellation patches");
+    }
+    if info.stores_global_memory
+        || info.uses_local_memory
+        || info.uses_global_memory
+        || info.uses_shared_increment
+        || info.uses_shared_decrement
+        || info.uses_global_increment
+        || info.uses_global_decrement
+        || info.uses_atomic_f32_add
+        || info.uses_atomic_f16x2_add
+        || info.uses_atomic_f16x2_min
+        || info.uses_atomic_f16x2_max
+        || info.uses_atomic_f32x2_add
+        || info.uses_atomic_f32x2_min
+        || info.uses_atomic_f32x2_max
+        || info.uses_atomic_s32_min
+        || info.uses_atomic_s32_max
+        || info.uses_int64_bit_atomics
+        || info.uses_atomic_image_u32
+    {
+        return Some("memory operations");
+    }
+    if info.uses_workgroup_id
+        || info.uses_local_invocation_id
+        || info.uses_invocation_id
+        || info.uses_invocation_info
+        || info.uses_sample_id
+        || info.uses_is_helper_invocation
+        || info.uses_subgroup_invocation_id
+        || info.uses_subgroup_shuffles
+        || info.uses_subgroup_vote
+        || info.uses_subgroup_mask
+        || info.requires_layer_emulation
+        || info.emulated_layer != 0
+        || info.used_clip_distances != 0
+    {
+        return Some("stage built-ins");
+    }
+    if info.uses_fp16
+        || info.uses_fp64
+        || info.uses_fp16_denorms_flush
+        || info.uses_fp16_denorms_preserve
+        || info.uses_fp32_denorms_flush
+        || info.uses_fp32_denorms_preserve
+        || info.uses_int8
+        || info.uses_int16
+        || info.uses_int64
+        || info.uses_image_1d
+        || info.uses_sampled_1d
+        || info.uses_sparse_residency
+        || info.uses_demote_to_helper_invocation
+        || info.uses_fswzadd
+        || info.uses_derivatives
+        || info.uses_typeless_image_reads
+        || info.uses_typeless_image_writes
+        || info.uses_image_buffers
+        || info.uses_shadow_lod
+        || info.uses_rescaling_uniform
+        || info.uses_cbuf_indirect
+        || info.uses_render_area
+    {
+        return Some("shader capabilities");
+    }
+    None
+}
+
 /// Emit native MSL directly from the backend-neutral shader IR.
 ///
 /// The initial supported language is intentionally exact: empty vertex and
@@ -25,6 +144,9 @@ pub fn emit_msl(
     _runtime_info: &RuntimeInfo,
 ) -> Result<MslShaderArtifact, MslError> {
     let context = MslEmitContext::new(program.stage)?;
+    if let Some(feature) = first_unsupported_program_feature(program) {
+        return Err(MslError::UnsupportedProgramFeature(feature));
+    }
     for (block_index, block) in program.blocks.iter().enumerate() {
         if let Some((inst_index, inst)) = block.indexed_iter().next() {
             return Err(MslError::UnsupportedOpcode {
@@ -123,6 +245,33 @@ mod tests {
                 &RuntimeInfo::default()
             ),
             Err(MslError::UnmergedVertexA)
+        );
+    }
+
+    #[test]
+    fn rejects_unported_resources_even_without_instructions() {
+        let mut program = empty_program(Stage::Fragment);
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 0, count: 1 });
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature("resource bindings"))
+        );
+    }
+
+    #[test]
+    fn rejects_unported_stage_interfaces_even_without_instructions() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_color[0] = true;
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "stage inputs or outputs"
+            ))
         );
     }
 }

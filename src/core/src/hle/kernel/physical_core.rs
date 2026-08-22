@@ -18,7 +18,6 @@ use crate::core::System;
 use crate::hle::kernel::svc_dispatch::{self, SvcArgs, SvcId};
 
 use super::k_process::ProcessLock;
-use super::k_typed_address::KProcessAddress;
 #[cfg(feature = "debug-logs")]
 use super::physical_core_log;
 use super::{
@@ -220,11 +219,6 @@ impl PhysicalCore {
         if data_abort {
             if system.debugger_enabled() {
                 if let Some(watchpoint) = jit.halted_watchpoint() {
-                    let watchpoint = super::k_process::DebugWatchpoint {
-                        start_address: KProcessAddress::new(watchpoint.start_address),
-                        end_address: KProcessAddress::new(watchpoint.end_address),
-                        type_: watchpoint.type_ as u8,
-                    };
                     system.notify_debugger_thread_watchpoint(Arc::clone(thread), watchpoint);
                 } else {
                     log::error!("Dynarmic reported a data abort without a halted watchpoint");
@@ -432,6 +426,7 @@ impl PhysicalCore {
         };
 
         let mut process = parent.lock().unwrap();
+        let watchpoints = std::ptr::addr_of!(process.watchpoints);
         if let Some(jit) = process.get_arm_interface_mut(self.m_core_index) {
             let k_ctx = &thread.thread_context;
             // Safety: both ThreadContext types have identical layout.
@@ -441,6 +436,7 @@ impl PhysicalCore {
             };
             jit.set_context(arm_ctx);
             jit.set_tpidrro_el0(thread.get_tls_address().get());
+            jit.set_watchpoint_array(watchpoints);
             trace_wrapper_context_event(3, self.m_core_index, thread, arm_ctx);
             log::info!(
                 "PhysicalCore::load_context: core={} r15/PC=0x{:X} r13/SP=0x{:X} ctx.pc=0x{:X} ctx.sp=0x{:X}",
@@ -784,7 +780,9 @@ fn is_animus_sdk_thread_wrapper_context(pc: u64, lr: u64) -> bool {
 mod tests {
     use std::collections::VecDeque;
 
-    use crate::arm::arm_interface::{Architecture, DebugWatchpoint, KThread as OpaqueKThread};
+    use crate::arm::arm_interface::{
+        Architecture, DebugWatchpoint, KThread as OpaqueKThread, WatchpointArray,
+    };
     use crate::core::System;
     use crate::hle::kernel::k_thread::ThreadState;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
@@ -850,6 +848,8 @@ mod tests {
             self.tpidrro_el0 = value;
         }
 
+        fn set_watchpoint_array(&mut self, _watchpoints: *const WatchpointArray) {}
+
         fn get_svc_arguments(&self, args: &mut [u64; 8]) {
             *args = [0; 8];
         }
@@ -864,7 +864,7 @@ mod tests {
 
         fn signal_interrupt(&mut self, _thread: &mut OpaqueKThread) {}
 
-        fn halted_watchpoint(&self) -> Option<&DebugWatchpoint> {
+        fn halted_watchpoint(&self) -> Option<DebugWatchpoint> {
             None
         }
 

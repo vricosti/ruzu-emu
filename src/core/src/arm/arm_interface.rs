@@ -4,7 +4,13 @@
 //! Port of zuyu/src/core/arm/arm_interface.h and arm_interface.cpp
 //! ArmInterface abstract base class (register access, step, run, etc.)
 
+use std::sync::{
+    atomic::{AtomicPtr, Ordering},
+    Arc,
+};
+
 use crate::hardware_properties;
+pub use crate::hle::kernel::k_process::{DebugWatchpoint, DebugWatchpointType};
 
 use bitflags::bitflags;
 
@@ -47,35 +53,13 @@ pub struct ThreadContext {
     pub tpidr: u64,
 }
 
-/// Debug watchpoint type, matching Kernel::DebugWatchpointType
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DebugWatchpointType {
-    None = 0,
-    Read = 1,
-    Write = 2,
-    ReadOrWrite = 3,
-}
-
-impl std::ops::BitAnd for DebugWatchpointType {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self {
-        let val = (self as u8) & (rhs as u8);
-        // Safety: result is always 0..=3
-        unsafe { std::mem::transmute(val) }
-    }
-}
-
-/// Debug watchpoint structure, matching Kernel::DebugWatchpoint
-#[derive(Debug, Clone)]
-pub struct DebugWatchpoint {
-    pub start_address: u64,
-    pub end_address: u64,
-    pub type_: DebugWatchpointType,
-}
-
 /// Array of watchpoints, matching Core::WatchpointArray
 pub type WatchpointArray = [DebugWatchpoint; hardware_properties::NUM_WATCHPOINTS as usize];
+
+/// Shared access to the process-owned watchpoint array. Rust callbacks are
+/// moved into the JIT, so they share the same pointer slot as their parent ARM
+/// interface instead of retaining Eden's direct parent reference.
+pub(crate) type SharedWatchpointArray = Arc<AtomicPtr<WatchpointArray>>;
 
 // NOTE: these values match the HaltReason enum in Dynarmic
 bitflags! {
@@ -145,31 +129,38 @@ pub trait ArmInterface: Send {
         None
     }
 
+    fn set_watchpoint_array(&mut self, watchpoints: *const WatchpointArray);
+
     /// Signal an interrupt for execution to halt as soon as possible.
     /// It is safe to call this if the CPU is not running.
     fn signal_interrupt(&mut self, thread: &mut KThread);
 
     /// Debug functionality.
-    fn halted_watchpoint(&self) -> Option<&DebugWatchpoint>;
+    fn halted_watchpoint(&self) -> Option<DebugWatchpoint>;
     fn rewind_breakpoint_instruction(&mut self);
 }
 
 /// Base state shared by all ArmInterface implementations.
 pub struct ArmInterfaceBase {
-    pub watchpoints: Option<*const WatchpointArray>,
+    watchpoints: SharedWatchpointArray,
     pub uses_wall_clock: bool,
 }
 
 impl ArmInterfaceBase {
     pub fn new(uses_wall_clock: bool) -> Self {
         Self {
-            watchpoints: None,
+            watchpoints: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
             uses_wall_clock,
         }
     }
 
     pub fn set_watchpoint_array(&mut self, watchpoints: *const WatchpointArray) {
-        self.watchpoints = Some(watchpoints);
+        self.watchpoints
+            .store(watchpoints.cast_mut(), Ordering::Release);
+    }
+
+    pub(crate) fn shared_watchpoint_array(&self) -> SharedWatchpointArray {
+        Arc::clone(&self.watchpoints)
     }
 
     /// Stack trace generation.
@@ -208,28 +199,72 @@ impl ArmInterfaceBase {
         addr: u64,
         size: u64,
         access_type: DebugWatchpointType,
-    ) -> Option<&DebugWatchpoint> {
-        let watchpoints = match self.watchpoints {
-            Some(ptr) => unsafe { &*ptr },
-            None => return None,
-        };
+    ) -> Option<DebugWatchpoint> {
+        matching_watchpoint(&self.watchpoints, addr, size, access_type)
+    }
+}
 
-        let start_address = addr;
-        let end_address = addr + size;
+/// Rust callback counterpart of calling `m_parent.MatchingWatchpoint(...)` in
+/// Eden. The shared pointer slot is owned by `ArmInterfaceBase` and updated by
+/// `PhysicalCore::load_context` before the thread runs.
+pub(crate) fn matching_watchpoint(
+    watchpoint_array: &SharedWatchpointArray,
+    addr: u64,
+    size: u64,
+    access_type: DebugWatchpointType,
+) -> Option<DebugWatchpoint> {
+    let watchpoints = watchpoint_array.load(Ordering::Acquire);
+    if watchpoints.is_null() {
+        return None;
+    }
+    let watchpoints = unsafe { &*watchpoints };
 
-        for watch in watchpoints.iter() {
-            if end_address <= watch.start_address {
-                continue;
-            }
-            if start_address >= watch.end_address {
-                continue;
-            }
-            if (access_type & watch.type_) == DebugWatchpointType::None {
-                continue;
-            }
-            return Some(watch);
+    let start_address = addr;
+    let end_address = addr.wrapping_add(size);
+
+    for watch in watchpoints.iter() {
+        if end_address <= watch.start_address.get() {
+            continue;
         }
+        if start_address >= watch.end_address.get() {
+            continue;
+        }
+        if !(access_type & watch.type_).is_empty() {
+            return Some(*watch);
+        }
+    }
 
-        None
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_typed_address::KProcessAddress;
+
+    #[test]
+    fn matching_watchpoint_uses_half_open_ranges_and_access_flags() {
+        let mut watchpoints =
+            [DebugWatchpoint::default(); hardware_properties::NUM_WATCHPOINTS as usize];
+        watchpoints[0] = DebugWatchpoint {
+            start_address: KProcessAddress::new(0x1000),
+            end_address: KProcessAddress::new(0x1010),
+            type_: DebugWatchpointType::READ,
+        };
+        let mut interface = ArmInterfaceBase::new(false);
+        interface.set_watchpoint_array(&watchpoints);
+
+        assert_eq!(
+            interface
+                .matching_watchpoint(0x1008, 4, DebugWatchpointType::READ)
+                .map(|watchpoint| watchpoint.start_address.get()),
+            Some(0x1000)
+        );
+        assert!(interface
+            .matching_watchpoint(0x1010, 4, DebugWatchpointType::READ)
+            .is_none());
+        assert!(interface
+            .matching_watchpoint(0x1008, 4, DebugWatchpointType::WRITE)
+            .is_none());
     }
 }

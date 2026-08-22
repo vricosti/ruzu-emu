@@ -58,6 +58,28 @@
   test baseline recorded above.
 - Remaining prerequisite: port A32/A64 `CheckMemoryAccess`, connect the process watchpoint array and
   retain the halted watchpoint so the now-live physical-core data-abort path can be exercised.
+- Dynarmic watchpoint slice interrupted after type/callback wiring: Eden's
+  `KProcess::{Insert,Remove}Watchpoint` reference-count and mark each covered page through
+  `Memory::MarkRegionDebug`, while Ruzu only changed its watchpoint table. Fastmem could therefore
+  bypass the callbacks entirely. Port `memory.rs::mark_region_debug` in its upstream-owned module,
+  wire the existing `debug_page_refcounts` in `k_process.rs`, verify that prerequisite, then resume
+  the callback slice.
+- Debug-page prerequisite completed: `memory.rs::mark_region_debug` now reproduces Eden's fastmem
+  protection and `Memory`/`DebugMemory` transitions, while `k_process.rs` uses its existing
+  `debug_page_refcounts` for overlapping watchpoints. Both focused regressions pass. Resume the
+  interrupted A32/A64 callback slice.
+- Dynarmic watchpoint prerequisite completed: both callbacks now validate slow-path accesses,
+  distinguish read/write matches, retain the process-owned matching watchpoint and emit Eden's
+  prefetch/data-abort halt reasons. `PhysicalCore::load_context` supplies the process watchpoint
+  array before execution. Focused A32 halt translation, A64 callback, matching, page-transition,
+  reference-count and layout regressions pass.
+- Validation result: all six focused watchpoint/debug-memory regressions pass and
+  `cargo check -p ruzu --bin ruzu` succeeds with only the two deferred GDB dispatcher warnings.
+  The single-threaded full `core` suite again reached unrelated pre-existing ARM, crypto,
+  integrity-storage, condition-variable and process-test failures before timing out in the known
+  scheduler-test baseline; none of the new watchpoint tests failed.
+- Status: CPU stepping, breakpoint notification and A32/A64 watchpoint generation prerequisites are
+  complete. Resume the interrupted `gdbstub.rs` command-dispatcher warning slice.
 
 ## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
 

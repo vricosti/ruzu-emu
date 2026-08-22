@@ -7859,3 +7859,125 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: no serialized or guest-visible layout changes.
+
+## 2026-08-22 — `src/core/src/memory/memory.rs` vs Eden `src/core/memory.{h,cpp}` debugger-page marking
+
+### Intentional differences
+- Rust receives the process address as its underlying `u64`; the page-table bridge already uses raw
+  virtual addresses throughout, while preserving Eden's address-space validation and page walk.
+
+### Unintentional differences (to fix)
+- `Memory::MarkRegionDebug` was absent. Watchpoint pages now lose fastmem access, transition from
+  `Memory` to `DebugMemory`, and recover their biased host pointer when the last debug reference is
+  removed, in Eden's protection-before-page-transition order.
+
+### Missing items
+- None for `MarkRegionDebug`.
+
+### Binary layout verification
+- N/A: this changes page-table entry state but introduces no serialized structure.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` watchpoint ownership
+
+### Intentional differences
+- Rust's optional `Arc<Mutex<Memory>>` replaces Eden's directly owned `Memory`; initialized runtime
+  processes always have it, while isolated `KProcess::new()` tests can still exercise table and
+  reference-count behavior without a system memory owner.
+
+### Unintentional differences (to fix)
+- `DebugWatchpoint` stored its type as an untyped byte and insert/remove changed only the table.
+  The field now uses the owning bitflag type, and both operations apply Eden's per-page reference
+  counting and `MarkRegionDebug` calls for overlapping watchpoints.
+
+### Missing items
+- None for the reviewed watchpoint table and page-reference slice.
+
+### Binary layout verification
+- PASS: replacing the raw `u8` with a `u8`-backed bitflag preserves the field's size and alignment;
+  focused assertions verify the 24-byte size and 8-byte alignment of the host structure.
+
+## 2026-08-22 — `src/core/src/arm/arm_interface.rs` vs Eden `src/core/arm/arm_interface.{h,cpp}` watchpoints
+
+### Intentional differences
+- Rust JIT callbacks are moved owners rather than C++ objects retaining a parent reference. The
+  process-array pointer therefore lives in a shared atomic slot, and a match is copied out instead
+  of returning a reference whose lifetime cannot cross the callback mutex boundary.
+
+### Unintentional differences (to fix)
+- The interface previously duplicated the kernel watchpoint type with primitive addresses and did
+  not expose `SetWatchpointArray` through every backend. It now consumes the `k_process.rs` owner and
+  applies Eden's half-open range and access-bit matching literally.
+
+### Missing items
+- None for the reviewed watchpoint-array and matching slice.
+
+### Binary layout verification
+- N/A: the shared atomic pointer is host callback state; the process-owned watchpoint layout is
+  verified in `k_process.rs`.
+
+## 2026-08-22 — `src/core/src/arm/dynarmic/arm_dynarmic_32.rs` vs Eden `src/core/arm/dynarmic/arm_dynarmic_32.{h,cpp}` watchpoint callbacks
+
+### Intentional differences
+- The callback shares halted-watchpoint state with its Rust JIT owner through `Arc<Mutex<_>>` and
+  invokes the existing Rust JIT halt bridge. Rust-only exclusive-read/128-bit callback extensions
+  perform the same access check before their underlying memory operation.
+
+### Unintentional differences (to fix)
+- `CheckMemoryAccess` previously returned unconditionally and the halt translation discarded
+  Dynarmic's memory-abort bit. Address validation, read/write matching, retained watchpoint state,
+  prefetch/data-abort halts and exclusive-access ordering now match Eden.
+
+### Missing items
+- None for the reviewed A32 memory-access/watchpoint slice.
+
+### Binary layout verification
+- N/A: callback and halt state are host-only.
+
+## 2026-08-22 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs` vs Eden `src/core/arm/dynarmic/arm_dynarmic_64.{h,cpp}` watchpoint callbacks
+
+### Intentional differences
+- The moved Rust callback uses a shared watchpoint-array pointer and mutex-protected copied match in
+  place of Eden's parent reference and raw matched pointer; ownership and halt timing are preserved.
+
+### Unintentional differences (to fix)
+- `CheckMemoryAccess` previously returned unconditionally. It now derives Eden's exact enable state,
+  validates addresses, distinguishes read/write watchpoints, retains the match and prevents writes
+  after requesting the corresponding prefetch/data-abort halt.
+
+### Missing items
+- None for the reviewed A64 memory-access/watchpoint slice.
+
+### Binary layout verification
+- N/A: callback and halt state are host-only.
+
+## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs Eden `src/core/hle/kernel/physical_core.cpp` watchpoint loading
+
+### Intentional differences
+- Rust passes the address of the stable process-owned array while holding the process lock; Eden
+  obtains the same array through `GetWatchpoints()`.
+
+### Unintentional differences (to fix)
+- `LoadContext` previously omitted `SetWatchpointArray`, and the data-abort path converted from a
+  duplicate ARM watchpoint representation. It now wires the process owner after context/TLS setup
+  and forwards that exact typed watchpoint to the debugger.
+
+### Missing items
+- None for the reviewed load-context/data-abort watchpoint slice.
+
+### Binary layout verification
+- N/A: this is host lifecycle wiring.
+
+## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` vs Eden `src/core/debugger/gdbstub.cpp` typed watchpoint reply
+
+### Intentional differences
+- None in the reviewed watchpoint classification.
+
+### Unintentional differences (to fix)
+- The reply path previously reconstructed a watchpoint type from an untyped byte. It now matches the
+  owning kernel bitflag directly when selecting `rwatch`, `watch`, or `awatch`.
+
+### Missing items
+- The command dispatcher remains the next warning-driven slice recorded in `PORTING_STATE.md`.
+
+### Binary layout verification
+- N/A: this formats a remote-protocol reply and introduces no payload structure.

@@ -90,7 +90,7 @@ impl DebuggerFrontend for GdbStub {
             thread.get_thread_id(),
             GDB_STUB_SIGTRAP,
         );
-        let kind = match DebugWatchpointType::from_bits_truncate(watch.type_) {
+        let kind = match watch.type_ {
             DebugWatchpointType::READ => "rwatch",
             DebugWatchpointType::WRITE => "watch",
             _ => "awatch",

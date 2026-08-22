@@ -1046,6 +1046,56 @@ impl Memory {
         self.get_pointer_from_debug_memory(vaddr)
     }
 
+    /// Mark or unmark a process virtual-address range for debugger memory
+    /// callbacks. Port of Eden `Memory::Impl::MarkRegionDebug`.
+    pub fn mark_region_debug(&self, vaddr: u64, size: u64, debug: bool) {
+        if vaddr == 0
+            || self.current_page_table.is_null()
+            || usize::try_from(size)
+                .map(|size| !self.address_space_contains(vaddr, size))
+                .unwrap_or(true)
+        {
+            return;
+        }
+
+        let page_table = unsafe { &*self.current_page_table };
+        if !page_table.fastmem_arena.is_null() {
+            let permission = if debug {
+                MemoryPermission::empty()
+            } else {
+                MemoryPermission::READ_WRITE
+            };
+            self.protect_buffer(vaddr as usize, size as usize, permission);
+        }
+
+        let num_pages = ((vaddr.wrapping_add(size).wrapping_sub(1)) >> PAGE_BITS)
+            .wrapping_sub(vaddr >> PAGE_BITS)
+            .wrapping_add(1);
+        let mut current_vaddr = vaddr;
+        for _ in 0..num_pages {
+            let page_index = (current_vaddr >> PAGE_BITS) as usize;
+            let entry = &page_table.pointers[page_index];
+            match (debug, PageInfo::extract_type(entry.raw_value())) {
+                (true, PageType::Unmapped) => {
+                    debug_assert!(false, "Attempted to mark unmapped pages as debug");
+                }
+                (true, PageType::Memory) => entry.store(0, PageType::DebugMemory),
+                (true, PageType::RasterizerCachedMemory | PageType::DebugMemory)
+                | (false, PageType::RasterizerCachedMemory | PageType::Memory) => {}
+                (false, PageType::Unmapped) => {
+                    debug_assert!(false, "Attempted to mark unmapped pages as non-debug");
+                }
+                (false, PageType::DebugMemory) => {
+                    let page = current_vaddr & !PAGE_MASK;
+                    let pointer = self.get_pointer_from_debug_memory(page);
+                    let encoded = (pointer as usize).wrapping_sub(page as usize);
+                    entry.store(encoded, PageType::Memory);
+                }
+            }
+            current_vaddr = current_vaddr.wrapping_add(PAGE_SIZE);
+        }
+    }
+
     /// Mark a CPU virtual-address range as cached (or no longer cached) by the
     /// rasterizer. Used by the GPU device-memory manager when shader/buffer/
     /// texture caches register or invalidate regions.
@@ -3002,6 +3052,43 @@ mod process_fastmem_tests {
             assert!(application_page_table.fastmem_arena.is_null());
         }
         assert!(applet_page_table.fastmem_arena.is_null());
+    }
+
+    #[test]
+    fn debugger_region_switches_memory_pages_to_slow_callbacks_and_back() {
+        const VADDR: u64 = 0x4000;
+        const DEVICE_OFFSET: u64 = 0x2000;
+
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut memory = memory_for_device(&device_memory);
+        let mut page_table = PageTable::new();
+        page_table.resize(32, PAGE_BITS);
+        memory.set_current_page_table(&mut page_table, true);
+        memory.map_memory_region(
+            &mut page_table,
+            VADDR,
+            PAGE_SIZE,
+            dram_memory_map::BASE + DEVICE_OFFSET,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+
+        memory.mark_region_debug(VADDR, PAGE_SIZE, true);
+        let page = (VADDR >> PAGE_BITS) as usize;
+        assert_eq!(
+            PageInfo::extract_type(page_table.pointers[page].raw_value()),
+            PageType::DebugMemory
+        );
+
+        memory.mark_region_debug(VADDR, PAGE_SIZE, false);
+        assert_eq!(
+            PageInfo::extract_type(page_table.pointers[page].raw_value()),
+            PageType::Memory
+        );
+        assert_ne!(
+            PageInfo::extract_pointer(page_table.pointers[page].raw_value()),
+            0
+        );
     }
 
     #[cfg(target_os = "linux")]

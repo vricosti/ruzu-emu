@@ -115,13 +115,15 @@ pub struct IJitEnvironment {
 }
 
 impl IJitEnvironment {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(
+        memory: std::sync::Arc<std::sync::Mutex<crate::memory::memory::Memory>>,
+    ) -> Result<Self, String> {
+        Ok(Self {
             user_rx: CodeMemory::new(),
             user_ro: CodeMemory::new(),
             callbacks: GuestCallbacks::default(),
             configuration: JITConfiguration::default(),
-            context: JitContext::new(),
-        }
+            context: JitContext::new(memory)?,
+        })
     }
 }

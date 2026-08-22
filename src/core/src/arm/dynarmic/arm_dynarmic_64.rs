@@ -2472,6 +2472,7 @@ impl ArmDynarmic64 {
             // Auto/unsafe-fastmem-check may widen only the fastmem side to
             // 64 bits below, matching the upstream accuracy switch.
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits,
                 silently_mirror_fastmem: false,
                 fastmem_exclusive_access,

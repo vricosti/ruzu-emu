@@ -1531,6 +1531,10 @@ impl A64Jit {
                 instruction_cache_op_trampoline as usize as u64,
                 inner_ptr,
             )),
+            instruction_synchronization_barrier: Box::new(ArgCallback::new(
+                instruction_synchronization_barrier_trampoline as usize as u64,
+                inner_ptr,
+            )),
             add_ticks: Box::new(ArgCallback::new(
                 add_ticks_trampoline as usize as u64,
                 inner_ptr,
@@ -2399,6 +2403,11 @@ extern "C" fn instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u6
     inner.callbacks.instruction_cache_operation(op, vaddr);
 }
 
+extern "C" fn instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
+    inner.callbacks.instruction_synchronization_barrier_raised();
+}
+
 extern "C" fn get_cntpct_trampoline(inner_ptr: u64) -> u64 {
     let inner = unsafe { &*(inner_ptr as *const JitInner) };
     inner.callbacks.get_cntpct()
@@ -3013,6 +3022,10 @@ impl A32Jit {
             )),
             instruction_cache_operation: Box::new(ArgCallback::new(
                 a32_instruction_cache_op_trampoline as usize as u64,
+                inner_ptr,
+            )),
+            instruction_synchronization_barrier: Box::new(ArgCallback::new(
+                a32_instruction_synchronization_barrier_trampoline as usize as u64,
                 inner_ptr,
             )),
             add_ticks: Box::new(ArgCallback::new(
@@ -3934,6 +3947,11 @@ extern "C" fn a32_instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr
     a32_callbacks::instruction_cache_operation(inner.callbacks.as_mut(), op, vaddr);
 }
 
+extern "C" fn a32_instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.instruction_synchronization_barrier_raised();
+}
+
 extern "C" fn a32_get_cntpct_trampoline(inner_ptr: u64) -> u64 {
     let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
     a32_callbacks::get_cntpct(inner.callbacks.as_ref())
@@ -4182,6 +4200,7 @@ mod tests {
         cntpct: u64,
         last_svc: Option<u32>,
         svc_sink: Option<Arc<AtomicU32>>,
+        isb_sink: Option<Arc<AtomicU32>>,
         memory_read_address_sink: Option<Arc<AtomicU64>>,
         memory_read_64_count: Option<Arc<AtomicU64>>,
         halt_reason_ptr: Option<usize>,
@@ -4203,6 +4222,7 @@ mod tests {
                 cntpct: 0,
                 last_svc: None,
                 svc_sink: None,
+                isb_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4218,6 +4238,7 @@ mod tests {
                 cntpct: 0,
                 last_svc: None,
                 svc_sink: None,
+                isb_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4233,6 +4254,7 @@ mod tests {
                 cntpct: 0,
                 last_svc: None,
                 svc_sink: None,
+                isb_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4261,6 +4283,7 @@ mod tests {
                 cntpct: 0,
                 last_svc: None,
                 svc_sink: Some(svc_sink),
+                isb_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4276,6 +4299,12 @@ mod tests {
         fn with_memory_read_64_count(base_addr: u64, code: &[u32], count: Arc<AtomicU64>) -> Self {
             let mut callbacks = Self::new(base_addr, code);
             callbacks.memory_read_64_count = Some(count);
+            callbacks
+        }
+
+        fn with_isb_sink(base_addr: u64, code: &[u32], isb_sink: Arc<AtomicU32>) -> Self {
+            let mut callbacks = Self::new(base_addr, code);
+            callbacks.isb_sink = Some(isb_sink);
             callbacks
         }
     }
@@ -4429,6 +4458,12 @@ mod tests {
         }
         fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
 
+        fn instruction_synchronization_barrier_raised(&mut self) {
+            if let Some(ref sink) = self.isb_sink {
+                sink.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         fn get_cntpct(&self) -> u64 {
             self.cntpct
         }
@@ -4548,6 +4583,7 @@ mod tests {
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits: 16,
                 silently_mirror_fastmem: true,
                 page_table_present: true,
@@ -4606,6 +4642,7 @@ mod tests {
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits: 16,
                 silently_mirror_fastmem: true,
                 page_table_present: true,
@@ -5000,13 +5037,53 @@ mod tests {
         assert_eq!(jit.get_register(2), 0xFFFF_FFFF_FFFF_FFF8);
     }
 
-    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn test_a64_barriers_execute_on_arm64_backend() {
+    fn test_a64_barriers_respect_isb_hook() {
         // DSB SY; DMB SY; ISB SY; SVC #0
         let code: [u32; 4] = [0xD503_3F9F, 0xD503_3FBF, 0xD503_3FDF, 0xD400_0001];
+        let isb_count = Arc::new(AtomicU32::new(0));
         let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
+            callbacks: Box::new(MockCallbacks::with_isb_sink(
+                0x1000,
+                &code,
+                Arc::clone(&isb_count),
+            )),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: None,
+            page_table_pointer: None,
+            define_unpredictable_behaviour: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: true,
+                ..Default::default()
+            },
+        };
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+
+        let mut halt = jit.run();
+        if halt.is_empty() {
+            halt = jit.run();
+        }
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(isb_count.load(Ordering::Relaxed), 1);
+
+        let isb_count = Arc::new(AtomicU32::new(0));
+        let config = JitConfig {
+            callbacks: Box::new(MockCallbacks::with_isb_sink(
+                0x1000,
+                &code,
+                Arc::clone(&isb_count),
+            )),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
             optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
@@ -5024,13 +5101,13 @@ mod tests {
         };
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
-
         let mut halt = jit.run();
         if halt.is_empty() {
             halt = jit.run();
         }
 
         assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(isb_count.load(Ordering::Relaxed), 0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5128,6 +5205,7 @@ mod tests {
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits: 16,
                 silently_mirror_fastmem: true,
                 fastmem_exclusive_access: true,
@@ -5249,6 +5327,7 @@ mod tests {
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits: 16,
                 silently_mirror_fastmem: true,
                 fastmem_exclusive_access: true,
@@ -6775,6 +6854,7 @@ mod tests {
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits: 39,
                 silently_mirror_fastmem: false,
                 fastmem_exclusive_access: false,

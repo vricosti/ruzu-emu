@@ -7553,3 +7553,50 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: this is a host-side ownership helper, not a raw guest payload. Focused coverage verifies the
   sampled address, generated-code state, execute permission, getters, and final unmap.
+
+## 2026-08-22 — `src/core/src/hle/service/jit/jit_context.rs` vs Eden `src/core/hle/service/jit/jit_context.{h,cpp}`
+
+### Intentional differences
+- Rust shares the local-memory/range/helper state through `Arc<Mutex<_>>` because `rdynarmic`
+  owns its boxed callback object; Eden stores callbacks and the JIT beside their parent and uses
+  direct references.
+- `JitContext::new` returns the local `rdynarmic` construction error instead of relying on a C++
+  constructor that always succeeds. Checked arithmetic prevents a malformed address from wrapping
+  during host slice bounds checks.
+- Mapped ranges are retained as interval pairs rather than Boost ICL nodes. Membership has the same
+  half-open-range result used by every memory access, and no operation depends on interval count.
+- Rust clears the persistent `USER_DEFINED1` halt bit before each invocation; Eden's Dynarmic
+  `HaltExecution` lifecycle performs the equivalent reset internally.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for the public `JITContext` interface or the private behavior in `JITContextImpl` and
+  `DynarmicCallbacks64`.
+
+### Binary layout verification
+- PASS: ELF dynamic/RELA/RELR entries use the shared `repr(C)` definitions; helper bytes are the
+  exact `svc #0; ret` sequence, stack/heap alignment is 16 bytes, and focused execution coverage
+  verifies the ninth integer argument at `[SP]`.
+
+## 2026-08-22 — `src/rdynarmic/src/jit_config.rs` and A32/A64 backend callback wiring vs Eden `src/core/hle/service/jit/jit_context.cpp::DynarmicCallbacks64`
+
+### Intentional differences
+- The Rust backend exposes `instruction_synchronization_barrier_raised` as a default no-op trait
+  method and wires it for every JIT configuration. This avoids a JIT-service-only backend type while
+  leaving existing callback implementations behaviorally unchanged.
+- The flag corresponding to Dynarmic's top-level `UserConfig::hook_isb` lives in the shared Rust
+  `MemoryEmitConfig`, which is already the frontend-to-backend option carrier used by both host
+  emitters. Its default remains false.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for the instruction-synchronization callback required by `JITContext`.
+
+### Binary layout verification
+- N/A: this adds a host callback slot only. A focused A64 execution test verifies one ISB produces
+  exactly one callback before the terminating SVC when `hook_isb` is enabled on the active host
+  backend; the default-disabled behavior matches Eden's `UserConfig`.

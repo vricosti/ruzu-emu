@@ -2645,6 +2645,7 @@ impl ArmDynarmic32 {
             // rejection above (that stays driven by `page_table_pointer_mask_bits`
             // + `recompile_on_fastmem_failure`).
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits: 32,
                 silently_mirror_fastmem: true,
                 fastmem_exclusive_access,

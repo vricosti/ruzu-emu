@@ -92,6 +92,9 @@ pub trait UserCallbacks: Send {
     /// Called for instruction cache operations (IC instructions).
     fn instruction_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
 
+    /// Called when an instruction synchronization barrier is executed.
+    fn instruction_synchronization_barrier_raised(&mut self) {}
+
     /// Get the emulated counter-timer physical count register (CNTPCT_EL0).
     /// Called from A64 MRS CNTPCT_EL0 instruction.
     /// Default: returns 0 (override for proper timing).

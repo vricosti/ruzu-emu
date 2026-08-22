@@ -265,7 +265,7 @@ impl EmitConfig {
         Self {
             is_a32: true,
             optimizations: effective_optimizations(config),
-            hook_isb: false,
+            hook_isb: config.memory.hook_isb,
             cntfreq_el0: 0,
             ctr_el0: 0,
             dczid_el0: 0,
@@ -308,7 +308,7 @@ impl EmitConfig {
         Self {
             is_a32: false,
             optimizations: effective_optimizations(config),
-            hook_isb: false,
+            hook_isb: config.memory.hook_isb,
             // Upstream A64::UserConfig::cntfrq_el0 — forwarded from the
             // emulator (yuzu sets the Switch's 19'200'000 Hz; the dynarmic
             // default of 600'000'000 only applies when left unconfigured).

@@ -1127,6 +1127,7 @@ mod tests {
                 exception_raised: cb(),
                 data_cache_operation: cb(),
                 instruction_cache_operation: cb(),
+                instruction_synchronization_barrier: cb(),
                 add_ticks: cb(),
                 get_ticks_remaining: cb(),
                 exclusive_clear: cb(),

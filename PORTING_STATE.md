@@ -36,8 +36,18 @@
 - JIT code-memory result: `CodeMemory` now samples the process alias-code region with the caller's
   `mt19937_64` stream, retries only `ResultInvalidMemoryRegion`, retains the kernel code-memory
   reference after a successful owner mapping, and asserts the matching unmap during finalization.
-- Status: the code-memory prerequisite chain is complete; the interrupted `jit.rs` environment and
-  callback slice may resume.
+- Newly discovered prerequisite: `jit_context.rs` is still an inert placeholder even though
+  `rdynarmic` is now integrated. Eden's environment methods require its NRO relocation, local and
+  mapped memory routing, AArch64 argument ABI, helper-SVC dispatch, heap and callback execution;
+  consuming `GuestCallbacks` without those owners would only replace warnings with dead calls.
+- Required next action: port and verify `jit_context.{h,cpp}` against the local `rdynarmic` A64 API,
+  then resume the interrupted `jit.rs` environment and IPC slice.
+- JIT-context prerequisite result: the context now owns the local NRO image, RELA/RELR fixups,
+  helper stubs, stack/heap ABI, mapped process ranges and an A64 `rdynarmic` executor. The local
+  backend now exposes Eden's instruction-synchronization callback on both x86-64 and AArch64 hosts,
+  controlled by the same default-disabled `hook_isb` policy; the callback itself drops the cached
+  code page when enabled.
+- Status: `jit_context.rs` is functional and re-verified; the interrupted `jit.rs` slice may resume.
 
 ## 2026-08-22 — PlatformServiceManager warning interrupted by kernel font-memory prerequisite
 

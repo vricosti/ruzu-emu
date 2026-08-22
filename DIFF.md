@@ -7007,3 +7007,33 @@ vs Eden `display_list.h` and `layer_list.h`
   `SyncptIncr` 0x14, syncpoint/waitbase/clock-rate and map entries 0x8, and map parameters 0xC.
   Focused tests cover clock-rate serialization, concrete-device routing, `num_entries` bounds, and
   syncpoint recycling.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvhost_as_gpu.{h,cpp}`
+
+### Intentional differences
+- Eden retains a `Container&` after deriving `nvmap` from it but never reads that reference again.
+  Ruzu removes the equivalent raw pointer and keeps only the live NvMap dependency.
+- Eden's `std::map`/`unordered_dense::set` owners map to `BTreeMap`/`HashSet`; `Arc<Mapping>` lets
+  allocation records and the mapping map refer to one Rust mapping owner instead of duplicating an
+  offset and performing a second lookup.
+- Eden owns a concrete `Tegra::MemoryManager`; Ruzu owns an `Arc<dyn GpuMemoryManagerHandle>` so the
+  renderer backend can provide the platform implementation while preserving map/unmap ordering.
+- Invalid device descriptors, absent memory managers, failed pins, missing allocators, and stale
+  tracked mappings return an NV error or safe success instead of relying on Eden's assertions or
+  unchecked dereferences. Optional trace calls do not alter the guest outputs.
+- Rust uses one outer operation mutex plus mutexes required by the shared trait handles. `Remap` is
+  also serialized even though Eden omits its otherwise customary `scoped_lock`.
+
+### Unintentional differences (to fix)
+- No remaining difference was found in the dead-container removal, `map_buffer_offsets` lifecycle,
+  or `GetVARegionsImpl`/`GetVARegions1`/`GetVARegions3` ownership corrected by this slice.
+
+### Missing items
+- None: the ioctl1 commands A/1, A/2, A/3, A/5, A/6, A/8, A/9 and A/0x14, ioctl3 A/8,
+  empty open/close hooks, and unknown-event behavior all have counterparts.
+
+### Binary layout verification
+- PASS: all ioctl payloads have `repr(C)` and exact upstream sizes, including the newly asserted
+  0x4-byte `IoctlBindChannel`; `VaRegion` is 0x18 and `IoctlGetVaRegions` is 0x40. Focused tests
+  cover tracked/untracked unmap behavior, the inline-region copy bound, and existing allocation,
+  mapping, sparse, remap, free, and channel-binding behavior.

@@ -2,10 +2,10 @@
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h
-//! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+//! Port of eden/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h
+//! Port of eden/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use common::address_space::FlatAllocator;
@@ -109,6 +109,7 @@ const _: () = assert!(std::mem::size_of::<IoctlUnmapBuffer>() == 8);
 pub struct IoctlBindChannel {
     pub fd: i32,
 }
+const _: () = assert!(std::mem::size_of::<IoctlBindChannel>() == 0x4);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -177,18 +178,18 @@ impl VM {
 pub struct NvHostAsGpu {
     system: SystemRef,
     module: *const Module,
-    container: *const Container,
     nvmap: *const NvMap,
     mutex: Mutex<()>,
     vm: Mutex<VM>,
+    map_buffer_offsets: Mutex<HashSet<i64>>,
     mapping_map: Mutex<BTreeMap<u64, Arc<Mapping>>>,
     allocation_map: Mutex<BTreeMap<u64, Allocation>>,
     gmmu: Mutex<Option<Arc<dyn GpuMemoryManagerHandle>>>,
 }
 
 // Safety: the device is accessed through the nvdrv service thread, matching the
-// ownership model used by other nvdrv device wrappers that store raw pointers to
-// shared container state.
+// ownership model used by other nvdrv device wrappers that retain raw pointers
+// to the module and its NvMap state.
 unsafe impl Send for NvHostAsGpu {}
 unsafe impl Sync for NvHostAsGpu {}
 
@@ -202,18 +203,14 @@ impl NvHostAsGpu {
         Self {
             system,
             module: module as *const _,
-            container: container as *const _,
             nvmap: container.get_nv_map_file() as *const _,
             mutex: Mutex::new(()),
             vm: Mutex::new(VM::default()),
+            map_buffer_offsets: Mutex::new(HashSet::new()),
             mapping_map: Mutex::new(BTreeMap::new()),
             allocation_map: Mutex::new(BTreeMap::new()),
             gmmu: Mutex::new(None),
         }
-    }
-
-    fn container(&self) -> &Container {
-        unsafe { &*self.container }
     }
 
     fn module(&self) -> &Module {
@@ -727,6 +724,10 @@ impl NvHostAsGpu {
                 );
             }
             Self::trace_gpu_va_map(params.handle, size, offset, params.flags, params.kind);
+            self.map_buffer_offsets
+                .lock()
+                .unwrap()
+                .insert(params.offset);
             return NvResult::Success;
         }
 
@@ -801,6 +802,10 @@ impl NvHostAsGpu {
             params.flags,
             params.kind,
         );
+        self.map_buffer_offsets
+            .lock()
+            .unwrap()
+            .insert(params.offset);
         NvResult::Success
     }
 
@@ -841,6 +846,10 @@ impl NvHostAsGpu {
         );
 
         let _owner_guard = self.mutex.lock().unwrap();
+        let mut map_buffer_offsets = self.map_buffer_offsets.lock().unwrap();
+        if !map_buffer_offsets.contains(&params.offset) {
+            return NvResult::Success;
+        }
         let vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -885,6 +894,7 @@ impl NvHostAsGpu {
         }
         self.nvmap().unpin_handle(mapping.handle);
         mapping_map.remove(&(params.offset as u64));
+        map_buffer_offsets.remove(&params.offset);
         Self::trace_gpu_va_unmap(params.offset as u64);
         NvResult::Success
     }
@@ -902,32 +912,20 @@ impl NvHostAsGpu {
         NvResult::Success
     }
 
-    pub fn get_va_regions(&self, params: &mut IoctlGetVaRegions) -> NvResult {
-        log::debug!(
-            "nvhost_as_gpu::GetVARegions called, buf_addr={:X}, buf_size={:X}",
-            params.buf_addr,
-            params.buf_size
-        );
-
-        let _owner_guard = self.mutex.lock().unwrap();
-        let vm = self.vm.lock().unwrap();
-        if !vm.initialised {
-            return NvResult::BadValue;
-        }
-
-        let Some(small_page_allocator) = vm.small_page_allocator.as_ref() else {
-            return NvResult::InvalidState;
-        };
-        let Some(big_page_allocator) = vm.big_page_allocator.as_ref() else {
-            return NvResult::InvalidState;
-        };
+    fn get_va_regions_impl(vm: &VM, params: &mut IoctlGetVaRegions) {
+        let small_page_allocator = vm
+            .small_page_allocator
+            .as_ref()
+            .expect("initialized VM must own its small-page allocator");
+        let big_page_allocator = vm
+            .big_page_allocator
+            .as_ref()
+            .expect("initialized VM must own its big-page allocator");
 
         params.buf_size = 2 * std::mem::size_of::<VaRegion>() as u32;
         // Match upstream's u32 overflow semantics: the shift happens on u32
-        // (VaType) and silently truncates; the Switch game's nnSdk runtime
-        // is compiled assuming this overflow (big-page region offset reads as
-        // 0 when start * page_size exceeds u32). Performing the math in u64
-        // and returning the "correct" value breaks the game's branch.
+        // (VaType) and silently truncates; the Switch runtime is compiled
+        // assuming this overflow.
         params.regions[0] = VaRegion {
             offset: (small_page_allocator
                 .get_va_start()
@@ -945,6 +943,22 @@ impl NvHostAsGpu {
             _pad0: 0,
             pages: (big_page_allocator.get_va_limit() - big_page_allocator.get_va_start()) as u64,
         };
+    }
+
+    pub fn get_va_regions1(&self, params: &mut IoctlGetVaRegions) -> NvResult {
+        log::debug!(
+            "nvhost_as_gpu::GetVARegions1 called, buf_addr={:X}, buf_size={:X}",
+            params.buf_addr,
+            params.buf_size
+        );
+
+        let _owner_guard = self.mutex.lock().unwrap();
+        let vm = self.vm.lock().unwrap();
+        if !vm.initialised {
+            return NvResult::BadValue;
+        }
+
+        Self::get_va_regions_impl(&vm, params);
         log::debug!(
             "nvhost_as_gpu::GetVARegions result small=[0x{:X}, pages=0x{:X}] big=[0x{:X}, pages=0x{:X}, page_size=0x{:X}]",
             params.regions[0].offset,
@@ -954,6 +968,29 @@ impl NvHostAsGpu {
             params.regions[1].page_size
         );
 
+        NvResult::Success
+    }
+
+    pub fn get_va_regions3(
+        &self,
+        params: &mut IoctlGetVaRegions,
+        regions: &mut [VaRegion],
+    ) -> NvResult {
+        log::debug!(
+            "nvhost_as_gpu::GetVARegions3 called, buf_addr={:X}, buf_size={:X}",
+            params.buf_addr,
+            params.buf_size
+        );
+
+        let _owner_guard = self.mutex.lock().unwrap();
+        let vm = self.vm.lock().unwrap();
+        if !vm.initialised {
+            return NvResult::BadValue;
+        }
+
+        Self::get_va_regions_impl(&vm, params);
+        let num_regions = params.regions.len().min(regions.len());
+        regions[..num_regions].copy_from_slice(&params.regions[..num_regions]);
         NvResult::Success
     }
 }
@@ -994,7 +1031,7 @@ impl NvDevice for NvHostAsGpu {
                 }
                 0x8 => {
                     let mut params: IoctlGetVaRegions = read_struct(input);
-                    let r = self.get_va_regions(&mut params);
+                    let r = self.get_va_regions1(&mut params);
                     write_struct(output, &params);
                     r
                 }
@@ -1062,11 +1099,11 @@ impl NvDevice for NvHostAsGpu {
             b'A' => match command.cmd() {
                 0x8 => {
                     let mut params: IoctlGetVaRegions = read_struct(input);
-                    let r = self.get_va_regions(&mut params);
-                    write_struct(output, &params);
-                    // Write inline output
                     let region_size = std::mem::size_of::<VaRegion>();
-                    for (i, region) in params.regions.iter().enumerate() {
+                    let mut regions = vec![VaRegion::default(); inline_output.len() / region_size];
+                    let r = self.get_va_regions3(&mut params, &mut regions);
+                    write_struct(output, &params);
+                    for (i, region) in regions.iter().enumerate() {
                         let start = i * region_size;
                         if start + region_size <= inline_output.len() {
                             write_struct(&mut inline_output[start..], region);
@@ -1275,6 +1312,31 @@ mod tests {
     }
 
     #[test]
+    fn get_va_regions3_copies_only_the_available_inline_regions() {
+        let system = system_with_fake_gpu();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut params = super::IoctlGetVaRegions::default();
+        let mut inline_regions = [super::VaRegion::default(); 1];
+        assert_eq!(
+            gpu_as.get_va_regions3(&mut params, &mut inline_regions),
+            NvResult::Success
+        );
+
+        assert_eq!(
+            params.buf_size,
+            (2 * std::mem::size_of::<super::VaRegion>()) as u32
+        );
+        assert_eq!(inline_regions[0].offset, params.regions[0].offset);
+        assert_eq!(inline_regions[0].page_size, params.regions[0].page_size);
+        assert_eq!(inline_regions[0].pages, params.regions[0].pages);
+    }
+
+    #[test]
     fn alloc_as_ex_applies_non_zero_va_ranges_literally() {
         let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
@@ -1372,6 +1434,19 @@ mod tests {
         let mut unmap = IoctlUnmapBuffer {
             offset: 0xDEAD_0000,
         };
+        assert_eq!(gpu_as.unmap_buffer(&mut unmap), NvResult::Success);
+    }
+
+    #[test]
+    fn unmap_buffer_untracked_offset_succeeds_before_vm_initialization() {
+        let system = system_with_fake_gpu();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut unmap = IoctlUnmapBuffer {
+            offset: 0xDEAD_0000,
+        };
+
         assert_eq!(gpu_as.unmap_buffer(&mut unmap), NvResult::Success);
     }
 

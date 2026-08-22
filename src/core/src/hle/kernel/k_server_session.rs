@@ -287,8 +287,6 @@ impl KServerSession {
         dst_page_table: &KProcessPageTable,
         src_page_table: &KProcessPageTable,
     ) -> u32 {
-        let mut src_words = src_words.to_vec();
-        let src_message = MessageBuffer::new(&mut src_words);
         let src_end_offset = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
             src_header,
             src_special_header,
@@ -392,8 +390,6 @@ impl KServerSession {
         dst_page_table: &KProcessPageTable,
         _src_page_table: &KProcessPageTable,
     ) -> u32 {
-        let mut src_words = src_words.to_vec();
-        let src_message = MessageBuffer::new(&mut src_words);
         let src_end_offset = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
             src_header,
             src_special_header,

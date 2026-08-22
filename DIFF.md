@@ -7182,3 +7182,22 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: this change only preserves a 32-bit result code already produced by the session layer; no
   IPC payload or raw-memory structure changes.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_server_session.rs` vs Eden `src/core/hle/kernel/k_server_session.{h,cpp}`
+
+### Intentional differences
+- Eden's pointer-descriptor constructors read through a const `MessageBuffer` view. Ruzu's
+  `PointerDescriptor::from_raw` reads the same two words directly from the immutable source slice.
+
+### Unintentional differences (to fix)
+- The receive and send pointer helpers cloned the complete source message into mutable vectors and
+  constructed unused `MessageBuffer` views. Those dead allocations are removed; descriptor offsets,
+  memory-copy direction, validation, and destination writes remain unchanged.
+
+### Missing items
+- None in the pointer-descriptor source parsing covered by this cleanup.
+
+### Binary layout verification
+- PASS: each pointer descriptor is still decoded from the same two `u32` words and encoded into the
+  same destination offsets. Existing focused tests cover send copying, receive linear-to-user
+  copying, receive heap-to-heap copying, and end-to-end request pointer payload transfer.

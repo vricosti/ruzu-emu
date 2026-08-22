@@ -7061,3 +7061,25 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: `SyncpointEventValue` remains a 4-byte raw value and this cleanup does not alter any ioctl
   payload. A focused test verifies allocated-event decoding and matching-syncpoint lookup.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/nvdrv_interface.rs` vs Eden `src/core/hle/service/nvdrv/nvdrv_interface.{h,cpp}`
+
+### Intentional differences
+- Eden's `Common::ScratchBuffer<u8>` owners map to reusable `Vec<u8>` fields. Ruzu clears the
+  requested range before every dispatch instead of leaving reused bytes unspecified, preserving
+  deterministic reserved/output bytes as required by the Rust raw-payload contract.
+- The static `ServiceFramework` adapters and mutex-protected `NvdrvInterface` state split one C++
+  `NVDRV` object into two Rust layers; the buffers remain owned by that per-service state.
+- Optional ioctl tracing/history observes the service-owned buffers after dispatch without changing
+  the guest-visible write condition or response.
+
+### Unintentional differences (to fix)
+- None in the output-buffer ownership corrected by this slice.
+
+### Missing items
+- None for ioctl scratch storage: ioctl1/ioctl2 reuse `output_buffer`, while ioctl3 reuses both
+  `output_buffer` and `inline_output_buffer` before writing descriptors 0 and 1 respectively.
+
+### Binary layout verification
+- N/A: the reusable vectors are host-only storage. Their requested lengths still come directly from
+  the IPC write descriptors, and a focused test verifies resize and deterministic clearing.

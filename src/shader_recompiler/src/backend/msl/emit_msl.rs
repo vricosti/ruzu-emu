@@ -559,6 +559,10 @@ fn emit_inst(
         Opcode::ImageSampleDrefImplicitLod | Opcode::ImageSampleDrefExplicitLod => {
             emit_msl_image::emit_image_sample_dref(context, inst_ref, inst)
         }
+        Opcode::ImageFetch => emit_msl_image::emit_image_fetch(context, inst_ref, inst),
+        Opcode::ImageQueryDimensions => {
+            emit_msl_image::emit_image_query_dimensions(context, inst_ref, inst)
+        }
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -756,6 +760,79 @@ mod tests {
         program
     }
 
+    fn array_2d_fetch_program(is_multisample: bool, with_offset: bool) -> ir::Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::ColorArray2D,
+            is_depth: false,
+            is_multisample,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x3,
+            vec![Value::ImmU32(4), Value::ImmU32(2), Value::ImmU32(1)],
+        );
+        let offset = if with_offset {
+            let offset = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(1), Value::ImmU32(2)],
+            );
+            Value::Inst(InstRef {
+                block: 0,
+                inst: offset,
+            })
+        } else {
+            Value::Void
+        };
+        let fetch = program.blocks[0].append_new_inst(
+            Opcode::ImageFetch,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                offset,
+                Value::ImmU32(3),
+                if is_multisample {
+                    Value::ImmU32(2)
+                } else {
+                    Value::Void
+                },
+            ],
+        );
+        program.blocks[0].inst_mut(fetch).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::ColorArray2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        let query = program.blocks[0].append_new_inst(
+            Opcode::ImageQueryDimensions,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(3),
+                Value::ImmU1(is_multisample),
+            ],
+        );
+        program.blocks[0].inst_mut(query).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::ColorArray2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program
+    }
+
     #[test]
     fn emits_minimal_vertex_entry_point_without_spirv() {
         let artifact = emit_msl(
@@ -863,6 +940,42 @@ mod tests {
             .source
             .source
             .contains("float4 v_0_1 = tex0.sample(samp0, v_0_0);"));
+    }
+
+    #[test]
+    fn emits_array_fetch_offset_and_dimension_query() {
+        let artifact = emit_msl(
+            &array_2d_fetch_program(false, true),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+
+        assert!(source.contains("texture2d_array<float> tex0 [[texture(0)]]"));
+        assert!(source.contains("+ uint3((v_0_1).xy, 0u)"));
+        assert!(source.contains(".read("));
+        assert!(source.contains(".get_width(0x00000003u)"));
+        assert!(source.contains(".get_height(0x00000003u)"));
+        assert!(source.contains(".get_array_size()"));
+        assert!(source.contains(".get_num_mip_levels()"));
+    }
+
+    #[test]
+    fn emits_multisample_array_fetch_without_lod() {
+        let artifact = emit_msl(
+            &array_2d_fetch_program(true, false),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+
+        assert!(source.contains("texture2d_ms_array<float> tex0 [[texture(0)]]"));
+        assert!(source.contains(".read((v_0_0).xy, (v_0_0).z, 0x00000002u)"));
+        assert!(source
+            .contains("uint4(tex0.get_width(), tex0.get_height(), tex0.get_array_size(), 0u)"));
+        assert!(!source.contains("get_num_mip_levels"));
     }
 
     #[test]

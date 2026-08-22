@@ -936,6 +936,181 @@ mod tests {
         program
     }
 
+    fn fetch_coordinates(program: &mut Program, texture_type: TextureType) -> Value {
+        let (opcode, values) = match texture_type {
+            TextureType::Color1D => return Value::ImmU32(4),
+            TextureType::ColorArray1D | TextureType::Color2D | TextureType::Color2DRect => (
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(4), Value::ImmU32(2)],
+            ),
+            TextureType::ColorArray2D | TextureType::Color3D | TextureType::ColorCube => (
+                Opcode::CompositeConstructU32x3,
+                vec![Value::ImmU32(4), Value::ImmU32(2), Value::ImmU32(1)],
+            ),
+            TextureType::ColorArrayCube => (
+                Opcode::CompositeConstructU32x4,
+                vec![
+                    Value::ImmU32(4),
+                    Value::ImmU32(2),
+                    Value::ImmU32(1),
+                    Value::ImmU32(0),
+                ],
+            ),
+            TextureType::Buffer => unreachable!("sampled fetch test does not use buffers"),
+        };
+        let coords = program.blocks[0].append_new_inst(opcode, values);
+        Value::Inst(InstRef {
+            block: 0,
+            inst: coords,
+        })
+    }
+
+    fn store_query_result(program: &mut Program, query: u32) {
+        program.info.stores_frag_color[0] = true;
+        for component in 0..4 {
+            let extracted = program.blocks[0].append_new_inst(
+                Opcode::CompositeExtractU32x4,
+                vec![
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: query,
+                    }),
+                    Value::ImmU32(component),
+                ],
+            );
+            let value = program.blocks[0].append_new_inst(
+                Opcode::BitCastU32F32,
+                vec![Value::Inst(InstRef {
+                    block: 0,
+                    inst: extracted,
+                })],
+            );
+            program.blocks[0].append_new_inst(
+                Opcode::SetFragColor,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(component),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: value,
+                    }),
+                ],
+            );
+        }
+    }
+
+    fn fetched_texture_program(
+        texture_type: TextureType,
+        is_depth: bool,
+        is_integer: bool,
+        is_multisample: bool,
+        with_offset: bool,
+    ) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth,
+            is_multisample,
+            is_integer,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        program.info.uses_sampled_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        );
+        let coords = fetch_coordinates(&mut program, texture_type);
+        let offset = if with_offset {
+            let offset = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(1), Value::ImmU32(2)],
+            );
+            Value::Inst(InstRef {
+                block: 0,
+                inst: offset,
+            })
+        } else {
+            Value::Void
+        };
+        let fetch = program.blocks[0].append_new_inst(
+            Opcode::ImageFetch,
+            vec![
+                Value::ImmU32(0),
+                coords,
+                offset,
+                Value::ImmU32(1),
+                if is_multisample {
+                    Value::ImmU32(0)
+                } else {
+                    Value::Void
+                },
+            ],
+        );
+        program.blocks[0].inst_mut(fetch).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
+            is_depth,
+            ..Default::default()
+        }
+        .to_u32();
+        store_sample_result(&mut program, fetch, true);
+        program
+    }
+
+    fn texture_query_program(texture_type: TextureType, is_multisample: bool) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth: false,
+            is_multisample,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        program.info.uses_sampled_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        );
+        let query = program.blocks[0].append_new_inst(
+            Opcode::ImageQueryDimensions,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(0),
+                Value::ImmU1(is_multisample),
+            ],
+        );
+        program.blocks[0].inst_mut(query).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
+            ..Default::default()
+        }
+        .to_u32();
+        store_query_result(&mut program, query);
+        program
+    }
+
     fn empty_program(stage: Stage) -> Program {
         let mut program = Program::new(stage);
         program.blocks.push(Block::new());
@@ -1496,6 +1671,145 @@ mod tests {
             assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
             assert!(direct.source().source.contains(".sample_compare("));
         }
+    }
+
+    #[test]
+    fn compiles_direct_texture_fetch_dimensions_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for texture_type in [
+            TextureType::Color1D,
+            TextureType::ColorArray1D,
+            TextureType::Color2D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+            TextureType::Color3D,
+            TextureType::ColorCube,
+            TextureType::ColorArrayCube,
+        ] {
+            let program = fetched_texture_program(texture_type, false, false, false, false);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("active {texture_type:?} fetch must compile: {error}"));
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| panic!("direct {texture_type:?} fetch must compile: {error}"));
+            assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
+            assert!(direct.source().source.contains(".read("));
+        }
+    }
+
+    #[test]
+    fn compiles_direct_integer_offset_and_multisample_fetches() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for program in [
+            fetched_texture_program(TextureType::Color2D, false, true, false, false),
+            fetched_texture_program(TextureType::ColorArray2D, false, false, false, true),
+            fetched_texture_program(TextureType::Color2D, true, false, false, false),
+            fetched_texture_program(TextureType::ColorCube, true, false, false, false),
+            fetched_texture_program(TextureType::Color2D, false, false, true, false),
+            fetched_texture_program(TextureType::ColorArray2D, false, false, true, false),
+            fetched_texture_program(TextureType::Color2D, true, false, true, false),
+        ] {
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .expect("active fetch variant must compile");
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .expect("direct fetch variant must compile with the active ABI");
+            assert_eq!(direct.bindings(), active.bindings());
+        }
+    }
+
+    #[test]
+    fn compiles_direct_texture_dimension_queries_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for (texture_type, is_multisample) in [
+            (TextureType::Color1D, false),
+            (TextureType::ColorArray1D, false),
+            (TextureType::Color2D, false),
+            (TextureType::Color2DRect, false),
+            (TextureType::ColorArray2D, false),
+            (TextureType::Color3D, false),
+            (TextureType::ColorCube, false),
+            (TextureType::ColorArrayCube, false),
+            (TextureType::Color2D, true),
+            (TextureType::ColorArray2D, true),
+        ] {
+            let program = texture_query_program(texture_type, is_multisample);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("active {texture_type:?} query must compile: {error}"));
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| panic!("direct {texture_type:?} query must compile: {error}"));
+            assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
+        }
+    }
+
+    #[test]
+    fn compiles_direct_multisample_fetch_at_msl_2_3_baseline() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let program = fetched_texture_program(TextureType::ColorArray2D, false, false, true, false);
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &make_shader_profile(device.profile()),
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
+            },
+        )
+        .expect("multisample fetch must lower at the MSL 2.3 baseline");
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("multisample fetch must compile at the MSL 2.3 baseline");
+        assert_eq!(
+            shader.language_version(),
+            shader_recompiler::backend::msl::MslVersion::V2_3
+        );
     }
 
     #[test]

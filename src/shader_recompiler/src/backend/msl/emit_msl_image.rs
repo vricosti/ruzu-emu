@@ -46,6 +46,66 @@ fn append_sample_coordinates(
     Ok(())
 }
 
+fn add_offset_to_coordinates(
+    context: &MslEmitContext,
+    inst_ref: InstRef,
+    info: TextureInstInfo,
+    coords: String,
+    offset: &Value,
+) -> Result<String, MslError> {
+    if matches!(offset, Value::Void) {
+        return Ok(coords);
+    }
+    let offset = context.value_expression(offset, inst_ref, 2)?;
+    Ok(match TextureType::from_u8(info.texture_type) {
+        TextureType::Buffer | TextureType::Color1D => format!("(({coords}) + ({offset}))"),
+        TextureType::ColorArray1D => {
+            format!("(({coords}) + uint2(({offset}), 0u))")
+        }
+        TextureType::Color2D | TextureType::Color2DRect => {
+            format!("(({coords}) + ({offset}))")
+        }
+        TextureType::ColorArray2D => {
+            format!("(({coords}) + uint3(({offset}).xy, 0u))")
+        }
+        TextureType::Color3D => format!("(({coords}) + ({offset}))"),
+        TextureType::ColorCube | TextureType::ColorArrayCube => coords,
+    })
+}
+
+fn append_fetch_coordinates(
+    arguments: &mut Vec<String>,
+    texture_type: TextureType,
+    coords: String,
+) -> Result<(), MslError> {
+    match texture_type {
+        TextureType::Color1D => arguments.push(coords),
+        TextureType::ColorArray1D => {
+            arguments.push(format!("({coords}).x"));
+            arguments.push(format!("({coords}).y"));
+        }
+        TextureType::Color2D | TextureType::Color2DRect => arguments.push(coords),
+        TextureType::ColorArray2D => {
+            arguments.push(format!("({coords}).xy"));
+            arguments.push(format!("({coords}).z"));
+        }
+        TextureType::Color3D => arguments.push(coords),
+        TextureType::ColorCube => {
+            arguments.push(format!("({coords}).xy"));
+            arguments.push(format!("({coords}).z"));
+        }
+        TextureType::ColorArrayCube => {
+            arguments.push(format!("({coords}).xy"));
+            arguments.push(format!("({coords}).z"));
+            arguments.push(format!("({coords}).w"));
+        }
+        TextureType::Buffer => {
+            return Err(MslError::UnsupportedProgramFeature("texture buffer fetch"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_sample(context: &MslEmitContext, inst: &Inst) -> Result<TextureInstInfo, MslError> {
     let info = TextureInstInfo::from_u32(inst.flags);
     if info.has_bias {
@@ -183,4 +243,106 @@ pub fn emit_image_sample_dref(
         ),
         false,
     )
+}
+
+pub fn emit_image_fetch(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    context.validate_texture(info)?;
+    let texture = context.texture_expressions(info, inst.arg(0), inst_ref)?;
+    let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let coords = add_offset_to_coordinates(context, inst_ref, info, coords, inst.arg(2))?;
+    let mut arguments = Vec::with_capacity(4);
+    append_fetch_coordinates(&mut arguments, texture.texture_type, coords)?;
+
+    let sample = (!matches!(inst.arg(4), Value::Void))
+        .then(|| context.value_expression(inst.arg(4), inst_ref, 4))
+        .transpose()?;
+    if texture.is_multisample != sample.is_some() {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture fetch multisample descriptor/instruction mismatch",
+        ));
+    }
+    if let Some(sample) = sample {
+        arguments.push(sample);
+    } else if !matches!(inst.arg(3), Value::Void)
+        && !matches!(
+            texture.texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        )
+    {
+        arguments.push(context.value_expression(inst.arg(3), inst_ref, 3)?);
+    }
+
+    let read = format!("{}.read({})", texture.texture, arguments.join(", "));
+    let expression = if texture.is_depth {
+        format!("float4({read})")
+    } else if texture.is_integer {
+        format!("as_type<float4>({read})")
+    } else {
+        read
+    };
+    context.define(inst_ref, Type::F32x4, expression, false)
+}
+
+pub fn emit_image_query_dimensions(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    context.validate_texture(info)?;
+    let texture = context.texture_expressions(info, inst.arg(0), inst_ref)?;
+    if texture.texture_type == TextureType::Buffer {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture buffer dimension query",
+        ));
+    }
+    let lod = if texture.is_multisample
+        || matches!(
+            texture.texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        ) {
+        None
+    } else {
+        Some(context.value_expression(inst.arg(1), inst_ref, 1)?)
+    };
+    let query = |method: &str| match &lod {
+        Some(lod) => format!("{}.{}({lod})", texture.texture, method),
+        None => format!("{}.{}()", texture.texture, method),
+    };
+    let skip_mips = inst.args.get(2).map(Value::imm_u1).unwrap_or(false);
+    let mips = if skip_mips {
+        "0u".to_owned()
+    } else if texture.is_multisample {
+        "1u".to_owned()
+    } else {
+        format!("{}.get_num_mip_levels()", texture.texture)
+    };
+    let width = query("get_width");
+    let expression = match texture.texture_type {
+        TextureType::Color1D => format!("uint4({width}, 0u, 0u, {mips})"),
+        TextureType::ColorArray1D => format!(
+            "uint4({width}, {}.get_array_size(), 0u, {mips})",
+            texture.texture
+        ),
+        TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorCube => {
+            format!("uint4({width}, {}, 0u, {mips})", query("get_height"))
+        }
+        TextureType::ColorArray2D | TextureType::ColorArrayCube => format!(
+            "uint4({width}, {}, {}.get_array_size(), {mips})",
+            query("get_height"),
+            texture.texture
+        ),
+        TextureType::Color3D => format!(
+            "uint4({width}, {}, {}, {mips})",
+            query("get_height"),
+            query("get_depth")
+        ),
+        TextureType::Buffer => unreachable!("texture buffers were rejected above"),
+    };
+    context.define(inst_ref, Type::U32x4, expression, false)
 }

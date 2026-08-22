@@ -48,6 +48,7 @@ struct MslTextureDefinition {
     count: u32,
     is_depth: bool,
     is_integer: bool,
+    is_multisample: bool,
 }
 
 pub(super) struct MslTextureExpressions {
@@ -56,6 +57,7 @@ pub(super) struct MslTextureExpressions {
     pub texture_type: TextureType,
     pub is_depth: bool,
     pub is_integer: bool,
+    pub is_multisample: bool,
 }
 
 impl MslEmitContext {
@@ -243,11 +245,6 @@ impl MslEmitContext {
                 "texture buffer in sampled texture descriptors",
             ));
         }
-        if descriptor.is_multisample {
-            return Err(MslError::UnsupportedProgramFeature(
-                "multisample texture descriptor",
-            ));
-        }
         if descriptor.count == 0 {
             return Err(MslError::UnsupportedProgramFeature(
                 "zero-sized texture descriptor array",
@@ -276,7 +273,25 @@ impl MslEmitContext {
 
         let texture_name = format!("tex{descriptor_index}");
         let sampler_name = format!("samp{descriptor_index}");
-        let texture_type = if descriptor.is_depth {
+        let texture_type = if descriptor.is_multisample {
+            let texture_class = match (descriptor.texture_type, descriptor.is_depth) {
+                (TextureType::Color2D | TextureType::Color2DRect, false) => "texture2d_ms",
+                (TextureType::ColorArray2D, false) => "texture2d_ms_array",
+                (TextureType::Color2D | TextureType::Color2DRect, true) => "depth2d_ms",
+                (TextureType::ColorArray2D, true) => "depth2d_ms_array",
+                _ => {
+                    return Err(MslError::UnsupportedProgramFeature(
+                        "multisample texture dimension unsupported by Metal",
+                    ));
+                }
+            };
+            let component = if descriptor.is_integer {
+                "uint"
+            } else {
+                "float"
+            };
+            format!("{texture_class}<{component}>")
+        } else if descriptor.is_depth {
             let texture_class = match descriptor.texture_type {
                 TextureType::Color2D | TextureType::Color2DRect => "depth2d",
                 TextureType::ColorArray2D => "depth2d_array",
@@ -331,6 +346,7 @@ impl MslEmitContext {
             count: descriptor.count,
             is_depth: descriptor.is_depth,
             is_integer: descriptor.is_integer,
+            is_multisample: descriptor.is_multisample,
         })
     }
 
@@ -358,7 +374,7 @@ impl MslEmitContext {
         Ok(())
     }
 
-    pub fn texture_expressions(
+    pub(super) fn texture_expressions(
         &self,
         info: crate::ir::types::TextureInstInfo,
         index: &Value,
@@ -375,6 +391,7 @@ impl MslEmitContext {
                 texture_type: definition.texture_type,
                 is_depth: definition.is_depth,
                 is_integer: definition.is_integer,
+                is_multisample: definition.is_multisample,
             });
         }
         let index = self.value_expression(index, inst_ref, 0)?;
@@ -384,6 +401,7 @@ impl MslEmitContext {
             texture_type: definition.texture_type,
             is_depth: definition.is_depth,
             is_integer: definition.is_integer,
+            is_multisample: definition.is_multisample,
         })
     }
 

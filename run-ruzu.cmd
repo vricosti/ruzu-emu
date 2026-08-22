@@ -17,7 +17,7 @@ if not exist "%RUZU_DLL_DIR%\gtk-4-1.dll" (
     echo Ruzu's vcpkg runtime DLL directory was not found:
     echo   %RUZU_DLL_DIR%
     echo.
-    echo Run scripts\setup.ps1 first, or set VCPKG_ROOT to the vcpkg installation.
+    echo Run scripts\build.ps1 first, or set VCPKG_ROOT to the vcpkg installation.
     pause
     exit /b 1
 )

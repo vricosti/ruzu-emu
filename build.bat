@@ -3,7 +3,7 @@ rem IN PROGRESS: install and configure the tools required to build Ruzu on Windo
 
 set "RUZU_ENV_FILE=%TEMP%\ruzu-windows-env.bat"
 
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-windows.ps1" %*
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build.ps1" %*
 if errorlevel 1 exit /b %errorlevel%
 
 if exist "%RUZU_ENV_FILE%" call "%RUZU_ENV_FILE%"

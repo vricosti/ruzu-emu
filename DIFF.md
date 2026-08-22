@@ -7529,3 +7529,27 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: focused dispatch coverage verifies the generated AArch32 and AArch64 input/output register
   positions; operation discriminants remain `0..=3` with unknown values rejected explicitly.
+
+## 2026-08-22 — `src/core/src/hle/service/jit/jit_code_memory.rs` vs Eden `src/core/hle/service/jit/jit_code_memory.{h,cpp}`
+
+### Intentional differences
+- `Arc<Mutex<KCodeMemory>>` represents Eden's raw pointer plus explicit `Open`/`Close` reference;
+  the mapping helper accepts the Rust process owner and random generator as references rather than
+  the C++ kernel argument.
+- Rust obtains the retained `KCodeMemory` owner before calling its mapping methods because the
+  process-wide mutex is the Rust counterpart of the page-table and object locking used upstream.
+
+### Unintentional differences (to fix)
+- The former file exposed only zero-valued size/address fields and documented the real behavior as
+  blocked. `Initialize` now samples page-aligned addresses across the process alias-code region,
+  retries indefinitely only for `ResultInvalidMemoryRegion`, maps with the requested permission,
+  and publishes all members only after success.
+- `Finalize` now asserts the matching owner unmap, releases the retained code-memory reference, and
+  clears its object member in Eden's order.
+
+### Missing items
+- None for `CodeMemory::Initialize`, `Finalize`, `GetSize`, or `GetAddress`.
+
+### Binary layout verification
+- N/A: this is a host-side ownership helper, not a raw guest payload. Focused coverage verifies the
+  sampled address, generated-code state, execute permission, getters, and final unmap.

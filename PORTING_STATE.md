@@ -33,6 +33,11 @@
   operation values return `ResultInvalidEnumValue` without an unsafe enum conversion.
 - Status: kernel code-memory prerequisite completed and re-verified; `jit_code_memory.rs` may now
   resume.
+- JIT code-memory result: `CodeMemory` now samples the process alias-code region with the caller's
+  `mt19937_64` stream, retries only `ResultInvalidMemoryRegion`, retains the kernel code-memory
+  reference after a successful owner mapping, and asserts the matching unmap during finalization.
+- Status: the code-memory prerequisite chain is complete; the interrupted `jit.rs` environment and
+  callback slice may resume.
 
 ## 2026-08-22 — PlatformServiceManager warning interrupted by kernel font-memory prerequisite
 

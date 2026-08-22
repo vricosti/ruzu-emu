@@ -6532,6 +6532,8 @@ vs Eden `display_list.h` and `layer_list.h`
   constructor's `None` semantics.
 - Corrected the local-clock regression expectation: when steady-clock source IDs differ, Eden
   derives a context from the current steady clock rather than copying the supplied context.
+- Restored Eden's non-fatal error log when the boot-time timezone rule cannot be parsed; setup
+  continues and initializes the remaining timezone state in the same order.
 
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/alarm_worker.rs` vs `src/core/hle/service/glue/time/alarm_worker.{h,cpp}`
 
@@ -6753,3 +6755,101 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: this changes only the language mode used to compile the existing C++ shim sources.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/tzif.rs` vs Eden `externals/tz/tz/tz.{h,cpp}`
+
+### Intentional differences
+- Rust checks the input length and `TZif` magic before decoding the header. Eden's current
+  `tzloadbody` copies the header without those guards; rejecting malformed input avoids an
+  out-of-bounds read without changing valid Switch archive behavior.
+- C++ `bool` storage in `ttinfo` and `Rule` is represented by raw `u8` fields. This preserves the
+  same offsets while making every guest-provided bit pattern valid to decode in Rust.
+
+### Unintentional differences (to fix)
+- `parse_posix_tz` implements only the POSIX footer forms exercised by the embedded Switch
+  archive. Eden retains the complete `tzparse` implementation, including its broader validation
+  and transition-generation behavior.
+
+### Missing items
+- The remaining `tzparse` branches and edge cases not represented by the current embedded archive
+  still need a literal port before the external TZ library can be called complete.
+
+### Binary layout verification
+- PASS: `TtInfo` is 0x10 bytes and `TzRule` is 0x4000 bytes with Eden's field offsets, fixed array
+  capacities and explicit zeroed padding. Unaligned IPC decoding and full deterministic output are
+  covered by focused tests.
+- The parser now matches Eden's Switch-specific single 8-byte data block, counter ordering and
+  256-byte footer bound; a regression parses the archive's `Etc/GMT` rule.
+- `mktime_tzname` now preserves Eden's distinct success, overflow and not-found statuses and writes
+  the normalized `CalendarTimeInternal` back only after a successful conversion.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/time_zone.rs` vs Eden `src/core/hle/service/psc/time/time_zone.{h,cpp}`
+
+### Intentional differences
+- Eden's recursive member mutex is paired with borrowed references. Rust combines the existing
+  member mutex with the enclosing `TimeManager` mutex used by shared service owners.
+- A zero-capacity Rust output slice returns zero results before writing. Eden writes the first
+  element before checking `out_times_max_count`; valid CMIF requests provide output storage, while
+  the Rust guard prevents malformed IPC from causing an out-of-bounds access.
+
+### Binary layout verification
+- PASS: parsing now updates `m_my_rule` only after success, failed output parsing preserves the
+  caller's rule, getters enforce Eden's initialization boundary, and `ValidateRule` checks the
+  fixed 0x4000-byte rule before conversion.
+- `GetTimeZoneTime`, `ToCalendarTimeImpl` and `ToPosixTimeImpl` now retain Eden's ownership and
+  locking boundaries. Reverse conversion preserves overflow/not-found mapping, normalized-calendar
+  validation, two-result ambiguity detection and ascending result order; focused regressions cover
+  the zero-result and two-result paths.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/time_zone_service.rs` and `static.rs` vs Eden PSC time services
+
+### Intentional differences
+- `Arc<Mutex<TimeManager>>` retains the single owner behind Eden's
+  `StandardSteadyClockCore&` and `TimeZone&` references. Isolated constructors create a private
+  manager for unit-level service use; production `StaticService` forwards its shared manager.
+- Eden asserts that an `InLargeData` descriptor exists. Ruzu treats a missing descriptor as an
+  empty buffer, retaining the same value-initialized rule without aborting the service process.
+
+### Binary layout verification
+- PASS: commands 8, 100 and 201 now exchange the fixed 0x4000-byte rule rather than serializing
+  Rust `Vec` metadata. Command 7 mutates the manager-owned timezone and captures the shared
+  standard steady-clock time point in Eden's order.
+- Commands 100 and 201 now reproduce CMIF `InLargeData` decoding by zero-initializing the rule and
+  copying the available prefix. Commands 201 and 202 allocate exactly the guest-advertised output
+  capacity rather than inventing two output elements.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/time_zone.rs` vs Eden `src/core/hle/service/glue/time/time_zone.{h,cpp}`
+
+### Intentional differences
+- Eden's borrowed worker/binary references and shared service pointers use the corresponding
+  `Arc<Mutex<_>>` or `Arc<_>` owners. Its one intrusive-list member operation event is represented
+  by one stable optional `OperationEvent`; repeated handle requests reuse that event.
+- Event materialization is deferred until an IPC context can create the kernel bridge. Eden owns
+  its kernel event at service construction and recreates it on the first handle request.
+- Eden asserts that an `InLargeData` descriptor exists. Ruzu treats a missing descriptor as an
+  empty buffer, retaining the same value-initialized rule without aborting the service process.
+
+### Binary layout verification
+- PASS: location changes now follow Eden's validation, rule update, filesystem timestamp, wrapped
+  readback, settings-name persistence, settings-time persistence and event-signal order. Rule IPC
+  uses the complete deterministic 0x4000-byte payload, and output capacities come from the actual
+  IPC buffers.
+- Commands 100 and 201 preserve Eden's zero-initialize-then-copy-prefix `InLargeData` semantics;
+  focused coverage verifies that bytes beyond an undersized input remain zero.
+
+## 2026-08-22 — `src/core/src/hle/service/set/system_settings_server.rs` timezone forwarding vs Eden settings server
+
+### Intentional differences
+- Direct Rust forwarding methods return typed values or unit because the corresponding inner
+  settings methods cannot fail; Eden expresses the same always-successful operations as `Result`.
+
+### Unintentional differences (to fix)
+- The broader pre-existing partial service differences remain recorded in the earlier
+  `system_settings_server.rs` audit entry.
+
+### Missing items
+- No additional settings prerequisite is missing for timezone persistence.
+
+### Binary layout verification
+- PASS: `LocationName` remains 0x24 bytes and `SteadyClockTimePoint` remains 0x18 bytes. Focused
+  round-trip coverage includes a negative signed time point and a nonzero homebrew test UUID.

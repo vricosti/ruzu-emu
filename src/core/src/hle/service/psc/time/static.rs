@@ -261,10 +261,9 @@ impl StaticService {
     pub fn get_time_zone_service(&self) -> TimeZoneService {
         log::debug!("PSC::Time::StaticService::GetTimeZoneService called");
         if let Some(shared_time) = &self.shared_time {
-            let time = shared_time.lock().unwrap();
-            return TimeZoneService::from_time_zone(
+            return TimeZoneService::with_time_manager(
                 self.setup_info.can_write_timezone_device_location,
-                &time.time_zone,
+                Arc::clone(shared_time),
             );
         }
         TimeZoneService::new(self.setup_info.can_write_timezone_device_location)

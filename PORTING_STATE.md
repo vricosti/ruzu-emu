@@ -1,5 +1,62 @@
 # Porting State
 
+## 2026-08-22 — TimeZoneService warning/parity slice
+
+- Status: warning/ownership slice completed after resolving settings, shared-time, parser and
+  binary-layout prerequisites; reverse conversion parity was then completed as a discovered
+  prerequisite.
+- Interrupted slice: retain Eden's `m_set_sys` owner, persist timezone location updates, and
+  restore the shared operation-event ownership and signaling performed by
+  `Glue::Time::TimeZoneService`.
+- Exact missing prerequisite: Ruzu's IPC-facing `SystemSettingsService` does not expose Eden's
+  typed `SetDeviceTimeZoneLocationName` and `SetDeviceTimeZoneLocationUpdatedTime` methods to
+  service-to-service callers. The timezone service would otherwise have to own settings payload
+  serialization that belongs in `set/system_settings_server.rs`.
+- Required next action: add the two typed forwarding methods in the settings owner, verify their
+  payload conversion against Eden, then resume the timezone service with the retained singleton
+  and `PSC::Time::OperationEvent`.
+- Settings prerequisite result: `SystemSettingsService` now exposes the four typed timezone
+  getters/setters owned by Eden's `ISystemSettingsServer`; the existing settings payload helpers
+  keep the `LocationName` and `SteadyClockTimePoint` conversion in the settings module.
+- Newly discovered prerequisite: Ruzu's wrapped PSC `TimeZoneService` owns a snapshot of
+  `TimeZone` and no `StandardSteadyClockCore`. Eden retains references to both, sets the current
+  steady-clock time point immediately after parsing a new rule, and therefore returns a real
+  update time for Glue to persist. Continuing the Glue slice would persist a zero time point.
+- Required next action: restore shared `TimeZone` and `StandardSteadyClockCore` ownership in
+  `psc/time/time_zone_service.rs` and its manager/static-service construction path, verify that
+  rule updates mutate the manager-owned timezone and capture the current clock time, then resume
+  Glue persistence and operation-event signaling.
+- PSC ownership prerequisite result: every runtime `TimeZoneService` now retains the shared
+  `TimeManager` that owns Eden's clock core and timezone, command 7 delegates to the real method,
+  and successful updates capture the standard steady-clock time before mutating the shared zone.
+- Newly discovered parser prerequisite: after removing the non-upstream UTC fallback,
+  `TzRule::parse` rejects the valid `Etc/GMT` TZif supplied by Ruzu's synthesized system archive.
+  The fallback previously hid this parser defect and made command 7 appear successful while using
+  the wrong rule.
+- Required next action: compare `psc/time/tzif.rs` with Eden's TZ parser contract, fix the valid
+  synthesized TZif rejection with a focused regression, then resume the PSC and Glue tests.
+- Parser prerequisite result: the parser now follows Eden's Switch-specific single 8-byte data
+  block, uses the upstream `ttisutcnt`/`ttisstdcnt` header order and accepts the embedded
+  `Etc/GMT` rule without a UTC fallback.
+- Newly discovered reverse-conversion prerequisite: Ruzu collapsed `mktime_tzname` overflow and
+  not-found statuses, retained an invented UTC fallback, and could not return both timestamps for
+  an ambiguous local time. This also forced `TimeZone` to read `m_my_rule` outside its member-lock
+  boundary.
+- Reverse-conversion prerequisite result: `tzif.rs` now preserves Eden's status and normalized
+  calendar output, while `time_zone.rs` owns the exact `ToPosixTimeImpl` ambiguity search and
+  public wrapper ordering under the member mutex.
+- Newly discovered binary-layout prerequisite: Ruzu represented the raw IPC `Tz::Rule` payload
+  with `Vec` fields and read it through an aligned typed pointer. Eden's payload is a fixed,
+  value-initialized 0x4000-byte structure; the Rust representation was neither layout-compatible
+  nor safe for unaligned guest buffers.
+- Binary-layout prerequisite result: `TtInfo` and `TzRule` now mirror Eden's field offsets,
+  explicit padding and fixed array capacities. IPC decoding uses an unaligned-safe, all-bit-valid
+  representation, output includes deterministic reserved bytes, and conversion restores Eden's
+  `ValidateRule` boundary.
+- Resumed slice result: Glue retains the exact `set:sys` singleton, persists name then update
+  time, retains one stable operation event and signals it after persistence. The original unread
+  `system` field is removed because its upstream responsibilities now have explicit owners.
+
 ## 2026-08-22 — TimeWorker warning/parity slice
 
 - Status: interrupted before consuming the four unread report-context fields or replacing the

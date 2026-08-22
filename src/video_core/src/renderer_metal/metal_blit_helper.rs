@@ -25,6 +25,7 @@ use thiserror::Error;
 
 use super::metal_device::MetalDevice;
 use super::metal_framebuffer::MetalFramebufferSignature;
+use super::metal_query_cache::{MetalQueryCache, MetalVisibilityQuery};
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 
 #[derive(Clone, Copy, Debug)]
@@ -104,8 +105,10 @@ pub struct MetalBlitHelper {
     fragment: Retained<ProtocolObject<dyn MTLFunction>>,
     blit_pipelines:
         HashMap<MetalFramebufferSignature, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
-    clear_pipelines: HashMap<ClearPipelineKey, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
-    clear_depth_states: HashMap<ClearPipelineKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
+    clear_pipelines:
+        HashMap<ClearPipelineKey, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    clear_depth_states:
+        HashMap<ClearPipelineKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
 }
 
 impl MetalBlitHelper {
@@ -340,6 +343,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
         dst: MetalBlitRegion,
         src: MetalBlitRegion,
         source_size: (u32, u32),
+        visibility_query: Option<MetalVisibilityQuery>,
     ) -> Result<(), MetalBlitError> {
         let pipeline = self.pipeline(signature)?;
         let parameters = BlitParameters {
@@ -360,6 +364,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
         };
         scheduler.begin_render_pass(render_pass)?;
         scheduler.with_render_encoder(|encoder| unsafe {
+            MetalQueryCache::configure_draw(encoder, visibility_query);
             encoder.setRenderPipelineState(&pipeline);
             encoder.setVertexBytes_length_atIndex(
                 NonNull::new(

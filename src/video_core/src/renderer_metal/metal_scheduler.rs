@@ -232,6 +232,10 @@ impl MetalScheduler {
         self.next_tick
     }
 
+    pub fn has_active_work(&self) -> bool {
+        self.active.is_some()
+    }
+
     /// Last completion observed by the scheduler without polling Metal.
     /// `BufferCacheRuntime::KnownGpuTick` is a const query in the common
     /// cache; frame ticks poll through the staging pool before using it.

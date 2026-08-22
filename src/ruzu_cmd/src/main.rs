@@ -1218,22 +1218,41 @@ fn main() {
                         let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
                         gpu_ref.renderer_frame_end_notify();
                     });
-                    Box::new(
-                        video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
-                            // SAFETY: this renderer is immediately bound to `gpu` below;
-                            // `Gpu` drops the renderer before its shader notifier.
-                            unsafe { gpu.shader_notify_handle() },
-                            window_info,
-                            *drawable_size,
-                            Arc::clone(shown_state),
-                            Arc::clone(framebuffer_layout),
-                            frame_displayed_notify,
-                            frame_end_notify,
-                            syncpoints.clone(),
-                            device_memory,
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = drawable_size;
+                        Box::new(
+                            video_core::renderer_metal::renderer_metal::RendererMetal::new(
+                                window_info,
+                                Arc::clone(shown_state),
+                                Arc::clone(framebuffer_layout),
+                                frame_displayed_notify,
+                                frame_end_notify,
+                                syncpoints.clone(),
+                                device_memory,
+                            )
+                            .map_err(|error| format!("Failed to create Metal renderer: {error}"))?,
                         )
-                        .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
-                    )
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        Box::new(
+                            video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
+                                // SAFETY: this renderer is immediately bound to `gpu` below;
+                                // `Gpu` drops the renderer before its shader notifier.
+                                unsafe { gpu.shader_notify_handle() },
+                                window_info,
+                                *drawable_size,
+                                Arc::clone(shown_state),
+                                Arc::clone(framebuffer_layout),
+                                frame_displayed_notify,
+                                frame_end_notify,
+                                syncpoints.clone(),
+                                device_memory,
+                            )
+                            .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
+                        )
+                    }
                 }
                 _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
                     syncpoints.clone(),

@@ -7363,3 +7363,22 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: the copied region remains exactly `0x1100000` bytes. A focused test pre-fills the complete
   kernel buffer and verifies that the service copy overwrites it byte-for-byte with the font blob.
+
+## 2026-08-22 — `src/core/src/hle/service/nvnflinger/buffer_queue_consumer.rs` vs Eden `src/core/hle/service/nvnflinger/buffer_queue_consumer.{h,cpp}`
+
+### Intentional differences
+- The unused release-fence parameter is named `_release_fence` in Rust to make Eden's deliberate
+  temporary non-use explicit while preserving the public method signature.
+
+### Unintentional differences (to fix)
+- Ruzu previously retained a sampled `[BQC_RELEASE]` diagnostic counter absent from Eden. It has
+  been removed, and Eden's explanatory TODO beside the intentionally disabled fence assignment is
+  now preserved at the matching point.
+
+### Missing items
+- Proper waiting on release fences remains an upstream TODO; Ruzu deliberately keeps the previous
+  acquire fence exactly as Eden does rather than inventing behavior ahead of upstream.
+
+### Binary layout verification
+- N/A: no serialized or raw-memory payload changes. A focused state test verifies that release
+  frees the acquired slot without replacing its existing fence.

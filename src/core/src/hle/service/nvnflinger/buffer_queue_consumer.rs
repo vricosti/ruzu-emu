@@ -156,20 +156,7 @@ impl BufferQueueConsumer {
         Status::NoError
     }
 
-    pub fn release_buffer(&self, slot: i32, frame_number: u64, release_fence: &Fence) -> Status {
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNT: AtomicU64 = AtomicU64::new(0);
-            let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 16 || n.is_power_of_two() {
-                log::info!(
-                    "[BQC_RELEASE] #{} slot={} frame_number={}",
-                    n,
-                    slot,
-                    frame_number
-                );
-            }
-        }
+    pub fn release_buffer(&self, slot: i32, frame_number: u64, _release_fence: &Fence) -> Status {
         if slot < 0 || slot >= NUM_BUFFER_SLOTS as i32 {
             log::error!("BufferQueueConsumer: slot {} out of range", slot);
             return Status::BadValue;
@@ -197,6 +184,10 @@ impl BufferQueueConsumer {
             }
 
             if inner.slots[slot as usize].buffer_state == BufferState::Acquired {
+                // TODO: for now, avoid resetting the fence, so that when we next return this
+                // slot to the producer, it can wait for its own fence to pass. We should fix this
+                // by properly waiting for the fence in the BufferItemConsumer.
+                // inner.slots[slot as usize].fence = *_release_fence;
                 inner.slots[slot as usize].buffer_state = BufferState::Free;
                 listener = inner.connected_producer_listener.clone();
                 log::debug!("BufferQueueConsumer: releasing slot {}", slot);
@@ -382,6 +373,7 @@ impl IBinder for BufferQueueConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::nvdrv::nvdata::NvFence;
 
     fn consumer() -> BufferQueueConsumer {
         BufferQueueConsumer::new(BufferQueueCore::new())
@@ -403,6 +395,36 @@ mod tests {
         out.extend_from_slice(&(data_offset + data.len() as u32).to_le_bytes());
         out.extend_from_slice(&data);
         out
+    }
+
+    #[test]
+    fn release_buffer_keeps_the_acquire_fence_like_upstream() {
+        let core = BufferQueueCore::new();
+        {
+            let mut inner = core.mutex.lock().unwrap();
+            inner.slots[0].buffer_state = BufferState::Acquired;
+            inner.slots[0].frame_number = 7;
+            inner.slots[0].fence = Fence {
+                num_fences: 1,
+                fences: [NvFence { id: 3, value: 11 }; 4],
+            };
+        }
+        let consumer = BufferQueueConsumer::new(Arc::clone(&core));
+        let release_fence = Fence {
+            num_fences: 1,
+            fences: [NvFence { id: 9, value: 27 }; 4],
+        };
+
+        assert_eq!(
+            consumer.release_buffer(0, 7, &release_fence),
+            Status::NoError
+        );
+
+        let inner = core.mutex.lock().unwrap();
+        assert_eq!(inner.slots[0].buffer_state, BufferState::Free);
+        assert_eq!(inner.slots[0].fence.num_fences, 1);
+        assert_eq!(inner.slots[0].fence.fences[0].id, 3);
+        assert_eq!(inner.slots[0].fence.fences[0].value, 11);
     }
 
     #[test]

@@ -7163,3 +7163,22 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: `NintendoScaleMode` remains `repr(u32)` with values 0 through 4; the new conversion does not
   alter its representation. `OperationType` discriminants and native errno values are unchanged.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_ipc.rs` vs Eden `src/core/hle/kernel/svc/svc_ipc.cpp`, `k_client_session.cpp`, and `k_server_session.{h,cpp}`
+
+### Intentional differences
+- Ruzu retains an inline HLE dispatch fallback for ownerless test fixtures. Eden always queues the
+  request through `KClientSession` and waits for the owning server thread.
+
+### Unintentional differences (to fix)
+- The inline fallback converted enqueue and receive failures to `ResultInvalidHandle`. Both phases
+  now preserve the original Kernel result, matching Eden's `R_RETURN` chain from
+  `KServerSession::OnRequest` through `KClientSession::SendSyncRequest` and `SendSyncRequestImpl`.
+
+### Missing items
+- None for result propagation on the inline request path. A focused regression test verifies that
+  a closed session returns Kernel `ResultSessionClosed` rather than `ResultInvalidHandle`.
+
+### Binary layout verification
+- N/A: this change only preserves a 32-bit result code already produced by the session layer; no
+  IPC payload or raw-memory structure changes.

@@ -725,7 +725,7 @@ fn send_sync_request_impl(
                 server_session.enqueue_inline_request_hle(Arc::clone(&request))
             };
             if let Err(code) = enqueue_result {
-                return RESULT_INVALID_HANDLE;
+                return ResultCode::new(code);
             }
             let mut waited_us: u64 = 0;
             loop {
@@ -773,7 +773,7 @@ fn send_sync_request_impl(
                         session_handle, parent_id, code
                     );
                 }
-                return RESULT_INVALID_HANDLE;
+                return ResultCode::new(code);
             }
         }
     };
@@ -1591,6 +1591,43 @@ mod tests {
             RESULT_SUCCESS.get_inner_value()
         );
         assert_eq!(read_test_32(&system, tls_base + 0x20), 0x8000);
+    }
+
+    #[test]
+    fn send_sync_request_inline_propagates_session_closed() {
+        let system = test_system();
+        let tls_base = get_tls_base(&system);
+        let current_thread = system
+            .current_process_arc()
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(1)
+            .unwrap();
+        let mut request_context = HLERequestContext::new_with_thread(current_thread, tls_base);
+        request_context.set_service_manager(system.service_manager().unwrap());
+        let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
+        let lm_handle = request_context
+            .create_session_for_service(lm_handler)
+            .unwrap();
+
+        {
+            let process = system.current_process_arc();
+            let process = process.lock().unwrap();
+            let client_session_object_id = process.handle_table.get_object(lm_handle).unwrap();
+            let client_session = process
+                .get_client_session_by_object_id(client_session_object_id)
+                .unwrap();
+            let parent_id = client_session.lock().unwrap().get_parent_id().unwrap();
+            let parent_session = process.get_session_by_object_id(parent_id).unwrap();
+            let server_session = parent_session.lock().unwrap().get_server_session().clone();
+            server_session.lock().unwrap().client_closed = true;
+        }
+
+        write_control_query_pointer_buffer_size_request(&system);
+        assert_eq!(
+            send_sync_request(&system, lm_handle),
+            crate::hle::kernel::svc::svc_results::RESULT_SESSION_CLOSED
+        );
     }
 
     #[test]

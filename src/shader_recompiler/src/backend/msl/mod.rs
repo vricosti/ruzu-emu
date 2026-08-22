@@ -9,8 +9,12 @@
 //! renderer never has to recover resource metadata from generated source.
 
 pub mod emit_msl;
+mod emit_msl_bitwise_conversion;
+mod emit_msl_convert;
 mod emit_msl_floating_point;
 mod emit_msl_integer;
+mod emit_msl_logical;
+mod emit_msl_select;
 pub mod msl_emit_context;
 
 use std::num::NonZeroU32;

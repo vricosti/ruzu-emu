@@ -26,6 +26,7 @@ pub struct MslEmitContext {
     returns_output: bool,
     uses_no_contraction_add: bool,
     uses_no_contraction_mul: bool,
+    uses_no_contraction_fma: bool,
     language_version: MslVersion,
     execution: MslExecutionInfo,
 }
@@ -83,6 +84,7 @@ impl MslEmitContext {
             returns_output,
             uses_no_contraction_add: false,
             uses_no_contraction_mul: false,
+            uses_no_contraction_fma: false,
             language_version: options.language_version,
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
@@ -148,6 +150,10 @@ impl MslEmitContext {
         }
     }
 
+    pub fn is_defined(&self, inst_ref: InstRef) -> bool {
+        self.definitions.contains_key(&inst_ref)
+    }
+
     pub fn define(
         &mut self,
         inst_ref: InstRef,
@@ -207,6 +213,20 @@ impl MslEmitContext {
             format!("({lhs}) {operator} ({rhs})")
         };
         self.define(inst_ref, ty, expression, false)
+    }
+
+    pub fn emit_fma_32(&mut self, inst_ref: InstRef, inst: &Inst) -> Result<(), MslError> {
+        let a = self.value_expression(inst.arg(0), inst_ref, 0)?;
+        let b = self.value_expression(inst.arg(1), inst_ref, 1)?;
+        let c = self.value_expression(inst.arg(2), inst_ref, 2)?;
+        let control = crate::ir::types::FpControl::from_u32(inst.flags);
+        let expression = if control.no_contraction {
+            self.uses_no_contraction_fma = true;
+            format!("spvFma({a}, {b}, {c})")
+        } else {
+            format!("fma({a}, {b}, {c})")
+        };
+        self.define(inst_ref, Type::F32, expression, false)
     }
 
     pub fn emit_identity(
@@ -273,6 +293,14 @@ impl MslEmitContext {
                 "template<typename T>\n",
                 "[[clang::optnone]] T spvFMul(T lhs, T rhs) {\n",
                 "    return fma(lhs, rhs, T(0));\n",
+                "}\n\n",
+            ));
+        }
+        if self.uses_no_contraction_fma {
+            source.push_str(concat!(
+                "template<typename T>\n",
+                "[[clang::optnone]] T spvFma(T a, T b, T c) {\n",
+                "    return fma(a, b, c);\n",
                 "}\n\n",
             ));
         }

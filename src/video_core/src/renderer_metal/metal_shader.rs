@@ -710,6 +710,7 @@ pub fn validate_direct_msl_against_active_module(
 mod tests {
     use shader_recompiler::backend::emit_spirv;
     use shader_recompiler::ir::basic_block::Block;
+    use shader_recompiler::ir::emitter::Emitter;
     use shader_recompiler::ir::opcodes::Opcode;
     use shader_recompiler::ir::types::FpControl;
     use shader_recompiler::ir::value::{InstRef, Value};
@@ -897,6 +898,93 @@ mod tests {
             .source()
             .source
             .contains("[[clang::optnone]] T spvFAdd"));
+    }
+
+    #[test]
+    fn compiles_direct_msl_scalar_opcode_families_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = empty_program(Stage::VertexB);
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let add = emitter.iadd_32(Value::ImmU32(u32::MAX), Value::ImmU32(1));
+            emitter.get_zero_from_op(add);
+            emitter.get_sign_from_op(add);
+            emitter.get_carry_from_op(add);
+            emitter.get_overflow_from_op(add);
+        }
+        let block = &mut program.blocks[0];
+        block.append_new_inst(
+            Opcode::ShiftRightArithmetic32,
+            vec![Value::ImmU32(0x8000_0000), Value::ImmU32(4)],
+        );
+        block.append_new_inst(
+            Opcode::SMin32,
+            vec![Value::ImmU32(u32::MAX), Value::ImmU32(1)],
+        );
+        block.append_new_inst(
+            Opcode::SClamp32,
+            vec![
+                Value::ImmU32(u32::MAX),
+                Value::ImmU32(0xFFFF_FFF0),
+                Value::ImmU32(1),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::LogicalXor,
+            vec![Value::ImmU1(true), Value::ImmU1(false)],
+        );
+        block.append_new_inst(
+            Opcode::SelectF32,
+            vec![Value::ImmU1(true), Value::ImmF32(-1.0), Value::ImmF32(1.0)],
+        );
+        block.append_new_inst(Opcode::BitCastF32U32, vec![Value::ImmU32(0x3F80_0000)]);
+        block.append_new_inst(Opcode::FPAbs32, vec![Value::ImmF32(-1.0)]);
+        let fma = block.append_new_inst(
+            Opcode::FPFma32,
+            vec![Value::ImmF32(2.0), Value::ImmF32(3.0), Value::ImmF32(4.0)],
+        );
+        block.inst_mut(fma).flags = FpControl {
+            no_contraction: true,
+            ..Default::default()
+        }
+        .to_u32();
+        block.append_new_inst(
+            Opcode::FPClamp32,
+            vec![Value::ImmF32(2.0), Value::ImmF32(0.0), Value::ImmF32(1.0)],
+        );
+        block.append_new_inst(Opcode::FPRoundEven32, vec![Value::ImmF32(1.5)]);
+        block.append_new_inst(Opcode::FPRecipSqrt32, vec![Value::ImmF32(4.0)]);
+        block.append_new_inst(
+            Opcode::FPOrdNotEqual32,
+            vec![Value::ImmF32(f32::NAN), Value::ImmF32(1.0)],
+        );
+        block.append_new_inst(
+            Opcode::FPUnordEqual32,
+            vec![Value::ImmF32(f32::NAN), Value::ImmF32(1.0)],
+        );
+        block.append_new_inst(Opcode::ConvertS32F32, vec![Value::ImmF32(-2.0)]);
+        block.append_new_inst(Opcode::ConvertF32S32, vec![Value::ImmU32(0xFFFF_FFFE)]);
+
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+            },
+        )
+        .expect("scalar IR must lower directly to MSL");
+        assert!(artifact
+            .source
+            .source
+            .contains("[[clang::optnone]] T spvFma"));
+        assert!(artifact.source.source.contains("spvFma("));
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct scalar MSL must compile as a native Metal function");
+
+        assert_eq!(shader.source().stage, Stage::VertexB);
+        assert_eq!(shader.function().name().to_string(), "main0");
     }
 
     #[test]

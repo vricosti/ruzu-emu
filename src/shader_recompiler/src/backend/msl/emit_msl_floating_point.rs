@@ -42,3 +42,99 @@ pub fn emit_fp_mul_32(
 ) -> Result<(), MslError> {
     emit_binary(context, program, inst_ref, inst, "*")
 }
+
+pub fn emit_fp_fma_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    context.emit_fma_32(inst_ref, inst)
+}
+
+pub fn emit_binary_operator_32(
+    context: &mut MslEmitContext,
+    program: &crate::ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    operator: &'static str,
+) -> Result<(), MslError> {
+    emit_binary(context, program, inst_ref, inst, operator)
+}
+
+pub fn emit_unary_operator_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    operator: &'static str,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(inst_ref, Type::F32, format!("{operator}({value})"), false)
+}
+
+pub fn emit_intrinsic_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    intrinsic: &'static str,
+) -> Result<(), MslError> {
+    let arguments = (0..inst.num_args())
+        .map(|arg| context.value_expression(inst.arg(arg), inst_ref, arg as u32))
+        .collect::<Result<Vec<_>, _>>()?;
+    context.define(
+        inst_ref,
+        Type::F32,
+        format!("{intrinsic}({})", arguments.join(", ")),
+        false,
+    )
+}
+
+pub fn emit_recip_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(inst_ref, Type::F32, format!("1.0f / ({value})"), false)
+}
+
+pub fn emit_ordered_comparison_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    operator: &'static str,
+) -> Result<(), MslError> {
+    let lhs = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let rhs = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let comparison = format!("({lhs}) {operator} ({rhs})");
+    let expression = if operator == "!=" {
+        format!("!isnan({lhs}) && !isnan({rhs}) && ({comparison})")
+    } else {
+        comparison
+    };
+    context.define(inst_ref, Type::U1, expression, false)
+}
+
+pub fn emit_unordered_comparison_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    operator: &'static str,
+) -> Result<(), MslError> {
+    let lhs = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let rhs = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let expression = if operator == "!=" {
+        format!("({lhs}) != ({rhs})")
+    } else {
+        format!("isnan({lhs}) || isnan({rhs}) || (({lhs}) {operator} ({rhs}))")
+    };
+    context.define(inst_ref, Type::U1, expression, false)
+}
+
+pub fn emit_is_nan_32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(inst_ref, Type::U1, format!("isnan({value})"), false)
+}

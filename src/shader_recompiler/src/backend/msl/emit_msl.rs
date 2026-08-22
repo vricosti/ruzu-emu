@@ -13,8 +13,12 @@ use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
+use super::emit_msl_bitwise_conversion;
+use super::emit_msl_convert;
 use super::emit_msl_floating_point;
 use super::emit_msl_integer;
+use super::emit_msl_logical;
+use super::emit_msl_select;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
 
@@ -170,14 +174,191 @@ fn emit_inst(
     let inst = program.block(inst_ref.block).inst(inst_ref.inst);
     match inst.opcode {
         Opcode::Void | Opcode::Prologue | Opcode::Epilogue => Ok(()),
+        Opcode::GetZeroFromOp
+        | Opcode::GetSignFromOp
+        | Opcode::GetCarryFromOp
+        | Opcode::GetOverflowFromOp
+            if context.is_defined(inst_ref) =>
+        {
+            Ok(())
+        }
         Opcode::Identity => context.emit_identity(program, inst_ref, inst),
+        Opcode::SelectU1 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U1),
+        Opcode::SelectU32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U32),
+        Opcode::SelectF32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::F32),
+        Opcode::BitCastU32F32 => emit_msl_bitwise_conversion::emit_bitcast(
+            context,
+            inst_ref,
+            inst,
+            ir::Type::U32,
+            "uint",
+        ),
+        Opcode::BitCastF32U32 => emit_msl_bitwise_conversion::emit_bitcast(
+            context,
+            inst_ref,
+            inst,
+            ir::Type::F32,
+            "float",
+        ),
+        Opcode::LogicalOr => emit_msl_logical::emit_binary(context, inst_ref, inst, "||"),
+        Opcode::LogicalAnd => emit_msl_logical::emit_binary(context, inst_ref, inst, "&&"),
+        Opcode::LogicalXor => emit_msl_logical::emit_binary(context, inst_ref, inst, "!="),
+        Opcode::LogicalNot => emit_msl_logical::emit_not(context, inst_ref, inst),
         Opcode::IAdd32 => emit_msl_integer::emit_iadd_32(context, program, inst_ref, inst),
+        Opcode::ISub32 => emit_msl_integer::emit_isub_32(context, program, inst_ref, inst),
+        Opcode::IMul32 => emit_msl_integer::emit_imul_32(context, program, inst_ref, inst),
+        Opcode::SDiv32 => emit_msl_integer::emit_sdiv_32(context, inst_ref, inst),
+        Opcode::UDiv32 => emit_msl_integer::emit_udiv_32(context, program, inst_ref, inst),
+        Opcode::INeg32 => emit_msl_integer::emit_ineg_32(context, inst_ref, inst),
+        Opcode::IAbs32 => emit_msl_integer::emit_iabs_32(context, inst_ref, inst),
+        Opcode::ShiftLeftLogical32 => {
+            emit_msl_integer::emit_binary(context, program, inst_ref, inst, "<<")
+        }
+        Opcode::ShiftRightLogical32 => {
+            emit_msl_integer::emit_binary(context, program, inst_ref, inst, ">>")
+        }
+        Opcode::ShiftRightArithmetic32 => {
+            emit_msl_integer::emit_shift_right_arithmetic_32(context, inst_ref, inst)
+        }
+        Opcode::BitwiseAnd32 => {
+            emit_msl_integer::emit_bitwise_with_flags(context, program, inst_ref, inst, "&")
+        }
+        Opcode::BitwiseOr32 => {
+            emit_msl_integer::emit_bitwise_with_flags(context, program, inst_ref, inst, "|")
+        }
+        Opcode::BitwiseXor32 => {
+            emit_msl_integer::emit_bitwise_with_flags(context, program, inst_ref, inst, "^")
+        }
+        Opcode::BitwiseNot32 => emit_msl_integer::emit_not_32(context, inst_ref, inst),
+        Opcode::SMin32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "min", true),
+        Opcode::UMin32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "min", false),
+        Opcode::SMax32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "max", true),
+        Opcode::UMax32 => emit_msl_integer::emit_min_max(context, inst_ref, inst, "max", false),
+        Opcode::SClamp32 => emit_msl_integer::emit_clamp(context, inst_ref, inst, true),
+        Opcode::UClamp32 => emit_msl_integer::emit_clamp(context, inst_ref, inst, false),
+        Opcode::IEqual => emit_msl_integer::emit_comparison(context, inst_ref, inst, "==", false),
+        Opcode::INotEqual => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, "!=", false)
+        }
+        Opcode::SLessThan => emit_msl_integer::emit_comparison(context, inst_ref, inst, "<", true),
+        Opcode::ULessThan => emit_msl_integer::emit_comparison(context, inst_ref, inst, "<", false),
+        Opcode::SLessThanEqual => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, "<=", true)
+        }
+        Opcode::ULessThanEqual => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, "<=", false)
+        }
+        Opcode::SGreaterThan => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, ">", true)
+        }
+        Opcode::UGreaterThan => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, ">", false)
+        }
+        Opcode::SGreaterThanEqual => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, ">=", true)
+        }
+        Opcode::UGreaterThanEqual => {
+            emit_msl_integer::emit_comparison(context, inst_ref, inst, ">=", false)
+        }
         Opcode::FPAdd32 => {
             emit_msl_floating_point::emit_fp_add_32(context, program, inst_ref, inst)
+        }
+        Opcode::FPSub32 => {
+            emit_msl_floating_point::emit_binary_operator_32(context, program, inst_ref, inst, "-")
         }
         Opcode::FPMul32 => {
             emit_msl_floating_point::emit_fp_mul_32(context, program, inst_ref, inst)
         }
+        Opcode::FPDiv32 => {
+            emit_msl_floating_point::emit_binary_operator_32(context, program, inst_ref, inst, "/")
+        }
+        Opcode::FPFma32 => emit_msl_floating_point::emit_fp_fma_32(context, inst_ref, inst),
+        Opcode::FPNeg32 => {
+            emit_msl_floating_point::emit_unary_operator_32(context, inst_ref, inst, "-")
+        }
+        Opcode::FPAbs32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "fabs")
+        }
+        Opcode::FPSaturate32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "saturate")
+        }
+        Opcode::FPClamp32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "clamp")
+        }
+        Opcode::FPMin32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "min")
+        }
+        Opcode::FPMax32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "max")
+        }
+        Opcode::FPRoundEven32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "rint")
+        }
+        Opcode::FPFloor32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "floor")
+        }
+        Opcode::FPCeil32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "ceil")
+        }
+        Opcode::FPTrunc32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "trunc")
+        }
+        Opcode::FPRecip32 => emit_msl_floating_point::emit_recip_32(context, inst_ref, inst),
+        Opcode::FPRecipSqrt32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "rsqrt")
+        }
+        Opcode::FPSqrt32 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "sqrt")
+        }
+        Opcode::FPSin => emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "sin"),
+        Opcode::FPCos => emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "cos"),
+        Opcode::FPExp2 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "exp2")
+        }
+        Opcode::FPLog2 => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "log2")
+        }
+        Opcode::FPOrdEqual32 => {
+            emit_msl_floating_point::emit_ordered_comparison_32(context, inst_ref, inst, "==")
+        }
+        Opcode::FPOrdNotEqual32 => {
+            emit_msl_floating_point::emit_ordered_comparison_32(context, inst_ref, inst, "!=")
+        }
+        Opcode::FPOrdLessThan32 => {
+            emit_msl_floating_point::emit_ordered_comparison_32(context, inst_ref, inst, "<")
+        }
+        Opcode::FPOrdGreaterThan32 => {
+            emit_msl_floating_point::emit_ordered_comparison_32(context, inst_ref, inst, ">")
+        }
+        Opcode::FPOrdLessThanEqual32 => {
+            emit_msl_floating_point::emit_ordered_comparison_32(context, inst_ref, inst, "<=")
+        }
+        Opcode::FPOrdGreaterThanEqual32 => {
+            emit_msl_floating_point::emit_ordered_comparison_32(context, inst_ref, inst, ">=")
+        }
+        Opcode::FPUnordEqual32 => {
+            emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, "==")
+        }
+        Opcode::FPUnordNotEqual32 => {
+            emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, "!=")
+        }
+        Opcode::FPUnordLessThan32 => {
+            emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, "<")
+        }
+        Opcode::FPUnordGreaterThan32 => {
+            emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, ">")
+        }
+        Opcode::FPUnordLessThanEqual32 => {
+            emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, "<=")
+        }
+        Opcode::FPUnordGreaterThanEqual32 => {
+            emit_msl_floating_point::emit_unordered_comparison_32(context, inst_ref, inst, ">=")
+        }
+        Opcode::FPIsNan32 => emit_msl_floating_point::emit_is_nan_32(context, inst_ref, inst),
+        Opcode::ConvertS32F32 => emit_msl_convert::emit_convert_s32_f32(context, inst_ref, inst),
+        Opcode::ConvertU32F32 => emit_msl_convert::emit_convert_u32_f32(context, inst_ref, inst),
+        Opcode::ConvertF32S32 => emit_msl_convert::emit_convert_f32_s32(context, inst_ref, inst),
+        Opcode::ConvertF32U32 => emit_msl_convert::emit_convert_f32_u32(context, inst_ref, inst),
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -277,6 +458,7 @@ pub fn emit_msl_with_options(
 #[cfg(test)]
 mod tests {
     use crate::ir::basic_block::Block;
+    use crate::ir::emitter::Emitter;
     use crate::ir::opcodes::Opcode;
     use crate::ir::value::Value;
     use crate::profile::Profile;
@@ -350,14 +532,14 @@ mod tests {
     #[test]
     fn rejects_unported_ir_instead_of_emitting_a_fallback() {
         let mut program = empty_program(Stage::Fragment);
-        program.blocks[0].append_new_inst(Opcode::FPCos, vec![Value::ImmF32(1.0)]);
+        program.blocks[0].append_new_inst(Opcode::IAdd64, vec![Value::ImmU32(1), Value::ImmU32(2)]);
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
             Err(MslError::UnsupportedOpcode {
                 block: 0,
                 inst: 0,
-                opcode: Opcode::FPCos,
+                opcode: Opcode::IAdd64,
             })
         );
     }
@@ -429,6 +611,104 @@ mod tests {
             .source
             .contains("[[clang::optnone]] T spvFAdd"));
         assert_eq!(integer, 0);
+    }
+
+    #[test]
+    fn emits_iadd_flags_before_visiting_associated_pseudos() {
+        let mut program = empty_program(Stage::VertexB);
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let add = emitter.iadd_32(Value::ImmU32(u32::MAX), Value::ImmU32(1));
+            emitter.get_zero_from_op(add);
+            emitter.get_sign_from_op(add);
+            emitter.get_carry_from_op(add);
+            emitter.get_overflow_from_op(add);
+        }
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint v_0_0 = (0xFFFFFFFFu) + (0x00000001u);"));
+        assert!(source.contains("bool v_0_1 = (v_0_0) == 0u;"));
+        assert!(source.contains("bool v_0_2 = as_type<int>(v_0_0) < 0;"));
+        assert!(source.contains("bool v_0_3 = (v_0_0) < (0xFFFFFFFFu);"));
+        assert!(source.contains(
+            "bool v_0_4 = (as_type<int>(0xFFFFFFFFu) >= 0) ? (as_type<int>(0x00000001u) > as_type<int>(0x7FFFFFFFu - (0xFFFFFFFFu)))"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_pseudo_without_a_parent_definition() {
+        let mut program = empty_program(Stage::VertexB);
+        program.blocks[0].append_new_inst(Opcode::GetZeroFromOp, vec![Value::ImmU32(0)]);
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedOpcode {
+                block: 0,
+                inst: 0,
+                opcode: Opcode::GetZeroFromOp,
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_ordered_and_unordered_nan_comparison_semantics() {
+        let mut program = empty_program(Stage::Fragment);
+        program.blocks[0].append_new_inst(
+            Opcode::FPOrdNotEqual32,
+            vec![Value::ImmF32(f32::NAN), Value::ImmF32(1.0)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::FPUnordEqual32,
+            vec![Value::ImmF32(f32::NAN), Value::ImmF32(1.0)],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains(
+            "!isnan(as_type<float>(0x7FC00000u)) && !isnan(as_type<float>(0x3F800000u))"
+        ));
+        assert!(source
+            .contains("isnan(as_type<float>(0x7FC00000u)) || isnan(as_type<float>(0x3F800000u))"));
+    }
+
+    #[test]
+    fn emits_signed_comparisons_bitcasts_selects_and_scalar_conversions() {
+        let mut program = empty_program(Stage::VertexB);
+        let signed_less = program.blocks[0].append_new_inst(
+            Opcode::SLessThan,
+            vec![Value::ImmU32(0xFFFF_FFFF), Value::ImmU32(1)],
+        );
+        let selected = program.blocks[0].append_new_inst(
+            Opcode::SelectU32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: signed_less,
+                }),
+                Value::ImmU32(7),
+                Value::ImmU32(9),
+            ],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::BitCastF32U32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: selected,
+            })],
+        );
+        program.blocks[0].append_new_inst(Opcode::ConvertS32F32, vec![Value::ImmF32(-2.0)]);
+        program.blocks[0].append_new_inst(Opcode::ConvertF32S32, vec![Value::ImmU32(0xFFFF_FFFE)]);
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(
+            source.contains("bool v_0_0 = as_type<int>(0xFFFFFFFFu) < as_type<int>(0x00000001u);")
+        );
+        assert!(source.contains("uint v_0_1 = (v_0_0) ? (0x00000007u) : (0x00000009u);"));
+        assert!(source.contains("float v_0_2 = as_type<float>(v_0_1);"));
+        assert!(source.contains("uint v_0_3 = as_type<uint>(int(as_type<float>(0xC0000000u)));"));
+        assert!(source.contains("float v_0_4 = float(as_type<int>(0xFFFFFFFEu));"));
     }
 
     #[test]

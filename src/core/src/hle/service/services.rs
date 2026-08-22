@@ -54,8 +54,6 @@ impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService 
         let is_domain = ctx
             .get_manager()
             .map_or(false, |m| m.lock().unwrap().is_domain());
-        let has_domain_header = ctx.has_domain_message_header();
-
         log::warn!(
             "GenericStubService({}): unhandled command {}, domain={}, returning success",
             self.name,
@@ -68,7 +66,6 @@ impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService 
         // but the "Create*Service" pattern is typically cmd 0 on the initial service.
         // For safety, push a stub domain object on the initial domain "SendMessage"
         // to cmd 0, which is the most common pattern.
-        let cmd = ctx.get_command();
         // Commands that return sub-services (Out<SharedPointer<T>>) need a
         // domain object (in domain mode) or a move handle (in non-domain mode).
         // The "Create*Service" pattern is typically cmd 0 on the initial service.
@@ -176,10 +173,9 @@ impl Services {
         host_service!("audio", move || {
             Self::loop_process_audio(&sm, system);
         });
-        let sm = service_manager.clone();
         let fsc = filesystem_controller.clone();
         host_service!("FS", move || {
-            Self::loop_process_filesystem(&sm, system, fsc);
+            Self::loop_process_filesystem(system, fsc);
         });
         let sm = service_manager.clone();
         host_service!("jit", move || {
@@ -234,13 +230,11 @@ impl Services {
         guest_service!("account", move || {
             Self::loop_process_account(&sm, system);
         });
-        let sm = service_manager.clone();
         guest_service!("am", move || {
-            crate::hle::service::am::am::loop_process(&sm, system);
+            crate::hle::service::am::am::loop_process(system);
         });
-        let sm = service_manager.clone();
         guest_service!("aoc", move || {
-            crate::hle::service::aoc::addon_content_manager::loop_process(&sm, system);
+            crate::hle::service::aoc::addon_content_manager::loop_process(system);
         });
         guest_service!("apm", move || {
             crate::hle::service::apm::apm::loop_process(system);
@@ -390,7 +384,6 @@ impl Services {
         guest_service!("pcie", move || {
             Self::loop_process_pcie(&sm, system);
         });
-        let sm = service_manager.clone();
         guest_service!("pctl", move || {
             crate::hle::service::pctl::pctl::loop_process(system);
         });
@@ -453,11 +446,10 @@ impl Services {
     }
 
     fn loop_process_filesystem(
-        sm: &Arc<Mutex<ServiceManager>>,
         system: crate::core::SystemRef,
         fsc: Arc<Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
     ) {
-        crate::hle::service::filesystem::filesystem::loop_process(sm, system, fsc);
+        crate::hle::service::filesystem::filesystem::loop_process(system, fsc);
     }
 
     fn loop_process_jit(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {

@@ -7,7 +7,7 @@
 //! IAddOnContentManager service ("aoc:u").
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
@@ -16,7 +16,6 @@ use crate::hle::service::hle_ipc::{
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::hle::service::sm::sm::ServiceManager;
 
 /// IPC command IDs for IAddOnContentManager
 pub mod commands {
@@ -446,7 +445,7 @@ impl IAddOnContentManager {
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+pub fn loop_process(system: crate::core::SystemRef) {
     let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
     {
         let mut server_manager = server_manager.lock().unwrap();

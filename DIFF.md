@@ -7105,3 +7105,25 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: these are host execution-loop signatures and do not define serialized guest data.
+
+## 2026-08-22 — service bootstrap in `services.rs`, `am/am.rs`, `aoc/addon_content_manager.rs`, and `filesystem/filesystem.rs` vs Eden counterparts
+
+### Intentional differences
+- Ruzu passes `SystemRef` and, for FileSystem, the shared Rust `FileSystemController` handle into
+  each service process. Eden reaches the controller through `Core::System&`.
+- The Rust launcher still uses explicit closures/macros for host and guest service processes instead
+  of Eden's tables of `void (*)(Core::System&)` function pointers.
+
+### Unintentional differences (to fix)
+- `GenericStubService` has no Eden counterpart and guesses that command 0 returns a sub-interface.
+  Removing its unused domain-header local and duplicate command read does not resolve that broader
+  service-parity debt; concrete services must replace each remaining use.
+
+### Missing items
+- AM, AOC, and FileSystem no longer accept an unused global `ServiceManager`: like Eden, their
+  `loop_process` entry points create and own a local `ServerManager` from the system context.
+- The unused `ServiceManager` clone before PCTL launch was removed because PCTL already had the
+  upstream-shaped system-only entry point.
+
+### Binary layout verification
+- N/A: this slice changes host service bootstrap signatures and local dispatch variables only.

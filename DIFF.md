@@ -7278,3 +7278,23 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: the method forwards existing `NACP` and virtual-file owners without changing their layout.
   A focused provider test verifies the exact base-then-update request order.
+
+## 2026-08-22 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}`
+
+### Intentional differences
+- The Rust method returns a value-initialized `[u8; 16]` which the handler writes to CMIF as two
+  `u64` values. Eden receives a value-initialized `Out<DisplayVersion>` from CMIF serialization.
+- The bounded copy and fallback are extracted into a file-local helper so their byte-level behavior
+  can be tested without constructing the full emulator system; ownership remains in the matching
+  application-functions file.
+
+### Unintentional differences (to fix)
+- `GetDisplayVersion` previously ignored its service owner and always returned `"1.0.0"`. It now
+  reads the applet program ID and uses `PatchManager::GetMetadataFromBaseOrUpdate`, matching Eden.
+
+### Missing items
+- None for display-version lookup, fallback, bounded copy, final NUL byte, or CMIF output size.
+
+### Binary layout verification
+- PASS: the response remains a deterministic 16-byte `DisplayVersion`; bytes beyond the copied
+  string are zero and byte 15 is always NUL. Focused tests verify the fallback and 16-byte truncation.

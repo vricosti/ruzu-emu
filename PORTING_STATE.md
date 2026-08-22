@@ -14,6 +14,10 @@
 - Prerequisite result: `PatchManager` now owns the upstream-shaped static lookup, retains the
   filesystem controller and content-provider locks across both attempts, and falls back to the
   update title only when the base lookup has no NACP. The AM display-version slice may resume.
+- Resumed result: `IApplicationFunctions::GetDisplayVersion` now reads the applet program ID,
+  requests base/update NACP metadata through `PatchManager`, copies at most 16 version bytes,
+  forces the final byte to NUL, and uses `"1.0.0"` only when metadata is absent.
+- Status: prerequisite and resumed display-version slice completed and re-verified.
 
 ## 2026-08-22 — TimeZoneService warning/parity slice
 

@@ -7511,6 +7511,11 @@ mod tests {
             .map(|inst| inst.class.opcode)
             .collect::<Vec<_>>();
         assert!(emitted.contains(&spirv::Op::FConvert));
+        #[cfg(not(target_os = "android"))]
+        {
+            assert!(emitted.contains(&spirv::Op::IsNan));
+            assert!(emitted.contains(&spirv::Op::Select));
+        }
         assert!(emitted.contains(&spirv::Op::FMul));
         assert!(emitted.contains(&spirv::Op::ExtInst));
         assert!(emitted.contains(&spirv::Op::ConvertFToS));

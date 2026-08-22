@@ -331,13 +331,13 @@ impl<'a> MessageBuffer<'a> {
     }
 
     /// Compute the index of special data fields.
-    pub fn get_special_data_index(spc: &SpecialHeader) -> usize {
+    pub fn get_special_data_index(_hdr: &MessageHeader, spc: &SpecialHeader) -> usize {
         (MessageHeader::DATA_SIZE / 4) + (spc.get_header_size() / 4)
     }
 
     /// Compute the index of pointer descriptors.
     pub fn get_pointer_descriptor_index(hdr: &MessageHeader, spc: &SpecialHeader) -> usize {
-        Self::get_special_data_index(spc) + (spc.get_data_size() / 4)
+        Self::get_special_data_index(hdr, spc) + (spc.get_data_size() / 4)
     }
 
     /// Compute the index of map alias descriptors.
@@ -428,5 +428,41 @@ mod tests {
         assert_eq!(message.get_process_id(4), 0x1122_3344_5566_7788);
         assert_eq!(words[4], 0x5566_7788);
         assert_eq!(words[5], 0x1122_3344);
+    }
+
+    #[test]
+    fn descriptor_indices_follow_upstream_dependency_chain() {
+        let header = MessageHeader::new(
+            5,
+            true,
+            3,
+            1,
+            1,
+            1,
+            5,
+            ReceiveListCountType::ToSingleBuffer as u32,
+        );
+        let special_header = SpecialHeader::new(true, 2, 1);
+
+        assert_eq!(
+            MessageBuffer::get_special_data_index(&header, &special_header),
+            3
+        );
+        assert_eq!(
+            MessageBuffer::get_pointer_descriptor_index(&header, &special_header),
+            8
+        );
+        assert_eq!(
+            MessageBuffer::get_map_alias_descriptor_index(&header, &special_header),
+            14
+        );
+        assert_eq!(
+            MessageBuffer::get_raw_data_index(&header, &special_header),
+            23
+        );
+        assert_eq!(
+            MessageBuffer::get_receive_list_index(&header, &special_header),
+            28
+        );
     }
 }

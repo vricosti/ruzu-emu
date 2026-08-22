@@ -7240,3 +7240,22 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: the removed tuple element was temporary host state and was never serialized.
+
+## 2026-08-22 — `src/core/src/hle/kernel/message_buffer.rs` vs Eden `src/core/hle/kernel/message_buffer.h`
+
+### Intentional differences
+- Rust names the header argument `_hdr` in `get_special_data_index` because, exactly as in Eden's
+  formula, the special-data start depends only on the fixed message-header size and special-header
+  size. Keeping the argument preserves the upstream helper signature without an unused warning.
+
+### Unintentional differences (to fix)
+- Ruzu had removed the header parameter from `get_special_data_index` while retaining it in the
+  downstream index helpers. The parameter and forwarding chain now match Eden again.
+
+### Missing items
+- None for the special-data, pointer, map-alias, raw-data, and receive-list index dependency chain.
+
+### Binary layout verification
+- PASS: the index formula remains `MessageHeader::DATA_SIZE / 4 + spc.header_size / 4`; only the
+  upstream-compatible header forwarding is restored. Existing message-buffer index and IPC copy
+  tests exercise the downstream offsets.

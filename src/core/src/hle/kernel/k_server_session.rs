@@ -906,6 +906,7 @@ impl KServerSession {
 
         let mut message = MessageBuffer::new(dst_words);
         let mut offset = crate::hle::kernel::message_buffer::MessageBuffer::get_special_data_index(
+            &header,
             &special_header,
         );
         if special_header.get_has_process_id() {
@@ -981,6 +982,7 @@ impl KServerSession {
         let src_message = MessageBuffer::new(&mut src_words);
         let mut dst_message = MessageBuffer::new(dst_words);
         let mut offset = crate::hle::kernel::message_buffer::MessageBuffer::get_special_data_index(
+            src_header,
             src_special_header,
         );
 
@@ -1744,6 +1746,7 @@ impl KServerSession {
             let message = MessageBuffer::new(&mut words);
             let mut offset =
                 crate::hle::kernel::message_buffer::MessageBuffer::get_special_data_index(
+                    &header,
                     &special_header,
                 );
             if special_header.get_has_process_id() {

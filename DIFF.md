@@ -6877,3 +6877,27 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: `TouchState` is 0x28 bytes, `AutoPilotState` is 0x288 bytes, and
   `TouchScreenConfigurationForNx` is 0x10 bytes. Focused tests also cover the exact command IDs,
   active-handler set, and touch/gesture restart-then-stop lifecycle.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/power_state_service.rs` vs Eden `src/core/hle/service/psc/time/power_state_service.{h,cpp}`
+
+### Intentional differences
+- Eden's `Core::System&` belongs to the `ServiceFramework` base, not to
+  `IPowerStateRequestHandler` itself. Ruzu's framework obtains the process/kernel owner from the
+  IPC context when the shared service `Event` lazily materializes its readable copy handle, so the
+  duplicate concrete-service `SystemRef` field and constructor parameter were removed.
+- `Arc<PowerStateRequestManager>` preserves Eden's borrowed manager lifetime. The manager-owned
+  `Event` caches its own kernel bridge, replacing the extra service-local readable-event cache.
+- Eden leaves `out_priority` at its value-initialized zero when no request was cleared. The manual
+  Rust IPC adapter writes that zero explicitly.
+
+### Unintentional differences (to fix)
+- Dynamic `time:p` registration remains part of the already-recorded missing `SetupSAndP` work in
+  `service_manager.rs`; no additional behavior difference remains inside this service file.
+
+### Missing items
+- None in `IPowerStateRequestHandler`: both commands and their manager delegation are present.
+
+### Binary layout verification
+- N/A: the service exchanges scalar CMIF outputs and a copy handle, with no raw aggregate payload.
+  Focused tests cover the exact handler table and pending/available/clear state transition through
+  the shared manager.

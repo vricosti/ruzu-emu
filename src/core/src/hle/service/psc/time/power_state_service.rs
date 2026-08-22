@@ -1,17 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/psc/time/power_state_service.h
-//! Port of zuyu/src/core/hle/service/psc/time/power_state_service.cpp
+//! Port of Eden src/core/hle/service/psc/time/power_state_service.h/.cpp
 //!
 //! IPowerStateRequestHandler: handles power state requests for "time:p".
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::power_state_request_manager::PowerStateRequestManager;
-use crate::core::SystemRef;
-use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -31,21 +28,16 @@ pub mod commands {
 /// Upstream holds a reference to `PowerStateRequestManager&
 /// m_power_state_request_manager` and delegates all operations to it.
 pub struct PowerStateRequestHandler {
-    system: SystemRef,
     /// Reference to the power state request manager.
     /// Corresponds to `PowerStateRequestManager& m_power_state_request_manager`
     /// in upstream.
     power_state_request_manager: Arc<PowerStateRequestManager>,
-    readable_event: Mutex<Option<Arc<Mutex<KReadableEvent>>>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl PowerStateRequestHandler {
-    pub fn new(
-        system: SystemRef,
-        power_state_request_manager: Arc<PowerStateRequestManager>,
-    ) -> Self {
+    pub fn new(power_state_request_manager: Arc<PowerStateRequestManager>) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_POWER_STATE_REQUEST_EVENT_READABLE_HANDLE,
@@ -59,9 +51,7 @@ impl PowerStateRequestHandler {
             ),
         ]);
         Self {
-            system,
             power_state_request_manager,
-            readable_event: Mutex::new(None),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -72,23 +62,15 @@ impl PowerStateRequestHandler {
     /// Corresponds to `IPowerStateRequestHandler::GetPowerStateRequestEventReadableHandle`
     /// in upstream power_state_service.cpp.
     /// Upstream returns `&m_power_state_request_manager.GetReadableEvent()`.
-    /// We return the event Arc for the caller to hand out as a copy handle.
+    /// The Rust event owner lazily materializes the equivalent copy handle.
     pub fn get_power_state_request_event_readable_handle(
         &self,
         ctx: &HLERequestContext,
     ) -> Option<u32> {
         log::debug!("IPowerStateRequestHandler::GetPowerStateRequestEventReadableHandle called");
-        if let Some(readable_event) = self.readable_event.lock().unwrap().as_ref() {
-            return ctx.copy_handle_for_readable_event(Arc::clone(readable_event));
-        }
-
-        let (handle, readable_event) = ctx.create_readable_event(false)?;
-        let owner_process = ctx.owner_process_arc()?;
         self.power_state_request_manager
             .get_event()
-            .attach_kernel_event(Arc::clone(&readable_event), owner_process);
-        *self.readable_event.lock().unwrap() = Some(readable_event);
-        Some(handle)
+            .copy_handle(ctx)
     }
 
     /// GetAndClearPowerStateRequest (cmd 1).
@@ -162,5 +144,40 @@ impl ServiceFramework for PowerStateRequestHandler {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegates_get_and_clear_to_the_shared_manager() {
+        let manager = Arc::new(PowerStateRequestManager::new());
+        let service = PowerStateRequestHandler::new(Arc::clone(&manager));
+
+        assert_eq!(service.get_and_clear_power_state_request(), (false, 0));
+        manager.update_pending_power_state_request_priority(3);
+        manager.update_pending_power_state_request_priority(8);
+        manager.signal_power_state_request_availability();
+        assert_eq!(service.get_and_clear_power_state_request(), (true, 8));
+        assert_eq!(service.get_and_clear_power_state_request(), (false, 0));
+    }
+
+    #[test]
+    fn command_table_matches_upstream() {
+        let service = PowerStateRequestHandler::new(Arc::new(PowerStateRequestManager::new()));
+        let entries = service
+            .handlers
+            .iter()
+            .map(|(id, info)| (*id, info.name, info.handler_callback.is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [
+                (0, "GetPowerStateRequestEventReadableHandle", true),
+                (1, "GetAndClearPowerStateRequest", true),
+            ]
+        );
     }
 }

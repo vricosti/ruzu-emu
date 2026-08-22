@@ -1095,6 +1095,13 @@ pub struct System {
     /// The kernel core (schedulers, physical cores, kernel objects).
     kernel: Option<KernelCore>,
 
+    /// Remote debugger server for the current application process.
+    /// Upstream owner: `System::Impl::debugger`.
+    debugger: Mutex<Option<crate::debugger::debugger::Debugger>>,
+    /// Rust frontend handoff for upstream's detached `System::Exit()` call from
+    /// the debugger connection thread.
+    debugger_shutdown_requested: Arc<AtomicBool>,
+
     /// Shared HLE service registry.
     service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
 
@@ -1300,6 +1307,8 @@ impl System {
             frontend_applet_holder: FrontendAppletHolder::new(Arc::clone(&hid_core)),
             hid_core,
             kernel: None,
+            debugger: Mutex::new(None),
+            debugger_shutdown_requested: Arc::new(AtomicBool::new(false)),
             telemetry_session: None,
             _network_instance: crate::internal_network::network::NetworkInstance::new(),
             host1x_core: None,
@@ -2128,6 +2137,9 @@ impl System {
 
         self.perf_stats = None;
         self.cpu_manager.shutdown();
+        self.debugger.lock().take();
+        self.debugger_shutdown_requested
+            .store(false, Ordering::Release);
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_services_after_cpu_shutdown();
         }
@@ -2458,6 +2470,55 @@ impl System {
     /// Matches upstream `System::DebuggerEnabled()`.
     pub fn debugger_enabled(&self) -> bool {
         *common::settings::values().use_gdbstub.get_value()
+    }
+
+    /// Initialize the debugger after the application process and CPU/GPU
+    /// runtime exist, matching `System::InitializeDebugger`.
+    pub fn initialize_debugger(&self) {
+        let Some(process) = self.current_process_arc_opt() else {
+            log::error!("Cannot initialize debugger without an application process");
+            return;
+        };
+        self.debugger_shutdown_requested
+            .store(false, Ordering::Release);
+        let port = *common::settings::values().gdbstub_port.get_value();
+        let debugger = crate::debugger::debugger::Debugger::new(
+            process,
+            port,
+            Arc::clone(&self.debugger_shutdown_requested),
+        );
+        if debugger.is_initialized() {
+            *self.debugger.lock() = Some(debugger);
+        }
+    }
+
+    /// Notify and detach the active debugger before process teardown.
+    pub fn detach_debugger(&self) {
+        if let Some(debugger) = self.debugger.lock().as_ref() {
+            debugger.notify_shutdown();
+        }
+    }
+
+    pub fn debugger_shutdown_requested(&self) -> bool {
+        self.debugger_shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub fn notify_debugger_thread_stopped(&self, thread: Arc<KThreadLock>) -> bool {
+        self.debugger
+            .lock()
+            .as_ref()
+            .is_some_and(|debugger| debugger.notify_thread_stopped(thread))
+    }
+
+    pub fn notify_debugger_thread_watchpoint(
+        &self,
+        thread: Arc<KThreadLock>,
+        watchpoint: crate::hle::kernel::k_process::DebugWatchpoint,
+    ) -> bool {
+        self.debugger
+            .lock()
+            .as_ref()
+            .is_some_and(|debugger| debugger.notify_thread_watchpoint(thread, watchpoint))
     }
 
     /// Sets multicore mode. Should be called before initialize().
@@ -2894,8 +2955,7 @@ impl System {
     /// Returns `(total_iterations, total_svc_count)`.
     pub fn run_main_loop(&mut self) -> (u32, u32) {
         use crate::arm::arm_interface::{
-            ArmInterface, HaltReason, KThread as OpaqueKThread,
-            ThreadContext,
+            ArmInterface, HaltReason, KThread as OpaqueKThread, ThreadContext,
         };
         use crate::hle::kernel::physical_core::PhysicalCoreExecutionControl;
 

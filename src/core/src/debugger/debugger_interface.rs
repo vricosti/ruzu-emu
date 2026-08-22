@@ -4,6 +4,11 @@
 //! Port of zuyu/src/core/debugger/debugger_interface.h
 //! Debugger backend and frontend interface traits.
 
+use std::sync::Arc;
+
+use crate::hle::kernel::k_process::DebugWatchpoint;
+use crate::hle::kernel::k_thread::KThreadLock;
+
 /// Actions the debugger can request of the emulation engine.
 ///
 /// Corresponds to upstream `Core::DebuggerAction`.
@@ -47,11 +52,10 @@ pub trait DebuggerBackend {
     fn write_to_client(&mut self, data: &[u8]);
 
     /// Gets the currently active thread when the debugger is stopped.
-    /// Returns an opaque thread identifier.
-    fn get_active_thread(&self) -> u64;
+    fn get_active_thread(&self) -> Option<Arc<KThreadLock>>;
 
     /// Sets the currently active thread when the debugger is stopped.
-    fn set_active_thread(&mut self, thread_id: u64);
+    fn set_active_thread(&mut self, thread: Arc<KThreadLock>);
 }
 
 /// Frontend interface for the debugger (protocol implementation).
@@ -62,7 +66,7 @@ pub trait DebuggerFrontend {
     fn connected(&mut self, backend: &mut dyn DebuggerBackend);
 
     /// Called when emulation has stopped.
-    fn stopped(&mut self, backend: &mut dyn DebuggerBackend, thread_id: u64);
+    fn stopped(&mut self, backend: &mut dyn DebuggerBackend, thread: Arc<KThreadLock>);
 
     /// Called when emulation is shutting down.
     fn shutting_down(&mut self, backend: &mut dyn DebuggerBackend);
@@ -71,9 +75,8 @@ pub trait DebuggerFrontend {
     fn watchpoint(
         &mut self,
         backend: &mut dyn DebuggerBackend,
-        thread_id: u64,
-        watch_addr: u64,
-        watch_type: u8,
+        thread: Arc<KThreadLock>,
+        watch: DebugWatchpoint,
     );
 
     /// Called when new data is asynchronously received on the client socket.

@@ -7708,3 +7708,108 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - PASS: OpenGL pipeline key bytes and their placement after serialized environments are unchanged.
+
+## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
+
+### Intentional differences
+- Rust passes retained `Arc<KThreadLock>` values instead of Eden's non-owning `KThread*`; this keeps
+  the thread alive across the channel from a CPU thread to the debugger connection thread.
+- The backend reference is an explicit argument to frontend callbacks because Rust traits cannot
+  retain the same self-referential backend reference as Eden's `DebuggerFrontend` constructor.
+
+### Unintentional differences (to fix)
+- The former interface represented threads as opaque integers and watchpoints as split primitive
+  fields. It now carries the matching kernel thread and `DebugWatchpoint` owners required by Eden's
+  frontend contract.
+
+### Missing items
+- None in the debugger frontend/backend action and callback interface.
+
+### Binary layout verification
+- N/A: these are host-only Rust traits and retained kernel-object references, not guest payloads.
+
+## 2026-08-22 — `src/core/src/debugger/debugger.rs` vs Eden `src/core/debugger/debugger.{h,cpp}`
+
+### Intentional differences
+- Rust's standard `TcpListener`, `TcpStream`, channel and owned thread replace Boost.Asio's acceptor,
+  socket and asynchronous signal pipe. They retain the same single server thread, 4096-byte reads,
+  replacement of an existing connection, and synchronous frontend callbacks.
+- `Arc<ProcessLock>`/`Arc<KThreadLock>` replace Eden's scoped intrusive kernel-object references.
+  Process locking supplies the matching thread-list lifetime while individual scheduler-aware Rust
+  thread methods perform suspend/resume transitions.
+- A shutdown request is handed to Ruzu's boot controller through an atomic flag instead of spawning
+  a detached call to `System::Exit`; the Rust `System` is owned by that controller thread and cannot
+  safely be mutably exited by the debugger thread.
+- An empty process thread list leaves the active thread unset instead of dereferencing Eden's
+  `threads.front()` precondition. A connected debugger still pauses every thread that exists.
+
+### Unintentional differences (to fix)
+- The previous file contained no server, connection state, process/thread ownership, signal path,
+  pause/resume behavior, or debugger thread lifecycle. Those responsibilities now live in their
+  matching module and execute in Eden's connection/action order.
+
+### Missing items
+- CPU-side step completion, breakpoint notification and watchpoint generation are prerequisites in
+  their own upstream-owned modules; they are recorded in `PORTING_STATE.md` before the GDB command
+  dispatcher is resumed.
+
+### Binary layout verification
+- N/A: the connection and synchronization state is host-only. Socket regression tests verify bind
+  failure, deterministic thread shutdown and real packet routing.
+
+## 2026-08-22 — `src/core/src/core.rs` debugger ownership vs Eden `src/core/core.{h,cpp}`
+
+### Intentional differences
+- Ruzu exposes notification forwarding methods on `System` because its CPU owners cannot borrow the
+  debugger field directly while retaining a kernel thread `Arc`; Eden exposes `GetDebugger()`.
+- The debugger-triggered exit flag is reset explicitly at initialization and after debugger
+  destruction because it replaces Eden's detached `System::Exit()` call.
+
+### Unintentional differences (to fix)
+- `System` previously had no debugger owner. It now initializes the configured server, forwards
+  thread notifications, sends shutdown before teardown, and destroys the debugger immediately after
+  CPU-manager shutdown and before kernel shutdown, matching Eden's lifecycle ordering.
+
+### Missing items
+- None in `System`'s debugger ownership and initialization/detachment lifecycle.
+
+### Binary layout verification
+- N/A: the new members are host runtime state and do not alter any raw guest structure.
+
+## 2026-08-22 — `src/ruzu/src/boot.rs` debugger lifecycle vs Eden `src/qt_common/render/emu_thread.cpp`
+
+### Intentional differences
+- Ruzu's non-Qt boot controller polls the atomic debugger shutdown request in its existing command
+  loop; Eden's GDB backend invokes `System::Exit()` from a detached thread.
+
+### Unintentional differences (to fix)
+- The frontend previously ignored `use_gdbstub`. It now initializes the debugger after GPU/CPU
+  readiness, observes debugger-requested exit, and detaches it before pausing and shutting down the
+  application process in the same lifecycle positions as Eden.
+
+### Missing items
+- None in the frontend-owned debugger initialization and detachment slice.
+
+### Binary layout verification
+- N/A: this is frontend control flow only.
+
+## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` connection callback slice vs Eden `src/core/debugger/gdbstub.{h,cpp}`
+
+### Intentional differences
+- Rust returns explicit packet-completeness booleans from `process_data` so split TCP frames remain
+  buffered without the recursive asynchronous-read structure used by Boost.Asio.
+
+### Unintentional differences (to fix)
+- Stop and watchpoint callbacks previously fabricated a default register context and only logged
+  the reply. They now read the retained active thread and send the matching remote status packet.
+- Packet acknowledgement, checksum rejection, escaping, replies and the initial supported-feature
+  negotiation now use the live backend instead of remaining inert helpers.
+
+### Missing items
+- The complete register, memory, thread, query, breakpoint/watchpoint and `vCont` dispatcher remains
+  interrupted behind the CPU stop/step and Dynarmic watchpoint prerequisites recorded in
+  `PORTING_STATE.md`.
+
+### Binary layout verification
+- N/A for this framing slice; register byte order and architecture-specific XML remain owned by
+  `gdbstub_arch.rs` and will be verified with the resumed command dispatcher.

@@ -5,10 +5,12 @@
 //! GDB stub for remote debugging.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::debugger::debugger_interface::{DebuggerAction, DebuggerBackend, DebuggerFrontend};
 use crate::debugger::gdbstub_arch::{GdbStubA32, GdbStubA64, GdbStubArch};
-use crate::hle::kernel::k_thread::ThreadContext;
+use crate::hle::kernel::k_process::{DebugWatchpoint, DebugWatchpointType, ProcessLock};
+use crate::hle::kernel::k_thread::KThreadLock;
 
 // GDB protocol constants (matching upstream)
 const GDB_STUB_START: u8 = b'$';
@@ -26,18 +28,20 @@ const GDB_STUB_REPLY_EMPTY: &str = "";
 ///
 /// Corresponds to upstream `Core::GDBStub`.
 pub struct GdbStub {
+    debug_process: Arc<ProcessLock>,
     arch: Box<dyn GdbStubArch>,
     current_command: Vec<u8>,
     replaced_instructions: BTreeMap<u64, u32>,
+    pub(crate) resume_threads: Vec<Arc<KThreadLock>>,
     no_ack: bool,
-    is_64bit: bool,
 }
 
 impl GdbStub {
     /// Create a new GDB stub.
     ///
     /// Corresponds to upstream `GDBStub::GDBStub`.
-    pub fn new(is_64bit: bool) -> Self {
+    pub fn new(debug_process: Arc<ProcessLock>) -> Self {
+        let is_64bit = debug_process.lock().unwrap().is_64bit();
         let arch: Box<dyn GdbStubArch> = if is_64bit {
             Box::new(GdbStubA64)
         } else {
@@ -45,11 +49,12 @@ impl GdbStub {
         };
 
         Self {
+            debug_process,
             arch,
             current_command: Vec::new(),
             replaced_instructions: BTreeMap::new(),
+            resume_threads: Vec::new(),
             no_ack: false,
-            is_64bit,
         }
     }
 }
@@ -59,13 +64,14 @@ impl DebuggerFrontend for GdbStub {
         // Nothing to do on connection
     }
 
-    fn stopped(&mut self, _backend: &mut dyn DebuggerBackend, thread_id: u64) {
-        // Upstream: SendReply(arch->ThreadStatus(thread, GDB_STUB_SIGTRAP));
-        // Without a system reference we cannot look up the thread's context here.
-        // The reply will be generated when the backend provides thread context.
-        let ctx = ThreadContext::default();
-        let reply = self.arch.thread_status(&ctx, thread_id, GDB_STUB_SIGTRAP);
-        log::debug!("GDB stopped reply: {}", reply);
+    fn stopped(&mut self, backend: &mut dyn DebuggerBackend, thread: Arc<KThreadLock>) {
+        let thread = thread.lock().unwrap();
+        let reply = self.arch.thread_status(
+            &thread.thread_context,
+            thread.get_thread_id(),
+            GDB_STUB_SIGTRAP,
+        );
+        self.send_reply(backend, &reply);
     }
 
     fn shutting_down(&mut self, _backend: &mut dyn DebuggerBackend) {
@@ -74,28 +80,39 @@ impl DebuggerFrontend for GdbStub {
 
     fn watchpoint(
         &mut self,
-        _backend: &mut dyn DebuggerBackend,
-        thread_id: u64,
-        _watch_addr: u64,
-        watch_type: u8,
+        backend: &mut dyn DebuggerBackend,
+        thread: Arc<KThreadLock>,
+        watch: DebugWatchpoint,
     ) {
-        // Upstream sends a stop reply with watchpoint details.
-        // watch_type: 2=write, 3=read, 4=access
-        let ctx = ThreadContext::default();
-        let reply = self.arch.thread_status(&ctx, thread_id, GDB_STUB_SIGTRAP);
-        log::debug!("GDB watchpoint reply (type {}): {}", watch_type, reply);
+        let thread = thread.lock().unwrap();
+        let status = self.arch.thread_status(
+            &thread.thread_context,
+            thread.get_thread_id(),
+            GDB_STUB_SIGTRAP,
+        );
+        let kind = match DebugWatchpointType::from_bits_truncate(watch.type_) {
+            DebugWatchpointType::READ => "rwatch",
+            DebugWatchpointType::WRITE => "watch",
+            _ => "awatch",
+        };
+        self.send_reply(
+            backend,
+            &format!("{}{}:{:x};", status, kind, watch.start_address.get()),
+        );
     }
 
     fn client_data(
         &mut self,
-        _backend: &mut dyn DebuggerBackend,
+        backend: &mut dyn DebuggerBackend,
         data: &[u8],
     ) -> Vec<DebuggerAction> {
         let mut actions = Vec::new();
         self.current_command.extend_from_slice(data);
 
         while !self.current_command.is_empty() {
-            self.process_data(&mut actions);
+            if !self.process_data(backend, &mut actions) {
+                break;
+            }
         }
 
         actions
@@ -106,9 +123,13 @@ impl GdbStub {
     /// Process incoming data and generate debugger actions.
     ///
     /// Corresponds to upstream `GDBStub::ProcessData`.
-    fn process_data(&mut self, actions: &mut Vec<DebuggerAction>) {
+    fn process_data(
+        &mut self,
+        backend: &mut dyn DebuggerBackend,
+        actions: &mut Vec<DebuggerAction>,
+    ) -> bool {
         if self.current_command.is_empty() {
-            return;
+            return false;
         }
 
         let c = self.current_command[0];
@@ -116,7 +137,7 @@ impl GdbStub {
         // Acknowledgement
         if c == GDB_STUB_ACK || c == GDB_STUB_NACK {
             self.current_command.remove(0);
-            return;
+            return true;
         }
 
         // Interrupt
@@ -124,14 +145,16 @@ impl GdbStub {
             log::info!("GDB: Received interrupt");
             self.current_command.remove(0);
             actions.push(DebuggerAction::Interrupt);
-            return;
+            self.send_status(backend, GDB_STUB_ACK);
+            return true;
         }
 
         // Require start of command
         if c != GDB_STUB_START {
             log::error!("GDB: Invalid command buffer contents");
             self.current_command.clear();
-            return;
+            self.send_status(backend, GDB_STUB_NACK);
+            return false;
         }
 
         // Find the end marker '#' followed by 2 checksum hex chars.
@@ -140,7 +163,7 @@ impl GdbStub {
             Some(pos) if pos + 2 < self.current_command.len() => pos,
             _ => {
                 // Incomplete command — wait for more data.
-                return;
+                return false;
             }
         };
 
@@ -162,8 +185,11 @@ impl GdbStub {
                 received_checksum,
                 computed_checksum
             );
-            return;
+            self.send_status(backend, GDB_STUB_NACK);
+            return true;
         }
+
+        self.send_status(backend, GDB_STUB_ACK);
 
         // Dispatch command (upstream: ExecuteCommand)
         let command_str = String::from_utf8_lossy(&command_body).to_string();
@@ -171,14 +197,26 @@ impl GdbStub {
 
         // Minimal command handling matching upstream dispatch
         if command_str.starts_with('?') {
-            // Status query — report stopped
-            actions.push(DebuggerAction::Interrupt);
+            if let Some(thread) = backend.get_active_thread() {
+                let thread = thread.lock().unwrap();
+                let reply = self.arch.thread_status(
+                    &thread.thread_context,
+                    thread.get_thread_id(),
+                    GDB_STUB_SIGTRAP,
+                );
+                self.send_reply(backend, &reply);
+            } else {
+                self.send_reply(backend, GDB_STUB_REPLY_ERR);
+            }
         } else if command_str == "D" {
             // Detach
+            self.send_reply(backend, GDB_STUB_REPLY_OK);
             actions.push(DebuggerAction::Continue);
         } else if command_str.starts_with("qSupported") {
-            // Feature negotiation — handled by upstream ExecuteCommand
-            log::debug!("GDB: qSupported received");
+            self.send_reply(
+                backend,
+                "PacketSize=4000;qXfer:features:read+;qXfer:threads:read+;qXfer:libraries:read+;vContSupported+;QStartNoAckMode+",
+            );
         } else if command_str == "k" {
             // Kill
             actions.push(DebuggerAction::ShutdownEmulation);
@@ -186,7 +224,11 @@ impl GdbStub {
             actions.push(DebuggerAction::Continue);
         } else if command_str == "s" {
             actions.push(DebuggerAction::StepThread);
+        } else {
+            self.send_reply(backend, GDB_STUB_REPLY_EMPTY);
         }
+
+        true
     }
 
     /// Calculate GDB checksum.
@@ -211,6 +253,31 @@ impl GdbStub {
             }
         }
         escaped
+    }
+
+    /// Send one escaped GDB remote packet.
+    ///
+    /// Corresponds to upstream `GDBStub::SendReply`.
+    fn send_reply(&self, backend: &mut dyn DebuggerBackend, data: &str) {
+        let escaped = Self::escape_gdb(data);
+        let output = format!(
+            "{}{}{}{:02x}",
+            GDB_STUB_START as char,
+            escaped,
+            GDB_STUB_END as char,
+            Self::calculate_checksum(escaped.as_bytes())
+        );
+        log::trace!("GDB: writing reply: {output}");
+        backend.write_to_client(output.as_bytes());
+    }
+
+    /// Send an acknowledgement unless no-ack mode has been negotiated.
+    ///
+    /// Corresponds to upstream `GDBStub::SendStatus`.
+    fn send_status(&self, backend: &mut dyn DebuggerBackend, status: u8) {
+        if !self.no_ack {
+            backend.write_to_client(&[status]);
+        }
     }
 }
 

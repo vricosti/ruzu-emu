@@ -33,6 +33,23 @@
 - Required next action: port the debugger backend/frontend ownership and connection wiring in
   `debugger.rs`, verify that matching file, then resume the GDB command handlers. Deleting or merely
   allowing the warned members would hide functional parity debt.
+- Backend audit: Ruzu currently never constructs `Debugger`, does not retain it in `System`, and
+  does not connect the frontend setting to the boot/shutdown lifecycle. The backend will therefore
+  be restored first with the process/thread owners used by Rust.
+- Follow-on prerequisites discovered during the backend audit: the CPU execution loop does not yet
+  honor `StepPending`/`StepPerformed` or notify the debugger on a breakpoint, and both Dynarmic
+  `check_memory_access` implementations are inert. These must be completed before claiming GDB
+  stepping/watchpoint parity; they are not grounds for leaving partial command handlers behind.
+- Backend prerequisite result: `System` now owns the debugger for the application lifetime, the
+  boot controller initializes/detaches it in Eden's order, and `debugger.rs` owns the TCP server,
+  connection replacement, stop notifications, active-thread selection and resume/step actions.
+  Focused socket tests cover bind failure, destruction, and routing a remote packet to the frontend.
+- Validation result: `cargo check -p ruzu --bin ruzu` and all three debugger server tests pass.
+  The pre-existing full `core` test binary is not green: parallel execution aborts in
+  `cleanup_map_succeeds_without_resolved_processes`, while single-threaded execution reports
+  unrelated ARM/kernel failures and then hangs in a scheduler test. No debugger test failed.
+- Status: resume the interrupted `gdbstub.rs` slice only after the CPU stop/step notification and
+  Dynarmic watchpoint prerequisites above are implemented and verified against their Eden owners.
 
 ## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
 

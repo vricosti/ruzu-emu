@@ -8004,3 +8004,33 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: the module path record is decoded as upstream's `u32`, `s32`, and 0x200-byte path in its
   exact 0x208-byte little-endian layout; focused coverage reads a real record from process memory.
+
+## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` vs Eden `src/core/debugger/gdbstub.{h,cpp}` command dispatcher
+
+### Intentional differences
+- Eden retains its backend, `System` and process as raw references. Rust receives the backend per
+  callback, retains the process as `Arc<ProcessLock>`, and uses `Arc<KThreadLock>` for selected and
+  resumed threads; pointer identity preserves Eden's `vCont` matching semantics.
+- Eden's synchronous `ProcessData` reads from the socket until a packet is complete. Ruzu's
+  asynchronous connection owner delivers fragments through `ClientData`, so an incomplete packet
+  remains buffered until the next callback instead of blocking the debugger thread.
+- Runtime Rust processes expose `Memory` through `Option<Arc<Mutex<_>>>`; missing memory and missing
+  active threads return `E01` instead of dereferencing an invalid owner. Valid runtime paths retain
+  Eden's command behavior and ordering.
+- Rust rejects a malformed `M` packet whose decoded byte vector is shorter than its declared size,
+  avoiding the out-of-bounds source read possible in the C++ expression while preserving every
+  valid packet.
+
+### Unintentional differences (to fix)
+- The stub previously implemented only stop status, `qSupported`, kill, continue and step. It now
+  ports Eden's complete register/memory dispatch, instruction restoration, software breakpoint and
+  watchpoint lifecycle, query transfers, `vCont`, monitor output, pagination and escaping.
+- Breakpoint removal now writes the saved instruction, invalidates the instruction cache, and only
+  then erases the saved entry, matching Eden's lifecycle order.
+
+### Missing items
+- None in the reviewed GDB stub command and query surface.
+
+### Binary layout verification
+- N/A: the GDB remote protocol serializes explicit text and hexadecimal byte streams rather than
+  raw host structures.

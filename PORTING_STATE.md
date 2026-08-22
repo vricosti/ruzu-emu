@@ -90,8 +90,17 @@
   directory separators, computes the text/rodata/data end and falls back to the process code-region
   start. The duplicate empty symbolication walker and unsafe opaque process/thread casts were also
   removed. Both focused module-discovery/entrypoint regressions and `cargo check -p core` pass.
-- Status: resume `gdbstub.rs`; module enumeration and offset queries now have their upstream-owned
-  prerequisite.
+- GDB dispatcher result: `gdbstub.rs` now owns Eden's complete command dispatch, register and memory
+  access, software breakpoints, typed watchpoints, query transfers, thread selection, leftmost-match
+  `vCont` resolution, monitor commands, pagination and XML escaping. `debug_process`,
+  `replaced_instructions`, and `BreakpointType` are consequently live parity state rather than
+  warning suppressions or dead code.
+- Validation result: all five focused GDB protocol tests pass after clearing a Rust 1.92 incremental
+  compiler ICE, and `cargo check -p ruzu --bin ruzu` passes with only the explicitly ignored naming
+  warnings. The mandatory single-threaded full `core` attempt reached the previously recorded ARM,
+  crypto, integrity-storage, condition-variable and process fixture failures, then timed out in the
+  known scheduler-test hang; every GDB test passed within that run.
+- Status: the interrupted GDB warning slice and all of its discovered prerequisites are complete.
 
 ## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
 

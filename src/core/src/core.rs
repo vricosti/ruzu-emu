@@ -1545,8 +1545,14 @@ impl System {
             );
 
             // Upstream `KernelCore::Impl::InitializeHackSharedMemory` runs
-            // after the physical memory manager is ready. Initialize the IRS
-            // object here so every `irs` session returns the same backing.
+            // after the physical memory manager is ready. Initialize the
+            // persistent objects here so every font and `irs` session returns
+            // the same respective backing.
+            let result = kernel.initialize_font_shared_memory(device_memory);
+            assert!(
+                result.is_success(),
+                "failed to initialize font shared memory"
+            );
             let result = kernel.initialize_irs_shared_memory(device_memory);
             assert!(
                 result.is_success(),

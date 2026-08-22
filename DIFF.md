@@ -7317,3 +7317,26 @@ vs Eden `display_list.h` and `layer_list.h`
 - N/A: this correction only consumes the existing result for diagnostics and does not alter IPC
   payload or HID shared-memory layout. A focused test verifies that a manager failure is logged-only
   behavior and the handler still returns success plus an interface, as Eden does.
+
+## 2026-08-22 — `src/core/src/hle/kernel/kernel.rs`, `src/core/src/core.rs` vs Eden `src/core/hle/kernel/kernel.{h,cpp}`
+
+### Intentional differences
+- Ruzu initializes the persistent font and IRS objects from `System::initialize_kernel` after its
+  physical memory manager has been initialized. Eden performs the same ordered allocation inside
+  `KernelCore::Impl::InitializeHackSharedMemory`; this split follows Ruzu's existing staged kernel
+  initialization without changing object ownership or allocation order.
+- Rust retains the registered kernel object as `(object_id, Arc<KSharedMemory>)`; Eden retains its
+  intrusive `KSharedMemory*`. Both expose one stable kernel-owned object for its full boot lifetime.
+
+### Unintentional differences (to fix)
+- Ruzu previously lacked Eden's kernel-owned `font_shared_mem`. It now allocates it before IRS with
+  owner permission `None`, user permission `Read`, size `0x1100000`, and clears it before IRS during
+  shutdown.
+
+### Missing items
+- None for the font shared-memory field, initialization order, permissions, accessor, persistence,
+  or shutdown order required by the platform font services.
+
+### Binary layout verification
+- N/A: the object owns raw shared pages rather than a serialized structure. A focused test verifies
+  the exact allocation size and stable object identity across repeated initialization.

@@ -1,5 +1,16 @@
 # Porting State
 
+## 2026-08-22 — PlatformServiceManager warning interrupted by kernel font-memory prerequisite
+
+- Active slice: remove the unused caller-process lookup in
+  `ns/platform_service_manager.rs::create_shared_memory_object`.
+- Missing prerequisite discovered: Eden's `GetSharedMemoryNativeHandle` returns the single
+  kernel-owned `font_shared_mem`, but Ruzu currently allocates and caches one font shared-memory
+  object per `IPlatformServiceManager` instance.
+- Resume condition: add the persistent font shared-memory object to `KernelCore`, initialize it
+  with Eden's owner/user permissions and lifetime, verify it, then make both `pl:*` services return
+  that kernel object and remove their redundant allocation/cache path.
+
 ## 2026-08-22 — Application display-version warning interrupted by metadata prerequisite
 
 - Status: interrupted before replacing the hard-coded `"1.0.0"` response in

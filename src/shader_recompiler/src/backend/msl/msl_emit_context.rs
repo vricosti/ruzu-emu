@@ -15,7 +15,8 @@ use crate::ir::value::{InstRef, Value};
 use crate::stage::Stage;
 
 use super::{
-    MslBindingLayout, MslError, MslOptions, MslShaderArtifact, MslShaderSource, MslVersion,
+    MslBindingLayout, MslError, MslExecutionInfo, MslOptions, MslShaderArtifact, MslShaderSource,
+    MslVersion,
 };
 
 pub struct MslEmitContext {
@@ -26,6 +27,7 @@ pub struct MslEmitContext {
     uses_no_contraction_add: bool,
     uses_no_contraction_mul: bool,
     language_version: MslVersion,
+    execution: MslExecutionInfo,
 }
 
 impl MslEmitContext {
@@ -33,11 +35,10 @@ impl MslEmitContext {
         let stage = program.stage;
         match stage {
             Stage::VertexA => return Err(MslError::UnmergedVertexA),
-            Stage::VertexB | Stage::Fragment => {}
-            Stage::TessellationControl
-            | Stage::TessellationEval
-            | Stage::Geometry
-            | Stage::Compute => return Err(MslError::UnsupportedStage(stage)),
+            Stage::VertexB | Stage::Fragment | Stage::Compute => {}
+            Stage::TessellationControl | Stage::TessellationEval | Stage::Geometry => {
+                return Err(MslError::UnsupportedStage(stage))
+            }
         }
 
         let mut source = String::new();
@@ -68,6 +69,10 @@ impl MslEmitContext {
                 source.push_str("fragment void main0() {\n");
                 false
             }
+            Stage::Compute => {
+                source.push_str("kernel void main0() {\n");
+                false
+            }
             _ => unreachable!("stage was validated above"),
         };
 
@@ -79,6 +84,9 @@ impl MslEmitContext {
             uses_no_contraction_add: false,
             uses_no_contraction_mul: false,
             language_version: options.language_version,
+            execution: MslExecutionInfo {
+                workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
+            },
         })
     }
 
@@ -277,6 +285,7 @@ impl MslEmitContext {
             bindings: MslBindingLayout::default(),
             entry_point: "main0".to_owned(),
             language_version: self.language_version,
+            execution: self.execution,
         }
     }
 }

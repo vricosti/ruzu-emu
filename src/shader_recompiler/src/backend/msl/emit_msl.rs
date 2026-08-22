@@ -38,7 +38,7 @@ fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static s
     if program.shared_memory_size != 0 {
         return Some("shared memory");
     }
-    if program.workgroup_size != [1, 1, 1] {
+    if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
     }
     if program.output_vertices != 0 || program.invocations != 1 {
@@ -334,6 +334,17 @@ mod tests {
             .source
             .to_ascii_lowercase()
             .contains("spir-v"));
+    }
+
+    #[test]
+    fn emits_minimal_compute_entry_point_and_execution_metadata() {
+        let mut program = empty_program(Stage::Compute);
+        program.workgroup_size = [8, 4, 2];
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+
+        assert_eq!(artifact.source.stage, Stage::Compute);
+        assert!(artifact.source.source.contains("kernel void main0()"));
+        assert_eq!(artifact.execution.workgroup_size, Some([8, 4, 2]));
     }
 
     #[test]

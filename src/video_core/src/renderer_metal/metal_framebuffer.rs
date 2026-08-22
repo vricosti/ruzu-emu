@@ -6,7 +6,8 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor, MTLStoreAction, MTLTexture,
+    MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor, MTLStoreAction,
+    MTLTexture,
 };
 use thiserror::Error;
 
@@ -47,6 +48,15 @@ pub struct MetalFramebufferSignature {
     pub depth_format: MTLPixelFormat,
     pub stencil_format: MTLPixelFormat,
     pub samples: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetalFramebufferClear {
+    pub color: Option<(usize, [f32; 4])>,
+    pub depth: Option<f32>,
+    pub stencil: Option<u32>,
+    pub base_layer: u32,
+    pub layer_count: u32,
 }
 
 impl MetalFramebuffer {
@@ -160,6 +170,79 @@ impl MetalFramebuffer {
             descriptor.setRenderTargetWidth(self.render_area.0 as usize);
             descriptor.setRenderTargetHeight(self.render_area.1 as usize);
             descriptor.setRenderTargetArrayLength(self.layers);
+            descriptor.setDefaultRasterSampleCount(self.samples as usize);
+        }
+        descriptor
+    }
+
+    pub fn render_pass_descriptor_for_layer(
+        &self,
+        layer: u32,
+    ) -> Retained<MTLRenderPassDescriptor> {
+        let descriptor = self.render_pass_descriptor();
+        for index in 0..NUM_RT {
+            let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(index) };
+            if attachment.texture().is_some() {
+                unsafe { attachment.setSlice(layer as usize) };
+            }
+        }
+        if descriptor.depthAttachment().texture().is_some() {
+            unsafe { descriptor.depthAttachment().setSlice(layer as usize) };
+        }
+        if descriptor.stencilAttachment().texture().is_some() {
+            unsafe { descriptor.stencilAttachment().setSlice(layer as usize) };
+        }
+        unsafe { descriptor.setRenderTargetArrayLength(1) };
+        descriptor
+    }
+
+    /// Build a targeted attachment clear. Only attachments selected by the
+    /// Maxwell clear flags are present, so unrelated render targets retain
+    /// their contents without relying on a shader write mask.
+    pub fn clear_render_pass_descriptor(
+        &self,
+        clear: MetalFramebufferClear,
+    ) -> Retained<MTLRenderPassDescriptor> {
+        let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
+        if let Some((index, value)) = clear.color {
+            if let Some(texture) = self.color_attachments.get(index).and_then(Option::as_ref) {
+                let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(index) };
+                attachment.setTexture(Some(texture));
+                attachment.setLoadAction(MTLLoadAction::Clear);
+                attachment.setStoreAction(MTLStoreAction::Store);
+                attachment.setClearColor(MTLClearColor {
+                    red: value[0] as f64,
+                    green: value[1] as f64,
+                    blue: value[2] as f64,
+                    alpha: value[3] as f64,
+                });
+                unsafe { attachment.setSlice(clear.base_layer as usize) };
+            }
+        }
+        if let Some(value) = clear.depth {
+            if let Some(texture) = self.depth_attachment.as_ref() {
+                let attachment = descriptor.depthAttachment();
+                attachment.setTexture(Some(texture));
+                attachment.setLoadAction(MTLLoadAction::Clear);
+                attachment.setStoreAction(MTLStoreAction::Store);
+                attachment.setClearDepth(value as f64);
+                unsafe { attachment.setSlice(clear.base_layer as usize) };
+            }
+        }
+        if let Some(value) = clear.stencil {
+            if let Some(texture) = self.stencil_attachment.as_ref() {
+                let attachment = descriptor.stencilAttachment();
+                attachment.setTexture(Some(texture));
+                attachment.setLoadAction(MTLLoadAction::Clear);
+                attachment.setStoreAction(MTLStoreAction::Store);
+                attachment.setClearStencil(value);
+                unsafe { attachment.setSlice(clear.base_layer as usize) };
+            }
+        }
+        unsafe {
+            descriptor.setRenderTargetWidth(self.render_area.0 as usize);
+            descriptor.setRenderTargetHeight(self.render_area.1 as usize);
+            descriptor.setRenderTargetArrayLength(clear.layer_count.max(1) as usize);
             descriptor.setDefaultRasterSampleCount(self.samples as usize);
         }
         descriptor

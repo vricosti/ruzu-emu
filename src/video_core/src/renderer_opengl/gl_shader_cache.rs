@@ -509,15 +509,15 @@ impl ShaderCache {
             || stop_loading.load(Ordering::Acquire),
             &self.shader_cache_filename,
             CACHE_VERSION,
-            Box::new(|file, env| match read_compute_pipeline_key(file) {
-                Ok(key) => compute_entries.borrow_mut().push((key, env)),
-                Err(error) => log::error!("Failed to read OpenGL compute pipeline key: {error}"),
+            Box::new(|file, env| {
+                let key = read_compute_pipeline_key(file)?;
+                compute_entries.borrow_mut().push((key, env));
+                Ok(())
             }),
-            Box::new(|file, envs| match read_graphics_pipeline_key(file) {
-                Ok(key) => graphics_entries.borrow_mut().push((key, envs)),
-                Err(error) => {
-                    log::error!("Failed to read OpenGL graphics pipeline key: {error}")
-                }
+            Box::new(|file, envs| {
+                let key = read_graphics_pipeline_key(file)?;
+                graphics_entries.borrow_mut().push((key, envs));
+                Ok(())
             }),
         );
 

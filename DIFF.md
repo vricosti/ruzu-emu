@@ -7652,3 +7652,59 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: focused tests verify `CodeRange` is 16 bytes/aligned to 8, `Struct32` is 32 bytes, and
   `JITConfiguration` is 80 bytes. Callback execution tests cover `GenerateCode`'s 13-argument ABI,
   `Control`, cleared output-range sizes, and preserved output-buffer contents.
+
+## 2026-08-22 — `src/video_core/src/shader_environment.rs` vs Eden `src/video_core/shader_environment.{h,cpp}`
+
+### Intentional differences
+- Rust validates serialized environment counts and their complete byte size against the remaining
+  cache file before allocating. It also uses fallible reservations, rejects empty pipeline entries,
+  and requires exactly one environment for compute pipelines. Eden relies on trusted cache contents
+  and throwing stream reads; the additional validation prevents a malformed or same-version legacy
+  cache from aborting the process in Rust's infallible allocation path.
+- Pipeline-loader callbacks return `std::io::Result<()>` so key-read failures reach the same outer
+  invalid-cache cleanup that Eden obtains from `ifstream` exceptions.
+
+### Unintentional differences (to fix)
+- None in the reviewed serialization and disk-cache loading slice.
+
+### Missing items
+- None in the reviewed serialization and disk-cache loading slice.
+
+### Binary layout verification
+- PASS: the magic, cache version, field order, field widths, stage-specific payloads, and pipeline
+  key placement remain unchanged. Round-trip and malformed-cache tests cover valid compute entries,
+  truncated data, invalid discriminants, empty entries, oversized environment counts, and oversized
+  shader payloads.
+
+## 2026-08-22 — `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`
+
+### Intentional differences
+- Rust key readers return `std::io::Result` instead of relying on `ifstream::failbit` exceptions.
+  Dynamic-feature incompatibility remains a skipped valid entry and does not invalidate the cache.
+
+### Unintentional differences (to fix)
+- Cached compute and graphics key read failures were previously logged and swallowed, allowing a
+  desynchronized reader to continue. They now propagate through `load_pipelines`, matching Eden's
+  whole-file deletion on a failed key read.
+
+### Missing items
+- None in the reviewed disk-resource key-loading slice.
+
+### Binary layout verification
+- PASS: `ComputePipelineCacheKey` and `GraphicsPipelineKey` serialization is unchanged; only failure
+  propagation after reading those existing layouts changed.
+
+## 2026-08-22 — `src/video_core/src/renderer_opengl/gl_shader_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_cache.{h,cpp}`
+
+### Intentional differences
+- Rust key readers report `std::io::Result` explicitly instead of using throwing `ifstream` reads.
+
+### Unintentional differences (to fix)
+- Cached compute and graphics key read failures were previously logged and swallowed. They now
+  reach `load_pipelines` and delete the invalid cache as Eden's stream exception path does.
+
+### Missing items
+- None in the reviewed disk-resource key-loading slice.
+
+### Binary layout verification
+- PASS: OpenGL pipeline key bytes and their placement after serialized environments are unchanged.

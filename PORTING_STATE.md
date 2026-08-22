@@ -1,5 +1,23 @@
 # Porting State
 
+## 2026-08-22 — Warning cleanup interrupted by MK8D Vulkan cache crash
+
+- Crash cause: `load_pipelines` interpreted a same-version legacy/mixed graphics-key segment as the
+  later environment count `0x49A00190` and called `Vec::with_capacity`, requesting
+  652,197,705,984 bytes and aborting the process.
+- The serialized environment/key boundary had drifted by 40 bytes after five old graphics entries;
+  the current cache format remains aligned with Eden version 18, so changing the version would
+  unnecessarily break current Eden cache compatibility.
+- Resolution: environment counts and payload sizes are now validated before allocation, allocations
+  are fallible, empty/invalid entries are refused, and Vulkan/OpenGL key read failures propagate to
+  the existing whole-cache deletion path.
+- Validation: focused `shader_environment` tests, `cargo check -p ruzu --bin ruzu`, and the release
+  build pass. A release launch against the captured invalid cache rejected its zero-environment
+  entry, deleted the file, retained its 1,859 preceding valid pipelines in memory, and booted MK8D
+  without invoking the allocator failure.
+- Status: crash slice resolved; all 1,479 `video_core` library tests pass (one ignored). The warning
+  cleanup can resume at the interrupted GDB slice after this auditable crash-fix commit.
+
 ## 2026-08-22 — GDB warning slice interrupted by debugger-backend prerequisite
 
 - Active slice: resolve the unused reply constants, breakpoint map, no-ack state, architecture

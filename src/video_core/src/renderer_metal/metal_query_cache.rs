@@ -22,7 +22,8 @@ use super::metal_device::MetalDevice;
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 
 const QUERY_SLOT_SIZE: usize = std::mem::size_of::<u64>();
-const QUERY_SLOT_COUNT: usize = 64 * 1024;
+// Metal limits visibility-result offsets to 256 KiB minus one 64-bit result.
+const QUERY_SLOT_COUNT: usize = (256 * 1024) / QUERY_SLOT_SIZE;
 
 #[derive(Debug, Error)]
 pub enum MetalQueryCacheError {
@@ -75,7 +76,7 @@ impl MetalQueryCache {
         if !zpass_enabled {
             return Ok(None);
         }
-        if self.next_slot == QUERY_SLOT_COUNT {
+        if self.next_slot >= QUERY_SLOT_COUNT {
             scheduler.finish_all()?;
             self.zpass_accumulated = self
                 .zpass_accumulated
@@ -204,5 +205,19 @@ mod tests {
 
         cache.reset_counter(QueryType::ZPassPixelCount64 as u32);
         assert!(cache.zpass_slots.is_empty());
+    }
+
+    #[test]
+    fn visibility_slots_wrap_before_metals_maximum_offset() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut cache = MetalQueryCache::new(&device).unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        cache.next_slot = QUERY_SLOT_COUNT;
+
+        let query = cache.prepare_draw(&mut scheduler, true).unwrap().unwrap();
+
+        assert_eq!(query.offset(), 0);
+        assert_eq!(cache.next_slot, 1);
+        assert!(query.offset() <= 256 * 1024 - QUERY_SLOT_SIZE);
     }
 }

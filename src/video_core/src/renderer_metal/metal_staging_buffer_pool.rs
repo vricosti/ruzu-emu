@@ -178,6 +178,40 @@ impl MetalStagingBufferPool {
         self.request(scheduler, size, StagingBufferUsage::Upload, deferred)
     }
 
+    /// Request a stream allocation whose Metal buffer has at least
+    /// `binding_span` bytes available after the returned offset.
+    ///
+    /// Metal validates statically-sized shader buffer arguments against the
+    /// backing resource rather than the logical byte range copied by the
+    /// guest. The allocation itself remains `size` bytes; `binding_span` only
+    /// makes the ring wrap before an otherwise valid binding reaches its tail.
+    pub fn request_upload_buffer_with_binding_span(
+        &mut self,
+        scheduler: &mut MetalScheduler,
+        size: usize,
+        binding_span: usize,
+    ) -> Result<StagingBufferRef, MetalStagingBufferError> {
+        if size <= MAX_STREAM_BUFFER_SIZE / NUM_SYNCS
+            && binding_span <= MAX_STREAM_BUFFER_SIZE
+        {
+            return self.get_stream_buffer_with_binding_span(
+                scheduler,
+                size,
+                binding_span.max(size),
+            );
+        }
+        self.get_staging_buffer(
+            scheduler,
+            size.max(binding_span),
+            StagingBufferUsage::Upload,
+            false,
+        )
+        .map(|mut allocation| {
+            allocation.size = size;
+            allocation
+        })
+    }
+
     pub fn request_download_buffer(
         &mut self,
         scheduler: &mut MetalScheduler,
@@ -223,6 +257,15 @@ impl MetalStagingBufferPool {
         scheduler: &mut MetalScheduler,
         size: usize,
     ) -> Result<StagingBufferRef, MetalStagingBufferError> {
+        self.get_stream_buffer_with_binding_span(scheduler, size, size)
+    }
+
+    fn get_stream_buffer_with_binding_span(
+        &mut self,
+        scheduler: &mut MetalScheduler,
+        size: usize,
+        binding_span: usize,
+    ) -> Result<StagingBufferRef, MetalStagingBufferError> {
         if self.are_regions_active(
             scheduler,
             self.region(self.stream_free_iterator) + 1,
@@ -244,7 +287,7 @@ impl MetalStagingBufferPool {
             .stream_free_iterator
             .max(self.stream_iterator.saturating_add(size));
 
-        if self.stream_iterator.saturating_add(size) >= MAX_STREAM_BUFFER_SIZE {
+        if self.stream_iterator.saturating_add(binding_span) >= MAX_STREAM_BUFFER_SIZE {
             self.fill_sync_regions(
                 self.region(self.stream_used_iterator),
                 NUM_SYNCS,
@@ -437,6 +480,23 @@ mod tests {
         assert_eq!(first.offset, 0);
         assert_eq!(second.offset, MAX_ALIGNMENT);
         assert_eq!(first.size, 17);
+    }
+
+    #[test]
+    fn buffer_binding_span_wraps_before_the_stream_tail() {
+        let device = MetalDevice::new().unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        let mut pool = MetalStagingBufferPool::new(&device).unwrap();
+        pool.stream_iterator = MAX_STREAM_BUFFER_SIZE - 0x10000 + MAX_ALIGNMENT;
+        pool.stream_used_iterator = pool.stream_iterator;
+        pool.stream_free_iterator = pool.stream_iterator;
+
+        let allocation = pool
+            .request_upload_buffer_with_binding_span(&mut scheduler, 256, 0x10000)
+            .unwrap();
+
+        assert_eq!(allocation.offset, 0);
+        assert_eq!(allocation.size, 256);
     }
 
     #[test]

@@ -6,9 +6,10 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLDevice, MTLOrigin, MTLSize, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType,
+    MTLBlitCommandEncoder, MTLBlitOption, MTLDevice, MTLOrigin, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType,
 };
+use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
 use crate::surface::PixelFormat;
@@ -56,6 +57,15 @@ pub struct MetalImage {
     samples: u32,
     guest_samples: u32,
     allocation_tick: u64,
+    storage_authority: AtomicU8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum StorageAuthority {
+    Coherent = 0,
+    Native = 1,
+    Slices = 2,
 }
 
 impl MetalImage {
@@ -152,6 +162,7 @@ impl MetalImage {
             samples,
             guest_samples: info.num_samples,
             allocation_tick: 0,
+            storage_authority: AtomicU8::new(StorageAuthority::Coherent as u8),
         })
     }
 
@@ -216,6 +227,141 @@ impl MetalImage {
         self.allocation_tick
     }
 
+    fn storage_authority(&self) -> StorageAuthority {
+        match self.storage_authority.load(Ordering::Acquire) {
+            1 => StorageAuthority::Native,
+            2 => StorageAuthority::Slices,
+            _ => StorageAuthority::Coherent,
+        }
+    }
+
+    fn set_storage_authority(&self, authority: StorageAuthority) {
+        self.storage_authority
+            .store(authority as u8, Ordering::Release);
+    }
+
+    pub fn ensure_native_storage(
+        &self,
+        scheduler: &mut MetalScheduler,
+    ) -> Result<(), MetalImageError> {
+        if self.slice_texture.is_none() || self.storage_authority() != StorageAuthority::Slices {
+            return Ok(());
+        }
+        self.copy_slice_storage(scheduler, true)?;
+        self.set_storage_authority(StorageAuthority::Coherent);
+        Ok(())
+    }
+
+    pub fn ensure_slice_storage(
+        &self,
+        scheduler: &mut MetalScheduler,
+    ) -> Result<(), MetalImageError> {
+        if self.slice_texture.is_none() || self.storage_authority() != StorageAuthority::Native {
+            return Ok(());
+        }
+        self.copy_slice_storage(scheduler, false)?;
+        self.set_storage_authority(StorageAuthority::Coherent);
+        Ok(())
+    }
+
+    pub fn ensure_storage_for_texture_type(
+        &self,
+        scheduler: &mut MetalScheduler,
+        texture_type: TextureType,
+    ) -> Result<(), MetalImageError> {
+        if self.image_type == ImageType::E3D && texture_type != TextureType::Color3D {
+            self.ensure_slice_storage(scheduler)
+        } else {
+            self.ensure_native_storage(scheduler)
+        }
+    }
+
+    pub fn mark_native_modified(&self) {
+        if self.slice_texture.is_some() {
+            self.set_storage_authority(StorageAuthority::Native);
+        }
+    }
+
+    pub fn mark_slice_modified(&self) {
+        if self.slice_texture.is_some() {
+            self.set_storage_authority(StorageAuthority::Slices);
+        }
+    }
+
+    pub fn mark_modified_for_texture_type(&self, texture_type: TextureType) {
+        if self.image_type == ImageType::E3D && texture_type != TextureType::Color3D {
+            self.mark_slice_modified();
+        } else {
+            self.mark_native_modified();
+        }
+    }
+
+    fn copy_slice_storage(
+        &self,
+        scheduler: &mut MetalScheduler,
+        slices_to_native: bool,
+    ) -> Result<(), MetalImageError> {
+        let slices = self
+            .slice_texture
+            .as_ref()
+            .expect("slice synchronization requires slice-compatible storage");
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.with_blit_encoder(|encoder| {
+            for level in 0..self.levels as usize {
+                let width = (self.size.0 as usize >> level).max(1);
+                let height = (self.size.1 as usize >> level).max(1);
+                let depth = (self.size.2 as usize >> level).max(1);
+                for slice in 0..depth {
+                    let size = MTLSize {
+                        width,
+                        height,
+                        depth: 1,
+                    };
+                    let slice_origin = MTLOrigin { x: 0, y: 0, z: 0 };
+                    let volume_origin = MTLOrigin {
+                        x: 0,
+                        y: 0,
+                        z: slice,
+                    };
+                    let (source, source_slice, source_origin, destination, destination_slice, destination_origin) =
+                        if slices_to_native {
+                            (
+                                slices.as_ref(),
+                                slice,
+                                slice_origin,
+                                self.handle(),
+                                0,
+                                volume_origin,
+                            )
+                        } else {
+                            (
+                                self.handle(),
+                                0,
+                                volume_origin,
+                                slices.as_ref(),
+                                slice,
+                                slice_origin,
+                            )
+                        };
+                    unsafe {
+                        encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            source,
+                            source_slice,
+                            level,
+                            source_origin,
+                            size,
+                            destination,
+                            destination_slice,
+                            level,
+                            destination_origin,
+                        );
+                    }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
     /// Port of Eden `Image::UploadMemory` for byte-compatible Metal formats.
     pub fn upload_memory(
         &self,
@@ -264,6 +410,7 @@ impl MetalImage {
                 }
             }
         })?;
+        self.set_storage_authority(StorageAuthority::Coherent);
         Ok(())
     }
 
@@ -332,6 +479,54 @@ impl MetalImage {
                 }
             }
         })?;
+        self.set_storage_authority(StorageAuthority::Coherent);
+        Ok(())
+    }
+
+    /// Uploads the separately converted depth and stencil planes of a guest
+    /// D24S8 image into Metal's combined Depth32Float_Stencil8 texture.
+    pub fn upload_depth_stencil_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        source: &MetalBuffer,
+        base_offset: usize,
+        depth_copies: &[BufferImageCopy],
+        stencil_copies: &[BufferImageCopy],
+    ) -> Result<(), MetalImageError> {
+        if !self.format.requires_conversion {
+            return Err(MetalImageError::InvalidCopy(
+                "depth/stencil upload requested for a native format",
+            ));
+        }
+        if depth_copies.len() != stencil_copies.len() {
+            return Err(MetalImageError::InvalidCopy(
+                "depth/stencil copy count mismatch",
+            ));
+        }
+        let depth =
+            self.native_buffer_copies_with_layout(source, base_offset, depth_copies, 1, 1, 4)?;
+        let stencil =
+            self.native_buffer_copies_with_layout(source, base_offset, stencil_copies, 1, 1, 1)?;
+        let depth_slices = self
+            .slice_texture
+            .as_ref()
+            .map(|_| expand_3d_buffer_copies_to_slices(&depth));
+        let stencil_slices = self
+            .slice_texture
+            .as_ref()
+            .map(|_| expand_3d_buffer_copies_to_slices(&stencil));
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.with_blit_encoder(|encoder| {
+            encode_depth_stencil_uploads(encoder, source, self.handle(), &depth, &stencil);
+            if let (Some(texture), Some(depth), Some(stencil)) = (
+                &self.slice_texture,
+                depth_slices.as_ref(),
+                stencil_slices.as_ref(),
+            ) {
+                encode_depth_stencil_uploads(encoder, source, texture, depth, stencil);
+            }
+        })?;
+        self.set_storage_authority(StorageAuthority::Coherent);
         Ok(())
     }
 
@@ -343,6 +538,7 @@ impl MetalImage {
         base_offset: usize,
         copies: &[BufferImageCopy],
     ) -> Result<(), MetalImageError> {
+        self.ensure_native_storage(scheduler)?;
         let native_copies = self.native_buffer_copies(destination, base_offset, copies)?;
         scheduler.request_outside_render_pass_operation_context();
         scheduler.with_blit_encoder(|encoder| {
@@ -522,6 +718,39 @@ struct NativeBufferImageCopy {
     slice: usize,
     level: usize,
     origin: MTLOrigin,
+}
+
+fn encode_depth_stencil_uploads(
+    encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
+    source: &MetalBuffer,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    depth: &[NativeBufferImageCopy],
+    stencil: &[NativeBufferImageCopy],
+) {
+    for (copy, options) in depth
+        .iter()
+        .map(|copy| (copy, MTLBlitOption::DepthFromDepthStencil))
+        .chain(
+            stencil
+                .iter()
+                .map(|copy| (copy, MTLBlitOption::StencilFromDepthStencil)),
+        )
+    {
+        unsafe {
+            encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                source.handle(),
+                copy.buffer_offset,
+                copy.bytes_per_row,
+                copy.bytes_per_image,
+                copy.size,
+                texture,
+                copy.slice,
+                copy.level,
+                copy.origin,
+                options,
+            );
+        }
+    }
 }
 
 fn expand_3d_buffer_copies_to_slices(
@@ -723,5 +952,73 @@ mod tests {
         let mut downloaded = vec![0; 64];
         destination.read(0, &mut downloaded).unwrap();
         assert_eq!(downloaded, pixels);
+    }
+
+    #[test]
+    fn synchronizes_slice_rendering_back_to_native_3d_storage() {
+        let device = MetalDevice::new().unwrap();
+        let image = MetalImage::new(
+            &device,
+            &ImageInfo {
+                format: PixelFormat::A8B8G8R8Unorm,
+                image_type: ImageType::E3D,
+                resources: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+                size: Extent3D {
+                    width: 4,
+                    height: 4,
+                    depth: 4,
+                },
+                num_samples: 1,
+                ..ImageInfo::default()
+            },
+        )
+        .unwrap();
+        let source = MetalBuffer::new(&device, 64).unwrap();
+        let destination = MetalBuffer::new(&device, 256).unwrap();
+        let pixels = (0..64)
+            .map(|value| (value as u8).wrapping_mul(3).wrapping_add(1))
+            .collect::<Vec<_>>();
+        source.write(0, &pixels).unwrap();
+
+        let mut scheduler = MetalScheduler::new(&device);
+        scheduler.with_blit_encoder(|encoder| unsafe {
+            encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                source.handle(),
+                0,
+                16,
+                64,
+                MTLSize {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                },
+                image.slice_handle().unwrap(),
+                2,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }).unwrap();
+        image.mark_slice_modified();
+
+        let copy = BufferImageCopy {
+            buffer_size: 256,
+            image_extent: Extent3D {
+                width: 4,
+                height: 4,
+                depth: 4,
+            },
+            ..BufferImageCopy::default()
+        };
+        image
+            .download_memory(&mut scheduler, &destination, 0, &[copy])
+            .unwrap();
+        scheduler.finish_all().unwrap();
+
+        let mut downloaded = vec![0; 256];
+        destination.read(0, &mut downloaded).unwrap();
+        assert_eq!(&downloaded[128..192], pixels.as_slice());
     }
 }

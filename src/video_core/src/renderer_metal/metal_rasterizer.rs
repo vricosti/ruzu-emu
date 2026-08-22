@@ -21,7 +21,9 @@ use crate::buffer_cache::buffer_cache_base::{DeviceMemoryAccess, GpuMemoryAccess
 use crate::cache_types::CacheType;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
-use crate::engines::draw_manager::{Maxwell3DDrawTextureView, Maxwell3DDrawView};
+use crate::engines::draw_manager::{
+    Maxwell3DClearView, Maxwell3DDrawTextureView, Maxwell3DDrawView,
+};
 use crate::engines::maxwell_3d::{CullFace, FrontFace, PrimitiveTopology};
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
@@ -34,10 +36,13 @@ use crate::renderer_base::{
 };
 use crate::shader_cache::ShaderCache;
 
-use super::metal_blit_helper::{MetalBlitError, MetalBlitHelper, MetalBlitRegion};
+use super::metal_blit_helper::{
+    MetalBlitError, MetalBlitHelper, MetalBlitRegion, MetalClearColorType,
+    MetalClearParameters,
+};
 use super::metal_buffer_cache::{BufferCacheRuntime, MetalCommonBufferCache};
 use super::metal_device::MetalDevice;
-use super::metal_framebuffer::MetalFramebufferError;
+use super::metal_framebuffer::{MetalFramebufferClear, MetalFramebufferError};
 use super::metal_graphics_pipeline::{
     configure_graphics_resources, MetalGraphicsPipelineError, MetalPreparedGraphics,
     MetalPreparedStage,
@@ -777,6 +782,212 @@ impl MetalRasterizer {
             src,
             source_size,
         )?;
+        Ok(())
+    }
+
+    /// Port of Eden `RasterizerVulkan::Clear` for full attachment clears.
+    /// Scissored and channel-masked clears are kept out of this path because
+    /// Metal load actions cannot express them; `MetalBlitHelper` owns that
+    /// shader-based prerequisite.
+    pub fn clear(
+        &mut self,
+        mut clear_view: Maxwell3DClearView<'_>,
+        layer_count: u32,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        let state = clear_view.clear_state();
+        let use_depth = state.flags & (1 << 0) != 0;
+        let use_stencil = state.flags & (1 << 1) != 0;
+        let use_r = state.flags & (1 << 2) != 0;
+        let use_g = state.flags & (1 << 3) != 0;
+        let use_b = state.flags & (1 << 4) != 0;
+        let use_a = state.flags & (1 << 5) != 0;
+        let use_color = use_r || use_g || use_b || use_a;
+        if !use_color && !use_depth && !use_stencil {
+            return Ok(());
+        }
+
+        let render_targets = clear_view.render_targets();
+        let clear_scissor = clear_view.use_scissor().then(|| {
+            let scissor = clear_view.scissor(0);
+            (scissor.min_x, scissor.min_y, scissor.max_x, scissor.max_y)
+        });
+        let original_dirty_flags = *clear_view.dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
+        let memory_manager = self.channel_memory_manager.as_ref().cloned();
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.update_render_targets_with_snapshot(
+            &render_targets,
+            &mut dirty_flags,
+            |address, size| {
+                memory_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().gpu_to_cpu_address_range(address, size))
+            },
+            true,
+            clear_scissor,
+        );
+        for (index, (&was_dirty, &is_dirty)) in original_dirty_flags
+            .iter()
+            .zip(dirty_flags.iter())
+            .enumerate()
+        {
+            if was_dirty && !is_dirty {
+                clear_view.clear_dirty_flag(index as u8);
+            }
+        }
+
+        let depth_stencil = clear_view.depth_stencil();
+        let color_attachment = ((state.flags >> 6) & 0xf) as usize;
+        let clear_layer = (state.flags >> 10) & 0xffff;
+        let color_mask = u8::from(use_r)
+            | (u8::from(use_g) << 1)
+            | (u8::from(use_b) << 2)
+            | (u8::from(use_a) << 3);
+        let stencil_mask = depth_stencil.front.write_mask;
+        let stencil_partial = use_stencil && stencil_mask != 0 && stencil_mask != 0xff;
+        let (signature, render_area, color_present, depth_present, stencil_present) = {
+            let framebuffer = self.texture_cache.base.get_framebuffer()?;
+            let signature = framebuffer.signature();
+            let color_present = use_color
+                && signature
+                    .color_formats
+                    .get(color_attachment)
+                    .is_some_and(|format| *format != objc2_metal::MTLPixelFormat::Invalid);
+            (
+                signature,
+                framebuffer.render_area(),
+                color_present,
+                use_depth && framebuffer.has_depth(),
+                use_stencil && framebuffer.has_stencil(),
+            )
+        };
+        if !color_present && !depth_present && !stencil_present {
+            return Ok(());
+        }
+        let color_format = color_present.then(|| {
+            crate::surface::pixel_format_from_render_target_format(
+                render_targets.render_targets[color_attachment].format,
+            )
+        });
+        // VkClearValue carries integer attachments as typed integer payloads.
+        // MTLClearColor is floating-point, so keep integer clears on the typed
+        // shader path even when every channel and the full extent are selected.
+        let color_is_integer = color_format
+            .is_some_and(crate::surface::is_pixel_format_integer);
+        let full_clear = !clear_view.use_scissor()
+            && (!use_color || color_mask == 0xf)
+            && !color_is_integer
+            && !stencil_partial;
+
+        if full_clear {
+            for layer in 0..layer_count.max(1) {
+                let descriptor = {
+                    let framebuffer = self.texture_cache.base.get_framebuffer()?;
+                    framebuffer.clear_render_pass_descriptor(MetalFramebufferClear {
+                        color: color_present.then_some((color_attachment, state.color)),
+                        depth: depth_present.then_some(state.depth),
+                        stencil: stencil_present.then_some(state.stencil as u32),
+                        base_layer: clear_layer + layer,
+                        layer_count: 1,
+                    })
+                };
+                self.scheduler.begin_render_pass(&descriptor)?;
+                self.scheduler.end_render_pass();
+            }
+            return Ok(());
+        }
+
+        let resolution = common::settings::values().resolution_info.clone();
+        let (up_scale, down_shift) = if self.texture_cache.base.is_rescaling {
+            (resolution.up_scale, resolution.down_shift)
+        } else {
+            (1, 0)
+        };
+        let mut region = if clear_view.use_scissor() {
+            let scissor = clear_view.scissor(0);
+            let (min_y, max_y) = if clear_view.window_origin_lower_left() {
+                (
+                    render_targets.surface_clip.height.saturating_sub(scissor.max_y),
+                    render_targets.surface_clip.height.saturating_sub(scissor.min_y),
+                )
+            } else {
+                (scissor.min_y, scissor.max_y)
+            };
+            MetalBlitRegion {
+                start: (
+                    (scissor.min_x.wrapping_mul(up_scale) >> down_shift) as i32,
+                    (min_y.wrapping_mul(up_scale) >> down_shift) as i32,
+                ),
+                end: (
+                    (scissor.max_x.wrapping_mul(up_scale) >> down_shift) as i32,
+                    (max_y.wrapping_mul(up_scale) >> down_shift) as i32,
+                ),
+            }
+        } else {
+            MetalBlitRegion {
+                start: (0, 0),
+                end: (render_area.0 as i32, render_area.1 as i32),
+            }
+        };
+        region.start.0 = region.start.0.clamp(0, render_area.0 as i32);
+        region.start.1 = region.start.1.clamp(0, render_area.1 as i32);
+        region.end.0 = region.end.0.clamp(region.start.0, render_area.0 as i32);
+        region.end.1 = region.end.1.clamp(region.start.1, render_area.1 as i32);
+        if region.start == region.end {
+            return Ok(());
+        }
+
+        let color_type = match color_format {
+            Some(format) if crate::surface::is_pixel_format_signed_integer(format) => {
+                MetalClearColorType::Sint
+            }
+            Some(format) if crate::surface::is_pixel_format_integer(format) => {
+                MetalClearColorType::Uint
+            }
+            _ => MetalClearColorType::Float,
+        };
+        let mut signed_color = [0; 4];
+        let mut unsigned_color = [0; 4];
+        if let Some(format) = color_format.filter(|format| crate::surface::is_pixel_format_integer(*format)) {
+            let bits = crate::surface::pixel_component_size_bits_integer(format);
+            if crate::surface::is_pixel_format_signed_integer(format) {
+                let scale = (((bits - 1) as i64) << 1) as f32;
+                signed_color = state.color.map(|component| (scale * (component - 0.5)) as i32);
+            } else {
+                let scale = ((bits as u64) << 1) as f32;
+                unsigned_color = state.color.map(|component| (scale * component) as u32);
+            }
+        }
+        for layer in 0..layer_count.max(1) {
+            let render_pass = {
+                let framebuffer = self.texture_cache.base.get_framebuffer()?;
+                framebuffer.render_pass_descriptor_for_layer(clear_layer + layer)
+            };
+            self.blit_image.clear_attachments(
+                self.scheduler.as_mut(),
+                &render_pass,
+                signature,
+                color_present.then_some(color_attachment as u8),
+                color_type,
+                color_mask,
+                depth_present,
+                stencil_present,
+                stencil_mask,
+                MetalClearParameters {
+                    region,
+                    render_area,
+                    color: state.color,
+                    signed_color,
+                    unsigned_color,
+                    depth: state.depth,
+                    stencil: state.stencil as u32,
+                },
+            )?;
+        }
         Ok(())
     }
 

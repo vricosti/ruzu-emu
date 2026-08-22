@@ -325,11 +325,11 @@ pub struct SockAddrIn {
     pub zeroes: [u8; 8],
 }
 
-/// PollEvents flags.
-///
-/// Corresponds to `PollEvents` in upstream sockets.h.
-/// Uses DECLARE_ENUM_FLAG_OPERATORS in C++.
 bitflags::bitflags! {
+    /// PollEvents flags.
+    ///
+    /// Corresponds to `PollEvents` in upstream sockets.h.
+    /// Uses DECLARE_ENUM_FLAG_OPERATORS in C++.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PollEvents: u16 {
         const IN = 1 << 0;

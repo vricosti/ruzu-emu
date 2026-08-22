@@ -57,8 +57,8 @@ impl Default for NativeWindowScalingMode {
     }
 }
 
-/// Transform parameter for QueueBuffer
 bitflags::bitflags! {
+    /// Transform parameter for QueueBuffer.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct NativeWindowTransform: u32 {
         const NONE = 0x0;

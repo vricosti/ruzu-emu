@@ -7127,3 +7127,19 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: this slice changes host service bootstrap signatures and local dispatch variables only.
+
+## 2026-08-22 — `nvnflinger/window.rs` and `sockets/sockets.rs` vs Eden `window.h` and `sockets.h`
+
+### Intentional differences
+- Eden uses `enum class` plus `DECLARE_ENUM_FLAG_OPERATORS`; Ruzu expresses the same flag types
+  with `bitflags!`, so their rustdoc belongs inside the macro invocation.
+
+### Unintentional differences (to fix)
+- The two type comments were attached to macro invocations rather than generated types and produced
+  no Rust documentation. They now document `NativeWindowTransform` and `PollEvents` directly.
+
+### Missing items
+- None in this documentation-placement slice.
+
+### Binary layout verification
+- PASS: flag bases and values remain unchanged (`u32` for window transform, `u16` for poll events).

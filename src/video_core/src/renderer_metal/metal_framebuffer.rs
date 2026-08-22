@@ -21,8 +21,6 @@ use super::metal_image_view::MetalImageView;
 pub enum MetalFramebufferError {
     #[error("Metal framebuffer attachments use different sample counts")]
     SampleCountMismatch,
-    #[error("rescaled Metal framebuffer attachments are not materialized")]
-    RescaledAttachmentsUnavailable,
 }
 
 /// Metal counterpart of Eden's `Framebuffer`.
@@ -66,9 +64,14 @@ impl MetalFramebuffer {
         depth_buffer: Option<&MetalImageView>,
         key: &RenderTargets,
     ) -> Result<Self, MetalFramebufferError> {
-        if key.is_rescaled {
-            return Err(MetalFramebufferError::RescaledAttachmentsUnavailable);
-        }
+        let resolution = common::settings::values().resolution_info.clone();
+        let attachment_extent = |value: u32| {
+            if key.is_rescaled {
+                resolution.scale_up_u32(value)
+            } else {
+                value
+            }
+        };
         let mut width = key.size.width;
         let mut height = key.size.height;
         let mut samples = None;
@@ -76,8 +79,8 @@ impl MetalFramebuffer {
         let mut num_color_buffers = 0;
         let color_attachments = std::array::from_fn(|index| {
             color_buffers[index].map(|view| {
-                width = width.min(view.base().size.width);
-                height = height.min(view.base().size.height);
+                width = width.min(attachment_extent(view.base().size.width));
+                height = height.min(attachment_extent(view.base().size.height));
                 layers = layers.max(view.base().range.extent.layers.max(1) as usize);
                 num_color_buffers += 1;
                 samples.get_or_insert(view.samples());
@@ -90,8 +93,8 @@ impl MetalFramebuffer {
         let mut has_depth = false;
         let mut has_stencil = false;
         if let Some(view) = depth_buffer {
-            width = width.min(view.base().size.width);
-            height = height.min(view.base().size.height);
+            width = width.min(attachment_extent(view.base().size.width));
+            height = height.min(attachment_extent(view.base().size.height));
             layers = layers.max(view.base().range.extent.layers.max(1) as usize);
             if samples.is_some_and(|value| value != view.samples()) {
                 return Err(MetalFramebufferError::SampleCountMismatch);
@@ -181,7 +184,11 @@ impl MetalFramebuffer {
     ) -> Retained<MTLRenderPassDescriptor> {
         let descriptor = self.render_pass_descriptor();
         for index in 0..NUM_RT {
-            let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(index) };
+            let attachment = unsafe {
+                descriptor
+                    .colorAttachments()
+                    .objectAtIndexedSubscript(index)
+            };
             if attachment.texture().is_some() {
                 unsafe { attachment.setSlice(layer as usize) };
             }
@@ -206,7 +213,11 @@ impl MetalFramebuffer {
         let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
         if let Some((index, value)) = clear.color {
             if let Some(texture) = self.color_attachments.get(index).and_then(Option::as_ref) {
-                let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(index) };
+                let attachment = unsafe {
+                    descriptor
+                        .colorAttachments()
+                        .objectAtIndexedSubscript(index)
+                };
                 attachment.setTexture(Some(texture));
                 attachment.setLoadAction(MTLLoadAction::Clear);
                 attachment.setStoreAction(MTLStoreAction::Store);

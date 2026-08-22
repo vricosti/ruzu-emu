@@ -335,6 +335,9 @@ pub fn configure_graphics_resources(
         view: 0,
         sampler: 0,
     };
+    // Eden's DescriptorLayoutBuilder and SPIR-V Bindings both assign one
+    // shared binding sequence across every graphics stage.
+    let mut descriptor_binding = 0u32;
 
     let vertex = prepare_stage(
         device,
@@ -348,6 +351,7 @@ pub fn configure_graphics_resources(
         &sampler_ids,
         &mut cursors,
         &mut rescaling,
+        &mut descriptor_binding,
     )?;
     for stage in 1..4 {
         advance_empty_native_stage(
@@ -355,6 +359,7 @@ pub fn configure_graphics_resources(
             &stages.stage_infos()[stage],
             &mut cursors,
             &mut rescaling,
+            &mut descriptor_binding,
         );
     }
     let fragment = if let Some(module) = stages.fragment() {
@@ -370,6 +375,7 @@ pub fn configure_graphics_resources(
             &sampler_ids,
             &mut cursors,
             &mut rescaling,
+            &mut descriptor_binding,
         )?
     } else {
         MetalPreparedStage::default()
@@ -417,7 +423,10 @@ fn read_texture_handle(
         .address
         .wrapping_add(cbuf_offset.wrapping_add(index_offset) as u64);
     if !has_secondary {
-        return Ok(texture_pair(read_word(primary_address, read_gpu), via_header));
+        return Ok(texture_pair(
+            read_word(primary_address, read_gpu),
+            via_header,
+        ));
     }
     let secondary = draw.const_buffer_binding(stage, secondary_cbuf_index as usize);
     if !secondary.enabled {
@@ -478,10 +487,11 @@ fn prepare_stage(
     sampler_ids: &[SamplerId],
     cursors: &mut StageDescriptorCursors,
     rescaling: &mut RescalingPushConstant,
+    descriptor_binding: &mut u32,
 ) -> Result<MetalPreparedStage, MetalGraphicsPipelineError> {
     let info = &stage_infos[stage];
     let mut declarations = Vec::new();
-    let mut binding = 0u32;
+    let mut binding = *descriptor_binding;
     let mut uniform_cursor = 0usize;
     for _ in &info.constant_buffer_descriptors {
         let value = graphics_buffers.uniform_buffers[stage]
@@ -551,7 +561,10 @@ fn prepare_stage(
     for descriptor in &info.image_buffer_descriptors {
         let mut textures = Vec::with_capacity(descriptor.count as usize);
         for _ in 0..descriptor.count {
-            let cached = graphics_buffers.image_buffers.get(cursors.image_buffer).cloned();
+            let cached = graphics_buffers
+                .image_buffers
+                .get(cursors.image_buffer)
+                .cloned();
             cursors.image_buffer += 1;
             textures.push(
                 cached
@@ -584,7 +597,8 @@ fn prepare_stage(
             let image_view = texture_cache.image_view(view_id);
             let texture = image_view.and_then(|view| view.retained_handle(descriptor.texture_type));
             let format = image_view.map_or(PixelFormat::Invalid, |view| view.base().format);
-            let supports_anisotropy = image_view.is_some_and(|view| view.base().supports_anisotropy());
+            let supports_anisotropy =
+                image_view.is_some_and(|view| view.base().supports_anisotropy());
             let supports_depth_comparison = image_view.is_some_and(|view| {
                 matches!(
                     get_format_type(view.base().format),
@@ -649,6 +663,8 @@ fn prepare_stage(
         binding += 1;
     }
 
+    *descriptor_binding = binding;
+
     let mut prepared = bind_reflected_layout(module.bindings(), declarations)?;
     if let Some(index) = module.bindings().push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, rescaling)));
@@ -679,9 +695,7 @@ fn bind_reflected_layout(
         bind_declaration(&mut prepared, reflected, declaration.value)?;
     }
     for reflected in &layout.resources {
-        if reflected.descriptor_set == 0
-            && !prepared_binding_exists(reflected, &prepared)
-        {
+        if reflected.descriptor_set == 0 && !prepared_binding_exists(reflected, &prepared) {
             return Err(MetalGraphicsPipelineError::MissingDescriptor(
                 reflected.binding,
             ));
@@ -706,27 +720,33 @@ fn bind_declaration(
         }
         PreparedDescriptor::Textures(textures) => {
             require_count(reflected, textures.len() as u32)?;
-            prepared.textures.extend(textures.into_iter().enumerate().map(
-                |(element, texture)| MetalStageTextureBinding {
-                    index: reflected.texture_index + element as u32,
-                    texture,
-                },
-            ));
+            prepared
+                .textures
+                .extend(textures.into_iter().enumerate().map(|(element, texture)| {
+                    MetalStageTextureBinding {
+                        index: reflected.texture_index + element as u32,
+                        texture,
+                    }
+                }));
         }
         PreparedDescriptor::Sampled { textures, samplers } => {
             require_count(reflected, textures.len() as u32)?;
-            prepared.textures.extend(textures.into_iter().enumerate().map(
-                |(element, texture)| MetalStageTextureBinding {
-                    index: reflected.texture_index + element as u32,
-                    texture,
-                },
-            ));
-            prepared.samplers.extend(samplers.into_iter().enumerate().map(
-                |(element, sampler)| MetalStageSamplerBinding {
-                    index: reflected.sampler_index + element as u32,
-                    sampler,
-                },
-            ));
+            prepared
+                .textures
+                .extend(textures.into_iter().enumerate().map(|(element, texture)| {
+                    MetalStageTextureBinding {
+                        index: reflected.texture_index + element as u32,
+                        texture,
+                    }
+                }));
+            prepared
+                .samplers
+                .extend(samplers.into_iter().enumerate().map(|(element, sampler)| {
+                    MetalStageSamplerBinding {
+                        index: reflected.sampler_index + element as u32,
+                        sampler,
+                    }
+                }));
         }
     }
     Ok(())
@@ -802,7 +822,9 @@ fn advance_empty_native_stage(
     info: &ShaderInfo,
     cursors: &mut StageDescriptorCursors,
     rescaling: &mut RescalingPushConstant,
+    descriptor_binding: &mut u32,
 ) {
+    *descriptor_binding += descriptor_binding_count(info);
     cursors.texture_buffer += num_descriptors(&info.texture_buffer_descriptors) as usize;
     cursors.image_buffer += num_descriptors(&info.image_buffer_descriptors) as usize;
     cursors.view += num_descriptors(&info.texture_buffer_descriptors) as usize;
@@ -815,5 +837,41 @@ fn advance_empty_native_stage(
     for descriptor in &info.image_descriptors {
         cursors.view += descriptor.count as usize;
         rescaling.push_image(false);
+    }
+}
+
+/// Eden `DescriptorLayoutBuilder::Add` allocates one binding per descriptor
+/// declaration. Array elements affect `descriptorCount`, not binding numbers.
+fn descriptor_binding_count(info: &ShaderInfo) -> u32 {
+    (info.constant_buffer_descriptors.len()
+        + info.storage_buffers_descriptors.len()
+        + info.texture_buffer_descriptors.len()
+        + info.image_buffer_descriptors.len()
+        + info.texture_descriptors.len()
+        + info.image_descriptors.len()) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use shader_recompiler::shader_info::{
+        ConstantBufferDescriptor, Info as ShaderInfo, StorageBufferDescriptor,
+    };
+
+    use super::descriptor_binding_count;
+
+    #[test]
+    fn descriptor_binding_count_counts_declarations_not_array_elements() {
+        let mut info = ShaderInfo::default();
+        info.constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 7 });
+        info.storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 1,
+                cbuf_offset: 0,
+                count: 3,
+                is_written: false,
+            });
+
+        assert_eq!(descriptor_binding_count(&info), 2);
     }
 }

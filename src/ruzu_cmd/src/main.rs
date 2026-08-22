@@ -1557,8 +1557,6 @@ fn main() {
         signal(15, 0);
     }
 
-    // emu_window::emu_window_sdl3::schedule_auto_lr_if_requested();
-    // emu_window::emu_window_sdl3::schedule_auto_a_if_requested();
     emu_window::emu_window_sdl3::schedule_perf_log_if_requested(emu_window_system_ref);
     log::info!("Entering main event loop");
     let poll_events_loop = std::env::var_os("RUZU_POLL_EVENTS_LOOP").is_some();

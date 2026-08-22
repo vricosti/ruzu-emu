@@ -2818,7 +2818,7 @@ impl Opcode {
             },
             Opcode::ImageQueryLod => OpcodeMeta {
                 name: "ImageQueryLod",
-                return_type: F32x2,
+                return_type: F32x4,
                 arg_types: &[Opaque, Opaque],
             },
             Opcode::ImageGradient => OpcodeMeta {
@@ -3515,6 +3515,8 @@ impl fmt::Display for Opcode {
 
 #[cfg(test)]
 mod tests {
+    use crate::ir::types::Type;
+
     use super::Opcode;
 
     #[test]
@@ -3531,5 +3533,10 @@ mod tests {
         assert!(Opcode::SetFragColor.may_have_side_effects());
         assert!(Opcode::WriteGlobal32.may_have_side_effects());
         assert!(Opcode::Barrier.may_have_side_effects());
+    }
+
+    #[test]
+    fn image_query_lod_matches_the_upstream_four_component_result() {
+        assert_eq!(Opcode::ImageQueryLod.meta().return_type, Type::F32x4);
     }
 }

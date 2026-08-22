@@ -71,6 +71,8 @@ pub enum MslError {
     UnmergedVertexA,
     #[error("MSL emission for {0} is not implemented")]
     UnsupportedStage(Stage),
+    #[error("MSL emission does not implement program feature {0}")]
+    UnsupportedProgramFeature(&'static str),
     #[error("MSL emission does not implement {opcode} at block {block} instruction {inst}")]
     UnsupportedOpcode {
         block: u32,

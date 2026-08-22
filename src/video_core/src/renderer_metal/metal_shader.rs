@@ -22,11 +22,15 @@ use spirv_cross2::targets::Msl;
 use spirv_cross2::{Compiler, Module, SpirvCrossError};
 use thiserror::Error;
 
+use shader_recompiler::backend::msl::MslError;
 pub use shader_recompiler::backend::msl::{
     MslBindingLayout as MetalShaderBindingLayout, MslResourceBinding as MetalResourceBinding,
     MslResourceKind as MetalResourceKind, MslShaderArtifact as MetalShaderArtifact,
     MslShaderSource as MetalShaderSource,
 };
+use shader_recompiler::ir::Program;
+use shader_recompiler::profile::Profile;
+use shader_recompiler::runtime_info::RuntimeInfo;
 use shader_recompiler::stage::Stage;
 
 use super::metal_device::MetalDeviceProfile;
@@ -92,6 +96,18 @@ pub enum MetalShaderError {
     LibraryCompile(String),
     #[error("Metal library does not contain entry point {0}")]
     MissingEntryPoint(String),
+}
+
+#[derive(Debug, Error)]
+pub enum DirectMslValidationError {
+    #[error(transparent)]
+    Emission(#[from] MslError),
+    #[error(transparent)]
+    Compilation(#[from] MetalShaderError),
+    #[error("direct MSL stage {direct:?} differs from active SPIR-V/MSL stage {active:?}")]
+    StageMismatch { direct: Stage, active: Stage },
+    #[error("direct MSL resource ABI differs from the active SPIR-V/MSL resource ABI")]
+    BindingLayoutMismatch,
 }
 
 /// Native shader objects retained for the lifetime of a Metal pipeline.
@@ -581,6 +597,32 @@ pub fn compile_native_msl_artifact(
     })
 }
 
+/// Compile the direct-MSL output for the same backend-neutral IR as an active
+/// SPIR-V/MSL module and verify their externally visible shader contract.
+///
+/// This function is validation-only: callers retain and use `active`, and an
+/// unsupported direct opcode is reported rather than replaced with a shader
+/// fallback.
+pub fn validate_direct_msl_against_active_module(
+    device: &ProtocolObject<dyn MTLDevice>,
+    program: &Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    active: &MetalShaderModule,
+) -> Result<MetalShaderModule, DirectMslValidationError> {
+    let artifact = shader_recompiler::backend::msl::emit_msl(program, profile, runtime_info)?;
+    if artifact.source.stage != active.source().stage {
+        return Err(DirectMslValidationError::StageMismatch {
+            direct: artifact.source.stage,
+            active: active.source().stage,
+        });
+    }
+    if artifact.bindings != *active.bindings() {
+        return Err(DirectMslValidationError::BindingLayoutMismatch);
+    }
+    Ok(compile_native_msl_artifact(device, artifact)?)
+}
+
 #[cfg(test)]
 mod tests {
     use shader_recompiler::backend::emit_spirv;
@@ -620,6 +662,12 @@ mod tests {
             size_shift: 0,
         });
         program.info.uses_rescaling_uniform = true;
+        program
+    }
+
+    fn empty_program(stage: Stage) -> Program {
+        let mut program = Program::new(stage);
+        program.blocks.push(Block::new());
         program
     }
 
@@ -735,5 +783,35 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn validates_direct_vertex_msl_against_spirv_from_the_same_ir() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let program = empty_program(Stage::VertexB);
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::default(),
+        )
+        .unwrap();
+
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .unwrap();
+
+        assert_eq!(direct.source().stage, Stage::VertexB);
+        assert_eq!(direct.bindings(), active.bindings());
     }
 }

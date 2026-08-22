@@ -1,5 +1,20 @@
 # Porting State
 
+## 2026-08-22 — Application display-version warning interrupted by metadata prerequisite
+
+- Status: interrupted before replacing the hard-coded `"1.0.0"` response in
+  `IApplicationFunctions::GetDisplayVersion`.
+- Interrupted slice: read the running applet's control metadata and return its 16-byte display
+  version, falling back to `"1.0.0"` only when metadata is unavailable.
+- Exact missing prerequisite: Eden owns the base-title/update-title fallback in the static
+  `PatchManager::GetMetadataFromBaseOrUpdate`, but Ruzu does not yet expose that method. Duplicating
+  it in AM would violate method ownership and leave the same gap in other callers.
+- Required next action: port and test `get_metadata_from_base_or_update` in
+  `file_sys/patch_manager.rs`, verify it against `patch_manager.{h,cpp}`, then resume the AM handler.
+- Prerequisite result: `PatchManager` now owns the upstream-shaped static lookup, retains the
+  filesystem controller and content-provider locks across both attempts, and falls back to the
+  update title only when the base lookup has no NACP. The AM display-version slice may resume.
+
 ## 2026-08-22 — TimeZoneService warning/parity slice
 
 - Status: warning/ownership slice completed after resolving settings, shared-time, parser and

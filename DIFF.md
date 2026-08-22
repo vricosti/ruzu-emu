@@ -7259,3 +7259,22 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: the index formula remains `MessageHeader::DATA_SIZE / 4 + spc.header_size / 4`; only the
   upstream-compatible header forwarding is restored. Existing message-buffer index and IPC copy
   tests exercise the downstream offsets.
+
+## 2026-08-22 — `src/core/src/file_sys/patch_manager.rs` vs Eden `src/core/file_sys/patch_manager.{h,cpp}`
+
+### Intentional differences
+- Rust locks the shared filesystem controller and content-provider union while both temporary
+  `PatchManager` values borrow them. Eden receives stable references directly from `Core::System`.
+- When no content provider is installed, Ruzu returns empty metadata; Eden's accessor contract
+  assumes the provider has already been initialized.
+
+### Unintentional differences (to fix)
+- Ruzu was missing `GetMetadataFromBaseOrUpdate`. The associated method now checks the application
+  title first and, only when its NACP is absent, checks `GetUpdateTitleID(application_id)`.
+
+### Missing items
+- None for this base/update metadata lookup helper.
+
+### Binary layout verification
+- N/A: the method forwards existing `NACP` and virtual-file owners without changing their layout.
+  A focused provider test verifies the exact base-then-update request order.

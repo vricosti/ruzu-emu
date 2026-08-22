@@ -7402,3 +7402,30 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: only fatal diagnostics changed. Focused tests verify the exact listener and unsupported
   transaction messages.
+
+## 2026-08-22 — `src/core/src/file_sys/fssystem/hierarchical_integrity_verification_storage.rs` vs Eden `src/core/file_sys/fssystem/fssystem_hierarchical_integrity_verification_storage.{h,cpp}`
+
+### Intentional differences
+- Rust uses `Arc::get_mut` while a verification level is exclusively owned, and a scoped closure
+  plus explicit error cleanup in place of Eden's `ON_RESULT_FAILURE` guards.
+- Rust slices make Eden's non-null read-buffer assertion implicit.
+
+### Unintentional differences (to fix)
+- An allocated `top_verify` object was never used; the existing owned level zero was initialized
+  instead. The dead allocation is removed.
+- Initialization previously recreated every verification owner and retained partial level state on
+  error. It now preserves constructor ownership and finalizes initialized levels on failure.
+- `Read` previously returned zero on an uninitialized object instead of enforcing Eden's
+  initialization precondition. It now asserts the same state contract.
+- `GetSize` previously replaced Eden's direct signed-to-unsigned `-1` bit pattern with zero while
+  uninitialized. It now returns the direct `usize` cast, yielding `usize::MAX` as upstream does.
+- Ruzu previously relied only on member destruction; `Drop` now invokes `finalize` explicitly,
+  matching Eden's destructor lifecycle.
+
+### Missing items
+- None for construction ownership, level initialization order, failure cleanup, finalization order,
+  read routing, size reporting, or the accessors defined in the matching upstream files.
+
+### Binary layout verification
+- PASS: the level-information structure is asserted to have Eden's size `0x18` and alignment `0x4`.
+  Focused tests verify failed-initialization cleanup/retry and the uninitialized `GetSize` bit pattern.

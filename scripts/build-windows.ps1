@@ -611,7 +611,7 @@ function Verify-NativeDependencies {
 }
 
 if ($PSVersionTable.PSEdition -eq "Core" -and -not $IsWindows) {
-    throw "This setup script only supports Windows."
+    throw "This build script only supports Windows."
 }
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "Ruzu requires a 64-bit Windows installation."

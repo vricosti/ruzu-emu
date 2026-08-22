@@ -9,7 +9,7 @@ The script stages the Rust executables, the dynamic vcpkg runtime, GTK/GLib
 data files, licenses and documentation under target\package. It then invokes
 the Ruzu NSIS installer definition in this directory.
 
-Run setup.bat once before this script so the x64 MSVC and vcpkg environment is
+Run build.bat once before this script so the x64 MSVC and vcpkg environment is
 available. Cargo builds SDL3 statically; GTK, FFmpeg, OpenSSL and their runtime
 DLLs come from the x64-windows-ruzu vcpkg triplet.
 #>
@@ -98,7 +98,7 @@ function Resolve-VcpkgRoot {
             return $candidate
         }
     }
-    throw "The $Triplet vcpkg tree was not found. Run setup.bat first."
+    throw "The $Triplet vcpkg tree was not found. Run build.bat first."
 }
 
 function Resolve-MakeNsis {
@@ -264,7 +264,7 @@ if ($pixbufQuery) {
 
 $compiledSchemas = Join-Path $stageDirectory "share\glib-2.0\schemas\gschemas.compiled"
 if (-not (Test-Path -LiteralPath $compiledSchemas -PathType Leaf)) {
-    throw "The staged GTK runtime has no compiled GSettings schemas. Run setup.bat again."
+    throw "The staged GTK runtime has no compiled GSettings schemas. Run build.bat again."
 }
 
 Write-Host "Staged Ruzu and $($runtimeDlls.Count) vcpkg DLLs in:"

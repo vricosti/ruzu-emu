@@ -137,9 +137,6 @@ publishes no X11 packages for NetBSD.
 
 ## Building
 
-For first-time runtime setup, including installing your own dumped keys and
-firmware, see the [ruzu quickstart guide](docs/quickstart.md).
-
 ### Requirements
 
 - Rust **1.85** or newer (the workspace `rust-version`; the platforms above were
@@ -172,8 +169,10 @@ From the root of the clone:
 ./build.sh
 ```
 
-`build.sh` dispatches to `scripts/build-linux.sh`, `scripts/build-bsd.sh` or
-`scripts/build-macos.sh` based on `uname -s`. Each one checks the platform
+`build.sh` is sufficient to install the required dependencies and build Ruzu;
+no separate Cargo command is needed. It dispatches to
+`scripts/build-linux.sh`, `scripts/build-bsd.sh` or `scripts/build-macos.sh`
+based on `uname -s`. Each one checks the platform
 dependencies, then compiles the workspace in release. The dependency step is
 idempotent, and it asks separately before installing system packages and before
 installing Rust — it will not install either without confirmation. On macOS the
@@ -187,17 +186,9 @@ Info.plist, the icon and the bundled MoltenVK.
 ./build.sh -- --bin ruzu-cmd  # everything after `--` goes to cargo
 ```
 
-### Build and run
+### Run
 
 ```sh
-cargo build --locked --bin ruzu
-./target/debug/ruzu
-```
-
-Optimized:
-
-```sh
-cargo build --locked --release --bin ruzu
 ./target/release/ruzu
 ```
 
@@ -213,9 +204,13 @@ MoltenVK under `Contents/Frameworks`, matching the upstream macOS bundle
 layout. Set `MOLTENVK_LIBRARY=/path/to/libMoltenVK.dylib` to package a specific
 MoltenVK build instead of the Homebrew installation.
 
-On Windows, first run `setup.bat` from an x64 Native Tools command prompt, then
-install [NSIS 3](https://nsis.sourceforge.io/Download) and build the portable
-runtime directory plus installer with:
+> **Windows:** `build.bat` is **IN PROGRESS** and the automated Windows build is
+> not yet considered complete.
+
+The intended Windows workflow starts by running `build.bat` from an x64 Native
+Tools command prompt. Packaging additionally requires
+[NSIS 3](https://nsis.sourceforge.io/Download); the portable runtime directory
+and installer are then generated with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dist\package-windows.ps1

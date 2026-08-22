@@ -8,6 +8,7 @@
 
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
+use crate::ir::program::Program;
 use crate::ir::types::{TextureInstInfo, Type};
 use crate::ir::value::{InstRef, Value};
 use crate::shader_info::TextureType;
@@ -104,6 +105,157 @@ fn append_fetch_coordinates(
         }
     }
     Ok(())
+}
+
+fn query_lod_coordinates(texture_type: TextureType, coords: String) -> Result<String, MslError> {
+    match texture_type {
+        TextureType::Color1D | TextureType::ColorArray1D => Err(
+            MslError::UnsupportedProgramFeature("texture LOD query on a Metal 1D texture"),
+        ),
+        TextureType::Color2D | TextureType::Color2DRect => Ok(coords),
+        TextureType::ColorArray2D => Ok(format!("({coords}).xy")),
+        TextureType::Color3D | TextureType::ColorCube => Ok(coords),
+        TextureType::ColorArrayCube => Ok(format!("({coords}).xyz")),
+        TextureType::Buffer => Err(MslError::UnsupportedProgramFeature(
+            "texture buffer LOD query",
+        )),
+    }
+}
+
+fn resolve_ir_value(program: &Program, mut value: Value) -> Value {
+    while let Value::Inst(inst_ref) = value {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != Opcode::Identity || inst.args.is_empty() {
+            break;
+        }
+        value = inst.args[0];
+    }
+    value
+}
+
+fn immediate_offset_components(program: &Program, offset: Value) -> Option<Vec<i32>> {
+    match resolve_ir_value(program, offset) {
+        Value::ImmU32(value) => Some(vec![value as i32]),
+        Value::Inst(inst_ref) => {
+            let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+            let count = match inst.opcode {
+                Opcode::CompositeConstructU32x2 => 2,
+                Opcode::CompositeConstructU32x3 => 3,
+                Opcode::CompositeConstructU32x4 => 4,
+                _ => return None,
+            };
+            inst.args
+                .iter()
+                .take(count)
+                .map(|value| match resolve_ir_value(program, *value) {
+                    Value::ImmU32(value) => Some(value as i32),
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+fn gradient_expression(
+    context: &MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    texture_type: TextureType,
+) -> Result<Option<String>, MslError> {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let derivatives = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let expected_derivatives = match texture_type {
+        TextureType::Color1D | TextureType::ColorArray1D => 1,
+        TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D => 2,
+        TextureType::Color3D | TextureType::ColorCube | TextureType::ColorArrayCube => 3,
+        TextureType::Buffer => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture buffer gradient",
+            ));
+        }
+    };
+    if info.num_derivatives != expected_derivatives {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture gradient derivative count mismatch",
+        ));
+    }
+    Ok(Some(match info.num_derivatives {
+        // MSL has no gradient1d type or texture1d gradient overload.
+        // SPIRV-Cross lowers this exact case to an implicit sample as well.
+        1 => return Ok(None),
+        2 => format!(
+            "gradient2d(float2(({derivatives}).x, ({derivatives}).z), float2(({derivatives}).y, ({derivatives}).w))"
+        ),
+        3 => {
+            let second = context.value_expression(inst.arg(3), inst_ref, 3)?;
+            let gradient = if matches!(
+                texture_type,
+                TextureType::ColorCube | TextureType::ColorArrayCube
+            ) {
+                "gradientcube"
+            } else {
+                "gradient3d"
+            };
+            format!(
+                "{gradient}(float3(({derivatives}).x, ({derivatives}).z, ({second}).x), float3(({derivatives}).y, ({derivatives}).w, ({second}).y))"
+            )
+        }
+        _ => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture gradient derivative count",
+            ));
+        }
+    }))
+}
+
+fn gradient_offset_expression(
+    program: &Program,
+    texture_type: TextureType,
+    offset: Value,
+) -> Result<Option<String>, MslError> {
+    if matches!(offset, Value::Void) {
+        return Ok(None);
+    }
+    let Some(components) = immediate_offset_components(program, offset) else {
+        // Upstream only adds ConstOffset here. Runtime TXD offsets are
+        // deliberately omitted when they cannot be proven immediate.
+        return Ok(None);
+    };
+    let spatial_components = match texture_type {
+        TextureType::Color1D | TextureType::ColorArray1D => 1,
+        TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D => 2,
+        TextureType::Color3D => 3,
+        TextureType::ColorCube | TextureType::ColorArrayCube => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "cube texture gradient offset",
+            ));
+        }
+        TextureType::Buffer => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture buffer gradient offset",
+            ));
+        }
+    };
+    if components.len() != spatial_components {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture gradient offset component count",
+        ));
+    }
+    let expression = if spatial_components == 1 {
+        components[0].to_string()
+    } else {
+        format!(
+            "int{}({})",
+            spatial_components,
+            components
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Ok(Some(expression))
 }
 
 fn validate_sample(context: &MslEmitContext, inst: &Inst) -> Result<TextureInstInfo, MslError> {
@@ -345,4 +497,105 @@ pub fn emit_image_query_dimensions(
         TextureType::Buffer => unreachable!("texture buffers were rejected above"),
     };
     context.define(inst_ref, Type::U32x4, expression, false)
+}
+
+pub fn emit_image_query_lod(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    if context.stage() != Stage::Fragment {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture LOD query outside a fragment shader",
+        ));
+    }
+    if !context.supports_query_texture_lod() {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture LOD query on the selected Metal device",
+        ));
+    }
+    let info = TextureInstInfo::from_u32(inst.flags);
+    context.validate_texture(info)?;
+    let texture = context.texture_expressions(info, inst.arg(0), inst_ref)?;
+    if texture.is_multisample {
+        return Err(MslError::UnsupportedProgramFeature(
+            "multisample texture LOD query",
+        ));
+    }
+    let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let coords = query_lod_coordinates(texture.texture_type, coords)?;
+    let clamped = format!(
+        "{}.calculate_clamped_lod({}, {coords})",
+        texture.texture, texture.sampler
+    );
+    let unclamped = format!(
+        "{}.calculate_unclamped_lod({}, {coords})",
+        texture.texture, texture.sampler
+    );
+    context.define(
+        inst_ref,
+        Type::F32x4,
+        format!("float4({clamped}, {unclamped}, 0.0f, 0.0f)"),
+        false,
+    )
+}
+
+pub fn emit_image_gradient(
+    context: &mut MslEmitContext,
+    program: &Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    if inst
+        .get_associated_pseudo(Opcode::GetSparseFromOp)
+        .is_some()
+    {
+        return Err(MslError::UnsupportedProgramFeature(
+            "sparse texture gradient",
+        ));
+    }
+    let info = TextureInstInfo::from_u32(inst.flags);
+    context.validate_texture(info)?;
+    let texture = context.texture_expressions(info, inst.arg(0), inst_ref)?;
+    if texture.is_depth || info.is_depth {
+        return Err(MslError::UnsupportedProgramFeature(
+            "depth texture used by a color gradient sample",
+        ));
+    }
+    if texture.is_multisample {
+        return Err(MslError::UnsupportedProgramFeature(
+            "multisample texture gradient",
+        ));
+    }
+    let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let mut arguments = vec![texture.sampler.clone()];
+    append_sample_coordinates(&mut arguments, texture.texture_type, coords)?;
+    let gradient = gradient_expression(context, inst_ref, inst, texture.texture_type)?;
+    if gradient.is_none() && (!matches!(inst.arg(3), Value::Void) || info.has_lod_clamp) {
+        return Err(MslError::UnsupportedProgramFeature(
+            "Metal 1D texture gradient operands",
+        ));
+    }
+    if let Some(gradient) = gradient {
+        arguments.push(gradient);
+    }
+    let offset = if info.num_derivatives != 3 {
+        gradient_offset_expression(program, texture.texture_type, *inst.arg(3))?
+    } else {
+        None
+    };
+    if info.has_lod_clamp {
+        let clamp = context.value_expression(inst.arg(4), inst_ref, 4)?;
+        arguments.push(format!("min_lod_clamp({clamp})"));
+    }
+    if let Some(offset) = offset {
+        arguments.push(offset);
+    }
+    let sample = format!("{}.sample({})", texture.texture, arguments.join(", "));
+    let expression = if texture.is_integer {
+        format!("as_type<float4>({sample})")
+    } else {
+        sample
+    };
+    context.define(inst_ref, Type::F32x4, expression, false)
 }

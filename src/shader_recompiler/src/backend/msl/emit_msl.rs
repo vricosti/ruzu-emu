@@ -563,6 +563,10 @@ fn emit_inst(
         Opcode::ImageQueryDimensions => {
             emit_msl_image::emit_image_query_dimensions(context, inst_ref, inst)
         }
+        Opcode::ImageQueryLod => emit_msl_image::emit_image_query_lod(context, inst_ref, inst),
+        Opcode::ImageGradient => {
+            emit_msl_image::emit_image_gradient(context, program, inst_ref, inst)
+        }
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -833,6 +837,166 @@ mod tests {
         program
     }
 
+    fn query_lod_program(texture_type: TextureType) -> ir::Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x3,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75), Value::ImmF32(1.0)],
+        );
+        let query = program.blocks[0].append_new_inst(
+            Opcode::ImageQueryLod,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+            ],
+        );
+        program.blocks[0].inst_mut(query).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: texture_type as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program
+    }
+
+    fn gradient_program(
+        texture_type: TextureType,
+        num_derivatives: u8,
+        with_offset: bool,
+        with_lod_clamp: bool,
+    ) -> ir::Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords_opcode = match texture_type {
+            TextureType::Color1D => Opcode::Identity,
+            TextureType::ColorArray1D | TextureType::Color2D | TextureType::Color2DRect => {
+                Opcode::CompositeConstructF32x2
+            }
+            TextureType::ColorArray2D | TextureType::Color3D | TextureType::ColorCube => {
+                Opcode::CompositeConstructF32x3
+            }
+            TextureType::ColorArrayCube => Opcode::CompositeConstructF32x4,
+            TextureType::Buffer => unreachable!(),
+        };
+        let coords = if texture_type == TextureType::Color1D {
+            Value::ImmF32(0.25)
+        } else {
+            let values = [
+                Value::ImmF32(0.25),
+                Value::ImmF32(0.5),
+                Value::ImmF32(0.75),
+                Value::ImmF32(1.0),
+            ];
+            let count = match coords_opcode {
+                Opcode::CompositeConstructF32x2 => 2,
+                Opcode::CompositeConstructF32x3 => 3,
+                Opcode::CompositeConstructF32x4 => 4,
+                _ => unreachable!(),
+            };
+            let coords = program.blocks[0].append_new_inst(coords_opcode, values[..count].to_vec());
+            Value::Inst(InstRef {
+                block: 0,
+                inst: coords,
+            })
+        };
+        let derivatives = program.blocks[0].append_new_inst(
+            if num_derivatives == 1 {
+                Opcode::CompositeConstructF32x2
+            } else {
+                Opcode::CompositeConstructF32x4
+            },
+            if num_derivatives == 1 {
+                vec![Value::ImmF32(0.1), Value::ImmF32(0.2)]
+            } else {
+                vec![
+                    Value::ImmF32(0.1),
+                    Value::ImmF32(0.2),
+                    Value::ImmF32(0.3),
+                    Value::ImmF32(0.4),
+                ]
+            },
+        );
+        let fourth_argument = if num_derivatives == 3 {
+            let second = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructF32x2,
+                vec![Value::ImmF32(0.5), Value::ImmF32(0.6)],
+            );
+            Value::Inst(InstRef {
+                block: 0,
+                inst: second,
+            })
+        } else if with_offset {
+            let offset = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(u32::MAX), Value::ImmU32(2)],
+            );
+            Value::Inst(InstRef {
+                block: 0,
+                inst: offset,
+            })
+        } else {
+            Value::Void
+        };
+        let gradient = program.blocks[0].append_new_inst(
+            Opcode::ImageGradient,
+            vec![
+                Value::ImmU32(0),
+                coords,
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: derivatives,
+                }),
+                fourth_argument,
+                if with_lod_clamp {
+                    Value::ImmF32(0.5)
+                } else {
+                    Value::Void
+                },
+            ],
+        );
+        program.blocks[0].inst_mut(gradient).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: texture_type as u8,
+            num_derivatives,
+            has_lod_clamp: with_lod_clamp,
+            ..Default::default()
+        }
+        .to_u32();
+        program
+    }
+
     #[test]
     fn emits_minimal_vertex_entry_point_without_spirv() {
         let artifact = emit_msl(
@@ -976,6 +1140,71 @@ mod tests {
         assert!(source
             .contains("uint4(tex0.get_width(), tex0.get_height(), tex0.get_array_size(), 0u)"));
         assert!(!source.contains("get_num_mip_levels"));
+    }
+
+    #[test]
+    fn emits_capability_gated_texture_lod_queries() {
+        let program = query_lod_program(TextureType::ColorArray2D);
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "texture LOD query on the selected Metal device"
+            ))
+        );
+
+        let artifact = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &MslOptions {
+                supports_query_texture_lod: true,
+                ..MslOptions::default()
+            },
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("tex0.calculate_clamped_lod(samp0, (v_0_0).xy)"));
+        assert!(source.contains("tex0.calculate_unclamped_lod(samp0, (v_0_0).xy)"));
+        assert!(source.contains(", 0.0f, 0.0f)"));
+
+        let one_dimensional = query_lod_program(TextureType::Color1D);
+        assert_eq!(
+            emit_msl_with_options(
+                &one_dimensional,
+                &Profile::default(),
+                &RuntimeInfo::default(),
+                &MslOptions {
+                    supports_query_texture_lod: true,
+                    ..MslOptions::default()
+                },
+            ),
+            Err(MslError::UnsupportedProgramFeature(
+                "texture LOD query on a Metal 1D texture"
+            ))
+        );
+    }
+
+    #[test]
+    fn emits_texture_gradients_with_upstream_derivative_packing() {
+        let two_dimensional = emit_msl(
+            &gradient_program(TextureType::Color2D, 2, true, true),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        let source = &two_dimensional.source.source;
+        assert!(source
+            .contains("gradient2d(float2((v_0_1).x, (v_0_1).z), float2((v_0_1).y, (v_0_1).w))"));
+        assert!(source.contains("int2(-1, 2)"));
+        assert!(source.contains("min_lod_clamp(as_type<float>(0x3F000000u))"));
+
+        let cube = emit_msl(
+            &gradient_program(TextureType::ColorCube, 3, false, false),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        assert!(cube.source.source.contains("gradientcube(float3("));
     }
 
     #[test]

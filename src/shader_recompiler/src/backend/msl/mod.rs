@@ -45,12 +45,16 @@ impl MslVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MslOptions {
     pub language_version: MslVersion,
+    /// Whether the selected Metal device supports the texture LOD query
+    /// methods. This is a device capability, independent of the MSL version.
+    pub supports_query_texture_lod: bool,
 }
 
 impl Default for MslOptions {
     fn default() -> Self {
         Self {
             language_version: MslVersion::V2_3,
+            supports_query_texture_lod: false,
         }
     }
 }

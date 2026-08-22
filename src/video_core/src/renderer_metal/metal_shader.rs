@@ -710,6 +710,7 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
         runtime_info,
         &shader_recompiler::backend::msl::MslOptions {
             language_version: active.language_version(),
+            supports_query_texture_lod: device.supportsQueryTextureLOD(),
         },
         bindings,
     )?;
@@ -1111,6 +1112,151 @@ mod tests {
         program
     }
 
+    fn texture_lod_query_program(texture_type: TextureType) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        program.info.uses_sampled_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        );
+        let coords = sample_coordinates(&mut program, texture_type);
+        let query = program.blocks[0]
+            .append_new_inst(Opcode::ImageQueryLod, vec![Value::ImmU32(0), coords]);
+        program.blocks[0].inst_mut(query).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
+            ..Default::default()
+        }
+        .to_u32();
+        store_sample_result(&mut program, query, true);
+        program
+    }
+
+    fn texture_gradient_program(
+        texture_type: TextureType,
+        with_offset: bool,
+        with_lod_clamp: bool,
+    ) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        program.info.uses_sampled_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        );
+        let coords = sample_coordinates(&mut program, texture_type);
+        let num_derivatives = match texture_type {
+            TextureType::Color1D | TextureType::ColorArray1D => 1,
+            TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D => 2,
+            TextureType::Color3D | TextureType::ColorCube | TextureType::ColorArrayCube => 3,
+            TextureType::Buffer => unreachable!(),
+        };
+        let derivatives = program.blocks[0].append_new_inst(
+            if num_derivatives == 1 {
+                Opcode::CompositeConstructF32x2
+            } else {
+                Opcode::CompositeConstructF32x4
+            },
+            if num_derivatives == 1 {
+                vec![Value::ImmF32(0.1), Value::ImmF32(0.2)]
+            } else {
+                vec![
+                    Value::ImmF32(0.1),
+                    Value::ImmF32(0.2),
+                    Value::ImmF32(0.3),
+                    Value::ImmF32(0.4),
+                ]
+            },
+        );
+        let fourth_argument = if num_derivatives == 3 {
+            let second = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructF32x2,
+                vec![Value::ImmF32(0.5), Value::ImmF32(0.6)],
+            );
+            Value::Inst(InstRef {
+                block: 0,
+                inst: second,
+            })
+        } else if with_offset {
+            if num_derivatives == 1 {
+                Value::ImmU32(u32::MAX)
+            } else {
+                let offset = program.blocks[0].append_new_inst(
+                    Opcode::CompositeConstructU32x2,
+                    vec![Value::ImmU32(u32::MAX), Value::ImmU32(2)],
+                );
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: offset,
+                })
+            }
+        } else {
+            Value::Void
+        };
+        let gradient = program.blocks[0].append_new_inst(
+            Opcode::ImageGradient,
+            vec![
+                Value::ImmU32(0),
+                coords,
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: derivatives,
+                }),
+                fourth_argument,
+                if with_lod_clamp {
+                    Value::ImmF32(0.5)
+                } else {
+                    Value::Void
+                },
+            ],
+        );
+        program.blocks[0].inst_mut(gradient).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
+            num_derivatives,
+            has_lod_clamp: with_lod_clamp,
+            ..Default::default()
+        }
+        .to_u32();
+        store_sample_result(&mut program, gradient, true);
+        program
+    }
+
     fn empty_program(stage: Stage) -> Program {
         let mut program = Program::new(stage);
         program.blocks.push(Block::new());
@@ -1198,6 +1344,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
             },
         )
         .expect("minimal compute IR must lower directly to MSL");
@@ -1241,6 +1388,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
             },
         )
         .expect("supported vertex IR must lower directly to MSL");
@@ -1351,6 +1499,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
             },
         )
         .expect("scalar IR must lower directly to MSL");
@@ -1466,6 +1615,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
             },
         )
         .expect("native half/int64 IR must lower directly to MSL when supported");
@@ -1789,6 +1939,126 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_texture_lod_queries_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        if !device.profile().supports_query_texture_lod {
+            return;
+        }
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for texture_type in [
+            TextureType::Color2D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+            TextureType::Color3D,
+            TextureType::ColorCube,
+            TextureType::ColorArrayCube,
+        ] {
+            let program = texture_lod_query_program(texture_type);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::for_device(device.profile()),
+            )
+            .unwrap_or_else(|error| {
+                panic!("active {texture_type:?} LOD query must compile: {error}")
+            });
+            assert!(active.source().source.contains("calculate_clamped_lod"));
+            assert!(active.source().source.contains("calculate_unclamped_lod"));
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct {texture_type:?} LOD query must compile: {error}")
+            });
+            assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
+            assert!(direct.source().source.contains(".calculate_clamped_lod("));
+            assert!(direct.source().source.contains(".calculate_unclamped_lod("));
+        }
+    }
+
+    #[test]
+    fn compiles_direct_texture_gradients_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for texture_type in [
+            TextureType::Color1D,
+            TextureType::ColorArray1D,
+            TextureType::Color2D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+            TextureType::Color3D,
+            TextureType::ColorCube,
+            TextureType::ColorArrayCube,
+        ] {
+            let program = texture_gradient_program(texture_type, false, false);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::for_device(device.profile()),
+            )
+            .unwrap_or_else(|error| {
+                panic!("active {texture_type:?} gradient must compile: {error}")
+            });
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "direct {texture_type:?} gradient must compile: {error}\nactive MSL:\n{}",
+                    active.source().source
+                )
+            });
+            assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
+            if matches!(
+                texture_type,
+                TextureType::Color1D | TextureType::ColorArray1D
+            ) {
+                assert!(!direct.source().source.contains("gradient1d"));
+            } else {
+                assert!(direct.source().source.contains("gradient"));
+            }
+        }
+
+        let program = texture_gradient_program(TextureType::Color2D, true, true);
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active 2D offset/clamped gradient must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct 2D offset/clamped gradient must compile");
+        assert!(direct.source().source.contains("int2(-1, 2)"));
+        assert!(direct.source().source.contains("min_lod_clamp("));
+    }
+
+    #[test]
     fn compiles_direct_multisample_fetch_at_msl_2_3_baseline() {
         let Ok(device) = MetalDevice::new() else {
             return;
@@ -1800,6 +2070,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
             },
         )
         .expect("multisample fetch must lower at the MSL 2.3 baseline");
@@ -2033,6 +2304,7 @@ mod tests {
             &runtime_info,
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
             },
         )
         .unwrap();

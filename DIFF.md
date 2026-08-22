@@ -7201,3 +7201,25 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: each pointer descriptor is still decoded from the same two `u32` words and encoded into the
   same destination offsets. Existing focused tests cover send copying, receive linear-to-user
   copying, receive heap-to-heap copying, and end-to-end request pointer payload transfer.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_condition_variable.rs` vs Eden `src/core/hle/kernel/k_condition_variable.{h,cpp}`
+
+### Intentional differences
+- `signal_to_address` returns the next-owner handle together with the result when releasing Ruzu's
+  process mutex; the scheduler guard remains live through `end_wait`, preserving Eden's ordering
+  without nesting the process mutex around the Rust thread lock.
+- The active condition-variable wait queue is constructed in `wait_locked_after_sleep_guard`, where
+  Ruzu's split implementation calls `BeginWait`. Eden constructs its stack queue at `Wait` entry.
+
+### Unintentional differences (to fix)
+- `signal_to_address` initialized `next_owner_thread` to `None` before unconditionally replacing it.
+  The redundant initialization is removed by returning `(result, next_owner_thread)` from the
+  process-locked section.
+- `wait_locked` constructed a second queue that was never configured or passed to `BeginWait`; the
+  unused duplicate is removed.
+
+### Missing items
+- None for the owner-transfer or wait-queue lifetimes changed by this cleanup.
+
+### Binary layout verification
+- N/A: condition-variable ownership and queues are host kernel state; no raw payload layout changes.

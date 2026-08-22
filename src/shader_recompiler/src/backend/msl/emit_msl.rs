@@ -137,7 +137,6 @@ fn first_unsupported_program_feature(
     if info.uses_fp32_denorms_flush
         || info.uses_fp32_denorms_preserve
         || info.uses_image_1d
-        || info.uses_sampled_1d
         || info.uses_sparse_residency
         || info.uses_demote_to_helper_invocation
         || info.uses_fswzadd
@@ -145,7 +144,6 @@ fn first_unsupported_program_feature(
         || info.uses_typeless_image_reads
         || info.uses_typeless_image_writes
         || info.uses_image_buffers
-        || info.uses_shadow_lod
         || info.uses_rescaling_uniform
         || info.uses_cbuf_indirect
         || info.uses_render_area
@@ -557,6 +555,9 @@ fn emit_inst(
         | Opcode::WriteStorage128 => emit_msl_memory::emit_write_storage(context, inst_ref, inst),
         Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
             emit_msl_image::emit_image_sample(context, inst_ref, inst)
+        }
+        Opcode::ImageSampleDrefImplicitLod | Opcode::ImageSampleDrefExplicitLod => {
+            emit_msl_image::emit_image_sample_dref(context, inst_ref, inst)
         }
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {

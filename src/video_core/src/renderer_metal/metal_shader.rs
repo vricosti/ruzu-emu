@@ -774,11 +774,84 @@ mod tests {
         program
     }
 
-    fn sampled_texture_program(texture_count: u32) -> Program {
+    fn sample_coordinates(program: &mut Program, texture_type: TextureType) -> Value {
+        match texture_type {
+            TextureType::Color1D => Value::ImmF32(0.25),
+            TextureType::ColorArray1D | TextureType::Color2D | TextureType::Color2DRect => {
+                let coords = program.blocks[0].append_new_inst(
+                    Opcode::CompositeConstructF32x2,
+                    vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+                );
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                })
+            }
+            TextureType::ColorArray2D | TextureType::Color3D | TextureType::ColorCube => {
+                let coords = program.blocks[0].append_new_inst(
+                    Opcode::CompositeConstructF32x3,
+                    vec![Value::ImmF32(0.25), Value::ImmF32(0.5), Value::ImmF32(0.75)],
+                );
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                })
+            }
+            TextureType::ColorArrayCube => {
+                let coords = program.blocks[0].append_new_inst(
+                    Opcode::CompositeConstructF32x4,
+                    vec![
+                        Value::ImmF32(0.25),
+                        Value::ImmF32(0.5),
+                        Value::ImmF32(0.75),
+                        Value::ImmF32(1.0),
+                    ],
+                );
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                })
+            }
+            TextureType::Buffer => unreachable!("sampled texture test does not use buffers"),
+        }
+    }
+
+    fn store_sample_result(program: &mut Program, sample: u32, vector: bool) {
+        program.info.stores_frag_color[0] = true;
+        for component in 0..4 {
+            let value = if vector {
+                let extracted = program.blocks[0].append_new_inst(
+                    Opcode::CompositeExtractF32x4,
+                    vec![
+                        Value::Inst(InstRef {
+                            block: 0,
+                            inst: sample,
+                        }),
+                        Value::ImmU32(component),
+                    ],
+                );
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: extracted,
+                })
+            } else {
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: sample,
+                })
+            };
+            program.blocks[0].append_new_inst(
+                Opcode::SetFragColor,
+                vec![Value::ImmU32(0), Value::ImmU32(component), value],
+            );
+        }
+    }
+
+    fn sampled_texture_program(texture_count: u32, texture_type: TextureType) -> Program {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
-            texture_type: TextureType::Color2D,
+            texture_type,
             is_depth: false,
             is_multisample: false,
             is_integer: false,
@@ -792,63 +865,74 @@ mod tests {
             count: texture_count,
             size_shift: 0,
         });
-        let coords = program.blocks[0].append_new_inst(
-            Opcode::CompositeConstructF32x2,
-            vec![Value::ImmF32(0.25), Value::ImmF32(0.0)],
+        program.info.uses_sampled_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
         );
-        let coords = program.blocks[0].append_new_inst(
-            Opcode::CompositeInsertF32x2,
-            vec![
-                Value::Inst(InstRef {
-                    block: 0,
-                    inst: coords,
-                }),
-                Value::ImmF32(0.75),
-                Value::ImmU32(1),
-            ],
-        );
+        let coords = sample_coordinates(&mut program, texture_type);
         let sample = program.blocks[0].append_new_inst(
             Opcode::ImageSampleExplicitLod,
             vec![
                 Value::ImmU32(texture_count.saturating_sub(1)),
-                Value::Inst(InstRef {
-                    block: 0,
-                    inst: coords,
-                }),
+                coords,
                 Value::ImmF32(1.0),
                 Value::Void,
             ],
         );
         program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
             descriptor_index: 0,
-            texture_type: TextureType::Color2D as u8,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
             ..Default::default()
         }
         .to_u32();
-        program.info.stores_frag_color[0] = true;
-        for component in 0..4 {
-            let extracted = program.blocks[0].append_new_inst(
-                Opcode::CompositeExtractF32x4,
-                vec![
-                    Value::Inst(InstRef {
-                        block: 0,
-                        inst: sample,
-                    }),
-                    Value::ImmU32(component),
-                ],
-            );
-            program.blocks[0].append_new_inst(
-                Opcode::SetFragColor,
-                vec![
-                    Value::ImmU32(0),
-                    Value::ImmU32(component),
-                    Value::Inst(InstRef {
-                        block: 0,
-                        inst: extracted,
-                    }),
-                ],
-            );
+        store_sample_result(&mut program, sample, true);
+        program
+    }
+
+    fn depth_sampled_texture_program(texture_type: TextureType) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth: true,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        program.info.uses_shadow_lod = true;
+        let coords = sample_coordinates(&mut program, texture_type);
+        let sample = program.blocks[0].append_new_inst(
+            Opcode::ImageSampleDrefExplicitLod,
+            vec![
+                Value::ImmU32(0),
+                coords,
+                Value::ImmF32(0.5),
+                Value::ImmF32(1.0),
+                Value::Void,
+            ],
+        );
+        program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
+            is_depth: true,
+            ..Default::default()
         }
+        .to_u32();
+        store_sample_result(&mut program, sample, false);
         program
     }
 
@@ -1301,7 +1385,7 @@ mod tests {
         let Ok(device) = MetalDevice::new() else {
             return;
         };
-        let program = sampled_texture_program(2);
+        let program = sampled_texture_program(2, TextureType::Color2D);
         let profile = make_shader_profile(device.profile());
         let runtime_info = RuntimeInfo::default();
         let spirv = emit_spirv(&program, &profile, &runtime_info);
@@ -1331,6 +1415,87 @@ mod tests {
             .source()
             .source
             .contains("array<texture2d<float>, 2> tex0"));
+    }
+
+    #[test]
+    fn compiles_direct_sampled_texture_dimensions_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for texture_type in [
+            TextureType::Color1D,
+            TextureType::ColorArray1D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+            TextureType::Color3D,
+            TextureType::ColorCube,
+            TextureType::ColorArrayCube,
+        ] {
+            let program = sampled_texture_program(1, texture_type);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("active {texture_type:?} SPIR-V/MSL must compile: {error}")
+            });
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct {texture_type:?} MSL must compile with active ABI: {error}")
+            });
+            assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
+        }
+    }
+
+    #[test]
+    fn compiles_direct_depth_sample_dimensions_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for texture_type in [
+            TextureType::Color2D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+            TextureType::ColorCube,
+            TextureType::ColorArrayCube,
+        ] {
+            let program = depth_sampled_texture_program(texture_type);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("active depth {texture_type:?} SPIR-V/MSL must compile: {error}")
+            });
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct depth {texture_type:?} MSL must compile with active ABI: {error}")
+            });
+            assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
+            assert!(direct.source().source.contains(".sample_compare("));
+        }
     }
 
     #[test]

@@ -46,7 +46,16 @@ struct MslTextureDefinition {
     sampler_name: String,
     texture_type: TextureType,
     count: u32,
+    is_depth: bool,
     is_integer: bool,
+}
+
+pub(super) struct MslTextureExpressions {
+    pub texture: String,
+    pub sampler: String,
+    pub texture_type: TextureType,
+    pub is_depth: bool,
+    pub is_integer: bool,
 }
 
 impl MslEmitContext {
@@ -229,14 +238,9 @@ impl MslEmitContext {
         bindings: &mut MslBindingLayout,
         parameters: &mut Vec<String>,
     ) -> Result<MslTextureDefinition, MslError> {
-        if descriptor.texture_type != TextureType::Color2D {
+        if descriptor.texture_type == TextureType::Buffer {
             return Err(MslError::UnsupportedProgramFeature(
-                "sampled texture type other than Color2D",
-            ));
-        }
-        if descriptor.is_depth {
-            return Err(MslError::UnsupportedProgramFeature(
-                "depth texture descriptor",
+                "texture buffer in sampled texture descriptors",
             ));
         }
         if descriptor.is_multisample {
@@ -247,6 +251,11 @@ impl MslEmitContext {
         if descriptor.count == 0 {
             return Err(MslError::UnsupportedProgramFeature(
                 "zero-sized texture descriptor array",
+            ));
+        }
+        if descriptor.is_depth && descriptor.is_integer {
+            return Err(MslError::UnsupportedProgramFeature(
+                "integer depth texture descriptor",
             ));
         }
 
@@ -267,12 +276,37 @@ impl MslEmitContext {
 
         let texture_name = format!("tex{descriptor_index}");
         let sampler_name = format!("samp{descriptor_index}");
-        let component = if descriptor.is_integer {
-            "uint"
+        let texture_type = if descriptor.is_depth {
+            let texture_class = match descriptor.texture_type {
+                TextureType::Color2D | TextureType::Color2DRect => "depth2d",
+                TextureType::ColorArray2D => "depth2d_array",
+                TextureType::ColorCube => "depthcube",
+                TextureType::ColorArrayCube => "depthcube_array",
+                _ => {
+                    return Err(MslError::UnsupportedProgramFeature(
+                        "depth texture dimension unsupported by Metal",
+                    ));
+                }
+            };
+            format!("{texture_class}<float>")
         } else {
-            "float"
+            let component = if descriptor.is_integer {
+                "uint"
+            } else {
+                "float"
+            };
+            let texture_class = match descriptor.texture_type {
+                TextureType::Color1D => "texture1d",
+                TextureType::ColorArray1D => "texture1d_array",
+                TextureType::Color2D | TextureType::Color2DRect => "texture2d",
+                TextureType::ColorArray2D => "texture2d_array",
+                TextureType::Color3D => "texture3d",
+                TextureType::ColorCube => "texturecube",
+                TextureType::ColorArrayCube => "texturecube_array",
+                TextureType::Buffer => unreachable!("texture buffers were rejected above"),
+            };
+            format!("{texture_class}<{component}>")
         };
-        let texture_type = format!("texture2d<{component}>");
         if descriptor.count > 1 {
             parameters.push(format!(
                 "array<{texture_type}, {}> {texture_name} [[texture({texture_index})]]",
@@ -295,6 +329,7 @@ impl MslEmitContext {
             sampler_name,
             texture_type: descriptor.texture_type,
             count: descriptor.count,
+            is_depth: descriptor.is_depth,
             is_integer: descriptor.is_integer,
         })
     }
@@ -311,7 +346,11 @@ impl MslEmitContext {
             .textures
             .get(info.descriptor_index as usize)
             .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
-        if definition.texture_type != TextureType::from_u8(info.texture_type) {
+        let instruction_type = TextureType::from_u8(info.texture_type);
+        let matches = definition.texture_type == instruction_type
+            || (definition.texture_type == TextureType::Color2DRect
+                && instruction_type == TextureType::Color2D);
+        if !matches {
             return Err(MslError::UnsupportedProgramFeature(
                 "texture instruction/descriptor type mismatch",
             ));
@@ -324,24 +363,28 @@ impl MslEmitContext {
         info: crate::ir::types::TextureInstInfo,
         index: &Value,
         inst_ref: InstRef,
-    ) -> Result<(String, String, bool), MslError> {
+    ) -> Result<MslTextureExpressions, MslError> {
         let definition = self
             .textures
             .get(info.descriptor_index as usize)
             .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
         if definition.count == 1 {
-            return Ok((
-                definition.texture_name.clone(),
-                definition.sampler_name.clone(),
-                definition.is_integer,
-            ));
+            return Ok(MslTextureExpressions {
+                texture: definition.texture_name.clone(),
+                sampler: definition.sampler_name.clone(),
+                texture_type: definition.texture_type,
+                is_depth: definition.is_depth,
+                is_integer: definition.is_integer,
+            });
         }
         let index = self.value_expression(index, inst_ref, 0)?;
-        Ok((
-            format!("{}[{index}]", definition.texture_name),
-            format!("{}[{index}]", definition.sampler_name),
-            definition.is_integer,
-        ))
+        Ok(MslTextureExpressions {
+            texture: format!("{}[{index}]", definition.texture_name),
+            sampler: format!("{}[{index}]", definition.sampler_name),
+            texture_type: definition.texture_type,
+            is_depth: definition.is_depth,
+            is_integer: definition.is_integer,
+        })
     }
 
     pub fn constant_buffer_element_expression(

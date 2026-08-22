@@ -20,6 +20,7 @@ use super::emit_msl_convert;
 use super::emit_msl_floating_point;
 use super::emit_msl_integer;
 use super::emit_msl_logical;
+use super::emit_msl_memory;
 use super::emit_msl_select;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
@@ -73,12 +74,13 @@ fn first_unsupported_program_feature(
     {
         return Some("stage inputs or outputs");
     }
-    if !info.storage_buffers_descriptors.is_empty()
-        || !info.texture_buffer_descriptors.is_empty()
+    if !info.storage_buffers_descriptors.is_empty() && profile.support_descriptor_aliasing {
+        return Some("descriptor-aliasing storage buffers");
+    }
+    if !info.texture_buffer_descriptors.is_empty()
         || !info.image_buffer_descriptors.is_empty()
         || !info.texture_descriptors.is_empty()
         || !info.image_descriptors.is_empty()
-        || info.used_storage_buffer_types != 0
     {
         return Some("resource bindings");
     }
@@ -507,6 +509,20 @@ fn emit_inst(
         | Opcode::GetCbufU32
         | Opcode::GetCbufF32
         | Opcode::GetCbufU32x2 => emit_msl_context_get_set::emit_get_cbuf(context, inst_ref, inst),
+        Opcode::LoadStorageU8
+        | Opcode::LoadStorageS8
+        | Opcode::LoadStorageU16
+        | Opcode::LoadStorageS16
+        | Opcode::LoadStorage32
+        | Opcode::LoadStorage64
+        | Opcode::LoadStorage128 => emit_msl_memory::emit_load_storage(context, inst_ref, inst),
+        Opcode::WriteStorageU8
+        | Opcode::WriteStorageS8
+        | Opcode::WriteStorageU16
+        | Opcode::WriteStorageS16
+        | Opcode::WriteStorage32
+        | Opcode::WriteStorage64
+        | Opcode::WriteStorage128 => emit_msl_memory::emit_write_storage(context, inst_ref, inst),
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -836,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_storage_resources_even_without_instructions() {
+    fn rejects_descriptor_aliasing_storage_resources() {
         let mut program = empty_program(Stage::Fragment);
         program.info.storage_buffers_descriptors.push(
             crate::shader_info::StorageBufferDescriptor {
@@ -847,9 +863,15 @@ mod tests {
             },
         );
 
+        let profile = Profile {
+            support_descriptor_aliasing: true,
+            ..Profile::default()
+        };
         assert_eq!(
-            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
-            Err(MslError::UnsupportedProgramFeature("resource bindings"))
+            emit_msl(&program, &profile, &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "descriptor-aliasing storage buffers"
+            ))
         );
     }
 
@@ -941,6 +963,163 @@ mod tests {
             .source
             .source
             .contains("uint v_0_1 = c2[((v_0_0) >> 4u)][(((v_0_0) >> 2u) & 3u)];"));
+    }
+
+    #[test]
+    fn emits_non_aliasing_storage_buffer_memory_and_direct_binding_abi() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 2,
+                is_written: true,
+            },
+        );
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        program.info.used_storage_buffer_types = crate::ir::Type::U8 as u32
+            | crate::ir::Type::U16 as u32
+            | crate::ir::Type::U32 as u32
+            | crate::ir::Type::U32x2 as u32
+            | crate::ir::Type::U32x4 as u32;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(
+            Opcode::LoadStorageU8,
+            vec![Value::ImmU32(0), Value::ImmU32(1)],
+        );
+        block.append_new_inst(
+            Opcode::LoadStorageS16,
+            vec![Value::ImmU32(1), Value::ImmU32(2)],
+        );
+        block.append_new_inst(
+            Opcode::LoadStorage32,
+            vec![Value::ImmU32(0), Value::ImmU32(4)],
+        );
+        let load64 = block.append_new_inst(
+            Opcode::LoadStorage64,
+            vec![Value::ImmU32(0), Value::ImmU32(8)],
+        );
+        let load128 = block.append_new_inst(
+            Opcode::LoadStorage128,
+            vec![Value::ImmU32(0), Value::ImmU32(16)],
+        );
+        block.append_new_inst(
+            Opcode::WriteStorageU8,
+            vec![Value::ImmU32(0), Value::ImmU32(3), Value::ImmU32(0xAB)],
+        );
+        block.append_new_inst(
+            Opcode::WriteStorageU16,
+            vec![Value::ImmU32(0), Value::ImmU32(6), Value::ImmU32(0xCDEF)],
+        );
+        block.append_new_inst(
+            Opcode::WriteStorage32,
+            vec![Value::ImmU32(0), Value::ImmU32(4), Value::ImmU32(7)],
+        );
+        block.append_new_inst(
+            Opcode::WriteStorage64,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(8),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load64,
+                }),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::WriteStorage128,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(16),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load128,
+                }),
+            ],
+        );
+
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let mut bindings = Bindings {
+            unified: 5,
+            ..Bindings::default()
+        };
+        let artifact =
+            emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
+                .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("kernel void main0(device uint* ssbo0 [[buffer(0)]])"));
+        assert!(source.contains("extract_bits(ssbo0[0u], 8u, 8u)"));
+        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(ssbo0[0u]), 16u, 16u))"));
+        assert!(source.contains("uint v_0_2 = ssbo0[1u];"));
+        assert!(source.contains("uint2 v_0_3 = uint2(ssbo0[2u], ssbo0[3u]);"));
+        assert!(source.contains("uint4 v_0_4 = uint4(ssbo0[4u], ssbo0[5u], ssbo0[6u], ssbo0[7u]);"));
+        assert!(source.contains("spvWriteStorageBits(&ssbo0[0u], 0x000000ABu, 24u, 8u);"));
+        assert!(source.contains("spvWriteStorageBits(&ssbo0[1u], 0x0000CDEFu, 16u, 16u);"));
+        assert!(source.contains("ssbo0[1u] = 0x00000007u;"));
+        assert!(source.contains("ssbo0[2u] = v_0_3.x;"));
+        assert!(source.contains("ssbo0[7u] = v_0_4.w;"));
+        assert!(source.contains("atomic_compare_exchange_weak_explicit"));
+        assert_eq!(bindings.unified, 7);
+        assert_eq!(artifact.bindings.buffer_count, 1);
+        assert_eq!(artifact.bindings.resources.len(), 1);
+        assert_eq!(artifact.bindings.resources[0].binding, 5);
+        assert_eq!(
+            artifact.bindings.resources[0].kind,
+            MslResourceKind::StorageBuffer
+        );
+        assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
+        assert_eq!(artifact.bindings.resources[0].count, None);
+    }
+
+    #[test]
+    fn dynamic_storage_offsets_follow_the_upstream_word_index_path() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        program.info.used_storage_buffer_types = crate::ir::Type::U32 as u32;
+        let offset = program.blocks[0]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(8), Value::ImmU32(4)]);
+        program.blocks[0].append_new_inst(
+            Opcode::LoadStorage32,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: offset,
+                }),
+            ],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::WriteStorage32,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: offset,
+                }),
+                Value::ImmU32(7),
+            ],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("uint v_0_1 = ssbo0[((v_0_0) >> 2u)];"));
+        assert!(artifact
+            .source
+            .source
+            .contains("ssbo0[((v_0_0) >> 2u)] = 0x00000007u;"));
     }
 
     #[test]

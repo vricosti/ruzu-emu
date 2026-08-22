@@ -740,7 +740,7 @@ mod tests {
     use shader_recompiler::profile::Profile;
     use shader_recompiler::runtime_info::RuntimeInfo;
     use shader_recompiler::shader_info::{
-        ConstantBufferDescriptor, TextureDescriptor, TextureType,
+        ConstantBufferDescriptor, StorageBufferDescriptor, TextureDescriptor, TextureType,
     };
     use shader_recompiler::stage::Stage;
 
@@ -1331,5 +1331,121 @@ mod tests {
         }
         assert_eq!(spirv_bindings.unified, 2);
         assert_eq!(direct_bindings.unified, 2);
+    }
+
+    #[test]
+    fn compiles_and_validates_direct_storage_buffer_msl() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let mut program = empty_program(Stage::Compute);
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 2,
+                is_written: true,
+            });
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        program.info.used_storage_buffer_types = shader_recompiler::ir::Type::U8 as u32
+            | shader_recompiler::ir::Type::U16 as u32
+            | shader_recompiler::ir::Type::U32 as u32
+            | shader_recompiler::ir::Type::U32x2 as u32
+            | shader_recompiler::ir::Type::U32x4 as u32;
+        program.blocks[0].append_new_inst(
+            Opcode::LoadStorageU8,
+            vec![Value::ImmU32(1), Value::ImmU32(1)],
+        );
+        let load64 = program.blocks[0].append_new_inst(
+            Opcode::LoadStorage64,
+            vec![Value::ImmU32(0), Value::ImmU32(8)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::WriteStorage32,
+            vec![Value::ImmU32(0), Value::ImmU32(4), Value::ImmU32(0x1234)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::WriteStorage64,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(16),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load64,
+                }),
+            ],
+        );
+
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+        )
+        .unwrap();
+
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .unwrap();
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(direct.bindings().resources.len(), 2);
+        assert_eq!(
+            direct.bindings().resources[1].kind,
+            MetalResourceKind::StorageBuffer
+        );
+        assert!(direct
+            .source()
+            .source
+            .contains("device uint* ssbo0 [[buffer(1)]]"));
+
+        let mut subword_program = empty_program(Stage::Compute);
+        subword_program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            });
+        subword_program.info.uses_int16 = true;
+        subword_program.info.used_storage_buffer_types = shader_recompiler::ir::Type::U16 as u32;
+        subword_program.blocks[0].append_new_inst(
+            Opcode::WriteStorageU16,
+            vec![Value::ImmU32(0), Value::ImmU32(2), Value::ImmU32(0x1234)],
+        );
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &subword_program,
+            &profile,
+            &runtime_info,
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+            },
+        )
+        .unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("atomic_compare_exchange_weak_explicit"));
+        compile_native_msl_artifact(device.device(), artifact).unwrap();
     }
 }

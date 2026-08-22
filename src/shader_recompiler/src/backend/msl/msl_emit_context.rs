@@ -26,11 +26,13 @@ pub struct MslEmitContext {
     source: String,
     definitions: HashMap<InstRef, String>,
     constant_buffers: HashMap<u32, String>,
+    storage_buffers: HashMap<u32, String>,
     bindings: MslBindingLayout,
     returns_output: bool,
     uses_no_contraction_add: bool,
     uses_no_contraction_mul: bool,
     uses_no_contraction_fma: bool,
+    uses_storage_subword_cas: bool,
     language_version: MslVersion,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
@@ -54,6 +56,7 @@ impl MslEmitContext {
 
         let mut bindings = MslBindingLayout::default();
         let mut constant_buffers = HashMap::new();
+        let mut storage_buffers = HashMap::new();
         let mut parameters = Vec::new();
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
@@ -82,6 +85,33 @@ impl MslEmitContext {
             let name = format!("c{}", descriptor.index);
             parameters.push(format!("constant uint4* {name} [[buffer({buffer_index})]]"));
             constant_buffers.insert(descriptor.index, name);
+        }
+        let binding_counter = if profile.unified_descriptor_binding {
+            &mut binding_counters.unified
+        } else {
+            &mut binding_counters.storage_buffer
+        };
+        let mut storage_index = 0u32;
+        for descriptor in &program.info.storage_buffers_descriptors {
+            let descriptor_binding = *binding_counter;
+            *binding_counter += descriptor.count;
+            let buffer_index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.resources.push(MslResourceBinding {
+                descriptor_set: 0,
+                binding: descriptor_binding,
+                kind: MslResourceKind::StorageBuffer,
+                buffer_index,
+                texture_index: 0,
+                sampler_index: 0,
+                count: None,
+            });
+            let name = format!("ssbo{storage_index}");
+            parameters.push(format!("device uint* {name} [[buffer({buffer_index})]]"));
+            for alias in 0..descriptor.count {
+                storage_buffers.insert(storage_index + alias, name.clone());
+            }
+            storage_index += descriptor.count;
         }
         let parameters = parameters.join(", ");
         let mut source = String::new();
@@ -128,11 +158,13 @@ impl MslEmitContext {
             source,
             definitions: HashMap::new(),
             constant_buffers,
+            storage_buffers,
             bindings,
             returns_output,
             uses_no_contraction_add: false,
             uses_no_contraction_mul: false,
             uses_no_contraction_fma: false,
+            uses_storage_subword_cas: false,
             language_version: options.language_version,
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
@@ -149,6 +181,7 @@ impl MslEmitContext {
             Type::F16 => Ok("half"),
             Type::F32 => Ok("float"),
             Type::U32x2 => Ok("uint2"),
+            Type::U32x4 => Ok("uint4"),
             _ => Err(MslError::UnsupportedType(ty)),
         }
     }
@@ -196,8 +229,38 @@ impl MslEmitContext {
             (Value::ImmU32(offset), 16) => format!("{}u", ((offset / 2) % 2) * 16),
             (_, 8) => format!("((({expression}) << 3u) & 24u)"),
             (_, 16) => format!("((({expression}) << 3u) & 16u)"),
-            _ => unreachable!("CBUF extraction width must be 8 or 16"),
+            _ => unreachable!("subword extraction width must be 8 or 16"),
         })
+    }
+
+    pub fn storage_buffer_word_expression(
+        &self,
+        inst_ref: InstRef,
+        binding: u32,
+        offset: &Value,
+        word_offset: u32,
+    ) -> Result<String, MslError> {
+        let name = self
+            .storage_buffers
+            .get(&binding)
+            .ok_or(MslError::MissingStorageBuffer(binding))?;
+        let offset_expression = self.value_expression(offset, inst_ref, 1)?;
+        let index = match offset {
+            Value::ImmU32(offset) => format!("{}u", offset / 4 + word_offset),
+            _ if word_offset == 0 => format!("(({offset_expression}) >> 2u)"),
+            _ => format!("((({offset_expression}) >> 2u) + {word_offset}u)"),
+        };
+        Ok(format!("{name}[{index}]"))
+    }
+
+    pub fn emit_statement(&mut self, statement: &str) {
+        self.source.push_str("    ");
+        self.source.push_str(statement);
+        self.source.push('\n');
+    }
+
+    pub fn require_storage_subword_cas(&mut self) {
+        self.uses_storage_subword_cas = true;
     }
 
     fn unsupported_value_name(value: &Value) -> &'static str {
@@ -402,6 +465,20 @@ impl MslEmitContext {
                 "template<typename T>\n",
                 "[[clang::optnone]] T spvFma(T a, T b, T c) {\n",
                 "    return fma(a, b, c);\n",
+                "}\n\n",
+            ));
+        }
+        if self.uses_storage_subword_cas {
+            source.push_str(concat!(
+                "inline void spvWriteStorageBits(device uint* pointer, uint value, uint bit_offset, uint bit_count) {\n",
+                "    device atomic_uint* atomic_pointer = reinterpret_cast<device atomic_uint*>(pointer);\n",
+                "    uint expected = atomic_load_explicit(atomic_pointer, memory_order_relaxed);\n",
+                "    while (true) {\n",
+                "        uint desired = insert_bits(expected, value, bit_offset, bit_count);\n",
+                "        if (atomic_compare_exchange_weak_explicit(atomic_pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
+                "            return;\n",
+                "        }\n",
+                "    }\n",
                 "}\n\n",
             ));
         }

@@ -15,6 +15,7 @@ mod emit_msl_convert;
 mod emit_msl_floating_point;
 mod emit_msl_integer;
 mod emit_msl_logical;
+mod emit_msl_memory;
 mod emit_msl_select;
 pub mod msl_emit_context;
 
@@ -136,6 +137,8 @@ pub enum MslError {
     UnsupportedAttribute(u32),
     #[error("MSL emission references undeclared constant buffer {0}")]
     MissingConstantBuffer(u32),
+    #[error("MSL emission references undeclared storage buffer {0}")]
+    MissingStorageBuffer(u32),
     #[error("MSL emission does not implement {opcode} at block {block} instruction {inst}")]
     UnsupportedOpcode {
         block: u32,

@@ -7,11 +7,27 @@
 //! a new target backend, so there is no upstream MSL source to mirror.
 
 use crate::ir;
+use crate::ir::opcodes::Opcode;
+use crate::ir::program::SyntaxNode;
+use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
+use super::emit_msl_floating_point;
+use super::emit_msl_integer;
 use super::msl_emit_context::MslEmitContext;
-use super::{MslError, MslShaderArtifact};
+use super::{MslError, MslOptions, MslShaderArtifact};
+
+fn varying_mask_has_only_position(mask: &[u64; 8]) -> bool {
+    mask.iter().enumerate().all(|(word_index, word)| {
+        let allowed = if word_index == 0 {
+            (0b1111u64) << 28
+        } else {
+            0
+        };
+        word & !allowed == 0
+    })
+}
 
 fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static str> {
     let info = &program.info;
@@ -31,12 +47,15 @@ fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static s
     if program.is_geometry_passthrough {
         return Some("geometry passthrough");
     }
+    let supported_vertex_position_stores = program.stage == crate::stage::Stage::VertexB
+        && varying_mask_has_only_position(&info.stores.mask);
+    let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
     if info.loads.mask.iter().any(|word| *word != 0)
-        || info.stores.mask.iter().any(|word| *word != 0)
+        || (!supported_vertex_position_stores && info.stores.mask.iter().any(|word| *word != 0))
         || info.passthrough.mask.iter().any(|word| *word != 0)
         || info.loads_indexed_attributes
         || info.stores_indexed_attributes
-        || info.stores_frag_color.iter().any(|store| *store)
+        || (!supported_fragment_colors && info.stores_frag_color.iter().any(|store| *store))
         || info.stores_sample_mask
         || info.stores_frag_depth
         || info.stores_tess_level_outer
@@ -132,6 +151,85 @@ fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static s
     None
 }
 
+fn immediate_u32(inst: &crate::ir::instruction::Inst, arg: u32) -> Result<u32, MslError> {
+    match inst.arg(arg as usize) {
+        Value::ImmU32(value) => Ok(*value),
+        _ => Err(MslError::ExpectedImmediate {
+            opcode: inst.opcode,
+            arg,
+            expected: "u32",
+        }),
+    }
+}
+
+fn emit_inst(
+    context: &mut MslEmitContext,
+    program: &ir::Program,
+    inst_ref: InstRef,
+) -> Result<(), MslError> {
+    let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+    match inst.opcode {
+        Opcode::Void | Opcode::Prologue | Opcode::Epilogue => Ok(()),
+        Opcode::Identity => context.emit_identity(program, inst_ref, inst),
+        Opcode::IAdd32 => emit_msl_integer::emit_iadd_32(context, program, inst_ref, inst),
+        Opcode::FPAdd32 => {
+            emit_msl_floating_point::emit_fp_add_32(context, program, inst_ref, inst)
+        }
+        Opcode::FPMul32 => {
+            emit_msl_floating_point::emit_fp_mul_32(context, program, inst_ref, inst)
+        }
+        Opcode::SetAttribute => {
+            let Value::Attribute(attribute) = inst.arg(0) else {
+                return Err(MslError::ExpectedImmediate {
+                    opcode: inst.opcode,
+                    arg: 0,
+                    expected: "attribute",
+                });
+            };
+            if immediate_u32(inst, 2)? != 0 {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "per-vertex output indexing",
+                ));
+            }
+            if !attribute.is_position() {
+                return Err(MslError::UnsupportedAttribute(attribute.0));
+            }
+            context.emit_set_position(inst_ref, attribute.position_element(), inst.arg(1))
+        }
+        Opcode::SetFragColor => {
+            let render_target = immediate_u32(inst, 0)?;
+            let component = immediate_u32(inst, 1)?;
+            if render_target >= 8 || component >= 4 {
+                return Err(MslError::UnsupportedProgramFeature("fragment output index"));
+            }
+            context.emit_set_frag_color(inst_ref, render_target, component, inst.arg(2))
+        }
+        opcode => Err(MslError::UnsupportedOpcode {
+            block: inst_ref.block,
+            inst: inst_ref.inst,
+            opcode,
+        }),
+    }
+}
+
+fn emit_block(
+    context: &mut MslEmitContext,
+    program: &ir::Program,
+    block_index: u32,
+) -> Result<(), MslError> {
+    for (inst_index, _) in program.block(block_index).indexed_iter() {
+        emit_inst(
+            context,
+            program,
+            InstRef {
+                block: block_index,
+                inst: inst_index,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Emit native MSL directly from the backend-neutral shader IR.
 ///
 /// The initial supported language is intentionally exact: empty vertex and
@@ -140,20 +238,37 @@ fn first_unsupported_program_feature(program: &ir::Program) -> Option<&'static s
 /// error.
 pub fn emit_msl(
     program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_with_options(program, profile, runtime_info, &MslOptions::default())
+}
+
+pub fn emit_msl_with_options(
+    program: &ir::Program,
     _profile: &Profile,
     _runtime_info: &RuntimeInfo,
+    options: &MslOptions,
 ) -> Result<MslShaderArtifact, MslError> {
-    let context = MslEmitContext::new(program.stage)?;
+    let mut context = MslEmitContext::new(program, options)?;
     if let Some(feature) = first_unsupported_program_feature(program) {
         return Err(MslError::UnsupportedProgramFeature(feature));
     }
-    for (block_index, block) in program.blocks.iter().enumerate() {
-        if let Some((inst_index, inst)) = block.indexed_iter().next() {
-            return Err(MslError::UnsupportedOpcode {
-                block: block_index as u32,
-                inst: inst_index,
-                opcode: inst.opcode,
-            });
+    if program.syntax_list.is_empty() {
+        for block_index in 0..program.blocks.len() as u32 {
+            emit_block(&mut context, program, block_index)?;
+        }
+    } else {
+        for node in &program.syntax_list {
+            match node {
+                SyntaxNode::Block(block_index) => emit_block(&mut context, program, *block_index)?,
+                SyntaxNode::Return => {}
+                _ => {
+                    return Err(MslError::UnsupportedProgramFeature(
+                        "structured control flow",
+                    ))
+                }
+            }
         }
     }
     Ok(context.finish())
@@ -224,14 +339,14 @@ mod tests {
     #[test]
     fn rejects_unported_ir_instead_of_emitting_a_fallback() {
         let mut program = empty_program(Stage::Fragment);
-        program.blocks[0].append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(1), Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(Opcode::FPCos, vec![Value::ImmF32(1.0)]);
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
             Err(MslError::UnsupportedOpcode {
                 block: 0,
                 inst: 0,
-                opcode: Opcode::IAdd32,
+                opcode: Opcode::FPCos,
             })
         );
     }
@@ -265,7 +380,7 @@ mod tests {
     #[test]
     fn rejects_unported_stage_interfaces_even_without_instructions() {
         let mut program = empty_program(Stage::Fragment);
-        program.info.stores_frag_color[0] = true;
+        program.info.loads.mask[0] = 1u64 << 32;
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
@@ -273,5 +388,70 @@ mod tests {
                 "stage inputs or outputs"
             ))
         );
+    }
+
+    #[test]
+    fn emits_typed_ssa_integer_and_float_expressions() {
+        let mut program = empty_program(Stage::VertexB);
+        let integer = program.blocks[0]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(1), Value::ImmU32(2)]);
+        let float = program.blocks[0].append_new_inst(
+            Opcode::FPAdd32,
+            vec![Value::ImmF32(-0.0), Value::ImmF32(2.0)],
+        );
+        program.blocks[0].inst_mut(float).flags = crate::ir::types::FpControl {
+            no_contraction: true,
+            ..Default::default()
+        }
+        .to_u32();
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("uint v_0_0 = (0x00000001u) + (0x00000002u);"));
+        assert!(artifact.source.source.contains(
+            "float v_0_1 = spvFAdd(as_type<float>(0x80000000u), as_type<float>(0x40000000u));"
+        ));
+        assert!(artifact
+            .source
+            .source
+            .contains("[[clang::optnone]] T spvFAdd"));
+        assert_eq!(integer, 0);
+    }
+
+    #[test]
+    fn emits_vertex_position_and_fragment_color_outputs() {
+        let mut vertex = empty_program(Stage::VertexB);
+        vertex.info.stores.set(28, true);
+        vertex.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(crate::ir::Attribute::POSITION_X),
+                Value::ImmF32(1.0),
+                Value::ImmU32(0),
+            ],
+        );
+        let vertex = emit_msl(&vertex, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(vertex
+            .source
+            .source
+            .contains("output.position.x = as_type<float>(0x3F800000u);"));
+
+        let mut fragment = empty_program(Stage::Fragment);
+        fragment.info.stores_frag_color[0] = true;
+        fragment.blocks[0].append_new_inst(
+            Opcode::SetFragColor,
+            vec![Value::ImmU32(0), Value::ImmU32(2), Value::ImmF32(0.5)],
+        );
+        let fragment = emit_msl(&fragment, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(fragment
+            .source
+            .source
+            .contains("float4 color0 [[color(0)]];"));
+        assert!(fragment
+            .source
+            .source
+            .contains("output.color0.z = as_type<float>(0x3F000000u);"));
     }
 }

@@ -11,6 +11,8 @@ use objc2_metal::{
 };
 use thiserror::Error;
 
+use shader_recompiler::backend::msl::MslVersion;
+
 #[derive(Debug, Error)]
 pub enum MetalDeviceError {
     #[error("macOS did not expose a default Metal device")]
@@ -40,6 +42,7 @@ pub struct MetalDevice {
 pub struct MetalDeviceProfile {
     pub architecture_name: String,
     pub registry_id: u64,
+    pub msl_language_version: MslVersion,
     pub highest_apple_family: Option<u8>,
     pub supports_mac2_family: bool,
     pub supports_metal3_family: bool,
@@ -99,8 +102,7 @@ fn family_limits(highest_apple_family: Option<u8>) -> MetalFamilyLimits {
     MetalFamilyLimits {
         max_vertex_attributes: 31,
         max_buffer_bindings_per_stage: 31,
-        max_texture_bindings_per_stage: if highest_apple_family.is_some_and(|family| family >= 6)
-        {
+        max_texture_bindings_per_stage: if highest_apple_family.is_some_and(|family| family >= 6) {
             128
         } else if highest_apple_family.is_some_and(|family| family >= 4) {
             96
@@ -140,6 +142,19 @@ impl MetalDeviceProfile {
             objc2::available!(macos = 13.0, ..) && device.supportsFamily(MTLGPUFamily::Metal3);
         let supports_metal4_family =
             objc2::available!(macos = 26.0, ..) && device.supportsFamily(MTLGPUFamily::Metal4);
+        let msl_language_version = if objc2::available!(macos = 26.0, ..) {
+            MslVersion::V4_0
+        } else if objc2::available!(macos = 15.0, ..) {
+            MslVersion::V3_2
+        } else if objc2::available!(macos = 14.0, ..) {
+            MslVersion::V3_1
+        } else if objc2::available!(macos = 13.0, ..) {
+            MslVersion::V3_0
+        } else if objc2::available!(macos = 12.0, ..) {
+            MslVersion::V2_4
+        } else {
+            MslVersion::V2_3
+        };
         // Apple publishes these implementation limits by GPU family rather
         // than through individual MTLDevice selectors. All Apple Silicon
         // devices are Apple7 or newer; direct binding limits remain stable,
@@ -152,6 +167,7 @@ impl MetalDeviceProfile {
                 device.name().to_string()
             },
             registry_id: device.registryID(),
+            msl_language_version,
             highest_apple_family,
             supports_mac2_family,
             supports_metal3_family,
@@ -293,6 +309,20 @@ mod tests {
         assert!(!Retained::as_ptr(&device.command_queue).is_null());
         assert!(device.profile().supports_sample_count(1));
         assert!(device.profile().highest_apple_family.is_some());
+        let expected_msl = if objc2::available!(macos = 26.0, ..) {
+            MslVersion::V4_0
+        } else if objc2::available!(macos = 15.0, ..) {
+            MslVersion::V3_2
+        } else if objc2::available!(macos = 14.0, ..) {
+            MslVersion::V3_1
+        } else if objc2::available!(macos = 13.0, ..) {
+            MslVersion::V3_0
+        } else if objc2::available!(macos = 12.0, ..) {
+            MslVersion::V2_4
+        } else {
+            MslVersion::V2_3
+        };
+        assert_eq!(device.profile().msl_language_version, expected_msl);
     }
 
     #[test]

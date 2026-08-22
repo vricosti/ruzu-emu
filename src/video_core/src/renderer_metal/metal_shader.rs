@@ -15,7 +15,7 @@ use objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLFunction, MTLLanguageVersion, MTLLibrary, MTLMathMode,
 };
 use spirv_cross2::compile::msl::{
-    BindTarget, CompilerOptions, MetalPlatform, MslVersion, ResourceBinding,
+    BindTarget, CompilerOptions, MetalPlatform, MslVersion as SpirvCrossMslVersion, ResourceBinding,
 };
 use spirv_cross2::reflect::{ArrayDimension, Resource, TypeInner};
 use spirv_cross2::targets::Msl;
@@ -23,6 +23,7 @@ use spirv_cross2::{Compiler, Module, SpirvCrossError};
 use thiserror::Error;
 
 use shader_recompiler::backend::msl::MslError;
+use shader_recompiler::backend::msl::MslVersion;
 pub use shader_recompiler::backend::msl::{
     MslBindingLayout as MetalShaderBindingLayout, MslResourceBinding as MetalResourceBinding,
     MslResourceKind as MetalResourceKind, MslShaderArtifact as MetalShaderArtifact,
@@ -42,6 +43,7 @@ use super::metal_device::MetalDeviceProfile;
 /// native compiler version are advanced together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetalShaderCompileOptions {
+    pub language_version: MslVersion,
     pub argument_buffers: bool,
     pub fixed_subgroup_size: u32,
     pub enable_frag_depth_builtin: bool,
@@ -52,6 +54,7 @@ pub struct MetalShaderCompileOptions {
 impl Default for MetalShaderCompileOptions {
     fn default() -> Self {
         Self {
+            language_version: MslVersion::V2_3,
             // Direct bindings are the first complete runtime ABI. Enabling
             // argument buffers requires a matching CPU-side argument encoder.
             argument_buffers: false,
@@ -59,6 +62,15 @@ impl Default for MetalShaderCompileOptions {
             enable_frag_depth_builtin: true,
             enable_frag_stencil_ref_builtin: true,
             enable_frag_output_mask: u32::MAX,
+        }
+    }
+}
+
+impl MetalShaderCompileOptions {
+    pub fn for_device(profile: &MetalDeviceProfile) -> Self {
+        Self {
+            language_version: profile.msl_language_version,
+            ..Self::default()
         }
     }
 }
@@ -96,6 +108,8 @@ pub enum MetalShaderError {
     LibraryCompile(String),
     #[error("Metal library does not contain entry point {0}")]
     MissingEntryPoint(String),
+    #[error("MSL language version {major}.{minor} is unavailable on this macOS version")]
+    UnsupportedLanguageVersion { major: u8, minor: u8 },
 }
 
 #[derive(Debug, Error)]
@@ -115,6 +129,7 @@ pub enum DirectMslValidationError {
 pub struct MetalShaderModule {
     source: MetalShaderSource,
     bindings: MetalShaderBindingLayout,
+    language_version: MslVersion,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     function: Retained<ProtocolObject<dyn MTLFunction>>,
 }
@@ -126,6 +141,10 @@ impl MetalShaderModule {
 
     pub fn bindings(&self) -> &MetalShaderBindingLayout {
         &self.bindings
+    }
+
+    pub fn language_version(&self) -> MslVersion {
+        self.language_version
     }
 
     pub fn library(&self) -> &ProtocolObject<dyn MTLLibrary> {
@@ -460,7 +479,11 @@ fn stage_from_execution_model(
 
 fn make_compiler_options(metal_options: &MetalShaderCompileOptions) -> CompilerOptions {
     let mut options = CompilerOptions::default();
-    options.version = MslVersion::new(2, 3, 0);
+    options.version = SpirvCrossMslVersion::new(
+        metal_options.language_version.major as u32,
+        metal_options.language_version.minor as u32,
+        0,
+    );
     options.platform = MetalPlatform::MacOS;
     options.argument_buffers = metal_options.argument_buffers;
     options.texture_buffer_native = true;
@@ -560,6 +583,7 @@ pub fn compile_native_shader(
             source,
             bindings,
             entry_point: "main0".to_owned(),
+            language_version: options.language_version,
         },
     )
 }
@@ -571,8 +595,9 @@ pub fn compile_native_msl_artifact(
     device: &ProtocolObject<dyn MTLDevice>,
     artifact: MetalShaderArtifact,
 ) -> Result<MetalShaderModule, MetalShaderError> {
+    let language_version = artifact.language_version;
     let compile_options = MTLCompileOptions::new();
-    compile_options.setLanguageVersion(MTLLanguageVersion::Version2_3);
+    compile_options.setLanguageVersion(metal_language_version(artifact.language_version)?);
     if objc2::available!(macos = 15.0, ..) {
         compile_options.setMathMode(MTLMathMode::Safe);
     } else {
@@ -592,8 +617,35 @@ pub fn compile_native_msl_artifact(
     Ok(MetalShaderModule {
         source: artifact.source,
         bindings: artifact.bindings,
+        language_version,
         library,
         function,
+    })
+}
+
+fn metal_language_version(version: MslVersion) -> Result<MTLLanguageVersion, MetalShaderError> {
+    let available = match version {
+        MslVersion::V2_3 => Some(MTLLanguageVersion::Version2_3),
+        MslVersion::V2_4 if objc2::available!(macos = 12.0, ..) => {
+            Some(MTLLanguageVersion::Version2_4)
+        }
+        MslVersion::V3_0 if objc2::available!(macos = 13.0, ..) => {
+            Some(MTLLanguageVersion::Version3_0)
+        }
+        MslVersion::V3_1 if objc2::available!(macos = 14.0, ..) => {
+            Some(MTLLanguageVersion::Version3_1)
+        }
+        MslVersion::V3_2 if objc2::available!(macos = 15.0, ..) => {
+            Some(MTLLanguageVersion::Version3_2)
+        }
+        MslVersion::V4_0 if objc2::available!(macos = 26.0, ..) => {
+            Some(MTLLanguageVersion::Version4_0)
+        }
+        _ => None,
+    };
+    available.ok_or(MetalShaderError::UnsupportedLanguageVersion {
+        major: version.major,
+        minor: version.minor,
     })
 }
 
@@ -610,7 +662,14 @@ pub fn validate_direct_msl_against_active_module(
     runtime_info: &RuntimeInfo,
     active: &MetalShaderModule,
 ) -> Result<MetalShaderModule, DirectMslValidationError> {
-    let artifact = shader_recompiler::backend::msl::emit_msl(program, profile, runtime_info)?;
+    let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+        program,
+        profile,
+        runtime_info,
+        &shader_recompiler::backend::msl::MslOptions {
+            language_version: active.language_version(),
+        },
+    )?;
     if artifact.source.stage != active.source().stage {
         return Err(DirectMslValidationError::StageMismatch {
             direct: artifact.source.stage,
@@ -627,6 +686,9 @@ pub fn validate_direct_msl_against_active_module(
 mod tests {
     use shader_recompiler::backend::emit_spirv;
     use shader_recompiler::ir::basic_block::Block;
+    use shader_recompiler::ir::opcodes::Opcode;
+    use shader_recompiler::ir::types::FpControl;
+    use shader_recompiler::ir::value::{InstRef, Value};
     use shader_recompiler::ir::Program;
     use shader_recompiler::profile::Profile;
     use shader_recompiler::runtime_info::RuntimeInfo;
@@ -739,6 +801,55 @@ mod tests {
 
         assert_eq!(shader.source().stage, Stage::Fragment);
         assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
+    fn compiles_direct_msl_ssa_and_vertex_output_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = empty_program(Stage::VertexB);
+        program.info.stores.set(28, true);
+        let value = program.blocks[0].append_new_inst(
+            Opcode::FPAdd32,
+            vec![Value::ImmF32(-0.0), Value::ImmF32(1.0)],
+        );
+        program.blocks[0].inst_mut(value).flags = FpControl {
+            no_contraction: true,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(shader_recompiler::ir::Attribute::POSITION_X),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: value,
+                }),
+                Value::ImmU32(0),
+            ],
+        );
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+            },
+        )
+        .expect("supported vertex IR must lower directly to MSL");
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct SSA MSL must compile as a native Metal function");
+
+        assert_eq!(shader.source().stage, Stage::VertexB);
+        assert_eq!(
+            shader.language_version(),
+            device.profile().msl_language_version
+        );
+        assert!(shader
+            .source()
+            .source
+            .contains("[[clang::optnone]] T spvFAdd"));
     }
 
     #[test]

@@ -679,6 +679,11 @@ impl IHidServer {
         let aruid = rp.pop_u64();
 
         let result = server.resource_manager.lock().create_applet_resource(aruid);
+        log::debug!(
+            "IHidServer::CreateAppletResource called, applet_resource_user_id={}, result={:#x}",
+            aruid,
+            result.raw()
+        );
 
         let applet_resource: Arc<dyn SessionRequestHandler> =
             Arc::new(super::applet_resource::IAppletResource::new(
@@ -3313,5 +3318,43 @@ impl ServiceFramework for IHidServer {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hid_core::hid_core::HIDCore;
+
+    #[test]
+    fn create_applet_resource_reports_success_and_returns_interface_after_manager_error() {
+        let firmware_settings = Arc::new(HidFirmwareSettings::new());
+        let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::clone(&firmware_settings),
+            Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        let aruid = 0x1122_3344_5566_7788;
+
+        // No shared-memory backing is installed, so the manager call fails. Eden logs this
+        // diagnostic result but still returns a successful IPC interface.
+        assert!(resource_manager
+            .lock()
+            .create_applet_resource(aruid)
+            .is_error());
+
+        let server = IHidServer::new(
+            SystemRef::null(),
+            resource_manager,
+            firmware_settings,
+            Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+        );
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = aruid as u32;
+        ctx.cmd_buf[3] = (aruid >> 32) as u32;
+
+        IHidServer::create_applet_resource(&server, &mut ctx);
+
+        assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+        assert_eq!(ctx.outgoing_move_objects.len(), 1);
     }
 }

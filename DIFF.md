@@ -7298,3 +7298,22 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS: the response remains a deterministic 16-byte `DisplayVersion`; bytes beyond the copied
   string are zero and byte 15 is always NUL. Focused tests verify the fallback and 16-byte truncation.
+
+## 2026-08-22 — `src/core/src/hle/service/hid/hid_server.rs` vs Eden `src/core/hle/service/hid/hid_server.{h,cpp}`
+
+### Intentional differences
+- Rust decodes `ClientAppletResourceUserId` directly as its single `u64` `pid` value and returns the
+  IPC interface through `ResponseBuilder`; Eden expresses both through CMIF wrapper types.
+
+### Unintentional differences (to fix)
+- `CreateAppletResource` previously discarded the resource manager result without reproducing
+  Eden's diagnostic. It now logs the ARUID and raw result before constructing the interface.
+
+### Missing items
+- None for the `CreateAppletResource` call, diagnostic, interface construction, or unconditional
+  success behavior.
+
+### Binary layout verification
+- N/A: this correction only consumes the existing result for diagnostics and does not alter IPC
+  payload or HID shared-memory layout. A focused test verifies that a manager failure is logged-only
+  behavior and the handler still returns success plus an interface, as Eden does.

@@ -41,6 +41,14 @@ pub struct MetalFramebuffer {
     has_stencil: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetalFramebufferSignature {
+    pub color_formats: [MTLPixelFormat; NUM_RT],
+    pub depth_format: MTLPixelFormat,
+    pub stencil_format: MTLPixelFormat,
+    pub samples: u32,
+}
+
 impl MetalFramebuffer {
     /// Port of Eden `Framebuffer::CreateFramebuffer`.
     pub fn new(
@@ -195,6 +203,15 @@ impl MetalFramebuffer {
 
     pub fn has_stencil(&self) -> bool {
         self.has_stencil
+    }
+
+    pub fn signature(&self) -> MetalFramebufferSignature {
+        MetalFramebufferSignature {
+            color_formats: self.color_formats(),
+            depth_format: self.depth_format(),
+            stencil_format: self.stencil_format(),
+            samples: self.samples,
+        }
     }
 }
 

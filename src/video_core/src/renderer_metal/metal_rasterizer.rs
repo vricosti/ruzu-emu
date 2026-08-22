@@ -21,7 +21,7 @@ use crate::buffer_cache::buffer_cache_base::{DeviceMemoryAccess, GpuMemoryAccess
 use crate::cache_types::CacheType;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
-use crate::engines::draw_manager::Maxwell3DDrawView;
+use crate::engines::draw_manager::{Maxwell3DDrawTextureView, Maxwell3DDrawView};
 use crate::engines::maxwell_3d::{CullFace, FrontFace, PrimitiveTopology};
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
@@ -34,6 +34,7 @@ use crate::renderer_base::{
 };
 use crate::shader_cache::ShaderCache;
 
+use super::metal_blit_helper::{MetalBlitError, MetalBlitHelper, MetalBlitRegion};
 use super::metal_buffer_cache::{BufferCacheRuntime, MetalCommonBufferCache};
 use super::metal_device::MetalDevice;
 use super::metal_framebuffer::MetalFramebufferError;
@@ -73,6 +74,8 @@ pub enum MetalRasterizerError {
     GraphicsPipeline(#[from] MetalGraphicsPipelineError),
     #[error(transparent)]
     Framebuffer(#[from] MetalFramebufferError),
+    #[error(transparent)]
+    Blit(#[from] MetalBlitError),
     #[error("Metal does not support Maxwell primitive topology {0:?}")]
     UnsupportedTopology(PrimitiveTopology),
 }
@@ -314,6 +317,7 @@ pub struct MetalRasterizer {
     shader_cache: ShaderCache,
     common_buffer_cache: Box<MetalCommonBufferCache>,
     texture_cache: Box<MetalTextureCache>,
+    blit_image: MetalBlitHelper,
     accelerate_dma: AccelerateDMA,
     syncpoints: Arc<SyncpointManager>,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
@@ -351,6 +355,7 @@ impl MetalRasterizer {
         ));
         let shader_cache = ShaderCache::new(device_memory);
         let pipeline_cache = MetalPipelineCache::new(device.clone());
+        let blit_image = MetalBlitHelper::new(&device)?;
         let accelerate_dma = AccelerateDMA::new(common_buffer_cache.as_mut());
 
         Ok(Self {
@@ -361,6 +366,7 @@ impl MetalRasterizer {
             shader_cache,
             common_buffer_cache,
             texture_cache,
+            blit_image,
             accelerate_dma,
             syncpoints,
             channel_caches: ChannelSetupCaches::new(),
@@ -652,6 +658,128 @@ impl MetalRasterizer {
         Ok(())
     }
 
+    /// Port of Eden `RasterizerVulkan::DrawTexture` using a native Metal
+    /// textured quad rather than a Vulkan render-pass helper.
+    pub fn draw_texture(
+        &mut self,
+        mut draw_texture_view: Maxwell3DDrawTextureView<'_>,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        let state = draw_texture_view.draw_texture_state();
+        let render_targets = draw_texture_view.render_targets();
+        let original_dirty_flags = *draw_texture_view.dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
+        let memory_manager = self.channel_memory_manager.as_ref().cloned();
+
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache
+            .synchronize_graphics_descriptors(draw_texture_view.descriptor_sync_regs());
+        self.texture_cache.base.update_render_targets_with_snapshot(
+            &render_targets,
+            &mut dirty_flags,
+            |address, size| {
+                memory_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().gpu_to_cpu_address_range(address, size))
+            },
+            false,
+            None,
+        );
+        for (index, (&was_dirty, &is_dirty)) in original_dirty_flags
+            .iter()
+            .zip(dirty_flags.iter())
+            .enumerate()
+        {
+            if was_dirty && !is_dirty {
+                draw_texture_view.clear_dirty_flag(index as u8);
+            }
+        }
+
+        let sampler_id = self.texture_cache.get_sampler_id(state.src_sampler, false);
+        let Some(sampler) = self
+            .texture_cache
+            .sampler(sampler_id)
+            .map(|sampler| sampler.retained_handle())
+        else {
+            log::warn!(
+                "Metal DrawTexture skipped: invalid sampler {}",
+                state.src_sampler
+            );
+            return Ok(());
+        };
+        let Some((source, source_width, source_height, source_rescaled)) =
+            self.texture_cache.draw_texture_source(state.src_texture)
+        else {
+            log::warn!(
+                "Metal DrawTexture skipped: invalid texture {}",
+                state.src_texture
+            );
+            return Ok(());
+        };
+        let (render_pass, signature, render_area) = {
+            let framebuffer = self.texture_cache.base.get_framebuffer()?;
+            (
+                framebuffer.render_pass_descriptor(),
+                framebuffer.signature(),
+                framebuffer.render_area(),
+            )
+        };
+
+        let destination_rescaled = self.texture_cache.base.is_rescaling;
+        let resolution = common::settings::values().resolution_info.clone();
+        let scale = |value: f32, rescaled: bool| {
+            let value = value as i32;
+            if rescaled {
+                resolution.scale_up_i32(value)
+            } else {
+                value
+            }
+        };
+        let dst = MetalBlitRegion {
+            start: (
+                scale(state.dst_x0, destination_rescaled),
+                scale(state.dst_y0, destination_rescaled),
+            ),
+            end: (
+                scale(state.dst_x1, destination_rescaled),
+                scale(state.dst_y1, destination_rescaled),
+            ),
+        };
+        let src = MetalBlitRegion {
+            start: (
+                scale(state.src_x0, source_rescaled),
+                scale(state.src_y0, source_rescaled),
+            ),
+            end: (
+                scale(state.src_x1, source_rescaled),
+                scale(state.src_y1, source_rescaled),
+            ),
+        };
+        let source_size = if source_rescaled {
+            (
+                resolution.scale_up_u32(source_width),
+                resolution.scale_up_u32(source_height),
+            )
+        } else {
+            (source_width, source_height)
+        };
+        self.blit_image.blit_color_with_sampler(
+            self.scheduler.as_mut(),
+            &render_pass,
+            signature,
+            render_area,
+            &source,
+            &sampler,
+            dst,
+            src,
+            source_size,
+        )?;
+        Ok(())
+    }
+
     pub fn tick_frame(&mut self) {
         self.texture_cache.tick_frame();
         self.common_buffer_cache.tick_frame();
@@ -760,7 +888,8 @@ mod tests {
     fn owns_one_scheduler_and_shared_cache_runtime() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
-        let mut rasterizer = MetalRasterizer::new(device, device_memory).unwrap();
+        let syncpoints = Arc::new(SyncpointManager::new());
+        let mut rasterizer = MetalRasterizer::new(device, syncpoints, device_memory).unwrap();
 
         let initial_tick = rasterizer.scheduler().current_tick();
         rasterizer.tick_frame();

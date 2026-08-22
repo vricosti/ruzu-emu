@@ -650,6 +650,33 @@ impl MetalTextureCache {
             )
         })
     }
+
+    /// Metal specialization of upstream `TextureCache::GetImageView(index)`
+    /// used by Maxwell's DrawTexture path.
+    pub fn draw_texture_source(
+        &mut self,
+        index: u32,
+    ) -> Option<(
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLTexture>>,
+        u32,
+        u32,
+        bool,
+    )> {
+        let mut selected = [ImageViewInOut {
+            index,
+            blacklist: false,
+            id: NULL_IMAGE_VIEW_ID,
+        }];
+        self.fill_image_views(&mut selected, false, false);
+        let view_id = selected[0].id;
+        let view = self.image_view(view_id)?;
+        Some((
+            view.retained_handle(TextureType::Color2D)?,
+            view.base().size.width,
+            view.base().size.height,
+            false,
+        ))
+    }
 }
 
 struct NativeImageCopy {

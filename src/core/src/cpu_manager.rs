@@ -752,7 +752,7 @@ impl CpuManager {
         // this guest thread exists. `arm_interfaces` entries are populated once
         // during process init and never change afterwards, so holding raw
         // pointers into them is sound for the thread's lifetime.
-        let (_process_owner, is_64bit, cached_jits): (
+        let (process_owner, is_64bit, cached_jits): (
             _,
             bool,
             [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
@@ -793,6 +793,7 @@ impl CpuManager {
                     kernel,
                     physical_core,
                     &thread_arc,
+                    &process_owner,
                     is_64bit,
                     &cached_jits,
                 );
@@ -834,6 +835,7 @@ impl CpuManager {
         kernel: &KernelCore,
         physical_core: &super::hle::kernel::physical_core::PhysicalCore,
         thread_arc: &Arc<KThreadLock>,
+        process_owner: &Arc<crate::hle::kernel::k_process::ProcessLock>,
         is_64bit: bool,
         cached_jits: &[Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
              hardware_properties::NUM_CPU_CORES as usize],
@@ -1013,6 +1015,14 @@ impl CpuManager {
                 }
             }
 
+            let system_ref = kernel.system();
+            if !system_ref.is_null()
+                && physical_core.stop_after_completed_step(system_ref.get(), thread_arc)
+            {
+                Self::reschedule_current_core_raw(kernel);
+                return;
+            }
+
             if physical_core.is_interrupted() {
                 return;
             }
@@ -1052,9 +1062,10 @@ impl CpuManager {
             } else {
                 None
             };
-            let event = physical_core.run_thread(jit_ref, opaque);
+            let event = physical_core.run_thread_with_step_state(jit_ref, opaque, thread_arc);
             drop(_serialized_jit_guard);
-            physical_core.exit_running(jit_ptr, thread_ptr);
+            let debugger_enabled = !system_ref.is_null() && system_ref.get().debugger_enabled();
+            physical_core.exit_running(jit_ptr, thread_ptr, debugger_enabled.then_some(thread_arc));
 
             match event {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::SupervisorCall {
@@ -1215,10 +1226,14 @@ impl CpuManager {
                         }
                     }
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
-                    let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);
-                    let data_abort = halt_reason.contains(HaltReason::DATA_ABORT);
-                    let prefetch_abort = halt_reason.contains(HaltReason::PREFETCH_ABORT);
-                    let breakpoint = halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
+                    let step_completed = physical_core.step_completed(halt_reason, thread_arc);
+                    let interrupt = !step_completed && halt_reason.contains(HaltReason::BREAK_LOOP);
+                    let data_abort =
+                        !step_completed && halt_reason.contains(HaltReason::DATA_ABORT);
+                    let prefetch_abort =
+                        !step_completed && halt_reason.contains(HaltReason::PREFETCH_ABORT);
+                    let breakpoint =
+                        !step_completed && halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
                     if current_thread_id == 17
                         && TID17_HALT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) < 500
                     {
@@ -1258,6 +1273,19 @@ impl CpuManager {
                     }
                     let zero_pc_break_loop = interrupt && _spin_pc.pc == 0;
 
+                    if !system_ref.is_null()
+                        && physical_core.handle_debug_halt(
+                            jit_ref,
+                            halt_reason,
+                            thread_arc,
+                            process_owner,
+                            system_ref.get(),
+                        )
+                    {
+                        Self::reschedule_current_core_raw(kernel);
+                        return;
+                    }
+
                     // Upstream: if (breakpoint || prefetch_abort) {
                     //     thread->RequestSuspend(SuspendType::Debug); return; }
                     // Upstream then handles data_abort the same way. The Rust
@@ -1266,10 +1294,7 @@ impl CpuManager {
                     // treat that as the same non-continuable state so the
                     // guest thread does not spin forever at PC=0.
                     // Without this, the thread re-executes the faulting PC forever.
-                    if breakpoint || prefetch_abort || data_abort || zero_pc_break_loop {
-                        if breakpoint {
-                            jit_ref.rewind_breakpoint_instruction();
-                        }
+                    if zero_pc_break_loop {
                         {
                             let mut tc = crate::arm::arm_interface::ThreadContext::default();
                             jit_ref.get_context(&mut tc);
@@ -1826,7 +1851,7 @@ impl CpuManager {
                 // Single-core path: one host thread, no contention. Fetch the
                 // JIT per-iteration (matches upstream's RunThread) — the
                 // multi-core caching optimization above is unnecessary here.
-                let (_process_owner, is_64bit, cached_jits) = {
+                let (process_owner, is_64bit, cached_jits) = {
                     let parent_weak = {
                         let thread = thread_arc.lock().unwrap();
                         match thread.parent.as_ref() {
@@ -1858,6 +1883,7 @@ impl CpuManager {
                     kernel,
                     physical_core,
                     &thread_arc,
+                    &process_owner,
                     is_64bit,
                     &cached_jits,
                 );

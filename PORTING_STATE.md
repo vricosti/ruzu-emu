@@ -50,6 +50,14 @@
   unrelated ARM/kernel failures and then hangs in a scheduler test. No debugger test failed.
 - Status: resume the interrupted `gdbstub.rs` slice only after the CPU stop/step notification and
   Dynarmic watchpoint prerequisites above are implemented and verified against their Eden owners.
+- CPU prerequisite result: `physical_core.rs` now owns `StepPending` execution, the
+  `StepPerformed` reschedule stop, step-priority halt classification, debugger context capture,
+  breakpoint rewind/notification and debug suspension. `cpu_manager.rs` delegates those decisions
+  while retaining its Rust fiber/JIT coordination. The two focused step/breakpoint regressions pass;
+  two unrelated pre-existing physical-core fixture tests still fail as part of the non-green core
+  test baseline recorded above.
+- Remaining prerequisite: port A32/A64 `CheckMemoryAccess`, connect the process watchpoint array and
+  retain the halted watchpoint so the now-live physical-core data-abort path can be exercised.
 
 ## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
 

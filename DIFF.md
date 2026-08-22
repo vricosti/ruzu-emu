@@ -7813,3 +7813,49 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A for this framing slice; register byte order and architecture-specific XML remain owned by
   `gdbstub_arch.rs` and will be verified with the resumed command dispatcher.
+
+## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs Eden `src/core/hle/kernel/physical_core.{h,cpp}` debugger halt slice
+
+### Intentional differences
+- Ruzu's host-fiber dispatcher retains the `Arc<KThreadLock>` and JIT pointer in `cpu_manager.rs`,
+  so that coordinator calls narrow `PhysicalCore` methods for the upstream-owned execution and halt
+  decisions rather than holding the Rust thread mutex across guest execution.
+- `exit_running` receives the retained thread owner only when debugging is enabled; it captures the
+  JIT context before `UnlockThread`, matching Eden's `ExitContext` order without dereferencing the
+  raw inner `KThread` outside its mutex.
+- A data abort without a retained watchpoint is logged instead of dereferencing a null pointer. Eden
+  relies on the invariant that only a matched debugger watchpoint emits `DataAbort`.
+
+### Unintentional differences (to fix)
+- Runtime execution previously ignored `StepPending` and always called `RunThread`; a successful
+  step could also be misclassified as an SVC. It now calls `StepThread`, records `StepPerformed`,
+  gives the step priority over simultaneous halt bits, and reports/suspends it when rescheduled.
+- Breakpoint and prefetch-abort paths previously suspended without notifying the live debugger and
+  did not refresh the saved thread context after rewinding. The matching owner now performs Eden's
+  rewind, context save, notification and suspension ordering.
+
+### Missing items
+- A32/A64 Dynarmic callbacks still need to produce and retain matched watchpoints; that prerequisite
+  is recorded in `PORTING_STATE.md` and is required before the data-abort path is complete.
+
+### Binary layout verification
+- N/A: this slice changes host execution ordering and retained thread state only.
+
+## 2026-08-22 — `src/core/src/cpu_manager.rs` delegation vs Eden `src/core/hle/kernel/physical_core.cpp`
+
+### Intentional differences
+- Ruzu's CPU manager owns the fiber boundary and cached per-core JIT pointers. It therefore invokes
+  the corresponding `PhysicalCore` decisions before/after the JIT call; the behavioral logic and
+  ordering remain in `physical_core.rs`, matching upstream ownership as closely as the fiber model
+  permits.
+
+### Unintentional differences (to fix)
+- The coordinator formerly classified breakpoint/data/prefetch halts itself and omitted the step
+  state and debugger notifications. It now delegates those decisions and reschedules only after
+  `PhysicalCore` has requested the upstream debug suspension.
+
+### Missing items
+- None in the CPU-manager delegation for the reviewed debugger halt slice.
+
+### Binary layout verification
+- N/A: no serialized or guest-visible layout changes.

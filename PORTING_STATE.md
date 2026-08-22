@@ -47,7 +47,12 @@
   backend now exposes Eden's instruction-synchronization callback on both x86-64 and AArch64 hosts,
   controlled by the same default-disabled `hook_isb` policy; the callback itself drops the cached
   code page when enabled.
-- Status: `jit_context.rs` is functional and re-verified; the interrupted `jit.rs` slice may resume.
+- JIT-service result: `jit:u` now owns the real `JITU` service and `IJitEnvironment`; it resolves
+  typed process/code/transfer-memory handles, maps RX/RO ranges, loads and prepares plugin NROs,
+  executes `Control`/`GenerateCode`, returns code addresses, and finalizes RX before RO. Eden's
+  resolved-but-unused `_fini` and `nnjitpluginKeeper` fields remain explicitly retained.
+- Status: the interrupted JIT warning slice is complete and re-verified. The next library-warning
+  group is the partial GDB stub in `debugger/gdbstub.rs`.
 
 ## 2026-08-22 — PlatformServiceManager warning interrupted by kernel font-memory prerequisite
 

@@ -432,6 +432,12 @@ pub struct JitContext {
     state: Arc<Mutex<ContextState>>,
 }
 
+// `A64Jit` owns every allocation referenced by its backend raw pointers, so
+// moving the outer value does not invalidate them. IJitEnvironment serializes
+// all execution through one mutex, matching Eden's single service-object call
+// boundary; no JIT operation can run concurrently after the move.
+unsafe impl Send for JitContext {}
+
 impl JitContext {
     pub fn new(memory: Arc<Mutex<Memory>>) -> Result<Self, String> {
         Self::new_impl(Some(memory))

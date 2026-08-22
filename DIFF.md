@@ -7567,6 +7567,9 @@ vs Eden `display_list.h` and `layer_list.h`
   half-open-range result used by every memory access, and no operation depends on interval count.
 - Rust clears the persistent `USER_DEFINED1` halt bit before each invocation; Eden's Dynarmic
   `HaltExecution` lifecycle performs the equivalent reset internally.
+- `JitContext` has a narrow `Send` implementation because the Rust IPC interface requires
+  `Send + Sync`. Its backend pointers target stable owned allocations, and `IJitEnvironment`
+  serializes every JIT call through one mutex.
 
 ### Unintentional differences (to fix)
 - None.
@@ -7600,3 +7603,33 @@ vs Eden `display_list.h` and `layer_list.h`
 - N/A: this adds a host callback slot only. A focused A64 execution test verifies one ISB produces
   exactly one callback before the terminating SVC when `hook_isb` is enabled on the active host
   backend; the default-disabled behavior matches Eden's `UserConfig`.
+
+## 2026-08-22 — `src/core/src/hle/service/jit/jit.rs` vs Eden `src/core/hle/service/jit/jit.{h,cpp}`
+
+### Intentional differences
+- Rust places the mutable environment members behind one `Mutex` because service callbacks receive
+  `&self`; this preserves their upstream ownership and serializes the same per-object operations.
+- Typed copy handles are resolved through the caller process's Rust object registries, and
+  `KScopedAutoObject<KProcess>` is represented by a retained `Arc<ProcessLock>`.
+- CMIF arguments are parsed explicitly. Output buffers are copied from guest memory before plugin
+  execution and written back afterward because Rust's memory bridge is mutex-owned rather than a
+  directly borrowed span.
+- Rust implements the `std::mt19937_64` member locally with its exact default seed and output
+  sequence. The standard library does not provide this engine.
+- `JitContext` construction can report backend allocation/emitter errors. Those Rust-only failure
+  paths finalize both already-mapped code ranges before returning `ResultUnknown`; Eden's Dynarmic
+  constructor is effectively infallible here.
+- Eden resolves `_fini` and `nnjitpluginKeeper` but never invokes them. Rust retains both fields and
+  uses narrow `allow(dead_code)` annotations rather than deleting ABI-visible symbol ownership or
+  inventing calls absent upstream.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for `JITU`, `IJitEnvironment`, their command tables, callbacks, configuration, or lifecycle.
+
+### Binary layout verification
+- PASS: focused tests verify `CodeRange` is 16 bytes/aligned to 8, `Struct32` is 32 bytes, and
+  `JITConfiguration` is 80 bytes. Callback execution tests cover `GenerateCode`'s 13-argument ABI,
+  `Control`, cleared output-range sizes, and preserved output-buffer contents.

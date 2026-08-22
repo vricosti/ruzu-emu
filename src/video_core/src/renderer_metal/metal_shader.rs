@@ -22,63 +22,14 @@ use spirv_cross2::targets::Msl;
 use spirv_cross2::{Compiler, Module, SpirvCrossError};
 use thiserror::Error;
 
+pub use shader_recompiler::backend::msl::{
+    MslBindingLayout as MetalShaderBindingLayout, MslResourceBinding as MetalResourceBinding,
+    MslResourceKind as MetalResourceKind, MslShaderArtifact as MetalShaderArtifact,
+    MslShaderSource as MetalShaderSource,
+};
+use shader_recompiler::stage::Stage;
+
 use super::metal_device::MetalDeviceProfile;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MetalResourceKind {
-    UniformBuffer,
-    StorageBuffer,
-    StorageImage,
-    SampledImage,
-    SeparateImage,
-    SeparateSampler,
-}
-
-/// Explicit mapping from one SPIR-V descriptor to Metal resource indices.
-///
-/// Metal has independent buffer, texture and sampler namespaces. Keeping all
-/// three indices explicit avoids inheriting Vulkan descriptor-set semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MetalResourceBinding {
-    pub descriptor_set: u32,
-    pub binding: u32,
-    pub kind: MetalResourceKind,
-    pub buffer_index: u32,
-    pub texture_index: u32,
-    pub sampler_index: u32,
-    pub count: Option<NonZeroU32>,
-}
-
-/// Complete direct-binding ABI retained by a compiled Metal shader.
-///
-/// The runtime must consume these exact indices when encoding a draw or
-/// dispatch. Metal's buffer, texture and sampler namespaces are independent.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MetalShaderBindingLayout {
-    pub resources: Vec<MetalResourceBinding>,
-    pub push_constant_buffer_index: Option<u32>,
-    pub buffer_count: u32,
-    pub texture_count: u32,
-    pub sampler_count: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct MetalShaderSource {
-    pub source: String,
-    pub execution_model: spirv_cross2::spirv::ExecutionModel,
-}
-
-/// Backend-neutral input to Apple's native MSL compiler.
-///
-/// Today this artifact is produced by SPIRV-Cross. A direct shader-recompiler
-/// MSL backend can produce the same source/binding contract without changing
-/// the Metal pipeline, rasterizer, or cache owners.
-#[derive(Debug, Clone)]
-pub struct MetalShaderArtifact {
-    pub source: MetalShaderSource,
-    pub bindings: MetalShaderBindingLayout,
-    pub entry_point: String,
-}
 
 /// SPIRV-Cross policy for the baseline Apple7 renderer.
 ///
@@ -135,6 +86,8 @@ pub enum MetalShaderError {
     AliasedResourceBinding { set: u32, binding: u32 },
     #[error("MSL requires unsupported auxiliary buffer {0}")]
     UnsupportedAuxiliaryBuffer(&'static str),
+    #[error("SPIRV-Cross returned unsupported execution model {0:?}")]
+    UnsupportedExecutionModel(spirv_cross2::spirv::ExecutionModel),
     #[error("Metal failed to compile MSL: {0}")]
     LibraryCompile(String),
     #[error("Metal library does not contain entry point {0}")]
@@ -435,7 +388,7 @@ pub fn reflect_direct_resource_bindings(
 pub fn compile_spirv_to_msl(
     words: &[u32],
     resource_bindings: &[MetalResourceBinding],
-) -> Result<MetalShaderSource, SpirvCrossError> {
+) -> Result<MetalShaderSource, MetalShaderError> {
     compile_spirv_to_msl_with_options(
         words,
         resource_bindings,
@@ -447,7 +400,7 @@ pub fn compile_spirv_to_msl_with_options(
     words: &[u32],
     resource_bindings: &[MetalResourceBinding],
     metal_options: &MetalShaderCompileOptions,
-) -> Result<MetalShaderSource, SpirvCrossError> {
+) -> Result<MetalShaderSource, MetalShaderError> {
     let module = Module::from_words(words);
     let mut compiler = Compiler::<Msl>::new(module)?;
     let execution_model = compiler.execution_model()?;
@@ -469,8 +422,24 @@ pub fn compile_spirv_to_msl_with_options(
     let artifact = compiler.compile(&options)?;
     Ok(MetalShaderSource {
         source: artifact.as_ref().to_owned(),
-        execution_model,
+        stage: stage_from_execution_model(execution_model)?,
     })
+}
+
+fn stage_from_execution_model(
+    execution_model: spirv_cross2::spirv::ExecutionModel,
+) -> Result<Stage, MetalShaderError> {
+    use spirv_cross2::spirv::ExecutionModel;
+
+    match execution_model {
+        ExecutionModel::Vertex => Ok(Stage::VertexB),
+        ExecutionModel::TessellationControl => Ok(Stage::TessellationControl),
+        ExecutionModel::TessellationEvaluation => Ok(Stage::TessellationEval),
+        ExecutionModel::Geometry => Ok(Stage::Geometry),
+        ExecutionModel::Fragment => Ok(Stage::Fragment),
+        ExecutionModel::GLCompute => Ok(Stage::Compute),
+        other => Err(MetalShaderError::UnsupportedExecutionModel(other)),
+    }
 }
 
 fn make_compiler_options(metal_options: &MetalShaderCompileOptions) -> CompilerOptions {
@@ -555,7 +524,7 @@ fn compile_spirv_to_msl_with_layout(
     }
     Ok(MetalShaderSource {
         source: artifact.as_ref().to_owned(),
-        execution_model,
+        stage: stage_from_execution_model(execution_model)?,
     })
 }
 
@@ -661,10 +630,7 @@ mod tests {
         let words = emit_spirv(&program, &Profile::default(), &RuntimeInfo::default());
 
         let msl = compile_spirv_to_msl(&words, &[]).expect("SPIR-V must translate to MSL");
-        assert_eq!(
-            msl.execution_model,
-            spirv_cross2::spirv::ExecutionModel::Vertex
-        );
+        assert_eq!(msl.stage, Stage::VertexB);
         assert!(msl.source.contains("vertex"));
         assert!(msl.source.contains("main0"));
     }
@@ -684,11 +650,46 @@ mod tests {
         )
         .expect("recompiler SPIR-V must compile as a native Metal function");
 
-        assert_eq!(
-            shader.source().execution_model,
-            spirv_cross2::spirv::ExecutionModel::Vertex
-        );
+        assert_eq!(shader.source().stage, Stage::VertexB);
         assert!(!shader.library().functionNames().is_empty());
+        assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
+    fn compiles_direct_msl_vertex_artifact_to_native_metal_function() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = Program::new(Stage::VertexB);
+        program.blocks.push(Block::new());
+        let artifact = shader_recompiler::backend::msl::emit_msl(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .expect("minimal vertex IR must lower directly to MSL");
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct MSL must compile as a native Metal function");
+
+        assert_eq!(shader.source().stage, Stage::VertexB);
+        assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
+    fn compiles_direct_msl_fragment_artifact_to_native_metal_function() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        let artifact = shader_recompiler::backend::msl::emit_msl(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .expect("minimal fragment IR must lower directly to MSL");
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct MSL must compile as a native Metal function");
+
+        assert_eq!(shader.source().stage, Stage::Fragment);
         assert_eq!(shader.function().name().to_string(), "main0");
     }
 

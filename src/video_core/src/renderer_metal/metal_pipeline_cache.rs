@@ -23,8 +23,8 @@ use objc2_metal::{
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::profile::Profile;
 use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::stage::Stage;
 use shader_recompiler::{backend::bindings::Bindings, RuntimeInfo};
-use spirv_cross2::spirv::ExecutionModel;
 use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::{
@@ -520,7 +520,7 @@ pub enum MetalPipelineError {
     #[error("expected {expected} shader, got {actual:?}")]
     InvalidShaderStage {
         expected: &'static str,
-        actual: ExecutionModel,
+        actual: Stage,
     },
     #[error("sample count {0} is not supported by this Metal device")]
     UnsupportedSampleCount(u32),
@@ -729,17 +729,17 @@ impl MetalPipelineCache {
         vertex: &MetalShaderModule,
         fragment: Option<&MetalShaderModule>,
     ) -> Result<&MetalRenderPipeline, MetalPipelineError> {
-        if vertex.source().execution_model != ExecutionModel::Vertex {
+        if vertex.source().stage != Stage::VertexB {
             return Err(MetalPipelineError::InvalidShaderStage {
                 expected: "vertex",
-                actual: vertex.source().execution_model,
+                actual: vertex.source().stage,
             });
         }
         if let Some(fragment) = fragment {
-            if fragment.source().execution_model != ExecutionModel::Fragment {
+            if fragment.source().stage != Stage::Fragment {
                 return Err(MetalPipelineError::InvalidShaderStage {
                     expected: "fragment",
-                    actual: fragment.source().execution_model,
+                    actual: fragment.source().stage,
                 });
             }
         }
@@ -884,10 +884,10 @@ impl MetalPipelineCache {
         shader_hash: u64,
         shader: &MetalShaderModule,
     ) -> Result<&MetalComputePipeline, MetalPipelineError> {
-        if shader.source().execution_model != ExecutionModel::GLCompute {
+        if shader.source().stage != Stage::Compute {
             return Err(MetalPipelineError::InvalidShaderStage {
                 expected: "compute",
-                actual: shader.source().execution_model,
+                actual: shader.source().stage,
             });
         }
         let key = MetalComputePipelineKey {

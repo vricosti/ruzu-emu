@@ -9893,3 +9893,47 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify atomic
   access tags, BE-8 double-word dependency order, pre-access writeback, and unpredictable empty
   lists across all six memory-transfer families.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_crypto_four_register.rs` vs Eden `frontend/A64/translate/impl/{simd_crypto_four_register.cpp,impl.h}`
+
+### Intentional differences
+- Rust extracts `Vm`, `Va`, `Vn`, and `Vd` from `DecodedInst` inside each visitor because its
+  decoder dispatch passes a decoded instruction rather than Eden's typed visitor arguments. The
+  register read order, IR operation nesting, and destination write remain identical.
+- Rust's `add_32` and `rotate_right_32` builders take an explicit false carry input; this is the IR
+  builder representation of Eden's non-flag-setting `Add` and `RotateRight` calls.
+
+### Unintentional differences (to fix)
+- Fixed: EOR3, BCAX, and SM3SS1 decoded successfully but fell through to the non-upstream
+  `interpret_this_instruction` terminal. Their implementations and dispatch now live in the
+  corresponding four-register crypto owner and emit Eden's exact IR sequence.
+
+### Missing items
+- None for the three visitors owned by Eden's `simd_crypto_four_register.cpp`.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify decoder
+  identity, distinct source-register ownership, exact EOR3/BCAX opcode order, and SM3SS1 lane,
+  rotation, addition, and destination-write shape.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_crypto_three_register.rs` vs Eden `frontend/A64/translate/impl/{simd_crypto_three_register.cpp,impl.h}`
+
+### Intentional differences
+- Rust's file-local `Sm3TtVariant`, `sm3tt1`, and `sm3tt2` mirror Eden's anonymous-namespace enum
+  and helpers. Each public visitor extracts the typed register and two-bit immediate operands from
+  `DecodedInst` before forwarding them to the matching helper.
+- Rust's arithmetic and rotation builders take an explicit false carry input; operation order and
+  data dependencies match Eden's non-flag-setting nested IR expressions.
+
+### Unintentional differences (to fix)
+- Fixed: SM3TT1A, SM3TT1B, SM3TT2A, and SM3TT2B decoded successfully but fell through to the
+  non-upstream `interpret_this_instruction` terminal. Their helpers, visitor ownership, and
+  dispatch now match Eden.
+
+### Missing items
+- None for the four visitors owned by Eden's `simd_crypto_three_register.cpp`.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify all
+  four decoder identities, D/M/N register order, non-zero two-bit lane extraction, four result-lane
+  writes, and the final destination write.

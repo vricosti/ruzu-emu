@@ -31,6 +31,8 @@ mod move_wide;
 mod simd_across_lanes;
 mod simd_aes;
 mod simd_copy;
+mod simd_crypto_four_register;
+mod simd_crypto_three_register;
 mod simd_extract;
 mod simd_modified_immediate;
 mod simd_permute;

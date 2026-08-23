@@ -1073,6 +1073,13 @@ impl<'a> TranslatorVisitor<'a> {
             SHA1H => self.sha1h(inst),
             SHA1SU1 => self.sha1su1(inst),
             SHA256SU0 => self.sha256su0(inst),
+            EOR3 => self.eor3(inst),
+            BCAX => self.bcax(inst),
+            SM3SS1 => self.sm3ss1(inst),
+            SM3TT1A => self.sm3tt1a(inst),
+            SM3TT1B => self.sm3tt1b(inst),
+            SM3TT2A => self.sm3tt2a(inst),
+            SM3TT2B => self.sm3tt2b(inst),
 
             // Cache maintenance (NOP in userspace)
             DC_IVAC => self.dc_ivac(inst),

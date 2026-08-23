@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+use super::arch_version::ArchVersion;
 use super::coprocessor::Coprocessor;
+use crate::exclusive_monitor::ExclusiveMonitor;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::a32_emitter::A32IREmitter;
 
 /// Exception reported through `A32::UserCallbacks::ExceptionRaised`.
@@ -96,6 +99,82 @@ pub fn empty_coprocessors() -> Coprocessors {
     [const { None }; 16]
 }
 
+/// Configuration for an A32 JIT instance.
+///
+/// Upstream owner: `interface/A32/config.h::UserConfig`.
+pub struct UserConfig {
+    pub callbacks: Box<dyn UserCallbacks>,
+    pub global_monitor: Option<*mut ExclusiveMonitor>,
+    pub page_table: Option<*mut [*mut u8; Self::NUM_PAGE_TABLE_ENTRIES]>,
+    pub coprocessors: Coprocessors,
+    pub fastmem_pointer: Option<*mut u8>,
+    pub optimizations: OptimizationFlag,
+    pub code_cache_size: u32,
+    pub page_table_pointer_mask_bits: i32,
+    pub page_table_log2_stride: usize,
+    pub arch_version: ArchVersion,
+    pub processor_id: u8,
+    pub detect_misaligned_access_via_page_table: u8,
+    pub unsafe_optimizations: bool,
+    pub absolute_offset_page_table: bool,
+    pub only_detect_misalignment_via_page_table_on_page_boundary: bool,
+    pub recompile_on_fastmem_failure: bool,
+    pub fastmem_exclusive_access: bool,
+    pub recompile_on_exclusive_fastmem_failure: bool,
+    pub hook_isb: bool,
+    pub hook_hint_instructions: bool,
+    pub define_unpredictable_behaviour: bool,
+    pub wall_clock_cntpct: bool,
+    pub check_halt_on_memory_access: bool,
+    pub enable_cycle_counting: bool,
+    pub always_little_endian: bool,
+    pub very_verbose_debugging_output: bool,
+}
+
+impl UserConfig {
+    pub const PAGE_BITS: usize = 12;
+    pub const NUM_PAGE_TABLE_ENTRIES: usize = 1 << (32 - Self::PAGE_BITS);
+    pub const DEFAULT_CODE_CACHE_SIZE: u32 = 128 * 1024 * 1024;
+
+    pub fn new(callbacks: Box<dyn UserCallbacks>) -> Self {
+        Self {
+            callbacks,
+            global_monitor: None,
+            page_table: None,
+            coprocessors: empty_coprocessors(),
+            fastmem_pointer: None,
+            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            code_cache_size: Self::DEFAULT_CODE_CACHE_SIZE,
+            page_table_pointer_mask_bits: 0,
+            page_table_log2_stride: 3,
+            arch_version: ArchVersion::V8,
+            processor_id: 0,
+            detect_misaligned_access_via_page_table: 0,
+            unsafe_optimizations: false,
+            absolute_offset_page_table: false,
+            only_detect_misalignment_via_page_table_on_page_boundary: false,
+            recompile_on_fastmem_failure: true,
+            fastmem_exclusive_access: false,
+            recompile_on_exclusive_fastmem_failure: true,
+            hook_isb: false,
+            hook_hint_instructions: false,
+            define_unpredictable_behaviour: false,
+            wall_clock_cntpct: false,
+            check_halt_on_memory_access: false,
+            enable_cycle_counting: true,
+            always_little_endian: false,
+            very_verbose_debugging_output: false,
+        }
+    }
+
+    pub fn has_optimization(&self, mut flag: OptimizationFlag) -> bool {
+        if !self.unsafe_optimizations {
+            flag &= OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        }
+        (flag & self.optimizations) != OptimizationFlag::NO_OPTIMIZATIONS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +252,20 @@ mod tests {
         assert!(!callbacks.memory_write_exclusive_32(0, 0, 0));
         assert!(!callbacks.memory_write_exclusive_64(0, 0, 0));
         assert!(!callbacks.is_read_only_memory(0));
+    }
+
+    #[test]
+    fn user_config_defaults_match_upstream() {
+        let config = UserConfig::new(Box::new(DefaultCallbacks));
+        assert_eq!(UserConfig::PAGE_BITS, 12);
+        assert_eq!(UserConfig::NUM_PAGE_TABLE_ENTRIES, 1 << 20);
+        assert_eq!(config.code_cache_size, 128 * 1024 * 1024);
+        assert_eq!(config.page_table_log2_stride, 3);
+        assert_eq!(config.arch_version, ArchVersion::V8);
+        assert!(config.recompile_on_fastmem_failure);
+        assert!(config.recompile_on_exclusive_fastmem_failure);
+        assert!(config.enable_cycle_counting);
+        assert!(config.has_optimization(OptimizationFlag::BLOCK_LINKING));
+        assert!(!config.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA));
     }
 }

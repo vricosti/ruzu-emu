@@ -10581,7 +10581,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   consumers. They must be removed after those consumers migrate to the new typed owners.
 
 ### Missing items
-- `UserConfig` remains missing from both architecture owners.
+- `UserConfig` was restored in the following 2026-08-24 configuration-owner slice.
 - Direct A32 and A64 runtime/backend consumption of the new traits remains the next prerequisite
   before the legacy shared callback trait can be deleted.
 
@@ -10589,3 +10589,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: A32/A64 exception and cache-event enums retain their verified four-byte layouts; A64
   `Vector = [u64; 2]` is verified as 16 bytes with eight-byte alignment. Trait objects themselves
   are host-side interfaces and are not raw-copied guest payloads.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/{a32,a64}/config.rs` vs Eden `interface/{A32,A64}/config.h` (`UserConfig` owners)
+
+### Intentional differences
+- Rust owns callbacks with `Box<dyn UserCallbacks>` and represents nullable pointers with `Option`;
+  Eden accepts non-owning raw callback pointers and uses null/default optionals. The JIT lifetime
+  remains responsible for keeping every callback and pointee alive.
+- A32's page table is typed as a pointer to the exact fixed-size pointer array; A64's `void**` is
+  represented as `*mut *mut c_void`. Fastmem bases use byte pointers rather than integer addresses.
+- Each Rust configuration is constructed with `UserConfig::new(callbacks)` because a useful safe
+  default cannot manufacture Eden's required callback pointer.
+
+### Unintentional differences (to fix)
+- Fixed: both architecture configuration owners lacked their complete `UserConfig` structures.
+  All fields now live beside their upstream counterparts with exact architecture-specific integer
+  widths, pointer shapes, constants, and initial values.
+- Fixed: the only optimization predicate lived on the merged legacy `JitConfig`. Both owned
+  configurations now apply Eden's unsafe-flag mask before testing the requested flag.
+- Runtime JITs and host backends still consume the merged legacy `JitConfig`; migration to these
+  new owners remains required before the old structure can be removed.
+
+### Missing items
+- Direct A32/A64 JIT and backend construction from their respective `UserConfig` types.
+- Removal of the legacy shared `jit_config::JitConfig` after all callers have migrated.
+
+### Binary layout verification
+- N/A: these host configuration structures are not raw-copied across the guest ABI. Focused tests
+  verify both upstream constants and every nonzero/true default, including A32 page-table geometry,
+  A64 timer/cache registers, mirror/recompile switches, cycle counting, and optimization masking.

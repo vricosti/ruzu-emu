@@ -107,9 +107,100 @@ pub trait UserCallbacks: Send {
     fn get_cntpct(&self) -> u64;
 }
 
+/// Configuration for an A64 JIT instance.
+///
+/// Upstream owner: `interface/A64/config.h::UserConfig`.
+pub struct UserConfig {
+    pub fastmem_pointer: Option<*mut u8>,
+    pub callbacks: Box<dyn UserCallbacks>,
+    pub global_monitor: Option<*mut ExclusiveMonitor>,
+    pub tpidrro_el0: Option<*const u64>,
+    pub tpidr_el0: Option<*mut u64>,
+    pub page_table: Option<*mut *mut c_void>,
+    pub optimizations: OptimizationFlag,
+    pub page_table_address_space_bits: u32,
+    pub page_table_pointer_mask_bits: i32,
+    pub page_table_log2_stride: usize,
+    pub cntfrq_el0: u32,
+    pub ctr_el0: u32,
+    pub dczid_el0: u32,
+    pub fastmem_address_space_bits: u32,
+    pub code_cache_size: u32,
+    pub detect_misaligned_access_via_page_table: u8,
+    pub processor_id: u8,
+    pub unsafe_optimizations: bool,
+    pub hook_data_cache_operations: bool,
+    pub hook_isb: bool,
+    pub hook_hint_instructions: bool,
+    pub silently_mirror_page_table: bool,
+    pub absolute_offset_page_table: bool,
+    pub only_detect_misalignment_via_page_table_on_page_boundary: bool,
+    pub recompile_on_fastmem_failure: bool,
+    pub silently_mirror_fastmem: bool,
+    pub fastmem_exclusive_access: bool,
+    pub recompile_on_exclusive_fastmem_failure: bool,
+    pub define_unpredictable_behaviour: bool,
+    pub wall_clock_cntpct: bool,
+    pub check_halt_on_memory_access: bool,
+    pub enable_cycle_counting: bool,
+    pub very_verbose_debugging_output: bool,
+}
+
+impl UserConfig {
+    pub const DEFAULT_CODE_CACHE_SIZE: u32 = 128 * 1024 * 1024;
+
+    pub fn new(callbacks: Box<dyn UserCallbacks>) -> Self {
+        Self {
+            fastmem_pointer: None,
+            callbacks,
+            global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            page_table: None,
+            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            page_table_address_space_bits: 36,
+            page_table_pointer_mask_bits: 0,
+            page_table_log2_stride: 3,
+            cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            fastmem_address_space_bits: 36,
+            code_cache_size: Self::DEFAULT_CODE_CACHE_SIZE,
+            detect_misaligned_access_via_page_table: 0,
+            processor_id: 0,
+            unsafe_optimizations: false,
+            hook_data_cache_operations: false,
+            hook_isb: false,
+            hook_hint_instructions: false,
+            silently_mirror_page_table: true,
+            absolute_offset_page_table: false,
+            only_detect_misalignment_via_page_table_on_page_boundary: false,
+            recompile_on_fastmem_failure: true,
+            silently_mirror_fastmem: true,
+            fastmem_exclusive_access: false,
+            recompile_on_exclusive_fastmem_failure: true,
+            define_unpredictable_behaviour: false,
+            wall_clock_cntpct: false,
+            check_halt_on_memory_access: false,
+            enable_cycle_counting: true,
+            very_verbose_debugging_output: false,
+        }
+    }
+
+    pub fn has_optimization(&self, mut flag: OptimizationFlag) -> bool {
+        if !self.unsafe_optimizations {
+            flag &= OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        }
+        (flag & self.optimizations) != OptimizationFlag::NO_OPTIMIZATIONS
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DataCacheOperation, Exception, InstructionCacheOperation, UserCallbacks, Vector};
+    use super::{
+        DataCacheOperation, Exception, InstructionCacheOperation, UserCallbacks, UserConfig, Vector,
+    };
+    use crate::interface::optimization_flags::OptimizationFlag;
 
     #[test]
     fn exception_values_and_layout_match_upstream() {
@@ -215,4 +306,27 @@ mod tests {
         assert!(!callbacks.memory_write_exclusive_128(0, [0; 2], [0; 2]));
         assert!(!callbacks.is_read_only_memory(0));
     }
+
+    #[test]
+    fn user_config_defaults_match_upstream() {
+        let config = UserConfig::new(Box::new(DefaultCallbacks));
+        assert_eq!(config.page_table_address_space_bits, 36);
+        assert_eq!(config.page_table_log2_stride, 3);
+        assert_eq!(config.cntfrq_el0, 600_000_000);
+        assert_eq!(config.ctr_el0, 0x8444_c004);
+        assert_eq!(config.dczid_el0, 4);
+        assert_eq!(config.fastmem_address_space_bits, 36);
+        assert_eq!(config.code_cache_size, 128 * 1024 * 1024);
+        assert!(config.silently_mirror_page_table);
+        assert!(config.recompile_on_fastmem_failure);
+        assert!(config.silently_mirror_fastmem);
+        assert!(config.recompile_on_exclusive_fastmem_failure);
+        assert!(config.enable_cycle_counting);
+        assert!(config.has_optimization(OptimizationFlag::BLOCK_LINKING));
+        assert!(!config.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA));
+    }
 }
+use std::ffi::c_void;
+
+use crate::exclusive_monitor::ExclusiveMonitor;
+use crate::interface::optimization_flags::OptimizationFlag;

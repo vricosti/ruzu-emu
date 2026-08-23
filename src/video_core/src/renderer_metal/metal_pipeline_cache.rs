@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "metal-spirv-validation")]
+use std::sync::OnceLock;
 
 use common::thread_worker::ThreadWorker;
 
@@ -58,9 +60,12 @@ use crate::shader_environment::{
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
 use super::metal_framebuffer::MetalFramebuffer;
 use super::metal_shader::{
-    compile_direct_msl_shader_with_bindings, compile_native_shader,
-    validate_direct_msl_module_against_compatibility, DirectMslCompileError,
-    MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
+    compile_direct_msl_shader_with_bindings, DirectMslCompileError, MetalShaderCompileOptions,
+    MetalShaderError, MetalShaderModule,
+};
+#[cfg(feature = "metal-spirv-validation")]
+use super::metal_shader::{
+    compile_native_shader, validate_direct_msl_module_against_compatibility,
 };
 
 const SPIRV_1_5: u32 = 0x0001_0500;
@@ -68,6 +73,7 @@ const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
 const METAL_MAX_USER_CLIP_DISTANCES: u32 = 8;
 const CACHE_VERSION: u32 = 1;
 
+#[cfg(feature = "metal-spirv-validation")]
 fn validate_direct_msl_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_VALIDATE_DIRECT_MSL").is_some())
@@ -690,6 +696,12 @@ impl MetalPipelineCache {
         let profile = make_shader_profile(device.profile());
         let host_info = make_host_translate_info(device.profile());
         log::info!("Metal pipeline cache is using direct Maxwell IR to MSL compilation");
+        #[cfg(not(feature = "metal-spirv-validation"))]
+        if std::env::var_os("RUZU_VALIDATE_DIRECT_MSL").is_some() {
+            log::warn!(
+                "RUZU_VALIDATE_DIRECT_MSL requires a build with the video_core/metal-spirv-validation feature"
+            );
+        }
         Self {
             device,
             profile,
@@ -797,6 +809,7 @@ impl MetalPipelineCache {
             }
         }
 
+        #[cfg(feature = "metal-spirv-validation")]
         if validate_direct_msl_enabled() {
             let validation = catch_shader_exception(|| {
                 let mut bindings = Bindings::default();
@@ -1151,6 +1164,7 @@ impl MetalPipelineCache {
             &options,
             &mut bindings,
         )?);
+        #[cfg(feature = "metal-spirv-validation")]
         if validate_direct_msl_enabled() {
             let compatibility = catch_shader_exception(|| {
                 let mut bindings = Bindings::default();

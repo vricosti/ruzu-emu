@@ -63,3 +63,12 @@ Implémenter un backend natif MSL pour le renderer Metal de ruzu, générant dir
   - Les titres de validation démarrent et rendent correctement.
   - Les performances de compilation et d’exécution sont mesurées avant/après.
   - Les limitations restantes sont explicitement identifiées, sans fallback ou dette masquée.
+
+## Completion audit (2026-08-23)
+
+- The normal Metal runtime compiles graphics and compute shaders directly from the shared Maxwell IR to MSL. It does not emit or consume SPIR-V and does not call SPIRV-Cross.
+- `spirv-cross2` is no longer a normal `video_core` dependency. It is available only to tests and to builds that explicitly enable `video_core/metal-spirv-validation`; `RUZU_VALIDATE_DIRECT_MSL` warns when used without that feature.
+- Vulkan remains on the SPIR-V backend. Metal and Vulkan Pinball smoke tests both exceeded 512 queued frames without shader failures or panics.
+- The MK8D persistent Metal cache rebuilt 1,041 direct-MSL pipelines. A cold 550-pipeline rebuild measured 0.254 s with direct MSL versus 3.796 s through SPIRV-Cross (about 14.95x faster). Runtime presentation throughput was effectively unchanged (about 59.55 versus 60.30 queued frames/s).
+- `cargo test -p shader_recompiler --release`: 534 passed, 0 failed. `cargo test -p video_core --release -- --test-threads=1`: 1,609 passed, 0 failed, 1 ignored.
+- Remaining explicit limitations are unmerged `VertexA`, tessellation-control/evaluation, geometry shaders, FP64, sparse residency, and unsupported host features detected by `first_unsupported_program_feature`. These paths return errors; there is no SPIR-V fallback. None was encountered by the validated homebrew, STK, or MK8D shader sets.

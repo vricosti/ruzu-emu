@@ -8,6 +8,7 @@
 //! validation oracle and for focused compatibility tests. Both paths finish at
 //! the same native Metal module and resource ABI.
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 use std::num::NonZeroU32;
 
 use objc2::rc::Retained;
@@ -17,11 +18,15 @@ use objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLFunction, MTLGPUFamily, MTLLanguageVersion, MTLLibrary,
     MTLMathMode, MTLReadWriteTextureTier,
 };
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 use spirv_cross2::compile::msl::{
     BindTarget, CompilerOptions, MetalPlatform, MslVersion as SpirvCrossMslVersion, ResourceBinding,
 };
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 use spirv_cross2::reflect::{ArrayDimension, Resource, TypeInner};
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 use spirv_cross2::targets::Msl;
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 use spirv_cross2::{Compiler, Module, SpirvCrossError};
 use thiserror::Error;
 
@@ -95,15 +100,19 @@ impl MetalShaderCompileOptions {
 
 #[derive(Debug, Error)]
 pub enum MetalShaderError {
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error(transparent)]
     Translation(#[from] SpirvCrossError),
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("SPIR-V resource {resource} is missing {decoration}")]
     MissingDecoration {
         resource: String,
         decoration: &'static str,
     },
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("SPIR-V resource {resource} has a non-literal or runtime descriptor array")]
     NonLiteralDescriptorArray { resource: String },
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("SPIR-V resource {resource} has an overflowing descriptor array size")]
     DescriptorArrayOverflow { resource: String },
     #[error(
@@ -114,12 +123,16 @@ pub enum MetalShaderError {
         requested: u32,
         limit: u32,
     },
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("Metal direct bindings do not yet support SPIR-V resource class {0}")]
     UnsupportedResourceClass(&'static str),
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("multiple SPIR-V resource classes use set {set} binding {binding}")]
     AliasedResourceBinding { set: u32, binding: u32 },
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("MSL requires unsupported auxiliary buffer {0}")]
     UnsupportedAuxiliaryBuffer(&'static str),
+    #[cfg(any(test, feature = "metal-spirv-validation"))]
     #[error("SPIRV-Cross returned unsupported execution model {0:?}")]
     UnsupportedExecutionModel(spirv_cross2::spirv::ExecutionModel),
     #[error("Metal failed to compile MSL: {0}")]
@@ -130,6 +143,7 @@ pub enum MetalShaderError {
     UnsupportedLanguageVersion { major: u8, minor: u8 },
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 #[derive(Debug, Error)]
 pub enum DirectMslValidationError {
     #[error(transparent)]
@@ -196,6 +210,7 @@ impl MetalShaderModule {
     }
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 #[derive(Debug)]
 struct ReflectedResource {
     descriptor_set: u32,
@@ -204,6 +219,7 @@ struct ReflectedResource {
     count: Option<NonZeroU32>,
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn resource_name(resource: &Resource<'_>) -> String {
     let name = resource.name.as_ref();
     if name.is_empty() {
@@ -213,6 +229,7 @@ fn resource_name(resource: &Resource<'_>) -> String {
     }
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn literal_decoration(
     compiler: &Compiler<Msl>,
     resource: &Resource<'_>,
@@ -228,6 +245,7 @@ fn literal_decoration(
         })
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn descriptor_array_count(
     compiler: &Compiler<Msl>,
     resource: &Resource<'_>,
@@ -261,6 +279,7 @@ fn descriptor_array_count(
         })
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn reflect_resource(
     compiler: &Compiler<Msl>,
     resource: Resource<'_>,
@@ -284,6 +303,7 @@ fn reflect_resource(
     })
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn require_empty_resource_class(class: &'static str, count: usize) -> Result<(), MetalShaderError> {
     if count == 0 {
         Ok(())
@@ -292,6 +312,7 @@ fn require_empty_resource_class(class: &'static str, count: usize) -> Result<(),
     }
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn allocate_slots(
     cursor: &mut u32,
     count: u32,
@@ -320,6 +341,7 @@ fn allocate_slots(
 /// Reflect and compact one SPIR-V module into Metal's three direct-binding
 /// namespaces. Numeric gaps in Vulkan bindings do not consume Metal slots;
 /// actual SPIR-V descriptor arrays do.
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn reflect_direct_resource_bindings(
     words: &[u32],
     profile: &MetalDeviceProfile,
@@ -460,6 +482,7 @@ pub fn reflect_direct_resource_bindings(
 }
 
 /// Translate shader-recompiler SPIR-V to native MSL.
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn compile_spirv_to_msl(
     words: &[u32],
     resource_bindings: &[MetalResourceBinding],
@@ -471,6 +494,7 @@ pub fn compile_spirv_to_msl(
     )
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn compile_spirv_to_msl_with_options(
     words: &[u32],
     resource_bindings: &[MetalResourceBinding],
@@ -501,6 +525,7 @@ pub fn compile_spirv_to_msl_with_options(
     })
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn stage_from_execution_model(
     execution_model: spirv_cross2::spirv::ExecutionModel,
 ) -> Result<Stage, MetalShaderError> {
@@ -517,6 +542,7 @@ fn stage_from_execution_model(
     }
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn make_compiler_options(metal_options: &MetalShaderCompileOptions) -> CompilerOptions {
     let mut options = CompilerOptions::default();
     options.version = SpirvCrossMslVersion::new(
@@ -543,6 +569,7 @@ fn make_compiler_options(metal_options: &MetalShaderCompileOptions) -> CompilerO
     options
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 fn compile_spirv_to_msl_with_layout(
     words: &[u32],
     bindings: &MetalShaderBindingLayout,
@@ -611,6 +638,7 @@ fn compile_spirv_to_msl_with_layout(
 
 /// Translate a shader-recompiler module and compile it with Apple's native
 /// Metal compiler. `main0` is SPIRV-Cross's stable entry-point name.
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn compile_native_shader(
     device: &ProtocolObject<dyn MTLDevice>,
     profile: &MetalDeviceProfile,
@@ -770,6 +798,7 @@ fn metal_language_version(version: MslVersion) -> Result<MTLLanguageVersion, Met
 /// This function is validation-only: callers retain and use `active`, and an
 /// unsupported direct opcode is reported rather than replaced with a shader
 /// fallback.
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn validate_direct_msl_against_active_module(
     device: &ProtocolObject<dyn MTLDevice>,
     program: &Program,
@@ -788,6 +817,7 @@ pub fn validate_direct_msl_against_active_module(
     )
 }
 
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn validate_direct_msl_against_active_module_with_bindings(
     device: &ProtocolObject<dyn MTLDevice>,
     program: &Program,
@@ -817,6 +847,7 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
 
 /// Compare an already-compiled direct-MSL module with the validation-only
 /// SPIRV-Cross module produced from the same backend-neutral IR.
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 pub fn validate_direct_msl_module_against_compatibility(
     direct: &MetalShaderModule,
     compatibility: &MetalShaderModule,

@@ -437,6 +437,14 @@ impl<'a> IREmitter<'a> {
         self.emit_pseudo_op(Opcode::GetNZCVFromOp, value)
     }
 
+    pub fn get_upper_from_op(&mut self, value: Value) -> Value {
+        self.emit_pseudo_op(Opcode::GetUpperFromOp, value)
+    }
+
+    pub fn get_lower_from_op(&mut self, value: Value) -> Value {
+        self.emit_pseudo_op(Opcode::GetLowerFromOp, value)
+    }
+
     /// Emit a pseudo-op that reads flags from a producing instruction.
     /// Links the pseudo-op to the producing instruction via next_pseudoop,
     /// matching upstream's GetAssociatedPseudoOperation mechanism.
@@ -2553,5 +2561,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn upper_and_lower_pseudo_operations_link_to_their_producer() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let (producer, upper, lower);
+        {
+            let mut e = IREmitter::new(&mut block);
+            producer = e.emit(Opcode::Void, &[]);
+            upper = e.get_upper_from_op(producer);
+            lower = e.get_lower_from_op(producer);
+        }
+
+        let producer = producer.inst_ref();
+        let upper = upper.inst_ref();
+        let lower = lower.inst_ref();
+        assert_eq!(block.get(upper).opcode, Opcode::GetUpperFromOp);
+        assert_eq!(block.get(lower).opcode, Opcode::GetLowerFromOp);
+        assert_eq!(
+            block.get_associated_pseudo_operation(producer, Opcode::GetUpperFromOp),
+            Some(upper)
+        );
+        assert_eq!(
+            block.get_associated_pseudo_operation(producer, Opcode::GetLowerFromOp),
+            Some(lower)
+        );
+        assert_eq!(block.get(upper).next_pseudoop, Some(lower));
     }
 }

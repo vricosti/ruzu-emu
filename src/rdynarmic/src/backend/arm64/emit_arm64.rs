@@ -545,6 +545,16 @@ fn emit_ir_instruction(
             }
             Ok(())
         }
+        Opcode::GetUpperFromOp | Opcode::GetLowerFromOp => {
+            let _args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+            if !ctx.reg_alloc.was_value_defined(inst_ref) {
+                return Err(format!(
+                    "ARM64 {:?} reached emitter before producer defined it",
+                    ctx.block.get(inst_ref).opcode
+                ));
+            }
+            Ok(())
+        }
         Opcode::GetNZCVFromOp | Opcode::GetNZFromOp => emit_get_nzcv_from_op(code, ctx, inst_ref),
         Opcode::GetCFlagFromNZCV => emit_get_c_flag_from_nzcv(code, ctx, inst_ref),
         Opcode::IsZero32 => emit_is_zero32(code, ctx, inst_ref),

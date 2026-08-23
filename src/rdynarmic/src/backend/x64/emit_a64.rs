@@ -925,40 +925,6 @@ pub fn emit_identity(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, i
     ra.define_value_from_arg(inst_ref, &args[0]);
 }
 
-// ---------------------------------------------------------------------------
-// Upper/Lower extraction (for 128-bit split)
-// ---------------------------------------------------------------------------
-
-/// GetUpperFromOp: extract upper 64 bits from a 128-bit value.
-pub fn emit_get_upper_from_op(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, 1);
-    let source = ra.use_scratch_xmm(&mut args[0]);
-    // Shift upper 64 bits down
-    ra.asm.psrlq_imm(source, 64).unwrap();
-    let result = ra.scratch_gpr();
-    ra.asm.movq(result, source).unwrap();
-    ra.define_value(inst_ref, result);
-}
-
-/// GetLowerFromOp: extract lower 64 bits from a 128-bit value.
-pub fn emit_get_lower_from_op(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let source = ra.use_xmm(&mut args[0]);
-    let result = ra.scratch_gpr();
-    ra.asm.movq(result, source).unwrap();
-    ra.define_value(inst_ref, result);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

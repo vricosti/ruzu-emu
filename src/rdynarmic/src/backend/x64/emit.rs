@@ -15,6 +15,7 @@ use crate::backend::x64::emit_saturation as sat;
 use crate::backend::x64::emit_sha;
 use crate::backend::x64::emit_sm4;
 use crate::backend::x64::emit_terminal;
+use crate::backend::x64::emit_x64;
 use crate::backend::x64::emit_vector_arrangement as varr;
 use crate::backend::x64::emit_vector_basic as vbasic;
 use crate::backend::x64::emit_vector_compare as vcmp;
@@ -337,8 +338,8 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             }
             Opcode::GetNZCVFromOp => emit_a64::emit_get_nzcv_from_op(ctx, ra, inst_ref, inst),
             Opcode::GetNZFromOp => emit_a64::emit_get_nz_from_op(ctx, ra, inst_ref, inst),
-            Opcode::GetUpperFromOp => emit_a64::emit_get_upper_from_op(ctx, ra, inst_ref, inst),
-            Opcode::GetLowerFromOp => emit_a64::emit_get_lower_from_op(ctx, ra, inst_ref, inst),
+            Opcode::GetUpperFromOp => emit_x64::emit_get_upper_from_op(ctx, ra, inst_ref, inst),
+            Opcode::GetLowerFromOp => emit_x64::emit_get_lower_from_op(ctx, ra, inst_ref, inst),
             Opcode::GetCFlagFromNZCV => {
                 emit_a64::emit_get_c_flag_from_nzcv(ctx, ra, inst_ref, inst)
             }

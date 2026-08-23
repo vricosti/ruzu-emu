@@ -8153,3 +8153,38 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 - PASS: all four opcodes use Eden's exact `U128(U128)` metadata. The x64 instruction sequences are
   covered for SSSE3 and SSE2, and arm64 encodings were independently verified in the prerequisite
   slice; no raw guest-visible payload is introduced.
+
+## 2026-08-23 — rdynarmic upper/lower multi-result pseudo-operations vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/ir/emitter.rs`,
+`src/rdynarmic/src/backend/x64/{emit_x64,reg_alloc}.rs`, and
+`src/rdynarmic/src/backend/arm64/emit_arm64.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/ir_emitter.h`,
+`src/dynarmic/src/dynarmic/backend/x64/{emit_x64,reg_alloc}.{h,cpp}`, and
+`src/dynarmic/src/dynarmic/backend/arm64/{emit_arm64,reg_alloc}.{h,cpp}`.
+
+### Intentional differences
+- Rust's arena-backed emitter exposes named `get_upper_from_op` and `get_lower_from_op` methods
+  around the common pseudo-operation linker; Eden constructs the same two typed `Inst<U128>`
+  values directly inside its multi-result emitter.
+- Eden asserts on an ARM64 pseudo-result that its producer failed to define. The Rust backend
+  returns its existing diagnostic `Err` for the same invariant violation, while preserving the
+  argument accounting before the check.
+
+### Unintentional differences (to fix)
+- The x64 handlers previously extracted one 64-bit half from an ordinary `U128` and incorrectly
+  defined the nominally 128-bit result in a GPR. They now only register the complete `U128` value
+  already defined by the multi-result producer, exactly as Eden does.
+- The handlers previously lived in `emit_a64.rs`; they now live in the matching
+  `backend/x64/emit_x64.rs` owner corresponding to Eden's `emit_x64.cpp`.
+
+### Missing items
+- The interrupted `VectorSignedMultiply16/32` and `VectorUnsignedMultiply16/32` producer slice
+  remains to be ported now that this prerequisite is available.
+- Other generic x64 methods from Eden `emit_x64.cpp` are still distributed across older Ruzu
+  modules and remain part of the structural ownership audit.
+
+### Binary layout verification
+- N/A: the change restores SSA pseudo-result ownership and register-allocation bookkeeping; it
+  introduces no serialized payload or ABI-visible data structure.

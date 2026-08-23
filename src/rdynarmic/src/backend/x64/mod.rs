@@ -32,6 +32,7 @@ pub mod emit_vector_misc;
 pub mod emit_vector_multiply;
 pub mod emit_vector_saturated;
 pub mod emit_vector_shift;
+pub mod emit_x64;
 pub mod emit_x64_memory;
 pub mod emit_x64_vector;
 pub mod exception_handler;

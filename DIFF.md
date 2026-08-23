@@ -10262,3 +10262,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all nine
   restored identities, reserved size combinations, all restored helper operation families, the
   corrected min/max validation, and explicit lower-vector zeroing order.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_three_different.rs` vs Eden `frontend/A64/translate/impl/{simd_three_different.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`;
+  all four anonymous-namespace helpers remain file-local with matching responsibilities.
+- Eden's `LongOperation` lambda for signed/unsigned extension is written as two explicit Rust
+  matches because two closures borrowing the mutable emitter cannot coexist. Operand read,
+  extension, arithmetic, and destination-write ordering are unchanged.
+- `SQDMLAL_vec_2` and `SQDMLSL_vec_2` are declarations only in Eden's `impl.h`; their decoder
+  entries are commented out and the reviewed source has no definitions, so Rust does not invent
+  unreachable visitors.
+
+### Unintentional differences (to fix)
+- Fixed: PMULL and SQDMULL decoded but fell through to the temporary interpreter terminal. Both now
+  preserve Eden's exact reserved size sets, Q-selected source halves, polynomial/saturating IR
+  operations, and 128-bit destination writes.
+- Fixed: the four anonymous-namespace helpers lived as visitor methods. Their ownership now matches
+  Eden without changing the existing long, wide, multiply-long, or absolute-difference behavior.
+
+### Missing items
+- None for the 20 visitors and four file-local helpers defined by the reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both
+  restored identities at every encoded size, reserved combinations, selected lower/upper halves,
+  and absence of interpreter fallback.

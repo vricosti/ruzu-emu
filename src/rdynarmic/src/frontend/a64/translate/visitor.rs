@@ -915,9 +915,11 @@ impl<'a> TranslatorVisitor<'a> {
             SMLAL_vec => self.smlal_vec(inst),
             SMLSL_vec => self.smlsl_vec(inst),
             SMULL_vec => self.smull_vec(inst),
+            PMULL => self.pmull(inst),
             UMLAL_vec => self.umlal_vec(inst),
             UMLSL_vec => self.umlsl_vec(inst),
             UMULL_vec => self.umull_vec(inst),
+            SQDMULL_vec_2 => self.sqdmull_vec_2(inst),
 
             // SIMD scalar three-same / scalar zero-compare.
             SQADD_1 => self.sqadd_1(inst),

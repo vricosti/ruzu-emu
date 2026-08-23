@@ -2916,6 +2916,18 @@ mod tests {
         block.append_new_inst(Opcode::ConvertF16U8, vec![Value::ImmU32(0xFF)]);
         block.append_new_inst(Opcode::ConvertF16U16, vec![Value::ImmU32(0xFFFF)]);
         block.append_new_inst(Opcode::ConvertF16U32, vec![Value::ImmU32(u32::MAX)]);
+        block.append_new_inst(Opcode::UnpackFloat2x16, vec![Value::ImmU32(0xC000_3C00)]);
+        let half_pair = block.append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(1.0), Value::ImmF32(-2.0)],
+        );
+        block.append_new_inst(
+            Opcode::PackHalf2x16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: half_pair,
+            })],
+        );
         if profile.support_int64 {
             program.info.uses_int64 = true;
             block.append_new_inst(
@@ -2968,7 +2980,7 @@ mod tests {
         .expect("native half/int64 IR must lower directly to MSL when supported");
         assert!(artifact.source.source.contains("half v_0_0 = spvFAdd("));
         if profile.support_int64 {
-            assert!(artifact.source.source.contains("ulong v_0_20 ="));
+            assert!(artifact.source.source.contains("ulong v_0_23 ="));
         }
 
         let shader = compile_native_msl_artifact(device.device(), artifact)

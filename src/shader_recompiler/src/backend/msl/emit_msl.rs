@@ -344,6 +344,12 @@ fn emit_inst(
             ir::Type::F32,
             "float",
         ),
+        Opcode::UnpackFloat2x16 => {
+            emit_msl_bitwise_conversion::emit_unpack_float2x16(context, inst_ref, inst)
+        }
+        Opcode::PackHalf2x16 => {
+            emit_msl_bitwise_conversion::emit_pack_half2x16(context, inst_ref, inst)
+        }
         Opcode::LogicalOr => emit_msl_logical::emit_binary(context, inst_ref, inst, "||"),
         Opcode::LogicalAnd => emit_msl_logical::emit_binary(context, inst_ref, inst, "&&"),
         Opcode::LogicalXor => emit_msl_logical::emit_binary(context, inst_ref, inst, "!="),
@@ -2295,6 +2301,30 @@ mod tests {
             "half v_0_9 = isnan(half(as_type<float>(0x7FC00000u))) ? as_type<half>(ushort(0u)) : half(as_type<float>(0x7FC00000u));"
         ));
         assert!(source.contains("float v_0_10 = float(0x0000000000000007ul);"));
+    }
+
+    #[test]
+    fn emits_half_unpack_bitcast_and_pack_conversion() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_fp16 = true;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::UnpackFloat2x16, vec![Value::ImmU32(0xC000_3C00)]);
+        let pair = block.append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(1.0), Value::ImmF32(-2.0)],
+        );
+        block.append_new_inst(
+            Opcode::PackHalf2x16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: pair,
+            })],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("half2 v_0_0 = as_type<half2>(0xC0003C00u);"));
+        assert!(source.contains("uint v_0_2 = as_type<uint>(half2(v_0_1));"));
     }
 
     #[test]

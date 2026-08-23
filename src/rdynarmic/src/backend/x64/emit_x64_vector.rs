@@ -549,7 +549,6 @@ mod tests {
                 memory_write_64: cb(),
                 memory_write_128: cb(),
                 call_supervisor: cb(),
-                interpreter_fallback: cb(),
                 exception_raised: cb(),
                 data_cache_operation: cb(),
                 instruction_cache_operation: cb(),

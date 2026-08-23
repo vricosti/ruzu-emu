@@ -59,7 +59,6 @@ pub struct A64CallbackFns {
     pub exclusive_write_memory_64: *const c_void,
     pub exclusive_write_memory_128: *const c_void,
     pub call_svc: *const c_void,
-    pub interpreter_fallback: *const c_void,
     pub exception_raised: *const c_void,
     pub isb_raised: *const c_void,
     pub ic_raised: *const c_void,
@@ -130,7 +129,6 @@ impl A64CallbackContext {
             exclusive_write_memory_64: a64_arm64_exclusive_write_64 as *const () as *const c_void,
             exclusive_write_memory_128: a64_arm64_exclusive_write_128 as *const () as *const c_void,
             call_svc: a64_arm64_call_svc as *const () as *const c_void,
-            interpreter_fallback: a64_arm64_interpreter_fallback as *const () as *const c_void,
             exception_raised: a64_arm64_exception_raised as *const () as *const c_void,
             isb_raised: a64_arm64_isb_raised as *const () as *const c_void,
             ic_raised: a64_arm64_instruction_cache_operation as *const () as *const c_void,
@@ -211,17 +209,6 @@ extern "C" fn a64_arm64_memory_write_128(
 extern "C" fn a64_arm64_call_svc(ctx: *mut A64CallbackContext, svc_num: u64) {
     let context = unsafe { &mut *ctx };
     context.callbacks_mut().call_supervisor(svc_num as u32);
-}
-
-extern "C" fn a64_arm64_interpreter_fallback(
-    ctx: *mut A64CallbackContext,
-    pc: u64,
-    num_instructions: u64,
-) {
-    let context = unsafe { &mut *ctx };
-    context
-        .callbacks_mut()
-        .interpreter_fallback(pc, num_instructions as usize);
 }
 
 extern "C" fn a64_arm64_exception_raised(ctx: *mut A64CallbackContext, pc: u64, exception: u64) {
@@ -719,9 +706,6 @@ impl A64AddressSpace {
         let call_svc = self
             .address_space
             .emit_call_trampoline(callback_context_ptr, fns.call_svc)?;
-        let interpreter_fallback = self
-            .address_space
-            .emit_call_trampoline(callback_context_ptr, fns.interpreter_fallback)?;
         let exception_raised = self
             .address_space
             .emit_call_trampoline(callback_context_ptr, fns.exception_raised)?;
@@ -776,7 +760,6 @@ impl A64AddressSpace {
         prelude_info.exclusive_write_memory_64 = Some(exclusive_write_memory_64);
         prelude_info.exclusive_write_memory_128 = Some(exclusive_write_memory_128);
         prelude_info.call_svc = Some(call_svc);
-        prelude_info.interpreter_fallback = Some(interpreter_fallback);
         prelude_info.exception_raised = Some(exception_raised);
         prelude_info.isb_raised = Some(isb_raised);
         prelude_info.ic_raised = Some(ic_raised);
@@ -1051,7 +1034,6 @@ mod tests {
             exclusive_write_memory_64: ptr,
             exclusive_write_memory_128: ptr,
             call_svc: ptr,
-            interpreter_fallback: ptr,
             exception_raised: ptr,
             isb_raised: ptr,
             ic_raised: ptr,

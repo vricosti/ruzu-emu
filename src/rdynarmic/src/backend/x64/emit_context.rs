@@ -207,9 +207,6 @@ pub struct EmitCallbacks {
     /// Called when an exception is raised.
     pub exception_raised: Box<dyn Callback>,
 
-    /// Called when execution falls back to the interpreter path.
-    pub interpreter_fallback: Box<dyn Callback>,
-
     /// Called for data cache operations.
     pub data_cache_operation: Box<dyn Callback>,
 

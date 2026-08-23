@@ -101,13 +101,6 @@ pub trait UserCallbacks: Send {
     /// Called when an exception is raised.
     fn exception_raised(&mut self, pc: u64, exception: u64);
 
-    /// Called when translation falls back to the interpreter for one or more
-    /// instructions.
-    ///
-    /// Matches upstream `A64::UserCallbacks::InterpreterFallback` and
-    /// `A32::UserCallbacks::InterpreterFallback`.
-    fn interpreter_fallback(&mut self, _pc: u64, _num_instructions: usize) {}
-
     /// Called for data cache operations (DC instructions).
     fn data_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
 

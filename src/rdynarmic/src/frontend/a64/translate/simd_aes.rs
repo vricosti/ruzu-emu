@@ -67,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn aes_family_emits_upstream_ir_instead_of_interpreter_fallback() {
+    fn aes_family_emits_upstream_ir() {
         let cases = [
             (0x4e28_4800, Opcode::AESEncryptSingleRound),
             (0x4e28_5800, Opcode::AESDecryptSingleRound),

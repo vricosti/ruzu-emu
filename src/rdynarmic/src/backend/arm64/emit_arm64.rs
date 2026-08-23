@@ -150,7 +150,6 @@ pub enum LinkTarget {
     ExclusiveWriteMemory64,
     ExclusiveWriteMemory128,
     CallSVC,
-    InterpreterFallback,
     ExceptionRaised,
     InstructionSynchronizationBarrierRaised,
     InstructionCacheOperationRaised,

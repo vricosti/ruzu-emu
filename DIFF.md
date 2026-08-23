@@ -10532,3 +10532,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: terminals are compiler-owned control-flow values and are not raw-copied across an ABI. The
   bounded crate suite passes with 1075 tests and four ignored after removing the two extra
   Interpret-specific tests.
+
+## 2026-08-24 — `src/rdynarmic/src/{jit_config.rs,jit.rs,backend/{common/a32_callbacks.rs,x64,arm64}}` vs Eden `interface/{A32,A64}/config.h` and host callback plumbing (interpreter-callback inventory)
+
+### Intentional differences
+- Rust still exposes a temporary shared `UserCallbacks` trait and constructs boxed x64 callback
+  adapters, while Eden owns separate A32/A64 interfaces and devirtualizes their methods directly.
+  That broader configuration-owner split remains the next parity slice.
+- The arm64 Rust backend stores callback addresses in an explicit callback table before emitting
+  trampolines; Eden's templated C++ emitters derive them directly from the architecture callback
+  type. The surviving callback inventory and relocation targets now match.
+
+### Unintentional differences (to fix)
+- Fixed: Rust retained a non-upstream `interpreter_fallback` trait method after removing the only
+  terminal that could invoke it. Its A32 forwarding helper, A32/A64 JIT trampolines, x64 callback
+  slots, arm64 callback address/trampoline, relocation target, and prelude field are removed.
+- Fixed: AES and SHA regression-test names still described the removed fallback architecture; they
+  now state the positive upstream-IR contract that the tests actually verify.
+
+### Missing items
+- Separate A32 and A64 callback traits in their matching configuration owners remain missing; the
+  shared callback interface is retained only until that structural prerequisite is implemented.
+
+### Binary layout verification
+- N/A: callback adapters, function pointers, and relocation discriminants are internal JIT
+  plumbing and are not raw-copied guest payloads. Backend construction tests compile against the
+  reduced callback inventory, and the bounded crate suite validates both host-independent paths.

@@ -1518,7 +1518,6 @@ mod tests {
             memory_write_64: mk_arg_w(),
             memory_write_128: mk_arg_w(),
             call_supervisor: mk_arg(),
-            interpreter_fallback: mk_arg(),
             exception_raised: mk_arg(),
             data_cache_operation: mk_arg(),
             instruction_cache_operation: mk_arg(),

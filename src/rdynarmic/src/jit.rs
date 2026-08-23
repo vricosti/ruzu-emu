@@ -1502,10 +1502,6 @@ impl A64Jit {
                 call_supervisor_trampoline as usize as u64,
                 inner_ptr,
             )),
-            interpreter_fallback: Box::new(ArgCallback::new(
-                interpreter_fallback_trampoline as usize as u64,
-                inner_ptr,
-            )),
             exception_raised: Box::new(ArgCallback::new(
                 exception_raised_trampoline as usize as u64,
                 inner_ptr,
@@ -2377,13 +2373,6 @@ extern "C" fn call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
     inner.callbacks.call_supervisor(svc_num as u32);
 }
 
-extern "C" fn interpreter_fallback_trampoline(inner_ptr: u64, pc: u64, num_instructions: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .interpreter_fallback(pc, num_instructions as usize);
-}
-
 extern "C" fn exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner.callbacks.exception_raised(pc, exception);
@@ -2978,10 +2967,6 @@ impl A32Jit {
             )),
             call_supervisor: Box::new(ArgCallback::new(
                 a32_call_supervisor_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            interpreter_fallback: Box::new(ArgCallback::new(
-                a32_interpreter_fallback_trampoline as usize as u64,
                 inner_ptr,
             )),
             exception_raised: Box::new(ArgCallback::new(
@@ -3851,10 +3836,6 @@ extern "C" fn a32_memory_write_128_trampoline(
 extern "C" fn a32_call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     a32_callbacks::call_supervisor(inner.callbacks.as_mut(), svc_num);
-}
-extern "C" fn a32_interpreter_fallback_trampoline(inner_ptr: u64, pc: u64, num_instructions: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::interpreter_fallback(inner.callbacks.as_mut(), pc, num_instructions);
 }
 extern "C" fn a32_exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };

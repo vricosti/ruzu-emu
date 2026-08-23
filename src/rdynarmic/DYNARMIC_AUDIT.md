@@ -115,10 +115,11 @@ validation blockers, not evidence against the focused slices.
   compatibility re-exports until their consumers are migrated.
 - A32 and A64 still share one public `JitConfig` instead of matching Eden's
   separate `interface/A32/config.h` and `interface/A64/config.h` owners.
-- The temporary shared callback trait no longer invents separate exclusive-read or exclusive-clear
-  host events: all backends use `MemoryRead*`, and clear only resets backend reservation state as
-  Eden does. Splitting the remaining architecture-specific callback surface is the active
-  prerequisite for splitting `JitConfig`.
+- The temporary shared callback trait no longer invents separate exclusive-read, exclusive-clear,
+  or interpreter-fallback host events: all backends use `MemoryRead*`, clear only resets backend
+  reservation state, and unsupported instructions follow Eden's translator exception/assertion
+  paths. Splitting the remaining architecture-specific callback surface is the active prerequisite
+  for splitting `JitConfig`.
 - Several A32 instruction families remain aggregated in broad Rust modules;
   the Thumb32 byte/preload, halfword-load, word-load, store-single,
   dual/exclusive/table-branch, and load/store-multiple owners are now split.
@@ -146,9 +147,8 @@ validation blockers, not evidence against the focused slices.
   visitors, including option-controlled store aliases, validation order, pair packing, access
   types, and limited/full ordered operations.
 - The extra `Terminal::Interpret` lifecycle and its no-op merge pass have been removed from the IR,
-  A64 frontend, and both host terminal emitters. The remaining interpreter-fallback callback and
-  trampoline fields are dead plumbing scheduled for the immediately following callback-owner
-  slice.
+  A64 frontend, and both host terminal emitters. Its dead shared callback, JIT trampolines, x64
+  callback slots, and arm64 relocation/prelude plumbing are removed as well.
 - The A64 SM3/EOR3/BCAX crypto slice now owns and dispatches all seven visitors from Eden's
   `simd_crypto_four_register.cpp` and `simd_crypto_three_register.cpp`. This removes seven decoded
   identities from the temporary interpreter fallback.

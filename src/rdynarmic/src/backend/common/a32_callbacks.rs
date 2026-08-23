@@ -89,11 +89,6 @@ pub fn call_supervisor(callbacks: &mut dyn UserCallbacks, svc_num: u64) {
 }
 
 #[inline]
-pub fn interpreter_fallback(callbacks: &mut dyn UserCallbacks, pc: u64, num_instructions: u64) {
-    callbacks.interpreter_fallback(pc, num_instructions as usize);
-}
-
-#[inline]
 pub fn exception_raised(callbacks: &mut dyn UserCallbacks, pc: u64, exception: u64) {
     callbacks.exception_raised(pc, exception);
 }

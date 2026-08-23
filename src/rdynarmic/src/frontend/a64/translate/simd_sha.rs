@@ -194,7 +194,7 @@ mod tests {
     use crate::ir::opcode::Opcode;
 
     #[test]
-    fn sha_family_translates_without_interpreter_fallback() {
+    fn sha_family_translates_to_upstream_ir() {
         let cases = [
             (0x5e00_0000, None),
             (0x5e00_1000, None),

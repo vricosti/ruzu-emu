@@ -1586,6 +1586,50 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_compute_position_builtins_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Compute);
+        program.workgroup_size = [8, 4, 2];
+        program.info.uses_workgroup_id = true;
+        program.info.uses_local_invocation_id = true;
+        program.blocks[0].append_new_inst(Opcode::WorkgroupId, vec![]);
+        program.blocks[0].append_new_inst(Opcode::LocalInvocationId, vec![]);
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+        )
+        .expect("active compute built-in SPIR-V/MSL must compile");
+        let shader = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct compute built-in MSL must compile with the active ABI");
+
+        assert_eq!(shader.bindings(), active.bindings());
+        assert_eq!(shader.execution().workgroup_size, Some([8, 4, 2]));
+        assert!(shader
+            .source()
+            .source
+            .contains("[[threadgroup_position_in_grid]]"));
+        assert!(shader
+            .source()
+            .source
+            .contains("[[thread_position_in_threadgroup]]"));
+    }
+
+    #[test]
     fn compiles_direct_msl_shared_memory_at_msl_2_3_baseline() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);

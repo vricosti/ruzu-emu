@@ -70,3 +70,21 @@ pub fn emit_get_cbuf(
         _ => unreachable!("non-CBUF opcode {:?}", inst.opcode),
     }
 }
+
+/// Emit Eden's `EmitWorkgroupId` through Metal's native compute built-in.
+pub fn emit_workgroup_id(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
+    context.define(inst_ref, ir::Type::U32x3, "workgroup_id".to_owned(), false)
+}
+
+/// Emit Eden's `EmitLocalInvocationId` through Metal's native compute built-in.
+pub fn emit_local_invocation_id(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+) -> Result<(), MslError> {
+    context.define(
+        inst_ref,
+        ir::Type::U32x3,
+        "local_invocation_id".to_owned(),
+        false,
+    )
+}

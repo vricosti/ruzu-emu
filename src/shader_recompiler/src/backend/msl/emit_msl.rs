@@ -54,6 +54,11 @@ fn first_unsupported_program_feature(
     if program.shared_memory_size != 0 && program.stage != crate::stage::Stage::Compute {
         return Some("shared memory outside a compute shader");
     }
+    if (info.uses_workgroup_id || info.uses_local_invocation_id)
+        && program.stage != crate::stage::Stage::Compute
+    {
+        return Some("compute built-in outside a compute shader");
+    }
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
     }
@@ -108,9 +113,7 @@ fn first_unsupported_program_feature(
     {
         return Some("memory operations");
     }
-    if info.uses_workgroup_id
-        || info.uses_local_invocation_id
-        || info.uses_invocation_id
+    if info.uses_invocation_id
         || info.uses_invocation_info
         || info.uses_sample_id
         || info.uses_is_helper_invocation
@@ -535,6 +538,10 @@ fn emit_inst(
         | Opcode::GetCbufU32
         | Opcode::GetCbufF32
         | Opcode::GetCbufU32x2 => emit_msl_context_get_set::emit_get_cbuf(context, inst_ref, inst),
+        Opcode::WorkgroupId => emit_msl_context_get_set::emit_workgroup_id(context, inst_ref),
+        Opcode::LocalInvocationId => {
+            emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
+        }
         Opcode::LoadStorageU8
         | Opcode::LoadStorageS8
         | Opcode::LoadStorageU16
@@ -1281,6 +1288,22 @@ mod tests {
         assert_eq!(artifact.source.stage, Stage::Compute);
         assert!(artifact.source.source.contains("kernel void main0()"));
         assert_eq!(artifact.execution.workgroup_size, Some([8, 4, 2]));
+    }
+
+    #[test]
+    fn emits_compute_grid_and_threadgroup_position_builtins() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_workgroup_id = true;
+        program.info.uses_local_invocation_id = true;
+        program.blocks[0].append_new_inst(Opcode::WorkgroupId, vec![]);
+        program.blocks[0].append_new_inst(Opcode::LocalInvocationId, vec![]);
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint3 workgroup_id [[threadgroup_position_in_grid]]"));
+        assert!(source.contains("uint3 local_invocation_id [[thread_position_in_threadgroup]]"));
+        assert!(source.contains("uint3 v_0_0 = workgroup_id;"));
+        assert!(source.contains("uint3 v_0_1 = local_invocation_id;"));
     }
 
     #[test]

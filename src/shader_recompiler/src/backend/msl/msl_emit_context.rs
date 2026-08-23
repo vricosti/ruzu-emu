@@ -192,6 +192,13 @@ impl MslEmitContext {
             images.push(definition);
             *binding_counter += 1;
         }
+        if program.info.uses_workgroup_id {
+            parameters.push("uint3 workgroup_id [[threadgroup_position_in_grid]]".to_owned());
+        }
+        if program.info.uses_local_invocation_id {
+            parameters
+                .push("uint3 local_invocation_id [[thread_position_in_threadgroup]]".to_owned());
+        }
         let parameters = parameters.join(", ");
         let mut source = String::new();
         let returns_output = match stage {

@@ -1586,6 +1586,43 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_shared_memory_at_msl_2_3_baseline() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 64;
+        program.info.uses_int8 = true;
+        let load = program.blocks[0].append_new_inst(Opcode::LoadSharedU32, vec![Value::ImmU32(4)]);
+        program.blocks[0].append_new_inst(
+            Opcode::WriteSharedU8,
+            vec![
+                Value::ImmU32(3),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load,
+                }),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Barrier, vec![]);
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
+                supports_query_texture_lod: false,
+                supports_read_write_textures: false,
+                supports_texture_atomics: false,
+            },
+        )
+        .expect("shared-memory compute IR must lower directly to MSL 2.3");
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct shared-memory MSL 2.3 must compile natively");
+        assert_eq!(shader.source().stage, Stage::Compute);
+        assert!(shader.source().source.contains("threadgroup uint smem[16]"));
+    }
+
+    #[test]
     fn compiles_direct_msl_ssa_and_vertex_output_with_metal() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::VertexB);

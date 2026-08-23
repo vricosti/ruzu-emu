@@ -14,6 +14,7 @@ use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
+use super::emit_msl_barriers;
 use super::emit_msl_bitwise_conversion;
 use super::emit_msl_composite;
 use super::emit_msl_context_get_set;
@@ -25,6 +26,7 @@ use super::emit_msl_integer;
 use super::emit_msl_logical;
 use super::emit_msl_memory;
 use super::emit_msl_select;
+use super::emit_msl_shared_memory;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
 
@@ -48,8 +50,8 @@ fn first_unsupported_program_feature(
     if program.local_memory_size != 0 {
         return Some("local memory");
     }
-    if program.shared_memory_size != 0 {
-        return Some("shared memory");
+    if program.shared_memory_size != 0 && program.stage != crate::stage::Stage::Compute {
+        return Some("shared memory outside a compute shader");
     }
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
@@ -550,6 +552,23 @@ fn emit_inst(
         | Opcode::WriteStorage32
         | Opcode::WriteStorage64
         | Opcode::WriteStorage128 => emit_msl_memory::emit_write_storage(context, inst_ref, inst),
+        Opcode::LoadSharedU8
+        | Opcode::LoadSharedS8
+        | Opcode::LoadSharedU16
+        | Opcode::LoadSharedS16
+        | Opcode::LoadSharedU32
+        | Opcode::LoadSharedU64
+        | Opcode::LoadSharedU128 => {
+            emit_msl_shared_memory::emit_load_shared(context, inst_ref, inst)
+        }
+        Opcode::WriteSharedU8
+        | Opcode::WriteSharedU16
+        | Opcode::WriteSharedU32
+        | Opcode::WriteSharedU64
+        | Opcode::WriteSharedU128 => {
+            emit_msl_shared_memory::emit_write_shared(context, inst_ref, inst)
+        }
+        Opcode::Barrier => emit_msl_barriers::emit_barrier(context),
         Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
             emit_msl_image::emit_image_sample(context, inst_ref, inst)
         }
@@ -1765,6 +1784,68 @@ mod tests {
         );
         assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
         assert_eq!(artifact.bindings.resources[0].count, None);
+    }
+
+    #[test]
+    fn emits_shared_memory_with_upstream_word_layout_and_subword_cas() {
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 64;
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::LoadSharedU8, vec![Value::ImmU32(1)]);
+        block.append_new_inst(Opcode::LoadSharedS16, vec![Value::ImmU32(2)]);
+        block.append_new_inst(Opcode::LoadSharedU32, vec![Value::ImmU32(4)]);
+        let load64 = block.append_new_inst(Opcode::LoadSharedU64, vec![Value::ImmU32(8)]);
+        let load128 = block.append_new_inst(Opcode::LoadSharedU128, vec![Value::ImmU32(16)]);
+        block.append_new_inst(
+            Opcode::WriteSharedU8,
+            vec![Value::ImmU32(3), Value::ImmU32(0xAB)],
+        );
+        block.append_new_inst(
+            Opcode::WriteSharedU16,
+            vec![Value::ImmU32(6), Value::ImmU32(0xCDEF)],
+        );
+        block.append_new_inst(
+            Opcode::WriteSharedU32,
+            vec![Value::ImmU32(4), Value::ImmU32(7)],
+        );
+        block.append_new_inst(
+            Opcode::WriteSharedU64,
+            vec![
+                Value::ImmU32(8),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load64,
+                }),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::WriteSharedU128,
+            vec![
+                Value::ImmU32(16),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load128,
+                }),
+            ],
+        );
+        block.append_new_inst(Opcode::Barrier, vec![]);
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("kernel void main0() {\n    threadgroup uint smem[16];"));
+        assert!(source.contains(
+            "extract_bits(smem[((0x00000001u) >> 2u)], (((0x00000001u) << 3u) & 24u), 8u)"
+        ));
+        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(smem[((0x00000002u) >> 2u)]), (((0x00000002u) << 3u) & 16u), 16u))"));
+        assert!(source.contains("uint v_0_2 = smem[((0x00000004u) >> 2u)];"));
+        assert!(source.contains("uint2 v_0_3 = uint2(smem[((0x00000008u) >> 2u)]"));
+        assert!(source.contains("uint4 v_0_4 = uint4(smem[((0x00000010u) >> 2u)]"));
+        assert!(source.contains("spvWriteSharedBits(&smem[((0x00000003u) >> 2u)]"));
+        assert!(source.contains("threadgroup atomic_uint* atomic_pointer"));
+        assert!(source.contains("smem[((0x00000004u) >> 2u)] = 0x00000007u;"));
+        assert!(source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
     }
 
     #[test]

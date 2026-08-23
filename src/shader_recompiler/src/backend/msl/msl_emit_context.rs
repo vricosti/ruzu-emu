@@ -36,6 +36,7 @@ pub struct MslEmitContext {
     uses_no_contraction_mul: bool,
     uses_no_contraction_fma: bool,
     uses_storage_subword_cas: bool,
+    uses_shared_subword_cas: bool,
     uses_texture_cast: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
@@ -225,6 +226,10 @@ impl MslEmitContext {
             }
             Stage::Compute => {
                 source.push_str(&format!("kernel void main0({parameters}) {{\n"));
+                if program.shared_memory_size != 0 {
+                    let num_words = program.shared_memory_size.div_ceil(4);
+                    source.push_str(&format!("    threadgroup uint smem[{num_words}];\n"));
+                }
                 false
             }
             _ => unreachable!("stage was validated above"),
@@ -244,6 +249,7 @@ impl MslEmitContext {
             uses_no_contraction_mul: false,
             uses_no_contraction_fma: false,
             uses_storage_subword_cas: false,
+            uses_shared_subword_cas: false,
             uses_texture_cast: false,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
@@ -658,6 +664,10 @@ impl MslEmitContext {
         self.uses_storage_subword_cas = true;
     }
 
+    pub fn require_shared_subword_cas(&mut self) {
+        self.uses_shared_subword_cas = true;
+    }
+
     fn unsupported_value_name(value: &Value) -> &'static str {
         match value {
             Value::Inst(_) => "undefined instruction",
@@ -873,6 +883,20 @@ impl MslEmitContext {
             source.push_str(concat!(
                 "inline void spvWriteStorageBits(device uint* pointer, uint value, uint bit_offset, uint bit_count) {\n",
                 "    device atomic_uint* atomic_pointer = reinterpret_cast<device atomic_uint*>(pointer);\n",
+                "    uint expected = atomic_load_explicit(atomic_pointer, memory_order_relaxed);\n",
+                "    while (true) {\n",
+                "        uint desired = insert_bits(expected, value, bit_offset, bit_count);\n",
+                "        if (atomic_compare_exchange_weak_explicit(atomic_pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
+                "            return;\n",
+                "        }\n",
+                "    }\n",
+                "}\n\n",
+            ));
+        }
+        if self.uses_shared_subword_cas {
+            source.push_str(concat!(
+                "inline void spvWriteSharedBits(threadgroup uint* pointer, uint value, uint bit_offset, uint bit_count) {\n",
+                "    threadgroup atomic_uint* atomic_pointer = reinterpret_cast<threadgroup atomic_uint*>(pointer);\n",
                 "    uint expected = atomic_load_explicit(atomic_pointer, memory_order_relaxed);\n",
                 "    while (true) {\n",
                 "        uint desired = insert_bits(expected, value, bit_offset, bit_count);\n",

@@ -6,6 +6,9 @@
 /// same frontend-facing configuration instead of adding a second user config.
 #[derive(Clone, Debug)]
 pub struct MemoryEmitConfig {
+    /// Whether ISB instructions invoke the user callback. Upstream keeps this
+    /// disabled by default through `UserConfig::hook_isb`.
+    pub hook_isb: bool,
     /// Number of bits in the guest VA space reachable via the fastmem
     /// region. `64` means no masking. `< 64` means either silently mirror or
     /// abort out-of-range accesses to the fallback path.
@@ -50,6 +53,7 @@ pub struct MemoryEmitConfig {
 impl Default for MemoryEmitConfig {
     fn default() -> Self {
         Self {
+            hook_isb: false,
             fastmem_address_space_bits: 64,
             silently_mirror_fastmem: true,
             fastmem_exclusive_access: false,
@@ -75,6 +79,7 @@ mod tests {
     #[test]
     fn fastmem_failure_recompilation_is_enabled_by_default() {
         let config = MemoryEmitConfig::default();
+        assert!(!config.hook_isb);
         assert!(config.recompile_on_fastmem_failure);
         assert!(config.recompile_on_exclusive_fastmem_failure);
     }

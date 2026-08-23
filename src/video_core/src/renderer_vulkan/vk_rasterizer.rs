@@ -4463,6 +4463,23 @@ mod tests {
     }
 
     #[test]
+    fn test_map_cull_mode() {
+        let mut rasterizer = crate::engines::maxwell_3d::RasterizerInfo::default();
+        assert_eq!(map_cull_mode(&rasterizer), vk::CullModeFlags::NONE);
+
+        rasterizer.cull_enable = true;
+        rasterizer.cull_face = CullFace::Front;
+        assert_eq!(map_cull_mode(&rasterizer), vk::CullModeFlags::FRONT);
+        rasterizer.cull_face = CullFace::Back;
+        assert_eq!(map_cull_mode(&rasterizer), vk::CullModeFlags::BACK);
+        rasterizer.cull_face = CullFace::FrontAndBack;
+        assert_eq!(
+            map_cull_mode(&rasterizer),
+            vk::CullModeFlags::FRONT_AND_BACK
+        );
+    }
+
+    #[test]
     fn missing_buffer_uses_null_descriptor_when_supported() {
         let fallback = vk::Buffer::from_raw(0x1234);
         assert_eq!(

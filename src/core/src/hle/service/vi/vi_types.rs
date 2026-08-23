@@ -59,6 +59,19 @@ pub enum NintendoScaleMode {
     PreserveAspectRatio = 4,
 }
 
+impl NintendoScaleMode {
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::None),
+            1 => Some(Self::Freeze),
+            2 => Some(Self::ScaleToWindow),
+            3 => Some(Self::ScaleAndCrop),
+            4 => Some(Self::PreserveAspectRatio),
+            _ => None,
+        }
+    }
+}
+
 pub type DisplayName = [u8; 0x40];
 
 #[derive(Clone, Copy)]
@@ -131,7 +144,7 @@ impl NativeWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::Policy;
+    use super::{NintendoScaleMode, Policy};
 
     #[test]
     fn policy_from_raw_matches_upstream_values() {
@@ -139,5 +152,19 @@ mod tests {
         assert_eq!(Policy::from_raw(1), Some(Policy::Compositor));
         assert_eq!(Policy::from_raw(2), None);
         assert_eq!(Policy::from_raw(u32::MAX), None);
+    }
+
+    #[test]
+    fn nintendo_scale_mode_from_raw_rejects_unknown_values() {
+        assert_eq!(
+            NintendoScaleMode::from_raw(0),
+            Some(NintendoScaleMode::None)
+        );
+        assert_eq!(
+            NintendoScaleMode::from_raw(4),
+            Some(NintendoScaleMode::PreserveAspectRatio)
+        );
+        assert_eq!(NintendoScaleMode::from_raw(5), None);
+        assert_eq!(NintendoScaleMode::from_raw(u32::MAX), None);
     }
 }

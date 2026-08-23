@@ -925,6 +925,9 @@ fn run_boot(
     system.register_exit_callback(Box::new(move || {
         exit_requested.store(true, Ordering::Release);
     }));
+    if system.debugger_enabled() {
+        system.initialize_debugger();
+    }
 
     // Run the guest (upstream `system.Run()`): starts CPU threads in background.
     system.run();
@@ -936,7 +939,7 @@ fn run_boot(
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and
     // waits for a stop request between samples.
     let (stopped_by_frontend, force_stop) = loop {
-        if guest_exit_requested.load(Ordering::Acquire) {
+        if guest_exit_requested.load(Ordering::Acquire) || system.debugger_shutdown_requested() {
             break (false, false);
         }
         match command_rx.recv_timeout(Duration::from_millis(500)) {
@@ -1010,6 +1013,7 @@ fn run_boot(
     }
 
     log::info!("Emulation stopping: pause + shutdown");
+    system.detach_debugger();
     system.pause();
     system.shutdown_main_process();
     loading_event(terminal_event_after_shutdown(

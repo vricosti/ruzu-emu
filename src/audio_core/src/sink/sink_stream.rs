@@ -529,8 +529,6 @@ fn clamp_i16(sample: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex;
-
     fn make_system() -> SharedSystem {
         crate::make_test_system()
     }

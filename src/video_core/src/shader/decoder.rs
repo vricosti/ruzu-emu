@@ -1893,7 +1893,7 @@ mod tests {
                 src_b: SrcB::Reg(r),
             } => {
                 assert_eq!(dst, 0); // R0 at bits [7:0]
-                                    // src_b reg at bits [27:20]
+                assert_eq!(r, 1); // src_b reg at bits [27:20]
             }
             _ => panic!("Expected Mov, got {:?}", decoded),
         }

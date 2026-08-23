@@ -493,8 +493,7 @@ impl KConditionVariable {
             .expect("scheduler_lock must exist — kernel not initialized?");
         let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
-        let mut next_owner_thread = None;
-        let result = {
+        let (result, next_owner_thread) = {
             let mut process_guard = process.lock().unwrap();
             let Some(owner_thread) = process_guard.get_thread_by_thread_id(current_thread_id)
             else {
@@ -515,7 +514,7 @@ impl KConditionVariable {
             }
 
             // If there are remaining waiters, transfer the lock info to the next owner.
-            next_owner_thread = if let Some((next_owner_id, _priority, _, transfer_lock_info)) =
+            let next_owner_thread = if let Some((next_owner_id, _priority, _, transfer_lock_info)) =
                 next_owner_result
             {
                 let remaining_waiter_count = transfer_lock_info
@@ -619,7 +618,7 @@ impl KConditionVariable {
                 next_value
             );
 
-            result
+            (result, next_owner_thread)
         };
 
         // RUZU_TRACE_UNLOCK=1 — log every ArbitrateUnlock with the
@@ -1137,7 +1136,6 @@ impl KConditionVariable {
         let scheduler_lock = super::kernel::scheduler_lock()
             .expect("scheduler_lock must exist — kernel not initialized?");
         let hardware_timer = super::kernel::get_hardware_timer_arc();
-        let wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
         let thread_ptr = {
             let guard = current_thread.lock().unwrap();
             &*guard as *const super::k_thread::KThread as usize

@@ -21,9 +21,7 @@ use super::devices::nvhost_vic::NvHostVic;
 use super::devices::nvmap::NvMapDevice;
 use super::nvdata::*;
 use crate::core::SystemRef;
-use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -382,26 +380,6 @@ impl Module {
             Some(event) => (NvResult::Success, Some(event)),
             None => (NvResult::BadParameter, None),
         }
-    }
-
-    pub fn register_query_event_owner(
-        &self,
-        fd: DeviceFD,
-        event_id: u32,
-        process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
-    ) {
-        if fd < 0 {
-            return;
-        }
-
-        let files = self.open_files.lock().unwrap();
-        let Some(device) = files.get(&fd).cloned() else {
-            return;
-        };
-        drop(files);
-
-        device.register_query_event_owner(event_id, process, scheduler);
     }
 
     pub fn get_container(&self) -> &Container {

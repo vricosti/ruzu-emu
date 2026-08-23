@@ -409,7 +409,7 @@ use bitflags::bitflags;
 bitflags! {
     /// Debug watchpoint type flags.
     /// Matches upstream `DebugWatchpointType` (k_process.h).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct DebugWatchpointType: u8 {
         const NONE = 0;
         const READ = 1 << 0;
@@ -424,7 +424,7 @@ bitflags! {
 pub struct DebugWatchpoint {
     pub start_address: KProcessAddress,
     pub end_address: KProcessAddress,
-    pub type_: u8, // DebugWatchpointType bits
+    pub type_: DebugWatchpointType,
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +557,7 @@ pub struct KProcess {
     pub shared_memory_infos: BTreeMap<usize, KSharedMemoryInfo>,
     pub transfer_memory_objects:
         BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
+    pub code_memory_objects: BTreeMap<u64, Arc<Mutex<super::k_code_memory::KCodeMemory>>>,
     pub sync_object: SynchronizationObjectState,
     pub self_reference: Option<Weak<ProcessLock>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
@@ -688,6 +689,7 @@ impl KProcess {
             shared_memory_objects: BTreeMap::new(),
             shared_memory_infos: BTreeMap::new(),
             transfer_memory_objects: BTreeMap::new(),
+            code_memory_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
             self_reference: None,
             scheduler: None,
@@ -2799,6 +2801,10 @@ impl KProcess {
         for object_id in transfer_memory_object_ids {
             self.unregister_transfer_memory_object_by_object_id(object_id);
         }
+        let code_memory_object_ids: Vec<u64> = self.code_memory_objects.keys().copied().collect();
+        for object_id in code_memory_object_ids {
+            self.unregister_code_memory_object_by_object_id(object_id);
+        }
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
@@ -3064,6 +3070,29 @@ impl KProcess {
         self.transfer_memory_objects.get(&object_id).cloned()
     }
 
+    pub fn register_code_memory_object(
+        &mut self,
+        object_id: u64,
+        code_memory: Arc<Mutex<super::k_code_memory::KCodeMemory>>,
+    ) {
+        self.code_memory_objects.insert(object_id, code_memory);
+    }
+
+    pub fn unregister_code_memory_object_by_object_id(&mut self, object_id: u64) {
+        if let Some(code_memory) = self.code_memory_objects.remove(&object_id) {
+            if Arc::strong_count(&code_memory) == 1 {
+                code_memory.lock().unwrap().finalize_with_owner(self);
+            }
+        }
+    }
+
+    pub fn get_code_memory_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_code_memory::KCodeMemory>>> {
+        self.code_memory_objects.get(&object_id).cloned()
+    }
+
     pub fn register_light_session_object(
         &mut self,
         object_id: u64,
@@ -3123,6 +3152,9 @@ impl KProcess {
             if self.transfer_memory_objects.contains_key(&object_id) {
                 self.unregister_transfer_memory_object_by_object_id(object_id);
             }
+            if self.code_memory_objects.contains_key(&object_id) {
+                self.unregister_code_memory_object_by_object_id(object_id);
+            }
             self.device_address_space_objects.remove(&object_id);
         }
 
@@ -3141,15 +3173,33 @@ impl KProcess {
         size: u64,
         wp_type: DebugWatchpointType,
     ) -> bool {
-        for wp in self.watchpoints.iter_mut() {
-            if wp.type_ == DebugWatchpointType::NONE.bits() {
-                wp.start_address = addr;
-                wp.end_address = KProcessAddress::new(addr.get() + size);
-                wp.type_ = wp_type.bits();
-                return true;
+        let Some(watchpoint) = self
+            .watchpoints
+            .iter_mut()
+            .find(|watchpoint| watchpoint.type_ == DebugWatchpointType::NONE)
+        else {
+            return false;
+        };
+
+        let end_address = addr.get().wrapping_add(size);
+        watchpoint.start_address = addr;
+        watchpoint.end_address = KProcessAddress::new(end_address);
+        watchpoint.type_ = wp_type;
+
+        let memory = self.memory.as_ref().map(Arc::clone);
+        let mut page = addr.get() & !((PAGE_SIZE as u64) - 1);
+        while page < end_address {
+            *self.debug_page_refcounts.entry(page).or_default() += 1;
+            if let Some(memory) = &memory {
+                memory
+                    .lock()
+                    .unwrap()
+                    .mark_region_debug(page, PAGE_SIZE as u64, true);
             }
+            page = page.wrapping_add(PAGE_SIZE as u64);
         }
-        false
+
+        true
     }
 
     /// Remove a debug watchpoint.
@@ -3159,14 +3209,38 @@ impl KProcess {
         size: u64,
         wp_type: DebugWatchpointType,
     ) -> bool {
-        let end = KProcessAddress::new(addr.get() + size);
-        for wp in self.watchpoints.iter_mut() {
-            if wp.start_address == addr && wp.end_address == end && wp.type_ == wp_type.bits() {
-                *wp = DebugWatchpoint::default();
-                return true;
+        let end_address = addr.get().wrapping_add(size);
+        let end = KProcessAddress::new(end_address);
+        let Some(watchpoint) = self.watchpoints.iter_mut().find(|watchpoint| {
+            watchpoint.start_address == addr
+                && watchpoint.end_address == end
+                && watchpoint.type_ == wp_type
+        }) else {
+            return false;
+        };
+
+        *watchpoint = DebugWatchpoint::default();
+
+        let memory = self.memory.as_ref().map(Arc::clone);
+        let mut page = addr.get() & !((PAGE_SIZE as u64) - 1);
+        while page < end_address {
+            let refcount = self
+                .debug_page_refcounts
+                .get_mut(&page)
+                .expect("watchpoint page must have a debug reference");
+            *refcount -= 1;
+            if *refcount == 0 {
+                if let Some(memory) = &memory {
+                    memory
+                        .lock()
+                        .unwrap()
+                        .mark_region_debug(page, PAGE_SIZE as u64, false);
+                }
             }
+            page = page.wrapping_add(PAGE_SIZE as u64);
         }
-        false
+
+        true
     }
 
     /// Write data to process memory at the given guest address.
@@ -3366,7 +3440,7 @@ mod tests {
     use super::*;
     use crate::arm::arm_interface::{
         Architecture, ArmInterface, DebugWatchpoint as ArmDebugWatchpoint, HaltReason,
-        KThread as OpaqueKThread, ThreadContext,
+        KThread as OpaqueKThread, ThreadContext, WatchpointArray,
     };
     use crate::file_sys::program_metadata::{ProgramAddressSpaceType, ProgramMetadata};
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
@@ -3408,6 +3482,8 @@ mod tests {
 
         fn set_tpidrro_el0(&mut self, _value: u64) {}
 
+        fn set_watchpoint_array(&mut self, _watchpoints: *const WatchpointArray) {}
+
         fn get_svc_arguments(&self, args: &mut [u64; 8]) {
             *args = [0; 8];
         }
@@ -3420,7 +3496,7 @@ mod tests {
 
         fn signal_interrupt(&mut self, _thread: &mut OpaqueKThread) {}
 
-        fn halted_watchpoint(&self) -> Option<&ArmDebugWatchpoint> {
+        fn halted_watchpoint(&self) -> Option<ArmDebugWatchpoint> {
             None
         }
 
@@ -4195,5 +4271,32 @@ mod tests {
         assert_eq!(result_second, RESULT_SUCCESS.get_inner_value());
         assert_eq!(first.entropy, second.entropy);
         assert_ne!(first.entropy, [0u64; 4]);
+    }
+
+    #[test]
+    fn overlapping_watchpoints_reference_count_each_debug_page() {
+        let mut process = KProcess::new();
+        let first_address = KProcessAddress::new(0x1800);
+        let second_address = KProcessAddress::new(0x1f00);
+
+        assert!(process.insert_watchpoint(first_address, 0x1000, DebugWatchpointType::READ));
+        assert!(process.insert_watchpoint(second_address, 0x200, DebugWatchpointType::WRITE));
+        assert_eq!(process.debug_page_refcounts.get(&0x1000), Some(&2));
+        assert_eq!(process.debug_page_refcounts.get(&0x2000), Some(&2));
+
+        assert!(process.remove_watchpoint(first_address, 0x1000, DebugWatchpointType::READ));
+        assert_eq!(process.debug_page_refcounts.get(&0x1000), Some(&1));
+        assert_eq!(process.debug_page_refcounts.get(&0x2000), Some(&1));
+
+        assert!(process.remove_watchpoint(second_address, 0x200, DebugWatchpointType::WRITE));
+        assert_eq!(process.debug_page_refcounts.get(&0x1000), Some(&0));
+        assert_eq!(process.debug_page_refcounts.get(&0x2000), Some(&0));
+    }
+
+    #[test]
+    fn debug_watchpoint_layout_matches_upstream_fields() {
+        assert_eq!(std::mem::size_of::<DebugWatchpointType>(), 1);
+        assert_eq!(std::mem::size_of::<DebugWatchpoint>(), 24);
+        assert_eq!(std::mem::align_of::<DebugWatchpoint>(), 8);
     }
 }

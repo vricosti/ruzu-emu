@@ -23,7 +23,6 @@ use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
 use crate::file_sys::vfs::vfs_types::{FileTimeStampRaw, VirtualDir, VirtualFile};
 use crate::hle::result::RESULT_SUCCESS;
 use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
-use crate::hle::service::sm::sm::ServiceManager;
 
 /// Port of upstream `ResultUnknown` (result.h:250) — `common::ResultCode(UINT32_MAX)`.
 /// Used as a fallback error code in VfsDirectoryServiceWrapper methods.
@@ -1345,19 +1344,11 @@ impl VfsDirectoryServiceWrapper {
 ///
 /// Matches upstream `void FileSystem::LoopProcess(Core::System& system)`:
 /// Registers "fsp-ldr", "fsp:pr", "fsp-srv".
-pub fn loop_process(
-    service_manager: &Arc<Mutex<ServiceManager>>,
-    system: crate::core::SystemRef,
-    fsc: Arc<Mutex<FileSystemController>>,
-) {
-    register_services(service_manager, system, fsc);
+pub fn loop_process(system: crate::core::SystemRef, fsc: Arc<Mutex<FileSystemController>>) {
+    register_services(system, fsc);
 }
 
-pub fn register_services(
-    service_manager: &Arc<Mutex<ServiceManager>>,
-    system: crate::core::SystemRef,
-    fsc: Arc<Mutex<FileSystemController>>,
-) {
+pub fn register_services(system: crate::core::SystemRef, fsc: Arc<Mutex<FileSystemController>>) {
     let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
 
     {

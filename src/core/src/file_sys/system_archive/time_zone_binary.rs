@@ -105,7 +105,6 @@ pub fn time_zone_binary() -> Option<VirtualDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_sys::vfs::vfs::VfsDirectory;
 
     const ALL_EMBEDDED_GROUPS: &[&[EmbeddedFile]] = &[
         nx_tzdb::BASE,

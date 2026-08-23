@@ -25,6 +25,8 @@ pub struct HierarchicalIntegrityVerificationLevelInformation {
 
 const _: () =
     assert!(std::mem::size_of::<HierarchicalIntegrityVerificationLevelInformation>() == 0x18);
+const _: () =
+    assert!(std::mem::align_of::<HierarchicalIntegrityVerificationLevelInformation>() == 0x4);
 
 /// Hierarchical integrity verification information.
 /// Corresponds to upstream `HierarchicalIntegrityVerificationInformation`.
@@ -191,110 +193,108 @@ impl HierarchicalIntegrityVerificationStorage {
         // Set member variables.
         self.max_layers = info.max_layers as i32;
 
-        // Re-create verify storages.
-        self.verify_storages.clear();
-        for _ in 0..Self::MAX_LAYERS - 1 {
-            self.verify_storages
-                .push(Arc::new(IntegrityVerificationStorage::new()));
-        }
-        self.buffer_storages = vec![None; Self::MAX_LAYERS - 1];
-
-        // Initialize the top level verification storage.
-        let master_storage = storage
-            .take(HierarchicalStorageInformation::MASTER_STORAGE)
-            .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
-        let layer1_storage = storage
-            .take(HierarchicalStorageInformation::LAYER1_STORAGE)
-            .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
-
-        let top_verify = Arc::new(IntegrityVerificationStorage::new());
-        // We need interior mutability to initialize. Use Arc::get_mut which works
-        // because we just created it.
-        {
-            let vs = Arc::get_mut(&mut self.verify_storages[0]).unwrap();
-            vs.initialize(
-                master_storage,
-                layer1_storage,
-                1i64 << info.info[0].block_order,
-                Self::HASH_SIZE,
-                false,
-            );
-        }
-
-        // Initialize the top level buffer storage.
-        self.buffer_storages[0] = Some(self.verify_storages[0].clone() as VirtualFile);
-
-        // Initialize the intermediate level storages.
-        let mut level: i32 = 0;
-        while level < self.max_layers - 3 {
-            let buffer_storage = self.buffer_storages[level as usize]
-                .clone()
+        let result = (|| -> Result<(), ResultCode> {
+            // Initialize the top level verification storage.
+            let master_storage = storage
+                .take(HierarchicalStorageInformation::MASTER_STORAGE)
                 .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
-
-            let offset_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
-                buffer_storage,
-                info.info[level as usize].size.get() as usize,
-                0,
-                String::new(),
-            ));
-
-            let next_storage = storage
-                .take(level as usize + 2)
+            let layer1_storage = storage
+                .take(HierarchicalStorageInformation::LAYER1_STORAGE)
                 .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
 
             {
-                let vs = Arc::get_mut(&mut self.verify_storages[(level + 1) as usize]).unwrap();
+                let vs = Arc::get_mut(&mut self.verify_storages[0]).unwrap();
                 vs.initialize(
-                    offset_storage,
-                    next_storage,
-                    1i64 << info.info[(level + 1) as usize].block_order,
-                    1i64 << info.info[level as usize].block_order,
+                    master_storage,
+                    layer1_storage,
+                    1i64 << info.info[0].block_order,
+                    Self::HASH_SIZE,
                     false,
                 );
             }
 
-            self.buffer_storages[(level + 1) as usize] =
-                Some(self.verify_storages[(level + 1) as usize].clone() as VirtualFile);
+            // Initialize the top level buffer storage.
+            self.buffer_storages[0] = Some(self.verify_storages[0].clone() as VirtualFile);
 
-            level += 1;
-        }
+            // Initialize the intermediate level storages.
+            let mut level: i32 = 0;
+            while level < self.max_layers - 3 {
+                let buffer_storage = self.buffer_storages[level as usize]
+                    .clone()
+                    .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
 
-        // Initialize the final level storage.
-        {
-            let buffer_storage = self.buffer_storages[level as usize]
-                .clone()
-                .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
+                let offset_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
+                    buffer_storage,
+                    info.info[level as usize].size.get() as usize,
+                    0,
+                    String::new(),
+                ));
 
-            let offset_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
-                buffer_storage,
-                info.info[level as usize].size.get() as usize,
-                0,
-                String::new(),
-            ));
+                let next_storage = storage
+                    .take(level as usize + 2)
+                    .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
 
-            let next_storage = storage
-                .take(level as usize + 2)
-                .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
+                {
+                    let vs = Arc::get_mut(&mut self.verify_storages[(level + 1) as usize]).unwrap();
+                    vs.initialize(
+                        offset_storage,
+                        next_storage,
+                        1i64 << info.info[(level + 1) as usize].block_order,
+                        1i64 << info.info[level as usize].block_order,
+                        false,
+                    );
+                }
 
-            {
-                let vs = Arc::get_mut(&mut self.verify_storages[(level + 1) as usize]).unwrap();
-                vs.initialize(
-                    offset_storage,
-                    next_storage,
-                    1i64 << info.info[(level + 1) as usize].block_order,
-                    1i64 << info.info[level as usize].block_order,
-                    true,
-                );
+                self.buffer_storages[(level + 1) as usize] =
+                    Some(self.verify_storages[(level + 1) as usize].clone() as VirtualFile);
+
+                level += 1;
             }
 
-            self.buffer_storages[(level + 1) as usize] =
-                Some(self.verify_storages[(level + 1) as usize].clone() as VirtualFile);
+            // Initialize the final level storage.
+            {
+                let buffer_storage = self.buffer_storages[level as usize]
+                    .clone()
+                    .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
+
+                let offset_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
+                    buffer_storage,
+                    info.info[level as usize].size.get() as usize,
+                    0,
+                    String::new(),
+                ));
+
+                let next_storage = storage
+                    .take(level as usize + 2)
+                    .ok_or(errors::RESULT_ALLOCATION_MEMORY_FAILED_ALLOCATE_SHARED)?;
+
+                {
+                    let vs = Arc::get_mut(&mut self.verify_storages[(level + 1) as usize]).unwrap();
+                    vs.initialize(
+                        offset_storage,
+                        next_storage,
+                        1i64 << info.info[(level + 1) as usize].block_order,
+                        1i64 << info.info[level as usize].block_order,
+                        true,
+                    );
+                }
+
+                self.buffer_storages[(level + 1) as usize] =
+                    Some(self.verify_storages[(level + 1) as usize].clone() as VirtualFile);
+            }
+
+            // Set the data size.
+            self.data_size = info.info[(level + 1) as usize].size.get();
+
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.data_size = 0;
+            self.finalize();
         }
 
-        // Set the data size.
-        self.data_size = info.info[(level + 1) as usize].size.get();
-
-        Ok(())
+        result
     }
 
     /// Finalize the storage, releasing all references.
@@ -323,11 +323,6 @@ impl HierarchicalIntegrityVerificationStorage {
     /// Get the size of the data layer.
     /// Corresponds to upstream `HierarchicalIntegrityVerificationStorage::GetSize`.
     pub fn get_size(&self) -> usize {
-        // Upstream asserts m_data_size >= 0 here. We return 0 when uninitialized
-        // to avoid panics on construction checks.
-        if self.data_size < 0 {
-            return 0;
-        }
         self.data_size as usize
     }
 
@@ -335,9 +330,7 @@ impl HierarchicalIntegrityVerificationStorage {
     /// Corresponds to upstream `HierarchicalIntegrityVerificationStorage::Read`.
     pub fn read(&self, buffer: &mut [u8], size: usize, offset: usize) -> usize {
         // Validate preconditions.
-        if self.data_size < 0 {
-            return 0;
-        }
+        assert!(self.data_size >= 0);
 
         // Succeed if zero-size.
         if size == 0 {
@@ -346,11 +339,10 @@ impl HierarchicalIntegrityVerificationStorage {
 
         // Read the data from the buffer storage of the data layer.
         let data_layer_idx = (self.max_layers - 2) as usize;
-        if let Some(ref bs) = self.buffer_storages[data_layer_idx] {
-            bs.read(buffer, size, offset)
-        } else {
-            0
-        }
+        self.buffer_storages[data_layer_idx]
+            .as_ref()
+            .expect("initialized hierarchy has a data-layer buffer")
+            .read(buffer, size, offset)
     }
 
     /// Get the L1 hash verification block size.
@@ -435,9 +427,52 @@ impl Default for HierarchicalIntegrityVerificationStorage {
     }
 }
 
+impl Drop for HierarchicalIntegrityVerificationStorage {
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+
+    fn three_layer_info() -> HierarchicalIntegrityVerificationInformation {
+        let mut levels = [HierarchicalIntegrityVerificationLevelInformation::default();
+            INTEGRITY_MAX_LAYER_COUNT - 1];
+        levels[0].size = Int64::from_i64(32);
+        levels[0].block_order = 5;
+        levels[1].size = Int64::from_i64(64);
+        levels[1].block_order = 5;
+        HierarchicalIntegrityVerificationInformation {
+            max_layers: 3,
+            info: levels,
+            seed: HashSalt::default(),
+        }
+    }
+
+    fn three_layer_storage(include_data: bool) -> HierarchicalStorageInformation {
+        let mut storage = HierarchicalStorageInformation::new();
+        storage.set_master_hash_storage(Arc::new(VectorVfsFile::new(
+            vec![0; 32],
+            "master".to_owned(),
+            None,
+        )));
+        storage.set_layer1_hash_storage(Arc::new(VectorVfsFile::new(
+            vec![0; 32],
+            "layer1".to_owned(),
+            None,
+        )));
+        if include_data {
+            storage.set_layer2_hash_storage(Arc::new(VectorVfsFile::new(
+                vec![0; 64],
+                "data".to_owned(),
+                None,
+            )));
+        }
+        storage
+    }
 
     #[test]
     fn test_level_information_size() {
@@ -471,6 +506,31 @@ mod tests {
     fn test_new_not_initialized() {
         let storage = HierarchicalIntegrityVerificationStorage::new();
         assert!(!storage.is_initialized());
+    }
+
+    #[test]
+    fn failed_initialization_cleans_layers_and_allows_retry() {
+        let info = three_layer_info();
+        let mut storage = HierarchicalIntegrityVerificationStorage::new();
+
+        assert!(storage
+            .initialize(&info, three_layer_storage(false), 0, 0, 0)
+            .is_err());
+        assert!(!storage.is_initialized());
+
+        assert!(storage
+            .initialize(&info, three_layer_storage(true), 0, 0, 0)
+            .is_ok());
+        assert!(storage.is_initialized());
+        assert_eq!(storage.get_size(), 64);
+    }
+
+    #[test]
+    fn get_size_preserves_uninitialized_signed_bit_pattern() {
+        assert_eq!(
+            HierarchicalIntegrityVerificationStorage::new().get_size(),
+            usize::MAX
+        );
     }
 
     #[test]

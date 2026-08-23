@@ -4,6 +4,11 @@
 //! Port of zuyu/src/core/debugger/debugger_interface.h
 //! Debugger backend and frontend interface traits.
 
+use std::sync::Arc;
+
+use crate::hle::kernel::k_process::DebugWatchpoint;
+use crate::hle::kernel::k_thread::KThreadLock;
+
 /// Actions the debugger can request of the emulation engine.
 ///
 /// Corresponds to upstream `Core::DebuggerAction`.
@@ -13,12 +18,26 @@ pub enum DebuggerAction {
     Interrupt,
     /// Resume emulation.
     Continue,
-    /// Step the currently-active thread without resuming others.
-    StepThreadLocked,
-    /// Step the currently-active thread and resume others.
-    StepThreadUnlocked,
+    /// Resume only the threads selected by the frontend.
+    ContinueThreads,
+    /// Step the active thread and resume only the threads selected by the frontend.
+    StepThread,
     /// Shut down the emulator.
     ShutdownEmulation,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DebuggerAction;
+
+    #[test]
+    fn debugger_actions_match_upstream_order() {
+        assert_eq!(DebuggerAction::Interrupt as usize, 0);
+        assert_eq!(DebuggerAction::Continue as usize, 1);
+        assert_eq!(DebuggerAction::ContinueThreads as usize, 2);
+        assert_eq!(DebuggerAction::StepThread as usize, 3);
+        assert_eq!(DebuggerAction::ShutdownEmulation as usize, 4);
+    }
 }
 
 /// Backend interface for the debugger (network I/O and thread management).
@@ -33,11 +52,10 @@ pub trait DebuggerBackend {
     fn write_to_client(&mut self, data: &[u8]);
 
     /// Gets the currently active thread when the debugger is stopped.
-    /// Returns an opaque thread identifier.
-    fn get_active_thread(&self) -> u64;
+    fn get_active_thread(&self) -> Option<Arc<KThreadLock>>;
 
     /// Sets the currently active thread when the debugger is stopped.
-    fn set_active_thread(&mut self, thread_id: u64);
+    fn set_active_thread(&mut self, thread: Arc<KThreadLock>);
 }
 
 /// Frontend interface for the debugger (protocol implementation).
@@ -45,18 +63,27 @@ pub trait DebuggerBackend {
 /// Corresponds to upstream `Core::DebuggerFrontend`.
 pub trait DebuggerFrontend {
     /// Called after the client has successfully connected to the port.
-    fn connected(&mut self);
+    fn connected(&mut self, backend: &mut dyn DebuggerBackend);
 
     /// Called when emulation has stopped.
-    fn stopped(&mut self, thread_id: u64);
+    fn stopped(&mut self, backend: &mut dyn DebuggerBackend, thread: Arc<KThreadLock>);
 
     /// Called when emulation is shutting down.
-    fn shutting_down(&mut self);
+    fn shutting_down(&mut self, backend: &mut dyn DebuggerBackend);
 
     /// Called when emulation has stopped on a watchpoint.
-    fn watchpoint(&mut self, thread_id: u64, watch_addr: u64, watch_type: u8);
+    fn watchpoint(
+        &mut self,
+        backend: &mut dyn DebuggerBackend,
+        thread: Arc<KThreadLock>,
+        watch: DebugWatchpoint,
+    );
 
     /// Called when new data is asynchronously received on the client socket.
     /// Returns a list of actions to perform.
-    fn client_data(&mut self, data: &[u8]) -> Vec<DebuggerAction>;
+    fn client_data(
+        &mut self,
+        backend: &mut dyn DebuggerBackend,
+        data: &[u8],
+    ) -> Vec<DebuggerAction>;
 }

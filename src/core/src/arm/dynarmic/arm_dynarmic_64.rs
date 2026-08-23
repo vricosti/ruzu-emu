@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::arm::arm_interface::{
-    Architecture, ArmInterface, ArmInterfaceBase, DebugWatchpoint, HaltReason, KProcess, KThread,
-    ThreadContext,
+    matching_watchpoint, Architecture, ArmInterface, ArmInterfaceBase, DebugWatchpoint,
+    DebugWatchpointType, HaltReason, KProcess, KThread, SharedWatchpointArray, ThreadContext,
+    WatchpointArray,
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
@@ -752,6 +753,14 @@ struct DynarmicCallbacks64 {
         *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
     /// CPU core index associated with this callback/JIT instance.
     core_index: usize,
+    /// Upstream: `const bool m_debugger_enabled`.
+    debugger_enabled: bool,
+    /// Upstream: `const bool m_check_memory_access`.
+    check_memory_access: bool,
+    /// Shared view of `ArmInterface::m_watchpoints` used by the moved callback.
+    watchpoints: SharedWatchpointArray,
+    /// Shared counterpart of `ArmDynarmic64::m_halted_watchpoint`.
+    halted_watchpoint: Arc<Mutex<Option<DebugWatchpoint>>>,
     /// Raw pointer to rdynarmic's `halt_reason` field.
     /// Set after JIT creation via `set_halt_reason_ptr()`.
     halt_reason_ptr: Option<*const AtomicU32>,
@@ -775,6 +784,9 @@ impl DynarmicCallbacks64 {
         breakpoint_context: Arc<Mutex<ThreadContext>>,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
+        debugger_enabled: bool,
+        watchpoints: SharedWatchpointArray,
+        halted_watchpoint: Arc<Mutex<Option<DebugWatchpoint>>>,
     ) -> Self {
         Self {
             memory,
@@ -786,6 +798,13 @@ impl DynarmicCallbacks64 {
             breakpoint_context,
             exclusive_monitor,
             core_index,
+            debugger_enabled,
+            check_memory_access: debugger_enabled
+                || !*common::settings::values()
+                    .cpuopt_ignore_memory_aborts
+                    .get_value(),
+            watchpoints,
+            halted_watchpoint,
             halt_reason_ptr: None,
             jit_pc_ptr: None,
         }
@@ -891,7 +910,38 @@ impl DynarmicCallbacks64 {
     ///
     /// Memory access validation is a debugger feature, not used in normal play.
     /// The JIT uses page table fastmem for actual memory protection.
-    fn check_memory_access(&self, _addr: u64, _size: u64) -> bool {
+    fn check_memory_access(&self, addr: u64, size: u64, access_type: DebugWatchpointType) -> bool {
+        if !self.check_memory_access {
+            return true;
+        }
+
+        let valid = if let Some(core_memory) = &self.core_memory {
+            core_memory
+                .lock()
+                .unwrap()
+                .is_valid_virtual_address_range(addr, size)
+        } else {
+            self.memory
+                .read()
+                .unwrap()
+                .is_valid_range(addr, size as usize)
+        };
+        if !valid {
+            log::error!("Stopping execution due to unmapped memory access at {addr:#x}");
+            self.halt_execution(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT);
+            return false;
+        }
+
+        if !self.debugger_enabled {
+            return true;
+        }
+
+        if let Some(watchpoint) = matching_watchpoint(&self.watchpoints, addr, size, access_type) {
+            *self.halted_watchpoint.lock().unwrap() = Some(watchpoint);
+            self.halt_execution(rdynarmic::halt_reason::HaltReason::MEMORY_ABORT);
+            return false;
+        }
+
         true
     }
 }
@@ -952,7 +1002,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
-        self.check_memory_access(vaddr, 1);
+        self.check_memory_access(vaddr, 1, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 1);
         let value = if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_8(vaddr)
@@ -965,7 +1015,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
-        self.check_memory_access(vaddr, 2);
+        self.check_memory_access(vaddr, 2, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 2);
         let value = if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_16(vaddr)
@@ -978,7 +1028,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
-        self.check_memory_access(vaddr, 4);
+        self.check_memory_access(vaddr, 4, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 4);
         let value = if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_32(vaddr)
@@ -991,7 +1041,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
-        self.check_memory_access(vaddr, 8);
+        self.check_memory_access(vaddr, 8, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 8);
         // RUZU_SNAPSHOT_VADDR=0xADDR — on every slow-path Read64, also
         // probe [ADDR] via slow path and log when its value first
@@ -1294,7 +1344,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-        self.check_memory_access(vaddr, 16);
+        self.check_memory_access(vaddr, 16, DebugWatchpointType::READ);
         // RUZU_DUMP_VEC_AT_PC=PC[,PC,...] — for vectorized strchr/strpbrk
         // scans, dump V17/V18/X3/X5 at LD1 entry. The reduction state
         // from the previous iteration is still live in V17/V18/X5
@@ -1364,7 +1414,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        if !self.check_memory_access(vaddr, 1) {
+        if !self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE) {
             return;
         }
         trace_unmapped_write_64(self, vaddr, 1, value as u128);
@@ -1412,7 +1462,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        if !self.check_memory_access(vaddr, 2) {
+        if !self.check_memory_access(vaddr, 2, DebugWatchpointType::WRITE) {
             return;
         }
         trace_unmapped_write_64(self, vaddr, 2, value as u128);
@@ -1437,7 +1487,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        if !self.check_memory_access(vaddr, 4) {
+        if !self.check_memory_access(vaddr, 4, DebugWatchpointType::WRITE) {
             return;
         }
         trace_unmapped_write_64(self, vaddr, 4, value as u128);
@@ -1526,7 +1576,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        if !self.check_memory_access(vaddr, 8) {
+        if !self.check_memory_access(vaddr, 8, DebugWatchpointType::WRITE) {
             return;
         }
         trace_unmapped_write_64(self, vaddr, 8, value as u128);
@@ -1759,7 +1809,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             xmm12_lo_at_entry,
             xmm12_hi_at_entry,
         ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-        if !self.check_memory_access(vaddr, 16) {
+        if !self.check_memory_access(vaddr, 16, DebugWatchpointType::WRITE) {
             return;
         }
         // RUZU_TRACE_W64_AT_VADDR — same logic as W64 path; also matches
@@ -1873,7 +1923,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
-        self.check_memory_access(vaddr, 1)
+        self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock().unwrap().write_exclusive_8(vaddr, value, expected)
             } else {
@@ -1883,7 +1933,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
-        self.check_memory_access(vaddr, 2)
+        self.check_memory_access(vaddr, 2, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock()
                     .unwrap()
@@ -1942,7 +1992,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         } else {
             None
         };
-        let success = self.check_memory_access(vaddr, 4)
+        let success = self.check_memory_access(vaddr, 4, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock()
                     .unwrap()
@@ -2001,7 +2051,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
-        self.check_memory_access(vaddr, 8)
+        self.check_memory_access(vaddr, 8, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock()
                     .unwrap()
@@ -2020,7 +2070,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         expected_lo: u64,
         expected_hi: u64,
     ) -> bool {
-        self.check_memory_access(vaddr, 16)
+        self.check_memory_access(vaddr, 16, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock().unwrap().write_exclusive_128(
                     vaddr,
@@ -2205,7 +2255,7 @@ pub struct ArmDynarmic64 {
     svc: Arc<AtomicU32>,
 
     /// Watchpoint that caused a halt
-    halted_watchpoint: Option<DebugWatchpoint>,
+    halted_watchpoint: Arc<Mutex<Option<DebugWatchpoint>>>,
 
     /// Context saved at breakpoint
     breakpoint_context: Arc<Mutex<ThreadContext>>,
@@ -2288,6 +2338,8 @@ impl ArmDynarmic64 {
         let svc = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
         let breakpoint_context = Arc::new(Mutex::new(ThreadContext::default()));
+        let base = ArmInterfaceBase::new(uses_wall_clock);
+        let halted_watchpoint = Arc::new(Mutex::new(None));
         let callbacks = DynarmicCallbacks64::new(
             shared_memory,
             core_memory,
@@ -2298,6 +2350,9 @@ impl ArmDynarmic64 {
             breakpoint_context.clone(),
             exclusive_monitor,
             core_index,
+            debugger_enabled,
+            base.shared_watchpoint_array(),
+            Arc::clone(&halted_watchpoint),
         );
 
         log::warn!(
@@ -2472,6 +2527,7 @@ impl ArmDynarmic64 {
             // Auto/unsafe-fastmem-check may widen only the fastmem side to
             // 64 bits below, matching the upstream accuracy switch.
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                hook_isb: false,
                 fastmem_address_space_bits,
                 silently_mirror_fastmem: false,
                 fastmem_exclusive_access,
@@ -2509,9 +2565,9 @@ impl ArmDynarmic64 {
         };
 
         Self {
-            base: ArmInterfaceBase::new(uses_wall_clock),
+            base,
             svc,
-            halted_watchpoint: None,
+            halted_watchpoint,
             breakpoint_context,
             jit,
             tpidrro_el0,
@@ -2690,6 +2746,10 @@ impl ArmInterface for ArmDynarmic64 {
         }
     }
 
+    fn set_watchpoint_array(&mut self, watchpoints: *const WatchpointArray) {
+        self.base.set_watchpoint_array(watchpoints);
+    }
+
     fn get_tpidrro_el0(&self) -> u64 {
         self.jit
             .as_ref()
@@ -2768,8 +2828,8 @@ impl ArmInterface for ArmDynarmic64 {
         }
     }
 
-    fn halted_watchpoint(&self) -> Option<&DebugWatchpoint> {
-        self.halted_watchpoint.as_ref()
+    fn halted_watchpoint(&self) -> Option<DebugWatchpoint> {
+        *self.halted_watchpoint.lock().unwrap()
     }
 
     fn rewind_breakpoint_instruction(&mut self) {
@@ -2802,12 +2862,19 @@ fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64) -> ThreadCont
 mod tests {
     use super::{
         parse_optimization_mask_env, parse_watch_ranges, thread_context_from_jit_state,
-        translate_halt_reason, upstream_optimization_config,
+        translate_halt_reason, upstream_optimization_config, DynarmicCallbacks64,
     };
-    use crate::arm::arm_interface::HaltReason;
+    use crate::arm::arm_interface::{
+        ArmInterfaceBase, DebugWatchpoint, DebugWatchpointType, HaltReason,
+    };
+    use crate::core_timing::CoreTiming;
+    use crate::hle::kernel::k_process::ProcessMemoryData;
+    use crate::hle::kernel::k_typed_address::KProcessAddress;
     use common::settings_enums::CpuAccuracy;
     use rdynarmic::backend::x64::jit_state::A64JitState;
-    use rdynarmic::jit_config::OptimizationFlag;
+    use rdynarmic::jit_config::{OptimizationFlag, UserCallbacks};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
 
     #[test]
     fn parse_watch_ranges_accepts_hex_and_default_size() {
@@ -2911,5 +2978,54 @@ mod tests {
         let translated =
             translate_halt_reason(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
         assert!(translated.is_empty());
+    }
+
+    #[test]
+    fn debugger_memory_check_retains_matching_watchpoint_and_halts() {
+        let mut memory = ProcessMemoryData::new();
+        memory.base = 0x1000;
+        memory.data = vec![0; 0x1000];
+
+        let mut watchpoints =
+            [DebugWatchpoint::default(); crate::hardware_properties::NUM_WATCHPOINTS as usize];
+        watchpoints[0] = DebugWatchpoint {
+            start_address: KProcessAddress::new(0x1100),
+            end_address: KProcessAddress::new(0x1110),
+            type_: DebugWatchpointType::WRITE,
+        };
+        let mut interface = ArmInterfaceBase::new(false);
+        interface.set_watchpoint_array(&watchpoints);
+        let halted_watchpoint = Arc::new(Mutex::new(None));
+        let mut callbacks = DynarmicCallbacks64::new(
+            Arc::new(RwLock::new(memory)),
+            None,
+            Arc::new(AtomicU32::new(0)),
+            false,
+            Arc::new(CoreTiming::new()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(Default::default())),
+            std::ptr::null_mut(),
+            0,
+            true,
+            interface.shared_watchpoint_array(),
+            Arc::clone(&halted_watchpoint),
+        );
+        let halt_reason = AtomicU32::new(0);
+        callbacks.set_halt_reason_ptr(halt_reason.as_ptr());
+
+        assert!(!callbacks.check_memory_access(0x1108, 4, DebugWatchpointType::WRITE));
+        assert_eq!(
+            halted_watchpoint
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|watchpoint| watchpoint.start_address.get()),
+            Some(0x1100)
+        );
+        assert_ne!(
+            halt_reason.load(Ordering::SeqCst)
+                & rdynarmic::halt_reason::HaltReason::MEMORY_ABORT.bits(),
+            0
+        );
     }
 }

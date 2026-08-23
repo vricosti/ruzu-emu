@@ -725,7 +725,7 @@ fn send_sync_request_impl(
                 server_session.enqueue_inline_request_hle(Arc::clone(&request))
             };
             if let Err(code) = enqueue_result {
-                return RESULT_INVALID_HANDLE;
+                return ResultCode::new(code);
             }
             let mut waited_us: u64 = 0;
             loop {
@@ -773,7 +773,7 @@ fn send_sync_request_impl(
                         session_handle, parent_id, code
                     );
                 }
-                return RESULT_INVALID_HANDLE;
+                return ResultCode::new(code);
             }
         }
     };
@@ -1402,11 +1402,6 @@ mod tests {
             .write_32(address, value);
     }
 
-    fn write_test_64(system: &System, address: u64, value: u64) {
-        write_test_32(system, address, value as u32);
-        write_test_32(system, address + 4, (value >> 32) as u32);
-    }
-
     fn read_test_32(system: &System, address: u64) -> u32 {
         if let Some(memory) = system.get_svc_memory() {
             return memory.lock().unwrap().read_32(address);
@@ -1445,23 +1440,6 @@ mod tests {
         write_test_32(system, tls_base + 0x14, 0);
         write_test_32(system, tls_base + 0x18, 0);
         write_test_32(system, tls_base + 0x1C, 0);
-    }
-
-    fn write_sm_get_service_request(system: &System, name: &str) {
-        let tls_base = get_tls_base(system);
-        let request_type = ipc::CommandType::Request as u32;
-        let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
-        let mut name_buf = [0u8; 8];
-        let copy_len = name.len().min(name_buf.len());
-        name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
-
-        write_test_32(system, tls_base, request_type);
-        write_test_32(system, tls_base + 4, 0);
-        write_test_32(system, tls_base + 0x10, sfci_magic);
-        write_test_32(system, tls_base + 0x14, 0);
-        write_test_32(system, tls_base + 0x18, 1);
-        write_test_32(system, tls_base + 0x1C, 0);
-        write_test_64(system, tls_base + 0x20, u64::from_le_bytes(name_buf));
     }
 
     fn write_control_query_pointer_buffer_size_request(system: &System) {
@@ -1594,6 +1572,43 @@ mod tests {
     }
 
     #[test]
+    fn send_sync_request_inline_propagates_session_closed() {
+        let system = test_system();
+        let tls_base = get_tls_base(&system);
+        let current_thread = system
+            .current_process_arc()
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(1)
+            .unwrap();
+        let mut request_context = HLERequestContext::new_with_thread(current_thread, tls_base);
+        request_context.set_service_manager(system.service_manager().unwrap());
+        let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
+        let lm_handle = request_context
+            .create_session_for_service(lm_handler)
+            .unwrap();
+
+        {
+            let process = system.current_process_arc();
+            let process = process.lock().unwrap();
+            let client_session_object_id = process.handle_table.get_object(lm_handle).unwrap();
+            let client_session = process
+                .get_client_session_by_object_id(client_session_object_id)
+                .unwrap();
+            let parent_id = client_session.lock().unwrap().get_parent_id().unwrap();
+            let parent_session = process.get_session_by_object_id(parent_id).unwrap();
+            let server_session = parent_session.lock().unwrap().get_server_session().clone();
+            server_session.lock().unwrap().client_closed = true;
+        }
+
+        write_control_query_pointer_buffer_size_request(&system);
+        assert_eq!(
+            send_sync_request(&system, lm_handle),
+            crate::hle::kernel::svc::svc_results::RESULT_SESSION_CLOSED
+        );
+    }
+
+    #[test]
     fn send_sync_request_with_user_buffer_dispatches_on_message_buffer() {
         let system = test_system();
         let message = 0x23A0000u64;
@@ -1688,7 +1703,7 @@ mod tests {
             .is_some());
 
         let client_session_object_id = process.handle_table.get_object(lm_handle).unwrap();
-        let client_session = process
+        let _client_session = process
             .get_client_session_by_object_id(client_session_object_id)
             .unwrap();
         let parent_id = process

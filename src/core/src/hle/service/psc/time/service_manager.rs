@@ -365,7 +365,9 @@ impl TimeServiceManager {
             return crate::hle::result::RESULT_UNKNOWN;
         }
         let mut time = self.time.lock().unwrap();
-        let _ = time.time_zone.parse_binary(name, rule_buffer);
+        if time.time_zone.parse_binary(name, rule_buffer).is_error() {
+            log::error!("Failed to parse time zone binary!");
+        }
         time.time_zone.set_time_point(time_point);
         time.time_zone.set_total_location_name_count(location_count);
         time.time_zone.set_rule_version(rule_version);

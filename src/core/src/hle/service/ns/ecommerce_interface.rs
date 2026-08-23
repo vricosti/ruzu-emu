@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/ns/ecommerce_interface.h
-//! Port of zuyu/src/core/hle/service/ns/ecommerce_interface.cpp
+//! Port of Eden src/core/hle/service/ns/ecommerce_interface.h/.cpp
 //!
 //! IECommerceInterface — e-commerce operations for NS.
 
@@ -29,13 +28,12 @@ pub mod commands {
 ///
 /// Corresponds to `IECommerceInterface` in upstream.
 pub struct IECommerceInterface {
-    system: crate::core::SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IECommerceInterface {
-    pub fn new(system: crate::core::SystemRef) -> Self {
+    pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (commands::REQUEST_LINK_DEVICE, None, "RequestLinkDevice"),
             (
@@ -62,10 +60,15 @@ impl IECommerceInterface {
             ),
         ]);
         Self {
-            system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+}
+
+impl Default for IECommerceInterface {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -90,5 +93,32 @@ impl ServiceFramework for IECommerceInterface {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_table_matches_upstream_null_handlers() {
+        let service = IECommerceInterface::new();
+        let entries = service
+            .handlers
+            .iter()
+            .map(|(id, info)| (*id, info.name, info.handler_callback.is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [
+                (0, "RequestLinkDevice", false),
+                (1, "RequestCleanupAllPreInstalledApplications", false),
+                (2, "RequestCleanupPreInstalledApplication", false),
+                (3, "RequestSyncRights", false),
+                (4, "RequestUnlinkDevice", false),
+                (5, "RequestRevokeAllELicense", false),
+                (6, "RequestSyncRightsBasedOnAssignedELicenses", false),
+            ]
+        );
     }
 }

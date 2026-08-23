@@ -314,6 +314,7 @@ fn buffer_image_view_materializes_upstream_buffer_size() {
     assert!(view.matches_buffer_base(&base));
 }
 
+#[test]
 fn present_internal_format_matches_basic_surface_formats() {
     assert_eq!(
         present_internal_format(PixelFormat::A8B8G8R8Unorm),

@@ -4,6 +4,25 @@ This file contains only active differences confirmed in the current source tree 
 `~/Dev/emulators/zuyu`. Implementation history, diagnostics, commands, runtime logs, and audit
 procedures are intentionally omitted.
 
+## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
+
+### Intentional differences
+- Rust represents upstream `Kernel::KThread*` backend/frontend arguments as stable numeric thread
+  identifiers. Kernel thread ownership remains in the process registries, avoiding non-owning raw
+  pointers across the debugger connection thread.
+- Rust traits replace the C++ virtual base classes. The eventual frontend/backend wiring passes the
+  backend explicitly rather than constructing a self-referential Rust object.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None in the action enum or declared backend/frontend operations.
+
+### Binary layout verification
+- N/A: these interfaces are not serialized. A focused test verifies the complete action set and its
+  upstream declaration order.
+
 ## Kernel
 
 ### Unintentional differences (to fix)
@@ -6532,6 +6551,8 @@ vs Eden `display_list.h` and `layer_list.h`
   constructor's `None` semantics.
 - Corrected the local-clock regression expectation: when steady-clock source IDs differ, Eden
   derives a context from the current steady clock rather than copying the supplied context.
+- Restored Eden's non-fatal error log when the boot-time timezone rule cannot be parsed; setup
+  continues and initializes the remaining timezone state in the same order.
 
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/alarm_worker.rs` vs `src/core/hle/service/glue/time/alarm_worker.{h,cpp}`
 
@@ -6753,3 +6774,1279 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: this changes only the language mode used to compile the existing C++ shim sources.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/tzif.rs` vs Eden `externals/tz/tz/tz.{h,cpp}`
+
+### Intentional differences
+- Rust checks the input length and `TZif` magic before decoding the header. Eden's current
+  `tzloadbody` copies the header without those guards; rejecting malformed input avoids an
+  out-of-bounds read without changing valid Switch archive behavior.
+- C++ `bool` storage in `ttinfo` and `Rule` is represented by raw `u8` fields. This preserves the
+  same offsets while making every guest-provided bit pattern valid to decode in Rust.
+
+### Unintentional differences (to fix)
+- `parse_posix_tz` implements only the POSIX footer forms exercised by the embedded Switch
+  archive. Eden retains the complete `tzparse` implementation, including its broader validation
+  and transition-generation behavior.
+
+### Missing items
+- The remaining `tzparse` branches and edge cases not represented by the current embedded archive
+  still need a literal port before the external TZ library can be called complete.
+
+### Binary layout verification
+- PASS: `TtInfo` is 0x10 bytes and `TzRule` is 0x4000 bytes with Eden's field offsets, fixed array
+  capacities and explicit zeroed padding. Unaligned IPC decoding and full deterministic output are
+  covered by focused tests.
+- The parser now matches Eden's Switch-specific single 8-byte data block, counter ordering and
+  256-byte footer bound; a regression parses the archive's `Etc/GMT` rule.
+- `mktime_tzname` now preserves Eden's distinct success, overflow and not-found statuses and writes
+  the normalized `CalendarTimeInternal` back only after a successful conversion.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/time_zone.rs` vs Eden `src/core/hle/service/psc/time/time_zone.{h,cpp}`
+
+### Intentional differences
+- Eden's recursive member mutex is paired with borrowed references. Rust combines the existing
+  member mutex with the enclosing `TimeManager` mutex used by shared service owners.
+- A zero-capacity Rust output slice returns zero results before writing. Eden writes the first
+  element before checking `out_times_max_count`; valid CMIF requests provide output storage, while
+  the Rust guard prevents malformed IPC from causing an out-of-bounds access.
+
+### Binary layout verification
+- PASS: parsing now updates `m_my_rule` only after success, failed output parsing preserves the
+  caller's rule, getters enforce Eden's initialization boundary, and `ValidateRule` checks the
+  fixed 0x4000-byte rule before conversion.
+- `GetTimeZoneTime`, `ToCalendarTimeImpl` and `ToPosixTimeImpl` now retain Eden's ownership and
+  locking boundaries. Reverse conversion preserves overflow/not-found mapping, normalized-calendar
+  validation, two-result ambiguity detection and ascending result order; focused regressions cover
+  the zero-result and two-result paths.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/time_zone_service.rs` and `static.rs` vs Eden PSC time services
+
+### Intentional differences
+- `Arc<Mutex<TimeManager>>` retains the single owner behind Eden's
+  `StandardSteadyClockCore&` and `TimeZone&` references. Isolated constructors create a private
+  manager for unit-level service use; production `StaticService` forwards its shared manager.
+- Eden asserts that an `InLargeData` descriptor exists. Ruzu treats a missing descriptor as an
+  empty buffer, retaining the same value-initialized rule without aborting the service process.
+
+### Binary layout verification
+- PASS: commands 8, 100 and 201 now exchange the fixed 0x4000-byte rule rather than serializing
+  Rust `Vec` metadata. Command 7 mutates the manager-owned timezone and captures the shared
+  standard steady-clock time point in Eden's order.
+- Commands 100 and 201 now reproduce CMIF `InLargeData` decoding by zero-initializing the rule and
+  copying the available prefix. Commands 201 and 202 allocate exactly the guest-advertised output
+  capacity rather than inventing two output elements.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/time_zone.rs` vs Eden `src/core/hle/service/glue/time/time_zone.{h,cpp}`
+
+### Intentional differences
+- Eden's borrowed worker/binary references and shared service pointers use the corresponding
+  `Arc<Mutex<_>>` or `Arc<_>` owners. Its one intrusive-list member operation event is represented
+  by one stable optional `OperationEvent`; repeated handle requests reuse that event.
+- Event materialization is deferred until an IPC context can create the kernel bridge. Eden owns
+  its kernel event at service construction and recreates it on the first handle request.
+- Eden asserts that an `InLargeData` descriptor exists. Ruzu treats a missing descriptor as an
+  empty buffer, retaining the same value-initialized rule without aborting the service process.
+
+### Binary layout verification
+- PASS: location changes now follow Eden's validation, rule update, filesystem timestamp, wrapped
+  readback, settings-name persistence, settings-time persistence and event-signal order. Rule IPC
+  uses the complete deterministic 0x4000-byte payload, and output capacities come from the actual
+  IPC buffers.
+- Commands 100 and 201 preserve Eden's zero-initialize-then-copy-prefix `InLargeData` semantics;
+  focused coverage verifies that bytes beyond an undersized input remain zero.
+
+## 2026-08-22 — `src/core/src/hle/service/set/system_settings_server.rs` timezone forwarding vs Eden settings server
+
+### Intentional differences
+- Direct Rust forwarding methods return typed values or unit because the corresponding inner
+  settings methods cannot fail; Eden expresses the same always-successful operations as `Result`.
+
+### Unintentional differences (to fix)
+- The broader pre-existing partial service differences remain recorded in the earlier
+  `system_settings_server.rs` audit entry.
+
+### Missing items
+- No additional settings prerequisite is missing for timezone persistence.
+
+### Binary layout verification
+- PASS: `LocationName` remains 0x24 bytes and `SteadyClockTimePoint` remains 0x18 bytes. Focused
+  round-trip coverage includes a negative signed time point and a nonzero homebrew test UUID.
+
+## 2026-08-22 — `src/core/src/hle/service/hid/hid_debug_server.rs` vs Eden `src/core/hle/service/hid/hid_debug_server.{h,cpp}`
+
+### Intentional differences
+- Eden stores `shared_ptr` children inside `ResourceManager`. Ruzu retains the existing
+  `Arc<Mutex<_>>` resource split and passes the shared `TouchResource`/`TouchScreenDriver` to the
+  matching child operation; method ownership and operation order remain in `hid_debug_server.rs`.
+- Eden's CMIF templates unwrap arguments and output parameters. Ruzu uses local typed CMIF
+  handlers, including the map-alias `TouchState` input buffer and the aligned `(u32, u64)` request.
+- `TouchScreen::IsActive` and `Gesture::IsActive` return their infallible boolean directly in the
+  current Rust ownership adaptation. Eden returns `ResultSuccess` plus an output boolean; the
+  service still evaluates both calls in Eden's order before combining their values.
+
+### Unintentional differences (to fix)
+- None remain in this file after the post-implementation comparison.
+
+### Missing items
+- None: all nine methods owned by Eden's `IHidDebugServer` are implemented, and all 158 command
+  IDs/names have matching implemented-versus-null registration state.
+
+### Binary layout verification
+- PASS: `TouchState` is 0x28 bytes, `AutoPilotState` is 0x288 bytes, and
+  `TouchScreenConfigurationForNx` is 0x10 bytes. Focused tests also cover the exact command IDs,
+  active-handler set, and touch/gesture restart-then-stop lifecycle.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/power_state_service.rs` vs Eden `src/core/hle/service/psc/time/power_state_service.{h,cpp}`
+
+### Intentional differences
+- Eden's `Core::System&` belongs to the `ServiceFramework` base, not to
+  `IPowerStateRequestHandler` itself. Ruzu's framework obtains the process/kernel owner from the
+  IPC context when the shared service `Event` lazily materializes its readable copy handle, so the
+  duplicate concrete-service `SystemRef` field and constructor parameter were removed.
+- `Arc<PowerStateRequestManager>` preserves Eden's borrowed manager lifetime. The manager-owned
+  `Event` caches its own kernel bridge, replacing the extra service-local readable-event cache.
+- Eden leaves `out_priority` at its value-initialized zero when no request was cleared. The manual
+  Rust IPC adapter writes that zero explicitly.
+
+### Unintentional differences (to fix)
+- Dynamic `time:p` registration remains part of the already-recorded missing `SetupSAndP` work in
+  `service_manager.rs`; no additional behavior difference remains inside this service file.
+
+### Missing items
+- None in `IPowerStateRequestHandler`: both commands and their manager delegation are present.
+
+### Binary layout verification
+- N/A: the service exchanges scalar CMIF outputs and a copy handle, with no raw aggregate payload.
+  Focused tests cover the exact handler table and pending/available/clear state transition through
+  the shared manager.
+
+## 2026-08-22 — `src/core/src/hle/service/olsc/remote_storage_controller.rs` and `olsc_service_for_system_service.rs` vs Eden OLSC counterparts
+
+### Intentional differences
+- Eden passes `Core::System&` to every child because it belongs to the C++ `ServiceFramework`
+  base. Ruzu's framework obtains system state from each IPC context, so the remote controller has
+  no duplicate concrete-service `SystemRef`; its parent constructs the otherwise stateless child
+  without downcasting merely to recover that unused value.
+- The typed CMIF template outputs of `GetSecondarySave` are represented by a private `repr(C)`
+  adapter containing the boolean, explicit zero padding, and three `u64` values. This preserves
+  the template's alignment while keeping the upstream method itself as the behavior owner.
+
+### Unintentional differences (to fix)
+- The broader pre-existing `IOlscServiceForSystemService` table and method parity were not part of
+  this warning slice and still require a complete dedicated audit.
+
+### Missing items
+- None in `IRemoteStorageController`: all 30 registered IDs/names and all three upstream methods
+  are present; commands 18 and 27 deliberately share `GetDataInfo` as in Eden.
+
+### Binary layout verification
+- PASS: `GetSecondarySave` writes a deterministic 0x20-byte output with the `[u64; 3]` at offset
+  8; `GetDataInfo` writes exactly 0x38 zero bytes. Focused tests cover the layouts, exact handler
+  table, implemented/null states, and all upstream stub outputs.
+
+## 2026-08-22 — `src/core/src/hle/service/ns/ecommerce_interface.rs` and `service_getter_interface.rs` vs Eden NS counterparts
+
+### Intentional differences
+- Eden supplies `Core::System&` solely to the e-commerce interface's C++ `ServiceFramework` base.
+  The Rust dispatcher obtains system state from the IPC context, so the concrete child stores no
+  duplicate `SystemRef` and its getter constructs the stateless interface without one.
+- Eden's typed `Out<SharedPointer<IECommerceInterface>>` wrapper is a direct Rust return plus a
+  thin IPC handler that installs the child as a moved interface object.
+
+### Unintentional differences (to fix)
+- `IServiceGetterInterface` still has null handlers for the other getters except commands 7992
+  and 7998. Several corresponding Rust modules are only command/data sketches rather than usable
+  `ServiceFramework` owners, so completing them requires a separate structural NS slice.
+
+### Missing items
+- None in `IECommerceInterface`: all seven upstream commands remain registered as null handlers.
+  Command 7992 now constructs and returns that exact child interface as Eden does.
+
+### Binary layout verification
+- N/A: this slice exchanges only a moved service interface and defines no raw payload.
+  Focused tests cover the seven-entry child table and command 7992 registration.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/core/container.rs` vs Eden `src/core/hle/service/nvdrv/core/container.{h,cpp}`
+
+### Intentional differences
+- `Container` is a cloneable Rust handle whose `Arc`-owned NvMap, syncpoint manager, device-file
+  data, and session store remain shared. This models the borrowed `NvCore::Container&` retained by
+  Eden's NVDEC/VIC base without a raw pointer or a second copy of the state.
+- Eden exposes mutable `Host1xDeviceFile()` access. Ruzu keeps that state private and exposes the
+  operation-shaped `take_accumulated_syncpoint`/`recycle_syncpoint` pair, preserving
+  the constructor/destructor FIFO ordering while preventing unrelated mutation.
+- Session process pointers are `Weak<ProcessLock>` and session state is mutex-protected. Missing or
+  inactive sessions return `None` instead of relying on Eden's unchecked deque indexing.
+- Ruzu releases the session mutex around `NvMap::unmap_all_handles` because that path re-enters the
+  shared Rust session store; the observable teardown order remains unmap handles, release the
+  preallocated area, deactivate the session, unregister the ASID, then recycle the ID.
+
+### Unintentional differences (to fix)
+- No remaining difference was found in the shared-handle and accumulated-syncpoint behavior
+  changed by this slice.
+
+### Missing items
+- None in the `Container` interface used by NVDEC/VIC: session ownership, NvMap/syncpoint access,
+  and accumulated-syncpoint take/return behavior are available through Rust ownership adapters.
+
+### Binary layout verification
+- N/A: `Container` and `Session` are internal ownership objects and are never serialized as raw
+  guest payloads. A focused test verifies that a cloned handle resolves the exact same process
+  session.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_nvdec_common.rs`, `nvhost_nvdec.rs`, and `nvhost_vic.rs` vs Eden counterparts
+
+### Intentional differences
+- Rust composition replaces C++ inheritance: both concrete devices forward `query_event` to the
+  common owner, while each concrete file retains its own ioctl table exactly where Eden defines it.
+- The upstream-only `submit_timeout`, `nvmap_fd`, and `device_syncpoints` state and the unused
+  `IoctlSubmitCommandBuffer`/`IocGetIdParams` declarations are omitted. Eden never reads any of
+  them, and `SetNVMAPfd`/`SetSubmitTimeout` still log and return success exactly as observable by
+  the guest.
+- Malformed submissions are rejected safely: an absent session/process memory/Host1x returns
+  `InvalidState`, non-positive command-buffer word counts are skipped, and a shorter fence array
+  does not cause unchecked indexing. Eden assumes all of those invariants.
+- Ruzu emits optional host1x trace records and converts each command list to native `u32` values
+  because its Host1x interface accepts `Vec<u32>` rather than Eden's moved `CpuGuestMemory` view.
+
+### Unintentional differences (to fix)
+- The eager command-list snapshot noted above cannot preserve Eden's lazy guest-memory view if the
+  guest mutates that memory before Host1x consumes it. Correcting that requires a dedicated Host1x
+  queue/interface ownership change and is not safe to fold into this warning-removal slice.
+
+### Missing items
+- None in the ioctl/query-event surface: NVDEC exposes commands 0x01, 0x02, 0x03, 0x07, 0x09,
+  0x0A, 0x23 and H/0x01; VIC exposes 0x01, 0x02, 0x03, 0x09, 0x0A and H/0x01. `GetClkRate`
+  writes 614400000/0, and unknown query events return no event.
+
+### Binary layout verification
+- PASS: every live fixed/variable ioctl payload has `repr(C)` and an exact size assertion:
+  `IoctlSetNvmapFD` 0x4, `IoctlSubmit` 0x10, `CommandBuffer` 0xC, `Reloc` 0x10,
+  `SyncptIncr` 0x14, syncpoint/waitbase/clock-rate and map entries 0x8, and map parameters 0xC.
+  Focused tests cover clock-rate serialization, concrete-device routing, `num_entries` bounds, and
+  syncpoint recycling.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvhost_as_gpu.{h,cpp}`
+
+### Intentional differences
+- Eden retains a `Container&` after deriving `nvmap` from it but never reads that reference again.
+  Ruzu removes the equivalent raw pointer and keeps only the live NvMap dependency.
+- Eden's `std::map`/`unordered_dense::set` owners map to `BTreeMap`/`HashSet`; `Arc<Mapping>` lets
+  allocation records and the mapping map refer to one Rust mapping owner instead of duplicating an
+  offset and performing a second lookup.
+- Eden owns a concrete `Tegra::MemoryManager`; Ruzu owns an `Arc<dyn GpuMemoryManagerHandle>` so the
+  renderer backend can provide the platform implementation while preserving map/unmap ordering.
+- Invalid device descriptors, absent memory managers, failed pins, missing allocators, and stale
+  tracked mappings return an NV error or safe success instead of relying on Eden's assertions or
+  unchecked dereferences. Optional trace calls do not alter the guest outputs.
+- Rust uses one outer operation mutex plus mutexes required by the shared trait handles. `Remap` is
+  also serialized even though Eden omits its otherwise customary `scoped_lock`.
+
+### Unintentional differences (to fix)
+- No remaining difference was found in the dead-container removal, `map_buffer_offsets` lifecycle,
+  or `GetVARegionsImpl`/`GetVARegions1`/`GetVARegions3` ownership corrected by this slice.
+
+### Missing items
+- None: the ioctl1 commands A/1, A/2, A/3, A/5, A/6, A/8, A/9 and A/0x14, ioctl3 A/8,
+  empty open/close hooks, and unknown-event behavior all have counterparts.
+
+### Binary layout verification
+- PASS: all ioctl payloads have `repr(C)` and exact upstream sizes, including the newly asserted
+  0x4-byte `IoctlBindChannel`; `VaRegion` is 0x18 and `IoctlGetVaRegions` is 0x40. Focused tests
+  cover tracked/untracked unmap behavior, the inline-region copy bound, and existing allocation,
+  mapping, sparse, remap, free, and channel-binding behavior.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs`, `nvdevice.rs`, `nvdrv.rs`, and `nvdrv_interface.rs` vs Eden counterparts
+
+### Intentional differences
+- Rust exposes the persistent readable event as `Arc<Mutex<KReadableEvent>>` instead of returning
+  Eden's owning `KEvent*`; copying that shared handle into the IPC object table preserves the same
+  event identity and waiter state.
+- The host-action closure captures the slot's atomic status and readable-event handle directly.
+  Eden captures `this` and the slot, but Rust cannot lock the event-table mutex from this callback
+  because `RegisterHostAction` may invoke it synchronously while `IocCtrlEventWait` holds that mutex.
+- Optional event trace records add diagnostics without changing event status, handle, or IPC output.
+
+### Unintentional differences (to fix)
+- The warning-triggering process/scheduler owner adapter was dead: neither weak field was read and
+  the live host-action callback already signals `KReadableEvent` directly. It has been removed from
+  all four layers, restoring Eden's direct `QueryEvent` path.
+
+### Missing items
+- None for queried-event ownership or signalling. The callback retains and signals the same
+  persistent readable event returned by `QueryEvent`.
+
+### Binary layout verification
+- PASS: `SyncpointEventValue` remains a 4-byte raw value and this cleanup does not alter any ioctl
+  payload. A focused test verifies allocated-event decoding and matching-syncpoint lookup.
+
+## 2026-08-22 — `src/core/src/hle/service/nvdrv/nvdrv_interface.rs` vs Eden `src/core/hle/service/nvdrv/nvdrv_interface.{h,cpp}`
+
+### Intentional differences
+- Eden's `Common::ScratchBuffer<u8>` owners map to reusable `Vec<u8>` fields. Ruzu clears the
+  requested range before every dispatch instead of leaving reused bytes unspecified, preserving
+  deterministic reserved/output bytes as required by the Rust raw-payload contract.
+- The static `ServiceFramework` adapters and mutex-protected `NvdrvInterface` state split one C++
+  `NVDRV` object into two Rust layers; the buffers remain owned by that per-service state.
+- Optional ioctl tracing/history observes the service-owned buffers after dispatch without changing
+  the guest-visible write condition or response.
+
+### Unintentional differences (to fix)
+- None in the output-buffer ownership corrected by this slice.
+
+### Missing items
+- None for ioctl scratch storage: ioctl1/ioctl2 reuse `output_buffer`, while ioctl3 reuses both
+  `output_buffer` and `inline_output_buffer` before writing descriptors 0 and 1 respectively.
+
+### Binary layout verification
+- N/A: the reusable vectors are host-only storage. Their requested lengths still come directly from
+  the IPC write descriptors, and a focused test verifies resize and deterministic clearing.
+
+## 2026-08-22 — `src/core/src/cpu_manager.rs` and `src/core/src/hle/kernel/k_scheduler.rs` vs Eden `cpu_manager.{h,cpp}` and `k_scheduler.{h,cpp}`
+
+### Intentional differences
+- Ruzu's CPU loop passes a cached per-core JIT table into its `run_guest_thread_once` adaptation;
+  the retained `_process_owner` `Arc` keeps those raw pointers valid without locking the process on
+  every inner-loop iteration. Eden follows raw owner pointers from `KThread` in `PhysicalCore`.
+- `wait_for_next_runnable_thread` is a Rust polling fallback around the scheduler priority queue;
+  Eden's fiber switch loop waits through its scheduler/idle-thread lifecycle instead.
+
+### Unintentional differences (to fix)
+- The process owner was redundantly passed into `run_guest_thread_once` after the cached-JIT change,
+  although the callee never read it. Ownership now remains explicitly in each caller only.
+- The Rust-only runnable-thread polling helper accepted a current-thread ID that never influenced
+  selection. The dead parameter and its forwarding were removed.
+
+### Missing items
+- This slice does not change the already documented Rust scheduler/fiber adaptations; it only
+  removes parameters with no control-flow, lifetime, or selection role.
+
+### Binary layout verification
+- N/A: these are host execution-loop signatures and do not define serialized guest data.
+
+## 2026-08-22 — service bootstrap in `services.rs`, `am/am.rs`, `aoc/addon_content_manager.rs`, and `filesystem/filesystem.rs` vs Eden counterparts
+
+### Intentional differences
+- Ruzu passes `SystemRef` and, for FileSystem, the shared Rust `FileSystemController` handle into
+  each service process. Eden reaches the controller through `Core::System&`.
+- The Rust launcher still uses explicit closures/macros for host and guest service processes instead
+  of Eden's tables of `void (*)(Core::System&)` function pointers.
+
+### Unintentional differences (to fix)
+- `GenericStubService` has no Eden counterpart and guesses that command 0 returns a sub-interface.
+  Removing its unused domain-header local and duplicate command read does not resolve that broader
+  service-parity debt; concrete services must replace each remaining use.
+
+### Missing items
+- AM, AOC, and FileSystem no longer accept an unused global `ServiceManager`: like Eden, their
+  `loop_process` entry points create and own a local `ServerManager` from the system context.
+- The unused `ServiceManager` clone before PCTL launch was removed because PCTL already had the
+  upstream-shaped system-only entry point.
+
+### Binary layout verification
+- N/A: this slice changes host service bootstrap signatures and local dispatch variables only.
+
+## 2026-08-22 — `nvnflinger/window.rs` and `sockets/sockets.rs` vs Eden `window.h` and `sockets.h`
+
+### Intentional differences
+- Eden uses `enum class` plus `DECLARE_ENUM_FLAG_OPERATORS`; Ruzu expresses the same flag types
+  with `bitflags!`, so their rustdoc belongs inside the macro invocation.
+
+### Unintentional differences (to fix)
+- The two type comments were attached to macro invocations rather than generated types and produced
+  no Rust documentation. They now document `NativeWindowTransform` and `PollEvents` directly.
+
+### Missing items
+- None in this documentation-placement slice.
+
+### Binary layout verification
+- PASS: flag bases and values remain unchanged (`u32` for window transform, `u16` for poll events).
+
+## 2026-08-22 — exhaustive value handling in `k_page_table_base.rs`, VI scaling, and `internal_network/sockets.rs` vs Eden counterparts
+
+### Intentional differences
+- Eden's `OperationType` switch ends in `UNREACHABLE`; Rust's closed enum makes the equivalent
+  single-address `operate` match exhaustive at compile time, so an unreachable wildcard is omitted.
+- POSIX platforms may define `EWOULDBLOCK` and `EAGAIN` to the same number. Ruzu uses one guarded
+  match arm so both names map to `Errno::Again` without an unreachable-pattern diagnostic.
+
+### Unintentional differences (to fix)
+- VI previously transmuted an arbitrary IPC `u32` into `NintendoScaleMode`, which is undefined
+  behavior for values outside 0..=4 and made its fallback arm illusory. `from_raw` now rejects such
+  values before enum construction and returns `ResultOperationFailed`, matching Eden's `default`.
+
+### Missing items
+- None for these value-domain checks.
+
+### Binary layout verification
+- PASS: `NintendoScaleMode` remains `repr(u32)` with values 0 through 4; the new conversion does not
+  alter its representation. `OperationType` discriminants and native errno values are unchanged.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_ipc.rs` vs Eden `src/core/hle/kernel/svc/svc_ipc.cpp`, `k_client_session.cpp`, and `k_server_session.{h,cpp}`
+
+### Intentional differences
+- Ruzu retains an inline HLE dispatch fallback for ownerless test fixtures. Eden always queues the
+  request through `KClientSession` and waits for the owning server thread.
+
+### Unintentional differences (to fix)
+- The inline fallback converted enqueue and receive failures to `ResultInvalidHandle`. Both phases
+  now preserve the original Kernel result, matching Eden's `R_RETURN` chain from
+  `KServerSession::OnRequest` through `KClientSession::SendSyncRequest` and `SendSyncRequestImpl`.
+
+### Missing items
+- None for result propagation on the inline request path. A focused regression test verifies that
+  a closed session returns Kernel `ResultSessionClosed` rather than `ResultInvalidHandle`.
+
+### Binary layout verification
+- N/A: this change only preserves a 32-bit result code already produced by the session layer; no
+  IPC payload or raw-memory structure changes.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_server_session.rs` vs Eden `src/core/hle/kernel/k_server_session.{h,cpp}`
+
+### Intentional differences
+- Eden's pointer-descriptor constructors read through a const `MessageBuffer` view. Ruzu's
+  `PointerDescriptor::from_raw` reads the same two words directly from the immutable source slice.
+
+### Unintentional differences (to fix)
+- The receive and send pointer helpers cloned the complete source message into mutable vectors and
+  constructed unused `MessageBuffer` views. Those dead allocations are removed; descriptor offsets,
+  memory-copy direction, validation, and destination writes remain unchanged.
+
+### Missing items
+- None in the pointer-descriptor source parsing covered by this cleanup.
+
+### Binary layout verification
+- PASS: each pointer descriptor is still decoded from the same two `u32` words and encoded into the
+  same destination offsets. Existing focused tests cover send copying, receive linear-to-user
+  copying, receive heap-to-heap copying, and end-to-end request pointer payload transfer.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_condition_variable.rs` vs Eden `src/core/hle/kernel/k_condition_variable.{h,cpp}`
+
+### Intentional differences
+- `signal_to_address` returns the next-owner handle together with the result when releasing Ruzu's
+  process mutex; the scheduler guard remains live through `end_wait`, preserving Eden's ordering
+  without nesting the process mutex around the Rust thread lock.
+- The active condition-variable wait queue is constructed in `wait_locked_after_sleep_guard`, where
+  Ruzu's split implementation calls `BeginWait`. Eden constructs its stack queue at `Wait` entry.
+
+### Unintentional differences (to fix)
+- `signal_to_address` initialized `next_owner_thread` to `None` before unconditionally replacing it.
+  The redundant initialization is removed by returning `(result, next_owner_thread)` from the
+  process-locked section.
+- `wait_locked` constructed a second queue that was never configured or passed to `BeginWait`; the
+  unused duplicate is removed.
+
+### Missing items
+- None for the owner-transfer or wait-queue lifetimes changed by this cleanup.
+
+### Binary layout verification
+- N/A: condition-variable ownership and queues are host kernel state; no raw payload layout changes.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_interrupt_manager.rs` vs Eden `src/core/hle/kernel/k_interrupt_manager.{h,cpp}`
+
+### Intentional differences
+- Ruzu snapshots the current thread fields before acquiring scheduler and process locks to preserve
+  its host-mutex order. Eden accesses the embedded kernel objects directly under its scheduler lock.
+
+### Unintentional differences (to fix)
+- The snapshot included `KThread::current_core`, although both Eden and Ruzu use the interrupt's
+  `core_id` for the pinned-thread lookup and pin operation. The unused field read is removed.
+
+### Missing items
+- None for interrupt-core selection: clear, pinned-thread lookup, pinning, and schedule request all
+  continue to use the `core_id` argument supplied by the physical core.
+
+### Binary layout verification
+- N/A: the removed tuple element was temporary host state and was never serialized.
+
+## 2026-08-22 — `src/core/src/hle/kernel/message_buffer.rs` vs Eden `src/core/hle/kernel/message_buffer.h`
+
+### Intentional differences
+- Rust names the header argument `_hdr` in `get_special_data_index` because, exactly as in Eden's
+  formula, the special-data start depends only on the fixed message-header size and special-header
+  size. Keeping the argument preserves the upstream helper signature without an unused warning.
+
+### Unintentional differences (to fix)
+- Ruzu had removed the header parameter from `get_special_data_index` while retaining it in the
+  downstream index helpers. The parameter and forwarding chain now match Eden again.
+
+### Missing items
+- None for the special-data, pointer, map-alias, raw-data, and receive-list index dependency chain.
+
+### Binary layout verification
+- PASS: the index formula remains `MessageHeader::DATA_SIZE / 4 + spc.header_size / 4`; only the
+  upstream-compatible header forwarding is restored. Existing message-buffer index and IPC copy
+  tests exercise the downstream offsets.
+
+## 2026-08-22 — `src/core/src/file_sys/patch_manager.rs` vs Eden `src/core/file_sys/patch_manager.{h,cpp}`
+
+### Intentional differences
+- Rust locks the shared filesystem controller and content-provider union while both temporary
+  `PatchManager` values borrow them. Eden receives stable references directly from `Core::System`.
+- When no content provider is installed, Ruzu returns empty metadata; Eden's accessor contract
+  assumes the provider has already been initialized.
+
+### Unintentional differences (to fix)
+- Ruzu was missing `GetMetadataFromBaseOrUpdate`. The associated method now checks the application
+  title first and, only when its NACP is absent, checks `GetUpdateTitleID(application_id)`.
+
+### Missing items
+- None for this base/update metadata lookup helper.
+
+### Binary layout verification
+- N/A: the method forwards existing `NACP` and virtual-file owners without changing their layout.
+  A focused provider test verifies the exact base-then-update request order.
+
+## 2026-08-22 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}`
+
+### Intentional differences
+- The Rust method returns a value-initialized `[u8; 16]` which the handler writes to CMIF as two
+  `u64` values. Eden receives a value-initialized `Out<DisplayVersion>` from CMIF serialization.
+- The bounded copy and fallback are extracted into a file-local helper so their byte-level behavior
+  can be tested without constructing the full emulator system; ownership remains in the matching
+  application-functions file.
+
+### Unintentional differences (to fix)
+- `GetDisplayVersion` previously ignored its service owner and always returned `"1.0.0"`. It now
+  reads the applet program ID and uses `PatchManager::GetMetadataFromBaseOrUpdate`, matching Eden.
+
+### Missing items
+- None for display-version lookup, fallback, bounded copy, final NUL byte, or CMIF output size.
+
+### Binary layout verification
+- PASS: the response remains a deterministic 16-byte `DisplayVersion`; bytes beyond the copied
+  string are zero and byte 15 is always NUL. Focused tests verify the fallback and 16-byte truncation.
+
+## 2026-08-22 — `src/core/src/hle/service/hid/hid_server.rs` vs Eden `src/core/hle/service/hid/hid_server.{h,cpp}`
+
+### Intentional differences
+- Rust decodes `ClientAppletResourceUserId` directly as its single `u64` `pid` value and returns the
+  IPC interface through `ResponseBuilder`; Eden expresses both through CMIF wrapper types.
+
+### Unintentional differences (to fix)
+- `CreateAppletResource` previously discarded the resource manager result without reproducing
+  Eden's diagnostic. It now logs the ARUID and raw result before constructing the interface.
+
+### Missing items
+- None for the `CreateAppletResource` call, diagnostic, interface construction, or unconditional
+  success behavior.
+
+### Binary layout verification
+- N/A: this correction only consumes the existing result for diagnostics and does not alter IPC
+  payload or HID shared-memory layout. A focused test verifies that a manager failure is logged-only
+  behavior and the handler still returns success plus an interface, as Eden does.
+
+## 2026-08-22 — `src/core/src/hle/kernel/kernel.rs`, `src/core/src/core.rs` vs Eden `src/core/hle/kernel/kernel.{h,cpp}`
+
+### Intentional differences
+- Ruzu initializes the persistent font and IRS objects from `System::initialize_kernel` after its
+  physical memory manager has been initialized. Eden performs the same ordered allocation inside
+  `KernelCore::Impl::InitializeHackSharedMemory`; this split follows Ruzu's existing staged kernel
+  initialization without changing object ownership or allocation order.
+- Rust retains the registered kernel object as `(object_id, Arc<KSharedMemory>)`; Eden retains its
+  intrusive `KSharedMemory*`. Both expose one stable kernel-owned object for its full boot lifetime.
+
+### Unintentional differences (to fix)
+- Ruzu previously lacked Eden's kernel-owned `font_shared_mem`. It now allocates it before IRS with
+  owner permission `None`, user permission `Read`, size `0x1100000`, and clears it before IRS during
+  shutdown.
+
+### Missing items
+- None for the font shared-memory field, initialization order, permissions, accessor, persistence,
+  or shutdown order required by the platform font services.
+
+### Binary layout verification
+- N/A: the object owns raw shared pages rather than a serialized structure. A focused test verifies
+  the exact allocation size and stable object identity across repeated initialization.
+
+## 2026-08-22 — `src/core/src/hle/service/ns/platform_service_manager.rs` vs Eden `src/core/hle/service/ns/platform_service_manager.{h,cpp}`
+
+### Intentional differences
+- Rust registers the kernel object's stable ID and `Arc<KSharedMemory>` with the caller process so
+  its IPC layer can translate the deferred copy object into a process handle. Eden's intrusive
+  kernel object and CMIF `OutCopyHandle` perform the equivalent registration during serialization.
+- The direct full-buffer copy is extracted into a file-local helper so it can be tested against a
+  real `KSharedMemory` without constructing a complete emulator system.
+
+### Unintentional differences (to fix)
+- `GetSharedMemoryNativeHandle` previously allocated and cached a separate shared memory in each
+  `pl:*` service, used incorrect owner permission `Read`, and redundantly resolved the caller twice.
+  It now copies the complete font blob into `KernelCore::GetFontSharedMem()` on every request and
+  returns that single kernel-owned object, matching Eden.
+
+### Missing items
+- None for font-buffer copying, shared-object ownership, caller registration, or returned handle
+  identity in `GetSharedMemoryNativeHandle`.
+
+### Binary layout verification
+- PASS: the copied region remains exactly `0x1100000` bytes. A focused test pre-fills the complete
+  kernel buffer and verifies that the service copy overwrites it byte-for-byte with the font blob.
+
+## 2026-08-22 — `src/core/src/hle/service/nvnflinger/buffer_queue_consumer.rs` vs Eden `src/core/hle/service/nvnflinger/buffer_queue_consumer.{h,cpp}`
+
+### Intentional differences
+- The unused release-fence parameter is named `_release_fence` in Rust to make Eden's deliberate
+  temporary non-use explicit while preserving the public method signature.
+
+### Unintentional differences (to fix)
+- Ruzu previously retained a sampled `[BQC_RELEASE]` diagnostic counter absent from Eden. It has
+  been removed, and Eden's explanatory TODO beside the intentionally disabled fence assignment is
+  now preserved at the matching point.
+
+### Missing items
+- Proper waiting on release fences remains an upstream TODO; Ruzu deliberately keeps the previous
+  acquire fence exactly as Eden does rather than inventing behavior ahead of upstream.
+
+### Binary layout verification
+- N/A: no serialized or raw-memory payload changes. A focused state test verifies that release
+  frees the acquired slot without replacing its existing fence.
+
+## 2026-08-22 — `src/core/src/hle/service/nvnflinger/buffer_queue_producer.rs` vs Eden `src/core/hle/service/nvnflinger/buffer_queue_producer.cpp`
+
+### Intentional differences
+- Rust turns Eden's fatal `UNIMPLEMENTED_IF_MSG` and `ASSERT_MSG` paths into explicit panics because
+  it does not use Eden's assertion macros.
+
+### Unintentional differences (to fix)
+- The Connect-listener panic helper accepted but ignored the transaction code even though Eden's
+  listener diagnostic does not include it; the dead parameter is removed.
+- The generic unsupported-transaction panic previously supplied `name` and `code` in reverse order.
+  It now reports the numeric transaction first and its symbolic name second.
+
+### Missing items
+- Producer-listener parcel decoding remains intentionally unimplemented exactly where Eden raises
+  `UNIMPLEMENTED_IF_MSG`.
+
+### Binary layout verification
+- N/A: only fatal diagnostics changed. Focused tests verify the exact listener and unsupported
+  transaction messages.
+
+## 2026-08-22 — `src/core/src/file_sys/fssystem/hierarchical_integrity_verification_storage.rs` vs Eden `src/core/file_sys/fssystem/fssystem_hierarchical_integrity_verification_storage.{h,cpp}`
+
+### Intentional differences
+- Rust uses `Arc::get_mut` while a verification level is exclusively owned, and a scoped closure
+  plus explicit error cleanup in place of Eden's `ON_RESULT_FAILURE` guards.
+- Rust slices make Eden's non-null read-buffer assertion implicit.
+
+### Unintentional differences (to fix)
+- An allocated `top_verify` object was never used; the existing owned level zero was initialized
+  instead. The dead allocation is removed.
+- Initialization previously recreated every verification owner and retained partial level state on
+  error. It now preserves constructor ownership and finalizes initialized levels on failure.
+- `Read` previously returned zero on an uninitialized object instead of enforcing Eden's
+  initialization precondition. It now asserts the same state contract.
+- `GetSize` previously replaced Eden's direct signed-to-unsigned `-1` bit pattern with zero while
+  uninitialized. It now returns the direct `usize` cast, yielding `usize::MAX` as upstream does.
+- Ruzu previously relied only on member destruction; `Drop` now invokes `finalize` explicitly,
+  matching Eden's destructor lifecycle.
+
+### Missing items
+- None for construction ownership, level initialization order, failure cleanup, finalization order,
+  read routing, size reporting, or the accessors defined in the matching upstream files.
+
+### Binary layout verification
+- PASS: the level-information structure is asserted to have Eden's size `0x18` and alignment `0x4`.
+  Focused tests verify failed-initialization cleanup/retry and the uninitialized `GetSize` bit pattern.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_base.rs` and `k_process_page_table.rs` vs Eden `src/core/hle/kernel/k_page_table_base.{h,cpp}` and `k_process_page_table.h`
+
+### Intentional differences
+- Rust forwards through the composed `KProcessPageTable::base` member; Eden inherits
+  `KProcessPageTable` from `KPageTableBase`.
+
+### Unintentional differences (to fix)
+- `LockForCodeMemory` previously returned a physical address, accepted a caller-selected
+  permission, and tested `FlagCanCodeAlias`. It now fills and opens the caller's page group,
+  tests `FlagCanCodeMemory`, and installs `KernelReadWrite | NotMapped` exactly like Eden.
+- `UnlockForCodeMemory` previously omitted the page-group identity check and used
+  `FlagCanCodeAlias`. It now forwards the exact page group into `UnlockMemory` and restores the
+  source under `FlagCanCodeMemory`.
+- The process-page-table wrapper previously omitted both code-memory forwarding methods and the
+  block-info-manager accessor needed to construct an owner-matched page group.
+
+### Missing items
+- None for the `LockForCodeMemory` and `UnlockForCodeMemory` dependency slice.
+
+### Binary layout verification
+- N/A: these methods operate on existing page groups and memory-block state; no serialized payload
+  changed.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_code_memory.rs` vs Eden `src/core/hle/kernel/k_code_memory.{h,cpp}`
+
+### Intentional differences
+- `Arc<ProcessLock>` represents Eden's explicitly opened owner-process reference, and the outer
+  `Mutex<KCodeMemory>` used by the typed object registry represents `m_lock`.
+- Methods receive an already locked mutable current/owner process where needed so Rust never
+  recursively locks the non-reentrant process mutex.
+- `Drop` invokes `Finalize` only for initialized objects; Eden's auto-object lifecycle invokes
+  `Finalize` before destruction under the same precondition.
+
+### Unintentional differences (to fix)
+- The former implementation fabricated physical pages from the guest virtual address and never
+  retained its owner. Initialization now obtains the owner page table's block-info manager, locks
+  the real source mapping, clears every physical byte to `0xFF`, retains the owner, and records the
+  source address and size in Eden's order.
+- `Map`, `Unmap`, `MapToOwner`, and `UnmapFromOwner` previously only toggled booleans. They now map
+  the retained page group with `CodeOut/UserReadWrite` or `GeneratedCode/UserRead{Execute}` and
+  preserve Eden's size and duplicate-map validation.
+- Finalization now conditionally unlocks the original source, closes and finalizes its page group,
+  and releases its owner reference in upstream order.
+
+### Missing items
+- None for `KCodeMemory` initialization, mapping, accessors, and finalization behavior.
+
+### Binary layout verification
+- N/A: `KCodeMemory` is an internal ownership object rather than a raw guest payload. Focused tests
+  verify the page count, physical `0xFF` fill, memory states, permissions, and lock restoration.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` code-memory ownership
+
+### Intentional differences
+- Ruzu's generic handle table stores opaque object IDs, so `KProcess` retains a typed
+  `Arc<Mutex<KCodeMemory>>` registry beside its existing typed kernel-object registries. Eden's
+  handle table and global auto-object container retain typed intrusive pointers directly.
+- Removing the final handle finalizes immediately only when no external Rust owner exists; an
+  external `Arc` retains the object and its strong owner-process reference like Eden's `Open`.
+
+### Unintentional differences (to fix)
+- Code-memory handles previously had no corresponding typed object and process teardown could not
+  finalize their source mappings. Registration, lookup, last-handle removal, and process-finalize
+  cleanup now preserve that lifecycle.
+
+### Missing items
+- None for process-owned lookup and release of code-memory handle objects.
+
+### Binary layout verification
+- N/A: the registry is host-only ownership state and does not alter `KProcess` guest ABI data.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_code_memory.rs` and `svc_dispatch.rs` vs Eden `src/core/hle/kernel/svc/svc_code_memory.cpp` and generated `svc.cpp`
+
+### Intentional differences
+- Rust heap allocation and `Arc` ownership replace Eden's slab `Create/Register/Open/Close`
+  mechanics; object IDs still come from `KernelCore` and handle-table insertion remains the
+  publication point.
+- Raw operation values are converted with fallible `TryFrom` because transmuting an invalid guest
+  integer into a Rust enum would be undefined behavior. Conversion occurs after basic validation
+  and handle lookup, preserving Eden's error precedence.
+
+### Unintentional differences (to fix)
+- `CreateCodeMemory` previously inserted only a synthetic opaque ID and never initialized an
+  object. It now creates, initializes, registers, and publishes the typed `KCodeMemory`, with
+  failure cleanup before returning.
+- `ControlCodeMemory` previously edited current-process permissions directly and never used the
+  retained physical pages or owner. Every operation now validates the matching address space and
+  delegates to the corresponding `KCodeMemory` method.
+- Both AArch32 SVCs previously returned unconditional stub success, while AArch64 fell through the
+  generic stub arm. Both dispatch tables now use Eden's generated register layouts, including the
+  split 64-bit address and size in `ControlCodeMemory64From32`.
+
+### Missing items
+- None for code-memory SVC validation, object lookup, operation dispatch, or 32/64-bit argument
+  marshalling.
+
+### Binary layout verification
+- PASS: focused dispatch coverage verifies the generated AArch32 and AArch64 input/output register
+  positions; operation discriminants remain `0..=3` with unknown values rejected explicitly.
+
+## 2026-08-22 — `src/core/src/hle/service/jit/jit_code_memory.rs` vs Eden `src/core/hle/service/jit/jit_code_memory.{h,cpp}`
+
+### Intentional differences
+- `Arc<Mutex<KCodeMemory>>` represents Eden's raw pointer plus explicit `Open`/`Close` reference;
+  the mapping helper accepts the Rust process owner and random generator as references rather than
+  the C++ kernel argument.
+- Rust obtains the retained `KCodeMemory` owner before calling its mapping methods because the
+  process-wide mutex is the Rust counterpart of the page-table and object locking used upstream.
+
+### Unintentional differences (to fix)
+- The former file exposed only zero-valued size/address fields and documented the real behavior as
+  blocked. `Initialize` now samples page-aligned addresses across the process alias-code region,
+  retries indefinitely only for `ResultInvalidMemoryRegion`, maps with the requested permission,
+  and publishes all members only after success.
+- `Finalize` now asserts the matching owner unmap, releases the retained code-memory reference, and
+  clears its object member in Eden's order.
+
+### Missing items
+- None for `CodeMemory::Initialize`, `Finalize`, `GetSize`, or `GetAddress`.
+
+### Binary layout verification
+- N/A: this is a host-side ownership helper, not a raw guest payload. Focused coverage verifies the
+  sampled address, generated-code state, execute permission, getters, and final unmap.
+
+## 2026-08-22 — `src/core/src/hle/service/jit/jit_context.rs` vs Eden `src/core/hle/service/jit/jit_context.{h,cpp}`
+
+### Intentional differences
+- Rust shares the local-memory/range/helper state through `Arc<Mutex<_>>` because `rdynarmic`
+  owns its boxed callback object; Eden stores callbacks and the JIT beside their parent and uses
+  direct references.
+- `JitContext::new` returns the local `rdynarmic` construction error instead of relying on a C++
+  constructor that always succeeds. Checked arithmetic prevents a malformed address from wrapping
+  during host slice bounds checks.
+- Mapped ranges are retained as interval pairs rather than Boost ICL nodes. Membership has the same
+  half-open-range result used by every memory access, and no operation depends on interval count.
+- Rust clears the persistent `USER_DEFINED1` halt bit before each invocation; Eden's Dynarmic
+  `HaltExecution` lifecycle performs the equivalent reset internally.
+- `JitContext` has a narrow `Send` implementation because the Rust IPC interface requires
+  `Send + Sync`. Its backend pointers target stable owned allocations, and `IJitEnvironment`
+  serializes every JIT call through one mutex.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for the public `JITContext` interface or the private behavior in `JITContextImpl` and
+  `DynarmicCallbacks64`.
+
+### Binary layout verification
+- PASS: ELF dynamic/RELA/RELR entries use the shared `repr(C)` definitions; helper bytes are the
+  exact `svc #0; ret` sequence, stack/heap alignment is 16 bytes, and focused execution coverage
+  verifies the ninth integer argument at `[SP]`.
+
+## 2026-08-22 — `src/rdynarmic/src/jit_config.rs` and A32/A64 backend callback wiring vs Eden `src/core/hle/service/jit/jit_context.cpp::DynarmicCallbacks64`
+
+### Intentional differences
+- The Rust backend exposes `instruction_synchronization_barrier_raised` as a default no-op trait
+  method and wires it for every JIT configuration. This avoids a JIT-service-only backend type while
+  leaving existing callback implementations behaviorally unchanged.
+- The flag corresponding to Dynarmic's top-level `UserConfig::hook_isb` lives in the shared Rust
+  `MemoryEmitConfig`, which is already the frontend-to-backend option carrier used by both host
+  emitters. Its default remains false.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for the instruction-synchronization callback required by `JITContext`.
+
+### Binary layout verification
+- N/A: this adds a host callback slot only. A focused A64 execution test verifies one ISB produces
+  exactly one callback before the terminating SVC when `hook_isb` is enabled on the active host
+  backend; the default-disabled behavior matches Eden's `UserConfig`.
+
+## 2026-08-22 — `src/core/src/hle/service/jit/jit.rs` vs Eden `src/core/hle/service/jit/jit.{h,cpp}`
+
+### Intentional differences
+- Rust places the mutable environment members behind one `Mutex` because service callbacks receive
+  `&self`; this preserves their upstream ownership and serializes the same per-object operations.
+- Typed copy handles are resolved through the caller process's Rust object registries, and
+  `KScopedAutoObject<KProcess>` is represented by a retained `Arc<ProcessLock>`.
+- CMIF arguments are parsed explicitly. Output buffers are copied from guest memory before plugin
+  execution and written back afterward because Rust's memory bridge is mutex-owned rather than a
+  directly borrowed span.
+- Rust implements the `std::mt19937_64` member locally with its exact default seed and output
+  sequence. The standard library does not provide this engine.
+- `JitContext` construction can report backend allocation/emitter errors. Those Rust-only failure
+  paths finalize both already-mapped code ranges before returning `ResultUnknown`; Eden's Dynarmic
+  constructor is effectively infallible here.
+- Eden resolves `_fini` and `nnjitpluginKeeper` but never invokes them. Rust retains both fields and
+  uses narrow `allow(dead_code)` annotations rather than deleting ABI-visible symbol ownership or
+  inventing calls absent upstream.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for `JITU`, `IJitEnvironment`, their command tables, callbacks, configuration, or lifecycle.
+
+### Binary layout verification
+- PASS: focused tests verify `CodeRange` is 16 bytes/aligned to 8, `Struct32` is 32 bytes, and
+  `JITConfiguration` is 80 bytes. Callback execution tests cover `GenerateCode`'s 13-argument ABI,
+  `Control`, cleared output-range sizes, and preserved output-buffer contents.
+
+## 2026-08-22 — `src/video_core/src/shader_environment.rs` vs Eden `src/video_core/shader_environment.{h,cpp}`
+
+### Intentional differences
+- Rust validates serialized environment counts and their complete byte size against the remaining
+  cache file before allocating. It also uses fallible reservations, rejects empty pipeline entries,
+  and requires exactly one environment for compute pipelines. Eden relies on trusted cache contents
+  and throwing stream reads; the additional validation prevents a malformed or same-version legacy
+  cache from aborting the process in Rust's infallible allocation path.
+- Pipeline-loader callbacks return `std::io::Result<()>` so key-read failures reach the same outer
+  invalid-cache cleanup that Eden obtains from `ifstream` exceptions.
+
+### Unintentional differences (to fix)
+- None in the reviewed serialization and disk-cache loading slice.
+
+### Missing items
+- None in the reviewed serialization and disk-cache loading slice.
+
+### Binary layout verification
+- PASS: the magic, cache version, field order, field widths, stage-specific payloads, and pipeline
+  key placement remain unchanged. Round-trip and malformed-cache tests cover valid compute entries,
+  truncated data, invalid discriminants, empty entries, oversized environment counts, and oversized
+  shader payloads.
+
+## 2026-08-22 — `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`
+
+### Intentional differences
+- Rust key readers return `std::io::Result` instead of relying on `ifstream::failbit` exceptions.
+  Dynamic-feature incompatibility remains a skipped valid entry and does not invalidate the cache.
+
+### Unintentional differences (to fix)
+- Cached compute and graphics key read failures were previously logged and swallowed, allowing a
+  desynchronized reader to continue. They now propagate through `load_pipelines`, matching Eden's
+  whole-file deletion on a failed key read.
+
+### Missing items
+- None in the reviewed disk-resource key-loading slice.
+
+### Binary layout verification
+- PASS: `ComputePipelineCacheKey` and `GraphicsPipelineKey` serialization is unchanged; only failure
+  propagation after reading those existing layouts changed.
+
+## 2026-08-22 — `src/video_core/src/renderer_opengl/gl_shader_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_cache.{h,cpp}`
+
+### Intentional differences
+- Rust key readers report `std::io::Result` explicitly instead of using throwing `ifstream` reads.
+
+### Unintentional differences (to fix)
+- Cached compute and graphics key read failures were previously logged and swallowed. They now
+  reach `load_pipelines` and delete the invalid cache as Eden's stream exception path does.
+
+### Missing items
+- None in the reviewed disk-resource key-loading slice.
+
+### Binary layout verification
+- PASS: OpenGL pipeline key bytes and their placement after serialized environments are unchanged.
+
+## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
+
+### Intentional differences
+- Rust passes retained `Arc<KThreadLock>` values instead of Eden's non-owning `KThread*`; this keeps
+  the thread alive across the channel from a CPU thread to the debugger connection thread.
+- The backend reference is an explicit argument to frontend callbacks because Rust traits cannot
+  retain the same self-referential backend reference as Eden's `DebuggerFrontend` constructor.
+
+### Unintentional differences (to fix)
+- The former interface represented threads as opaque integers and watchpoints as split primitive
+  fields. It now carries the matching kernel thread and `DebugWatchpoint` owners required by Eden's
+  frontend contract.
+
+### Missing items
+- None in the debugger frontend/backend action and callback interface.
+
+### Binary layout verification
+- N/A: these are host-only Rust traits and retained kernel-object references, not guest payloads.
+
+## 2026-08-22 — `src/core/src/debugger/debugger.rs` vs Eden `src/core/debugger/debugger.{h,cpp}`
+
+### Intentional differences
+- Rust's standard `TcpListener`, `TcpStream`, channel and owned thread replace Boost.Asio's acceptor,
+  socket and asynchronous signal pipe. They retain the same single server thread, 4096-byte reads,
+  replacement of an existing connection, and synchronous frontend callbacks.
+- `Arc<ProcessLock>`/`Arc<KThreadLock>` replace Eden's scoped intrusive kernel-object references.
+  Process locking supplies the matching thread-list lifetime while individual scheduler-aware Rust
+  thread methods perform suspend/resume transitions.
+- A shutdown request is handed to Ruzu's boot controller through an atomic flag instead of spawning
+  a detached call to `System::Exit`; the Rust `System` is owned by that controller thread and cannot
+  safely be mutably exited by the debugger thread.
+- An empty process thread list leaves the active thread unset instead of dereferencing Eden's
+  `threads.front()` precondition. A connected debugger still pauses every thread that exists.
+
+### Unintentional differences (to fix)
+- The previous file contained no server, connection state, process/thread ownership, signal path,
+  pause/resume behavior, or debugger thread lifecycle. Those responsibilities now live in their
+  matching module and execute in Eden's connection/action order.
+
+### Missing items
+- CPU-side step completion, breakpoint notification and watchpoint generation are prerequisites in
+  their own upstream-owned modules; they are recorded in `PORTING_STATE.md` before the GDB command
+  dispatcher is resumed.
+
+### Binary layout verification
+- N/A: the connection and synchronization state is host-only. Socket regression tests verify bind
+  failure, deterministic thread shutdown and real packet routing.
+
+## 2026-08-22 — `src/core/src/core.rs` debugger ownership vs Eden `src/core/core.{h,cpp}`
+
+### Intentional differences
+- Ruzu exposes notification forwarding methods on `System` because its CPU owners cannot borrow the
+  debugger field directly while retaining a kernel thread `Arc`; Eden exposes `GetDebugger()`.
+- The debugger-triggered exit flag is reset explicitly at initialization and after debugger
+  destruction because it replaces Eden's detached `System::Exit()` call.
+
+### Unintentional differences (to fix)
+- `System` previously had no debugger owner. It now initializes the configured server, forwards
+  thread notifications, sends shutdown before teardown, and destroys the debugger immediately after
+  CPU-manager shutdown and before kernel shutdown, matching Eden's lifecycle ordering.
+
+### Missing items
+- None in `System`'s debugger ownership and initialization/detachment lifecycle.
+
+### Binary layout verification
+- N/A: the new members are host runtime state and do not alter any raw guest structure.
+
+## 2026-08-22 — `src/ruzu/src/boot.rs` debugger lifecycle vs Eden `src/qt_common/render/emu_thread.cpp`
+
+### Intentional differences
+- Ruzu's non-Qt boot controller polls the atomic debugger shutdown request in its existing command
+  loop; Eden's GDB backend invokes `System::Exit()` from a detached thread.
+
+### Unintentional differences (to fix)
+- The frontend previously ignored `use_gdbstub`. It now initializes the debugger after GPU/CPU
+  readiness, observes debugger-requested exit, and detaches it before pausing and shutting down the
+  application process in the same lifecycle positions as Eden.
+
+### Missing items
+- None in the frontend-owned debugger initialization and detachment slice.
+
+### Binary layout verification
+- N/A: this is frontend control flow only.
+
+## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` connection callback slice vs Eden `src/core/debugger/gdbstub.{h,cpp}`
+
+### Intentional differences
+- Rust returns explicit packet-completeness booleans from `process_data` so split TCP frames remain
+  buffered without the recursive asynchronous-read structure used by Boost.Asio.
+
+### Unintentional differences (to fix)
+- Stop and watchpoint callbacks previously fabricated a default register context and only logged
+  the reply. They now read the retained active thread and send the matching remote status packet.
+- Packet acknowledgement, checksum rejection, escaping, replies and the initial supported-feature
+  negotiation now use the live backend instead of remaining inert helpers.
+
+### Missing items
+- The complete register, memory, thread, query, breakpoint/watchpoint and `vCont` dispatcher remains
+  interrupted behind the CPU stop/step and Dynarmic watchpoint prerequisites recorded in
+  `PORTING_STATE.md`.
+
+### Binary layout verification
+- N/A for this framing slice; register byte order and architecture-specific XML remain owned by
+  `gdbstub_arch.rs` and will be verified with the resumed command dispatcher.
+
+## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs Eden `src/core/hle/kernel/physical_core.{h,cpp}` debugger halt slice
+
+### Intentional differences
+- Ruzu's host-fiber dispatcher retains the `Arc<KThreadLock>` and JIT pointer in `cpu_manager.rs`,
+  so that coordinator calls narrow `PhysicalCore` methods for the upstream-owned execution and halt
+  decisions rather than holding the Rust thread mutex across guest execution.
+- `exit_running` receives the retained thread owner only when debugging is enabled; it captures the
+  JIT context before `UnlockThread`, matching Eden's `ExitContext` order without dereferencing the
+  raw inner `KThread` outside its mutex.
+- A data abort without a retained watchpoint is logged instead of dereferencing a null pointer. Eden
+  relies on the invariant that only a matched debugger watchpoint emits `DataAbort`.
+
+### Unintentional differences (to fix)
+- Runtime execution previously ignored `StepPending` and always called `RunThread`; a successful
+  step could also be misclassified as an SVC. It now calls `StepThread`, records `StepPerformed`,
+  gives the step priority over simultaneous halt bits, and reports/suspends it when rescheduled.
+- Breakpoint and prefetch-abort paths previously suspended without notifying the live debugger and
+  did not refresh the saved thread context after rewinding. The matching owner now performs Eden's
+  rewind, context save, notification and suspension ordering.
+
+### Missing items
+- A32/A64 Dynarmic callbacks still need to produce and retain matched watchpoints; that prerequisite
+  is recorded in `PORTING_STATE.md` and is required before the data-abort path is complete.
+
+### Binary layout verification
+- N/A: this slice changes host execution ordering and retained thread state only.
+
+## 2026-08-22 — `src/core/src/cpu_manager.rs` delegation vs Eden `src/core/hle/kernel/physical_core.cpp`
+
+### Intentional differences
+- Ruzu's CPU manager owns the fiber boundary and cached per-core JIT pointers. It therefore invokes
+  the corresponding `PhysicalCore` decisions before/after the JIT call; the behavioral logic and
+  ordering remain in `physical_core.rs`, matching upstream ownership as closely as the fiber model
+  permits.
+
+### Unintentional differences (to fix)
+- The coordinator formerly classified breakpoint/data/prefetch halts itself and omitted the step
+  state and debugger notifications. It now delegates those decisions and reschedules only after
+  `PhysicalCore` has requested the upstream debug suspension.
+
+### Missing items
+- None in the CPU-manager delegation for the reviewed debugger halt slice.
+
+### Binary layout verification
+- N/A: no serialized or guest-visible layout changes.
+
+## 2026-08-22 — `src/core/src/memory/memory.rs` vs Eden `src/core/memory.{h,cpp}` debugger-page marking
+
+### Intentional differences
+- Rust receives the process address as its underlying `u64`; the page-table bridge already uses raw
+  virtual addresses throughout, while preserving Eden's address-space validation and page walk.
+
+### Unintentional differences (to fix)
+- `Memory::MarkRegionDebug` was absent. Watchpoint pages now lose fastmem access, transition from
+  `Memory` to `DebugMemory`, and recover their biased host pointer when the last debug reference is
+  removed, in Eden's protection-before-page-transition order.
+
+### Missing items
+- None for `MarkRegionDebug`.
+
+### Binary layout verification
+- N/A: this changes page-table entry state but introduces no serialized structure.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` watchpoint ownership
+
+### Intentional differences
+- Rust's optional `Arc<Mutex<Memory>>` replaces Eden's directly owned `Memory`; initialized runtime
+  processes always have it, while isolated `KProcess::new()` tests can still exercise table and
+  reference-count behavior without a system memory owner.
+
+### Unintentional differences (to fix)
+- `DebugWatchpoint` stored its type as an untyped byte and insert/remove changed only the table.
+  The field now uses the owning bitflag type, and both operations apply Eden's per-page reference
+  counting and `MarkRegionDebug` calls for overlapping watchpoints.
+
+### Missing items
+- None for the reviewed watchpoint table and page-reference slice.
+
+### Binary layout verification
+- PASS: replacing the raw `u8` with a `u8`-backed bitflag preserves the field's size and alignment;
+  focused assertions verify the 24-byte size and 8-byte alignment of the host structure.
+
+## 2026-08-22 — `src/core/src/arm/arm_interface.rs` vs Eden `src/core/arm/arm_interface.{h,cpp}` watchpoints
+
+### Intentional differences
+- Rust JIT callbacks are moved owners rather than C++ objects retaining a parent reference. The
+  process-array pointer therefore lives in a shared atomic slot, and a match is copied out instead
+  of returning a reference whose lifetime cannot cross the callback mutex boundary.
+
+### Unintentional differences (to fix)
+- The interface previously duplicated the kernel watchpoint type with primitive addresses and did
+  not expose `SetWatchpointArray` through every backend. It now consumes the `k_process.rs` owner and
+  applies Eden's half-open range and access-bit matching literally.
+
+### Missing items
+- None for the reviewed watchpoint-array and matching slice.
+
+### Binary layout verification
+- N/A: the shared atomic pointer is host callback state; the process-owned watchpoint layout is
+  verified in `k_process.rs`.
+
+## 2026-08-22 — `src/core/src/arm/dynarmic/arm_dynarmic_32.rs` vs Eden `src/core/arm/dynarmic/arm_dynarmic_32.{h,cpp}` watchpoint callbacks
+
+### Intentional differences
+- The callback shares halted-watchpoint state with its Rust JIT owner through `Arc<Mutex<_>>` and
+  invokes the existing Rust JIT halt bridge. Rust-only exclusive-read/128-bit callback extensions
+  perform the same access check before their underlying memory operation.
+
+### Unintentional differences (to fix)
+- `CheckMemoryAccess` previously returned unconditionally and the halt translation discarded
+  Dynarmic's memory-abort bit. Address validation, read/write matching, retained watchpoint state,
+  prefetch/data-abort halts and exclusive-access ordering now match Eden.
+
+### Missing items
+- None for the reviewed A32 memory-access/watchpoint slice.
+
+### Binary layout verification
+- N/A: callback and halt state are host-only.
+
+## 2026-08-22 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs` vs Eden `src/core/arm/dynarmic/arm_dynarmic_64.{h,cpp}` watchpoint callbacks
+
+### Intentional differences
+- The moved Rust callback uses a shared watchpoint-array pointer and mutex-protected copied match in
+  place of Eden's parent reference and raw matched pointer; ownership and halt timing are preserved.
+
+### Unintentional differences (to fix)
+- `CheckMemoryAccess` previously returned unconditionally. It now derives Eden's exact enable state,
+  validates addresses, distinguishes read/write watchpoints, retains the match and prevents writes
+  after requesting the corresponding prefetch/data-abort halt.
+
+### Missing items
+- None for the reviewed A64 memory-access/watchpoint slice.
+
+### Binary layout verification
+- N/A: callback and halt state are host-only.
+
+## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs Eden `src/core/hle/kernel/physical_core.cpp` watchpoint loading
+
+### Intentional differences
+- Rust passes the address of the stable process-owned array while holding the process lock; Eden
+  obtains the same array through `GetWatchpoints()`.
+
+### Unintentional differences (to fix)
+- `LoadContext` previously omitted `SetWatchpointArray`, and the data-abort path converted from a
+  duplicate ARM watchpoint representation. It now wires the process owner after context/TLS setup
+  and forwards that exact typed watchpoint to the debugger.
+
+### Missing items
+- None for the reviewed load-context/data-abort watchpoint slice.
+
+### Binary layout verification
+- N/A: this is host lifecycle wiring.
+
+## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` vs Eden `src/core/debugger/gdbstub.cpp` typed watchpoint reply
+
+### Intentional differences
+- None in the reviewed watchpoint classification.
+
+### Unintentional differences (to fix)
+- The reply path previously reconstructed a watchpoint type from an untyped byte. It now matches the
+  owning kernel bitflag directly when selecting `rwatch`, `watch`, or `awatch`.
+
+### Missing items
+- The command dispatcher remains the next warning-driven slice recorded in `PORTING_STATE.md`.
+
+### Binary layout verification
+- N/A: this formats a remote-protocol reply and introduces no payload structure.
+
+## 2026-08-22 — `src/core/src/arm/debug.rs` vs Eden `src/core/arm/debug.{h,cpp}` module discovery
+
+### Intentional differences
+- Rust page-table queries return `Option` and are asserted with `expect` where Eden uses `R_ASSERT`.
+  Isolated tests can read the process-memory fallback when the runtime `Memory` bridge is absent.
+- Module path bytes are converted lossily to Rust UTF-8 strings; valid UTF-8 and ASCII paths retain
+  Eden's exact basename and declared-length behavior.
+
+### Unintentional differences (to fix)
+- `FindModules`, `GetModuleEnd` and the no-module entrypoint fallback previously returned empty or
+  placeholder values. They now reproduce Eden's complete region walk, state/permission checks,
+  module-path record parsing, three-segment end calculation and code-region fallback.
+- The file previously invented opaque process/thread types and duplicated an empty module walker for
+  symbolication. It now uses the owning kernel types and the single upstream-equivalent function.
+
+### Missing items
+- Existing backtrace symbol names are still not resolved/demangled because Ruzu has no counterpart
+  for Eden `common/demangle.{h,cpp}`; this is independent of the GDB module-enumeration prerequisite.
+
+### Binary layout verification
+- PASS: the module path record is decoded as upstream's `u32`, `s32`, and 0x200-byte path in its
+  exact 0x208-byte little-endian layout; focused coverage reads a real record from process memory.
+
+## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` vs Eden `src/core/debugger/gdbstub.{h,cpp}` command dispatcher
+
+### Intentional differences
+- Eden retains its backend, `System` and process as raw references. Rust receives the backend per
+  callback, retains the process as `Arc<ProcessLock>`, and uses `Arc<KThreadLock>` for selected and
+  resumed threads; pointer identity preserves Eden's `vCont` matching semantics.
+- Eden's synchronous `ProcessData` reads from the socket until a packet is complete. Ruzu's
+  asynchronous connection owner delivers fragments through `ClientData`, so an incomplete packet
+  remains buffered until the next callback instead of blocking the debugger thread.
+- Runtime Rust processes expose `Memory` through `Option<Arc<Mutex<_>>>`; missing memory and missing
+  active threads return `E01` instead of dereferencing an invalid owner. Valid runtime paths retain
+  Eden's command behavior and ordering.
+- Rust rejects a malformed `M` packet whose decoded byte vector is shorter than its declared size,
+  avoiding the out-of-bounds source read possible in the C++ expression while preserving every
+  valid packet.
+
+### Unintentional differences (to fix)
+- The stub previously implemented only stop status, `qSupported`, kill, continue and step. It now
+  ports Eden's complete register/memory dispatch, instruction restoration, software breakpoint and
+  watchpoint lifecycle, query transfers, `vCont`, monitor output, pagination and escaping.
+- Breakpoint removal now writes the saved instruction, invalidates the instruction cache, and only
+  then erases the saved entry, matching Eden's lifecycle order.
+
+### Missing items
+- None in the reviewed GDB stub command and query surface.
+
+### Binary layout verification
+- N/A: the GDB remote protocol serializes explicit text and hexadecimal byte streams rather than
+  raw host structures.
+
+## 2026-08-23 — `src/shader_recompiler/src/frontend/mod.rs` tests vs Eden `src/shader_recompiler/frontend/maxwell/{decode.cpp,maxwell.inc}`
+
+### Intentional differences
+- Ruzu keeps native Rust decoder smoke tests in the module root; Eden's C++ test tree is excluded
+  from the port, while the tested instruction words come directly from Eden's Maxwell table.
+
+### Unintentional differences (to fix)
+- The NOP and register-IADD instruction builders were unused, and the NOP test only checked that
+  decoding did not panic. Both encodings now assert Eden's exact decoded opcode.
+
+### Missing items
+- None for the two reviewed decoder encodings.
+
+### Binary layout verification
+- N/A: the tests pass explicit 64-bit Maxwell instruction words to the decoder.

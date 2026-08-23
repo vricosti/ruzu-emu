@@ -166,14 +166,12 @@ impl Default for KEvent {
 mod tests {
     use super::*;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
-    use crate::hle::kernel::k_scheduler::KScheduler;
 
     #[test]
     fn signal_clear_signal_roundtrip_uses_same_readable_event() {
         let mut process = KProcess::new();
         process.global_scheduler_context =
             Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
-        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
 
         let readable_id = 123;
         let event_id = 456;

@@ -611,7 +611,7 @@ mod tests {
             guard.set_timer_task_time(second_deadline);
         }
         {
-            let mut gsc_guard = gsc.lock().unwrap();
+            let gsc_guard = gsc.lock().unwrap();
             gsc_guard.add_thread(Arc::clone(&waiter1));
             gsc_guard.add_thread(Arc::clone(&waiter2));
         }

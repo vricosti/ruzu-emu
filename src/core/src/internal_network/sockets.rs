@@ -126,7 +126,7 @@ fn get_last_error() -> Errno {
     let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     match err {
         0 => Errno::Success,
-        libc::EWOULDBLOCK | libc::EAGAIN => Errno::Again,
+        value if value == libc::EWOULDBLOCK || value == libc::EAGAIN => Errno::Again,
         libc::EMFILE => Errno::Mfile,
         libc::ECONNREFUSED => Errno::Connrefused,
         libc::ECONNRESET => Errno::Connreset,

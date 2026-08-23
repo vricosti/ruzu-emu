@@ -1388,15 +1388,17 @@ pub fn emit_a32_dmb(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _
     ra.asm.mfence().unwrap();
 }
 
-/// A32InstructionSynchronizationBarrier: emit nothing (matches upstream default).
-///
-/// Upstream `A32EmitX64::EmitA32InstructionSynchronizationBarrier` early-exits
-/// when `conf.hook_isb == false` (the default). When enabled it would call a
-/// user-supplied `InstructionSynchronizationBarrierRaised` callback. We don't
-/// expose `hook_isb` (and ruzu doesn't need it), so emit nothing — ARM ISB is
-/// a pipeline-sync, not a memory-ordering primitive, and x86 architecturally
-/// flushes the pipeline at every interrupt/branch.
-pub fn emit_a32_isb(_ctx: &EmitContext, _ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {}
+/// A32InstructionSynchronizationBarrier: invoke the configured user callback.
+pub fn emit_a32_isb(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
+    if !ctx.config.memory.hook_isb {
+        return;
+    }
+    ctx.config
+        .callbacks
+        .instruction_synchronization_barrier
+        .emit_call_simple(&mut *ra.asm)
+        .unwrap();
+}
 
 // ---------------------------------------------------------------------------
 // Memory operations (delegate to shared memory callbacks)
@@ -2721,6 +2723,7 @@ mod tests {
                 exception_raised: cb(),
                 data_cache_operation: cb(),
                 instruction_cache_operation: cb(),
+                instruction_synchronization_barrier: cb(),
                 add_ticks: cb(),
                 get_ticks_remaining: cb(),
                 exclusive_clear: cb(),

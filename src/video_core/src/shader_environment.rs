@@ -1146,26 +1146,25 @@ impl ComputeEnvironment {
 
     #[cfg(test)]
     fn qmd_for_test(&self) -> Option<(u32, [ConstBufferConfig; 8], u64, u32, bool)> {
-        unsafe { self.kepler_compute.as_ref() }
-            .map(|kepler_compute| {
-                let qmd = kepler_compute.launch_description();
-                (
-                    qmd.const_buffer_enable_mask,
-                    qmd.const_buffers,
-                    kepler_compute.tic_address(),
-                    kepler_compute.tic_limit(),
-                    qmd.linked_tsc,
-                )
-            })
-            .or_else(|| {
-                Some((
-                    self.detached_state.const_buffer_enable_mask,
-                    self.detached_state.const_buffers,
-                    self.detached_state.tic_address,
-                    self.detached_state.tic_limit,
-                    self.detached_state.linked_tsc,
-                ))
-            })
+        if !self.kepler_compute.is_null() {
+            let kepler_compute = self.kepler_compute();
+            let qmd = kepler_compute.launch_description();
+            Some((
+                qmd.const_buffer_enable_mask,
+                qmd.const_buffers,
+                kepler_compute.tic_address(),
+                kepler_compute.tic_limit(),
+                qmd.linked_tsc,
+            ))
+        } else {
+            Some((
+                self.detached_state.const_buffer_enable_mask,
+                self.detached_state.const_buffers,
+                self.detached_state.tic_address,
+                self.detached_state.tic_limit,
+                self.detached_state.linked_tsc,
+            ))
+        }
     }
 
     pub fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
@@ -1295,26 +1294,6 @@ impl ComputeEnvironment {
     /// mutable `GenericEnvironment` base owner.
     pub fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
         &mut self.base
-    }
-
-    #[cfg(test)]
-    fn set_detached_const_buffer_enable_mask(&mut self, enable_mask: u32) {
-        self.detached_state.const_buffer_enable_mask = enable_mask;
-        self.kepler_compute = std::ptr::null();
-    }
-
-    #[cfg(test)]
-    fn set_detached_const_buffer(&mut self, index: usize, cbuf: ConstBufferConfig) {
-        self.detached_state.const_buffers[index] = cbuf;
-        self.kepler_compute = std::ptr::null();
-    }
-
-    #[cfg(test)]
-    fn set_detached_texture_state(&mut self, tic_address: u64, tic_limit: u32, linked_tsc: bool) {
-        self.detached_state.tic_address = tic_address;
-        self.detached_state.tic_limit = tic_limit;
-        self.detached_state.linked_tsc = linked_tsc;
-        self.kepler_compute = std::ptr::null();
     }
 }
 
@@ -1455,7 +1434,7 @@ impl FileEnvironment {
     /// Port of `FileEnvironment::Deserialize`. Reads all fields written by
     /// `GenericEnvironment::Serialize` plus stage-specific trailing fields.
     pub fn deserialize(&mut self, file: &mut std::fs::File) -> std::io::Result<()> {
-        use std::io::Read;
+        use std::io::{Read, Seek};
 
         let read_u32 = |f: &mut std::fs::File| -> std::io::Result<u32> {
             let mut buf = [0u8; 4];
@@ -1482,13 +1461,72 @@ impl FileEnvironment {
         let stage_raw = read_u32(file)?;
         self.stage = deserialize_enum_u32(stage_raw, ShaderStage::VertexA as u32, "ShaderStage")?;
 
-        // Read code words (code_size bytes, rounded up to u64 boundary)
-        let num_words = code_size.div_ceil(8) as usize;
-        self.code.resize(num_words, 0);
-        let code_bytes = unsafe {
-            std::slice::from_raw_parts_mut(self.code.as_mut_ptr() as *mut u8, code_size as usize)
+        let trailing_size = if self.stage == ShaderStage::Compute {
+            4 * std::mem::size_of::<u32>() as u64
+        } else {
+            std::mem::size_of::<ProgramHeader>() as u64
+                + if self.stage == ShaderStage::Geometry {
+                    std::mem::size_of::<[u32; 8]>() as u64
+                } else {
+                    0
+                }
         };
+        let payload_size = code_size
+            .checked_add(num_texture_types.checked_mul(8).ok_or_else(|| {
+                invalid_cache_data("texture-type count overflows the cache entry")
+            })?)
+            .and_then(|size| size.checked_add(num_texture_pixel_formats.checked_mul(8)?))
+            .and_then(|size| size.checked_add(num_cbuf_values.checked_mul(12)?))
+            .and_then(|size| size.checked_add(num_cbuf_replacement_values.checked_mul(12)?))
+            .and_then(|size| size.checked_add(trailing_size))
+            .ok_or_else(|| invalid_cache_data("shader-environment payload size overflows"))?;
+        let position = file.stream_position()?;
+        let remaining = file
+            .metadata()?
+            .len()
+            .checked_sub(position)
+            .ok_or_else(|| invalid_cache_data("cache cursor is past the end of the file"))?;
+        if payload_size > remaining {
+            return Err(invalid_cache_data(format!(
+                "shader-environment payload is {payload_size} bytes with only {remaining} remaining"
+            )));
+        }
+
+        // Read code words (code_size bytes, rounded up to u64 boundary)
+        let code_size = usize::try_from(code_size)
+            .map_err(|_| invalid_cache_data("shader code size does not fit host usize"))?;
+        let num_words = code_size.div_ceil(8);
+        if num_words > isize::MAX as usize / std::mem::size_of::<u64>() {
+            return Err(invalid_cache_data("shader code allocation is too large"));
+        }
+        self.code
+            .try_reserve_exact(num_words)
+            .map_err(|_| invalid_cache_data("shader code allocation is too large"))?;
+        self.code.resize(num_words, 0);
+        let code_bytes =
+            unsafe { std::slice::from_raw_parts_mut(self.code.as_mut_ptr() as *mut u8, code_size) };
         file.read_exact(code_bytes)?;
+
+        let num_texture_types = usize::try_from(num_texture_types)
+            .map_err(|_| invalid_cache_data("texture-type count does not fit host usize"))?;
+        let num_texture_pixel_formats = usize::try_from(num_texture_pixel_formats)
+            .map_err(|_| invalid_cache_data("texture-format count does not fit host usize"))?;
+        let num_cbuf_values = usize::try_from(num_cbuf_values)
+            .map_err(|_| invalid_cache_data("constant-buffer count does not fit host usize"))?;
+        let num_cbuf_replacement_values = usize::try_from(num_cbuf_replacement_values)
+            .map_err(|_| invalid_cache_data("replacement count does not fit host usize"))?;
+        self.texture_types
+            .try_reserve(num_texture_types)
+            .map_err(|_| invalid_cache_data("texture-type allocation is too large"))?;
+        self.texture_pixel_formats
+            .try_reserve(num_texture_pixel_formats)
+            .map_err(|_| invalid_cache_data("texture-format allocation is too large"))?;
+        self.cbuf_values
+            .try_reserve(num_cbuf_values)
+            .map_err(|_| invalid_cache_data("constant-buffer allocation is too large"))?;
+        self.cbuf_replacements
+            .try_reserve(num_cbuf_replacement_values)
+            .map_err(|_| invalid_cache_data("replacement allocation is too large"))?;
 
         for _ in 0..num_texture_types {
             let key = read_u32(file)?;
@@ -1756,6 +1794,11 @@ pub fn serialize_pipeline(
 ) {
     use std::io::Write;
 
+    if envs.is_empty() {
+        log::error!("serialize_pipeline: refusing to write a pipeline without environments");
+        return;
+    }
+
     // All envs must be serializable
     if !envs.iter().all(|e| e.can_be_serialized()) {
         return;
@@ -1879,8 +1922,12 @@ pub fn load_pipelines<'a, FStop>(
     stop_loading: FStop,
     filename: &Path,
     expected_cache_version: u32,
-    mut load_compute: Box<dyn FnMut(&mut std::fs::File, FileEnvironment) + 'a>,
-    mut load_graphics: Box<dyn FnMut(&mut std::fs::File, Vec<FileEnvironment>) + 'a>,
+    mut load_compute: Box<
+        dyn FnMut(&mut std::fs::File, FileEnvironment) -> std::io::Result<()> + 'a,
+    >,
+    mut load_graphics: Box<
+        dyn FnMut(&mut std::fs::File, Vec<FileEnvironment>) -> std::io::Result<()> + 'a,
+    >,
 ) where
     FStop: Fn() -> bool,
 {
@@ -1918,8 +1965,16 @@ pub fn load_pipelines<'a, FStop>(
             let mut buf4 = [0u8; 4];
             file.read_exact(&mut buf4)?;
             let num_envs = u32::from_le_bytes(buf4) as usize;
+            if num_envs == 0 || num_envs > crate::shader_cache::NUM_PROGRAMS {
+                return Err(invalid_cache_data(format!(
+                    "pipeline environment count {num_envs} is outside 1..={}",
+                    crate::shader_cache::NUM_PROGRAMS
+                )));
+            }
 
-            let mut envs: Vec<FileEnvironment> = Vec::with_capacity(num_envs);
+            let mut envs: Vec<FileEnvironment> = Vec::new();
+            envs.try_reserve_exact(num_envs)
+                .map_err(|_| invalid_cache_data("pipeline environment allocation is too large"))?;
             for _ in 0..num_envs {
                 let mut env = FileEnvironment::new();
                 env.deserialize(&mut file)?;
@@ -1930,11 +1985,16 @@ pub fn load_pipelines<'a, FStop>(
                 .first()
                 .is_some_and(|env| env.shader_stage() == ShaderStage::Compute)
             {
+                if envs.len() != 1 {
+                    return Err(invalid_cache_data(
+                        "compute pipeline cache entry has more than one environment",
+                    ));
+                }
                 if let Some(env) = envs.into_iter().next() {
-                    load_compute(&mut file, env);
+                    load_compute(&mut file, env)?;
                 }
             } else {
-                load_graphics(&mut file, envs);
+                load_graphics(&mut file, envs)?;
             }
         }
 
@@ -1970,6 +2030,10 @@ pub fn load_pipelines<'a, FStop>(
             );
         }
     }
+}
+
+fn invalid_cache_data(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
 fn convert_texture_type(entry: &TicEntry) -> TextureType {
@@ -2156,18 +2220,6 @@ mod tests {
             }
         });
         (reader, log)
-    }
-
-    fn make_mapped_memory_manager(
-        gpu_base: u64,
-        cpu_base: u64,
-        size: u64,
-    ) -> Arc<ParkingLotMutex<MemoryManager>> {
-        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(gpu_base, cpu_base, size, 0, false);
-        memory_manager
     }
 
     fn make_owner_backed_memory_manager(
@@ -2735,10 +2787,12 @@ mod tests {
                 assert_eq!(env.shader_stage(), ShaderStage::Compute);
                 assert_eq!(read_test_cache_key(file, 4), b"test");
                 compute_calls_clone.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             }),
             Box::new(move |file, _| {
                 let _ = read_test_cache_key(file, 4);
                 graphics_calls_clone.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             }),
         );
 
@@ -2758,7 +2812,13 @@ mod tests {
             .expect("write version");
         drop(file);
 
-        load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(())),
+        );
 
         assert!(!path.exists());
     }
@@ -2777,7 +2837,13 @@ mod tests {
             .expect("write partial code size");
         drop(file);
 
-        load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(())),
+        );
 
         assert!(!path.exists());
     }
@@ -2807,7 +2873,96 @@ mod tests {
             .expect("overwrite stage discriminant");
         drop(file);
 
-        load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(())),
+        );
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_pipelines_deletes_zero_environment_entry() {
+        use std::io::Write;
+
+        let path = make_test_cache_path("zero-environments");
+        let mut file = std::fs::File::create(&path).expect("create invalid cache");
+        file.write_all(&MAGIC_NUMBER).expect("write magic");
+        file.write_all(&7u32.to_le_bytes()).expect("write version");
+        file.write_all(&0u32.to_le_bytes())
+            .expect("write empty environment count");
+        file.write_all(&[0; 512]).expect("write stale cache key");
+        drop(file);
+
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(())),
+        );
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_pipelines_rejects_oversized_environment_count_before_allocating() {
+        use std::io::Write;
+
+        let path = make_test_cache_path("oversized-environment-count");
+        let mut file = std::fs::File::create(&path).expect("create invalid cache");
+        file.write_all(&MAGIC_NUMBER).expect("write magic");
+        file.write_all(&7u32.to_le_bytes()).expect("write version");
+        file.write_all(&u32::MAX.to_le_bytes())
+            .expect("write oversized environment count");
+        drop(file);
+
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(())),
+        );
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_pipelines_rejects_oversized_shader_payload_before_allocating() {
+        use std::io::Write;
+
+        let path = make_test_cache_path("oversized-shader-payload");
+        let mut file = std::fs::File::create(&path).expect("create invalid cache");
+        file.write_all(&MAGIC_NUMBER).expect("write magic");
+        file.write_all(&7u32.to_le_bytes()).expect("write version");
+        file.write_all(&1u32.to_le_bytes())
+            .expect("write environment count");
+        file.write_all(&u64::MAX.to_le_bytes())
+            .expect("write oversized code size");
+        file.write_all(&[0; 60])
+            .expect("write remainder of environment header");
+        drop(file);
+
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(|_, _| Ok(())),
+            Box::new(|_, _| Ok(())),
+        );
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn serialize_pipeline_does_not_write_empty_environment_entries() {
+        let path = make_test_cache_path("empty-serialization");
+
+        serialize_pipeline(b"key", &[], &path, 7);
 
         assert!(!path.exists());
     }

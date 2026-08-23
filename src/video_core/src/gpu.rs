@@ -161,9 +161,8 @@ pub struct Gpu {
     rasterizer: Mutex<Option<RasterizerHandle>>,
 
     /// GPU channel scheduler.
-    /// Upstream: `std::unique_ptr<Tegra::Control::Scheduler> scheduler` in GPU::Impl.
-    /// Initialized after Gpu is constructed (needs self-referential pointer).
-    scheduler: Mutex<Option<Box<crate::control::scheduler::Scheduler>>>,
+    /// Upstream: `Tegra::Control::Scheduler scheduler` in GPU::Impl.
+    scheduler: crate::control::scheduler::Scheduler,
 
     /// GPU command thread manager.
     /// Upstream: `VideoCommon::GPUThread::ThreadManager gpu_thread` in GPU::Impl.
@@ -221,7 +220,7 @@ impl Gpu {
             renderer: Mutex::new(None),
             shader_notify: ShaderNotify::new(),
             rasterizer: Mutex::new(None),
-            scheduler: Mutex::new(None),
+            scheduler: crate::control::scheduler::Scheduler::new(),
             gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(
                 SystemRef::null(),
                 is_async,
@@ -240,17 +239,6 @@ impl Gpu {
 
     pub fn system_ref(&self) -> SystemRef {
         *self.system.lock().unwrap()
-    }
-
-    /// Initialize the scheduler. Must be called after Gpu is placed at its
-    /// final address (the scheduler stores a raw pointer back to the Gpu).
-    ///
-    /// Upstream creates the scheduler in the GPU::Impl constructor:
-    ///   `scheduler{std::make_unique<Control::Scheduler>(gpu)}`
-    /// We defer it because Rust cannot take `&self` in the constructor.
-    pub fn init_scheduler(&self) {
-        let scheduler = unsafe { crate::control::scheduler::Scheduler::new(self as *const Gpu) };
-        *self.scheduler.lock().unwrap() = Some(Box::new(scheduler));
     }
 
     /// Binds a renderer to the GPU.
@@ -488,9 +476,7 @@ impl Gpu {
             .insert(channel_id, channel_state.clone());
 
         // Register with scheduler.
-        if let Some(ref mut scheduler) = *self.scheduler.lock().unwrap() {
-            scheduler.declare_channel(channel_state.clone());
-        }
+        self.scheduler.declare_channel(channel_state.clone());
 
         channel_state
     }
@@ -666,11 +652,6 @@ impl Gpu {
     pub fn start(&self) {
         settings::update_gpu_accuracy(&mut settings::values_mut());
 
-        // Initialize scheduler if not already done.
-        if self.scheduler.lock().unwrap().is_none() {
-            self.init_scheduler();
-        }
-
         let mut renderer_guard = self.renderer.lock().unwrap();
         if let Some(ref mut renderer) = *renderer_guard {
             log::info!("Gpu::start: GPU started (renderer bound, starting GPU thread)");
@@ -678,12 +659,7 @@ impl Gpu {
             let gpu_ptr = self as *const Gpu;
             let renderer_ptr = renderer.as_mut() as *mut dyn RendererBase;
             let context_ptr = renderer.context_ptr();
-            let scheduler_guard = self.scheduler.lock().unwrap();
-            let scheduler_ptr = scheduler_guard
-                .as_ref()
-                .map(|s| s.as_ref() as *const crate::control::scheduler::Scheduler)
-                .unwrap_or(std::ptr::null());
-            drop(scheduler_guard);
+            let scheduler_ptr = &self.scheduler as *const crate::control::scheduler::Scheduler;
             drop(renderer_guard);
             // Safety: Gpu, renderer, and scheduler outlive the ThreadManager.
             unsafe {

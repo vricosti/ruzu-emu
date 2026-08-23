@@ -22,7 +22,9 @@ use super::settings_types::*;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
-use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
+use crate::hle::service::psc::time::common::{
+    LocationName, SteadyClockTimePoint, SystemClockContext,
+};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Settings file version, matching upstream SETTINGS_VERSION.
@@ -1176,6 +1178,46 @@ pub struct SystemSettingsService {
 impl SystemSettingsService {
     pub fn new() -> Self {
         Self::new_with_inner(ISystemSettingsServer::new())
+    }
+
+    /// Direct service-to-service counterpart of
+    /// `ISystemSettingsServer::GetDeviceTimeZoneLocationName`.
+    pub fn get_device_time_zone_location_name(&self) -> LocationName {
+        self.inner
+            .lock()
+            .unwrap()
+            .get_device_time_zone_location_name()
+    }
+
+    /// Direct service-to-service counterpart of
+    /// `ISystemSettingsServer::SetDeviceTimeZoneLocationName`.
+    pub fn set_device_time_zone_location_name(&self, name: LocationName) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_device_time_zone_location_name(name);
+    }
+
+    /// Direct service-to-service counterpart of
+    /// `ISystemSettingsServer::GetDeviceTimeZoneLocationUpdatedTime`.
+    pub fn get_device_time_zone_location_updated_time(&self) -> SteadyClockTimePoint {
+        steady_clock_time_point_from_bytes(
+            self.inner
+                .lock()
+                .unwrap()
+                .get_device_time_zone_location_updated_time(),
+        )
+    }
+
+    /// Direct service-to-service counterpart of
+    /// `ISystemSettingsServer::SetDeviceTimeZoneLocationUpdatedTime`.
+    pub fn set_device_time_zone_location_updated_time(&self, time_point: SteadyClockTimePoint) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_device_time_zone_location_updated_time(steady_clock_time_point_to_bytes(
+                time_point,
+            ));
     }
 
     fn new_with_inner(inner: ISystemSettingsServer) -> Self {
@@ -3060,6 +3102,26 @@ mod tests {
         let mut server = ISystemSettingsServer::new_for_test();
         server.set_color_set_id(ColorSet::BasicBlack as u32);
         assert_eq!(server.get_color_set_id(), ColorSet::BasicBlack as u32);
+    }
+
+    #[test]
+    fn direct_timezone_setters_preserve_typed_payloads() {
+        let service = SystemSettingsService::new_for_test();
+        let mut name = [0u8; 0x24];
+        name[..7].copy_from_slice(b"Etc/GMT");
+        let time_point = SteadyClockTimePoint {
+            time_point: -0x1234_5678,
+            clock_source_id: *b"homebrew-clock!!",
+        };
+
+        service.set_device_time_zone_location_name(name);
+        service.set_device_time_zone_location_updated_time(time_point);
+
+        assert_eq!(service.get_device_time_zone_location_name(), name);
+        assert_eq!(
+            service.get_device_time_zone_location_updated_time(),
+            time_point
+        );
     }
 
     #[test]

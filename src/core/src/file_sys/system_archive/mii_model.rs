@@ -75,7 +75,6 @@ pub fn mii_model() -> Option<VirtualDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_sys::vfs::vfs::VfsDirectory;
 
     #[test]
     fn test_mii_model_has_six_files() {

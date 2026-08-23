@@ -1226,32 +1226,20 @@ impl PipelineCache {
         let loaded_compute: RefCell<Vec<(ComputePipelineCacheKey, FileEnvironment)>> =
             RefCell::new(Vec::new());
         let load_compute = |file: &mut std::fs::File, env: FileEnvironment| {
-            match ComputePipelineCacheKey::read_from_file(file) {
-                Ok(key) => {
-                    loaded_compute.borrow_mut().push((key, env));
-                }
-                Err(err) => {
-                    skipped.set(skipped.get() + 1);
-                    log::warn!("Failed to read cached compute pipeline key: {}", err);
-                }
-            }
+            let key = ComputePipelineCacheKey::read_from_file(file)?;
+            loaded_compute.borrow_mut().push((key, env));
+            Ok(())
         };
         let loaded_graphics: RefCell<Vec<(GraphicsPipelineKey, Vec<FileEnvironment>)>> =
             RefCell::new(Vec::new());
         let load_graphics = |file: &mut std::fs::File, envs: Vec<FileEnvironment>| {
-            match GraphicsPipelineKey::read_from_file(file) {
-                Ok(key) => {
-                    if !graphics_key_dynamic_features_match(&key, &dynamic_features) {
-                        skipped.set(skipped.get() + 1);
-                        return;
-                    }
-                    loaded_graphics.borrow_mut().push((key, envs));
-                }
-                Err(err) => {
-                    skipped.set(skipped.get() + 1);
-                    log::warn!("Failed to read cached graphics pipeline key: {}", err);
-                }
+            let key = GraphicsPipelineKey::read_from_file(file)?;
+            if !graphics_key_dynamic_features_match(&key, &dynamic_features) {
+                skipped.set(skipped.get() + 1);
+                return Ok(());
             }
+            loaded_graphics.borrow_mut().push((key, envs));
+            Ok(())
         };
         load_pipelines(
             || stop_loading.load(Ordering::Acquire),

@@ -23,7 +23,7 @@ use super::physical_core_log;
 use super::{
     k_process::KProcess,
     k_scheduler::KScheduler,
-    k_thread::{KThread, KThreadLock},
+    k_thread::{KThread, KThreadLock, StepState, SuspendType},
 };
 
 static ZERO_PC_SAVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -134,6 +134,107 @@ impl PhysicalCore {
     ) -> PhysicalCoreExecutionEvent {
         let halt_reason = jit.run_thread(thread);
         self.event_from_halt(jit, halt_reason)
+    }
+
+    /// Execute the active process thread with Eden's debugger step-state
+    /// ordering from `PhysicalCore::RunThread`.
+    pub fn run_thread_with_step_state(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread: &mut OpaqueKThread,
+        thread_owner: &Arc<KThreadLock>,
+    ) -> PhysicalCoreExecutionEvent {
+        let step_pending = thread_owner.lock().unwrap().get_step_state() == StepState::StepPending;
+        let halt_reason = if step_pending {
+            jit.step_thread(thread)
+        } else {
+            jit.run_thread(thread)
+        };
+
+        if step_pending && halt_reason.contains(HaltReason::STEP_THREAD) {
+            thread_owner
+                .lock()
+                .unwrap()
+                .set_step_state(StepState::StepPerformed);
+            // A completed step takes priority over every simultaneous halt
+            // reason, including SVC and breakpoint.
+            PhysicalCoreExecutionEvent::Halted(halt_reason)
+        } else {
+            self.event_from_halt(jit, halt_reason)
+        }
+    }
+
+    /// Notify and suspend a thread whose previous single-step completed.
+    /// This runs before entering the JIT when the thread is scheduled again.
+    pub fn stop_after_completed_step(&self, system: &System, thread: &Arc<KThreadLock>) -> bool {
+        if thread.lock().unwrap().get_step_state() != StepState::StepPerformed {
+            return false;
+        }
+
+        system.notify_debugger_thread_stopped(Arc::clone(thread));
+        thread.lock().unwrap().request_suspend(SuspendType::Debug);
+        true
+    }
+
+    /// Apply Eden's step-priority rule to halt-reason classification.
+    pub fn step_completed(&self, halt_reason: HaltReason, thread: &Arc<KThreadLock>) -> bool {
+        halt_reason.contains(HaltReason::STEP_THREAD)
+            && thread.lock().unwrap().get_step_state() == StepState::StepPerformed
+    }
+
+    /// Handle breakpoint, prefetch-abort and data-abort debugger stops.
+    /// Returns true when the thread was suspended and execution must return to
+    /// the scheduler.
+    pub fn handle_debug_halt(
+        &self,
+        jit: &mut dyn ArmInterface,
+        halt_reason: HaltReason,
+        thread: &Arc<KThreadLock>,
+        process: &Arc<ProcessLock>,
+        system: &System,
+    ) -> bool {
+        let step_completed = self.step_completed(halt_reason, thread);
+        let breakpoint =
+            !step_completed && halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
+        let prefetch_abort = !step_completed && halt_reason.contains(HaltReason::PREFETCH_ABORT);
+        let data_abort = !step_completed && halt_reason.contains(HaltReason::DATA_ABORT);
+
+        if breakpoint || prefetch_abort {
+            if breakpoint {
+                jit.rewind_breakpoint_instruction();
+                self.capture_debug_context(jit, thread);
+            }
+            if system.debugger_enabled() {
+                system.notify_debugger_thread_stopped(Arc::clone(thread));
+            } else {
+                let mut context = ThreadContext::default();
+                jit.get_context(&mut context);
+                crate::arm::arm_interface::ArmInterfaceBase::new(false)
+                    .log_backtrace(&process.lock().unwrap(), &context);
+            }
+            thread.lock().unwrap().request_suspend(SuspendType::Debug);
+            return true;
+        }
+
+        if data_abort {
+            if system.debugger_enabled() {
+                if let Some(watchpoint) = jit.halted_watchpoint() {
+                    system.notify_debugger_thread_watchpoint(Arc::clone(thread), watchpoint);
+                } else {
+                    log::error!("Dynarmic reported a data abort without a halted watchpoint");
+                }
+            }
+            thread.lock().unwrap().request_suspend(SuspendType::Debug);
+            return true;
+        }
+
+        false
+    }
+
+    fn capture_debug_context(&self, jit: &dyn ArmInterface, thread: &Arc<KThreadLock>) {
+        let mut context = ThreadContext::default();
+        jit.get_context(&mut context);
+        thread.lock().unwrap().capture_guest_context(&context);
     }
 
     pub fn step_thread(
@@ -325,6 +426,7 @@ impl PhysicalCore {
         };
 
         let mut process = parent.lock().unwrap();
+        let watchpoints = std::ptr::addr_of!(process.watchpoints);
         if let Some(jit) = process.get_arm_interface_mut(self.m_core_index) {
             let k_ctx = &thread.thread_context;
             // Safety: both ThreadContext types have identical layout.
@@ -334,6 +436,7 @@ impl PhysicalCore {
             };
             jit.set_context(arm_ctx);
             jit.set_tpidrro_el0(thread.get_tls_address().get());
+            jit.set_watchpoint_array(watchpoints);
             trace_wrapper_context_event(3, self.m_core_index, thread, arm_ctx);
             log::info!(
                 "PhysicalCore::load_context: core={} r15/PC=0x{:X} r13/SP=0x{:X} ctx.pc=0x{:X} ctx.sp=0x{:X}",
@@ -506,7 +609,14 @@ impl PhysicalCore {
         &self,
         arm_interface: *mut dyn crate::arm::arm_interface::ArmInterface,
         thread: *mut KThread,
+        debug_thread: Option<&Arc<KThreadLock>>,
     ) {
+        if let Some(debug_thread) = debug_thread {
+            unsafe {
+                self.capture_debug_context(&*arm_interface, debug_thread);
+            }
+        }
+
         unsafe {
             let thread_as_arm = &mut *(thread as *mut crate::arm::arm_interface::KThread);
             (*arm_interface).unlock_thread(thread_as_arm);
@@ -670,7 +780,9 @@ fn is_animus_sdk_thread_wrapper_context(pc: u64, lr: u64) -> bool {
 mod tests {
     use std::collections::VecDeque;
 
-    use crate::arm::arm_interface::{Architecture, DebugWatchpoint, KThread as OpaqueKThread};
+    use crate::arm::arm_interface::{
+        Architecture, DebugWatchpoint, KThread as OpaqueKThread, WatchpointArray,
+    };
     use crate::core::System;
     use crate::hle::kernel::k_thread::ThreadState;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
@@ -682,6 +794,9 @@ mod tests {
         context: ThreadContext,
         tpidrro_el0: u64,
         set_svc_arguments_count: usize,
+        run_count: usize,
+        step_count: usize,
+        rewind_count: usize,
     }
 
     impl TestArmInterface {
@@ -691,19 +806,26 @@ mod tests {
                 context: ThreadContext::default(),
                 tpidrro_el0: 0,
                 set_svc_arguments_count: 0,
+                run_count: 0,
+                step_count: 0,
+                rewind_count: 0,
             }
         }
     }
 
     impl ArmInterface for TestArmInterface {
         fn run_thread(&mut self, _thread: &mut OpaqueKThread) -> HaltReason {
+            self.run_count += 1;
             self.halt_reasons
                 .pop_front()
                 .unwrap_or(HaltReason::BREAK_LOOP)
         }
 
-        fn step_thread(&mut self, thread: &mut OpaqueKThread) -> HaltReason {
-            self.run_thread(thread)
+        fn step_thread(&mut self, _thread: &mut OpaqueKThread) -> HaltReason {
+            self.step_count += 1;
+            self.halt_reasons
+                .pop_front()
+                .unwrap_or(HaltReason::BREAK_LOOP)
         }
 
         fn clear_instruction_cache(&mut self) {}
@@ -726,6 +848,8 @@ mod tests {
             self.tpidrro_el0 = value;
         }
 
+        fn set_watchpoint_array(&mut self, _watchpoints: *const WatchpointArray) {}
+
         fn get_svc_arguments(&self, args: &mut [u64; 8]) {
             *args = [0; 8];
         }
@@ -740,11 +864,13 @@ mod tests {
 
         fn signal_interrupt(&mut self, _thread: &mut OpaqueKThread) {}
 
-        fn halted_watchpoint(&self) -> Option<&DebugWatchpoint> {
+        fn halted_watchpoint(&self) -> Option<DebugWatchpoint> {
             None
         }
 
-        fn rewind_breakpoint_instruction(&mut self) {}
+        fn rewind_breakpoint_instruction(&mut self) {
+            self.rewind_count += 1;
+        }
     }
 
     fn test_context() -> (
@@ -850,6 +976,81 @@ mod tests {
         let thread = current_thread.lock().unwrap();
         assert_eq!(thread.get_state(), ThreadState::TERMINATED);
         assert!(thread.is_signaled());
+    }
+
+    #[test]
+    fn debugger_step_uses_step_thread_and_defers_the_stop_until_rescheduled() {
+        let (physical_core, _process, _scheduler, current_thread, system) = test_context();
+        current_thread
+            .lock()
+            .unwrap()
+            .set_step_state(StepState::StepPending);
+        let mut jit = TestArmInterface::new(VecDeque::from([
+            HaltReason::STEP_THREAD | HaltReason::SUPERVISOR_CALL
+        ]));
+        let mut opaque_thread = unsafe { std::mem::zeroed::<OpaqueKThread>() };
+
+        let event =
+            physical_core.run_thread_with_step_state(&mut jit, &mut opaque_thread, &current_thread);
+
+        assert!(matches!(
+            event,
+            PhysicalCoreExecutionEvent::Halted(reason)
+                if reason.contains(HaltReason::STEP_THREAD)
+        ));
+        assert_eq!(jit.run_count, 0);
+        assert_eq!(jit.step_count, 1);
+        assert_eq!(
+            current_thread.lock().unwrap().get_step_state(),
+            StepState::StepPerformed
+        );
+        assert!(!current_thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(SuspendType::Debug));
+
+        assert!(physical_core.stop_after_completed_step(&system, &current_thread));
+        assert!(current_thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(SuspendType::Debug));
+    }
+
+    #[test]
+    fn breakpoint_rewinds_and_suspends_without_handling_a_simultaneous_step_twice() {
+        let (physical_core, process, _scheduler, current_thread, system) = test_context();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+
+        assert!(physical_core.handle_debug_halt(
+            &mut jit,
+            HaltReason::INSTRUCTION_BREAKPOINT,
+            &current_thread,
+            &process,
+            &system,
+        ));
+        assert_eq!(jit.rewind_count, 1);
+        assert!(current_thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(SuspendType::Debug));
+
+        current_thread.lock().unwrap().resume(SuspendType::Debug);
+        current_thread
+            .lock()
+            .unwrap()
+            .set_step_state(StepState::StepPerformed);
+        assert!(!physical_core.handle_debug_halt(
+            &mut jit,
+            HaltReason::STEP_THREAD | HaltReason::INSTRUCTION_BREAKPOINT,
+            &current_thread,
+            &process,
+            &system,
+        ));
+        assert_eq!(jit.rewind_count, 1);
+        assert!(!current_thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(SuspendType::Debug));
     }
 
     #[test]

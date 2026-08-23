@@ -198,7 +198,7 @@ impl IOlscServiceForSystemService {
     /// Corresponds to `IOlscServiceForSystemService::OpenRemoteStorageController` in upstream.
     pub fn open_remote_storage_controller(&self) -> (ResultCode, IRemoteStorageController) {
         log::info!("IOlscServiceForSystemService::open_remote_storage_controller called");
-        (RESULT_SUCCESS, IRemoteStorageController::new(self.system))
+        (RESULT_SUCCESS, IRemoteStorageController::new())
     }
 
     /// Cmd 2: OpenDaemonController
@@ -244,15 +244,12 @@ impl IOlscServiceForSystemService {
     }
 
     fn open_remote_storage_controller_handler(
-        this: &dyn ServiceFramework,
+        _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
         log::info!("IOlscServiceForSystemService::OpenRemoteStorageController called");
-        let svc = unsafe {
-            &*(this as *const dyn ServiceFramework as *const IOlscServiceForSystemService)
-        };
         let service: std::sync::Arc<dyn SessionRequestHandler> =
-            std::sync::Arc::new(IRemoteStorageController::new(svc.system));
+            std::sync::Arc::new(IRemoteStorageController::new());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(service);

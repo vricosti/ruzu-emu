@@ -10,19 +10,23 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::psc::time::common::{
-    CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
+    CalendarAdditionalInfo, CalendarTime, LocationName, OperationEvent, RuleVersion,
+    SteadyClockTimePoint,
 };
 use crate::hle::service::psc::time::errors::{
-    RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED, RESULT_TIME_ZONE_NOT_FOUND,
+    RESULT_FAILED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED, RESULT_TIME_ZONE_NOT_FOUND,
 };
 use crate::hle::service::psc::time::time_zone::TzRule;
 use crate::hle::service::psc::time::time_zone_service::TimeZoneService as PscTimeZoneService;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::set::system_settings_server::SystemSettingsService;
+use crate::hle::service::sm::sm::ServiceManager;
 
 use super::file_timestamp_worker::FileTimestampWorker;
 use super::time_zone_binary::TimeZoneBinary;
@@ -59,7 +63,8 @@ pub mod commands {
 /// - `m_operation_event` (OperationEvent)
 /// - `m_set_sys` (shared_ptr<Set::ISystemSettingsServer>)
 pub struct TimeZoneService {
-    system: crate::core::SystemRef,
+    /// System settings singleton. Upstream: `m_set_sys`.
+    set_sys: Arc<SystemSettingsService>,
     can_write_timezone_device_location: bool,
     /// Wrapped PSC timezone service. Upstream: `m_wrapped_service`.
     wrapped_service: Mutex<PscTimeZoneService>,
@@ -70,12 +75,36 @@ pub struct TimeZoneService {
     /// Mutex for location changes. Upstream: `m_mutex`.
     mutex: Mutex<()>,
     /// Upstream: `Service::PSC::Time::OperationEvent m_operation_event`.
-    operation_event: Mutex<Option<Arc<Mutex<KReadableEvent>>>>,
+    operation_event: Mutex<Option<OperationEvent>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl TimeZoneService {
+    fn get_set_sys_service_from_handler(
+        set_sys_handler: SessionRequestHandlerPtr,
+    ) -> Arc<SystemSettingsService> {
+        assert!(
+            set_sys_handler.as_any().is::<SystemSettingsService>(),
+            "set:sys is not an ISystemSettingsServer"
+        );
+        unsafe { Arc::from_raw(Arc::into_raw(set_sys_handler) as *const SystemSettingsService) }
+    }
+
+    fn get_set_sys_service(system: crate::core::SystemRef) -> Arc<SystemSettingsService> {
+        assert!(
+            !system.is_null(),
+            "Glue::Time::TimeZoneService requires a live Core::System"
+        );
+        let service_manager = system
+            .get()
+            .service_manager()
+            .expect("Glue::Time::TimeZoneService requires the service manager");
+        let set_sys_handler =
+            ServiceManager::get_service_blocking(&service_manager, system, "set:sys");
+        Self::get_set_sys_service_from_handler(set_sys_handler)
+    }
+
     fn pop_location_name(rp: &mut RequestParser<'_>) -> LocationName {
         let raw_words = rp.pop_raw::<[u32; 9]>();
         unsafe { core::mem::transmute::<[u32; 9], LocationName>(raw_words) }
@@ -159,19 +188,13 @@ impl TimeZoneService {
     pub fn new(system: crate::core::SystemRef, can_write_timezone_device_location: bool) -> Self {
         let mut tz_binary = TimeZoneBinary::new(system);
         let _ = tz_binary.mount();
-        Self {
-            system,
+        Self::with_wrapped_and_set_sys(
             can_write_timezone_device_location,
-            wrapped_service: Mutex::new(PscTimeZoneService::new(
-                can_write_timezone_device_location,
-            )),
-            time_zone_binary: Arc::new(Mutex::new(tz_binary)),
-            file_timestamp_worker: Arc::new(Mutex::new(FileTimestampWorker::new())),
-            mutex: Mutex::new(()),
-            operation_event: Mutex::new(None),
-            handlers: Self::build_handlers(),
-            handlers_tipc: BTreeMap::new(),
-        }
+            PscTimeZoneService::new(can_write_timezone_device_location),
+            Arc::new(Mutex::new(FileTimestampWorker::new())),
+            Arc::new(Mutex::new(tz_binary)),
+            Self::get_set_sys_service(system),
+        )
     }
 
     /// Create with an existing wrapped PSC service and timezone binary.
@@ -182,8 +205,24 @@ impl TimeZoneService {
         file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
         time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
     ) -> Self {
+        Self::with_wrapped_and_set_sys(
+            can_write_timezone_device_location,
+            wrapped_service,
+            file_timestamp_worker,
+            time_zone_binary,
+            Self::get_set_sys_service(system),
+        )
+    }
+
+    fn with_wrapped_and_set_sys(
+        can_write_timezone_device_location: bool,
+        wrapped_service: PscTimeZoneService,
+        file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
+        time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
+        set_sys: Arc<SystemSettingsService>,
+    ) -> Self {
         Self {
-            system,
+            set_sys,
             can_write_timezone_device_location,
             wrapped_service: Mutex::new(wrapped_service),
             time_zone_binary,
@@ -237,7 +276,7 @@ impl TimeZoneService {
         };
         drop(tz_binary);
 
-        let mut wrapped = self.wrapped_service.lock().unwrap();
+        let wrapped = self.wrapped_service.lock().unwrap();
         let rc = wrapped.set_device_location_name_with_time_zone_rule(name, &binary);
         if rc.is_error() {
             return rc;
@@ -248,10 +287,20 @@ impl TimeZoneService {
             .unwrap()
             .set_filesystem_posix_time();
 
-        // Upstream also persists the new location through set:sys. That owner
-        // is not wired here yet.
-        if let Some(readable_event) = self.operation_event.lock().unwrap().as_ref() {
-            let _ = readable_event.lock().unwrap().signal();
+        let (persisted_name, updated_time) =
+            match wrapped.get_device_location_name_and_updated_time() {
+                Ok(values) => values,
+                Err(rc) => return rc,
+            };
+        drop(wrapped);
+
+        self.set_sys
+            .set_device_time_zone_location_name(persisted_name);
+        self.set_sys
+            .set_device_time_zone_location_updated_time(updated_time);
+
+        if let Some(operation_event) = self.operation_event.lock().unwrap().as_ref() {
+            operation_event.signal();
         }
 
         RESULT_SUCCESS
@@ -273,12 +322,15 @@ impl TimeZoneService {
     ///
     /// Corresponds to `TimeZoneService::LoadLocationNameList` in upstream.
     /// Upstream delegates to `m_time_zone_binary.GetTimeZoneLocationList`.
-    pub fn load_location_name_list(&self, index: u32) -> Result<Vec<LocationName>, ResultCode> {
+    pub fn load_location_name_list(
+        &self,
+        index: u32,
+        max_names: usize,
+    ) -> Result<Vec<LocationName>, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::LoadLocationNameList called");
         let _lock = self.mutex.lock().unwrap();
         let mut tz_binary = self.time_zone_binary.lock().unwrap();
-        // Upstream passes out_names.size() as max_names; we use a reasonable default.
-        tz_binary.get_time_zone_location_list(100, index)
+        tz_binary.get_time_zone_location_list(max_names, index)
     }
 
     /// LoadTimeZoneRule (cmd 4).
@@ -328,7 +380,7 @@ impl TimeZoneService {
             .get_device_location_name_and_updated_time()
     }
 
-    /// ToCalendarTime (cmd 20).
+    /// ToCalendarTime (cmd 100).
     ///
     /// Corresponds to `TimeZoneService::ToCalendarTime` in upstream.
     /// Delegates to `m_wrapped_service->ToCalendarTime`.
@@ -344,7 +396,7 @@ impl TimeZoneService {
             .to_calendar_time(time, rule)
     }
 
-    /// ToCalendarTimeWithMyRule (cmd 21).
+    /// ToCalendarTimeWithMyRule (cmd 101).
     ///
     /// Corresponds to `TimeZoneService::ToCalendarTimeWithMyRule` in upstream.
     /// Delegates to `m_wrapped_service->ToCalendarTimeWithMyRule`.
@@ -395,9 +447,10 @@ impl TimeZoneService {
         &self,
         calendar: &CalendarTime,
         rule: &TzRule,
-    ) -> Result<(u32, [i64; 2]), ResultCode> {
+        max_times: usize,
+    ) -> Result<(u32, Vec<i64>), ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::ToPosixTime called");
-        let mut out_times = [0i64; 2];
+        let mut out_times = vec![0i64; max_times];
         let count =
             self.wrapped_service
                 .lock()
@@ -413,9 +466,10 @@ impl TimeZoneService {
     pub fn to_posix_time_with_my_rule(
         &self,
         calendar: &CalendarTime,
-    ) -> Result<(u32, [i64; 2]), ResultCode> {
+        max_times: usize,
+    ) -> Result<(u32, Vec<i64>), ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::ToPosixTimeWithMyRule called");
-        let mut out_times = [0i64; 2];
+        let mut out_times = vec![0i64; max_times];
         let count = self
             .wrapped_service
             .lock()
@@ -431,18 +485,16 @@ impl TimeZoneService {
         log::debug!(
             "Glue::Time::TimeZoneService::GetDeviceLocationNameOperationEventReadableHandle called"
         );
-        let mut operation_event = self.operation_event.lock().unwrap();
-        if let Some(readable_event) = operation_event.as_ref() {
-            return ctx
-                .copy_handle_for_readable_event(Arc::clone(readable_event))
-                .ok_or(crate::hle::service::psc::time::errors::RESULT_FAILED);
-        }
-
-        let Some((handle, readable_event)) = ctx.create_readable_event(false) else {
-            return Err(crate::hle::service::psc::time::errors::RESULT_FAILED);
+        let operation_event = {
+            let mut operation_event = self.operation_event.lock().unwrap();
+            operation_event
+                .get_or_insert_with(OperationEvent::new)
+                .clone()
         };
-        *operation_event = Some(readable_event);
-        Ok(handle)
+        operation_event
+            .get_event()
+            .copy_handle(ctx)
+            .ok_or(RESULT_FAILED)
     }
 
     fn get_device_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -495,7 +547,8 @@ impl TimeZoneService {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let index = rp.pop_u32();
-        match service.load_location_name_list(index) {
+        let max_names = ctx.get_write_buffer_size(0) / core::mem::size_of::<LocationName>();
+        match service.load_location_name_list(index, max_names) {
             Ok(names) => {
                 let byte_len = core::mem::size_of_val(names.as_slice());
                 let bytes =
@@ -518,13 +571,7 @@ impl TimeZoneService {
         let location_name = Self::pop_location_name(&mut rp);
         match service.load_time_zone_rule(&location_name) {
             Ok(rule) => {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &rule as *const TzRule as *const u8,
-                        core::mem::size_of::<TzRule>(),
-                    )
-                };
-                ctx.write_buffer(bytes, 0);
+                ctx.write_buffer(rule.as_bytes(), 0);
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
             }
@@ -584,11 +631,7 @@ impl TimeZoneService {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let time = rp.pop_i64();
-        let rule = ctx
-            .read_buffer(0)
-            .get(..core::mem::size_of::<TzRule>())
-            .map(|bytes| unsafe { core::ptr::read(bytes.as_ptr() as *const TzRule) })
-            .unwrap_or_default();
+        let rule = TzRule::from_prefix_bytes(&ctx.read_buffer(0));
         match service.to_calendar_time(time, &rule) {
             Ok((calendar, additional)) => {
                 let words = 2
@@ -650,13 +693,7 @@ impl TimeZoneService {
         let mut rule = TzRule::default();
         let rc = service.parse_time_zone_binary(&mut rule, &binary);
         if rc.is_success() {
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &rule as *const TzRule as *const u8,
-                    core::mem::size_of::<TzRule>(),
-                )
-            };
-            ctx.write_buffer(bytes, 0);
+            ctx.write_buffer(rule.as_bytes(), 0);
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
         } else {
@@ -687,12 +724,9 @@ impl TimeZoneService {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let calendar_time = rp.pop_raw::<CalendarTime>();
-        let rule = ctx
-            .read_buffer(0)
-            .get(..core::mem::size_of::<TzRule>())
-            .map(|bytes| unsafe { core::ptr::read(bytes.as_ptr() as *const TzRule) })
-            .unwrap_or_default();
-        match service.to_posix_time(&calendar_time, &rule) {
+        let rule = TzRule::from_prefix_bytes(&ctx.read_buffer(0));
+        let max_times = ctx.get_write_buffer_size(0) / core::mem::size_of::<i64>();
+        match service.to_posix_time(&calendar_time, &rule, max_times) {
             Ok((count, out_times)) => {
                 let byte_len = (count as usize).min(out_times.len()) * core::mem::size_of::<i64>();
                 let bytes = unsafe {
@@ -717,7 +751,8 @@ impl TimeZoneService {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let calendar_time = rp.pop_raw::<CalendarTime>();
-        match service.to_posix_time_with_my_rule(&calendar_time) {
+        let max_times = ctx.get_write_buffer_size(0) / core::mem::size_of::<i64>();
+        match service.to_posix_time_with_my_rule(&calendar_time, max_times) {
             Ok((count, out_times)) => {
                 let byte_len = (count as usize).min(out_times.len()) * core::mem::size_of::<i64>();
                 let bytes = unsafe {
@@ -763,11 +798,22 @@ impl ServiceFramework for TimeZoneService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{System, SystemRef};
     use crate::hle::service::psc::time::time_zone_service::TimeZoneService as PscTimeZoneService;
+
+    fn isolated_service(can_write_timezone_device_location: bool) -> TimeZoneService {
+        TimeZoneService::with_wrapped_and_set_sys(
+            can_write_timezone_device_location,
+            PscTimeZoneService::new(can_write_timezone_device_location),
+            Arc::new(Mutex::new(FileTimestampWorker::new())),
+            Arc::new(Mutex::new(TimeZoneBinary::new(SystemRef::null()))),
+            Arc::new(SystemSettingsService::new_for_test()),
+        )
+    }
 
     #[test]
     fn exercised_handlers_are_registered() {
-        let service = TimeZoneService::new(crate::core::SystemRef::null(), false);
+        let service = isolated_service(false);
         assert!(service
             .handlers()
             .get(&commands::GET_DEVICE_LOCATION_NAME)
@@ -796,18 +842,98 @@ mod tests {
         let time_zone_binary = Arc::new(Mutex::new(TimeZoneBinary::new(
             crate::core::SystemRef::null(),
         )));
-        let service = TimeZoneService::with_wrapped(
-            crate::core::SystemRef::null(),
+        let set_sys = Arc::new(SystemSettingsService::new_for_test());
+        let service = TimeZoneService::with_wrapped_and_set_sys(
             false,
             PscTimeZoneService::new(false),
             Arc::clone(&file_timestamp_worker),
             Arc::clone(&time_zone_binary),
+            Arc::clone(&set_sys),
         );
 
+        assert!(Arc::ptr_eq(&set_sys, &service.set_sys));
         assert!(Arc::ptr_eq(
             &file_timestamp_worker,
             &service.file_timestamp_worker
         ));
         assert!(Arc::ptr_eq(&time_zone_binary, &service.time_zone_binary));
+    }
+
+    #[test]
+    fn location_update_persists_settings_and_signals_operation_event() {
+        std::thread::Builder::new()
+            .name("Glue TimeZoneService parity test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let system = Box::new(System::new_for_test());
+                let system_ref = SystemRef::from_ref(system.as_ref());
+                let set_sys = Arc::new(SystemSettingsService::new_for_test());
+                let set_sys_factory_owner = Arc::clone(&set_sys);
+                let service_manager = system.service_manager().unwrap();
+                assert_eq!(
+                    service_manager.lock().unwrap().register_service(
+                        "set:sys".to_string(),
+                        64,
+                        Box::new(move || -> SessionRequestHandlerPtr {
+                            set_sys_factory_owner.clone()
+                        }),
+                    ),
+                    RESULT_SUCCESS
+                );
+
+                let resolved = TimeZoneService::get_set_sys_service(system_ref);
+                assert!(Arc::ptr_eq(&set_sys, &resolved));
+
+                let mut time_zone_binary = TimeZoneBinary::new(system_ref);
+                assert_eq!(time_zone_binary.mount(), RESULT_SUCCESS);
+                let psc_time = Arc::new(Mutex::new(
+                    crate::hle::service::psc::time::manager::TimeManager::new(Box::new(|| {
+                        42_000_000_000
+                    })),
+                ));
+                psc_time.lock().unwrap().time_zone.set_initialized();
+                let service = TimeZoneService::with_wrapped(
+                    system_ref,
+                    true,
+                    PscTimeZoneService::with_time_manager(true, psc_time),
+                    Arc::new(Mutex::new(FileTimestampWorker::new())),
+                    Arc::new(Mutex::new(time_zone_binary)),
+                );
+                assert!(Arc::ptr_eq(&set_sys, &service.set_sys));
+
+                let operation_event = OperationEvent::new();
+                *service.operation_event.lock().unwrap() = Some(operation_event.clone());
+                assert!(!operation_event.get_event().is_signaled());
+
+                let mut name = [0u8; 0x24];
+                name[..7].copy_from_slice(b"Etc/GMT");
+                assert_eq!(service.set_device_location_name(&name), RESULT_SUCCESS);
+
+                assert_eq!(service.load_location_name_list(0, 1).unwrap().len(), 1);
+                let calendar = CalendarTime {
+                    year: 2024,
+                    month: 1,
+                    day: 1,
+                    ..CalendarTime::default()
+                };
+                let utc_rule = service.load_time_zone_rule(&name).unwrap();
+                let (count, out_times) = service.to_posix_time(&calendar, &utc_rule, 5).unwrap();
+                assert_eq!(count, 1);
+                assert_eq!(out_times.len(), 5);
+                assert_eq!(out_times[0], 1_704_067_200);
+
+                let (persisted_name, persisted_time) =
+                    service.get_device_location_name_and_updated_time().unwrap();
+                assert_eq!(persisted_time.time_point, 42);
+                assert_eq!(set_sys.get_device_time_zone_location_name(), persisted_name);
+                assert_eq!(
+                    set_sys.get_device_time_zone_location_updated_time(),
+                    persisted_time
+                );
+                assert!(operation_event.get_event().is_signaled());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

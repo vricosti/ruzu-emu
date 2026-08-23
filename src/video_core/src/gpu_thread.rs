@@ -536,7 +536,7 @@ fn run_thread(
                     0,
                 );
                 let start = profile_enabled().then(std::time::Instant::now);
-                scheduler.push(submit.channel, submit.entries);
+                scheduler.push(gpu, submit.channel, submit.entries);
                 let elapsed = start.map(|start| start.elapsed());
                 if let Some(elapsed) = elapsed {
                     record_submit_elapsed(elapsed);

@@ -3013,10 +3013,10 @@ mod tests {
     fn write_block_cached_uses_device_memory_owner_and_accumulates() {
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
         let mut backing = vec![0u8; 0x1000];
-        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_set_physical_base_for_test(backing.as_mut_ptr() as usize);
         device_memory.smmu_map_with_cpu_backing(
             0x8000,
-            backing.as_ptr(),
+            backing.as_mut_ptr(),
             0x4000,
             backing.len(),
             1,

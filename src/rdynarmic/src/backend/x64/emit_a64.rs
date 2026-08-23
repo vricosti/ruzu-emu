@@ -847,8 +847,15 @@ pub fn emit_a64_dmb(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _
     ra.asm.mfence().unwrap();
 }
 
-pub fn emit_a64_isb(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
-    ra.asm.lfence().unwrap();
+pub fn emit_a64_isb(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
+    if !ctx.config.memory.hook_isb {
+        return;
+    }
+    ctx.config
+        .callbacks
+        .instruction_synchronization_barrier
+        .emit_call_simple(&mut *ra.asm)
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -4259,8 +4259,8 @@ mod tests {
         tic_words[1] = 0x2000;
         // word2: header_version = BlockLinear(3) at [23:21]
         tic_words[2] = 3 << 21;
-        // word3: block_height=0, block_depth=0
-        tic_words[3] = 0;
+        // word3: block_height at bits [5:3], block_depth=0
+        tic_words[3] = block_height << 3;
         // word4: width=15(+1=16), texture_type=Texture2D(1) at [26:23]
         tic_words[4] = 15 | (1 << 23);
         // word5: height=7(+1=8), normalized=1

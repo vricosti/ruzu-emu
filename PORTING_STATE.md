@@ -1,5 +1,241 @@
 # Porting State
 
+## 2026-08-22 — Warning cleanup interrupted by MK8D Vulkan cache crash
+
+- Crash cause: `load_pipelines` interpreted a same-version legacy/mixed graphics-key segment as the
+  later environment count `0x49A00190` and called `Vec::with_capacity`, requesting
+  652,197,705,984 bytes and aborting the process.
+- The serialized environment/key boundary had drifted by 40 bytes after five old graphics entries;
+  the current cache format remains aligned with Eden version 18, so changing the version would
+  unnecessarily break current Eden cache compatibility.
+- Resolution: environment counts and payload sizes are now validated before allocation, allocations
+  are fallible, empty/invalid entries are refused, and Vulkan/OpenGL key read failures propagate to
+  the existing whole-cache deletion path.
+- Validation: focused `shader_environment` tests, `cargo check -p ruzu --bin ruzu`, and the release
+  build pass. A release launch against the captured invalid cache rejected its zero-environment
+  entry, deleted the file, retained its 1,859 preceding valid pipelines in memory, and booted MK8D
+  without invoking the allocator failure.
+- Status: crash slice resolved; all 1,479 `video_core` library tests pass (one ignored). The warning
+  cleanup can resume at the interrupted GDB slice after this auditable crash-fix commit.
+
+## 2026-08-22 — GDB warning slice interrupted by debugger-backend prerequisite
+
+- Active slice: resolve the unused reply constants, breakpoint map, no-ack state, architecture
+  state, escape helper, and breakpoint enum in `debugger/gdbstub.rs`.
+- Finding: these are not dead upstream. Eden uses them in packet replies, memory access,
+  breakpoint/watchpoint insertion/removal, feature negotiation, and no-ack mode.
+- Exact missing prerequisite: Ruzu's `DebuggerBackend` exposes only opaque numeric thread IDs and
+  its `Debugger` never constructs a `GdbStub`; the frontend has no `System`, debug-process memory,
+  thread list/context, socket reply path, or cache-invalidation path required by Eden's handlers.
+- Prerequisite progress: `DebuggerAction` now has Eden's exact `Interrupt`, `Continue`,
+  `ContinueThreads`, `StepThread`, and `ShutdownEmulation` contract; the former Rust-only locked/
+  unlocked step split was removed.
+- Required next action: port the debugger backend/frontend ownership and connection wiring in
+  `debugger.rs`, verify that matching file, then resume the GDB command handlers. Deleting or merely
+  allowing the warned members would hide functional parity debt.
+- Backend audit: Ruzu currently never constructs `Debugger`, does not retain it in `System`, and
+  does not connect the frontend setting to the boot/shutdown lifecycle. The backend will therefore
+  be restored first with the process/thread owners used by Rust.
+- Follow-on prerequisites discovered during the backend audit: the CPU execution loop does not yet
+  honor `StepPending`/`StepPerformed` or notify the debugger on a breakpoint, and both Dynarmic
+  `check_memory_access` implementations are inert. These must be completed before claiming GDB
+  stepping/watchpoint parity; they are not grounds for leaving partial command handlers behind.
+- Backend prerequisite result: `System` now owns the debugger for the application lifetime, the
+  boot controller initializes/detaches it in Eden's order, and `debugger.rs` owns the TCP server,
+  connection replacement, stop notifications, active-thread selection and resume/step actions.
+  Focused socket tests cover bind failure, destruction, and routing a remote packet to the frontend.
+- Validation result: `cargo check -p ruzu --bin ruzu` and all three debugger server tests pass.
+  The pre-existing full `core` test binary is not green: parallel execution aborts in
+  `cleanup_map_succeeds_without_resolved_processes`, while single-threaded execution reports
+  unrelated ARM/kernel failures and then hangs in a scheduler test. No debugger test failed.
+- Status: resume the interrupted `gdbstub.rs` slice only after the CPU stop/step notification and
+  Dynarmic watchpoint prerequisites above are implemented and verified against their Eden owners.
+- CPU prerequisite result: `physical_core.rs` now owns `StepPending` execution, the
+  `StepPerformed` reschedule stop, step-priority halt classification, debugger context capture,
+  breakpoint rewind/notification and debug suspension. `cpu_manager.rs` delegates those decisions
+  while retaining its Rust fiber/JIT coordination. The two focused step/breakpoint regressions pass;
+  two unrelated pre-existing physical-core fixture tests still fail as part of the non-green core
+  test baseline recorded above.
+- Remaining prerequisite: port A32/A64 `CheckMemoryAccess`, connect the process watchpoint array and
+  retain the halted watchpoint so the now-live physical-core data-abort path can be exercised.
+- Dynarmic watchpoint slice interrupted after type/callback wiring: Eden's
+  `KProcess::{Insert,Remove}Watchpoint` reference-count and mark each covered page through
+  `Memory::MarkRegionDebug`, while Ruzu only changed its watchpoint table. Fastmem could therefore
+  bypass the callbacks entirely. Port `memory.rs::mark_region_debug` in its upstream-owned module,
+  wire the existing `debug_page_refcounts` in `k_process.rs`, verify that prerequisite, then resume
+  the callback slice.
+- Debug-page prerequisite completed: `memory.rs::mark_region_debug` now reproduces Eden's fastmem
+  protection and `Memory`/`DebugMemory` transitions, while `k_process.rs` uses its existing
+  `debug_page_refcounts` for overlapping watchpoints. Both focused regressions pass. Resume the
+  interrupted A32/A64 callback slice.
+- Dynarmic watchpoint prerequisite completed: both callbacks now validate slow-path accesses,
+  distinguish read/write matches, retain the process-owned matching watchpoint and emit Eden's
+  prefetch/data-abort halt reasons. `PhysicalCore::load_context` supplies the process watchpoint
+  array before execution. Focused A32 halt translation, A64 callback, matching, page-transition,
+  reference-count and layout regressions pass.
+- Validation result: all six focused watchpoint/debug-memory regressions pass and
+  `cargo check -p ruzu --bin ruzu` succeeds with only the two deferred GDB dispatcher warnings.
+  The single-threaded full `core` suite again reached unrelated pre-existing ARM, crypto,
+  integrity-storage, condition-variable and process-test failures before timing out in the known
+  scheduler-test baseline; none of the new watchpoint tests failed.
+- Status: CPU stepping, breakpoint notification and A32/A64 watchpoint generation prerequisites are
+  complete. Resume the interrupted `gdbstub.rs` command-dispatcher warning slice.
+- GDB dispatcher resumed, then interrupted by its module-discovery prerequisite: Eden's `qOffsets`
+  and `qXfer:libraries:read` handlers require `arm/debug.cpp::{FindModules,GetModuleEnd,
+  FindMainModuleEntrypoint}`, while the Rust counterparts still return an empty map, the input base
+  and zero. The process page-table query and code-region APIs now exist, so port these methods in
+  `arm/debug.rs`, verify their memory-region walk and module-path parsing, then resume `gdbstub.rs`.
+- Module-discovery prerequisite completed: `arm/debug.rs` now walks every page-table region, reads
+  the upstream 0x208-byte module-path record after executable Code/AliasCode regions, strips both
+  directory separators, computes the text/rodata/data end and falls back to the process code-region
+  start. The duplicate empty symbolication walker and unsafe opaque process/thread casts were also
+  removed. Both focused module-discovery/entrypoint regressions and `cargo check -p core` pass.
+- GDB dispatcher result: `gdbstub.rs` now owns Eden's complete command dispatch, register and memory
+  access, software breakpoints, typed watchpoints, query transfers, thread selection, leftmost-match
+  `vCont` resolution, monitor commands, pagination and XML escaping. `debug_process`,
+  `replaced_instructions`, and `BreakpointType` are consequently live parity state rather than
+  warning suppressions or dead code.
+- Validation result: all five focused GDB protocol tests pass after clearing a Rust 1.92 incremental
+  compiler ICE, and `cargo check -p ruzu --bin ruzu` passes with only the explicitly ignored naming
+  warnings. The mandatory single-threaded full `core` attempt reached the previously recorded ARM,
+  crypto, integrity-storage, condition-variable and process fixture failures, then timed out in the
+  known scheduler-test hang; every GDB test passed within that run.
+- Status: the interrupted GDB warning slice and all of its discovered prerequisites are complete.
+
+## 2026-08-22 — JIT warning slice interrupted by code-memory prerequisite
+
+- Status: interrupted before consuming the callback table fields in `hle/service/jit/jit.rs`.
+- Interrupted slice: port `JITU::CreateJitEnvironment`, `IJitEnvironment::LoadPlugin`, and the
+  callback execution paths that read every `GuestCallbacks` member.
+- Exact missing prerequisite: `hle/service/jit/jit_code_memory.rs` cannot implement Eden's random
+  owner mapping because Ruzu's `KCodeMemory` is not retained as a typed handle object. The code
+  memory SVC currently records only an opaque ID and directly edits the current page table instead
+  of calling `KCodeMemory::{Map,Unmap,MapToOwner,UnmapFromOwner}`. Its initializer also fabricates a
+  page group from a virtual address instead of using `LockForCodeMemory`.
+- Required next action: restore `KCodeMemory` page-group, owner, registry, SVC dispatch, and
+  finalization parity in their kernel-owned Rust counterparts; verify that prerequisite against
+  Eden before implementing `jit_code_memory.rs` and resuming `jit.rs`.
+- Prerequisite result: `KCodeMemory` now retains its owner and physical page group, locks and
+  clears source pages, maps/unmaps the group with Eden's states and permissions, and restores the
+  source on finalization. `KProcess` retains typed code-memory objects for opaque handle-table
+  IDs, both AArch32 and AArch64 generated dispatch layouts call the real SVC handlers, and invalid
+  operation values return `ResultInvalidEnumValue` without an unsafe enum conversion.
+- Status: kernel code-memory prerequisite completed and re-verified; `jit_code_memory.rs` may now
+  resume.
+- JIT code-memory result: `CodeMemory` now samples the process alias-code region with the caller's
+  `mt19937_64` stream, retries only `ResultInvalidMemoryRegion`, retains the kernel code-memory
+  reference after a successful owner mapping, and asserts the matching unmap during finalization.
+- Newly discovered prerequisite: `jit_context.rs` is still an inert placeholder even though
+  `rdynarmic` is now integrated. Eden's environment methods require its NRO relocation, local and
+  mapped memory routing, AArch64 argument ABI, helper-SVC dispatch, heap and callback execution;
+  consuming `GuestCallbacks` without those owners would only replace warnings with dead calls.
+- Required next action: port and verify `jit_context.{h,cpp}` against the local `rdynarmic` A64 API,
+  then resume the interrupted `jit.rs` environment and IPC slice.
+- JIT-context prerequisite result: the context now owns the local NRO image, RELA/RELR fixups,
+  helper stubs, stack/heap ABI, mapped process ranges and an A64 `rdynarmic` executor. The local
+  backend now exposes Eden's instruction-synchronization callback on both x86-64 and AArch64 hosts,
+  controlled by the same default-disabled `hook_isb` policy; the callback itself drops the cached
+  code page when enabled.
+- JIT-service result: `jit:u` now owns the real `JITU` service and `IJitEnvironment`; it resolves
+  typed process/code/transfer-memory handles, maps RX/RO ranges, loads and prepares plugin NROs,
+  executes `Control`/`GenerateCode`, returns code addresses, and finalizes RX before RO. Eden's
+  resolved-but-unused `_fini` and `nnjitpluginKeeper` fields remain explicitly retained.
+- Status: the interrupted JIT warning slice is complete and re-verified. The next library-warning
+  group is the partial GDB stub in `debugger/gdbstub.rs`.
+
+## 2026-08-22 — PlatformServiceManager warning interrupted by kernel font-memory prerequisite
+
+- Active slice: remove the unused caller-process lookup in
+  `ns/platform_service_manager.rs::create_shared_memory_object`.
+- Missing prerequisite discovered: Eden's `GetSharedMemoryNativeHandle` returns the single
+  kernel-owned `font_shared_mem`, but Ruzu currently allocates and caches one font shared-memory
+  object per `IPlatformServiceManager` instance.
+- Resume condition: add the persistent font shared-memory object to `KernelCore`, initialize it
+  with Eden's owner/user permissions and lifetime, verify it, then make both `pl:*` services return
+  that kernel object and remove their redundant allocation/cache path.
+- Prerequisite result: `KernelCore` now owns and initializes the persistent font object before IRS,
+  exposes its stable object ID and owner, and releases it before IRS during shutdown.
+- Resumed result: `IPlatformServiceManager::GetSharedMemoryNativeHandle` now copies its complete font
+  blob into that kernel object on every call, registers that same object with the caller, and no
+  longer owns a per-service cache or performs the duplicate caller lookup that caused the warning.
+- Status: prerequisite and resumed platform-service slice completed and re-verified.
+
+## 2026-08-22 — Application display-version warning interrupted by metadata prerequisite
+
+- Status: interrupted before replacing the hard-coded `"1.0.0"` response in
+  `IApplicationFunctions::GetDisplayVersion`.
+- Interrupted slice: read the running applet's control metadata and return its 16-byte display
+  version, falling back to `"1.0.0"` only when metadata is unavailable.
+- Exact missing prerequisite: Eden owns the base-title/update-title fallback in the static
+  `PatchManager::GetMetadataFromBaseOrUpdate`, but Ruzu does not yet expose that method. Duplicating
+  it in AM would violate method ownership and leave the same gap in other callers.
+- Required next action: port and test `get_metadata_from_base_or_update` in
+  `file_sys/patch_manager.rs`, verify it against `patch_manager.{h,cpp}`, then resume the AM handler.
+- Prerequisite result: `PatchManager` now owns the upstream-shaped static lookup, retains the
+  filesystem controller and content-provider locks across both attempts, and falls back to the
+  update title only when the base lookup has no NACP. The AM display-version slice may resume.
+- Resumed result: `IApplicationFunctions::GetDisplayVersion` now reads the applet program ID,
+  requests base/update NACP metadata through `PatchManager`, copies at most 16 version bytes,
+  forces the final byte to NUL, and uses `"1.0.0"` only when metadata is absent.
+- Status: prerequisite and resumed display-version slice completed and re-verified.
+
+## 2026-08-22 — TimeZoneService warning/parity slice
+
+- Status: warning/ownership slice completed after resolving settings, shared-time, parser and
+  binary-layout prerequisites; reverse conversion parity was then completed as a discovered
+  prerequisite.
+- Interrupted slice: retain Eden's `m_set_sys` owner, persist timezone location updates, and
+  restore the shared operation-event ownership and signaling performed by
+  `Glue::Time::TimeZoneService`.
+- Exact missing prerequisite: Ruzu's IPC-facing `SystemSettingsService` does not expose Eden's
+  typed `SetDeviceTimeZoneLocationName` and `SetDeviceTimeZoneLocationUpdatedTime` methods to
+  service-to-service callers. The timezone service would otherwise have to own settings payload
+  serialization that belongs in `set/system_settings_server.rs`.
+- Required next action: add the two typed forwarding methods in the settings owner, verify their
+  payload conversion against Eden, then resume the timezone service with the retained singleton
+  and `PSC::Time::OperationEvent`.
+- Settings prerequisite result: `SystemSettingsService` now exposes the four typed timezone
+  getters/setters owned by Eden's `ISystemSettingsServer`; the existing settings payload helpers
+  keep the `LocationName` and `SteadyClockTimePoint` conversion in the settings module.
+- Newly discovered prerequisite: Ruzu's wrapped PSC `TimeZoneService` owns a snapshot of
+  `TimeZone` and no `StandardSteadyClockCore`. Eden retains references to both, sets the current
+  steady-clock time point immediately after parsing a new rule, and therefore returns a real
+  update time for Glue to persist. Continuing the Glue slice would persist a zero time point.
+- Required next action: restore shared `TimeZone` and `StandardSteadyClockCore` ownership in
+  `psc/time/time_zone_service.rs` and its manager/static-service construction path, verify that
+  rule updates mutate the manager-owned timezone and capture the current clock time, then resume
+  Glue persistence and operation-event signaling.
+- PSC ownership prerequisite result: every runtime `TimeZoneService` now retains the shared
+  `TimeManager` that owns Eden's clock core and timezone, command 7 delegates to the real method,
+  and successful updates capture the standard steady-clock time before mutating the shared zone.
+- Newly discovered parser prerequisite: after removing the non-upstream UTC fallback,
+  `TzRule::parse` rejects the valid `Etc/GMT` TZif supplied by Ruzu's synthesized system archive.
+  The fallback previously hid this parser defect and made command 7 appear successful while using
+  the wrong rule.
+- Required next action: compare `psc/time/tzif.rs` with Eden's TZ parser contract, fix the valid
+  synthesized TZif rejection with a focused regression, then resume the PSC and Glue tests.
+- Parser prerequisite result: the parser now follows Eden's Switch-specific single 8-byte data
+  block, uses the upstream `ttisutcnt`/`ttisstdcnt` header order and accepts the embedded
+  `Etc/GMT` rule without a UTC fallback.
+- Newly discovered reverse-conversion prerequisite: Ruzu collapsed `mktime_tzname` overflow and
+  not-found statuses, retained an invented UTC fallback, and could not return both timestamps for
+  an ambiguous local time. This also forced `TimeZone` to read `m_my_rule` outside its member-lock
+  boundary.
+- Reverse-conversion prerequisite result: `tzif.rs` now preserves Eden's status and normalized
+  calendar output, while `time_zone.rs` owns the exact `ToPosixTimeImpl` ambiguity search and
+  public wrapper ordering under the member mutex.
+- Newly discovered binary-layout prerequisite: Ruzu represented the raw IPC `Tz::Rule` payload
+  with `Vec` fields and read it through an aligned typed pointer. Eden's payload is a fixed,
+  value-initialized 0x4000-byte structure; the Rust representation was neither layout-compatible
+  nor safe for unaligned guest buffers.
+- Binary-layout prerequisite result: `TtInfo` and `TzRule` now mirror Eden's field offsets,
+  explicit padding and fixed array capacities. IPC decoding uses an unaligned-safe, all-bit-valid
+  representation, output includes deterministic reserved bytes, and conversion restores Eden's
+  `ValidateRule` boundary.
+- Resumed slice result: Glue retains the exact `set:sys` singleton, persists name then update
+  time, retains one stable operation event and signals it after persistence. The original unread
+  `system` field is removed because its upstream responsibilities now have explicit owners.
+
 ## 2026-08-22 — TimeWorker warning/parity slice
 
 - Status: interrupted before consuming the four unread report-context fields or replacing the
@@ -1102,3 +1338,18 @@
   data like Eden and pushes it through the shared `System` owner. Focused coverage verifies the
   producer-to-system transfer and command registration.
 - Status: completed and re-verified for the home-menu/general-channel warning slice.
+
+## 2026-08-23 — video-core warning cleanup interrupted by scheduler ownership prerequisite
+
+- Interrupted slice: classify and resolve the remaining unused test locals in `video_core`.
+- Exact missing prerequisite: `control/scheduler.rs` retained a raw pointer to its owning `Gpu`,
+  even though Eden passes `GPU&` to `Scheduler::Push` and stores no back-reference. The warning in
+  the scheduler test exposed this self-referential ownership divergence.
+- Prerequisite result: `Scheduler::Push` now receives the GPU per call, `Gpu` owns the scheduler
+  directly from construction, and the channel map's mutex preserves Eden's single guarded region
+  across lookup and channel binding without unsafe `Send`/`Sync` implementations.
+- Resumed result: the remaining test locals now either assert the value they decode/remove, express
+  writable mapped memory through mutable pointers, feed descriptor fields, or have genuinely dead
+  shadowed setup removed.
+- Status: completed and re-verified; all 1,479 active `video_core` library tests pass and the
+  variable/mutability warnings covered by this slice are gone.

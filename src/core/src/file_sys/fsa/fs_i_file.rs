@@ -248,7 +248,6 @@ impl IFile {
 mod tests {
     use super::*;
     use crate::file_sys::fs_file::ReadOption;
-    use crate::file_sys::vfs::vfs::VfsFile;
     use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
     use std::sync::Arc;
 

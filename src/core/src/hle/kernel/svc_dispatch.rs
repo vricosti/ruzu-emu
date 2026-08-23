@@ -17,6 +17,7 @@ use crate::hardware_properties;
 use crate::hle::kernel::svc::svc_activity;
 use crate::hle::kernel::svc::svc_address_arbiter;
 use crate::hle::kernel::svc::svc_cache;
+use crate::hle::kernel::svc::svc_code_memory;
 use crate::hle::kernel::svc::svc_condition_variable;
 use crate::hle::kernel::svc::svc_debug_string;
 use crate::hle::kernel::svc::svc_event;
@@ -1256,12 +1257,26 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // Code memory
         // =====================================================================
         Some(SvcId::CreateCodeMemory) => {
-            // OUT: ret=arg32[0], handle=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle(system));
+            let mut handle = 0;
+            let result = svc_code_memory::create_code_memory(
+                system,
+                &mut handle,
+                get_arg32(args, 1) as u64,
+                get_arg32(args, 2) as u64,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, handle);
         }
         Some(SvcId::ControlCodeMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_code_memory::control_code_memory(
+                system,
+                get_arg32(args, 0),
+                get_arg32(args, 1),
+                gather64(args, 2, 3),
+                gather64(args, 4, 5),
+                decode_memory_permission(get_arg32(args, 6)),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
 
         // =====================================================================
@@ -1824,6 +1839,28 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 get_arg64(args, 0) as u32,
                 get_arg64(args, 1),
                 get_arg64(args, 2),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::CreateCodeMemory) => {
+            let mut handle = 0;
+            let result = svc_code_memory::create_code_memory(
+                system,
+                &mut handle,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, handle as u64);
+        }
+        Some(SvcId::ControlCodeMemory) => {
+            let result = svc_code_memory::control_code_memory(
+                system,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1) as u32,
+                get_arg64(args, 2),
+                get_arg64(args, 3),
+                decode_memory_permission(get_arg64(args, 4) as u32),
             );
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
@@ -3412,6 +3449,31 @@ mod tests {
         // Unknown
         assert_eq!(SvcId::from_u32(0x00), None);
         assert_eq!(SvcId::from_u32(0xFF), None);
+    }
+
+    #[test]
+    fn code_memory_dispatches_use_generated_argument_layouts() {
+        let system = test_system();
+
+        let mut args64 = [0; 8];
+        args64[1] = 1;
+        args64[2] = 0x1000;
+        call64(&system, SvcId::CreateCodeMemory as u32, &mut args64);
+        assert_eq!(
+            args64[0] as u32,
+            crate::hle::kernel::svc::svc_results::RESULT_INVALID_ADDRESS.get_inner_value()
+        );
+        assert_eq!(args64[1], 0);
+
+        let mut args32 = [0; 8];
+        set_arg32(&mut args32, 1, 1);
+        set_arg32(&mut args32, 2, 0x1000);
+        call32(&system, SvcId::CreateCodeMemory as u32, &mut args32);
+        assert_eq!(
+            get_arg32(&args32, 0),
+            crate::hle::kernel::svc::svc_results::RESULT_INVALID_ADDRESS.get_inner_value()
+        );
+        assert_eq!(get_arg32(&args32, 1), 0);
     }
 
     #[test]

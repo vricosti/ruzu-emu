@@ -7670,17 +7670,6 @@ mod tests {
 
     // ── MME macro integration tests ─────────────────────────────────────
 
-    /// Helper: encode an AddImmediate macro opcode.
-    /// operation=1, bits[31:14]=imm, bits[13:11]=src_a, bits[10:8]=dst,
-    /// bit[7]=exit, bits[6:4]=result_op.
-    fn macro_add_imm(result_op: u32, is_exit: bool, dst: u32, src_a: u32, imm: i32) -> u32 {
-        1u32 | ((result_op & 0x7) << 4)
-            | ((is_exit as u32) << 7)
-            | ((dst & 0x7) << 8)
-            | ((src_a & 0x7) << 11)
-            | (((imm as u32) & 0x3FFFF) << 14)
-    }
-
     #[test]
     fn test_load_mme_upload() {
         let mut engine = Maxwell3D::new();
@@ -8061,7 +8050,7 @@ mod tests {
 
     #[test]
     fn test_decode_texture_handle_independent() {
-        let mut engine = Maxwell3D::new();
+        let engine = Maxwell3D::new();
         // Default is Independently (0).
         let handle: u32 = (0x0AB << 20) | 0x1_2345;
         let (tic_id, tsc_id) = engine.decode_texture_handle(handle);

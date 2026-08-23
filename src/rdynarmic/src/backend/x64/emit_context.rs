@@ -215,6 +215,9 @@ pub struct EmitCallbacks {
     /// Called for instruction cache operations.
     pub instruction_cache_operation: Box<dyn Callback>,
 
+    /// Called when an instruction synchronization barrier is executed.
+    pub instruction_synchronization_barrier: Box<dyn Callback>,
+
     /// Called to add ticks when returning from JIT.
     pub add_ticks: Box<dyn Callback>,
 

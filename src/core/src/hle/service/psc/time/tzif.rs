@@ -2,20 +2,20 @@
 // SPDX-FileCopyrightText: Copyright 1996 Arthur David Olson
 // SPDX-License-Identifier: GPL-2.0-or-later AND BSD-2-Clause
 
-//! TZif binary parser and timezone conversion functions.
+//! Switch TZif binary parser and timezone conversion functions.
 //!
 //! Port of zuyu/externals/tz/tz/tz.h and tz.cpp (Arthur David Olson's
-//! IANA timezone library). Parses TZif binary files (RFC 8536) and provides
+//! IANA timezone library). Parses the Switch timezone archive's TZif-derived
+//! files and provides
 //! localtime_rz / mktime_tzname equivalent conversions.
 //!
 //! Used by the PSC time service to convert between POSIX timestamps and
 //! calendar time with timezone support.
 
-
 // Constants matching upstream tz.cpp
-const TZ_MAX_TIMES: usize = 1000;
-const TZ_MAX_TYPES: usize = 128;
-const TZ_MAX_CHARS: usize = 50;
+pub(crate) const TZ_MAX_TIMES: usize = 1000;
+pub(crate) const TZ_MAX_TYPES: usize = 128;
+pub(crate) const TZ_MAX_CHARS: usize = 50;
 const TZ_MAX_LEAPS: usize = 50;
 const TZNAME_MAXIMUM: usize = 255;
 const CHARS_EXTRA: usize = 3;
@@ -104,62 +104,99 @@ pub fn detzcode64(data: &[u8]) -> i64 {
 
 /// Type info for a timezone transition (matching upstream `ttinfo`).
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 pub struct TtInfo {
     pub tt_utoff: i32,
-    pub tt_isdst: bool,
+    pub tt_isdst: u8,
+    pub _padding0: [u8; 3],
     pub tt_desigidx: i32,
-    pub tt_ttisstd: bool,
-    pub tt_ttisut: bool,
+    pub tt_ttisstd: u8,
+    pub tt_ttisut: u8,
+    pub _padding1: [u8; 2],
 }
+const _: () = assert!(core::mem::size_of::<TtInfo>() == 0x10);
 
 /// Parsed TZif timezone rule (matching upstream `Tz::Rule`).
 ///
 /// Contains transition times, type indices, type info records, and
 /// abbreviation strings parsed from a TZif binary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct TzRule {
     pub timecnt: i32,
     pub typecnt: i32,
     pub charcnt: i32,
-    pub goback: bool,
-    pub goahead: bool,
-    pub ats: Vec<i64>,
-    pub types: Vec<u8>,
-    pub ttis: Vec<TtInfo>,
-    pub chars: Vec<u8>,
+    pub goback: u8,
+    pub goahead: u8,
+    pub _padding0: [u8; 2],
+    pub ats: [i64; TZ_MAX_TIMES],
+    pub types: [u8; TZ_MAX_TIMES],
+    pub ttis: [TtInfo; TZ_MAX_TYPES],
+    pub chars: [u8; 2 * (TZNAME_MAXIMUM + 1)],
     pub default_type: i32,
+    pub _padding1: [u8; 0x12C4],
 }
+const _: () = assert!(core::mem::size_of::<TzRule>() == 0x4000);
 
 impl Default for TzRule {
     fn default() -> Self {
-        // Default = UTC with a single type (offset 0, no DST, abbreviation "UTC").
-        let mut chars = vec![0u8; 4 + CHARS_EXTRA];
-        chars[0] = b'U';
-        chars[1] = b'T';
-        chars[2] = b'C';
-        chars[3] = 0;
-        Self {
-            timecnt: 0,
-            typecnt: 1,
-            charcnt: 4,
-            goback: false,
-            goahead: false,
-            ats: Vec::new(),
-            types: Vec::new(),
-            ttis: vec![TtInfo {
-                tt_utoff: 0,
-                tt_isdst: false,
-                tt_desigidx: 0,
-                tt_ttisstd: false,
-                tt_ttisut: false,
-            }],
-            chars,
-            default_type: 0,
-        }
+        // Matches C++ value-initialization (`Tz::Rule{}`). Runtime UTC rules
+        // are parsed from the timezone archive rather than invented here.
+        Self::zeroed()
     }
 }
 
 impl TzRule {
+    fn zeroed() -> Self {
+        Self {
+            timecnt: 0,
+            typecnt: 0,
+            charcnt: 0,
+            goback: 0,
+            goahead: 0,
+            _padding0: [0; 2],
+            ats: [0; TZ_MAX_TIMES],
+            types: [0; TZ_MAX_TIMES],
+            ttis: [TtInfo::default(); TZ_MAX_TYPES],
+            chars: [0; 2 * (TZNAME_MAXIMUM + 1)],
+            default_type: 0,
+            _padding1: [0; 0x12C4],
+        }
+    }
+
+    /// Decode the fixed-size IPC payload without imposing alignment on the
+    /// guest-provided byte buffer. Every field uses an all-bit-pattern-valid
+    /// integer representation.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes = bytes.get(..core::mem::size_of::<Self>())?;
+        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
+    }
+
+    /// Reconstruct an upstream `InLargeData<Rule>` argument: value-initialize
+    /// the complete object, then copy as much of the guest buffer as exists.
+    pub fn from_prefix_bytes(bytes: &[u8]) -> Self {
+        let mut rule = Self::default();
+        let copy_len = bytes.len().min(core::mem::size_of::<Self>());
+        let output = unsafe {
+            core::slice::from_raw_parts_mut(
+                (&mut rule as *mut Self).cast::<u8>(),
+                core::mem::size_of::<Self>(),
+            )
+        };
+        output[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        rule
+    }
+
+    /// Return the complete deterministic 0x4000-byte IPC representation.
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+
     /// Check if a type abbreviation is the unspecified marker "-00".
     fn ttunspecified(&self, i: usize) -> bool {
         let idx = self.ttis[i].tt_desigidx as usize;
@@ -202,8 +239,11 @@ impl TzRule {
 
     /// Parse a TZif binary into a TzRule (matching upstream `tzloadbody`).
     ///
-    /// Handles both V1 (4-byte timestamps) and V2/V3 (8-byte timestamps).
-    /// When V2+ data is present, the V1 data is skipped and V2 data is used.
+    /// The Switch timezone archive stores a single data block with 8-byte
+    /// timestamps, even though its header carries the `TZif2` version marker.
+    /// This deliberately matches Eden's `tzloadbody`, which reads that first
+    /// block directly with `stored = 8` instead of applying the standard TZif
+    /// v2 two-block layout.
     pub fn parse(binary: &[u8]) -> Option<TzRule> {
         if binary.len() < TZIF_HEADER_SIZE {
             return None;
@@ -214,45 +254,7 @@ impl TzRule {
             return None;
         }
 
-        let version = binary[4];
-
-        // Parse V1 header to compute V1 data block size so we can skip to V2
-        let v1_ttisstdcnt = detzcode(&binary[20..24]) as i64;
-        let v1_ttisutcnt = detzcode(&binary[24..28]) as i64;
-        let v1_leapcnt = detzcode(&binary[28..32]) as i64;
-        let v1_timecnt = detzcode(&binary[32..36]) as i64;
-        let v1_typecnt = detzcode(&binary[36..40]) as i64;
-        let v1_charcnt = detzcode(&binary[40..44]) as i64;
-
-        // Determine if we should use V2 data
-        let use_v2 = version >= b'2';
-
-        if use_v2 {
-            // Skip V1 data block to reach V2 header
-            let v1_datablock_size = v1_timecnt * 4  // ats (4-byte in V1)
-                + v1_timecnt                        // types
-                + v1_typecnt * 6                    // ttinfos
-                + v1_charcnt                        // chars
-                + v1_leapcnt * (4 + 4)              // lsinfos (4-byte in V1)
-                + v1_ttisstdcnt                     // ttisstds
-                + v1_ttisutcnt; // ttisuts
-            let v2_header_offset = (TZIF_HEADER_SIZE as i64 + v1_datablock_size) as usize;
-
-            if binary.len() < v2_header_offset + TZIF_HEADER_SIZE {
-                return None;
-            }
-
-            // Parse V2 header
-            let h2 = &binary[v2_header_offset..];
-            if &h2[0..4] != b"TZif" {
-                return None;
-            }
-
-            Self::parse_data_block(h2, 8)
-        } else {
-            // Parse V1 data
-            Self::parse_data_block(binary, 4)
-        }
+        Self::parse_data_block(binary, 8)
     }
 
     /// Parse a TZif data block (header + data) with the given timestamp size
@@ -262,8 +264,8 @@ impl TzRule {
             return None;
         }
 
-        let ttisstdcnt = detzcode(&header_and_data[20..24]);
-        let ttisutcnt = detzcode(&header_and_data[24..28]);
+        let ttisutcnt = detzcode(&header_and_data[20..24]);
+        let ttisstdcnt = detzcode(&header_and_data[24..28]);
         let leapcnt = detzcode(&header_and_data[28..32]);
         let timecnt_orig = detzcode(&header_and_data[32..36]);
         let typecnt = detzcode(&header_and_data[36..40]);
@@ -305,18 +307,10 @@ impl TzRule {
 
         let mut p = TZIF_HEADER_SIZE;
 
-        let mut sp = TzRule {
-            timecnt: timecnt_orig,
-            typecnt,
-            charcnt,
-            goback: false,
-            goahead: false,
-            ats: vec![0i64; TZ_MAX_TIMES],
-            types: vec![0u8; TZ_MAX_TIMES],
-            ttis: vec![TtInfo::default(); TZ_MAX_TYPES],
-            chars: vec![0u8; TZNAME_MAXIMUM + 1 + CHARS_EXTRA],
-            default_type: 0,
-        };
+        let mut sp = TzRule::zeroed();
+        sp.timecnt = timecnt_orig;
+        sp.typecnt = typecnt;
+        sp.charcnt = charcnt;
 
         // Read transitions, discarding those out of time_t range.
         // Matching upstream logic exactly.
@@ -370,7 +364,7 @@ impl TzRule {
             if isdst >= 2 {
                 return None; // EINVAL
             }
-            sp.ttis[i].tt_isdst = isdst != 0;
+            sp.ttis[i].tt_isdst = isdst;
             let desigidx = header_and_data[p];
             p += 1;
             if desigidx as i32 >= sp.charcnt {
@@ -392,34 +386,31 @@ impl TzRule {
             }
         }
 
-        // Skip leap second data
-        p += leapcnt as usize * (stored + 4);
-
         // Read ttisstd flags
         for i in 0..sp.typecnt as usize {
             if ttisstdcnt == 0 {
-                sp.ttis[i].tt_ttisstd = false;
+                sp.ttis[i].tt_ttisstd = 0;
             } else {
                 let val = header_and_data[p];
                 p += 1;
                 if val > 1 {
                     return None; // EINVAL
                 }
-                sp.ttis[i].tt_ttisstd = val != 0;
+                sp.ttis[i].tt_ttisstd = val;
             }
         }
 
         // Read ttisut flags
         for i in 0..sp.typecnt as usize {
             if ttisutcnt == 0 {
-                sp.ttis[i].tt_ttisut = false;
+                sp.ttis[i].tt_ttisut = 0;
             } else {
                 let val = header_and_data[p];
                 p += 1;
                 if val > 1 {
                     return None; // EINVAL
                 }
-                sp.ttis[i].tt_ttisut = val != 0;
+                sp.ttis[i].tt_ttisut = val;
             }
         }
 
@@ -427,6 +418,9 @@ impl TzRule {
         // We compute nread as the remaining data after parsing, matching upstream.
         let total_len = header_and_data.len();
         let nread = if total_len > p { total_len - p } else { 0 };
+        if nread > 256 {
+            return None;
+        }
 
         if nread > 2
             && header_and_data[total_len - nread] == b'\n'
@@ -517,7 +511,7 @@ impl TzRule {
                 let repeattype = sp.types[0] as usize;
                 for i in 1..sp.timecnt as usize {
                     if sp.ats[i] == repeatat && sp.typesequiv(sp.types[i] as usize, repeattype) {
-                        sp.goback = true;
+                        sp.goback = 1;
                         break;
                     }
                 }
@@ -527,7 +521,7 @@ impl TzRule {
                 let repeattype = sp.types[sp.timecnt as usize - 1] as usize;
                 for i in (0..sp.timecnt as usize - 1).rev() {
                     if sp.ats[i] == repeatat && sp.typesequiv(sp.types[i] as usize, repeattype) {
-                        sp.goahead = true;
+                        sp.goahead = 1;
                         break;
                     }
                 }
@@ -554,15 +548,15 @@ impl TzRule {
 
         // If dt < 0 and there are transitions and the first transition is to DST,
         // find the standard type less than and closest to the type of the first transition.
-        if dt < 0 && sp.timecnt > 0 && sp.ttis[sp.types[0] as usize].tt_isdst {
+        if dt < 0 && sp.timecnt > 0 && sp.ttis[sp.types[0] as usize].tt_isdst != 0 {
             dt = sp.types[0] as i32;
             while dt > 0 {
                 dt -= 1;
-                if !sp.ttis[dt as usize].tt_isdst {
+                if sp.ttis[dt as usize].tt_isdst == 0 {
                     break;
                 }
             }
-            if dt >= 0 && sp.ttis[dt as usize].tt_isdst {
+            if dt >= 0 && sp.ttis[dt as usize].tt_isdst != 0 {
                 dt = -1; // all were DST
             }
         }
@@ -570,7 +564,7 @@ impl TzRule {
         // If no result yet, find the first standard type. If none, use 0.
         if dt < 0 {
             dt = 0;
-            while sp.ttis[dt as usize].tt_isdst {
+            while sp.ttis[dt as usize].tt_isdst != 0 {
                 dt += 1;
                 if dt >= sp.typecnt {
                     dt = 0;
@@ -580,12 +574,6 @@ impl TzRule {
         }
 
         sp.default_type = dt;
-
-        // Trim the oversized vectors to actual used counts
-        sp.ats.truncate(sp.timecnt as usize);
-        sp.types.truncate(sp.timecnt as usize);
-        sp.ttis.truncate(sp.typecnt as usize);
-        // Keep chars at full size for CHARS_EXTRA safety
 
         Some(sp)
     }
@@ -683,7 +671,9 @@ fn timesub(timep: i64, offset: i64, _sp: &TzRule) -> Option<CalendarTimeInternal
 pub fn localsub(sp: &TzRule, t: i64) -> Option<CalendarTimeInternal> {
     // Handle goback/goahead (cyclic timezone rules)
     if sp.timecnt > 0 {
-        if (sp.goback && t < sp.ats[0]) || (sp.goahead && t > sp.ats[sp.timecnt as usize - 1]) {
+        if (sp.goback != 0 && t < sp.ats[0])
+            || (sp.goahead != 0 && t > sp.ats[sp.timecnt as usize - 1])
+        {
             let seconds_raw = if t < sp.ats[0] {
                 sp.ats[0] - t
             } else {
@@ -746,7 +736,7 @@ pub fn localsub(sp: &TzRule, t: i64) -> Option<CalendarTimeInternal> {
     let ttisp = &sp.ttis[i];
 
     let mut result = timesub(t, ttisp.tt_utoff as i64, sp)?;
-    result.tm_isdst = if ttisp.tt_isdst { 1 } else { 0 };
+    result.tm_isdst = i32::from(ttisp.tt_isdst != 0);
 
     // Copy abbreviation
     let desig_idx = ttisp.tt_desigidx as usize;
@@ -829,30 +819,34 @@ fn increment_overflow32(lp: &mut i64, m: i32) -> bool {
 
 /// Matching upstream `time2sub`: binary search for a time_t that produces the
 /// requested broken-down time.
-fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> Option<i64> {
+fn time2sub(
+    sp: &TzRule,
+    tmp_in: &CalendarTimeInternal,
+    do_norm_secs: bool,
+) -> Result<(i64, CalendarTimeInternal), u32> {
     let mut yourtm = tmp_in.clone();
 
     if do_norm_secs {
         if normalize_overflow(&mut yourtm.tm_min, &mut yourtm.tm_sec, SECSPERMIN as i32) {
-            return None;
+            return Err(1);
         }
     }
     if normalize_overflow(&mut yourtm.tm_hour, &mut yourtm.tm_min, MINSPERHOUR as i32) {
-        return None;
+        return Err(1);
     }
     if normalize_overflow(&mut yourtm.tm_mday, &mut yourtm.tm_hour, HOURSPERDAY as i32) {
-        return None;
+        return Err(1);
     }
     let mut y = yourtm.tm_year as i64;
     if normalize_overflow32(&mut y, &mut yourtm.tm_mon, MONSPERYEAR as i32) {
-        return None;
+        return Err(1);
     }
     if increment_overflow32(&mut y, TM_YEAR_BASE as i32) {
-        return None;
+        return Err(1);
     }
     while yourtm.tm_mday <= 0 {
         if increment_overflow32(&mut y, -1) {
-            return None;
+            return Err(1);
         }
         let li = y + if 1 < yourtm.tm_mon { 1 } else { 0 };
         yourtm.tm_mday += YEAR_LENGTHS[is_leap_idx(li)] as i32;
@@ -861,7 +855,7 @@ fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> O
         let li = y + if 1 < yourtm.tm_mon { 1 } else { 0 };
         yourtm.tm_mday -= YEAR_LENGTHS[is_leap_idx(li)] as i32;
         if increment_overflow32(&mut y, 1) {
-            return None;
+            return Err(1);
         }
     }
     loop {
@@ -874,16 +868,16 @@ fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> O
         if yourtm.tm_mon >= MONSPERYEAR as i32 {
             yourtm.tm_mon = 0;
             if increment_overflow32(&mut y, 1) {
-                return None;
+                return Err(1);
             }
         }
     }
 
     if increment_overflow32(&mut y, -(TM_YEAR_BASE as i32)) {
-        return None;
+        return Err(1);
     }
     if y < i32::MIN as i64 || y > i32::MAX as i64 {
-        return None;
+        return Err(1);
     }
     yourtm.tm_year = y as i32;
 
@@ -895,7 +889,7 @@ fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> O
         if (yourtm.tm_sec >= 0 && delta > i32::MAX - yourtm.tm_sec)
             || (yourtm.tm_sec < 0 && delta < i32::MIN - yourtm.tm_sec)
         {
-            return None;
+            return Err(1);
         }
         yourtm.tm_sec += delta;
         saved_seconds = yourtm.tm_sec;
@@ -931,17 +925,17 @@ fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> O
         if dir != 0 {
             if t == lo {
                 if t == TIME_T_MAX {
-                    return None;
+                    return Err(2);
                 }
                 lo = t + 1;
             } else if t == hi {
                 if t == TIME_T_MIN {
-                    return None;
+                    return Err(2);
                 }
                 hi = t - 1;
             }
             if lo > hi {
-                return None;
+                return Err(2);
             }
             if dir > 0 {
                 hi = t;
@@ -953,24 +947,27 @@ fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> O
 
         // Match found. Check DST preference.
         if yourtm.tm_isdst < 0 {
-            // Don't care about DST
-            let final_t = t + saved_seconds as i64;
-            return Some(final_t);
+            let final_t = t.wrapping_add(saved_seconds as i64);
+            return localsub(sp, final_t)
+                .map(|normalized| (final_t, normalized))
+                .ok_or(2);
         }
 
         if let Some(mytm) = localsub(sp, t) {
             if mytm.tm_isdst == yourtm.tm_isdst {
-                let final_t = t + saved_seconds as i64;
-                return Some(final_t);
+                let final_t = t.wrapping_add(saved_seconds as i64);
+                return localsub(sp, final_t)
+                    .map(|normalized| (final_t, normalized))
+                    .ok_or(2);
             }
 
             // Right time, wrong DST type. Hunt for right type.
-            for i in (0..sp.typecnt as usize).rev() {
-                if sp.ttis[i].tt_isdst != (yourtm.tm_isdst != 0) {
+            for i in (0..sp.typecnt.max(0) as usize).rev() {
+                if (sp.ttis[i].tt_isdst != 0) != (yourtm.tm_isdst != 0) {
                     continue;
                 }
-                for j in (0..sp.typecnt as usize).rev() {
-                    if sp.ttis[j].tt_isdst == (yourtm.tm_isdst != 0) {
+                for j in (0..sp.typecnt.max(0) as usize).rev() {
+                    if (sp.ttis[j].tt_isdst != 0) == (yourtm.tm_isdst != 0) {
                         continue;
                     }
                     if sp.ttunspecified(j) {
@@ -979,46 +976,53 @@ fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> O
                     let newt = t + sp.ttis[j].tt_utoff as i64 - sp.ttis[i].tt_utoff as i64;
                     if let Some(mytm2) = localsub(sp, newt) {
                         if tmcomp(&mytm2, &yourtm) == 0 && mytm2.tm_isdst == yourtm.tm_isdst {
-                            let final_t = newt + saved_seconds as i64;
-                            return Some(final_t);
+                            let final_t = newt.wrapping_add(saved_seconds as i64);
+                            return localsub(sp, final_t)
+                                .map(|normalized| (final_t, normalized))
+                                .ok_or(2);
                         }
                     }
                 }
             }
-            return None;
+            return Err(2);
         }
 
-        let final_t = t + saved_seconds as i64;
-        return Some(final_t);
+        let final_t = t.wrapping_add(saved_seconds as i64);
+        return localsub(sp, final_t)
+            .map(|normalized| (final_t, normalized))
+            .ok_or(2);
     }
 }
 
 /// Matching upstream `time2`: try without normalization first, then with.
-fn time2(sp: &TzRule, tmp: &CalendarTimeInternal) -> Option<i64> {
-    time2sub(sp, tmp, false).or_else(|| time2sub(sp, tmp, true))
+fn time2(sp: &TzRule, tmp: &CalendarTimeInternal) -> Result<(i64, CalendarTimeInternal), u32> {
+    time2sub(sp, tmp, false).or_else(|_| time2sub(sp, tmp, true))
 }
 
 /// Matching upstream `time1`: convert broken-down time to time_t.
-pub fn time1(sp: &TzRule, tmp: &CalendarTimeInternal) -> Option<i64> {
-    let mut yourtm = tmp.clone();
-    if yourtm.tm_isdst > 1 {
-        yourtm.tm_isdst = 1;
+fn time1(out_time: &mut i64, tmp: &mut CalendarTimeInternal, sp: &TzRule) -> u32 {
+    if tmp.tm_isdst > 1 {
+        tmp.tm_isdst = 1;
     }
-    if let Some(t) = time2(sp, &yourtm) {
-        return Some(t);
+    let first_result = match time2(sp, tmp) {
+        Ok((time, normalized)) => {
+            *out_time = time;
+            *tmp = normalized;
+            return 0;
+        }
+        Err(result) => result,
+    };
+    if tmp.tm_isdst < 0 {
+        return first_result;
     }
-    if yourtm.tm_isdst < 0 {
-        return None;
-    }
-
-    // Try adjusting for DST/standard type mismatch
-    let mut seen = vec![false; sp.typecnt as usize];
-    let mut nseen = 0usize;
-    let mut type_list = vec![0u8; sp.typecnt as usize];
 
     if sp.timecnt < 1 {
-        return None;
+        return 2;
     }
+
+    let mut seen = [false; TZ_MAX_TYPES];
+    let mut nseen = 0usize;
+    let mut type_list = [0u8; TZ_MAX_TYPES];
 
     for i in (0..sp.timecnt as usize).rev() {
         let ty = sp.types[i] as usize;
@@ -1030,29 +1034,38 @@ pub fn time1(sp: &TzRule, tmp: &CalendarTimeInternal) -> Option<i64> {
     }
 
     if nseen < 1 {
-        return None;
+        return 2;
     }
 
     for sameind in 0..nseen {
         let samei = type_list[sameind] as usize;
-        if sp.ttis[samei].tt_isdst != (yourtm.tm_isdst != 0) {
+        if (sp.ttis[samei].tt_isdst != 0) != (tmp.tm_isdst != 0) {
             continue;
         }
         for otherind in 0..nseen {
             let otheri = type_list[otherind] as usize;
-            if sp.ttis[otheri].tt_isdst == (yourtm.tm_isdst != 0) {
+            if (sp.ttis[otheri].tt_isdst != 0) == (tmp.tm_isdst != 0) {
                 continue;
             }
-            let mut adjusted = yourtm.clone();
-            adjusted.tm_sec += sp.ttis[otheri].tt_utoff - sp.ttis[samei].tt_utoff;
-            adjusted.tm_isdst = if adjusted.tm_isdst != 0 { 0 } else { 1 };
-            if let Some(t) = time2(sp, &adjusted) {
-                return Some(t);
+            let adjustment = sp.ttis[otheri].tt_utoff - sp.ttis[samei].tt_utoff;
+            tmp.tm_sec = tmp.tm_sec.wrapping_add(adjustment);
+            tmp.tm_isdst = i32::from(tmp.tm_isdst == 0);
+            if let Ok((time, normalized)) = time2(sp, tmp) {
+                *out_time = time;
+                *tmp = normalized;
+                return 0;
             }
+            tmp.tm_sec = tmp.tm_sec.wrapping_sub(adjustment);
+            tmp.tm_isdst = i32::from(tmp.tm_isdst == 0);
         }
     }
 
-    None
+    2
+}
+
+/// Matching upstream `mktime_tzname`.
+pub fn mktime_tzname(out_time: &mut i64, sp: &TzRule, tmp: &mut CalendarTimeInternal) -> u32 {
+    time1(out_time, tmp, sp)
 }
 
 /// Minimal POSIX TZ string parser for extending transitions beyond the TZif data.
@@ -1075,23 +1088,17 @@ pub fn parse_posix_tz(tz_str: &[u8]) -> Option<TzRule> {
 
     if rest.is_empty() {
         // No DST: single type
-        let mut rule = TzRule::default();
-        rule.timecnt = 0;
+        let mut rule = TzRule::zeroed();
         rule.typecnt = 1;
-        rule.ttis = vec![TtInfo {
+        rule.ttis[0] = TtInfo {
             tt_utoff: -stdoffset as i32,
-            tt_isdst: false,
+            tt_isdst: 0,
             tt_desigidx: 0,
             ..TtInfo::default()
-        }];
+        };
 
-        let mut chars = vec![0u8; stdname.len() + 1 + CHARS_EXTRA];
-        chars[..stdname.len()].copy_from_slice(stdname.as_bytes());
-        rule.chars = chars;
+        rule.chars[..stdname.len()].copy_from_slice(stdname.as_bytes());
         rule.charcnt = (stdname.len() + 1) as i32;
-        rule.default_type = 0;
-        rule.ats = Vec::new();
-        rule.types = Vec::new();
         return Some(rule);
     }
 
@@ -1126,47 +1133,26 @@ pub fn parse_posix_tz(tz_str: &[u8]) -> Option<TzRule> {
     let (end_rule, _) = parse_tz_rule(&rest[1..])?;
 
     // Build transitions for a wide range of years (matching upstream behavior)
-    let mut rule = TzRule {
-        timecnt: 0,
-        typecnt: 2,
-        charcnt: 0,
-        goback: false,
-        goahead: false,
-        ats: Vec::new(),
-        types: Vec::new(),
-        ttis: vec![
-            TtInfo {
-                tt_utoff: -stdoffset as i32,
-                tt_isdst: false,
-                tt_desigidx: 0,
-                ..TtInfo::default()
-            },
-            TtInfo {
-                tt_utoff: -dstoffset as i32,
-                tt_isdst: true,
-                tt_desigidx: stdname.len() as i32 + 1,
-                ..TtInfo::default()
-            },
-        ],
-        chars: Vec::new(),
-        default_type: 0,
+    let mut rule = TzRule::zeroed();
+    rule.typecnt = 2;
+    rule.ttis[0] = TtInfo {
+        tt_utoff: -stdoffset as i32,
+        tt_isdst: 0,
+        tt_desigidx: 0,
+        ..TtInfo::default()
+    };
+    rule.ttis[1] = TtInfo {
+        tt_utoff: -dstoffset as i32,
+        tt_isdst: 1,
+        tt_desigidx: stdname.len() as i32 + 1,
+        ..TtInfo::default()
     };
 
     // Build abbreviation chars
-    let mut chars = Vec::new();
-    chars.extend_from_slice(stdname.as_bytes());
-    chars.push(0);
-    chars.extend_from_slice(dstname.as_bytes());
-    chars.push(0);
-    while chars.len() < chars.len() + CHARS_EXTRA {
-        // Ensure CHARS_EXTRA trailing zeros
-        break;
-    }
-    for _ in 0..CHARS_EXTRA {
-        chars.push(0);
-    }
+    rule.chars[..stdname.len()].copy_from_slice(stdname.as_bytes());
+    let dst_start = stdname.len() + 1;
+    rule.chars[dst_start..dst_start + dstname.len()].copy_from_slice(dstname.as_bytes());
     rule.charcnt = (stdname.len() + 1 + dstname.len() + 1) as i32;
-    rule.chars = chars;
 
     // Generate transitions for years around the current era
     let yearbeg = EPOCH_YEAR - YEARSPERREPEAT / 2;
@@ -1200,16 +1186,16 @@ pub fn parse_posix_tz(tz_str: &[u8]) -> Option<TzRule> {
             (starttime, 1u8, endtime, 0u8)
         };
 
-        if rule.ats.len() < TZ_MAX_TIMES {
+        if (rule.timecnt as usize) < TZ_MAX_TIMES {
             let at = janfirst.wrapping_add(t1);
-            rule.ats.push(at);
-            rule.types.push(t1_type);
+            rule.ats[rule.timecnt as usize] = at;
+            rule.types[rule.timecnt as usize] = t1_type;
             rule.timecnt += 1;
         }
-        if rule.ats.len() < TZ_MAX_TIMES {
+        if (rule.timecnt as usize) < TZ_MAX_TIMES {
             let at = janfirst.wrapping_add(t2);
-            rule.ats.push(at);
-            rule.types.push(t2_type);
+            rule.ats[rule.timecnt as usize] = at;
+            rule.types[rule.timecnt as usize] = t2_type;
             rule.timecnt += 1;
         }
 
@@ -1399,5 +1385,87 @@ fn parse_tz_rule(s: &str) -> Option<(PosixTzRule, &str)> {
         Some((rule, rest2))
     } else {
         Some((rule, rest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TtInfo, TzRule};
+    use crate::file_sys::system_archive::time_zone_binary::time_zone_binary;
+
+    #[test]
+    fn rule_binary_layout_matches_eden() {
+        assert_eq!(core::mem::size_of::<TtInfo>(), 0x10);
+        assert_eq!(core::mem::offset_of!(TtInfo, tt_utoff), 0x0);
+        assert_eq!(core::mem::offset_of!(TtInfo, tt_isdst), 0x4);
+        assert_eq!(core::mem::offset_of!(TtInfo, tt_desigidx), 0x8);
+        assert_eq!(core::mem::offset_of!(TtInfo, tt_ttisstd), 0xC);
+        assert_eq!(core::mem::offset_of!(TtInfo, tt_ttisut), 0xD);
+
+        assert_eq!(core::mem::size_of::<TzRule>(), 0x4000);
+        assert_eq!(core::mem::offset_of!(TzRule, timecnt), 0x0);
+        assert_eq!(core::mem::offset_of!(TzRule, ats), 0x10);
+        assert_eq!(core::mem::offset_of!(TzRule, types), 0x1F50);
+        assert_eq!(core::mem::offset_of!(TzRule, ttis), 0x2338);
+        assert_eq!(core::mem::offset_of!(TzRule, chars), 0x2B38);
+        assert_eq!(core::mem::offset_of!(TzRule, default_type), 0x2D38);
+        assert_eq!(core::mem::offset_of!(TzRule, _padding1), 0x2D3C);
+    }
+
+    #[test]
+    fn rule_ipc_bytes_are_deterministic_and_support_unaligned_input() {
+        let rule = TzRule::default();
+        assert_eq!(rule.as_bytes().len(), 0x4000);
+        assert!(rule._padding0.iter().all(|byte| *byte == 0));
+        assert!(rule._padding1.iter().all(|byte| *byte == 0));
+        assert!(rule.ttis[0]._padding0.iter().all(|byte| *byte == 0));
+        assert!(rule.ttis[0]._padding1.iter().all(|byte| *byte == 0));
+
+        let mut unaligned = vec![0xFF; 0x4001];
+        unaligned[1..].copy_from_slice(rule.as_bytes());
+        let decoded = TzRule::from_bytes(&unaligned[1..]).expect("fixed-size rule");
+        assert_eq!(decoded.timecnt, rule.timecnt);
+        assert_eq!(decoded.typecnt, rule.typecnt);
+        assert_eq!(&decoded.chars[..4], &[0; 4]);
+    }
+
+    #[test]
+    fn in_large_data_zero_fills_after_the_available_prefix() {
+        let bytes = 2i32.to_ne_bytes();
+        let rule = TzRule::from_prefix_bytes(&bytes);
+
+        assert_eq!(rule.timecnt, 2);
+        assert!(rule.as_bytes()[bytes.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn parses_switch_header_counter_order() {
+        let mut binary = vec![0u8; 0x2C + 6 + 4 + 1];
+        binary[..5].copy_from_slice(b"TZif2");
+        binary[20..24].copy_from_slice(&1i32.to_be_bytes()); // ttisutcnt
+        binary[36..40].copy_from_slice(&1i32.to_be_bytes()); // typecnt
+        binary[40..44].copy_from_slice(&4i32.to_be_bytes()); // charcnt
+        binary[0x2C + 6..0x2C + 10].copy_from_slice(b"GMT\0");
+        binary[0x2C + 10] = 1;
+
+        let rule = TzRule::parse(&binary).expect("Switch rule with ttisut flag");
+        assert_eq!(rule.ttis[0].tt_ttisstd, 0);
+        assert_eq!(rule.ttis[0].tt_ttisut, 1);
+    }
+
+    #[test]
+    fn parses_switch_single_block_tzif2_rule() {
+        let archive = time_zone_binary().expect("embedded timezone archive");
+        let binary = archive
+            .get_file_relative("/zoneinfo/Etc/GMT")
+            .expect("Etc/GMT rule")
+            .read_all_bytes();
+
+        let rule = TzRule::parse(&binary).expect("Switch TZif2 rule must parse");
+        assert_eq!(rule.timecnt, 0);
+        assert_eq!(rule.typecnt, 1);
+        assert_eq!(rule.charcnt, 4);
+        assert_eq!(rule.ttis[0].tt_utoff, 0);
+        assert_eq!(&rule.chars[..4], b"GMT\0");
     }
 }

@@ -23,50 +23,31 @@ use crate::dma_pusher::CommandList;
 ///
 /// Corresponds to `Tegra::Control::Scheduler` in upstream.
 ///
-/// Stores a raw pointer to the owning GPU, matching upstream `GPU& gpu_`.
-/// The Gpu outlives the Scheduler (Gpu owns Scheduler).
 pub struct Scheduler {
-    channels: HashMap<i32, Arc<Mutex<ChannelState>>>,
-    scheduling_guard: Mutex<()>,
-    /// Raw pointer to owning GPU. Matches upstream `GPU& gpu_`.
-    /// Safety: Gpu outlives Scheduler (Gpu owns Scheduler).
-    gpu: *const crate::gpu::Gpu,
+    /// Combines upstream's `channels` map and `scheduling_guard`: the mutex
+    /// protects the map for the same duration as Eden's scheduling guard.
+    channels: Mutex<HashMap<i32, Arc<Mutex<ChannelState>>>>,
 }
 
-// Safety: Scheduler is only accessed from the GPU thread and under locks.
-// The gpu pointer is valid for the lifetime of the Scheduler.
-unsafe impl Send for Scheduler {}
-unsafe impl Sync for Scheduler {}
-
 impl Scheduler {
-    /// Create a new scheduler bound to the given GPU.
-    ///
-    /// Corresponds to `Scheduler::Scheduler(GPU& gpu_)`.
-    ///
-    /// # Safety
-    /// `gpu` must remain valid for the lifetime of this Scheduler.
-    pub unsafe fn new(gpu: *const crate::gpu::Gpu) -> Self {
+    pub fn new() -> Self {
         Self {
-            channels: HashMap::new(),
-            scheduling_guard: Mutex::new(()),
-            gpu,
+            channels: Mutex::new(HashMap::new()),
         }
     }
 
     /// Push a command list to a channel for execution.
     ///
-    /// Corresponds to `Scheduler::Push(s32 channel, CommandList&& entries)`.
-    pub fn push(&self, channel: i32, entries: CommandList) {
+    /// Corresponds to `Scheduler::Push(GPU&, s32, CommandList&&)`.
+    pub fn push(&self, gpu: &crate::gpu::Gpu, channel: i32, entries: CommandList) {
         let channel_state = {
-            let _lock = self.scheduling_guard.lock();
+            let channels = self.channels.lock();
             let channel_state = Arc::clone(
-                self.channels
+                channels
                     .get(&channel)
                     .expect("Scheduler::push: channel not found"),
             );
 
-            // Safety: gpu pointer is valid for the lifetime of the Scheduler.
-            let gpu = unsafe { &*self.gpu };
             let bind_id = channel_state.lock().bind_id;
             gpu.bind_channel(bind_id);
             channel_state
@@ -84,27 +65,23 @@ impl Scheduler {
     /// Register a channel with the scheduler.
     ///
     /// Corresponds to `Scheduler::DeclareChannel(shared_ptr<ChannelState>)`.
-    pub fn declare_channel(&mut self, new_channel: Arc<Mutex<ChannelState>>) {
+    pub fn declare_channel(&self, new_channel: Arc<Mutex<ChannelState>>) {
         let bind_id = new_channel.lock().bind_id;
-        let _lock = self.scheduling_guard.lock();
-        self.channels.insert(bind_id, new_channel);
+        self.channels.lock().insert(bind_id, new_channel);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syncpoint::SyncpointManager;
 
     #[test]
     fn test_declare_channel() {
-        let sp = Arc::new(SyncpointManager::new());
-        let gpu = crate::gpu::Gpu::new(false, false);
-        let mut sched = unsafe { Scheduler::new(&gpu as *const _) };
+        let sched = Scheduler::new();
 
         let cs = Arc::new(Mutex::new(ChannelState::new(5)));
         sched.declare_channel(cs);
 
-        assert!(sched.channels.contains_key(&5));
+        assert!(sched.channels.lock().contains_key(&5));
     }
 }

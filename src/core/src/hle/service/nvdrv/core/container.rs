@@ -154,6 +154,7 @@ impl ContainerSessionStore {
 }
 
 /// Container manages syncpoints on the host and provides access to NvMap and SyncpointManager.
+#[derive(Clone)]
 pub struct Container {
     file: Arc<NvMap>,
     manager: Arc<SyncpointManager>,
@@ -429,15 +430,11 @@ impl Container {
             .syncpts_accumulated
             .push_back(syncpoint);
     }
-
-    pub fn host1x_device_file_handle(&self) -> Arc<Mutex<Host1xDeviceFileData>> {
-        Arc::clone(&self.device_file_data)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use super::Container;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
@@ -466,5 +463,19 @@ mod tests {
         let session = container.open_session(&process);
 
         assert_eq!(container.sessions.session_asid(session), None);
+    }
+
+    #[test]
+    fn cloned_container_handle_preserves_session_ownership() {
+        let container = Container::new();
+        let shared_handle = container.clone();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let session = container.open_session(&process);
+
+        let resolved = shared_handle
+            .get_session_process(session)
+            .expect("the shared container handle must see the active session");
+
+        assert!(Arc::ptr_eq(&resolved, &process));
     }
 }

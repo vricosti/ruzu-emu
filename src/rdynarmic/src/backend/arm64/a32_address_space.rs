@@ -358,7 +358,12 @@ extern "C" fn a32_arm64_exception_raised(ctx: *mut A32CallbackContext, pc: u64, 
     a32_callbacks::exception_raised(context.callbacks_mut(), pc, exception);
 }
 
-extern "C" fn a32_arm64_isb_raised(_ctx: *mut A32CallbackContext) {}
+extern "C" fn a32_arm64_isb_raised(ctx: *mut A32CallbackContext) {
+    let context = unsafe { &mut *ctx };
+    context
+        .callbacks_mut()
+        .instruction_synchronization_barrier_raised();
+}
 
 extern "C" fn a32_arm64_add_ticks(ctx: *mut A32CallbackContext, ticks: u64) {
     let context = unsafe { &mut *ctx };

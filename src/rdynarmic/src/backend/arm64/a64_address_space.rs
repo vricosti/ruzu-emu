@@ -229,7 +229,12 @@ extern "C" fn a64_arm64_exception_raised(ctx: *mut A64CallbackContext, pc: u64, 
     context.callbacks_mut().exception_raised(pc, exception);
 }
 
-extern "C" fn a64_arm64_isb_raised(_ctx: *mut A64CallbackContext) {}
+extern "C" fn a64_arm64_isb_raised(ctx: *mut A64CallbackContext) {
+    let context = unsafe { &mut *ctx };
+    context
+        .callbacks_mut()
+        .instruction_synchronization_barrier_raised();
+}
 
 extern "C" fn a64_arm64_instruction_cache_operation(
     ctx: *mut A64CallbackContext,

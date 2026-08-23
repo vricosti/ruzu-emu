@@ -287,8 +287,6 @@ impl KServerSession {
         dst_page_table: &KProcessPageTable,
         src_page_table: &KProcessPageTable,
     ) -> u32 {
-        let mut src_words = src_words.to_vec();
-        let src_message = MessageBuffer::new(&mut src_words);
         let src_end_offset = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
             src_header,
             src_special_header,
@@ -392,8 +390,6 @@ impl KServerSession {
         dst_page_table: &KProcessPageTable,
         _src_page_table: &KProcessPageTable,
     ) -> u32 {
-        let mut src_words = src_words.to_vec();
-        let src_message = MessageBuffer::new(&mut src_words);
         let src_end_offset = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
             src_header,
             src_special_header,
@@ -910,6 +906,7 @@ impl KServerSession {
 
         let mut message = MessageBuffer::new(dst_words);
         let mut offset = crate::hle::kernel::message_buffer::MessageBuffer::get_special_data_index(
+            &header,
             &special_header,
         );
         if special_header.get_has_process_id() {
@@ -985,6 +982,7 @@ impl KServerSession {
         let src_message = MessageBuffer::new(&mut src_words);
         let mut dst_message = MessageBuffer::new(dst_words);
         let mut offset = crate::hle::kernel::message_buffer::MessageBuffer::get_special_data_index(
+            src_header,
             src_special_header,
         );
 
@@ -1748,6 +1746,7 @@ impl KServerSession {
             let message = MessageBuffer::new(&mut words);
             let mut offset =
                 crate::hle::kernel::message_buffer::MessageBuffer::get_special_data_index(
+                    &header,
                     &special_header,
                 );
             if special_header.get_has_process_id() {
@@ -2960,7 +2959,6 @@ mod tests {
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::kernel::k_scheduler::KScheduler;
-    use crate::hle::kernel::k_session::KSession;
     use crate::hle::kernel::k_session_request::KSessionRequest;
     use crate::hle::kernel::k_thread::{KThread, ThreadState, ThreadWaitReasonForDebugging};
     use crate::memory::memory::Memory;
@@ -5156,7 +5154,7 @@ mod tests {
 
     #[test]
     fn process_send_message_raw_data_from_user_source_uses_page_table_copy() {
-        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
+        let page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
 
@@ -6763,7 +6761,7 @@ mod tests {
                 1,
                 crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
             );
-            let mut offset = message.set_message_header(&header);
+            let offset = message.set_message_header(&header);
             let _ = message.set(offset, &[0xDEAD_BEEF]);
         }
         let valid_bytes: Vec<u8> = valid_words[..3]

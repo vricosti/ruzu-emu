@@ -12,7 +12,6 @@ use super::core::container::SessionId;
 use super::nvdata::*;
 use super::nvdrv::Module;
 use crate::hle::kernel::k_process::ProcessLock;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -172,7 +171,7 @@ impl NvdrvInterface {
         fd: DeviceFD,
         command: Ioctl,
         input: &[u8],
-        output: &mut [u8],
+        output_size: usize,
     ) -> NvResult {
         if Self::should_trace_lifecycle() {
             log::info!(
@@ -190,6 +189,9 @@ impl NvdrvInterface {
             return NvResult::NotInitialized;
         }
 
+        self.output_buffer.resize(output_size, 0);
+        self.output_buffer.fill(0);
+
         if Self::should_trace_ioctl_payload(command) {
             log::trace!(
                 "Ioctl1 input fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
@@ -199,7 +201,9 @@ impl NvdrvInterface {
                 Self::format_prefix_hex(input, 0x40)
             );
         }
-        let nv_result = self.nvdrv.ioctl1(fd, command, input, output);
+        let nv_result = self
+            .nvdrv
+            .ioctl1(fd, command, input, &mut self.output_buffer);
         log::trace!(
             "Ioctl1 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
             fd,
@@ -211,9 +215,9 @@ impl NvdrvInterface {
                 "[IOCTL_FP] fd={} ioctl=0x{:08X} out_sz=0x{:x} nv_result=0x{:x} head={}",
                 fd,
                 command.raw,
-                output.len(),
+                self.output_buffer.len(),
                 nv_result as u32,
-                Self::format_ioctl_fp_hex(output)
+                Self::format_ioctl_fp_hex(&self.output_buffer)
             );
         }
         if Self::should_trace_ioctl_payload(command) {
@@ -221,16 +225,16 @@ impl NvdrvInterface {
                 "Ioctl1 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                 fd,
                 command.raw,
-                output.len(),
-                Self::format_prefix_hex(output, 0x40)
+                self.output_buffer.len(),
+                Self::format_prefix_hex(&self.output_buffer, 0x40)
             );
             if std::env::var_os("RUZU_IOCTL_PAYLOAD_DUMP").is_some() {
                 log::info!(
                     "IOCTL1_OUTPUT fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                     fd,
                     command.raw,
-                    output.len(),
-                    Self::format_prefix_hex(output, 0x40)
+                    self.output_buffer.len(),
+                    Self::format_prefix_hex(&self.output_buffer, 0x40)
                 );
             }
         }
@@ -244,7 +248,7 @@ impl NvdrvInterface {
         command: Ioctl,
         input: &[u8],
         inline_input: &[u8],
-        output: &mut [u8],
+        output_size: usize,
     ) -> NvResult {
         if Self::should_trace_lifecycle() {
             log::info!(
@@ -262,6 +266,9 @@ impl NvdrvInterface {
             return NvResult::NotInitialized;
         }
 
+        self.output_buffer.resize(output_size, 0);
+        self.output_buffer.fill(0);
+
         if Self::should_trace_ioctl_payload(command) {
             log::trace!(
                 "Ioctl2 input fd={} ioctl=0x{:08X} len0=0x{:X} len1=0x{:X} bytes0=[{}] bytes1=[{}]",
@@ -273,7 +280,9 @@ impl NvdrvInterface {
                 Self::format_prefix_hex(inline_input, 0x40)
             );
         }
-        let nv_result = self.nvdrv.ioctl2(fd, command, input, inline_input, output);
+        let nv_result =
+            self.nvdrv
+                .ioctl2(fd, command, input, inline_input, &mut self.output_buffer);
         log::trace!(
             "Ioctl2 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
             fd,
@@ -285,8 +294,8 @@ impl NvdrvInterface {
                 "Ioctl2 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                 fd,
                 command.raw,
-                output.len(),
-                Self::format_prefix_hex(output, 0x40)
+                self.output_buffer.len(),
+                Self::format_prefix_hex(&self.output_buffer, 0x40)
             );
         }
         nv_result
@@ -298,8 +307,8 @@ impl NvdrvInterface {
         fd: DeviceFD,
         command: Ioctl,
         input: &[u8],
-        output: &mut [u8],
-        inline_output: &mut [u8],
+        output_size: usize,
+        inline_output_size: usize,
     ) -> NvResult {
         if Self::should_trace_lifecycle() {
             log::info!(
@@ -317,6 +326,11 @@ impl NvdrvInterface {
             return NvResult::NotInitialized;
         }
 
+        self.output_buffer.resize(output_size, 0);
+        self.output_buffer.fill(0);
+        self.inline_output_buffer.resize(inline_output_size, 0);
+        self.inline_output_buffer.fill(0);
+
         if Self::should_trace_ioctl_payload(command) {
             log::trace!(
                 "Ioctl3 input fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
@@ -326,7 +340,13 @@ impl NvdrvInterface {
                 Self::format_prefix_hex(input, 0x40)
             );
         }
-        let nv_result = self.nvdrv.ioctl3(fd, command, input, output, inline_output);
+        let nv_result = self.nvdrv.ioctl3(
+            fd,
+            command,
+            input,
+            &mut self.output_buffer,
+            &mut self.inline_output_buffer,
+        );
         log::trace!(
             "Ioctl3 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
             fd,
@@ -338,10 +358,10 @@ impl NvdrvInterface {
                 "Ioctl3 output fd={} ioctl=0x{:08X} len0=0x{:X} len1=0x{:X} bytes0=[{}] bytes1=[{}]",
                 fd,
                 command.raw,
-                output.len(),
-                inline_output.len(),
-                Self::format_prefix_hex(output, 0x40),
-                Self::format_prefix_hex(inline_output, 0x40)
+                self.output_buffer.len(),
+                self.inline_output_buffer.len(),
+                Self::format_prefix_hex(&self.output_buffer, 0x40),
+                Self::format_prefix_hex(&self.inline_output_buffer, 0x40)
             );
         }
         nv_result
@@ -444,17 +464,6 @@ impl NvdrvInterface {
         }
 
         result
-    }
-
-    pub fn register_query_event_owner(
-        &self,
-        fd: DeviceFD,
-        event_id: u32,
-        process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
-    ) {
-        self.nvdrv
-            .register_query_event_owner(fd, event_id, process, scheduler);
     }
 
     /// Port of NVDRV::SetAruid
@@ -603,7 +612,6 @@ impl NvdrvService {
 
         let input = ctx.read_buffer(0);
         let write_size = ctx.get_write_buffer_size(0);
-        let mut output = vec![0; write_size];
         record_nvdrv_ioctl_history(ctx, 1, fd, command, &input, write_size, 0);
         let nvmap_alloc_address = if command.raw == 0xC020_0104 {
             NvdrvInterface::read_le_u64_prefix(&input, 24)
@@ -701,11 +709,9 @@ impl NvdrvService {
         } else {
             None
         };
-        let nv_result = service
-            .interface
-            .lock()
-            .unwrap()
-            .ioctl1(fd, command, &input, &mut output);
+        let mut interface = service.interface.lock().unwrap();
+        let nv_result = interface.ioctl1(fd, command, &input, write_size);
+        let output = &interface.output_buffer;
         record_nvdrv_ioctl_history_result(ctx, 1, fd, command, nv_result, &output, &[]);
         if let Some(t0) = _ioctl_t0 {
             record_nvdrv_ioctl(command.raw, fd, 1, t0.elapsed());
@@ -832,36 +838,24 @@ impl NvdrvService {
 
         let input = ctx.read_buffer(0);
         let inline_input = ctx.read_buffer(1);
-        let mut output = vec![0; ctx.get_write_buffer_size(0)];
-        record_nvdrv_ioctl_history(
-            ctx,
-            2,
-            fd,
-            command,
-            &input,
-            output.len(),
-            inline_input.len(),
-        );
+        let write_size = ctx.get_write_buffer_size(0);
+        record_nvdrv_ioctl_history(ctx, 2, fd, command, &input, write_size, inline_input.len());
         log::trace!(
             "NVDRV::ioctl2_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} inline_in_len=0x{:X} out_len=0x{:X}",
             fd,
             command.raw,
             input.len(),
             inline_input.len(),
-            output.len()
+            write_size
         );
         let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        let nv_result = service.interface.lock().unwrap().ioctl2(
-            fd,
-            command,
-            &input,
-            &inline_input,
-            &mut output,
-        );
+        let mut interface = service.interface.lock().unwrap();
+        let nv_result = interface.ioctl2(fd, command, &input, &inline_input, write_size);
+        let output = &interface.output_buffer;
         record_nvdrv_ioctl_history_result(ctx, 2, fd, command, nv_result, &output, &[]);
         if let Some(t0) = _ioctl_t0 {
             record_nvdrv_ioctl(command.raw, fd, 2, t0.elapsed());
@@ -902,37 +896,26 @@ impl NvdrvService {
         }
 
         let input = ctx.read_buffer(0);
-        let mut output = vec![0; ctx.get_write_buffer_size(0)];
-        let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
-        record_nvdrv_ioctl_history(
-            ctx,
-            3,
-            fd,
-            command,
-            &input,
-            output.len(),
-            inline_output.len(),
-        );
+        let write_size = ctx.get_write_buffer_size(0);
+        let inline_write_size = ctx.get_write_buffer_size(1);
+        record_nvdrv_ioctl_history(ctx, 3, fd, command, &input, write_size, inline_write_size);
         log::trace!(
             "NVDRV::ioctl3_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X} inline_out_len=0x{:X}",
             fd,
             command.raw,
             input.len(),
-            output.len(),
-            inline_output.len()
+            write_size,
+            inline_write_size
         );
         let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        let nv_result = service.interface.lock().unwrap().ioctl3(
-            fd,
-            command,
-            &input,
-            &mut output,
-            &mut inline_output,
-        );
+        let mut interface = service.interface.lock().unwrap();
+        let nv_result = interface.ioctl3(fd, command, &input, write_size, inline_write_size);
+        let output = &interface.output_buffer;
+        let inline_output = &interface.inline_output_buffer;
         record_nvdrv_ioctl_history_result(ctx, 3, fd, command, nv_result, &output, &inline_output);
         if let Some(t0) = _ioctl_t0 {
             record_nvdrv_ioctl(command.raw, fd, 3, t0.elapsed());
@@ -1044,19 +1027,6 @@ impl NvdrvService {
         let event_id = rp.pop_u32();
         let interface = service.interface.lock().unwrap();
         let (nv_result, maybe_event) = interface.query_event(fd, event_id);
-        if maybe_event.is_some() {
-            if let Some(thread) = ctx.get_thread() {
-                let owner = {
-                    let thread_guard = thread.lock().unwrap();
-                    let process = thread_guard.parent.as_ref().and_then(|p| p.upgrade());
-                    let scheduler = thread_guard.scheduler.as_ref().and_then(|s| s.upgrade());
-                    process.zip(scheduler)
-                };
-                if let Some((process, scheduler)) = owner {
-                    interface.register_query_event_owner(fd, event_id, process, scheduler);
-                }
-            }
-        }
         drop(interface);
         match (nv_result, maybe_event) {
             (NvResult::Success, Some(event)) => {
@@ -1428,5 +1398,30 @@ pub fn dump_nvdrv_ioctl_profile() {
             e.total_ns as f64 / e.count as f64 / 1e3,
             e.max_ns as f64 / 1e3,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ioctl, Module, NvResult, NvdrvInterface};
+    use crate::core::{System, SystemRef};
+
+    #[test]
+    fn ioctl_output_buffers_are_service_owned_and_zeroed() {
+        let system = System::new_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let mut interface = NvdrvInterface::new(module);
+        interface.is_initialized = true;
+        interface.output_buffer = vec![0xA5; 16];
+        interface.inline_output_buffer = vec![0x5A; 16];
+
+        assert_eq!(
+            interface.ioctl3(-1, Ioctl { raw: 0 }, &[], 8, 4),
+            NvResult::InvalidState
+        );
+        assert_eq!(interface.output_buffer, vec![0; 8]);
+        assert_eq!(interface.inline_output_buffer, vec![0; 4]);
+
+        std::mem::forget(system);
     }
 }

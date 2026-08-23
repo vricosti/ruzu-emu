@@ -19,6 +19,22 @@ use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::ns::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+fn copy_display_version(version: Option<&str>) -> [u8; 16] {
+    let mut display_version = [0u8; 16];
+
+    if let Some(version) = version {
+        let version = version.as_bytes();
+        let copy_size = version.len().min(display_version.len());
+        display_version[..copy_size].copy_from_slice(&version[..copy_size]);
+    } else {
+        const DEFAULT_VERSION: &[u8] = b"1.0.0\0";
+        display_version[..DEFAULT_VERSION.len()].copy_from_slice(DEFAULT_VERSION);
+    }
+
+    display_version[15] = 0;
+    display_version
+}
+
 /// IPC command table for IApplicationFunctions:
 /// - 1: PopLaunchParameter
 /// - 10: CreateApplicationAndPushAndRequestToStart (unimplemented)
@@ -307,6 +323,15 @@ impl IApplicationFunctions {
         read_only.convert_application_language_to_language_code(application_language)
     }
 
+    /// Port of `IApplicationFunctions::GetDisplayVersion`.
+    fn get_display_version(&self) -> [u8; 16] {
+        let program_id = self.applet.lock().unwrap().program_id;
+        let metadata =
+            PatchManager::get_metadata_from_base_or_update(self.system.get(), program_id).0;
+        let version = metadata.as_ref().map(|nacp| nacp.get_version_string());
+        copy_display_version(version.as_deref())
+    }
+
     /// Port of IApplicationFunctions::PrepareForJit
     pub fn prepare_for_jit(&self) {
         log::debug!("PrepareForJit called");
@@ -482,13 +507,7 @@ impl IApplicationFunctions {
     fn get_display_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
-
-        // Try to read version from NACP metadata.
-        // For now, default to "1.0.0" matching upstream fallback.
-        let mut version_bytes = [0u8; 16];
-        let default_version = b"1.0.0\0";
-        version_bytes[..default_version.len()].copy_from_slice(default_version);
-        version_bytes[15] = 0; // ensure null termination
+        let version_bytes = service.get_display_version();
 
         log::info!(
             "GetDisplayVersion: returning '{}'",
@@ -799,5 +818,21 @@ mod tests {
         assert_eq!(ctx.cmd_buf[9], 0);
         assert_eq!(ctx.cmd_buf[10], 0);
         assert_eq!(ctx.cmd_buf[11], 0);
+    }
+
+    #[test]
+    fn display_version_defaults_when_control_metadata_is_absent() {
+        assert_eq!(
+            copy_display_version(None),
+            [b'1', b'.', b'0', b'.', b'0', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn display_version_is_bounded_and_null_terminated() {
+        assert_eq!(
+            copy_display_version(Some("1234567890abcdef-more")),
+            *b"1234567890abcde\0"
+        );
     }
 }

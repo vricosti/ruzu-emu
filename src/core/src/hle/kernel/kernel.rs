@@ -1872,6 +1872,10 @@ pub struct KernelCore {
     /// Physical memory manager. Upstream: `Impl::memory_manager`.
     memory_manager: KMemoryManager,
 
+    /// Kernel-owned shared memory exposed by the platform font services.
+    /// Upstream: `KernelCore::Impl::font_shared_mem`.
+    font_shared_mem: Option<(u64, Arc<KSharedMemory>)>,
+
     /// Kernel-owned shared memory exposed by the IRS service.
     /// Upstream: `KernelCore::Impl::irs_shared_mem`.
     irs_shared_mem: Option<(u64, Arc<KSharedMemory>)>,
@@ -1991,6 +1995,7 @@ impl KernelCore {
             registered_in_use_objects: Mutex::new(Vec::new()),
 
             memory_manager: KMemoryManager::new(),
+            font_shared_mem: None,
             irs_shared_mem: None,
             system_resource_limit: None,
             memory_block_slab_manager: None,
@@ -2506,6 +2511,7 @@ impl KernelCore {
         self.host_service_processes.lock().unwrap().clear();
         self.process_list.lock().unwrap().clear();
         self.terminating_processes.lock().unwrap().clear();
+        self.font_shared_mem = None;
         self.irs_shared_mem = None;
 
         // Upstream's thread/process Close() chain leaves no objects in the
@@ -3281,6 +3287,44 @@ impl KernelCore {
         &mut self.memory_manager
     }
 
+    /// Initialize the kernel-owned shared font memory.
+    ///
+    /// This is the font portion of upstream
+    /// `KernelCore::Impl::InitializeHackSharedMemory`: the object is allocated
+    /// once by the kernel, has no owner mapping, and is exposed read-only to
+    /// user processes.
+    pub fn initialize_font_shared_memory(&mut self, device_memory: &DeviceMemory) -> ResultCode {
+        const FONT_SHARED_MEMORY_SIZE: usize = 0x1100000;
+
+        if self.font_shared_mem.is_some() {
+            return crate::hle::result::RESULT_SUCCESS;
+        }
+
+        let mut shared_memory = KSharedMemory::new();
+        let result = shared_memory.initialize(
+            device_memory,
+            &mut self.memory_manager,
+            MemoryPermission::None,
+            MemoryPermission::Read,
+            FONT_SHARED_MEMORY_SIZE,
+        );
+        if result.is_error() {
+            return result;
+        }
+
+        let object_id = self.create_new_object_id() as u64;
+        self.font_shared_mem = Some((object_id, Arc::new(shared_memory)));
+        crate::hle::result::RESULT_SUCCESS
+    }
+
+    /// Get the persistent shared font-memory object and its kernel object id.
+    /// Upstream: `KernelCore::GetFontSharedMem()`.
+    pub fn get_font_shared_mem(&self) -> Option<(u64, Arc<KSharedMemory>)> {
+        self.font_shared_mem
+            .as_ref()
+            .map(|(object_id, shared_memory)| (*object_id, Arc::clone(shared_memory)))
+    }
+
     /// Initialize the kernel-owned IRS shared memory.
     ///
     /// This is the IRS portion of upstream
@@ -3716,6 +3760,36 @@ impl KernelCore {
 mod tests {
     use super::*;
     use crate::core::SystemRef;
+
+    #[test]
+    fn font_shared_memory_is_kernel_owned_and_persistent() {
+        use crate::device_memory::dram_memory_map;
+        use crate::hle::kernel::k_memory_manager::Pool;
+
+        // The buddy allocator rounds this 17 MiB contiguous request up to its
+        // 32 MiB block class, so leave a second block for the pool boundary.
+        const MEMORY_SIZE: usize = 0x400_0000;
+        let device_memory = DeviceMemory::with_size(MEMORY_SIZE);
+        let mut kernel = KernelCore::new();
+        kernel.memory_manager_mut().initialize_pool(
+            Pool::SECURE,
+            dram_memory_map::BASE,
+            MEMORY_SIZE,
+        );
+
+        assert!(kernel
+            .initialize_font_shared_memory(&device_memory)
+            .is_success());
+        let (first_id, first) = kernel.get_font_shared_mem().unwrap();
+        assert!(kernel
+            .initialize_font_shared_memory(&device_memory)
+            .is_success());
+        let (second_id, second) = kernel.get_font_shared_mem().unwrap();
+
+        assert_eq!(first.get_size(), 0x1100000);
+        assert_eq!(first_id, second_id);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn irs_shared_memory_is_kernel_owned_and_persistent() {

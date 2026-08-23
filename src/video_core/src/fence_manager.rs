@@ -401,12 +401,6 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         self.shared.state.lock().unwrap().fences.len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_operation_batch_count(&self) -> usize {
-        let state = self.shared.state.lock().unwrap();
-        let queued_operations = usize::from(!state.uncommitted_operations.is_empty());
-        state.fences.len() + queued_operations
-    }
 }
 
 impl<F: FenceBase + Send + 'static> Drop for FenceManager<F> {

@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_nvdec_common.h
-//! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_nvdec_common.cpp
+//! Port of eden/src/core/hle/service/nvdrv/devices/nvhost_nvdec_common.h
+//! Port of eden/src/core/hle/service/nvdrv/devices/nvhost_nvdec_common.cpp
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::hle::service::nvdrv::core::container::{Host1xDeviceFileData, SessionId};
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::syncpoint_manager::ChannelType;
 use crate::hle::service::nvdrv::core::{
     container::Container, nvmap::NvMap, syncpoint_manager::SyncpointManager,
 };
-use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
 use crate::hle::service::nvdrv::nvdata::*;
 use crate::{core::SystemRef, host1x_core::Host1xChannelType};
 
@@ -23,15 +23,6 @@ pub struct IoctlSetNvmapFD {
     pub nvmap_fd: i32,
 }
 const _: () = assert!(std::mem::size_of::<IoctlSetNvmapFD>() == 4);
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct IoctlSubmitCommandBuffer {
-    pub id: u32,
-    pub offset: u32,
-    pub count: u32,
-}
-const _: () = assert!(std::mem::size_of::<IoctlSubmitCommandBuffer>() == 0xC);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,6 +70,7 @@ pub struct IoctlGetSyncpoint {
     pub param: u32,
     pub value: u32,
 }
+const _: () = assert!(std::mem::size_of::<IoctlGetSyncpoint>() == 0x8);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -105,15 +97,21 @@ pub struct MapBufferEntry {
 }
 const _: () = assert!(std::mem::size_of::<MapBufferEntry>() == 0x8);
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoctlGetClkRate {
+    pub clk_rate: u32,
+    pub module_id: u32,
+}
+const _: () = assert!(std::mem::size_of::<IoctlGetClkRate>() == 0x8);
+
 /// Common base for NVDEC/VIC devices.
 pub struct NvHostNvDecCommon {
     system: SystemRef,
+    core: Container,
     pub channel_syncpoint: u32,
     nvmap: Arc<NvMap>,
     syncpoint_manager: Arc<SyncpointManager>,
-    host1x_device_file: Arc<Mutex<Host1xDeviceFileData>>,
-    nvmap_fd: Mutex<i32>,
-    submit_timeout: Mutex<u32>,
     channel_type: ChannelType,
     pub sessions: Mutex<HashMap<DeviceFD, SessionId>>,
 }
@@ -125,12 +123,10 @@ impl NvHostNvDecCommon {
             .unwrap_or_else(|| container.get_syncpoint_manager().allocate_syncpoint(false));
         Self {
             system,
+            core: container.clone(),
             channel_syncpoint,
             nvmap: container.get_nv_map_file_handle(),
             syncpoint_manager: container.get_syncpoint_manager_handle(),
-            host1x_device_file: container.host1x_device_file_handle(),
-            nvmap_fd: Mutex::new(0),
-            submit_timeout: Mutex::new(0),
             channel_type,
             sessions: Mutex::new(HashMap::new()),
         }
@@ -141,7 +137,6 @@ impl NvHostNvDecCommon {
             "nvhost_nvdec_common::SetNVMAPfd called, fd={}",
             params.nvmap_fd
         );
-        *self.nvmap_fd.lock().unwrap() = params.nvmap_fd;
         NvResult::Success
     }
 
@@ -156,7 +151,7 @@ impl NvHostNvDecCommon {
         );
 
         let mut offset = 0usize;
-        let mut command_buffers =
+        let command_buffers =
             read_vec::<CommandBuffer>(data, params.cmd_buffer_count as usize, &mut offset);
         let relocs = read_vec::<Reloc>(data, params.relocation_count as usize, &mut offset);
         let reloc_shifts = read_vec::<u32>(data, params.relocation_count as usize, &mut offset);
@@ -167,6 +162,25 @@ impl NvHostNvDecCommon {
             ChannelType::NvDec => 1,
             ChannelType::VIC => 2,
             _ => 0,
+        };
+
+        let session_id = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .copied()
+            .unwrap_or_default();
+        let Some(process) = self.core.get_session_process(session_id) else {
+            log::error!(
+                "nvhost_nvdec_common::Submit called without an active session for fd={}",
+                fd
+            );
+            return NvResult::InvalidState;
+        };
+        let Some(memory) = process.lock().unwrap().get_memory() else {
+            log::error!("nvhost_nvdec_common::Submit session has no process memory");
+            return NvResult::InvalidState;
         };
 
         for (index, syncpt_incr) in syncpt_increments.iter().enumerate() {
@@ -181,12 +195,8 @@ impl NvHostNvDecCommon {
             log::error!("nvhost_nvdec_common::Submit called without Host1x core");
             return NvResult::InvalidState;
         };
-        let Some(memory) = self.system.get().get_svc_memory() else {
-            log::error!("nvhost_nvdec_common::Submit called without application memory");
-            return NvResult::InvalidState;
-        };
 
-        for cmd_buffer in &mut command_buffers {
+        for cmd_buffer in &command_buffers {
             if cmd_buffer.word_count <= 0 {
                 continue;
             }
@@ -246,18 +256,19 @@ impl NvHostNvDecCommon {
     }
 
     pub fn get_waitbase(&self, params: &mut IoctlGetWaitbase) -> NvResult {
-        log::error!("nvhost_nvdec_common::GetWaitbase called");
+        log::debug!("nvhost_nvdec_common::GetWaitbase called");
         params.value = 0;
         NvResult::Success
     }
 
     pub fn map_buffer(
         &self,
-        _params: &mut IoctlMapBuffer,
+        params: &mut IoctlMapBuffer,
         entries: &mut [MapBufferEntry],
         _fd: DeviceFD,
     ) -> NvResult {
-        for entry in entries {
+        let num_entries = (params.num_entries as usize).min(entries.len());
+        for entry in &mut entries[..num_entries] {
             entry.map_address = self.nvmap.pin_handle(entry.map_handle, true) as u32;
         }
         NvResult::Success
@@ -268,7 +279,8 @@ impl NvHostNvDecCommon {
         params: &mut IoctlMapBuffer,
         entries: &mut [MapBufferEntry],
     ) -> NvResult {
-        for entry in entries {
+        let num_entries = (params.num_entries as usize).min(entries.len());
+        for entry in &mut entries[..num_entries] {
             self.nvmap.unpin_handle(entry.map_handle);
             *entry = MapBufferEntry::default();
         }
@@ -281,8 +293,16 @@ impl NvHostNvDecCommon {
         NvResult::Success
     }
 
-    pub fn channel_type(&self) -> ChannelType {
-        self.channel_type
+    pub fn get_clk_rate(&self, params: &mut IoctlGetClkRate) -> NvResult {
+        log::warn!("nvhost_nvdec_common::GetClkRate (STUBBED) called");
+        params.clk_rate = 614_400_000;
+        params.module_id = 0;
+        NvResult::Success
+    }
+
+    pub fn query_event(&self, event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
+        log::error!("Unknown HOSTX1 Event {}", event_id);
+        None
     }
 
     pub fn system(&self) -> SystemRef {
@@ -319,11 +339,7 @@ impl NvHostNvDecCommon {
 
 impl Drop for NvHostNvDecCommon {
     fn drop(&mut self) {
-        self.host1x_device_file
-            .lock()
-            .unwrap()
-            .syncpts_accumulated
-            .push_back(self.channel_syncpoint);
+        self.core.recycle_syncpoint(self.channel_syncpoint);
     }
 }
 
@@ -357,120 +373,6 @@ fn write_vec<T: Copy>(output: &mut [u8], input: &[T], offset: &mut usize) {
     }
 }
 
-fn read_variable_entries<T: Copy + Default>(input: &[u8]) -> Vec<T> {
-    let entry_size = std::mem::size_of::<T>();
-    if entry_size == 0 {
-        return Vec::new();
-    }
-    let count = input.len() / entry_size;
-    let mut offset = 0;
-    read_vec(input, count, &mut offset)
-}
-
-fn write_variable_entries<T: Copy>(output: &mut [u8], fixed_size: usize, entries: &[T]) {
-    if output.len() <= fixed_size || entries.is_empty() {
-        return;
-    }
-    let bytes = entries.len().saturating_mul(std::mem::size_of::<T>());
-    let copy_len = bytes.min(output.len() - fixed_size);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            entries.as_ptr() as *const u8,
-            output.as_mut_ptr().add(fixed_size),
-            copy_len,
-        );
-    }
-}
-
-/// Ioctl dispatch for nvdec-common-type devices.
-pub fn ioctl1_common(
-    common: &NvHostNvDecCommon,
-    fd: DeviceFD,
-    command: Ioctl,
-    input: &[u8],
-    output: &mut [u8],
-) -> NvResult {
-    match command.group() {
-        0x0 => match command.cmd() {
-            0x1 => {
-                // Submit (fixed + variable)
-                let mut params: IoctlSubmit = read_struct(input);
-                let fixed_size = std::mem::size_of::<IoctlSubmit>().min(input.len());
-                let mut data = input.get(fixed_size..).unwrap_or_default().to_vec();
-                let r = common.submit(&mut params, &mut data, fd);
-                write_struct(output, &params);
-                if output.len() > fixed_size {
-                    let copy_len = data.len().min(output.len() - fixed_size);
-                    output[fixed_size..fixed_size + copy_len].copy_from_slice(&data[..copy_len]);
-                }
-                r
-            }
-            0x2 => {
-                let mut params: IoctlGetSyncpoint = read_struct(input);
-                let r = common.get_syncpoint(&mut params);
-                write_struct(output, &params);
-                r
-            }
-            0x3 => {
-                let mut params: IoctlGetWaitbase = read_struct(input);
-                let r = common.get_waitbase(&mut params);
-                write_struct(output, &params);
-                r
-            }
-            0x7 => {
-                let timeout: u32 = read_struct(input);
-                let r = common.set_submit_timeout(timeout);
-                write_struct(output, &timeout);
-                r
-            }
-            0x9 => {
-                // MapBuffer (fixed + variable)
-                let mut params: IoctlMapBuffer = read_struct(input);
-                let fixed_size = std::mem::size_of::<IoctlMapBuffer>().min(input.len());
-                let mut entries = read_variable_entries::<MapBufferEntry>(
-                    input.get(fixed_size..).unwrap_or_default(),
-                );
-                let r = common.map_buffer(&mut params, &mut entries, fd);
-                write_struct(output, &params);
-                write_variable_entries(output, fixed_size, &entries);
-                r
-            }
-            0xa => {
-                // UnmapBuffer (fixed + variable)
-                let mut params: IoctlMapBuffer = read_struct(input);
-                let fixed_size = std::mem::size_of::<IoctlMapBuffer>().min(input.len());
-                let mut entries = read_variable_entries::<MapBufferEntry>(
-                    input.get(fixed_size..).unwrap_or_default(),
-                );
-                let r = common.unmap_buffer(&mut params, &mut entries);
-                write_struct(output, &params);
-                write_variable_entries(output, fixed_size, &entries);
-                r
-            }
-            _ => {
-                log::error!("Unimplemented ioctl={:08X}", command.raw);
-                NvResult::NotImplemented
-            }
-        },
-        b'H' => match command.cmd() {
-            0x1 => {
-                let mut params: IoctlSetNvmapFD = read_struct(input);
-                let r = common.set_nvmap_fd(&mut params);
-                write_struct(output, &params);
-                r
-            }
-            _ => {
-                log::error!("Unimplemented ioctl={:08X}", command.raw);
-                NvResult::NotImplemented
-            }
-        },
-        _ => {
-            log::error!("Unimplemented ioctl={:08X}", command.raw);
-            NvResult::NotImplemented
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +389,51 @@ mod tests {
         let second = NvHostNvDecCommon::new(SystemRef::null(), &container, ChannelType::NvDec);
 
         assert_eq!(second.channel_syncpoint, first_syncpoint);
+    }
+
+    #[test]
+    fn map_and_unmap_respect_num_entries_like_upstream() {
+        let container = Container::new();
+        let common = NvHostNvDecCommon::new(SystemRef::null(), &container, ChannelType::NvDec);
+        let original = MapBufferEntry {
+            map_handle: 0x1234,
+            map_address: 0x5678,
+        };
+        let mut entries = [original];
+        let mut params = IoctlMapBuffer {
+            num_entries: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            common.map_buffer(&mut params, &mut entries, 1),
+            NvResult::Success
+        );
+        assert_eq!(entries[0].map_handle, original.map_handle);
+        assert_eq!(entries[0].map_address, original.map_address);
+
+        assert_eq!(
+            common.unmap_buffer(&mut params, &mut entries),
+            NvResult::Success
+        );
+        assert_eq!(entries[0].map_handle, original.map_handle);
+        assert_eq!(entries[0].map_address, original.map_address);
+        assert_eq!(params.num_entries, 0);
+        assert_eq!(params.data_address, 0);
+        assert_eq!(params.attach_host_ch_das, 0);
+    }
+
+    #[test]
+    fn get_clk_rate_matches_upstream_stub_output() {
+        let container = Container::new();
+        let common = NvHostNvDecCommon::new(SystemRef::null(), &container, ChannelType::NvDec);
+        let mut params = IoctlGetClkRate {
+            clk_rate: 1,
+            module_id: 2,
+        };
+
+        assert_eq!(common.get_clk_rate(&mut params), NvResult::Success);
+        assert_eq!(params.clk_rate, 614_400_000);
+        assert_eq!(params.module_id, 0);
     }
 }

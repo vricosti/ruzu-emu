@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::content_management_interface::IContentManagementInterface;
+use super::ecommerce_interface::IECommerceInterface;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -63,7 +64,7 @@ impl IServiceGetterInterface {
             ),
             (
                 commands::GET_ECOMMERCE_INTERFACE,
-                None,
+                Some(Self::get_ecommerce_interface_handler),
                 "GetECommerceInterface",
             ),
             (
@@ -131,8 +132,18 @@ impl IServiceGetterInterface {
     }
 
     /// GetECommerceInterface (cmd 7992).
-    pub fn get_ecommerce_interface(&self) {
+    pub fn get_ecommerce_interface(&self) -> IECommerceInterface {
         log::debug!("IServiceGetterInterface::get_ecommerce_interface called");
+        IECommerceInterface::new()
+    }
+
+    fn get_ecommerce_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IServiceGetterInterface) };
+        let interface = Arc::new(service.get_ecommerce_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
     }
 
     /// GetApplicationVersionInterface (cmd 7993).
@@ -196,6 +207,17 @@ mod tests {
             .get(&commands::GET_CONTENT_MANAGEMENT_INTERFACE)
             .and_then(|info| info.handler_callback)
             .is_some());
+    }
+
+    #[test]
+    fn ecommerce_getter_has_upstream_handler_and_returns_exact_child_table() {
+        let service = IServiceGetterInterface::new(crate::core::SystemRef::null(), "ns:am2");
+        assert!(service
+            .handlers()
+            .get(&commands::GET_ECOMMERCE_INTERFACE)
+            .and_then(|info| info.handler_callback)
+            .is_some());
+        assert_eq!(service.get_ecommerce_interface().handlers().len(), 7);
     }
 }
 

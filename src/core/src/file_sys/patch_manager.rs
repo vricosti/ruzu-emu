@@ -1126,6 +1126,33 @@ impl<'a> PatchManager<'a> {
         (nacp, icon_file)
     }
 
+    /// Get control metadata from the base title, falling back to the update title.
+    /// Corresponds to upstream `PatchManager::GetMetadataFromBaseOrUpdate`.
+    pub fn get_metadata_from_base_or_update(
+        system: &crate::core::System,
+        application_id: u64,
+    ) -> (Option<NACP>, Option<VirtualFile>) {
+        let fs_controller = system.get_filesystem_controller();
+        let fs_controller = fs_controller.lock().unwrap();
+        let Some(content_provider) = system.get_content_provider() else {
+            return (None, None);
+        };
+        let content_provider = content_provider.lock().unwrap();
+
+        let metadata = PatchManager::new(application_id, &fs_controller, &*content_provider)
+            .get_control_metadata();
+        if metadata.0.is_some() {
+            return metadata;
+        }
+
+        PatchManager::new(
+            get_update_title_id(application_id),
+            &fs_controller,
+            &*content_provider,
+        )
+        .get_control_metadata()
+    }
+
     /// Patch RomFS with updates and LayeredFS.
     /// Corresponds to upstream `PatchManager::PatchRomFS`.
     pub fn patch_romfs(
@@ -1255,6 +1282,51 @@ impl<'a> PatchManager<'a> {
 mod tests {
     use super::super::vfs::vfs_vector::{VectorVfsDirectory, VectorVfsFile};
     use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingContentProvider {
+        control_requests: Mutex<Vec<u64>>,
+    }
+
+    impl ContentProvider for RecordingContentProvider {
+        fn refresh(&mut self) {}
+
+        fn has_entry(&self, _title_id: u64, _record_type: ContentRecordType) -> bool {
+            false
+        }
+
+        fn get_entry_version(&self, _title_id: u64) -> Option<u32> {
+            None
+        }
+
+        fn get_entry_unparsed(
+            &self,
+            _title_id: u64,
+            _record_type: ContentRecordType,
+        ) -> Option<VirtualFile> {
+            None
+        }
+
+        fn get_entry_raw(
+            &self,
+            title_id: u64,
+            record_type: ContentRecordType,
+        ) -> Option<VirtualFile> {
+            if record_type == ContentRecordType::Control {
+                self.control_requests.lock().unwrap().push(title_id);
+            }
+            None
+        }
+
+        fn list_entries_filter(
+            &self,
+            _title_type: Option<TitleType>,
+            _record_type: Option<ContentRecordType>,
+            _title_id: Option<u64>,
+        ) -> Vec<ContentProviderEntry> {
+            Vec::new()
+        }
+    }
 
     #[test]
     fn test_format_title_version_three() {
@@ -1308,5 +1380,31 @@ mod tests {
         assert_eq!(cheats.len(), 2);
         assert!(cheats[1].enabled);
         assert_eq!(cheats[1].definition.num_opcodes, 3);
+    }
+
+    #[test]
+    fn metadata_lookup_falls_back_from_base_to_update_title() {
+        let application_id = 0x05AA_0000_0000_1000;
+        let mut provider = Box::new(RecordingContentProvider {
+            control_requests: Mutex::new(Vec::new()),
+        });
+        let mut union = super::super::registered_cache::ContentProviderUnion::new();
+        unsafe {
+            union.set_slot(
+                ContentProviderUnionSlot::FrontendManual,
+                &mut *provider as *mut dyn ContentProvider,
+            );
+        }
+        let mut system = crate::core::System::new_for_test();
+        system.set_content_provider(Arc::new(Mutex::new(union)));
+
+        let metadata = PatchManager::get_metadata_from_base_or_update(&system, application_id);
+
+        assert!(metadata.0.is_none());
+        assert!(metadata.1.is_none());
+        assert_eq!(
+            *provider.control_requests.lock().unwrap(),
+            vec![application_id, get_update_title_id(application_id)]
+        );
     }
 }

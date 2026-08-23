@@ -1522,6 +1522,7 @@ mod tests {
             exception_raised: mk_arg(),
             data_cache_operation: mk_arg(),
             instruction_cache_operation: mk_arg(),
+            instruction_synchronization_barrier: mk_arg(),
             add_ticks: mk_arg(),
             get_ticks_remaining: mk_arg(),
             exclusive_clear: mk_arg(),

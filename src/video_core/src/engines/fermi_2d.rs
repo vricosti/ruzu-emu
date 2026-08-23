@@ -1383,11 +1383,6 @@ impl Fermi2D {
         unsafe { std::slice::from_raw_parts_mut(ptr, ENGINE_REG_COUNT) }
     }
 
-    #[cfg(test)]
-    fn upstream_reg_array(&self) -> &[u32; NUM_REGS_WORDS] {
-        unsafe { &self.regs.regs.reg_array }
-    }
-
     fn upstream_reg_array_mut(&mut self) -> &mut [u32; NUM_REGS_WORDS] {
         unsafe { &mut self.regs.regs.reg_array }
     }

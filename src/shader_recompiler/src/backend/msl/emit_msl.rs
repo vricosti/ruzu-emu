@@ -29,6 +29,7 @@ use super::emit_msl_logical;
 use super::emit_msl_memory;
 use super::emit_msl_select;
 use super::emit_msl_shared_memory;
+use super::emit_msl_special;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
 
@@ -59,13 +60,16 @@ fn varying_mask_has_only_stage_inputs(stage: crate::stage::Stage, mask: &[u64; 8
 
 fn varying_mask_has_only_vertex_outputs(mask: &[u64; 8]) -> bool {
     mask.iter().enumerate().all(|(word_index, word)| {
-        let allowed = match word_index {
-            0 => u64::MAX << 28,
-            1 => u64::MAX,
-            2 => u32::MAX as u64,
-            _ => 0,
-        };
-        word & !allowed == 0
+        let mut remaining = *word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as usize;
+            let attribute = word_index * 64 + bit;
+            if !matches!(attribute, 27..=159 | 176..=183) {
+                return false;
+            }
+            remaining &= remaining - 1;
+        }
+        true
     })
 }
 
@@ -199,7 +203,15 @@ fn emit_inst(
 ) -> Result<(), MslError> {
     let inst = program.block(inst_ref.block).inst(inst_ref.inst);
     match inst.opcode {
-        Opcode::Void | Opcode::Prologue | Opcode::Epilogue => Ok(()),
+        Opcode::Void => Ok(()),
+        Opcode::Prologue => {
+            emit_msl_special::emit_prologue(context, program);
+            Ok(())
+        }
+        Opcode::Epilogue => {
+            emit_msl_special::emit_epilogue(context);
+            Ok(())
+        }
         Opcode::DemoteToHelperInvocation => {
             emit_msl_control_flow::emit_demote_to_helper_invocation(context)
         }
@@ -691,10 +703,24 @@ fn emit_inst(
             if attribute.is_generic() {
                 return context.emit_set_generic(inst_ref, *attribute, inst.arg(1));
             }
-            if !attribute.is_position() {
-                return Err(MslError::UnsupportedAttribute(attribute.0));
+            if attribute.is_position() {
+                return context.emit_set_position(
+                    inst_ref,
+                    attribute.position_element(),
+                    inst.arg(1),
+                );
             }
-            context.emit_set_position(inst_ref, attribute.position_element(), inst.arg(1))
+            if *attribute == crate::ir::value::Attribute::POINT_SIZE {
+                return context.emit_set_point_size(inst_ref, inst.arg(1));
+            }
+            if attribute.is_clip_distance() {
+                return context.emit_set_clip_distance(
+                    inst_ref,
+                    attribute.clip_distance_index(),
+                    inst.arg(1),
+                );
+            }
+            Err(MslError::UnsupportedAttribute(attribute.0))
         }
         Opcode::SetFragColor => {
             let render_target = immediate_u32(inst, 0)?;
@@ -2505,6 +2531,89 @@ mod tests {
         assert!(!early.source.source.contains("[[depth(any)]]"));
         assert!(!early.source.source.contains("output.depth ="));
         assert!(early.source.source.contains("[[sample_mask]]"));
+    }
+
+    #[test]
+    fn emits_vertex_special_outputs_prologue_and_epilogue() {
+        let mut program = empty_program(Stage::VertexB);
+        let point_size = crate::ir::Attribute::POINT_SIZE;
+        let clip0 = crate::ir::Attribute::CLIP_DISTANCE_0;
+        let generic0_x = crate::ir::Attribute::generic(0, 0);
+        for attribute in [point_size, clip0, generic0_x] {
+            program.info.stores.set(attribute.0 as usize, true);
+        }
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(point_size),
+                Value::ImmF32(1.5),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(clip0),
+                Value::ImmF32(-0.25),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let profile = Profile {
+            max_user_clip_distances: 8,
+            ..Profile::default()
+        };
+        let runtime = RuntimeInfo {
+            convert_depth_mode: true,
+            fixed_state_point_size: Some(2.5),
+            ..RuntimeInfo::default()
+        };
+        let artifact = emit_msl(&program, &profile, &runtime).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("float point_size [[point_size]];"));
+        assert!(source.contains("float clip_distance [[clip_distance]] [8];"));
+        assert!(source.contains("output.position = float4(0.0f, 0.0f, 0.0f, 1.0f);"));
+        assert!(source.contains("output.out_attr0 = float4(0.0f, 0.0f, 0.0f, 1.0f);"));
+        assert!(source.contains("output.point_size = as_type<float>(0x40200000u);"));
+        assert!(source.contains("output.point_size = as_type<float>(0x3FC00000u);"));
+        assert!(source.contains("output.clip_distance[0] = as_type<float>(0xBE800000u);"));
+        assert!(source.contains("output.clip_distance[1] = 0.0f;"));
+        assert!(
+            source.contains("output.position.z = (output.position.z + output.position.w) * 0.5f;")
+        );
+    }
+
+    #[test]
+    fn emits_ordered_alpha_test_and_dual_source_defaults() {
+        use crate::runtime_info::CompareFunction;
+
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_color[0] = true;
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetFragColor,
+            vec![Value::ImmU32(0), Value::ImmU32(3), Value::ImmF32(0.75)],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+        let runtime = RuntimeInfo {
+            alpha_test_func: Some(CompareFunction::NotEqual),
+            alpha_test_reference: 0.5,
+            dual_source_blend: true,
+            ..RuntimeInfo::default()
+        };
+
+        let artifact = emit_msl(&program, &Profile::default(), &runtime).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("float4 color0 [[color(0), index(0)]];"));
+        assert!(source.contains("float4 color1 [[color(0), index(1)]];"));
+        assert!(source.contains("output.color0 = float4(0.0f, 0.0f, 0.0f, 1.0f);"));
+        assert!(source.contains("output.color1 = float4(0.0f, 0.0f, 0.0f, 1.0f);"));
+        assert!(
+            source.contains("if (!(!isnan(output.color0.w) && !isnan(as_type<float>(0x3F000000u))")
+        );
+        assert!(source.contains("discard_fragment();"));
     }
 
     #[test]

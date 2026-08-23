@@ -747,7 +747,7 @@ mod tests {
     use shader_recompiler::ir::value::{InstRef, Value};
     use shader_recompiler::ir::Program;
     use shader_recompiler::profile::Profile;
-    use shader_recompiler::runtime_info::{AttributeType, RuntimeInfo};
+    use shader_recompiler::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
     use shader_recompiler::shader_info::{
         ConstantBufferDescriptor, ImageDescriptor, ImageFormat, Interpolation,
         StorageBufferDescriptor, TextureDescriptor, TextureType,
@@ -1832,6 +1832,106 @@ mod tests {
         assert!(!source.contains("[[depth(any)]]"));
         assert!(source.contains("[[sample_mask]]"));
         assert!(source.contains("[[early_fragment_tests]] fragment"));
+    }
+
+    #[test]
+    fn compiles_direct_msl_vertex_special_outputs_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo {
+            convert_depth_mode: true,
+            fixed_state_point_size: Some(2.5),
+            ..RuntimeInfo::default()
+        };
+        let mut program = empty_program(Stage::VertexB);
+        let point_size = shader_recompiler::ir::Attribute::POINT_SIZE;
+        let clip0 = shader_recompiler::ir::Attribute::CLIP_DISTANCE_0;
+        program.info.stores.set(point_size.0 as usize, true);
+        program.info.stores.set(clip0.0 as usize, true);
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(point_size),
+                Value::ImmF32(1.5),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(clip0),
+                Value::ImmF32(-0.25),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active vertex special-output SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct vertex special-output MSL must compile with the active ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        let source = &direct.source().source;
+        assert!(source.contains("[[point_size]]"));
+        assert!(source.contains("[[clip_distance]]"));
+        assert!(source.contains("output.position.z ="));
+    }
+
+    #[test]
+    fn compiles_direct_msl_alpha_test_and_dual_source_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo {
+            alpha_test_func: Some(CompareFunction::NotEqual),
+            alpha_test_reference: 0.5,
+            dual_source_blend: true,
+            ..RuntimeInfo::default()
+        };
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_color[0] = true;
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetFragColor,
+            vec![Value::ImmU32(0), Value::ImmU32(3), Value::ImmF32(0.75)],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active alpha-test dual-source SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct alpha-test dual-source MSL must compile with the active ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        let source = &direct.source().source;
+        assert!(source.contains("[[color(0), index(0)]]"));
+        assert!(source.contains("[[color(0), index(1)]]"));
+        assert!(source.contains("discard_fragment()"));
     }
 
     #[test]

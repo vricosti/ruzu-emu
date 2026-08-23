@@ -24,6 +24,7 @@ mod emit_msl_logical;
 mod emit_msl_memory;
 mod emit_msl_select;
 mod emit_msl_shared_memory;
+mod emit_msl_special;
 pub mod msl_emit_context;
 
 use std::num::NonZeroU32;

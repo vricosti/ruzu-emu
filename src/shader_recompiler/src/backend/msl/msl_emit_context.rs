@@ -14,7 +14,7 @@ use crate::ir::instruction::Inst;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
-use crate::runtime_info::{AttributeType, RuntimeInfo};
+use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
 use crate::shader_info::{ImageDescriptor, TextureDescriptor, TextureType};
 use crate::stage::Stage;
 
@@ -52,6 +52,13 @@ pub struct MslEmitContext {
     support_vertex_instance_id: bool,
     convert_depth_mode: bool,
     emits_frag_depth: bool,
+    emits_point_size: bool,
+    clip_distance_count: u32,
+    fixed_state_point_size: Option<f32>,
+    alpha_test_func: Option<CompareFunction>,
+    alpha_test_reference: f32,
+    dual_source_blend: bool,
+    emits_frag_color: [bool; 8],
 }
 
 #[derive(Debug, Clone)]
@@ -335,10 +342,38 @@ impl MslEmitContext {
         // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
         // SPIR-V makes that write ineffective, while Metal rejects the pair.
         let emits_frag_depth = program.info.stores_frag_depth && !runtime_info.force_early_z;
+        let emits_point_size = program
+            .info
+            .stores
+            .get(crate::ir::value::Attribute::POINT_SIZE.0 as usize)
+            || runtime_info.fixed_state_point_size.is_some();
+        if emits_point_size && stage != Stage::VertexB {
+            return Err(MslError::UnsupportedProgramFeature(
+                "point-size output outside a vertex shader",
+            ));
+        }
+        let clip_distance_count = if program.info.stores.clip_distances() {
+            profile.max_user_clip_distances.min(8)
+        } else {
+            0
+        };
+        let mut emits_frag_color = program.info.stores_frag_color;
+        if runtime_info.dual_source_blend {
+            emits_frag_color[0] = true;
+            emits_frag_color[1] = true;
+        }
         let returns_output = match stage {
             Stage::VertexB => {
                 source.push_str("struct MslVertexOut {\n");
                 source.push_str("    float4 position [[position]];\n");
+                if emits_point_size {
+                    source.push_str("    float point_size [[point_size]];\n");
+                }
+                if clip_distance_count != 0 {
+                    source.push_str(&format!(
+                        "    float clip_distance [[clip_distance]] [{clip_distance_count}];\n"
+                    ));
+                }
                 for index in 0..32 {
                     if program.info.stores.generic_any(index) {
                         source.push_str(&format!(
@@ -355,14 +390,19 @@ impl MslEmitContext {
                 true
             }
             Stage::Fragment
-                if program.info.stores_frag_color.iter().any(|store| *store)
+                if emits_frag_color.iter().any(|store| *store)
                     || emits_frag_depth
                     || program.info.stores_sample_mask =>
             {
                 source.push_str("struct MslFragmentOut {\n");
-                for (index, stored) in program.info.stores_frag_color.iter().enumerate() {
+                for (index, stored) in emits_frag_color.iter().enumerate() {
                     if *stored {
-                        source.push_str(&format!("    float4 color{index} [[color({index})]];\n"));
+                        let attribute = if runtime_info.dual_source_blend && index <= 1 {
+                            format!("[[color(0), index({index})]]")
+                        } else {
+                            format!("[[color({index})]]")
+                        };
+                        source.push_str(&format!("    float4 color{index} {attribute};\n"));
                     }
                 }
                 if emits_frag_depth {
@@ -442,6 +482,13 @@ impl MslEmitContext {
             support_vertex_instance_id: profile.support_vertex_instance_id,
             convert_depth_mode: runtime_info.convert_depth_mode && !profile.support_native_ndc,
             emits_frag_depth,
+            emits_point_size,
+            clip_distance_count,
+            fixed_state_point_size: runtime_info.fixed_state_point_size,
+            alpha_test_func: runtime_info.alpha_test_func,
+            alpha_test_reference: runtime_info.alpha_test_reference,
+            dual_source_blend: runtime_info.dual_source_blend,
+            emits_frag_color,
         })
     }
 
@@ -689,6 +736,35 @@ impl MslEmitContext {
 
     pub fn stage(&self) -> Stage {
         self.stage
+    }
+
+    pub(crate) fn converts_depth_mode(&self) -> bool {
+        self.convert_depth_mode
+    }
+
+    pub(crate) fn emits_point_size(&self) -> bool {
+        self.emits_point_size
+    }
+
+    pub(crate) fn clip_distance_count(&self) -> u32 {
+        self.clip_distance_count
+    }
+
+    pub(crate) fn fixed_state_point_size(&self) -> Option<f32> {
+        self.fixed_state_point_size
+    }
+
+    pub(crate) fn alpha_test(&self) -> Option<(CompareFunction, f32)> {
+        self.alpha_test_func
+            .map(|function| (function, self.alpha_test_reference))
+    }
+
+    pub(crate) fn dual_source_blend(&self) -> bool {
+        self.dual_source_blend
+    }
+
+    pub(crate) fn emits_frag_color(&self, index: usize) -> bool {
+        self.emits_frag_color[index]
     }
 
     pub fn support_vertex_instance_id(&self) -> bool {
@@ -1051,6 +1127,38 @@ impl MslEmitContext {
         let swizzle = ["x", "y", "z", "w"][component as usize];
         self.source
             .push_str(&format!("    output.position.{swizzle} = {expression};\n"));
+        Ok(())
+    }
+
+    pub fn emit_set_point_size(
+        &mut self,
+        inst_ref: InstRef,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        let expression = self.value_expression(value, inst_ref, 1)?;
+        self.source
+            .push_str(&format!("    output.point_size = {expression};\n"));
+        Ok(())
+    }
+
+    pub fn emit_set_clip_distance(
+        &mut self,
+        inst_ref: InstRef,
+        index: u32,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        if index >= self.clip_distance_count {
+            log::warn!(
+                "Ignoring clip distance store {} >= {} supported",
+                index,
+                self.clip_distance_count
+            );
+            return Ok(());
+        }
+        let expression = self.value_expression(value, inst_ref, 1)?;
+        self.source.push_str(&format!(
+            "    output.clip_distance[{index}] = {expression};\n"
+        ));
         Ok(())
     }
 

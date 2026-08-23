@@ -138,6 +138,21 @@ impl MslEmitContext {
         let mut parameters = Vec::new();
         let mut input_generics: [Option<MslInputGenericDefinition>; 32] =
             std::array::from_fn(|_| None);
+        let render_area_declaration = if program.info.uses_render_area {
+            let buffer_index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.push_constant_buffer_index = Some(buffer_index);
+            parameters.push(format!(
+                "constant MslRenderAreaInfo& render_area_push_constants [[buffer({buffer_index})]]"
+            ));
+            concat!(
+                "struct MslRenderAreaInfo {\n",
+                "    float4 render_area;\n",
+                "};\n\n",
+            )
+        } else {
+            ""
+        };
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
         } else {
@@ -375,6 +390,7 @@ impl MslEmitContext {
         }
         let parameters = parameters.join(", ");
         let mut source = String::new();
+        source.push_str(render_area_declaration);
         source.push_str(&stage_input);
         // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
         // SPIR-V makes that write ineffective, while Metal rejects the pair.

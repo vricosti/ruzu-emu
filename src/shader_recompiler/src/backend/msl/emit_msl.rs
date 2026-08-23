@@ -138,6 +138,9 @@ fn first_unsupported_program_feature(
     if !info.constant_buffer_descriptors.is_empty() && profile.support_descriptor_aliasing {
         return Some("descriptor-aliasing constant buffers");
     }
+    if info.uses_render_area && !profile.unified_descriptor_binding {
+        return Some("render area without unified descriptor binding");
+    }
     if info.uses_patches.iter().any(|used| *used) {
         return Some("tessellation patches");
     }
@@ -179,7 +182,6 @@ fn first_unsupported_program_feature(
         || info.uses_image_buffers
         || info.uses_rescaling_uniform
         || info.uses_cbuf_indirect
-        || info.uses_render_area
     {
         return Some("shader capabilities");
     }
@@ -661,6 +663,7 @@ fn emit_inst(
             emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
         }
         Opcode::SampleId => emit_msl_context_get_set::emit_sample_id(context, inst_ref),
+        Opcode::RenderArea => emit_msl_context_get_set::emit_render_area(context, inst_ref),
         Opcode::IsHelperInvocation => {
             emit_msl_context_get_set::emit_is_helper_invocation(context, inst_ref)
         }
@@ -2271,6 +2274,39 @@ mod tests {
             .source
             .source
             .contains("uint v_0_1 = c2[((v_0_0) >> 4u)][(((v_0_0) >> 2u) & 3u)];"));
+    }
+
+    #[test]
+    fn render_area_uses_the_first_metal_push_constant_buffer_slot() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_render_area = true;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 2, count: 1 });
+        program.blocks[0].append_new_inst(Opcode::RenderArea, vec![]);
+
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("struct MslRenderAreaInfo"));
+        assert!(
+            source.contains("constant MslRenderAreaInfo& render_area_push_constants [[buffer(0)]]")
+        );
+        assert!(source.contains("constant uint4* c2 [[buffer(1)]]"));
+        assert!(source.contains("float4 v_0_0 = render_area_push_constants.render_area;"));
+        assert_eq!(artifact.bindings.push_constant_buffer_index, Some(0));
+        assert_eq!(artifact.bindings.buffer_count, 2);
+        assert_eq!(artifact.bindings.resources[0].buffer_index, 1);
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "render area without unified descriptor binding"
+            ))
+        );
     }
 
     #[test]

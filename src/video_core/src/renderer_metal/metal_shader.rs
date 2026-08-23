@@ -1630,6 +1630,13 @@ mod tests {
         program
     }
 
+    fn render_area_program() -> Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_render_area = true;
+        program.blocks[0].append_new_inst(Opcode::RenderArea, vec![]);
+        program
+    }
+
     fn subgroup_program() -> Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_fswzadd = true;
@@ -1823,6 +1830,37 @@ mod tests {
             assert_eq!(direct.bindings(), active.bindings());
             assert_eq!(direct.execution(), active.execution());
         }
+    }
+
+    #[test]
+    fn compiles_direct_render_area_with_active_push_constant_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let program = render_area_program();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active render-area SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct render-area MSL must compile with the active push-constant ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(direct.bindings().push_constant_buffer_index, Some(0));
+        assert!(direct
+            .source()
+            .source
+            .contains("render_area_push_constants.render_area"));
     }
 
     #[test]

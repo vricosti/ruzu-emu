@@ -94,6 +94,17 @@ pub fn emit_sample_id(context: &mut MslEmitContext, inst_ref: InstRef) -> Result
     context.define(inst_ref, ir::Type::U32, "sample_id".to_owned(), false)
 }
 
+/// Emit Eden's `EmitRenderArea` through the renderer-populated Metal push
+/// constant buffer. The first 16 bytes match `RenderAreaLayout::render_area`.
+pub fn emit_render_area(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
+    context.define(
+        inst_ref,
+        ir::Type::F32x4,
+        "render_area_push_constants.render_area".to_owned(),
+        false,
+    )
+}
+
 /// Emit Eden's `EmitIsHelperInvocation` while demote remains unsupported.
 pub fn emit_is_helper_invocation(
     context: &mut MslEmitContext,

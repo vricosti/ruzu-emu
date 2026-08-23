@@ -232,7 +232,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::file_sys::vfs::vfs::VfsDirectory;
     use crate::file_sys::vfs::vfs_vector::{make_array_file, VectorVfsDirectory};
 
     #[test]

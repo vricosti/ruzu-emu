@@ -83,7 +83,6 @@ pub fn system_version() -> Option<VirtualDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_sys::vfs::vfs::{VfsDirectory, VfsFile};
 
     #[test]
     fn test_get_long_display_version() {

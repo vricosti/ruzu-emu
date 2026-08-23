@@ -2959,7 +2959,6 @@ mod tests {
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::kernel::k_scheduler::KScheduler;
-    use crate::hle::kernel::k_session::KSession;
     use crate::hle::kernel::k_session_request::KSessionRequest;
     use crate::hle::kernel::k_thread::{KThread, ThreadState, ThreadWaitReasonForDebugging};
     use crate::memory::memory::Memory;

@@ -157,7 +157,6 @@ pub fn font_chinese_simple() -> Option<VirtualDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_sys::vfs::vfs::{VfsDirectory, VfsFile};
 
     #[test]
     fn test_font_nintendo_extension_has_two_files() {

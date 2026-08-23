@@ -467,7 +467,6 @@ pub fn open_file_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
     fn test_io_file_write_and_read() {

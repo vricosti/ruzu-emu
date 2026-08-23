@@ -141,7 +141,6 @@ pub fn ng_word_2() -> Option<VirtualDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_sys::vfs::vfs::VfsDirectory;
 
     #[test]
     fn test_ng_word_1_file_count() {

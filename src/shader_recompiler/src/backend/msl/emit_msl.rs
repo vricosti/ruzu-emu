@@ -644,8 +644,12 @@ fn emit_inst(
         Opcode::ConvertF16U64 => {
             emit_msl_convert::emit_convert_f16_unsigned(context, inst_ref, inst, 64)
         }
+        Opcode::ConvertF32S8 => emit_msl_convert::emit_convert_f32_s8(context, inst_ref, inst),
+        Opcode::ConvertF32S16 => emit_msl_convert::emit_convert_f32_s16(context, inst_ref, inst),
         Opcode::ConvertF32S32 => emit_msl_convert::emit_convert_f32_s32(context, inst_ref, inst),
         Opcode::ConvertF32S64 => emit_msl_convert::emit_convert_f32_s64(context, inst_ref, inst),
+        Opcode::ConvertF32U8 => emit_msl_convert::emit_convert_f32_u8(context, inst_ref, inst),
+        Opcode::ConvertF32U16 => emit_msl_convert::emit_convert_f32_u16(context, inst_ref, inst),
         Opcode::ConvertF32U32 => emit_msl_convert::emit_convert_f32_u32(context, inst_ref, inst),
         Opcode::ConvertF32U64 => emit_msl_convert::emit_convert_f32_u64(context, inst_ref, inst),
         Opcode::GetCbufU8
@@ -3208,6 +3212,10 @@ mod tests {
         );
         program.blocks[0].append_new_inst(Opcode::ConvertS32F32, vec![Value::ImmF32(-2.0)]);
         program.blocks[0].append_new_inst(Opcode::ConvertF32S32, vec![Value::ImmU32(0xFFFF_FFFE)]);
+        program.blocks[0].append_new_inst(Opcode::ConvertF32S8, vec![Value::ImmU32(0x1234_12FE)]);
+        program.blocks[0].append_new_inst(Opcode::ConvertF32S16, vec![Value::ImmU32(0x1234_FFFE)]);
+        program.blocks[0].append_new_inst(Opcode::ConvertF32U8, vec![Value::ImmU32(0x1234_12FE)]);
+        program.blocks[0].append_new_inst(Opcode::ConvertF32U16, vec![Value::ImmU32(0x1234_FFFE)]);
 
         let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
         let source = &artifact.source.source;
@@ -3218,6 +3226,13 @@ mod tests {
         assert!(source.contains("float v_0_2 = as_type<float>(v_0_1);"));
         assert!(source.contains("uint v_0_3 = as_type<uint>(int(as_type<float>(0xC0000000u)));"));
         assert!(source.contains("float v_0_4 = float(as_type<int>(0xFFFFFFFEu));"));
+        assert!(source
+            .contains("float v_0_5 = float(as_type<int>(((0x123412FEu) & 0xFFu) << 24u) >> 24);"));
+        assert!(source.contains(
+            "float v_0_6 = float(as_type<int>(((0x1234FFFEu) & 0xFFFFu) << 16u) >> 16);"
+        ));
+        assert!(source.contains("float v_0_7 = float((0x123412FEu) & 0xFFu);"));
+        assert!(source.contains("float v_0_8 = float((0x1234FFFEu) & 0xFFFFu);"));
     }
 
     #[test]

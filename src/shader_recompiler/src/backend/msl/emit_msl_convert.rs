@@ -130,6 +130,26 @@ pub fn emit_convert_u32_u64(
     })
 }
 
+pub fn emit_convert_f32_s8(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::F32, |value| {
+        format!("float(as_type<int>((({value}) & 0xFFu) << 24u) >> 24)")
+    })
+}
+
+pub fn emit_convert_f32_s16(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::F32, |value| {
+        format!("float(as_type<int>((({value}) & 0xFFFFu) << 16u) >> 16)")
+    })
+}
+
 pub fn emit_convert_f32_s32(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
@@ -144,6 +164,36 @@ pub fn emit_convert_f32_s32(
     )
 }
 
+pub fn emit_convert_f32_s64(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::F32, |value| {
+        format!("float(as_type<long>({value}))")
+    })
+}
+
+pub fn emit_convert_f32_u8(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::F32, |value| {
+        format!("float(({value}) & 0xFFu)")
+    })
+}
+
+pub fn emit_convert_f32_u16(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::F32, |value| {
+        format!("float(({value}) & 0xFFFFu)")
+    })
+}
+
 pub fn emit_convert_f32_u32(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
@@ -151,6 +201,16 @@ pub fn emit_convert_f32_u32(
 ) -> Result<(), MslError> {
     let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
     context.define(inst_ref, Type::F32, format!("float({value})"), false)
+}
+
+pub fn emit_convert_f32_u64(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::F32, |value| {
+        format!("float({value})")
+    })
 }
 
 pub fn emit_convert_f16_f32(
@@ -206,25 +266,5 @@ pub fn emit_convert_f16_unsigned(
             _ => unreachable!("IR integer conversion width"),
         };
         format!("half({unsigned})")
-    })
-}
-
-pub fn emit_convert_f32_s64(
-    context: &mut MslEmitContext,
-    inst_ref: InstRef,
-    inst: &Inst,
-) -> Result<(), MslError> {
-    define_cast(context, inst_ref, inst, Type::F32, |value| {
-        format!("float(as_type<long>({value}))")
-    })
-}
-
-pub fn emit_convert_f32_u64(
-    context: &mut MslEmitContext,
-    inst_ref: InstRef,
-    inst: &Inst,
-) -> Result<(), MslError> {
-    define_cast(context, inst_ref, inst, Type::F32, |value| {
-        format!("float({value})")
     })
 }

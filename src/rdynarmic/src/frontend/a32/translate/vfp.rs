@@ -498,6 +498,105 @@ pub fn arm_vmov_f32_u32(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     true
 }
 
+fn vfp_two_word_move_fields(raw: u32, sz: bool) -> (Reg, Reg, ExtReg) {
+    let t2 = Reg::from_u32((raw >> 16) & 0xF);
+    let t = Reg::from_u32((raw >> 12) & 0xF);
+    let m_bit = raw & (1 << 5) != 0;
+    let vm = raw & 0xF;
+    (t2, t, to_ext_reg(m_bit, vm, sz))
+}
+
+// VMOV<c> <Sm>, <Sm1>, <Rt>, <Rt2>
+pub fn vfp_vmov_2u32_2f32(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, false);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let word1 = ir.get_register(t);
+    let word2 = ir.get_register(t2);
+    ir.set_extended_register_32(m, word1);
+    ir.set_extended_register_32(advance_ext_reg(m, 1), word2);
+    true
+}
+
+// VMOV<c> <Rt>, <Rt2>, <Sm>, <Sm1>
+pub fn vfp_vmov_2f32_2u32(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, false);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 || t == t2 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let word1 = ir.get_extended_register_32(m);
+    let word2 = ir.get_extended_register_32(advance_ext_reg(m, 1));
+    ir.set_register(t, word1);
+    ir.set_register(t2, word2);
+    true
+}
+
+// VMOV<c> <Dm>, <Rt>, <Rt2>
+pub fn vfp_vmov_2u32_f64(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, true);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let word1 = ir.get_register(t);
+    let word2 = ir.get_register(t2);
+    let value = ir.ir().pack_2x32_to_1x64(word1, word2);
+    ir.set_extended_register_64(m, value);
+    true
+}
+
+// VMOV<c> <Rt>, <Rt2>, <Dm>
+pub fn vfp_vmov_f64_2u32(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, true);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 || t == t2 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let value = ir.get_extended_register_64(m);
+    let word1 = ir.ir().least_significant_word(value);
+    let word2 = ir.ir().most_significant_word(value);
+    ir.set_register(t, word1);
+    ir.set_register(t2, word2);
+    true
+}
+
+// VMSR FPSCR, <Rt>
+pub fn vfp_vmsr(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let t = Reg::from_u32((raw >> 12) & 0xF);
+    if t == Reg::R15 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let next_location = ir
+        .current_location
+        .expect("current_location not set")
+        .advance_pc(4)
+        .advance_it();
+    ir.base.push_rsb(next_location.into());
+    ir.update_upper_location_descriptor();
+    let value = ir.get_register(t);
+    ir.set_fpscr(value);
+    ir.branch_write_pc(Value::ImmU32(next_location.pc()));
+    ir.set_term(Terminal::PopRSBHint);
+    false
+}
+
+// VMRS <Rt>, FPSCR
+pub fn vfp_vmrs(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let t = Reg::from_u32((raw >> 12) & 0xF);
+    if t == Reg::R15 {
+        let nzcv = ir.get_fpscr_nzcv();
+        ir.set_cpsr_nzcv_raw(nzcv);
+    } else {
+        let value = ir.get_fpscr();
+        ir.set_register(t, value);
+    }
+    true
+}
+
 // VMOV<c>.32 <Dn[x]>, <Rt>
 pub fn arm_vmov_from_i32(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let index = ((inst.raw >> 21) & 1) as u8;

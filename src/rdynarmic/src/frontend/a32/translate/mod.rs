@@ -24,9 +24,10 @@ pub mod synchronization;
 pub mod thumb16;
 pub mod thumb32;
 pub mod thumb32_control;
+pub mod thumb32_coprocessor;
 pub mod vfp;
 
-use crate::frontend::a32::decoder::{decode_arm, ArmInstId};
+use crate::frontend::a32::decoder::{decode_arm, ArmInstId, DecodedArm};
 use crate::frontend::a32::decoder_thumb16::{decode_thumb16, Thumb16InstId};
 use crate::frontend::a32::decoder_thumb32::decode_thumb32;
 use crate::frontend::a32::types::Exception;
@@ -163,9 +164,82 @@ fn maybe_vfp_or_asimd_instruction(thumb_instruction: u32) -> bool {
         || (thumb_instruction & 0xFF10_0000) == 0xF900_0000
 }
 
+fn is_vfp_instruction(id: ArmInstId) -> bool {
+    use ArmInstId::*;
+    matches!(
+        id,
+        VPUSH
+            | VPOP
+            | VLDR_fp
+            | VSTR_fp
+            | VSTM
+            | VLDM
+            | VMLA_fp
+            | VMLS_fp
+            | VNMLS_fp
+            | VNMLA_fp
+            | VMUL_fp
+            | VNMUL_fp
+            | VADD_fp
+            | VSUB_fp
+            | VDIV_fp
+            | VFNMS_fp
+            | VFNMA_fp
+            | VFMA_fp
+            | VFMS_fp
+            | VSEL_fp
+            | VMAXNM_fp
+            | VMINNM_fp
+            | VMOV_fp_reg
+            | VMOV_fp_imm
+            | VABS_fp
+            | VNEG_fp
+            | VSQRT_fp
+            | VCMP_fp
+            | VCMP_zero_fp
+            | VCVT_f_to_f
+            | VCVT_from_int
+            | VCVT_to_u32
+            | VCVT_to_s32
+            | VMOV_u32_f64
+            | VMOV_f64_u32
+            | VMOV_u32_f32
+            | VMOV_f32_u32
+            | VMOV_2u32_2f32
+            | VMOV_2f32_2u32
+            | VMOV_2u32_f64
+            | VMOV_f64_2u32
+            | VMOV_from_i32
+            | VMOV_to_i32
+            | VMSR
+            | VMRS
+            | VFP_VDUP
+            | VFP_VRINT_rm
+            | VFP_VCVT_rm
+    )
+}
+
+fn decode_thumb_vfp_or_asimd(thumb_instruction: u32) -> Option<DecodedArm> {
+    if !maybe_vfp_or_asimd_instruction(thumb_instruction) {
+        return None;
+    }
+
+    let vfp_decoded = decode_arm(thumb_instruction);
+    if is_vfp_instruction(vfp_decoded.id) {
+        return Some(vfp_decoded);
+    }
+
+    let asimd_decoded = decode_arm(convert_asimd_instruction(thumb_instruction));
+    (asimd_decoded.id != ArmInstId::Unknown).then_some(asimd_decoded)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{convert_asimd_instruction, read_thumb_instruction, translate, ThumbInstSize};
+    use super::{
+        convert_asimd_instruction, decode_thumb_vfp_or_asimd, read_thumb_instruction, translate,
+        ThumbInstSize,
+    };
+    use crate::frontend::a32::decoder::ArmInstId;
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::Exception;
@@ -199,6 +273,19 @@ mod tests {
     fn convert_asimd_instruction_uses_upstream_second_mask() {
         let thumb_instruction = 0xF910_0000;
         assert_eq!(convert_asimd_instruction(thumb_instruction), 0xF410_0000);
+    }
+
+    #[test]
+    fn thumb_vfp_decode_precedes_generic_thumb32_coprocessor_decode() {
+        assert_eq!(
+            decode_thumb_vfp_or_asimd(0xEC42_3A1E).map(|decoded| decoded.id),
+            Some(ArmInstId::VMOV_2u32_2f32)
+        );
+        assert_eq!(
+            decode_thumb_vfp_or_asimd(0xEEF1_FA10).map(|decoded| decoded.id),
+            Some(ArmInstId::VMRS)
+        );
+        assert!(decode_thumb_vfp_or_asimd(0xEC42_3F1E).is_none());
     }
 
     #[test]
@@ -431,11 +518,7 @@ fn translate_thumb(
         let (cont, advance): (bool, i32) = if inst_size == ThumbInstSize::Thumb32 {
             let hw1 = (thumb_raw >> 16) as u16;
             let hw2 = thumb_raw as u16;
-            let maybe_arm_like = if maybe_vfp_or_asimd_instruction(thumb_raw) {
-                Some(decode_arm(convert_asimd_instruction(thumb_raw)))
-            } else {
-                None
-            };
+            let maybe_arm_like = decode_thumb_vfp_or_asimd(thumb_raw);
             let decoded = decode_thumb32(hw1, hw2);
             let mut ir = A32IREmitter::with_location(block, *current);
 
@@ -622,6 +705,8 @@ fn translate_arm_instruction(
         CDP => coprocessor::arm_cdp(ir, decoded),
         MRRC => coprocessor::arm_mrrc(ir, decoded),
         MCRR => coprocessor::arm_mcrr(ir, decoded),
+        LDC => coprocessor::arm_ldc(ir, decoded),
+        STC => coprocessor::arm_stc(ir, decoded),
         // Synchronization
         STL => synchronization::arm_stl(ir, decoded),
         STLEX => synchronization::arm_stlex(ir, decoded),
@@ -694,8 +779,14 @@ fn translate_arm_instruction(
         VMOV_f64_u32 => vfp::arm_vmov_f64_u32(ir, decoded),
         VMOV_u32_f32 => vfp::arm_vmov_u32_f32(ir, decoded),
         VMOV_f32_u32 => vfp::arm_vmov_f32_u32(ir, decoded),
+        VMOV_2u32_2f32 => vfp::vfp_vmov_2u32_2f32(ir, decoded.raw),
+        VMOV_2f32_2u32 => vfp::vfp_vmov_2f32_2u32(ir, decoded.raw),
+        VMOV_2u32_f64 => vfp::vfp_vmov_2u32_f64(ir, decoded.raw),
+        VMOV_f64_2u32 => vfp::vfp_vmov_f64_2u32(ir, decoded.raw),
         VMOV_from_i32 => vfp::arm_vmov_from_i32(ir, decoded),
         VMOV_to_i32 => vfp::arm_vmov_to_i32(ir, decoded),
+        VMSR => vfp::vfp_vmsr(ir, decoded.raw),
+        VMRS => vfp::vfp_vmrs(ir, decoded.raw),
         VFP_VDUP => vfp::arm_vdup(ir, decoded),
         VFP_VRINT_rm => vfp::arm_vfp_vrint_rm(ir, decoded),
         VFP_VCVT_rm => vfp::arm_vfp_vcvt_rm(ir, decoded),

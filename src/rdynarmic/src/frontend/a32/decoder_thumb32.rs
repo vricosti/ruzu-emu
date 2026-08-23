@@ -136,6 +136,15 @@ pub enum Thumb32InstId {
     SDIV,
     UDIV,
 
+    // Coprocessor
+    MCRR,
+    MRRC,
+    STC,
+    LDC,
+    CDP,
+    MCR,
+    MRC,
+
     // Misc
     CLZ,
     RBIT,
@@ -337,6 +346,44 @@ impl DecodedThumb32 {
         let widthm1 = (self.hw2() & 0x1F) as u32;
         (lsb, widthm1 + 1)
     }
+
+    // --- Coprocessor instruction fields ---
+
+    pub fn coproc_two(&self) -> bool {
+        self.raw & (1 << 28) != 0
+    }
+
+    pub fn coproc_no(&self) -> u32 {
+        (self.raw >> 8) & 0xF
+    }
+
+    pub fn coproc_opc1(&self) -> u32 {
+        (self.raw >> 21) & 0x7
+    }
+
+    pub fn coproc_dp_opc1(&self) -> u32 {
+        (self.raw >> 20) & 0xF
+    }
+
+    pub fn coproc_opc2(&self) -> u32 {
+        (self.raw >> 5) & 0x7
+    }
+
+    pub fn coproc_crn(&self) -> u32 {
+        (self.raw >> 16) & 0xF
+    }
+
+    pub fn coproc_crd(&self) -> u32 {
+        (self.raw >> 12) & 0xF
+    }
+
+    pub fn coproc_crm(&self) -> u32 {
+        self.raw & 0xF
+    }
+
+    pub fn coproc_transfer_opc(&self) -> u32 {
+        (self.raw >> 4) & 0xF
+    }
 }
 
 /// Expand Thumb modified immediate (12-bit) to 32-bit value.
@@ -376,7 +423,21 @@ pub fn thumb_expand_imm_c(imm12: u32, carry_in: bool) -> (u32, bool) {
 /// Decode a 32-bit Thumb instruction from two halfwords.
 pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
     let raw = ((hw1 as u32) << 16) | (hw2 as u32);
-    let id = if matches_thumb32(raw, 0xFFF0_F0E0, 0xFB50_F000) {
+    let id = if matches_thumb32(raw, 0xEFF0_0000, 0xEC40_0000) {
+        Thumb32InstId::MCRR
+    } else if matches_thumb32(raw, 0xEFF0_0000, 0xEC50_0000) {
+        Thumb32InstId::MRRC
+    } else if matches_thumb32(raw, 0xEF10_0010, 0xEE00_0010) {
+        Thumb32InstId::MCR
+    } else if matches_thumb32(raw, 0xEF10_0010, 0xEE10_0010) {
+        Thumb32InstId::MRC
+    } else if matches_thumb32(raw, 0xEF00_0010, 0xEE00_0000) {
+        Thumb32InstId::CDP
+    } else if matches_thumb32(raw, 0xEE10_0000, 0xEC10_0000) {
+        Thumb32InstId::LDC
+    } else if matches_thumb32(raw, 0xEE10_0000, 0xEC00_0000) {
+        Thumb32InstId::STC
+    } else if matches_thumb32(raw, 0xFFF0_F0E0, 0xFB50_F000) {
         Thumb32InstId::SMMUL
     } else if matches_thumb32(raw, 0xFFF0_00E0, 0xFB50_0000) {
         Thumb32InstId::SMMLA
@@ -1002,5 +1063,26 @@ mod tests {
         assert_eq!(dec.rn(), Reg::R3);
         assert_eq!(dec.rt(), Reg::R8);
         assert_eq!(dec.imm12(), 0x000A);
+    }
+
+    #[test]
+    fn test_decode_thumb32_coprocessor_forms() {
+        let cases: [(u32, Thumb32InstId); 7] = [
+            (0xEC42_3F1E, Thumb32InstId::MCRR),
+            (0xFC52_3F1E, Thumb32InstId::MRRC),
+            (0xED24_7F22, Thumb32InstId::STC),
+            (0xFDB4_7F22, Thumb32InstId::LDC),
+            (0xEEF4_3F41, Thumb32InstId::CDP),
+            (0xFE64_3F51, Thumb32InstId::MCR),
+            (0xEE74_3F51, Thumb32InstId::MRC),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:#010x}"
+            );
+        }
     }
 }

@@ -1,5 +1,6 @@
 use super::helpers::{emit_imm_shift, get_address};
 use super::thumb32_control;
+use super::thumb32_coprocessor;
 use crate::frontend::a32::decoder_thumb32::{DecodedThumb32, Thumb32InstId};
 use crate::frontend::a32::types::Reg;
 use crate::ir::a32_emitter::A32IREmitter;
@@ -122,6 +123,15 @@ pub fn translate_thumb32(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
         UMLAL => thumb32_umlal(ir, inst),
         SDIV => thumb32_sdiv(ir, inst),
         UDIV => thumb32_udiv(ir, inst),
+
+        // Coprocessor
+        MCRR => thumb32_coprocessor::thumb32_mcrr(ir, inst),
+        MRRC => thumb32_coprocessor::thumb32_mrrc(ir, inst),
+        STC => thumb32_coprocessor::thumb32_stc(ir, inst),
+        LDC => thumb32_coprocessor::thumb32_ldc(ir, inst),
+        CDP => thumb32_coprocessor::thumb32_cdp(ir, inst),
+        MCR => thumb32_coprocessor::thumb32_mcr(ir, inst),
+        MRC => thumb32_coprocessor::thumb32_mrc(ir, inst),
 
         // Misc
         CLZ => thumb32_clz(ir, inst),

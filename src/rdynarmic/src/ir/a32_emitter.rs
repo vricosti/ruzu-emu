@@ -1,4 +1,5 @@
 use crate::frontend::a32::types::{ExtReg, Reg};
+use crate::interface::a32::coprocessor_util::CoprocReg;
 use crate::ir::acc_type::AccType;
 use crate::ir::block::Block;
 use crate::ir::emitter::IREmitter;
@@ -434,60 +435,187 @@ impl<'a> A32IREmitter<'a> {
 
     // --- Coprocessor ---
 
-    pub fn coproc_internal_operation(&mut self, coproc_info: u64) {
+    pub fn coproc_internal_operation(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        opc1: usize,
+        crd: CoprocReg,
+        crn: CoprocReg,
+        crm: CoprocReg,
+        opc2: usize,
+    ) {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            opc1 as u8,
+            crd as u8,
+            crn as u8,
+            crm as u8,
+            opc2 as u8,
+            0,
+        ]);
         self.emit_void(
             Opcode::A32CoprocInternalOperation,
             &[Value::ImmCoprocInfo(coproc_info)],
         );
     }
 
-    pub fn coproc_send_one_word(&mut self, coproc_info: u64, word: Value) {
+    pub fn coproc_send_one_word(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        opc1: usize,
+        crn: CoprocReg,
+        crm: CoprocReg,
+        opc2: usize,
+        word: Value,
+    ) {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            opc1 as u8,
+            crn as u8,
+            crm as u8,
+            opc2 as u8,
+            0,
+            0,
+        ]);
         self.emit_void(
             Opcode::A32CoprocSendOneWord,
             &[Value::ImmCoprocInfo(coproc_info), word],
         );
     }
 
-    pub fn coproc_send_two_words(&mut self, coproc_info: u64, word1: Value, word2: Value) {
+    pub fn coproc_send_two_words(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        opc: usize,
+        crm: CoprocReg,
+        word1: Value,
+        word2: Value,
+    ) {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            opc as u8,
+            crm as u8,
+            0,
+            0,
+            0,
+            0,
+        ]);
         self.emit_void(
             Opcode::A32CoprocSendTwoWords,
             &[Value::ImmCoprocInfo(coproc_info), word1, word2],
         );
     }
 
-    pub fn coproc_get_one_word(&mut self, coproc_info: u64) -> Value {
+    pub fn coproc_get_one_word(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        opc1: usize,
+        crn: CoprocReg,
+        crm: CoprocReg,
+        opc2: usize,
+    ) -> Value {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            opc1 as u8,
+            crn as u8,
+            crm as u8,
+            opc2 as u8,
+            0,
+            0,
+        ]);
         self.emit(
             Opcode::A32CoprocGetOneWord,
             &[Value::ImmCoprocInfo(coproc_info)],
         )
     }
 
-    pub fn coproc_get_two_words(&mut self, coproc_info: u64) -> Value {
+    pub fn coproc_get_two_words(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        opc: usize,
+        crm: CoprocReg,
+    ) -> Value {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            opc as u8,
+            crm as u8,
+            0,
+            0,
+            0,
+            0,
+        ]);
         self.emit(
             Opcode::A32CoprocGetTwoWords,
             &[Value::ImmCoprocInfo(coproc_info)],
         )
     }
 
-    pub fn coproc_load_words(&mut self, coproc_info: u64, address: Value, is_64bit: bool) {
+    pub fn coproc_load_words(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        long_transfer: bool,
+        crd: CoprocReg,
+        address: Value,
+        has_option: bool,
+        option: u8,
+    ) {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            u8::from(long_transfer),
+            crd as u8,
+            u8::from(has_option),
+            option,
+            0,
+            0,
+        ]);
         self.emit_void(
             Opcode::A32CoprocLoadWords,
-            &[
-                Value::ImmCoprocInfo(coproc_info),
-                address,
-                Value::ImmU1(is_64bit),
-            ],
+            &[Value::ImmCoprocInfo(coproc_info), address],
         );
     }
 
-    pub fn coproc_store_words(&mut self, coproc_info: u64, address: Value, is_64bit: bool) {
+    pub fn coproc_store_words(
+        &mut self,
+        coproc_no: usize,
+        two: bool,
+        long_transfer: bool,
+        crd: CoprocReg,
+        address: Value,
+        has_option: bool,
+        option: u8,
+    ) {
+        assert!(coproc_no <= 15);
+        let coproc_info = u64::from_le_bytes([
+            coproc_no as u8,
+            u8::from(two),
+            u8::from(long_transfer),
+            crd as u8,
+            u8::from(has_option),
+            option,
+            0,
+            0,
+        ]);
         self.emit_void(
             Opcode::A32CoprocStoreWords,
-            &[
-                Value::ImmCoprocInfo(coproc_info),
-                address,
-                Value::ImmU1(is_64bit),
-            ],
+            &[Value::ImmCoprocInfo(coproc_info), address],
         );
     }
 
@@ -617,6 +745,74 @@ mod tests {
         }
         assert_eq!(block.inst_count(), 1);
         assert_eq!(block.get(InstRef(0)).opcode, Opcode::A32CallSupervisor);
+    }
+
+    #[test]
+    fn coprocessor_metadata_layout_matches_upstream_arrays() {
+        let loc = A32LocationDescriptor::at(0x4000);
+        let mut block = Block::new(loc.to_location());
+        {
+            let mut e = A32IREmitter::with_location(&mut block, loc);
+            e.coproc_internal_operation(
+                15,
+                true,
+                6,
+                CoprocReg::C5,
+                CoprocReg::C4,
+                CoprocReg::C3,
+                2,
+            );
+            e.coproc_send_one_word(
+                14,
+                true,
+                5,
+                CoprocReg::C4,
+                CoprocReg::C3,
+                2,
+                Value::ImmU32(1),
+            );
+            e.coproc_send_two_words(
+                13,
+                true,
+                4,
+                CoprocReg::C3,
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+            );
+            e.coproc_get_one_word(12, true, 3, CoprocReg::C2, CoprocReg::C1, 7);
+            e.coproc_get_two_words(11, true, 2, CoprocReg::C1);
+            e.coproc_load_words(
+                10,
+                true,
+                true,
+                CoprocReg::C9,
+                Value::ImmU32(0x1000),
+                true,
+                0x5a,
+            );
+            e.coproc_store_words(
+                9,
+                true,
+                false,
+                CoprocReg::C8,
+                Value::ImmU32(0x2000),
+                false,
+                0xa5,
+            );
+        }
+
+        let metadata = |index: u32| {
+            block.get(InstRef(index)).args[0]
+                .get_coproc_info()
+                .to_le_bytes()
+        };
+        assert_eq!(metadata(0), [15, 1, 6, 5, 4, 3, 2, 0]);
+        assert_eq!(metadata(1), [14, 1, 5, 4, 3, 2, 0, 0]);
+        assert_eq!(metadata(2), [13, 1, 4, 3, 0, 0, 0, 0]);
+        assert_eq!(metadata(3), [12, 1, 3, 2, 1, 7, 0, 0]);
+        assert_eq!(metadata(4), [11, 1, 2, 1, 0, 0, 0, 0]);
+        assert_eq!(metadata(5), [10, 1, 1, 9, 1, 0x5a, 0, 0]);
+        assert_eq!(metadata(6), [9, 1, 0, 8, 0, 0xa5, 0, 0]);
     }
 
     #[test]

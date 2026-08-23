@@ -8293,3 +8293,45 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 ### Binary layout verification
 - N/A: the registry contains host-owned `Arc` trait objects and is never serialized or exposed to
   guest memory. Focused tests verify exactly 16 empty default slots.
+
+## 2026-08-23 — rdynarmic A32 coprocessor frontend/IR vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/frontend/a32/{decoder,decoder_thumb32}.rs`,
+`src/rdynarmic/src/frontend/a32/translate/{coprocessor,thumb32_coprocessor,vfp,mod,thumb32}.rs`,
+and `src/rdynarmic/src/ir/{a32_emitter,opcode}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/frontend/A32/decoder/{arm,thumb32,vfp}.inc`,
+`src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{coprocessor,thumb32_coprocessor,vfp}.cpp`,
+`src/dynarmic/src/dynarmic/frontend/A32/translate/translate_thumb.cpp`, and
+`src/dynarmic/src/dynarmic/ir/{a32_ir_emitter.h,a32_ir_emitter.cpp,opcodes.inc}`.
+
+### Intentional differences
+- Rust represents Eden's generated decoder tables with explicit masked matches. The same VFP,
+  ASIMD, unconditional ARM, and generic coprocessor priority is preserved; focused overlap tests
+  cover the VFP-before-generic and VFP-before-Thumb32 boundaries.
+- Rust constructs each fixed-size coprocessor metadata record with `u64::from_le_bytes` instead of
+  Eden's `std::array<u8, 8>` plus `memcpy`. Field order, zeroed reserved bytes, and the resulting
+  `U64` bit pattern are identical.
+- Eden's `UndefinedInstruction` and `UnpredictableInstruction` visitor helpers map to the existing
+  Rust translation helpers, which emit the same exception kind through Rust's IR API.
+
+### Unintentional differences (to fix)
+- Coprocessor metadata was previously packed in the decoder, placed `opc2` in the wrong byte, and
+  could not represent CDP's `CRd`. Construction now belongs to `A32IREmitter`, with the seven exact
+  upstream argument lists and byte layouts.
+- ARM LDC/STC and all seven unconditional/Thumb32 coprocessor forms were previously absent or
+  decoded as `Unknown`. Their validation, address calculation, option/writeback handling, and IR
+  emission now follow the corresponding Eden visitors.
+- VMSR/VMRS and the four two-word VFP moves were previously inferred inside the generic
+  coprocessor owner, including non-upstream FPEXC behavior. Their exact decoder patterns and
+  implementations now live in `vfp.rs`; generic CP10/CP11 forms take Eden's undefined path.
+- `A32CoprocLoadWords` and `A32CoprocStoreWords` previously carried a separate `U1` argument.
+  Their complete transfer metadata now lives in the packed `U64`, leaving Eden's exact
+  `Void(U64, U32)` signature.
+
+### Missing items
+- None in the reviewed ARM/Thumb coprocessor frontend and A32 IR-emitter slice.
+
+### Binary layout verification
+- PASS: focused tests assert every byte of Eden's seven eight-byte coprocessor metadata layouts,
+  including CDP `CRd`, one-word `opc2`, load/store option fields, and zeroed reserved bytes.

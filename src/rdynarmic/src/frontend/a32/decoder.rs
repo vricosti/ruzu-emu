@@ -213,6 +213,8 @@ pub enum ArmInstId {
     CDP,
     MRRC,
     MCRR,
+    LDC,
+    STC,
     // VFP load/store
     VPUSH,
     VPOP,
@@ -254,8 +256,14 @@ pub enum ArmInstId {
     VMOV_f64_u32,
     VMOV_u32_f32,
     VMOV_f32_u32,
+    VMOV_2u32_2f32,
+    VMOV_2f32_2u32,
+    VMOV_2u32_f64,
+    VMOV_f64_2u32,
     VMOV_from_i32,
     VMOV_to_i32,
+    VMSR,
+    VMRS,
     VFP_VDUP,
     // ASIMD
     ASIMD_VMOV_imm,
@@ -455,6 +463,10 @@ impl DecodedArm {
     pub fn coproc_opc1(&self) -> u32 {
         (self.raw >> 21) & 0x7
     }
+    /// Coprocessor data-processing opc1 (bits [23:20]) for CDP.
+    pub fn coproc_dp_opc1(&self) -> u32 {
+        (self.raw >> 20) & 0xF
+    }
     /// Coprocessor opc2 (bits [7:5]) for MCR/MRC.
     pub fn coproc_opc2(&self) -> u32 {
         (self.raw >> 5) & 0x7
@@ -477,30 +489,9 @@ impl DecodedArm {
         (self.raw >> 4) & 0xF
     }
 
-    /// Pack coprocessor info for MRRC/MCRR into a u64.
-    /// For two-register operations, the layout matches dynarmic's CoprocessorInfo
-    /// with `two=true` and opc in the opc1 slot.
-    pub fn pack_coproc_info_two(&self) -> u64 {
-        let cp = self.coproc_no() as u64;
-        let tw = 0u64; // "two" flag for MRRC/MCRR
-        let opc = self.mrrc_opc() as u64;
-        let crm = self.crm() as u64;
-        cp | (tw << 8) | (opc << 16) | (crm << 32)
-    }
-
-    /// Pack coprocessor info for MCR/MRC into a u64 matching dynarmic's
-    /// `CoprocessorInfo` layout (8 bytes packed as a u64).
-    ///
-    /// Byte layout: [0]=coproc_no, [1]=two, [2]=opc1, [3]=CRn,
-    ///              [4]=CRm, [5]=unused, [6]=opc2, [7]=unused
-    pub fn pack_coproc_info(&self, two: bool) -> u64 {
-        let cp = self.coproc_no() as u64;
-        let tw = if two { 1u64 } else { 0u64 };
-        let opc1 = self.coproc_opc1() as u64;
-        let crn = self.crn() as u64;
-        let crm = self.crm() as u64;
-        let opc2 = self.coproc_opc2() as u64;
-        cp | (tw << 8) | (opc1 << 16) | (crn << 24) | (crm << 32) | (opc2 << 48)
+    /// The `2` encoding selector used by unconditional-space coprocessor forms.
+    pub fn coproc_two(&self) -> bool {
+        self.cond() == Cond::NV
     }
 }
 
@@ -766,6 +757,16 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
         _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B1_0300) => ArmInstId::ASIMD_VABS_int,
         // VCVT_integer: 111100111D11zz11dddd011oUQM0mmmm
         _ if matches_arm(instr, 0xFFB3_0E10, 0xF3B3_0600) => ArmInstId::ASIMD_VCVT_integer,
+        // Generic coprocessor instructions in the unconditional encoding space.
+        // Specific VFP/ASIMD encodings above retain priority, matching Eden's
+        // DecodeVFP/DecodeASIMD-before-DecodeArm dispatch order.
+        _ if matches_arm(instr, 0x0FF0_0000, 0x0C40_0000) => ArmInstId::MCRR,
+        _ if matches_arm(instr, 0x0FF0_0000, 0x0C50_0000) => ArmInstId::MRRC,
+        _ if matches_arm(instr, 0x0F10_0010, 0x0E00_0010) => ArmInstId::MCR,
+        _ if matches_arm(instr, 0x0F10_0010, 0x0E10_0010) => ArmInstId::MRC,
+        _ if matches_arm(instr, 0x0F00_0010, 0x0E00_0000) => ArmInstId::CDP,
+        _ if matches_arm(instr, 0x0E10_0000, 0x0C10_0000) => ArmInstId::LDC,
+        _ if matches_arm(instr, 0x0E10_0000, 0x0C00_0000) => ArmInstId::STC,
         // Barriers
         _ if instr & 0xFFFF_FFF0 == 0xF57F_F040 => ArmInstId::DSB,
         _ if instr & 0xFFFF_FFF0 == 0xF57F_F050 => ArmInstId::DMB,
@@ -1261,6 +1262,25 @@ fn decode_arm_vfp_coproc(instr: u32) -> Option<ArmInstId> {
         return None;
     }
 
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C40_0A10) {
+        return Some(ArmInstId::VMOV_2u32_2f32);
+    }
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C50_0A10) {
+        return Some(ArmInstId::VMOV_2f32_2u32);
+    }
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C40_0B10) {
+        return Some(ArmInstId::VMOV_2u32_f64);
+    }
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C50_0B10) {
+        return Some(ArmInstId::VMOV_f64_2u32);
+    }
+    if matches_arm(instr, 0x0FFF_0FFF, 0x0EE1_0A10) {
+        return Some(ArmInstId::VMSR);
+    }
+    if matches_arm(instr, 0x0FFF_0FFF, 0x0EF1_0A10) {
+        return Some(ArmInstId::VMRS);
+    }
+
     // Upstream decoder/vfp.inc ownership:
     //   VMLA:  cccc11100D00nnnndddd101zN0M0mmmm
     //   VMLS:  cccc11100D00nnnndddd101zN1M0mmmm
@@ -1404,6 +1424,10 @@ fn decode_arm_vfp_coproc(instr: u32) -> Option<ArmInstId> {
 
 fn decode_arm_coproc_ls(instr: u32) -> ArmInstId {
     // Category 0b110: coprocessor load/store and register transfers.
+    if let Some(vfp) = decode_arm_vfp_coproc(instr) {
+        return vfp;
+    }
+
     // MRRC/MCRR: bits [27:21] = 1100_010, bit[20] = L (1=MRRC, 0=MCRR)
     if instr & 0x0FE0_0000 == 0x0C40_0000 {
         return if instr & (1 << 20) != 0 {
@@ -1469,8 +1493,11 @@ fn decode_arm_coproc_ls(instr: u32) -> ArmInstId {
         };
     }
 
-    // Non-VFP LDC/STC — stub as Unknown
-    ArmInstId::Unknown
+    if instr & (1 << 20) != 0 {
+        ArmInstId::LDC
+    } else {
+        ArmInstId::STC
+    }
 }
 
 /// Expand an ARM immediate: 8-bit value rotated right by 2*rotate.
@@ -1665,6 +1692,42 @@ mod tests {
         assert_eq!(dec.rt2(), Reg::R3);
         assert_eq!(dec.mrrc_opc(), 0);
         assert_eq!(dec.crm(), 14);
+    }
+
+    #[test]
+    fn test_decode_generic_coprocessor_load_store() {
+        let ldc = decode_arm(0xEDB4_7F22);
+        assert_eq!(ldc.id, ArmInstId::LDC);
+        assert_eq!(ldc.rn(), Reg::R4);
+        assert_eq!(ldc.coproc_no(), 15);
+        assert_eq!(ldc.rd(), Reg::R7);
+        assert_eq!(ldc.imm8(), 0x22);
+
+        let stc = decode_arm(0xED24_7F22);
+        assert_eq!(stc.id, ArmInstId::STC);
+    }
+
+    #[test]
+    fn test_decode_unconditional_coprocessor_two_forms() {
+        assert_eq!(decode_arm(0xFE64_3F51).id, ArmInstId::MCR);
+        assert_eq!(decode_arm(0xFE74_3F51).id, ArmInstId::MRC);
+        assert_eq!(decode_arm(0xFEF4_3F41).id, ArmInstId::CDP);
+        assert_eq!(decode_arm(0xFC42_3F1E).id, ArmInstId::MCRR);
+        assert_eq!(decode_arm(0xFC52_3F1E).id, ArmInstId::MRRC);
+        assert_eq!(decode_arm(0xFDB4_7F22).id, ArmInstId::LDC);
+        assert_eq!(decode_arm(0xFD24_7F22).id, ArmInstId::STC);
+        assert_eq!(decode_arm(0xFC42_3A1E).id, ArmInstId::MCRR);
+        assert_eq!(decode_arm(0xFC52_3A1E).id, ArmInstId::MRRC);
+    }
+
+    #[test]
+    fn test_vfp_specific_patterns_precede_generic_coprocessor_patterns() {
+        assert_eq!(decode_arm(0xEC42_3A1E).id, ArmInstId::VMOV_2u32_2f32);
+        assert_eq!(decode_arm(0xEC52_3A1E).id, ArmInstId::VMOV_2f32_2u32);
+        assert_eq!(decode_arm(0xEC42_3B1E).id, ArmInstId::VMOV_2u32_f64);
+        assert_eq!(decode_arm(0xEC52_3B1E).id, ArmInstId::VMOV_f64_2u32);
+        assert_eq!(decode_arm(0xEEE1_0A10).id, ArmInstId::VMSR);
+        assert_eq!(decode_arm(0xEEF1_FA10).id, ArmInstId::VMRS);
     }
 
     #[test]

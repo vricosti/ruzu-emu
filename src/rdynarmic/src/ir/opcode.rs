@@ -1661,8 +1661,8 @@ impl Opcode {
             A32CoprocSendTwoWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U32] },
             A32CoprocGetOneWord => OpcodeInfo { ret: U32, args: &[COPROC] },
             A32CoprocGetTwoWords => OpcodeInfo { ret: U64, args: &[COPROC] },
-            A32CoprocLoadWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U1] },
-            A32CoprocStoreWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U1] },
+            A32CoprocLoadWords => OpcodeInfo { ret: V, args: &[COPROC, U32] },
+            A32CoprocStoreWords => OpcodeInfo { ret: V, args: &[COPROC, U32] },
         }
     }
 }

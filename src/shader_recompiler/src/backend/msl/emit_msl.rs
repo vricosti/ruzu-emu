@@ -14,6 +14,7 @@ use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
+use super::emit_msl_atomic;
 use super::emit_msl_barriers;
 use super::emit_msl_bitwise_conversion;
 use super::emit_msl_composite;
@@ -94,8 +95,6 @@ fn first_unsupported_program_feature(
     if info.stores_global_memory
         || info.uses_local_memory
         || info.uses_global_memory
-        || info.uses_shared_increment
-        || info.uses_shared_decrement
         || info.uses_global_increment
         || info.uses_global_decrement
         || info.uses_atomic_f32_add
@@ -105,8 +104,6 @@ fn first_unsupported_program_feature(
         || info.uses_atomic_f32x2_add
         || info.uses_atomic_f32x2_min
         || info.uses_atomic_f32x2_max
-        || info.uses_atomic_s32_min
-        || info.uses_atomic_s32_max
         || info.uses_int64_bit_atomics
     {
         return Some("memory operations");
@@ -569,6 +566,32 @@ fn emit_inst(
             emit_msl_shared_memory::emit_write_shared(context, inst_ref, inst)
         }
         Opcode::Barrier => emit_msl_barriers::emit_barrier(context),
+        Opcode::SharedAtomicIAdd32
+        | Opcode::SharedAtomicSMin32
+        | Opcode::SharedAtomicUMin32
+        | Opcode::SharedAtomicSMax32
+        | Opcode::SharedAtomicUMax32
+        | Opcode::SharedAtomicInc32
+        | Opcode::SharedAtomicDec32
+        | Opcode::SharedAtomicAnd32
+        | Opcode::SharedAtomicOr32
+        | Opcode::SharedAtomicXor32
+        | Opcode::SharedAtomicExchange32 => {
+            emit_msl_atomic::emit_shared_atomic(context, inst_ref, inst)
+        }
+        Opcode::StorageAtomicIAdd32
+        | Opcode::StorageAtomicSMin32
+        | Opcode::StorageAtomicUMin32
+        | Opcode::StorageAtomicSMax32
+        | Opcode::StorageAtomicUMax32
+        | Opcode::StorageAtomicInc32
+        | Opcode::StorageAtomicDec32
+        | Opcode::StorageAtomicAnd32
+        | Opcode::StorageAtomicOr32
+        | Opcode::StorageAtomicXor32
+        | Opcode::StorageAtomicExchange32 => {
+            emit_msl_atomic::emit_storage_atomic(context, inst_ref, inst)
+        }
         Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
             emit_msl_image::emit_image_sample(context, inst_ref, inst)
         }
@@ -1846,6 +1869,75 @@ mod tests {
         assert!(source.contains("threadgroup atomic_uint* atomic_pointer"));
         assert!(source.contains("smem[((0x00000004u) >> 2u)] = 0x00000007u;"));
         assert!(source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
+    }
+
+    #[test]
+    fn emits_shared_and_storage_u32_atomics_with_upstream_cas_semantics() {
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 64;
+        program.info.uses_shared_increment = true;
+        program.info.uses_shared_decrement = true;
+        program.info.uses_atomic_s32_min = true;
+        program.info.uses_atomic_s32_max = true;
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        let block = &mut program.blocks[0];
+        for opcode in [
+            Opcode::SharedAtomicIAdd32,
+            Opcode::SharedAtomicSMin32,
+            Opcode::SharedAtomicUMin32,
+            Opcode::SharedAtomicSMax32,
+            Opcode::SharedAtomicUMax32,
+            Opcode::SharedAtomicInc32,
+            Opcode::SharedAtomicDec32,
+            Opcode::SharedAtomicAnd32,
+            Opcode::SharedAtomicOr32,
+            Opcode::SharedAtomicXor32,
+            Opcode::SharedAtomicExchange32,
+        ] {
+            block.append_new_inst(opcode, vec![Value::ImmU32(4), Value::ImmU32(7)]);
+        }
+        for opcode in [
+            Opcode::StorageAtomicIAdd32,
+            Opcode::StorageAtomicSMin32,
+            Opcode::StorageAtomicUMin32,
+            Opcode::StorageAtomicSMax32,
+            Opcode::StorageAtomicUMax32,
+            Opcode::StorageAtomicInc32,
+            Opcode::StorageAtomicDec32,
+            Opcode::StorageAtomicAnd32,
+            Opcode::StorageAtomicOr32,
+            Opcode::StorageAtomicXor32,
+            Opcode::StorageAtomicExchange32,
+        ] {
+            block.append_new_inst(
+                opcode,
+                vec![Value::ImmU32(0), Value::ImmU32(8), Value::ImmU32(9)],
+            );
+        }
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(
+            source.contains("atomic_fetch_add_explicit(reinterpret_cast<threadgroup atomic_uint*>")
+        );
+        assert!(source.contains("reinterpret_cast<threadgroup atomic_int*>"));
+        assert!(source.contains("spvAtomicInc(reinterpret_cast<threadgroup atomic_uint*>"));
+        assert!(source.contains("spvAtomicDec(reinterpret_cast<threadgroup atomic_uint*>"));
+        assert!(source.contains(
+            "atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[2u])"
+        ));
+        assert!(source.contains("reinterpret_cast<device atomic_int*>"));
+        assert!(source.contains("uint desired = expected >= limit ? 0u : expected + 1u;"));
+        assert!(source.contains(
+            "uint desired = expected == 0u || expected > limit ? limit : expected - 1u;"
+        ));
     }
 
     #[test]

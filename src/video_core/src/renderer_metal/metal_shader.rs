@@ -1623,6 +1623,55 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_shared_and_storage_atomics_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 64;
+        program.info.uses_shared_increment = true;
+        program.info.storage_buffers_descriptors.push(
+            shader_recompiler::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SharedAtomicInc32,
+            vec![Value::ImmU32(4), Value::ImmU32(7)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicSMin32,
+            vec![Value::ImmU32(0), Value::ImmU32(8), Value::ImmU32(u32::MAX)],
+        );
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+        )
+        .expect("active shared/storage atomic SPIR-V/MSL must compile");
+        let shader = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct 32-bit memory atomic MSL must compile with the active ABI");
+        assert_eq!(shader.source().stage, Stage::Compute);
+        assert_eq!(shader.bindings(), active.bindings());
+        assert!(shader.source().source.contains("spvAtomicInc"));
+        assert!(shader.source().source.contains("atomic_fetch_min_explicit"));
+    }
+
+    #[test]
     fn compiles_direct_msl_ssa_and_vertex_output_with_metal() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::VertexB);

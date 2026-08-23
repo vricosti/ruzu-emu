@@ -37,6 +37,7 @@ pub struct MslEmitContext {
     uses_no_contraction_fma: bool,
     uses_storage_subword_cas: bool,
     uses_shared_subword_cas: bool,
+    uses_atomic_inc_dec_cas: bool,
     uses_texture_cast: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
@@ -250,6 +251,7 @@ impl MslEmitContext {
             uses_no_contraction_fma: false,
             uses_storage_subword_cas: false,
             uses_shared_subword_cas: false,
+            uses_atomic_inc_dec_cas: false,
             uses_texture_cast: false,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
@@ -668,6 +670,10 @@ impl MslEmitContext {
         self.uses_shared_subword_cas = true;
     }
 
+    pub fn require_atomic_inc_dec_cas(&mut self) {
+        self.uses_atomic_inc_dec_cas = true;
+    }
+
     fn unsupported_value_name(value: &Value) -> &'static str {
         match value {
             Value::Inst(_) => "undefined instruction",
@@ -902,6 +908,30 @@ impl MslEmitContext {
                 "        uint desired = insert_bits(expected, value, bit_offset, bit_count);\n",
                 "        if (atomic_compare_exchange_weak_explicit(atomic_pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
                 "            return;\n",
+                "        }\n",
+                "    }\n",
+                "}\n\n",
+            ));
+        }
+        if self.uses_atomic_inc_dec_cas {
+            source.push_str(concat!(
+                "template<typename T>\n",
+                "inline uint spvAtomicInc(T pointer, uint limit) {\n",
+                "    uint expected = atomic_load_explicit(pointer, memory_order_relaxed);\n",
+                "    while (true) {\n",
+                "        uint desired = expected >= limit ? 0u : expected + 1u;\n",
+                "        if (atomic_compare_exchange_weak_explicit(pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
+                "            return expected;\n",
+                "        }\n",
+                "    }\n",
+                "}\n\n",
+                "template<typename T>\n",
+                "inline uint spvAtomicDec(T pointer, uint limit) {\n",
+                "    uint expected = atomic_load_explicit(pointer, memory_order_relaxed);\n",
+                "    while (true) {\n",
+                "        uint desired = expected == 0u || expected > limit ? limit : expected - 1u;\n",
+                "        if (atomic_compare_exchange_weak_explicit(pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
+                "            return expected;\n",
                 "        }\n",
                 "    }\n",
                 "}\n\n",

@@ -9,6 +9,7 @@
 //! renderer never has to recover resource metadata from generated source.
 
 pub mod emit_msl;
+mod emit_msl_atomic;
 mod emit_msl_barriers;
 mod emit_msl_bitwise_conversion;
 mod emit_msl_composite;

@@ -7,11 +7,14 @@ use crate::backend::common::a32_callbacks::{self, A32ExclusiveState};
 use crate::exclusive_monitor::ExclusiveMonitor;
 use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
 use crate::frontend::a32::translate::{translate, TranslationOptions};
+use crate::interface::a32::config::{
+    UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+};
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::terminal::Terminal;
-use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 use super::address_space::AddressSpace;
 use super::emit_arm64::{CodePtr, EmitConfig};
@@ -31,7 +34,7 @@ pub struct BlockRange32 {
 /// Upstream owner: `backend/arm64/a32_address_space.h/.cpp`.
 pub struct A32AddressSpace {
     address_space: AddressSpace,
-    conf: JitConfig,
+    conf: A32UserConfig,
     block_ranges: Vec<BlockRange32>,
     dispatcher_entries: u64,
     dispatcher_cache_hits: u64,
@@ -61,7 +64,6 @@ pub struct A32NormalCallbackFns {
     pub isb_raised: *const c_void,
     pub add_ticks: *const c_void,
     pub get_ticks_remaining: *const c_void,
-    pub get_cntpct: *const c_void,
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +89,6 @@ pub struct A32CallbackFns {
     pub isb_raised: *const c_void,
     pub add_ticks: *const c_void,
     pub get_ticks_remaining: *const c_void,
-    pub get_cntpct: *const c_void,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,7 +132,7 @@ fn classify_terminal(terminal: &Terminal) -> TerminalKind {
 /// and processor id.
 pub struct A32CallbackContext {
     jit_state: *mut A32JitState,
-    callbacks: *mut (dyn UserCallbacks + 'static),
+    callbacks: *mut (dyn A32UserCallbacks + 'static),
     global_monitor: Option<*mut ExclusiveMonitor>,
     processor_id: usize,
     exclusive_value: [u64; 2],
@@ -140,7 +141,7 @@ pub struct A32CallbackContext {
 impl A32CallbackContext {
     pub fn new(
         jit_state: *mut A32JitState,
-        callbacks: *mut (dyn UserCallbacks + 'static),
+        callbacks: *mut (dyn A32UserCallbacks + 'static),
         global_monitor: Option<*mut ExclusiveMonitor>,
         processor_id: usize,
     ) -> Self {
@@ -176,15 +177,14 @@ impl A32CallbackContext {
             isb_raised: a32_arm64_isb_raised as *const () as *const c_void,
             add_ticks: a32_arm64_add_ticks as *const () as *const c_void,
             get_ticks_remaining: a32_arm64_get_ticks_remaining as *const () as *const c_void,
-            get_cntpct: a32_arm64_get_cntpct as *const () as *const c_void,
         }
     }
 
-    fn callbacks(&self) -> &dyn UserCallbacks {
+    fn callbacks(&self) -> &dyn A32UserCallbacks {
         unsafe { &*self.callbacks }
     }
 
-    fn callbacks_mut(&mut self) -> &mut dyn UserCallbacks {
+    fn callbacks_mut(&mut self) -> &mut dyn A32UserCallbacks {
         unsafe { &mut *self.callbacks }
     }
 }
@@ -385,11 +385,6 @@ extern "C" fn a32_arm64_get_ticks_remaining(ctx: *mut A32CallbackContext) -> u64
     a32_callbacks::get_ticks_remaining(context.callbacks())
 }
 
-extern "C" fn a32_arm64_get_cntpct(ctx: *mut A32CallbackContext) -> u64 {
-    let context = unsafe { &mut *ctx };
-    a32_callbacks::get_cntpct(context.callbacks())
-}
-
 extern "C" fn a32_arm64_exclusive_read_8(ctx: *mut A32CallbackContext, vaddr: u64) -> u64 {
     let context = unsafe { &mut *ctx };
     let global_monitor = context.global_monitor;
@@ -434,7 +429,7 @@ extern "C" fn a32_arm64_exclusive_write_8(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u8| {
-                callbacks.exclusive_write_8(vaddr, value as u8, expected)
+                callbacks.memory_write_exclusive_8(vaddr as u32, value as u8, expected)
             })
         } {
             0
@@ -445,7 +440,7 @@ extern "C" fn a32_arm64_exclusive_write_8(
     let expected = context.exclusive_value[0] as u8;
     context
         .callbacks_mut()
-        .exclusive_write_8(vaddr, value as u8, expected) as u64
+        .memory_write_exclusive_8(vaddr as u32, value as u8, expected) as u64
         ^ 1
 }
 
@@ -461,7 +456,7 @@ extern "C" fn a32_arm64_exclusive_write_16(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u16| {
-                callbacks.exclusive_write_16(vaddr, value as u16, expected)
+                callbacks.memory_write_exclusive_16(vaddr as u32, value as u16, expected)
             })
         } {
             0
@@ -472,7 +467,7 @@ extern "C" fn a32_arm64_exclusive_write_16(
     let expected = context.exclusive_value[0] as u16;
     context
         .callbacks_mut()
-        .exclusive_write_16(vaddr, value as u16, expected) as u64
+        .memory_write_exclusive_16(vaddr as u32, value as u16, expected) as u64
         ^ 1
 }
 
@@ -488,7 +483,7 @@ extern "C" fn a32_arm64_exclusive_write_32(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u32| {
-                callbacks.exclusive_write_32(vaddr, value as u32, expected)
+                callbacks.memory_write_exclusive_32(vaddr as u32, value as u32, expected)
             })
         } {
             0
@@ -499,7 +494,7 @@ extern "C" fn a32_arm64_exclusive_write_32(
     let expected = context.exclusive_value[0] as u32;
     context
         .callbacks_mut()
-        .exclusive_write_32(vaddr, value as u32, expected) as u64
+        .memory_write_exclusive_32(vaddr as u32, value as u32, expected) as u64
         ^ 1
 }
 
@@ -515,7 +510,7 @@ extern "C" fn a32_arm64_exclusive_write_64(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u64| {
-                callbacks.exclusive_write_64(vaddr, value, expected)
+                callbacks.memory_write_exclusive_64(vaddr as u32, value, expected)
             })
         } {
             0
@@ -526,22 +521,23 @@ extern "C" fn a32_arm64_exclusive_write_64(
     let expected = context.exclusive_value[0];
     context
         .callbacks_mut()
-        .exclusive_write_64(vaddr, value, expected) as u64
+        .memory_write_exclusive_64(vaddr as u32, value, expected) as u64
         ^ 1
 }
 
 impl A32AddressSpace {
-    pub fn new(conf: JitConfig) -> Result<Self, String> {
+    pub fn new(conf: impl Into<A32UserConfig>) -> Result<Self, String> {
         let mut address_space = Self::new_without_prelude(conf)?;
         emit_prelude(&mut address_space)?;
         Ok(address_space)
     }
 
-    pub(crate) fn new_without_prelude(conf: JitConfig) -> Result<Self, String> {
+    pub(crate) fn new_without_prelude(conf: impl Into<A32UserConfig>) -> Result<Self, String> {
+        let conf = conf.into();
         let code_cache_size = if conf.code_cache_size == 0 {
-            crate::jit_config::JitConfig::DEFAULT_CODE_CACHE_SIZE
+            A32UserConfig::DEFAULT_CODE_CACHE_SIZE as usize
         } else {
-            conf.code_cache_size
+            conf.code_cache_size as usize
         };
 
         let address_space = AddressSpace::new(code_cache_size)?;
@@ -589,7 +585,7 @@ impl A32AddressSpace {
                 return_stack_buffer: self
                     .config()
                     .has_optimization(OptimizationFlag::RETURN_STACK_BUFFER),
-                page_table_pointer: self.config().page_table_pointer.map_or(0, |p| p as u64),
+                page_table_pointer: self.config().page_table.map_or(0, |p| p as u64),
                 fastmem_pointer: self.config().fastmem_pointer.map_or(0, |p| p as u64),
             })
     }
@@ -598,11 +594,11 @@ impl A32AddressSpace {
         &self.address_space
     }
 
-    pub fn config(&self) -> &JitConfig {
+    pub fn config(&self) -> &A32UserConfig {
         &self.conf
     }
 
-    pub(crate) fn config_mut(&mut self) -> &mut JitConfig {
+    pub(crate) fn config_mut(&mut self) -> &mut A32UserConfig {
         &mut self.conf
     }
 
@@ -619,7 +615,7 @@ impl A32AddressSpace {
         if let Some((lo, hi)) = crate::jit::block_count_range() {
             let pc = A32LocationDescriptor::from_location(descriptor).pc();
             if pc >= lo && pc < hi {
-                let idx = self.conf.processor_id.min(15);
+                let idx = self.conf.processor_id.min(15) as usize;
                 crate::jit::block_count_counters()[idx]
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -743,7 +739,7 @@ impl A32AddressSpace {
             opt::dead_code_elimination(&mut block);
         }
         if self.conf.has_optimization(OptimizationFlag::CONST_PROP) {
-            let read_code = |vaddr: u32| self.conf.callbacks.memory_read_code(vaddr as u64);
+            let read_code = |vaddr: u32| self.conf.callbacks.memory_read_code(vaddr);
             let is_read_only = |vaddr: u32| self.conf.callbacks.is_read_only_memory(vaddr);
             opt::a32_constant_memory_reads(&mut block, &read_code, &is_read_only);
             opt::constant_propagation(&mut block);
@@ -808,10 +804,6 @@ impl A32AddressSpace {
         let get_ticks_remaining = self
             .address_space
             .emit_call_trampoline(this_ptr, fns.get_ticks_remaining)?;
-        let get_cntpct = self
-            .address_space
-            .emit_call_trampoline(this_ptr, fns.get_cntpct)?;
-
         let prelude_info = self.address_space.prelude_info_mut();
         prelude_info.read_memory_8 = Some(read_memory_8);
         prelude_info.read_memory_16 = Some(read_memory_16);
@@ -826,7 +818,6 @@ impl A32AddressSpace {
         prelude_info.isb_raised = Some(isb_raised);
         prelude_info.add_ticks = Some(add_ticks);
         prelude_info.get_ticks_remaining = Some(get_ticks_remaining);
-        prelude_info.get_cntpct = Some(get_cntpct);
         Ok(())
     }
 
@@ -929,10 +920,6 @@ impl A32AddressSpace {
         let get_ticks_remaining = self
             .address_space
             .emit_call_trampoline(callbacks_this_ptr, fns.get_ticks_remaining)?;
-        let get_cntpct = self
-            .address_space
-            .emit_call_trampoline(callbacks_this_ptr, fns.get_cntpct)?;
-
         let prelude_info = self.address_space.prelude_info_mut();
         prelude_info.read_memory_8 = Some(read_memory_8);
         prelude_info.read_memory_16 = Some(read_memory_16);
@@ -963,7 +950,6 @@ impl A32AddressSpace {
         prelude_info.isb_raised = Some(isb_raised);
         prelude_info.add_ticks = Some(add_ticks);
         prelude_info.get_ticks_remaining = Some(get_ticks_remaining);
-        prelude_info.get_cntpct = Some(get_cntpct);
         Ok(())
     }
 
@@ -1137,19 +1123,17 @@ fn ranges_overlap_u32(start: u32, end: u32, range: &RangeInclusive<u32>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::ir::opcode::Opcode;
-    use crate::jit_config::UserCallbacks;
 
     struct TestCallbacks {
         code: Vec<u32>,
         memory: [u8; 64],
     }
 
-    impl UserCallbacks for TestCallbacks {
-        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for TestCallbacks {
+        fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
             let index = (vaddr / 4) as usize;
             self.code.get(index).copied()
         }
@@ -1158,87 +1142,71 @@ mod tests {
             true
         }
 
-        fn memory_read_8(&self, _vaddr: u64) -> u8 {
+        fn memory_read_8(&self, _vaddr: u32) -> u8 {
             self.memory[_vaddr as usize]
         }
 
-        fn memory_read_16(&self, _vaddr: u64) -> u16 {
+        fn memory_read_16(&self, _vaddr: u32) -> u16 {
             let offset = _vaddr as usize;
             u16::from_le_bytes(self.memory[offset..offset + 2].try_into().unwrap())
         }
 
-        fn memory_read_32(&self, _vaddr: u64) -> u32 {
+        fn memory_read_32(&self, _vaddr: u32) -> u32 {
             let offset = _vaddr as usize;
             u32::from_le_bytes(self.memory[offset..offset + 4].try_into().unwrap())
         }
 
-        fn memory_read_64(&self, _vaddr: u64) -> u64 {
+        fn memory_read_64(&self, _vaddr: u32) -> u64 {
             let offset = _vaddr as usize;
             u64::from_le_bytes(self.memory[offset..offset + 8].try_into().unwrap())
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (self.memory_read_64(_vaddr), self.memory_read_64(_vaddr + 8))
-        }
-
-        fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {
+        fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {
             self.memory[_vaddr as usize] = _value;
         }
 
-        fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {
+        fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {
             let offset = _vaddr as usize;
             self.memory[offset..offset + 2].copy_from_slice(&_value.to_le_bytes());
         }
 
-        fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {
+        fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {
             let offset = _vaddr as usize;
             self.memory[offset..offset + 4].copy_from_slice(&_value.to_le_bytes());
         }
 
-        fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {
+        fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {
             let offset = _vaddr as usize;
             self.memory[offset..offset + 8].copy_from_slice(&_value.to_le_bytes());
         }
 
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {
-            self.memory_write_64(_vaddr, _value_lo);
-            self.memory_write_64(_vaddr + 8, _value_hi);
-        }
-
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
+        fn memory_write_exclusive_8(&mut self, _vaddr: u32, _value: u8, _expected: u8) -> bool {
             self.memory_write_8(_vaddr, _value);
             true
         }
 
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
+        fn memory_write_exclusive_16(&mut self, _vaddr: u32, _value: u16, _expected: u16) -> bool {
             self.memory_write_16(_vaddr, _value);
             true
         }
 
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
+        fn memory_write_exclusive_32(&mut self, _vaddr: u32, _value: u32, _expected: u32) -> bool {
             self.memory_write_32(_vaddr, _value);
             true
         }
 
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
+        fn memory_write_exclusive_64(&mut self, _vaddr: u32, _value: u64, _expected: u64) -> bool {
             self.memory_write_64(_vaddr, _value);
             true
         }
 
-        fn exclusive_write_128(
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(
             &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            self.memory_write_128(_vaddr, _value_lo, _value_hi);
-            true
+            _pc: u32,
+            _exception: crate::interface::a32::config::Exception,
+        ) {
         }
-
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
@@ -1246,34 +1214,15 @@ mod tests {
         }
     }
 
-    fn config(code: Vec<u32>) -> JitConfig {
-        JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
-            callbacks: Box::new(TestCallbacks {
-                code,
-                memory: [0; 64],
-            }),
-            enable_cycle_counting: false,
-            code_cache_size: 4096,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn config(code: Vec<u32>) -> A32UserConfig {
+        let mut config = A32UserConfig::new(Box::new(TestCallbacks {
+            code,
+            memory: [0; 64],
+        }));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4096;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config
     }
 
     extern "C" fn dummy_callback() {}
@@ -1294,7 +1243,6 @@ mod tests {
             isb_raised: ptr,
             add_ticks: ptr,
             get_ticks_remaining: ptr,
-            get_cntpct: ptr,
         }
     }
 
@@ -1322,7 +1270,6 @@ mod tests {
             isb_raised: ptr,
             add_ticks: ptr,
             get_ticks_remaining: ptr,
-            get_cntpct: ptr,
         }
     }
 
@@ -1413,7 +1360,7 @@ mod tests {
         assert!(prelude.write_memory_64.is_some());
         assert!(prelude.call_svc.is_some());
         assert!(prelude.get_ticks_remaining.is_some());
-        assert!(prelude.get_cntpct.is_some());
+        assert!(prelude.get_cntpct.is_none());
 
         let end_of_prelude = prelude.end_of_prelude;
         address_space.address_space.clear_cache().unwrap();

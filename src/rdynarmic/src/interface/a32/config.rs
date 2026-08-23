@@ -31,6 +31,25 @@ impl Exception {
     pub fn as_u32(self) -> u32 {
         self as u32
     }
+
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::UndefinedInstruction,
+            1 => Self::UnpredictableInstruction,
+            2 => Self::DecodeError,
+            3 => Self::SendEvent,
+            4 => Self::SendEventLocal,
+            5 => Self::WaitForInterrupt,
+            6 => Self::WaitForEvent,
+            7 => Self::Yield,
+            8 => Self::Breakpoint,
+            9 => Self::PreloadData,
+            10 => Self::PreloadDataWithIntentToWrite,
+            11 => Self::PreloadInstruction,
+            12 => Self::NoExecuteFault,
+            _ => unreachable!("invalid A32 exception value {value}"),
+        }
+    }
 }
 
 /// Host callbacks inserted into generated A32 code.
@@ -88,6 +107,15 @@ pub trait UserCallbacks: Send {
 
     fn add_ticks(&mut self, ticks: u64);
     fn get_ticks_remaining(&self) -> u64;
+
+    /// Rust lifecycle adapter: called once the owning JIT state has a stable address.
+    fn set_halt_reason_ptr(&mut self, _ptr: *const u32) {}
+
+    /// Rust lifecycle adapter: called once the owning JIT state has a stable address.
+    fn set_pc_ptr(&mut self, _ptr: *const u32) {}
+
+    /// Rust lifecycle adapter for the A32 upper location descriptor.
+    fn set_upper_location_descriptor_ptr(&mut self, _ptr: *const u32) {}
 }
 
 /// The 16 configurable A32 coprocessor slots from `A32::UserConfig`.
@@ -173,6 +201,14 @@ impl UserConfig {
         }
         (flag & self.optimizations) != OptimizationFlag::NO_OPTIMIZATIONS
     }
+
+    pub fn effective_optimizations(&self) -> OptimizationFlag {
+        if self.unsafe_optimizations {
+            self.optimizations
+        } else {
+            self.optimizations & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+        }
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +234,7 @@ mod tests {
         ];
         for (expected, exception) in values.into_iter().enumerate() {
             assert_eq!(exception.as_u32(), expected as u32);
+            assert_eq!(Exception::from_u32(expected as u32), exception);
         }
         assert_eq!(std::mem::size_of::<Exception>(), 4);
         assert_eq!(std::mem::align_of::<Exception>(), 4);

@@ -247,6 +247,18 @@ impl crate::interface::a32::config::UserCallbacks for dyn UserCallbacks + '_ {
     fn get_ticks_remaining(&self) -> u64 {
         UserCallbacks::get_ticks_remaining(self)
     }
+
+    fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
+        UserCallbacks::set_halt_reason_ptr(self, ptr);
+    }
+
+    fn set_pc_ptr(&mut self, ptr: *const u32) {
+        UserCallbacks::set_pc_ptr(self, ptr);
+    }
+
+    fn set_upper_location_descriptor_ptr(&mut self, ptr: *const u32) {
+        UserCallbacks::set_upper_location_descriptor_ptr(self, ptr);
+    }
 }
 
 impl crate::interface::a64::config::UserCallbacks for dyn UserCallbacks + '_ {
@@ -517,5 +529,235 @@ impl JitConfig {
         } else {
             self.optimizations & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
         }
+    }
+
+    /// Convert the legacy merged configuration at the public compatibility
+    /// boundary into Eden's A32-owned configuration.
+    pub fn into_a32_user_config(self) -> crate::interface::a32::config::UserConfig {
+        use crate::interface::a32::config::UserConfig;
+
+        let page_table = self
+            .page_table_pointer
+            .map(|pointer| pointer as *mut [*mut u8; UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        let memory = self.memory;
+        let callbacks = Box::new(LegacyA32Callbacks(self.callbacks));
+
+        UserConfig {
+            callbacks,
+            global_monitor: self.global_monitor,
+            page_table,
+            coprocessors: self.coprocessors,
+            fastmem_pointer: self.fastmem_pointer,
+            optimizations: self.optimizations,
+            code_cache_size: self
+                .code_cache_size
+                .try_into()
+                .expect("A32 code cache size must fit u32"),
+            page_table_pointer_mask_bits: memory
+                .page_table_pointer_mask_bits
+                .try_into()
+                .expect("A32 page-table pointer mask must fit i32"),
+            page_table_log2_stride: 3,
+            arch_version: self.arch_version,
+            processor_id: self
+                .processor_id
+                .try_into()
+                .expect("A32 processor id must fit u8"),
+            detect_misaligned_access_via_page_table: memory
+                .detect_misaligned_access_via_page_table
+                .try_into()
+                .expect("A32 misalignment mask must fit u8"),
+            unsafe_optimizations: self.unsafe_optimizations,
+            absolute_offset_page_table: memory.absolute_offset_page_table,
+            only_detect_misalignment_via_page_table_on_page_boundary: memory
+                .only_detect_misalignment_via_page_table_on_page_boundary,
+            recompile_on_fastmem_failure: memory.recompile_on_fastmem_failure,
+            fastmem_exclusive_access: memory.fastmem_exclusive_access,
+            recompile_on_exclusive_fastmem_failure: memory.recompile_on_exclusive_fastmem_failure,
+            hook_isb: self.hook_isb,
+            hook_hint_instructions: self.hook_hint_instructions,
+            define_unpredictable_behaviour: self.define_unpredictable_behaviour,
+            wall_clock_cntpct: self.wall_clock_cntpct,
+            check_halt_on_memory_access: memory.check_halt_on_memory_access,
+            enable_cycle_counting: self.enable_cycle_counting,
+            always_little_endian: false,
+            very_verbose_debugging_output: false,
+        }
+    }
+}
+
+struct LegacyA32Callbacks(Box<dyn UserCallbacks>);
+
+impl crate::interface::a32::config::UserCallbacks for LegacyA32Callbacks {
+    fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
+        crate::interface::a32::config::UserCallbacks::memory_read_code(self.0.as_ref(), vaddr)
+    }
+
+    fn pre_code_read_hook(
+        &self,
+        is_thumb: bool,
+        pc: u32,
+        ir: &mut crate::ir::a32_emitter::A32IREmitter<'_>,
+    ) -> bool {
+        crate::interface::a32::config::UserCallbacks::pre_code_read_hook(
+            self.0.as_ref(),
+            is_thumb,
+            pc,
+            ir,
+        )
+    }
+
+    fn pre_code_translation_hook(
+        &self,
+        is_thumb: bool,
+        pc: u32,
+        ir: &mut crate::ir::a32_emitter::A32IREmitter<'_>,
+    ) {
+        crate::interface::a32::config::UserCallbacks::pre_code_translation_hook(
+            self.0.as_ref(),
+            is_thumb,
+            pc,
+            ir,
+        );
+    }
+
+    fn get_ticks_for_code(&self, is_thumb: bool, vaddr: u32, instruction: u32) -> u64 {
+        crate::interface::a32::config::UserCallbacks::get_ticks_for_code(
+            self.0.as_ref(),
+            is_thumb,
+            vaddr,
+            instruction,
+        )
+    }
+
+    fn memory_read_8(&self, vaddr: u32) -> u8 {
+        crate::interface::a32::config::UserCallbacks::memory_read_8(self.0.as_ref(), vaddr)
+    }
+
+    fn memory_read_16(&self, vaddr: u32) -> u16 {
+        crate::interface::a32::config::UserCallbacks::memory_read_16(self.0.as_ref(), vaddr)
+    }
+
+    fn memory_read_32(&self, vaddr: u32) -> u32 {
+        crate::interface::a32::config::UserCallbacks::memory_read_32(self.0.as_ref(), vaddr)
+    }
+
+    fn memory_read_64(&self, vaddr: u32) -> u64 {
+        crate::interface::a32::config::UserCallbacks::memory_read_64(self.0.as_ref(), vaddr)
+    }
+
+    fn memory_write_8(&mut self, vaddr: u32, value: u8) {
+        crate::interface::a32::config::UserCallbacks::memory_write_8(self.0.as_mut(), vaddr, value);
+    }
+
+    fn memory_write_16(&mut self, vaddr: u32, value: u16) {
+        crate::interface::a32::config::UserCallbacks::memory_write_16(
+            self.0.as_mut(),
+            vaddr,
+            value,
+        );
+    }
+
+    fn memory_write_32(&mut self, vaddr: u32, value: u32) {
+        crate::interface::a32::config::UserCallbacks::memory_write_32(
+            self.0.as_mut(),
+            vaddr,
+            value,
+        );
+    }
+
+    fn memory_write_64(&mut self, vaddr: u32, value: u64) {
+        crate::interface::a32::config::UserCallbacks::memory_write_64(
+            self.0.as_mut(),
+            vaddr,
+            value,
+        );
+    }
+
+    fn memory_write_exclusive_8(&mut self, vaddr: u32, value: u8, expected: u8) -> bool {
+        crate::interface::a32::config::UserCallbacks::memory_write_exclusive_8(
+            self.0.as_mut(),
+            vaddr,
+            value,
+            expected,
+        )
+    }
+
+    fn memory_write_exclusive_16(&mut self, vaddr: u32, value: u16, expected: u16) -> bool {
+        crate::interface::a32::config::UserCallbacks::memory_write_exclusive_16(
+            self.0.as_mut(),
+            vaddr,
+            value,
+            expected,
+        )
+    }
+
+    fn memory_write_exclusive_32(&mut self, vaddr: u32, value: u32, expected: u32) -> bool {
+        crate::interface::a32::config::UserCallbacks::memory_write_exclusive_32(
+            self.0.as_mut(),
+            vaddr,
+            value,
+            expected,
+        )
+    }
+
+    fn memory_write_exclusive_64(&mut self, vaddr: u32, value: u64, expected: u64) -> bool {
+        crate::interface::a32::config::UserCallbacks::memory_write_exclusive_64(
+            self.0.as_mut(),
+            vaddr,
+            value,
+            expected,
+        )
+    }
+
+    fn is_read_only_memory(&self, vaddr: u32) -> bool {
+        crate::interface::a32::config::UserCallbacks::is_read_only_memory(self.0.as_ref(), vaddr)
+    }
+
+    fn call_svc(&mut self, swi: u32) {
+        crate::interface::a32::config::UserCallbacks::call_svc(self.0.as_mut(), swi);
+    }
+
+    fn exception_raised(&mut self, pc: u32, exception: crate::interface::a32::config::Exception) {
+        crate::interface::a32::config::UserCallbacks::exception_raised(
+            self.0.as_mut(),
+            pc,
+            exception,
+        );
+    }
+
+    fn instruction_synchronization_barrier_raised(&mut self) {
+        crate::interface::a32::config::UserCallbacks::instruction_synchronization_barrier_raised(
+            self.0.as_mut(),
+        );
+    }
+
+    fn add_ticks(&mut self, ticks: u64) {
+        crate::interface::a32::config::UserCallbacks::add_ticks(self.0.as_mut(), ticks);
+    }
+
+    fn get_ticks_remaining(&self) -> u64 {
+        crate::interface::a32::config::UserCallbacks::get_ticks_remaining(self.0.as_ref())
+    }
+
+    fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
+        crate::interface::a32::config::UserCallbacks::set_halt_reason_ptr(self.0.as_mut(), ptr);
+    }
+
+    fn set_pc_ptr(&mut self, ptr: *const u32) {
+        crate::interface::a32::config::UserCallbacks::set_pc_ptr(self.0.as_mut(), ptr);
+    }
+
+    fn set_upper_location_descriptor_ptr(&mut self, ptr: *const u32) {
+        crate::interface::a32::config::UserCallbacks::set_upper_location_descriptor_ptr(
+            self.0.as_mut(),
+            ptr,
+        );
+    }
+}
+
+impl From<JitConfig> for crate::interface::a32::config::UserConfig {
+    fn from(config: JitConfig) -> Self {
+        config.into_a32_user_config()
     }
 }

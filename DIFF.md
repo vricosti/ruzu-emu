@@ -10618,3 +10618,37 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these host configuration structures are not raw-copied across the guest ABI. Focused tests
   verify both upstream constants and every nonzero/true default, including A32 page-table geometry,
   A64 timer/cache registers, mirror/recompile switches, cycle counting, and optimization masking.
+
+## 2026-08-24 — `src/rdynarmic/src/{jit.rs,jit_config.rs,backend/{common/a32_callbacks.rs,arm64/a32_{address_space,core,interface}.rs,arm64/emit_arm64.rs}}` vs Eden `interface/A32/config.h` and `backend/{x64,arm64}/a32_{interface,address_space}.*`
+
+### Intentional differences
+- Rust owns the A32 callback object in `A32::UserConfig` and uses lifecycle pointer setters after
+  the boxed JIT state reaches a stable address. Eden's emulator callback object instead already
+  owns a pointer to the public JIT wrapper; callback values and invocation ordering are unchanged.
+- `jit_config.rs` retains a temporary consuming adapter from the legacy public merged
+  configuration. It exists only at the compatibility boundary; the A32 JIT and both A32 host
+  backends now store and consume the architecture-owned configuration directly.
+- The Rust arm64 backend uses a stable `A32CallbackContext` and explicit callback-address tables
+  where Eden devirtualizes C++ member-function pointers while emitting its prelude.
+
+### Unintentional differences (to fix)
+- Fixed: A32 runtime/backend consumers used the merged 64-bit-address callback surface. They now
+  use `A32::UserCallbacks`, preserve 32-bit guest addresses, and forward typed A32 exceptions.
+- Fixed: A32 callback tables exposed A64-only 128-bit reads/writes, cache-operation callbacks, and
+  `GetCNTPCT`. Actual A32 paths are removed, and the arm64 A32 prelude leaves its shared
+  `get_cntpct` relocation slot empty like Eden.
+- Fixed: the arm64 A32 emitter hard-coded little-endian behavior. It now forwards
+  `UserConfig::always_little_endian`, preserving Eden's CPSR.E policy.
+- The x64 `EmitCallbacks` and `RawExclusiveWriteCallbacks` structures are still shared between
+  A32 and A64, so A32 construction must populate unreachable placeholders for their A64-only
+  128-bit/cache/counter slots. Splitting these backend callback owners remains required.
+
+### Missing items
+- Direct A64 runtime/backend migration to `interface/a64/config.rs::UserConfig` and removal of the
+  legacy shared configuration/callback compatibility layer.
+- Architecture-specific x64 callback-table types matching Eden's separate A32/A64 emitters.
+
+### Binary layout verification
+- N/A: the changed configuration objects and callback tables are host-side Rust structures and
+  are not raw-copied guest payloads. A32 exception values retain their verified four-byte layout;
+  focused callback/configuration tests and all four cross-target test builds pass.

@@ -106,6 +106,7 @@ use crate::backend::arm64::{
     inst,
 };
 use crate::backend::common::emit_context::MemoryEmitConfig;
+use crate::interface::a32::config::UserConfig as A32UserConfig;
 use crate::ir::block::Block;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
@@ -252,20 +253,32 @@ impl EmitConfig {
         (self.optimizations & flag) != OptimizationFlag::NO_OPTIMIZATIONS
     }
 
-    pub fn from_a32_config(config: &JitConfig) -> Self {
-        let mut memory = config.memory.clone();
-        memory.processor_id = config.processor_id;
-        memory.fastmem_address_space_bits = 32;
-        memory.silently_mirror_fastmem = true;
-        memory.page_table_address_space_bits = 32;
-        memory.silently_mirror_page_table = true;
-        memory.fastmem_exclusive_access =
-            config.fastmem_pointer.is_some() && config.global_monitor.is_some();
+    pub fn from_a32_config(config: &A32UserConfig) -> Self {
+        let memory = MemoryEmitConfig {
+            fastmem_address_space_bits: 32,
+            silently_mirror_fastmem: true,
+            fastmem_exclusive_access: config.fastmem_exclusive_access
+                && config.fastmem_pointer.is_some()
+                && config.global_monitor.is_some(),
+            recompile_on_exclusive_fastmem_failure: config.recompile_on_exclusive_fastmem_failure,
+            recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+            page_table_present: config.page_table.is_some(),
+            page_table_address_space_bits: 32,
+            silently_mirror_page_table: true,
+            absolute_offset_page_table: config.absolute_offset_page_table,
+            page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+            detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
+                as u32,
+            only_detect_misalignment_via_page_table_on_page_boundary: config
+                .only_detect_misalignment_via_page_table_on_page_boundary,
+            check_halt_on_memory_access: config.check_halt_on_memory_access,
+            processor_id: config.processor_id as usize,
+        };
 
         Self {
             coprocessors: config.coprocessors.clone(),
             is_a32: true,
-            optimizations: effective_optimizations(config),
+            optimizations: config.effective_optimizations(),
             hook_isb: config.hook_isb,
             cntfreq_el0: 0,
             ctr_el0: 0,
@@ -277,7 +290,7 @@ impl EmitConfig {
             recompile_on_fastmem_failure: memory.recompile_on_fastmem_failure,
             fastmem_address_space_bits: 32,
             silently_mirror_fastmem: true,
-            page_table_pointer: config.page_table_pointer.map_or(0, |p| p as u64),
+            page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: 32,
             page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
             silently_mirror_page_table: true,
@@ -288,7 +301,7 @@ impl EmitConfig {
             memory,
             wall_clock_cntpct: config.wall_clock_cntpct,
             enable_cycle_counting: config.enable_cycle_counting,
-            always_little_endian: true,
+            always_little_endian: config.always_little_endian,
             descriptor_to_fpcr: descriptor_to_a32_fpcr,
             emit_cond: emit_a32_cond,
             emit_condition_failed_terminal: emit_a32_condition_failed_terminal,
@@ -2389,7 +2402,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a32_config(&config(false)),
+            EmitConfig::from_a32_config(&config(false).into_a32_user_config()),
         )
         .expect("PushRSB block should emit");
 
@@ -2440,11 +2453,17 @@ mod tests {
 
     #[test]
     fn a32_emit_config_forces_32_bit_mirrored_memory_spaces() {
-        let cfg = EmitConfig::from_a32_config(&config(false));
+        let mut a32_config = config(false).into_a32_user_config();
+        a32_config.always_little_endian = true;
+        a32_config.fastmem_exclusive_access = true;
+        a32_config.recompile_on_exclusive_fastmem_failure = false;
+        let cfg = EmitConfig::from_a32_config(&a32_config);
         assert_eq!(cfg.memory.fastmem_address_space_bits, 32);
         assert_eq!(cfg.memory.page_table_address_space_bits, 32);
         assert!(cfg.memory.silently_mirror_fastmem);
         assert!(cfg.memory.silently_mirror_page_table);
+        assert!(!cfg.memory.fastmem_exclusive_access);
+        assert!(!cfg.memory.recompile_on_exclusive_fastmem_failure);
         assert_eq!(cfg.fastmem_address_space_bits, 32);
         assert_eq!(cfg.page_table_address_space_bits, 32);
         assert!(cfg.silently_mirror_fastmem);
@@ -2459,6 +2478,7 @@ mod tests {
         assert_eq!(cfg.memory.processor_id, 3);
         assert!(cfg.wall_clock_cntpct);
         assert!(cfg.enable_cycle_counting);
+        assert!(cfg.always_little_endian);
         assert!(std::ptr::fn_addr_eq(
             cfg.emit_cond,
             emit_a32_cond as EmitCond
@@ -3127,7 +3147,12 @@ mod tests {
         jit_config.fastmem_pointer = None;
         jit_config.page_table_pointer = None;
 
-        let info = emit_arm64(&mut code, block, EmitConfig::from_a32_config(&jit_config)).unwrap();
+        let info = emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a32_config(&jit_config.into_a32_user_config()),
+        )
+        .unwrap();
 
         assert_eq!(info.size, 20);
         assert_eq!(

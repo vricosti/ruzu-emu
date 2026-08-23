@@ -172,7 +172,9 @@ pub fn emit_a32_coproc_get_one_word(
         CallbackOrAccessOneWord::Memory(source_ptr) => {
             let mut value = ctx.reg_alloc.write_w(inst_ref);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let value = value.index().expect("coprocessor destination must be realized") as u8;
+            let value = value
+                .index()
+                .expect("coprocessor destination must be realized") as u8;
             emit_mov_x_imm(code, XSCRATCH0, source_ptr as usize as u64)?;
             code.write_u32(inst::ldr_w_unsigned(value, XSCRATCH0, 0))?;
         }
@@ -204,7 +206,9 @@ pub fn emit_a32_coproc_get_two_words(
         CallbackOrAccessTwoWords::Memory(source_ptrs) => {
             let mut value = ctx.reg_alloc.write_x(inst_ref);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let value = value.index().expect("coprocessor destination must be realized") as u8;
+            let value = value
+                .index()
+                .expect("coprocessor destination must be realized") as u8;
             emit_mov_x_imm(code, XSCRATCH0, source_ptrs[0] as usize as u64)?;
             emit_mov_x_imm(code, XSCRATCH1, source_ptrs[1] as usize as u64)?;
             code.write_u32(inst::ldr_x_unsigned(value, XSCRATCH0, 0))?;
@@ -277,7 +281,6 @@ fn emit_mov_x_imm(code: &mut BlockOfCode, reg: u8, imm: u64) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interface::a32::coprocessor::Coprocessor;
     use crate::backend::arm64::emit_arm64::{emit_arm64, EmitConfig, EmittedBlockInfo};
     use crate::backend::arm64::fastmem::FastmemManager;
     use crate::backend::arm64::fpsr_manager::FpsrManager;
@@ -286,6 +289,7 @@ mod tests {
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::Reg;
+    use crate::interface::a32::coprocessor::Coprocessor;
     use crate::ir::block::Block;
     use crate::ir::inst::Inst;
     use crate::ir::location::A32LocationDescriptor;
@@ -484,7 +488,7 @@ mod tests {
             tpidr_el0: None,
             memory: MemoryEmitConfig::default(),
         };
-        EmitConfig::from_a32_config(&jit_config)
+        EmitConfig::from_a32_config(&jit_config.into_a32_user_config())
     }
 
     fn empty_block_info(code: &BlockOfCode) -> EmittedBlockInfo {

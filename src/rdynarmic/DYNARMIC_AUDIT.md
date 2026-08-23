@@ -114,9 +114,11 @@ validation blockers, not evidence against the focused slices.
   owners with Eden's four-byte enum representation. Frontend type modules retain temporary
   compatibility re-exports until their consumers are migrated.
 - A32 and A64 now own callback traits and `UserConfig` structures with Eden's exact
-  architecture-specific inventories, types, constants, and defaults. Runtime consumers still use
-  the temporary shared `jit_config::{UserCallbacks,JitConfig}` bridge; the next owner slices migrate
-  A32 and A64 JIT/backend consumers before deleting that compatibility surface.
+  architecture-specific inventories, types, constants, and defaults. The A32 JIT and both A32
+  host backends now consume the A32-owned types directly, including its 32-bit callback addresses,
+  typed exceptions, endianness setting, and reduced callback inventory. A legacy conversion
+  remains at the public boundary while A64 consumers still use the temporary shared
+  `jit_config::{UserCallbacks,JitConfig}` bridge.
 - Several A32 instruction families remain aggregated in broad Rust modules;
   the Thumb32 byte/preload, halfword-load, word-load, store-single,
   dual/exclusive/table-branch, and load/store-multiple owners are now split.

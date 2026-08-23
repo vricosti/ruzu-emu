@@ -167,7 +167,7 @@ mod tests {
             memory: MemoryEmitConfig::default(),
         };
         jit_config.memory.check_halt_on_memory_access = true;
-        EmitConfig::from_a32_config(&jit_config)
+        EmitConfig::from_a32_config(&jit_config.into_a32_user_config())
     }
 
     fn block_with_inst(opcode: Opcode, args: &[Value]) -> Block {

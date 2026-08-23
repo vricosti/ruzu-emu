@@ -13,6 +13,9 @@ use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
 use crate::frontend::a32::translate::TranslationOptions as A32TranslationOptions;
 use crate::frontend::a64::translate::TranslationOptions;
 use crate::halt_reason::HaltReason;
+use crate::interface::a32::config::{
+    UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+};
 use crate::ir::location::LocationDescriptor;
 #[cfg(test)]
 use crate::jit_config::OptimizationFlag;
@@ -2754,7 +2757,7 @@ pub struct A32Jit {
 struct A32JitInner {
     jit_state: A32JitState,
     emitter: Option<A32EmitX64>,
-    callbacks: Box<dyn UserCallbacks>,
+    callbacks: Box<dyn A32UserCallbacks>,
     run_code_fn: Option<RunCodeFn>,
     is_executing: bool,
     global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
@@ -2763,6 +2766,64 @@ struct A32JitInner {
 
 #[cfg(target_arch = "aarch64")]
 struct A32DummyCallbacks;
+
+#[cfg(target_arch = "aarch64")]
+impl A32UserCallbacks for A32DummyCallbacks {
+    fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
+        None
+    }
+
+    fn memory_read_8(&self, _vaddr: u32) -> u8 {
+        0
+    }
+
+    fn memory_read_16(&self, _vaddr: u32) -> u16 {
+        0
+    }
+
+    fn memory_read_32(&self, _vaddr: u32) -> u32 {
+        0
+    }
+
+    fn memory_read_64(&self, _vaddr: u32) -> u64 {
+        0
+    }
+
+    fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
+
+    fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
+
+    fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
+
+    fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
+
+    fn memory_write_exclusive_8(&mut self, _vaddr: u32, _value: u8, _expected: u8) -> bool {
+        false
+    }
+
+    fn memory_write_exclusive_16(&mut self, _vaddr: u32, _value: u16, _expected: u16) -> bool {
+        false
+    }
+
+    fn memory_write_exclusive_32(&mut self, _vaddr: u32, _value: u32, _expected: u32) -> bool {
+        false
+    }
+
+    fn memory_write_exclusive_64(&mut self, _vaddr: u32, _value: u64, _expected: u64) -> bool {
+        false
+    }
+
+    fn call_svc(&mut self, _svc_num: u32) {}
+
+    fn exception_raised(&mut self, _pc: u32, _exception: crate::interface::a32::config::Exception) {
+    }
+
+    fn add_ticks(&mut self, _ticks: u64) {}
+
+    fn get_ticks_remaining(&self) -> u64 {
+        0
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
 impl UserCallbacks for A32DummyCallbacks {
@@ -2791,31 +2852,22 @@ impl UserCallbacks for A32DummyCallbacks {
     }
 
     fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
-
     fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
-
     fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
-
     fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-
     fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-
     fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
         false
     }
-
     fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
         false
     }
-
     fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
         false
     }
-
     fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
         false
     }
-
     fn exclusive_write_128(
         &mut self,
         _vaddr: u64,
@@ -2826,13 +2878,9 @@ impl UserCallbacks for A32DummyCallbacks {
     ) -> bool {
         false
     }
-
     fn call_supervisor(&mut self, _svc_num: u32) {}
-
     fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
-
     fn add_ticks(&mut self, _ticks: u64) {}
-
     fn get_ticks_remaining(&self) -> u64 {
         0
     }
@@ -2853,7 +2901,8 @@ impl A32Jit {
     }
 
     /// Create a new A32Jit from the given configuration.
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: impl Into<A32UserConfig>) -> Result<Self, String> {
+        let config = config.into();
         #[cfg(target_arch = "aarch64")]
         {
             let arm64 = crate::backend::arm64::a32_interface::A32Interface::new(config)?;
@@ -2881,7 +2930,7 @@ impl A32Jit {
         }
 
         let cache_size = if config.code_cache_size > 0 {
-            config.code_cache_size
+            config.code_cache_size as usize
         } else {
             DEFAULT_CODE_SIZE
         };
@@ -2894,7 +2943,7 @@ impl A32Jit {
             run_code_fn: None,
             is_executing: false,
             global_monitor: config.global_monitor,
-            processor_id: config.processor_id,
+            processor_id: config.processor_id as usize,
         });
 
         // Wire the halt_reason pointer into callbacks so they can halt execution
@@ -2921,7 +2970,9 @@ impl A32Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
-            page_table_pointer: config.page_table_pointer,
+            page_table_pointer: config
+                .page_table
+                .map(|pointer| pointer.cast::<u8>() as *const u8),
         };
 
         let emit_callbacks = EmitCallbacks {
@@ -2942,7 +2993,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             memory_read_128: Box::new(ArgCallback::new(
-                a32_memory_read_128_trampoline as usize as u64,
+                a32_unreachable_read_128_trampoline as usize as u64,
                 inner_ptr,
             )),
             memory_write_8: Box::new(ArgCallback::new(
@@ -2962,7 +3013,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             memory_write_128: Box::new(ArgCallback::new(
-                a32_memory_write_128_trampoline as usize as u64,
+                a32_unreachable_write_128_trampoline as usize as u64,
                 inner_ptr,
             )),
             call_supervisor: Box::new(ArgCallback::new(
@@ -2974,11 +3025,11 @@ impl A32Jit {
                 inner_ptr,
             )),
             data_cache_operation: Box::new(ArgCallback::new(
-                a32_data_cache_op_trampoline as usize as u64,
+                a32_unreachable_cache_operation_trampoline as usize as u64,
                 inner_ptr,
             )),
             instruction_cache_operation: Box::new(ArgCallback::new(
-                a32_instruction_cache_op_trampoline as usize as u64,
+                a32_unreachable_cache_operation_trampoline as usize as u64,
                 inner_ptr,
             )),
             instruction_synchronization_barrier: Box::new(ArgCallback::new(
@@ -2994,7 +3045,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             get_cntpct: Box::new(ArgCallback::new(
-                a32_get_cntpct_trampoline as usize as u64,
+                a32_unreachable_get_cntpct_trampoline as usize as u64,
                 inner_ptr,
             )),
             exclusive_clear: Box::new(ArgCallback::new(
@@ -3018,7 +3069,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             exclusive_read_128: Box::new(ArgCallback::new(
-                a32_exclusive_read_128_trampoline as usize as u64,
+                a32_unreachable_read_128_trampoline as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_8: Box::new(ArgCallback::new(
@@ -3038,7 +3089,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             exclusive_write_128: Box::new(ArgCallback::new(
-                a32_exclusive_write_128_trampoline as usize as u64,
+                a32_unreachable_write_128_trampoline as usize as u64,
                 inner_ptr,
             )),
         };
@@ -3064,7 +3115,7 @@ impl A32Jit {
                     inner_ptr,
                 )),
                 write_128: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_128_trampoline as usize as u64,
+                    a32_unreachable_raw_exclusive_write_128_trampoline as usize as u64,
                     inner_ptr,
                 )),
             }),
@@ -3072,21 +3123,35 @@ impl A32Jit {
             // A32 memory emission uses the same fastmem/page-table policy as
             // upstream Dynarmic::A32::UserConfig. Preserve the caller-provided
             // settings instead of falling back to default 64-bit mirroring.
-            memory: {
-                let mut m = config.memory.clone();
-                m.processor_id = config.processor_id;
-                m.fastmem_exclusive_access = m.fastmem_exclusive_access
+            memory: crate::backend::common::emit_context::MemoryEmitConfig {
+                fastmem_address_space_bits: 32,
+                silently_mirror_fastmem: true,
+                fastmem_exclusive_access: config.fastmem_exclusive_access
                     && config.fastmem_pointer.is_some()
-                    && config.global_monitor.is_some();
-                m
+                    && config.global_monitor.is_some(),
+                recompile_on_exclusive_fastmem_failure: config
+                    .recompile_on_exclusive_fastmem_failure,
+                recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+                page_table_present: config.page_table.is_some(),
+                page_table_address_space_bits: 32,
+                silently_mirror_page_table: true,
+                absolute_offset_page_table: config.absolute_offset_page_table,
+                page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+                detect_misaligned_access_via_page_table: config
+                    .detect_misaligned_access_via_page_table
+                    as u32,
+                only_detect_misalignment_via_page_table_on_page_boundary: config
+                    .only_detect_misalignment_via_page_table_on_page_boundary,
+                check_halt_on_memory_access: config.check_halt_on_memory_access,
+                processor_id: config.processor_id as usize,
             },
             global_monitor: config.global_monitor,
             // Unused by A32 (CNTFRQ is a CP15 read there), but the shared
             // EmitConfig carries it; forward the configured value anyway.
-            cntfrq_el0: config.cntfrq_el0,
-            ctr_el0: config.ctr_el0,
-            dczid_el0: config.dczid_el0,
-            hook_data_cache_operations: config.hook_data_cache_operations,
+            cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
             hook_isb: config.hook_isb,
         };
 
@@ -3134,7 +3199,7 @@ impl A32Jit {
         // does it compile (with EnableWriting/DisableWriting inside Emit()).
         // RunCode() just calls the stored function pointer — no mprotect ever.
         let location = LocationDescriptor::new(self.inner.jit_state.get_unique_hash());
-        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn UserCallbacks;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
         let emitter = self.inner.emitter.as_mut().unwrap();
 
         // Fast path: block already compiled — no mprotect needed.
@@ -3189,7 +3254,7 @@ impl A32Jit {
         );
         let location = a32_loc.set_single_stepping(true).to_location();
 
-        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn UserCallbacks;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
 
         if let Some(ref mut emitter) = self.inner.emitter {
             let _ = emitter.make_writable();
@@ -3477,7 +3542,7 @@ impl A32Jit {
         );
         let location = a32_loc.to_location();
 
-        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn UserCallbacks;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
 
         if let Some(ref mut emitter) = self.inner.emitter {
             let _ = emitter.make_writable();
@@ -3674,7 +3739,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
             let mut buf = format!("[TRACK] r4=0x{:08X}", r4);
             for &off in track_offsets() {
                 let addr = r4.wrapping_add(off);
-                let v = inner.callbacks.memory_read_32(addr as u64);
+                let v = inner.callbacks.memory_read_32(addr);
                 use std::fmt::Write;
                 let _ = write!(buf, " *(this+0x{:x})=0x{:08X}", off, v);
             }
@@ -3690,7 +3755,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
             for off in (0..size).step_by(4) {
                 let word = inner
                     .callbacks
-                    .memory_read_32(base.wrapping_add(off as u32) as u64);
+                    .memory_read_32(base.wrapping_add(off as u32));
                 for i in 0..4.min(size - off) {
                     bytes.push(((word >> (i * 8)) & 0xff) as u8);
                 }
@@ -3741,7 +3806,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
             let n = block_trace_code_words();
             if n > 0 {
                 for i in 0..n {
-                    let vaddr = pc.wrapping_add((i * 4) as u32) as u64;
+                    let vaddr = pc.wrapping_add((i * 4) as u32);
                     let word = inner.callbacks.memory_read_code(vaddr).unwrap_or(0);
                     eprintln!("        code[0x{:08X}] = 0x{:08X}", vaddr as u32, word);
                 }
@@ -3751,7 +3816,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
 
     let location = LocationDescriptor::new(inner.jit_state.get_unique_hash());
 
-    let callbacks_ptr = inner.callbacks.as_ref() as *const dyn UserCallbacks;
+    let callbacks_ptr = inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
     let emitter = inner.emitter.as_mut().unwrap();
 
     // Fast path: block already compiled — no mprotect needed.
@@ -3797,9 +3862,8 @@ extern "C" fn a32_memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
     a32_callbacks::memory_read_64(inner.callbacks.as_ref(), vaddr)
 }
-extern "C" fn a32_memory_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: u64) {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::memory_read_128(inner.callbacks.as_ref(), vaddr, ret_ptr);
+extern "C" fn a32_unreachable_read_128_trampoline(_inner_ptr: u64, _vaddr: u64, _ret_ptr: u64) {
+    unreachable!("A32 has no 128-bit memory callback")
 }
 
 extern "C" fn a32_memory_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
@@ -3822,15 +3886,13 @@ extern "C" fn a32_memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: 
     maybe_log_a32_watch_write(inner, vaddr, 8, value, 0);
     a32_callbacks::memory_write_64(inner.callbacks.as_mut(), vaddr, value);
 }
-extern "C" fn a32_memory_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
+extern "C" fn a32_unreachable_write_128_trampoline(
+    _inner_ptr: u64,
+    _vaddr: u64,
+    _value_lo: u64,
+    _value_hi: u64,
 ) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 16, value_lo, value_hi);
-    a32_callbacks::memory_write_128(inner.callbacks.as_mut(), vaddr, value_lo, value_hi);
+    unreachable!("A32 has no 128-bit memory callback")
 }
 
 extern "C" fn a32_call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
@@ -3841,13 +3903,8 @@ extern "C" fn a32_exception_raised_trampoline(inner_ptr: u64, pc: u64, exception
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     a32_callbacks::exception_raised(inner.callbacks.as_mut(), pc, exception);
 }
-extern "C" fn a32_data_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::data_cache_operation(inner.callbacks.as_mut(), op, vaddr);
-}
-extern "C" fn a32_instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::instruction_cache_operation(inner.callbacks.as_mut(), op, vaddr);
+extern "C" fn a32_unreachable_cache_operation_trampoline(_inner_ptr: u64, _op: u64, _vaddr: u64) {
+    unreachable!("A32 has no A64 cache-operation callback")
 }
 
 extern "C" fn a32_instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
@@ -3855,9 +3912,8 @@ extern "C" fn a32_instruction_synchronization_barrier_trampoline(inner_ptr: u64)
     inner.callbacks.instruction_synchronization_barrier_raised();
 }
 
-extern "C" fn a32_get_cntpct_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::get_cntpct(inner.callbacks.as_ref())
+extern "C" fn a32_unreachable_get_cntpct_trampoline(_inner_ptr: u64) -> u64 {
+    unreachable!("A32 has no GetCNTPCT callback")
 }
 
 extern "C" fn a32_exclusive_clear_trampoline(inner_ptr: u64) {
@@ -3904,17 +3960,6 @@ extern "C" fn a32_exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u6
         vaddr,
     )
 }
-extern "C" fn a32_exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_128(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        ret_ptr,
-    );
-}
 extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     a32_callbacks::exclusive_write_8(
@@ -3960,24 +4005,6 @@ extern "C" fn a32_exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, valu
         value,
     )
 }
-extern "C" fn a32_exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_128(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        value_lo,
-        value_hi,
-    )
-}
-
 extern "C" fn a32_raw_exclusive_write_8_trampoline(
     inner_ptr: u64,
     vaddr: u64,
@@ -3987,7 +4014,7 @@ extern "C" fn a32_raw_exclusive_write_8_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     inner
         .callbacks
-        .exclusive_write_8(vaddr, value as u8, expected as u8) as u64
+        .memory_write_exclusive_8(vaddr as u32, value as u8, expected as u8) as u64
 }
 
 extern "C" fn a32_raw_exclusive_write_16_trampoline(
@@ -3999,7 +4026,7 @@ extern "C" fn a32_raw_exclusive_write_16_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     inner
         .callbacks
-        .exclusive_write_16(vaddr, value as u16, expected as u16) as u64
+        .memory_write_exclusive_16(vaddr as u32, value as u16, expected as u16) as u64
 }
 
 extern "C" fn a32_raw_exclusive_write_32_trampoline(
@@ -4011,7 +4038,7 @@ extern "C" fn a32_raw_exclusive_write_32_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     inner
         .callbacks
-        .exclusive_write_32(vaddr, value as u32, expected as u32) as u64
+        .memory_write_exclusive_32(vaddr as u32, value as u32, expected as u32) as u64
 }
 
 extern "C" fn a32_raw_exclusive_write_64_trampoline(
@@ -4021,21 +4048,18 @@ extern "C" fn a32_raw_exclusive_write_64_trampoline(
     expected: u64,
 ) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner.callbacks.exclusive_write_64(vaddr, value, expected) as u64
-}
-
-extern "C" fn a32_raw_exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: *const [u64; 2],
-    expected: *const [u64; 2],
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let value = unsafe { *value };
-    let expected = unsafe { *expected };
     inner
         .callbacks
-        .exclusive_write_128(vaddr, value[0], value[1], expected[0], expected[1]) as u64
+        .memory_write_exclusive_64(vaddr as u32, value, expected) as u64
+}
+
+extern "C" fn a32_unreachable_raw_exclusive_write_128_trampoline(
+    _inner_ptr: u64,
+    _vaddr: u64,
+    _value: *const [u64; 2],
+    _expected: *const [u64; 2],
+) -> u64 {
+    unreachable!("A32 has no 128-bit exclusive-write callback")
 }
 
 #[cfg(test)]

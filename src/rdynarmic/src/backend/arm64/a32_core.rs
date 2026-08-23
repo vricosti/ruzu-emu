@@ -1,6 +1,6 @@
 use crate::halt_reason::HaltReason;
+use crate::interface::a32::config::UserConfig as A32UserConfig;
 use crate::ir::location::A32LocationDescriptor;
-use crate::jit_config::JitConfig;
 
 use super::a32_address_space::A32AddressSpace;
 use super::jit_state::A32JitState;
@@ -11,7 +11,7 @@ use super::jit_state::A32JitState;
 pub struct A32Core;
 
 impl A32Core {
-    pub fn new(_config: &JitConfig) -> Self {
+    pub fn new(_config: &A32UserConfig) -> Self {
         Self
     }
 
@@ -63,7 +63,7 @@ mod tests {
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::ir::location::LocationDescriptor;
-    use crate::jit_config::{OptimizationFlag, UserCallbacks};
+    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
     use std::collections::HashMap;
 
     struct TestCallbacks;
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn get_or_emit_compiles_current_location_descriptor() {
-        let conf = config();
+        let conf = config().into_a32_user_config();
         let mut process = A32AddressSpace::new(conf).unwrap();
         let mut state = A32JitState::new();
         state.regs[15] = 0x1000;
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn run_existing_block_calls_arm64_prelude() {
-        let conf = config();
+        let conf = config().into_a32_user_config();
         let mut core = A32Core::new(&conf);
         let mut process = A32AddressSpace::new(conf).unwrap();
         let mut state = A32JitState::new();

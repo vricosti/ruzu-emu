@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::halt_reason::HaltReason;
-use crate::jit_config::JitConfig;
+use crate::interface::a32::config::{
+    UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+};
 
 use super::a32_address_space::{A32AddressSpace, A32CallbackContext};
 use super::a32_core::A32Core;
@@ -53,7 +55,8 @@ impl A32Interface {
         self.inner.current_address_space.dump_block_map(out)
     }
 
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: impl Into<A32UserConfig>) -> Result<Self, String> {
+        let config = config.into();
         let current_address_space = A32AddressSpace::new_without_prelude(config)?;
         let core = A32Core::new(current_address_space.config());
         let mut interface = Self {
@@ -263,13 +266,13 @@ impl A32Interface {
         let processor_id = inner.current_address_space.config().processor_id;
         let callbacks = {
             let callbacks = &mut inner.current_address_space.config_mut().callbacks;
-            callbacks.as_mut() as *mut dyn crate::jit_config::UserCallbacks
+            callbacks.as_mut() as *mut dyn A32UserCallbacks
         };
         inner.callback_context = Some(A32CallbackContext::new(
             &mut inner.current_state,
             callbacks,
             global_monitor,
-            processor_id,
+            processor_id as usize,
         ));
     }
 
@@ -300,7 +303,7 @@ impl A32Interface {
 mod tests {
     use super::*;
     use crate::backend::common::emit_context::MemoryEmitConfig;
-    use crate::jit_config::{OptimizationFlag, UserCallbacks};
+    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
     use std::sync::Arc;
 
     #[derive(Default)]

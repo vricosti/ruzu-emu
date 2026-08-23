@@ -1383,7 +1383,7 @@ mod tests {
         mutate_conf: impl FnOnce(&mut EmitConfig),
         f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
-        let mut conf = EmitConfig::from_a32_config(&config);
+        let mut conf = EmitConfig::from_a32_config(&config.into_a32_user_config());
         mutate_conf(&mut conf);
         let mut reg_alloc = RegAlloc::default();
         let mut info = EmittedBlockInfo {

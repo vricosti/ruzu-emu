@@ -1338,3 +1338,18 @@
   data like Eden and pushes it through the shared `System` owner. Focused coverage verifies the
   producer-to-system transfer and command registration.
 - Status: completed and re-verified for the home-menu/general-channel warning slice.
+
+## 2026-08-23 — video-core warning cleanup interrupted by scheduler ownership prerequisite
+
+- Interrupted slice: classify and resolve the remaining unused test locals in `video_core`.
+- Exact missing prerequisite: `control/scheduler.rs` retained a raw pointer to its owning `Gpu`,
+  even though Eden passes `GPU&` to `Scheduler::Push` and stores no back-reference. The warning in
+  the scheduler test exposed this self-referential ownership divergence.
+- Prerequisite result: `Scheduler::Push` now receives the GPU per call, `Gpu` owns the scheduler
+  directly from construction, and the channel map's mutex preserves Eden's single guarded region
+  across lookup and channel binding without unsafe `Send`/`Sync` implementations.
+- Resumed result: the remaining test locals now either assert the value they decode/remove, express
+  writable mapped memory through mutable pointers, feed descriptor fields, or have genuinely dead
+  shadowed setup removed.
+- Status: completed and re-verified; all 1,479 active `video_core` library tests pass and the
+  variable/mutability warnings covered by this slice are gone.

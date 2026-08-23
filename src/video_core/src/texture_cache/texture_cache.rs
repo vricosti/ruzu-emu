@@ -5713,6 +5713,7 @@ mod tests {
         assert!(cache
             .collect_images_in_gpu_region(0x4000, 4, false)
             .is_empty());
+        assert!(!cache.slot_images.contains(old_id));
         assert_eq!(
             cache
                 .collect_images_in_gpu_region(0x8000, 4, false)

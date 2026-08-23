@@ -1430,16 +1430,6 @@ mod tests {
             | (1u64 << 48)     // compare = LT
             | (7u64 << 39)     // bop_pred = PT
             | (1u64 << 20)     // src_b_reg = R1
-            | 0x0007_0100      // src_a=R1 at [15:8]... actually:
-            | (0u64 << 3)      // pred_a = P0
-            | 7u64; // pred_b = P7
-
-        // Adjust: src_a = R0 (bits[15:8]=0), but it's already 0 by default from the ORs above.
-        // Actually let me build this more carefully:
-        let fsetp = (0x5BB0u64 << 48)
-            | (1u64 << 48)     // compare = LT
-            | (7u64 << 39)     // bop_pred = PT
-            | (1u64 << 20)     // src_b_reg = R1
             | (0x0007u64 << 16) // predicate guard = PT
             | (0u64 << 8)     // src_a = R0
             | (0u64 << 3)     // pred_a = P0

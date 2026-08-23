@@ -8061,7 +8061,7 @@ mod tests {
 
     #[test]
     fn test_decode_texture_handle_independent() {
-        let mut engine = Maxwell3D::new();
+        let engine = Maxwell3D::new();
         // Default is Independently (0).
         let handle: u32 = (0x0AB << 20) | 0x1_2345;
         let (tic_id, tsc_id) = engine.decode_texture_handle(handle);

@@ -1054,10 +1054,10 @@ mod tests {
         let device_memory = Arc::new(
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
         );
-        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_set_physical_base_for_test(backing.as_mut_ptr() as usize);
         device_memory.smmu_map_with_cpu_backing(
             0x8000_0000,
-            backing.as_ptr(),
+            backing.as_mut_ptr(),
             0x4000_0000,
             backing.len(),
             1,
@@ -1081,7 +1081,7 @@ mod tests {
             .map(launch_desc, 0x8000_1000, 0x1000, 0, false);
 
         let mut engine = KeplerCompute::new(Arc::clone(&memory_manager));
-        let mut rasterizer = TestRasterizer::new(0x8000_0000, 4);
+        let rasterizer = TestRasterizer::new(0x8000_0000, 4);
         engine.set_current_dma_segment(0x10000);
 
         engine.regs[LAUNCH_DESC_LOC as usize] = (launch_desc >> 8) as u32;

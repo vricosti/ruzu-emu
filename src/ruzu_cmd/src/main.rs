@@ -47,6 +47,7 @@ fn resolve_renderer_backend(
         | RendererBackend::OpenGlGlasm
         | RendererBackend::OpenGlSpirV => "opengl",
         RendererBackend::Vulkan => "vulkan",
+        RendererBackend::Metal => "metal",
         RendererBackend::Null => "null",
     };
 
@@ -58,6 +59,8 @@ fn resolve_renderer_backend(
         "opengl" | "gl" | "0" => "opengl",
         "vulkan" | "vk" | "1" => "vulkan",
         "null" | "2" => "null",
+        #[cfg(target_os = "macos")]
+        "metal" | "mtl" | "5" => "metal",
         other => {
             log::warn!(
                 "Unknown renderer '{}', using configured backend {}",
@@ -90,6 +93,10 @@ mod tests {
             resolve_renderer_backend(None, RendererBackend::Null),
             "null"
         );
+        assert_eq!(
+            resolve_renderer_backend(None, RendererBackend::Metal),
+            "metal"
+        );
     }
 
     #[test]
@@ -101,6 +108,11 @@ mod tests {
         assert_eq!(
             resolve_renderer_backend(Some("GL"), RendererBackend::Vulkan),
             "opengl"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolve_renderer_backend(Some("metal"), RendererBackend::Vulkan),
+            "metal"
         );
     }
 
@@ -212,7 +224,7 @@ struct Args {
     #[arg(short = 'u', long = "user", value_name = "INDEX")]
     user: Option<u8>,
 
-    /// Renderer backend: opengl, vulkan, or null.
+    /// Renderer backend: opengl, vulkan, null, or metal (macOS only).
     ///
     /// Not in upstream CLI — added for convenience while Settings is not fully ported.
     #[arg(short = 'r', long = "renderer", value_name = "BACKEND")]
@@ -948,7 +960,9 @@ fn main() {
     let emu_window_system_ref = ruzu_core::core::SystemRef::from_ref(&system);
     let mut emu_window = match renderer_backend {
         "opengl" => EmuWindow::Gl(EmuWindowSdl3Gl::new(emu_window_system_ref, args.fullscreen)),
-        "vulkan" => EmuWindow::Vk(EmuWindowSdl3Vk::new(emu_window_system_ref, args.fullscreen)),
+        "vulkan" | "metal" => {
+            EmuWindow::Vk(EmuWindowSdl3Vk::new(emu_window_system_ref, args.fullscreen))
+        }
         _ => EmuWindow::Null(EmuWindowSdl3Null::new(
             emu_window_system_ref,
             args.fullscreen,
@@ -1186,9 +1200,52 @@ fn main() {
                         let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
                         gpu_ref.renderer_frame_end_notify();
                     });
+                    Box::new(
+                        video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
+                            // SAFETY: this renderer is immediately bound to `gpu` below;
+                            // `Gpu` drops the renderer before its shader notifier.
+                            unsafe { gpu.shader_notify_handle() },
+                            window_info,
+                            *drawable_size,
+                            Arc::clone(shown_state),
+                            Arc::clone(framebuffer_layout),
+                            frame_displayed_notify,
+                            frame_end_notify,
+                            syncpoints.clone(),
+                            device_memory,
+                        )
+                        .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
+                    )
+                }
+                "metal" => {
                     #[cfg(target_os = "macos")]
                     {
-                        let _ = drawable_size;
+                        let Some((window_info, _, shown_state, framebuffer_layout)) =
+                            vulkan_window_info.as_ref()
+                        else {
+                            return Err(
+                                "Metal renderer selected without Metal window info".to_owned(),
+                            );
+                        };
+                        let Some(host1x_core) = system.host1x_core() else {
+                            return Err(
+                                "Metal renderer selected before Host1x initialization".to_owned(),
+                            );
+                        };
+                        let Some(host1x) = host1x_core
+                            .as_any()
+                            .downcast_ref::<video_core::host1x::host1x::Host1x>()
+                        else {
+                            return Err(
+                                "Metal renderer could not resolve Host1x memory manager".to_owned(),
+                            );
+                        };
+                        let device_memory = Arc::clone(host1x.memory_manager());
+                        let frame_displayed_notify = Arc::new(|| {});
+                        let frame_end_notify = Arc::new(move || unsafe {
+                            let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
+                            gpu_ref.renderer_frame_end_notify();
+                        });
                         Box::new(
                             video_core::renderer_metal::renderer_metal::RendererMetal::new(
                                 window_info,
@@ -1204,21 +1261,7 @@ fn main() {
                     }
                     #[cfg(not(target_os = "macos"))]
                     {
-                        Box::new(
-                            video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
-                                // SAFETY: this renderer is immediately bound to `gpu` below;
-                                // `Gpu` drops the renderer before its shader notifier.
-                                unsafe { gpu.shader_notify_handle() },
-                                window_info,
-                                Arc::clone(shown_state),
-                                Arc::clone(framebuffer_layout),
-                                frame_displayed_notify,
-                                frame_end_notify,
-                                syncpoints.clone(),
-                                device_memory,
-                            )
-                            .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
-                        )
+                        return Err("The Metal renderer is available only on macOS".to_owned());
                     }
                 }
                 common::settings_enums::RendererBackend::Null => {

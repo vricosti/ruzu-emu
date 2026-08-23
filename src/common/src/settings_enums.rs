@@ -304,7 +304,8 @@ settings_enum! {
     }
 }
 
-/// Upstream `Settings::RendererBackend`.
+/// Upstream `Settings::RendererBackend`, extended with ruzu's native Metal
+/// backend after the serialized Eden range.
 ///
 /// The Rust identifiers follow Rust casing, while the canonical strings retain
 /// Eden's exact `OpenGL_*` spellings.
@@ -316,6 +317,9 @@ pub enum RendererBackend {
     Null = 2,
     OpenGlGlasm = 3,
     OpenGlSpirV = 4,
+    /// Native Apple Metal renderer. Appended after Eden's serialized values
+    /// so existing configuration files retain their exact numeric meaning.
+    Metal = 5,
 }
 
 impl RendererBackend {
@@ -326,6 +330,7 @@ impl RendererBackend {
             Self::Null => "Null",
             Self::OpenGlGlasm => "OpenGL_GLASM",
             Self::OpenGlSpirV => "OpenGL_SPIRV",
+            Self::Metal => "Metal",
         }
     }
 
@@ -336,6 +341,7 @@ impl RendererBackend {
             "Null" => Some(Self::Null),
             "OpenGL_GLASM" => Some(Self::OpenGlGlasm),
             "OpenGL_SPIRV" => Some(Self::OpenGlSpirV),
+            "Metal" => Some(Self::Metal),
             _ => None,
         }
     }
@@ -347,6 +353,7 @@ impl RendererBackend {
             2 => Some(Self::Null),
             3 => Some(Self::OpenGlGlasm),
             4 => Some(Self::OpenGlSpirV),
+            5 => Some(Self::Metal),
             _ => None,
         }
     }
@@ -358,6 +365,7 @@ impl RendererBackend {
             ("Null", Self::Null),
             ("OpenGL_GLASM", Self::OpenGlGlasm),
             ("OpenGL_SPIRV", Self::OpenGlSpirV),
+            ("Metal", Self::Metal),
         ]
     }
 }
@@ -697,24 +705,31 @@ mod tests {
     }
 
     #[test]
-    fn renderer_backend_discriminants_match_eden_fused_enum() {
-        let expected = [
+    fn renderer_backend_preserves_eden_discriminants_and_appends_metal() {
+        let eden = [
             RendererBackend::OpenGlGlsl,
             RendererBackend::Vulkan,
             RendererBackend::Null,
             RendererBackend::OpenGlGlasm,
             RendererBackend::OpenGlSpirV,
         ];
-        for (index, backend) in expected.into_iter().enumerate() {
+        for (index, backend) in eden.into_iter().enumerate() {
             assert_eq!(backend as u32, index as u32);
             assert_eq!(RendererBackend::from_u32(index as u32), Some(backend));
         }
-        assert_eq!(expected[0].canonicalize(), "OpenGL_GLSL");
-        assert_eq!(expected[3].canonicalize(), "OpenGL_GLASM");
-        assert_eq!(expected[4].canonicalize(), "OpenGL_SPIRV");
-        assert_eq!(RendererBackend::from_str("OpenGL_GLSL"), Ok(expected[0]));
-        assert_eq!(RendererBackend::from_str("OpenGL_GLASM"), Ok(expected[3]));
-        assert_eq!(RendererBackend::from_str("OpenGL_SPIRV"), Ok(expected[4]));
+        assert_eq!(eden[0].canonicalize(), "OpenGL_GLSL");
+        assert_eq!(eden[3].canonicalize(), "OpenGL_GLASM");
+        assert_eq!(eden[4].canonicalize(), "OpenGL_SPIRV");
+        assert_eq!(RendererBackend::from_str("OpenGL_GLSL"), Ok(eden[0]));
+        assert_eq!(RendererBackend::from_str("OpenGL_GLASM"), Ok(eden[3]));
+        assert_eq!(RendererBackend::from_str("OpenGL_SPIRV"), Ok(eden[4]));
+
+        assert_eq!(RendererBackend::Metal as u32, 5);
+        assert_eq!(RendererBackend::from_u32(5), Some(RendererBackend::Metal));
+        assert_eq!(
+            RendererBackend::from_str("Metal"),
+            Ok(RendererBackend::Metal)
+        );
     }
 
     #[test]

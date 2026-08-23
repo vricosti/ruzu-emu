@@ -2294,6 +2294,14 @@ mod tests {
             common::settings_enums::RendererBackend::from_str("1"),
             Ok(common::settings_enums::RendererBackend::Vulkan)
         );
+        assert_eq!(
+            common::settings_enums::RendererBackend::from_str("Metal"),
+            Ok(common::settings_enums::RendererBackend::Metal)
+        );
+        assert_eq!(
+            common::settings_enums::RendererBackend::from_str("5"),
+            Ok(common::settings_enums::RendererBackend::Metal)
+        );
         assert!(common::settings_enums::RendererBackend::from_str("invalid").is_err());
     }
 }

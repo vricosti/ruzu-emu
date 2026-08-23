@@ -180,8 +180,6 @@ fn first_unsupported_program_feature(
         || info.uses_fp32_denorms_preserve
         || info.uses_image_1d
         || info.uses_sparse_residency
-        || info.uses_typeless_image_reads
-        || info.uses_typeless_image_writes
         || info.uses_image_buffers
         || info.uses_cbuf_indirect
     {
@@ -1304,6 +1302,8 @@ mod tests {
         } else {
             ImageFormat::Typeless
         };
+        program.info.uses_typeless_image_reads = format == ImageFormat::Typeless && is_read;
+        program.info.uses_typeless_image_writes = format == ImageFormat::Typeless && is_written;
         program.info.image_descriptors.push(ImageDescriptor {
             texture_type,
             format,
@@ -3500,6 +3500,20 @@ mod tests {
         let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
         assert!(artifact.source.source.contains("= uint4(0u);"));
         assert!(!artifact.source.source.contains(".read("));
+    }
+
+    #[test]
+    fn typeless_image_write_is_not_blocked_by_load_capability() {
+        let program = storage_image_program(TextureType::Color2D, 1, false, false, true);
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("texture2d<float, access::write> img0"));
+        assert!(artifact
+            .source
+            .source
+            .contains("img0.write(as_type<float4>("));
     }
 
     #[test]

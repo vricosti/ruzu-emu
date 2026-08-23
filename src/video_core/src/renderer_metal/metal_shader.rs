@@ -1150,6 +1150,8 @@ mod tests {
         } else {
             ImageFormat::Typeless
         };
+        program.info.uses_typeless_image_reads = format == ImageFormat::Typeless && is_read;
+        program.info.uses_typeless_image_writes = format == ImageFormat::Typeless && is_written;
         program.info.image_descriptors.push(ImageDescriptor {
             texture_type,
             format,
@@ -3280,12 +3282,33 @@ mod tests {
         let Ok(device) = MetalDevice::new() else {
             return;
         };
-        let mut profile = make_shader_profile(device.profile());
+        let runtime_profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let typeless_read = storage_image_program(TextureType::Color2D, 1, false, true, false);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &emit_spirv(&typeless_read, &runtime_profile, &runtime_info),
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active unsupported typeless load must compile to zero");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &typeless_read,
+            &runtime_profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct unsupported typeless load must compile to zero");
+        assert_eq!(direct.bindings(), active.bindings());
+        assert!(direct.source().source.contains("= uint4(0u);"));
+        assert!(!direct.source().source.contains(".read("));
+
+        let mut profile = runtime_profile;
         // Exercise the float load conversion as well as the integer path.
         // Runtime Metal profiles keep typeless loads disabled and therefore
         // follow upstream's explicit zero-result path.
         profile.support_typeless_image_loads = true;
-        let runtime_info = RuntimeInfo::default();
         let mut programs = Vec::new();
         for texture_type in [
             TextureType::Color1D,

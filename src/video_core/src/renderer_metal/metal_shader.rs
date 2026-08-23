@@ -1637,6 +1637,17 @@ mod tests {
         program
     }
 
+    fn rescaling_program(stage: Stage) -> Program {
+        let mut program = empty_program(stage);
+        program.info.uses_rescaling_uniform = true;
+        if stage != Stage::Compute {
+            program.blocks[0].append_new_inst(Opcode::ResolutionDownFactor, vec![]);
+        }
+        program.blocks[0].append_new_inst(Opcode::IsTextureScaled, vec![Value::ImmU32(3)]);
+        program.blocks[0].append_new_inst(Opcode::IsImageScaled, vec![Value::ImmU32(5)]);
+        program
+    }
+
     fn subgroup_program() -> Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_fswzadd = true;
@@ -1861,6 +1872,55 @@ mod tests {
             .source()
             .source
             .contains("render_area_push_constants.render_area"));
+    }
+
+    #[test]
+    fn compiles_direct_rescaling_with_active_push_constant_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for stage in [Stage::Fragment, Stage::Compute] {
+            let program = rescaling_program(stage);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let options = if stage == Stage::Compute {
+                MetalShaderCompileOptions::for_compute_device(
+                    device.profile(),
+                    program.workgroup_size,
+                )
+            } else {
+                MetalShaderCompileOptions::for_device(device.profile())
+            };
+            let active = compile_native_shader(device.device(), device.profile(), &spirv, &options)
+                .unwrap_or_else(|error| panic!("active {stage:?} rescaling must compile: {error}"));
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct {stage:?} rescaling must match the active ABI: {error}")
+            });
+
+            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(direct.bindings().push_constant_buffer_index, Some(0));
+            assert_eq!(
+                direct
+                    .source()
+                    .source
+                    .contains("rescaling_push_constants.down_factor"),
+                stage != Stage::Compute
+            );
+            assert!(direct
+                .source()
+                .source
+                .contains("rescaling_push_constants.rescaling_textures"));
+            assert!(direct
+                .source()
+                .source
+                .contains("rescaling_push_constants.rescaling_images"));
+        }
     }
 
     #[test]

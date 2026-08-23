@@ -50,6 +50,9 @@ pub struct MslEmitContext {
     supports_subgroups: bool,
     warp_size_potentially_larger_than_guest: bool,
     fixed_subgroup_size: u32,
+    texture_rescaling_index: u32,
+    image_rescaling_index: u32,
+    uses_rescaling_push_constants: bool,
     need_gather_subpixel_offset: bool,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
@@ -138,7 +141,31 @@ impl MslEmitContext {
         let mut parameters = Vec::new();
         let mut input_generics: [Option<MslInputGenericDefinition>; 32] =
             std::array::from_fn(|_| None);
-        let render_area_declaration = if program.info.uses_render_area {
+        let uses_rescaling_push_constants = program.info.uses_rescaling_uniform;
+        let push_constant_declaration = if uses_rescaling_push_constants {
+            let buffer_index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.push_constant_buffer_index = Some(buffer_index);
+            parameters.push(format!(
+                "constant MslResolutionInfo& rescaling_push_constants [[buffer({buffer_index})]]"
+            ));
+            if stage == Stage::Compute {
+                concat!(
+                    "struct MslResolutionInfo {\n",
+                    "    uint4 rescaling_textures;\n",
+                    "    uint2 rescaling_images;\n",
+                    "};\n\n",
+                )
+            } else {
+                concat!(
+                    "struct MslResolutionInfo {\n",
+                    "    uint4 rescaling_textures;\n",
+                    "    uint2 rescaling_images;\n",
+                    "    float down_factor;\n",
+                    "};\n\n",
+                )
+            }
+        } else if program.info.uses_render_area {
             let buffer_index = bindings.buffer_count;
             bindings.buffer_count += 1;
             bindings.push_constant_buffer_index = Some(buffer_index);
@@ -153,6 +180,8 @@ impl MslEmitContext {
         } else {
             ""
         };
+        let texture_rescaling_index = binding_counters.texture_scaling_index;
+        let image_rescaling_index = binding_counters.image_scaling_index;
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
         } else {
@@ -224,6 +253,7 @@ impl MslEmitContext {
             textures.push(definition);
             *binding_counter += 1;
         }
+        binding_counters.texture_scaling_index += program.info.texture_descriptors.len() as u32;
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
         } else {
@@ -241,6 +271,7 @@ impl MslEmitContext {
             images.push(definition);
             *binding_counter += 1;
         }
+        binding_counters.image_scaling_index += program.info.image_descriptors.len() as u32;
         // Normal Metal vertex functions do not expose the SIMD-group lane
         // builtin. Fragment and kernel functions do, and the renderer's
         // profile advertises subgroup support only for those stages.
@@ -390,7 +421,7 @@ impl MslEmitContext {
         }
         let parameters = parameters.join(", ");
         let mut source = String::new();
-        source.push_str(render_area_declaration);
+        source.push_str(push_constant_declaration);
         source.push_str(&stage_input);
         // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
         // SPIR-V makes that write ineffective, while Metal rejects the pair.
@@ -532,6 +563,9 @@ impl MslEmitContext {
             warp_size_potentially_larger_than_guest: profile
                 .warp_size_potentially_larger_than_guest,
             fixed_subgroup_size: options.fixed_subgroup_size,
+            texture_rescaling_index,
+            image_rescaling_index,
+            uses_rescaling_push_constants,
             need_gather_subpixel_offset: profile.need_gather_subpixel_offset,
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
@@ -856,6 +890,26 @@ impl MslEmitContext {
 
     pub fn fixed_subgroup_size(&self) -> u32 {
         self.fixed_subgroup_size
+    }
+
+    pub(super) fn texture_rescaling_index(&self) -> u32 {
+        self.texture_rescaling_index
+    }
+
+    pub(super) fn image_rescaling_index(&self) -> u32 {
+        self.image_rescaling_index
+    }
+
+    pub(super) fn resolution_down_factor_expression(&self) -> &'static str {
+        "rescaling_push_constants.down_factor"
+    }
+
+    pub(super) fn render_area_expression(&self) -> &'static str {
+        if self.uses_rescaling_push_constants {
+            "as_type<float4>(rescaling_push_constants.rescaling_textures)"
+        } else {
+            "render_area_push_constants.render_area"
+        }
     }
 
     pub fn subgroup_lane_id_expression(&self) -> &'static str {

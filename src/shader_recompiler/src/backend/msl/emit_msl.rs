@@ -141,6 +141,9 @@ fn first_unsupported_program_feature(
     if info.uses_render_area && !profile.unified_descriptor_binding {
         return Some("render area without unified descriptor binding");
     }
+    if info.uses_rescaling_uniform && !profile.unified_descriptor_binding {
+        return Some("rescaling without unified descriptor binding");
+    }
     if info.uses_patches.iter().any(|used| *used) {
         return Some("tessellation patches");
     }
@@ -180,7 +183,6 @@ fn first_unsupported_program_feature(
         || info.uses_typeless_image_reads
         || info.uses_typeless_image_writes
         || info.uses_image_buffers
-        || info.uses_rescaling_uniform
         || info.uses_cbuf_indirect
     {
         return Some("shader capabilities");
@@ -663,6 +665,11 @@ fn emit_inst(
             emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
         }
         Opcode::SampleId => emit_msl_context_get_set::emit_sample_id(context, inst_ref),
+        Opcode::ResolutionDownFactor => {
+            emit_msl_context_get_set::emit_resolution_down_factor(context, inst_ref)
+        }
+        Opcode::IsTextureScaled => emit_msl_image::emit_is_texture_scaled(context, inst_ref, inst),
+        Opcode::IsImageScaled => emit_msl_image::emit_is_image_scaled(context, inst_ref, inst),
         Opcode::RenderArea => emit_msl_context_get_set::emit_render_area(context, inst_ref),
         Opcode::IsHelperInvocation => {
             emit_msl_context_get_set::emit_is_helper_invocation(context, inst_ref)
@@ -2305,6 +2312,119 @@ mod tests {
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
             Err(MslError::UnsupportedProgramFeature(
                 "render area without unified descriptor binding"
+            ))
+        );
+    }
+
+    #[test]
+    fn rescaling_uses_upstream_layout_indices_and_binding_order() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_rescaling_uniform = true;
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 3,
+            size_shift: 0,
+        });
+        program.info.image_descriptors.push(ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32Uint,
+            is_written: false,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 2,
+            size_shift: 0,
+        });
+        program.blocks[0].append_new_inst(Opcode::ResolutionDownFactor, vec![]);
+        program.blocks[0].append_new_inst(Opcode::IsTextureScaled, vec![Value::ImmU32(2)]);
+        let dynamic_index = program.blocks[0]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(1), Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(
+            Opcode::IsImageScaled,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: dynamic_index,
+            })],
+        );
+
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let mut bindings = Bindings {
+            unified: 7,
+            texture_scaling_index: 31,
+            image_scaling_index: 32,
+            ..Bindings::default()
+        };
+        let artifact =
+            emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
+                .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("struct MslResolutionInfo"));
+        assert!(source.contains("    uint4 rescaling_textures;"));
+        assert!(source.contains("    uint2 rescaling_images;"));
+        assert!(source.contains("    float down_factor;"));
+        assert!(
+            source.contains("constant MslResolutionInfo& rescaling_push_constants [[buffer(0)]]")
+        );
+        assert!(source.contains("float v_0_0 = rescaling_push_constants.down_factor;"));
+        assert!(source.contains(
+            "bool v_0_1 = ((rescaling_push_constants.rescaling_textures[1u] & 0x00000002u) != 0u);"
+        ));
+        assert!(source.contains("rescaling_push_constants.rescaling_images[((v_0_2 + 32u) >> 5u)]"));
+        assert!(source.contains("(1u << ((v_0_2 + 32u) & 31u))"));
+        assert_eq!(artifact.bindings.push_constant_buffer_index, Some(0));
+        assert_eq!(artifact.bindings.resources[0].binding, 7);
+        assert_eq!(artifact.bindings.resources[1].binding, 8);
+        assert_eq!(bindings.unified, 9);
+        assert_eq!(bindings.texture_scaling_index, 32);
+        assert_eq!(bindings.image_scaling_index, 33);
+    }
+
+    #[test]
+    fn render_area_and_rescaling_share_the_upstream_push_constant_bytes() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_render_area = true;
+        program.info.uses_rescaling_uniform = true;
+        program.blocks[0].append_new_inst(Opcode::RenderArea, vec![]);
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert_eq!(source.matches("[[buffer(0)]]").count(), 1);
+        assert!(!source.contains("MslRenderAreaInfo"));
+        assert!(source.contains(
+            "float4 v_0_0 = as_type<float4>(rescaling_push_constants.rescaling_textures);"
+        ));
+        assert_eq!(artifact.bindings.push_constant_buffer_index, Some(0));
+        assert_eq!(artifact.bindings.buffer_count, 1);
+    }
+
+    #[test]
+    fn rejects_non_unified_rescaling_without_a_silent_uniform_fallback() {
+        let mut program = empty_program(Stage::VertexB);
+        program.info.uses_rescaling_uniform = true;
+        program.blocks[0].append_new_inst(Opcode::ResolutionDownFactor, vec![]);
+
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "rescaling without unified descriptor binding"
             ))
         );
     }

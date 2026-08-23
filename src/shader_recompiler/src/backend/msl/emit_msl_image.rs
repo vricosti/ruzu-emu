@@ -970,3 +970,62 @@ pub fn emit_image_write(
     context.push_statement(format!("{}.write({});", image.image, arguments.join(", ")));
     Ok(())
 }
+
+fn emit_is_scaled(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+    masks: &'static str,
+    base_index: u32,
+) -> Result<(), MslError> {
+    let expression = match inst.arg(0) {
+        Value::ImmU32(index) => {
+            let index = index.wrapping_add(base_index);
+            let word_index = index / 32;
+            let bit_mask = 1u32 << (index % 32);
+            format!("(({masks}[{word_index}u] & 0x{bit_mask:08X}u) != 0u)")
+        }
+        index => {
+            let index = context.value_expression(index, inst_ref, 0)?;
+            let index = if base_index == 0 {
+                index
+            } else {
+                format!("({index} + {base_index}u)")
+            };
+            format!("(({masks}[({index} >> 5u)] & (1u << ({index} & 31u))) != 0u)")
+        }
+    };
+    context.define(inst_ref, Type::U1, expression, false)
+}
+
+/// Native-MSL counterpart of upstream `EmitIsTextureScaled`.
+pub fn emit_is_texture_scaled(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let base_index = context.texture_rescaling_index();
+    emit_is_scaled(
+        context,
+        inst_ref,
+        inst,
+        "rescaling_push_constants.rescaling_textures",
+        base_index,
+    )
+}
+
+/// Native-MSL counterpart of upstream `EmitIsImageScaled`.
+pub fn emit_is_image_scaled(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let base_index = context.image_rescaling_index();
+    emit_is_scaled(
+        context,
+        inst_ref,
+        inst,
+        "rescaling_push_constants.rescaling_images",
+        base_index,
+    )
+}

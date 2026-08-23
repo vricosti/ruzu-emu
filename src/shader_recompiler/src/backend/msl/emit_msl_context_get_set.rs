@@ -100,7 +100,21 @@ pub fn emit_render_area(context: &mut MslEmitContext, inst_ref: InstRef) -> Resu
     context.define(
         inst_ref,
         ir::Type::F32x4,
-        "render_area_push_constants.render_area".to_owned(),
+        context.render_area_expression().to_owned(),
+        false,
+    )
+}
+
+/// Emit Eden's `EmitResolutionDownFactor` from the renderer-populated
+/// `RescalingLayout::down_factor` field at byte offset 24.
+pub fn emit_resolution_down_factor(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+) -> Result<(), MslError> {
+    context.define(
+        inst_ref,
+        ir::Type::F32,
+        context.resolution_down_factor_expression().to_owned(),
         false,
     )
 }

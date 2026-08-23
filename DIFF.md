@@ -8101,3 +8101,22 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 ### Binary layout verification
 - PASS: all seven opcodes use Eden's exact `U128(U128, U8)` metadata. No raw-memory payload or ABI
   structure is introduced; x64 instruction bytes and arm64 `DUP` encodings have focused coverage.
+
+## 2026-08-23 — `src/rdynarmic/src/backend/arm64/inst.rs` vs Oaknut instructions used by Eden vector reductions
+
+### Intentional differences
+- Ruzu encodes AArch64 instructions directly as `u32` words rather than invoking Oaknut's
+  overloaded `ADDV` and `ADDP` methods.
+
+### Unintentional differences (to fix)
+- The direct encoder previously lacked the scalar across-lane `ADDV` and pairwise `ADDP Dd,
+  Vn.2D` forms required by Eden's `VectorReduceAdd*` backend. Both encodings are now present in the
+  arm64 instruction owner.
+
+### Missing items
+- The four `VectorReduceAdd*` IR and backend paths remain paused until this prerequisite is
+  independently committed.
+
+### Binary layout verification
+- PASS: GNU AArch64 binutils independently assembled the covered instructions as `0x4e31b820`,
+  `0x4e71b862`, `0x4eb1b8a4`, and `0x5ef1b8e6`; focused Rust assertions require the same words.

@@ -2541,6 +2541,16 @@ pub fn addp_v(rd: u8, rn: u8, rm: u8, size: u8, q: bool) -> u32 {
     simd_three_same(0x0e20_bc00, rd, rn, rm, size, q)
 }
 
+/// `addv <Bd/Hd/Sd>, vN.<16B/8H/4S>`.
+pub fn addv_from_v(rd: u8, rn: u8, size: u8) -> u32 {
+    0x4e31_b800 | (simd_size(size) << 22) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `addp Dd, vN.2D`.
+pub fn addp_d_from_v2d(rd: u8, rn: u8) -> u32 {
+    0x5ef1_b800 | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `smaxp vD.<T>, vN.<T>, vM.<T>`.
 pub fn smaxp_v(rd: u8, rn: u8, rm: u8, size: u8, q: bool) -> u32 {
     simd_three_same(0x0e20_a400, rd, rn, rm, size, q)
@@ -3542,6 +3552,10 @@ mod tests {
         assert_eq!(umin_v(16, 17, 18, 8, true), 0x6e32_6e30);
         assert_eq!(addp_v(16, 17, 18, 8, true), 0x4e32_be30);
         assert_eq!(addp_v(16, 17, 18, 8, false), 0x0e32_be30);
+        assert_eq!(addv_from_v(0, 1, 8), 0x4e31_b820);
+        assert_eq!(addv_from_v(2, 3, 16), 0x4e71_b862);
+        assert_eq!(addv_from_v(4, 5, 32), 0x4eb1_b8a4);
+        assert_eq!(addp_d_from_v2d(6, 7), 0x5ef1_b8e6);
         assert_eq!(smaxp_v(16, 17, 18, 8, true), 0x4e32_a630);
         assert_eq!(umaxp_v(16, 17, 18, 8, true), 0x6e32_a630);
         assert_eq!(sminp_v(16, 17, 18, 8, true), 0x4e32_ae30);

@@ -13,24 +13,13 @@ use crate::ir::value::{InstRef, Value};
 use super::msl_emit_context::MslEmitContext;
 use super::MslError;
 
-fn immediate_binding(inst: &ir::Inst) -> Result<u32, MslError> {
-    match inst.arg(0) {
-        Value::ImmU32(binding) => Ok(*binding),
-        _ => Err(MslError::ExpectedImmediate {
-            opcode: inst.opcode,
-            arg: 0,
-            expected: "constant-buffer binding",
-        }),
-    }
-}
-
 /// Emit the non-aliasing `uint4` CBUF path used by the Metal profile.
 pub fn emit_get_cbuf(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
     inst: &ir::Inst,
 ) -> Result<(), MslError> {
-    let binding = immediate_binding(inst)?;
+    let binding = inst.arg(0);
     let offset = inst.arg(1);
     let word = context.constant_buffer_element_expression(inst_ref, binding, offset, 0)?;
     match inst.opcode {

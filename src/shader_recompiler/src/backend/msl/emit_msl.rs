@@ -177,7 +177,6 @@ fn first_unsupported_program_feature(
         || info.uses_fp32_denorms_preserve
         || info.uses_image_1d
         || info.uses_sparse_residency
-        || info.uses_cbuf_indirect
     {
         return Some("shader capabilities");
     }
@@ -2399,6 +2398,89 @@ mod tests {
             .source
             .source
             .contains("uint v_0_1 = c2[((v_0_0) >> 4u)][(((v_0_0) >> 2u) & 3u)];"));
+    }
+
+    #[test]
+    fn indirect_constant_buffer_binding_switches_over_all_hardware_bindings() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_cbuf_indirect = true;
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        program.info.used_indirect_cbuf_types = crate::ir::Type::U8 as u32
+            | crate::ir::Type::U16 as u32
+            | crate::ir::Type::U32 as u32
+            | crate::ir::Type::F32 as u32
+            | crate::ir::Type::U32x2 as u32;
+        for index in 0..crate::shader_info::Info::MAX_INDIRECT_CBUFS as u32 {
+            program
+                .info
+                .constant_buffer_descriptors
+                .push(crate::shader_info::ConstantBufferDescriptor { index, count: 1 });
+            program.info.constant_buffer_mask |= 1 << index;
+            program.info.constant_buffer_used_sizes[index as usize] = 0x1_0000;
+        }
+        let binding = program.blocks[0]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(1), Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: binding,
+                }),
+                Value::ImmU32(20),
+            ],
+        );
+        let dynamic_binding = Value::Inst(InstRef {
+            block: 0,
+            inst: binding,
+        });
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU8,
+            vec![dynamic_binding.clone(), Value::ImmU32(5)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufS16,
+            vec![dynamic_binding.clone(), Value::ImmU32(6)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufF32,
+            vec![dynamic_binding.clone(), Value::ImmU32(24)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32x2,
+            vec![dynamic_binding, Value::ImmU32(8)],
+        );
+
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let mut bindings = Bindings::default();
+        let artifact =
+            emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
+                .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("inline uint4 spvLoadConstU32x4("));
+        for index in 0..crate::shader_info::Info::MAX_INDIRECT_CBUFS {
+            assert!(source.contains(&format!("case {index}: return c{index}[offset];")));
+        }
+        assert!(source.contains("default: return c0[offset];"));
+        assert!(source.contains(
+            "spvLoadConstU32x4(v_0_0, 1u, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13)[1u]"
+        ));
+        assert!(source.contains("extract_bits(spvLoadConstU32x4(v_0_0, 0u,"));
+        assert!(source.contains("as_type<int>(spvLoadConstU32x4(v_0_0, 0u,"));
+        assert!(source.contains("as_type<float>(spvLoadConstU32x4(v_0_0, 1u,"));
+        assert!(source.contains("uint2(spvLoadConstU32x4(v_0_0, 0u,"));
+        assert_eq!(
+            artifact.bindings.resources.len(),
+            crate::shader_info::Info::MAX_INDIRECT_CBUFS
+        );
+        assert_eq!(
+            bindings.unified,
+            crate::shader_info::Info::MAX_INDIRECT_CBUFS as u32
+        );
     }
 
     #[test]

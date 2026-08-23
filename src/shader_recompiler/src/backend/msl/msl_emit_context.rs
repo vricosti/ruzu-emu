@@ -16,7 +16,8 @@ use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
 use crate::shader_info::{
-    ImageBufferDescriptor, ImageDescriptor, TextureBufferDescriptor, TextureDescriptor, TextureType,
+    ImageBufferDescriptor, ImageDescriptor, Info, TextureBufferDescriptor, TextureDescriptor,
+    TextureType,
 };
 use crate::stage::Stage;
 
@@ -47,6 +48,7 @@ pub struct MslEmitContext {
     uses_atomic_inc_dec_cas: bool,
     uses_texture_cast: bool,
     tracks_helper_invocation: bool,
+    uses_cbuf_indirect: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
     supports_texture_atomics: bool,
@@ -228,6 +230,13 @@ impl MslEmitContext {
             let name = format!("c{}", descriptor.index);
             parameters.push(format!("constant uint4* {name} [[buffer({buffer_index})]]"));
             constant_buffers.insert(descriptor.index, name);
+        }
+        if program.info.uses_cbuf_indirect {
+            for index in 0..Info::MAX_INDIRECT_CBUFS as u32 {
+                if !constant_buffers.contains_key(&index) {
+                    return Err(MslError::MissingConstantBuffer(index));
+                }
+            }
         }
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
@@ -613,6 +622,7 @@ impl MslEmitContext {
             uses_atomic_inc_dec_cas: false,
             uses_texture_cast: false,
             tracks_helper_invocation,
+            uses_cbuf_indirect: program.info.uses_cbuf_indirect,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
             supports_texture_atomics: options.supports_texture_atomics,
@@ -1215,23 +1225,46 @@ impl MslEmitContext {
     pub fn constant_buffer_element_expression(
         &self,
         inst_ref: InstRef,
-        binding: u32,
+        binding: &Value,
         offset: &Value,
         element_offset: u32,
     ) -> Result<String, MslError> {
-        let name = self
-            .constant_buffers
-            .get(&binding)
-            .ok_or(MslError::MissingConstantBuffer(binding))?;
         let offset_expression = self.value_expression(offset, inst_ref, 1)?;
         let vector_index = match offset {
             Value::ImmU32(offset) => format!("{}u", offset / 16),
             _ => format!("(({offset_expression}) >> 4u)"),
         };
+        let vector = match binding {
+            Value::ImmU32(binding) => {
+                let name = self
+                    .constant_buffers
+                    .get(binding)
+                    .ok_or(MslError::MissingConstantBuffer(*binding))?;
+                format!("{name}[{vector_index}]")
+            }
+            binding => {
+                if !self.uses_cbuf_indirect {
+                    return Err(MslError::UnsupportedProgramFeature(
+                        "indirect constant-buffer binding was not collected",
+                    ));
+                }
+                let binding_expression = self.value_expression(binding, inst_ref, 0)?;
+                let buffers = (0..Info::MAX_INDIRECT_CBUFS)
+                    .map(|index| {
+                        self.constant_buffers
+                            .get(&(index as u32))
+                            .cloned()
+                            .ok_or(MslError::MissingConstantBuffer(index as u32))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                format!("spvLoadConstU32x4({binding_expression}, {vector_index}, {buffers})")
+            }
+        };
         let vector = if self.has_broken_robust && !matches!(offset, Value::ImmU32(_)) {
-            format!("(({vector_index}) <= 0x0000FFFFu ? {name}[{vector_index}] : uint4(0u))")
+            format!("(({vector_index}) <= 0x0000FFFFu ? {vector} : uint4(0u))")
         } else {
-            format!("{name}[{vector_index}]")
+            vector
         };
         let component = match offset {
             Value::ImmU32(offset) => format!("{}u", (offset / 4) % 4 + element_offset),
@@ -1241,6 +1274,28 @@ impl MslEmitContext {
             _ => format!("((((({offset_expression}) >> 2u) & 3u)) + {element_offset}u)"),
         };
         Ok(format!("{vector}[{component}]"))
+    }
+
+    /// Native-MSL counterpart of Eden
+    /// `EmitContext::DefineConstantBufferIndirectFunctions` for the
+    /// non-aliasing `uint4` CBUF representation selected by Metal.
+    fn define_constant_buffer_indirect_functions(source: &mut String) {
+        let parameters = (0..Info::MAX_INDIRECT_CBUFS)
+            .map(|index| format!("constant uint4* c{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        source.push_str(&format!(
+            "inline uint4 spvLoadConstU32x4(uint binding, uint offset, {parameters}) {{\n"
+        ));
+        source.push_str("    switch (binding) {\n");
+        for index in 0..Info::MAX_INDIRECT_CBUFS {
+            source.push_str(&format!("    case {index}: return c{index}[offset];\n"));
+        }
+        source.push_str(concat!(
+            "    default: return c0[offset];\n",
+            "    }\n",
+            "}\n\n",
+        ));
     }
 
     pub fn bit_offset_expression(
@@ -1608,6 +1663,9 @@ impl MslEmitContext {
         }
         self.source.push_str("}\n");
         let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
+        if self.uses_cbuf_indirect {
+            Self::define_constant_buffer_indirect_functions(&mut source);
+        }
         if self.uses_no_contraction_add {
             source.push_str(concat!(
                 "template<typename T>\n",

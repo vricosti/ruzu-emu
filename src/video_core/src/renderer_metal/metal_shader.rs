@@ -3931,6 +3931,94 @@ mod tests {
     }
 
     #[test]
+    fn compiles_and_validates_direct_indirect_constant_buffer_msl() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_cbuf_indirect = true;
+        program.info.uses_int8 = true;
+        program.info.uses_int16 = true;
+        program.info.used_indirect_cbuf_types = Type::U8 as u32
+            | Type::U16 as u32
+            | Type::U32 as u32
+            | Type::F32 as u32
+            | Type::U32x2 as u32;
+        for index in 0..shader_recompiler::shader_info::Info::MAX_INDIRECT_CBUFS as u32 {
+            program
+                .info
+                .constant_buffer_descriptors
+                .push(ConstantBufferDescriptor { index, count: 1 });
+            program.info.constant_buffer_mask |= 1 << index;
+            program.info.constant_buffer_used_sizes[index as usize] = 0x1_0000;
+        }
+        let binding = program.blocks[0]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(5), Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: binding,
+                }),
+                Value::ImmU32(20),
+            ],
+        );
+        let dynamic_binding = Value::Inst(InstRef {
+            block: 0,
+            inst: binding,
+        });
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU8,
+            vec![dynamic_binding.clone(), Value::ImmU32(5)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufS16,
+            vec![dynamic_binding.clone(), Value::ImmU32(6)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufF32,
+            vec![dynamic_binding.clone(), Value::ImmU32(24)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GetCbufU32x2,
+            vec![dynamic_binding, Value::ImmU32(8)],
+        );
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+        )
+        .expect("active indirect CBUF SPIR-V/MSL must compile");
+
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct indirect CBUF MSL must compile with the active ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(
+            direct.bindings().resources.len(),
+            shader_recompiler::shader_info::Info::MAX_INDIRECT_CBUFS
+        );
+        assert!(direct
+            .source()
+            .source
+            .contains("inline uint4 spvLoadConstU32x4("));
+    }
+
+    #[test]
     fn validates_direct_constant_buffer_bindings_across_graphics_stages() {
         let Ok(device) = MetalDevice::new() else {
             return;

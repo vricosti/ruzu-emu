@@ -32,12 +32,12 @@ mod ng_word_1_data {
 
 /// Synthesize the NgWord1 archive.
 ///
-/// Creates a directory "data" containing 0x10 numbered .txt files,
-/// a common.txt, and version.dat — matching upstream exactly.
+/// Upstream reserves room for the numbered files, then iterates over the
+/// still-empty vector. Consequently only common.txt and version.dat are added.
 pub fn ng_word_1() -> Option<VirtualDir> {
-    let mut files: Vec<VirtualFile> = Vec::with_capacity(ng_word_1_data::NUMBER_WORD_TXT_FILES + 2);
+    let mut files: Vec<VirtualFile> = Vec::with_capacity(ng_word_1_data::NUMBER_WORD_TXT_FILES);
 
-    for i in 0..ng_word_1_data::NUMBER_WORD_TXT_FILES {
+    for i in 0..files.len() {
         files.push(make_array_file(
             ng_word_1_data::WORD_TXT.to_vec(),
             format!("{}.txt", i),
@@ -146,8 +146,9 @@ mod tests {
     fn test_ng_word_1_file_count() {
         let dir = ng_word_1().expect("ng_word_1 should return Some");
         assert_eq!(dir.get_name(), "data");
-        // 0x10 numbered files + common.txt + version.dat = 18
-        assert_eq!(dir.get_files().len(), 18);
+        // Eden loops over files.size() immediately after reserve(), so the
+        // numbered files are not created.
+        assert_eq!(dir.get_files().len(), 2);
     }
 
     #[test]

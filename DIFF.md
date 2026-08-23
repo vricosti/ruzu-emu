@@ -8050,3 +8050,20 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: the tests pass explicit 64-bit Maxwell instruction words to the decoder.
+
+## 2026-08-23 — `src/core/src/file_sys/system_archive/ng_word.rs` vs Eden `src/core/file_sys/system_archive/ng_word.{h,cpp}`
+
+### Intentional differences
+- Rust returns `Option<VirtualDir>` to match the surrounding Ruzu system-archive interface.
+
+### Unintentional differences (to fix)
+- `ng_word_1` previously iterated over `NUMBER_WORD_TXT_FILES` and created 16 numbered files.
+  Eden reserves that capacity but iterates over the empty vector's size, so Ruzu now reproduces
+  the resulting two-file archive containing only `common.txt` and `version.dat`.
+
+### Missing items
+- None in `ng_word_1` or `ng_word_2`.
+
+### Binary layout verification
+- PASS: `VERSION_DAT`, `WORD_TXT`, and `AC_NX_DATA` retain Eden's byte-for-byte contents; this
+  correction only changes which `ng_word_1` files are inserted.

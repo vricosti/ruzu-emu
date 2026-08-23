@@ -100,6 +100,39 @@ impl fmt::Display for Type {
 }
 
 impl Type {
+    /// Decode one concrete IR type flag without accepting combined masks.
+    pub fn from_raw(value: u32) -> Option<Self> {
+        Some(match value {
+            x if x == Self::Void as u32 => Self::Void,
+            x if x == Self::Opaque as u32 => Self::Opaque,
+            x if x == Self::Reg as u32 => Self::Reg,
+            x if x == Self::Pred as u32 => Self::Pred,
+            x if x == Self::Attribute as u32 => Self::Attribute,
+            x if x == Self::Patch as u32 => Self::Patch,
+            x if x == Self::U1 as u32 => Self::U1,
+            x if x == Self::U8 as u32 => Self::U8,
+            x if x == Self::U16 as u32 => Self::U16,
+            x if x == Self::U32 as u32 => Self::U32,
+            x if x == Self::U64 as u32 => Self::U64,
+            x if x == Self::F16 as u32 => Self::F16,
+            x if x == Self::F32 as u32 => Self::F32,
+            x if x == Self::F64 as u32 => Self::F64,
+            x if x == Self::U32x2 as u32 => Self::U32x2,
+            x if x == Self::U32x3 as u32 => Self::U32x3,
+            x if x == Self::U32x4 as u32 => Self::U32x4,
+            x if x == Self::F16x2 as u32 => Self::F16x2,
+            x if x == Self::F16x3 as u32 => Self::F16x3,
+            x if x == Self::F16x4 as u32 => Self::F16x4,
+            x if x == Self::F32x2 as u32 => Self::F32x2,
+            x if x == Self::F32x3 as u32 => Self::F32x3,
+            x if x == Self::F32x4 as u32 => Self::F32x4,
+            x if x == Self::F64x2 as u32 => Self::F64x2,
+            x if x == Self::F64x3 as u32 => Self::F64x3,
+            x if x == Self::F64x4 as u32 => Self::F64x4,
+            _ => return None,
+        })
+    }
+
     /// Check if this is a scalar integer type.
     pub fn is_integer(self) -> bool {
         matches!(

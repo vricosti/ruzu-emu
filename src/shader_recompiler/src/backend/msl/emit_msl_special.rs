@@ -7,11 +7,25 @@
 //! `backend/spirv/emit_spirv_special.cpp`.
 
 use crate::ir;
-use crate::ir::value::Attribute;
+use crate::ir::value::{Attribute, InstRef};
 use crate::runtime_info::CompareFunction;
 use crate::stage::Stage;
 
 use super::msl_emit_context::MslEmitContext;
+use super::MslError;
+
+pub fn emit_phi_move(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let phi = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    if phi != value {
+        context.emit_statement(&format!("{phi} = {value};"));
+    }
+    Ok(())
+}
 
 fn float_bits(value: f32) -> String {
     format!("as_type<float>(0x{:08X}u)", value.to_bits())

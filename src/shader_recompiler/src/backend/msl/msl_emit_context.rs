@@ -34,6 +34,7 @@ pub struct MslEmitContext {
     input_generics: [Option<MslInputGenericDefinition>; 32],
     bindings: MslBindingLayout,
     returns_output: bool,
+    terminal_return_emitted: bool,
     uses_no_contraction_add: bool,
     uses_no_contraction_mul: bool,
     uses_no_contraction_fma: bool,
@@ -498,6 +499,7 @@ impl MslEmitContext {
             input_generics,
             bindings,
             returns_output,
+            terminal_return_emitted: false,
             uses_no_contraction_add: false,
             uses_no_contraction_mul: false,
             uses_no_contraction_fma: false,
@@ -1080,6 +1082,32 @@ impl MslEmitContext {
         self.definitions.contains_key(&inst_ref)
     }
 
+    pub fn declare_phi(&mut self, inst_ref: InstRef, ty: Type) -> Result<(), MslError> {
+        let name = format!("v_{}_{}", inst_ref.block, inst_ref.inst);
+        let type_name = Self::type_name(ty)?;
+        self.source
+            .push_str(&format!("    {type_name} {name} = {type_name}(0);\n"));
+        self.definitions.insert(inst_ref, name);
+        Ok(())
+    }
+
+    pub fn declare_loop_safety_counter(&mut self, index: usize) {
+        self.source
+            .push_str(&format!("    int loop{index} = 0x2000;\n"));
+    }
+
+    pub fn emit_return(&mut self) {
+        if self.returns_output {
+            self.emit_statement("return output;");
+        } else {
+            self.emit_statement("return;");
+        }
+    }
+
+    pub fn mark_terminal_return_emitted(&mut self) {
+        self.terminal_return_emitted = true;
+    }
+
     pub fn define(
         &mut self,
         inst_ref: InstRef,
@@ -1174,6 +1202,10 @@ impl MslEmitContext {
                 .inst(reference.inst)
                 .return_type(),
             value => value.ir_type(),
+        };
+        let ty = match ty {
+            Type::U8 | Type::U16 => Type::U32,
+            ty => ty,
         };
         self.define(inst_ref, ty, expression, false)
     }
@@ -1301,7 +1333,7 @@ impl MslEmitContext {
     }
 
     pub fn finish(mut self) -> MslShaderArtifact {
-        if self.returns_output {
+        if self.returns_output && !self.terminal_return_emitted {
             self.source.push_str("    return output;\n");
         }
         self.source.push_str("}\n");

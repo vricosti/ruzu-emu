@@ -25,6 +25,7 @@ mod emit_msl_memory;
 mod emit_msl_select;
 mod emit_msl_shared_memory;
 mod emit_msl_special;
+mod emit_msl_undefined;
 mod emit_msl_warp;
 pub mod msl_emit_context;
 

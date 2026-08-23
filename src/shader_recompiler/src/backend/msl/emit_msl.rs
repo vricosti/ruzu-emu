@@ -8,8 +8,10 @@
 
 use crate::backend::bindings::Bindings;
 use crate::ir;
+use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::SyntaxNode;
+use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
@@ -30,6 +32,7 @@ use super::emit_msl_memory;
 use super::emit_msl_select;
 use super::emit_msl_shared_memory;
 use super::emit_msl_special;
+use super::emit_msl_undefined;
 use super::emit_msl_warp;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
@@ -194,6 +197,67 @@ fn immediate_u32(inst: &crate::ir::instruction::Inst, arg: u32) -> Result<u32, M
     }
 }
 
+fn precolor(program: &mut ir::Program) {
+    for block_index in 0..program.blocks.len() as u32 {
+        let phi_indices = program
+            .block(block_index)
+            .indexed_iter()
+            .take_while(|(_, inst)| inst.opcode == Opcode::Phi)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for phi_index in phi_indices {
+            let phi_ref = InstRef {
+                block: block_index,
+                inst: phi_index,
+            };
+            let phi_args = program.block(block_index).inst(phi_index).phi_args.clone();
+            for &(predecessor, value) in &phi_args {
+                let insert_before = program
+                    .block(predecessor)
+                    .indexed_rev_iter()
+                    .take_while(|(_, inst)| inst.opcode == Opcode::Reference)
+                    .last()
+                    .map(|(index, _)| index);
+                let phi_move = Inst::new(Opcode::PhiMove, vec![Value::Inst(phi_ref), value]);
+                if let Some(insert_before) = insert_before {
+                    program
+                        .block_mut(predecessor)
+                        .insert_inst_before(insert_before, phi_move);
+                } else {
+                    program.block_mut(predecessor).append_inst(phi_move);
+                }
+            }
+            for (predecessor, _) in phi_args {
+                program
+                    .block_mut(predecessor)
+                    .append_inst(Inst::new(Opcode::Reference, vec![Value::Inst(phi_ref)]));
+            }
+        }
+    }
+}
+
+fn declare_phis(context: &mut MslEmitContext, program: &ir::Program) -> Result<(), MslError> {
+    for (block_index, block) in program.blocks.iter().enumerate() {
+        for (inst_index, inst) in block
+            .indexed_iter()
+            .take_while(|(_, inst)| inst.opcode == Opcode::Phi)
+        {
+            let ty = match inst.return_type() {
+                Type::U8 | Type::U16 => Type::U32,
+                ty => ty,
+            };
+            context.declare_phi(
+                InstRef {
+                    block: block_index as u32,
+                    inst: inst_index,
+                },
+                ty,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn emit_inst(
     context: &mut MslEmitContext,
     program: &ir::Program,
@@ -202,6 +266,16 @@ fn emit_inst(
     let inst = program.block(inst_ref.block).inst(inst_ref.inst);
     match inst.opcode {
         Opcode::Void => Ok(()),
+        Opcode::Phi | Opcode::Reference => Ok(()),
+        Opcode::PhiMove => emit_msl_special::emit_phi_move(context, inst_ref, inst),
+        Opcode::ConditionRef => {
+            emit_msl_bitwise_conversion::emit_condition_ref(context, inst_ref, inst)
+        }
+        Opcode::UndefU1
+        | Opcode::UndefU8
+        | Opcode::UndefU16
+        | Opcode::UndefU32
+        | Opcode::UndefU64 => emit_msl_undefined::emit_undef(context, inst_ref, inst),
         Opcode::Prologue => {
             emit_msl_special::emit_prologue(context, program);
             Ok(())
@@ -777,6 +851,93 @@ fn emit_block(
     Ok(())
 }
 
+fn emit_program(context: &mut MslEmitContext, program: &ir::Program) -> Result<(), MslError> {
+    if program.syntax_list.is_empty() {
+        for block_index in 0..program.blocks.len() as u32 {
+            emit_block(context, program, block_index)?;
+        }
+        return Ok(());
+    }
+
+    let loop_safety_enabled = !*common::settings::values()
+        .disable_shader_loop_safety_checks
+        .get_value();
+    let repeat_count = program
+        .syntax_list
+        .iter()
+        .filter(|node| matches!(node, SyntaxNode::Repeat { .. }))
+        .count();
+    if loop_safety_enabled {
+        for index in 0..repeat_count {
+            context.declare_loop_safety_counter(index);
+        }
+    }
+
+    let mut repeat_index = 0usize;
+    for node in &program.syntax_list {
+        match *node {
+            SyntaxNode::Block(block_index) => emit_block(context, program, block_index)?,
+            SyntaxNode::If { cond, body, .. } => {
+                let cond = context.value_expression(
+                    &cond,
+                    InstRef {
+                        block: body,
+                        inst: 0,
+                    },
+                    0,
+                )?;
+                context.emit_statement(&format!("if ({cond}) {{"));
+            }
+            SyntaxNode::EndIf { .. } => context.emit_statement("}"),
+            SyntaxNode::Break { cond, skip, .. } => match cond {
+                Value::ImmU1(true) => context.emit_statement("break;"),
+                Value::ImmU1(false) => {}
+                _ => {
+                    let cond = context.value_expression(
+                        &cond,
+                        InstRef {
+                            block: skip,
+                            inst: 0,
+                        },
+                        0,
+                    )?;
+                    context.emit_statement(&format!("if ({cond}) {{ break; }}"));
+                }
+            },
+            SyntaxNode::Return | SyntaxNode::Unreachable => context.emit_return(),
+            SyntaxNode::Loop { .. } => context.emit_statement("for (;;) {"),
+            SyntaxNode::Repeat {
+                cond, loop_header, ..
+            } => {
+                let cond = context.value_expression(
+                    &cond,
+                    InstRef {
+                        block: loop_header,
+                        inst: 0,
+                    },
+                    0,
+                )?;
+                if loop_safety_enabled {
+                    context.emit_statement(&format!(
+                        "if (--loop{repeat_index} < 0 || !({cond})) {{ break; }}"
+                    ));
+                } else {
+                    context.emit_statement(&format!("if (!({cond})) {{ break; }}"));
+                }
+                context.emit_statement("}");
+                repeat_index += 1;
+            }
+        }
+    }
+    if matches!(
+        program.syntax_list.last(),
+        Some(SyntaxNode::Return | SyntaxNode::Unreachable)
+    ) {
+        context.mark_terminal_return_emitted();
+    }
+    Ok(())
+}
+
 /// Emit native MSL directly from the backend-neutral shader IR.
 ///
 /// The initial supported language is intentionally exact: empty vertex and
@@ -833,24 +994,11 @@ pub fn emit_msl_with_options_and_bindings(
     if let Some(feature) = first_unsupported_program_feature(program, profile) {
         return Err(MslError::UnsupportedProgramFeature(feature));
     }
-    let mut context = MslEmitContext::new(program, profile, runtime_info, options, bindings)?;
-    if program.syntax_list.is_empty() {
-        for block_index in 0..program.blocks.len() as u32 {
-            emit_block(&mut context, program, block_index)?;
-        }
-    } else {
-        for node in &program.syntax_list {
-            match node {
-                SyntaxNode::Block(block_index) => emit_block(&mut context, program, *block_index)?,
-                SyntaxNode::Return => {}
-                _ => {
-                    return Err(MslError::UnsupportedProgramFeature(
-                        "structured control flow",
-                    ))
-                }
-            }
-        }
-    }
+    let mut program = program.clone();
+    precolor(&mut program);
+    let mut context = MslEmitContext::new(&program, profile, runtime_info, options, bindings)?;
+    declare_phis(&mut context, &program)?;
+    emit_program(&mut context, &program)?;
     Ok(context.finish())
 }
 
@@ -872,6 +1020,79 @@ mod tests {
     fn empty_program(stage: Stage) -> ir::Program {
         let mut program = ir::Program::new(stage);
         program.blocks.push(Block::new());
+        program
+    }
+
+    fn structured_phi_program() -> ir::Program {
+        let mut program = ir::Program::new(Stage::Compute);
+        program.blocks = (0..3).map(|_| Block::new()).collect();
+        let cond =
+            program.blocks[0].append_new_inst(Opcode::ConditionRef, vec![Value::ImmU1(true)]);
+        let mut phi = Inst::phi();
+        phi.flags = Type::U32 as u32;
+        phi.add_phi_operand(0, Value::ImmU32(10));
+        phi.add_phi_operand(1, Value::ImmU32(20));
+        let phi = program.blocks[2].append_inst(phi);
+        program.blocks[2].append_new_inst(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef {
+                block: 2,
+                inst: phi,
+            })],
+        );
+        program.syntax_list = vec![
+            SyntaxNode::Block(0),
+            SyntaxNode::If {
+                cond: Value::Inst(InstRef {
+                    block: 0,
+                    inst: cond,
+                }),
+                body: 1,
+                merge: 2,
+            },
+            SyntaxNode::Block(1),
+            SyntaxNode::EndIf { merge: 2 },
+            SyntaxNode::Block(2),
+            SyntaxNode::Return,
+        ];
+        program
+    }
+
+    fn structured_loop_program() -> ir::Program {
+        let mut program = ir::Program::new(Stage::Compute);
+        program.blocks = (0..4).map(|_| Block::new()).collect();
+        let break_cond =
+            program.blocks[1].append_new_inst(Opcode::ConditionRef, vec![Value::ImmU1(false)]);
+        let repeat_cond =
+            program.blocks[2].append_new_inst(Opcode::ConditionRef, vec![Value::ImmU1(false)]);
+        program.syntax_list = vec![
+            SyntaxNode::Block(0),
+            SyntaxNode::Loop {
+                body: 1,
+                continue_block: 2,
+                merge: 3,
+            },
+            SyntaxNode::Block(1),
+            SyntaxNode::Break {
+                cond: Value::Inst(InstRef {
+                    block: 1,
+                    inst: break_cond,
+                }),
+                merge: 3,
+                skip: 2,
+            },
+            SyntaxNode::Block(2),
+            SyntaxNode::Repeat {
+                cond: Value::Inst(InstRef {
+                    block: 2,
+                    inst: repeat_cond,
+                }),
+                loop_header: 0,
+                merge: 3,
+            },
+            SyntaxNode::Block(3),
+            SyntaxNode::Return,
+        ];
         program
     }
 
@@ -1741,6 +1962,55 @@ mod tests {
     }
 
     #[test]
+    fn emits_structured_if_and_precolored_phi_assignments() {
+        let source = emit_msl(
+            &structured_phi_program(),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap()
+        .source
+        .source;
+
+        assert!(source.contains("uint v_2_0 = uint(0);"));
+        assert!(source.contains("v_2_0 = 0x0000000Au;"));
+        assert!(source.contains("if (v_0_0) {"));
+        assert!(source.contains("v_2_0 = 0x00000014u;"));
+        assert!(source.contains("uint v_2_1 = v_2_0;"));
+        assert!(source.contains("return;"));
+    }
+
+    #[test]
+    fn emits_structured_loop_break_repeat_and_safety_counter() {
+        let source = emit_msl(
+            &structured_loop_program(),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap()
+        .source
+        .source;
+
+        assert!(source.contains("int loop0 = 0x2000;"));
+        assert!(source.contains("for (;;) {"));
+        assert!(source.contains("if (v_1_0) { break; }"));
+        assert!(source.contains("if (--loop0 < 0 || !(v_2_0)) { break; }"));
+    }
+
+    #[test]
+    fn structured_output_return_is_not_duplicated_by_finish() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_color[0] = true;
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let source = emit_msl(&program, &Profile::default(), &RuntimeInfo::default())
+            .unwrap()
+            .source
+            .source;
+        assert_eq!(source.matches("return output;").count(), 1);
+    }
+
+    #[test]
     fn implicit_non_fragment_depth_sample_does_not_emit_min_lod() {
         let color = emit_msl(
             &sampled_texture_operands_program(Stage::Compute, false),
@@ -1768,14 +2038,14 @@ mod tests {
     #[test]
     fn rejects_unported_ir_instead_of_emitting_a_fallback() {
         let mut program = empty_program(Stage::Fragment);
-        program.blocks[0].append_new_inst(Opcode::UndefU32, vec![]);
+        program.blocks[0].append_new_inst(Opcode::PackDouble2x32, vec![]);
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
             Err(MslError::UnsupportedOpcode {
                 block: 0,
                 inst: 0,
-                opcode: Opcode::UndefU32,
+                opcode: Opcode::PackDouble2x32,
             })
         );
     }

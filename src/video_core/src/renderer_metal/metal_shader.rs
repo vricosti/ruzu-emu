@@ -744,8 +744,9 @@ mod tests {
     use shader_recompiler::backend::emit_spirv;
     use shader_recompiler::ir::basic_block::Block;
     use shader_recompiler::ir::emitter::Emitter;
+    use shader_recompiler::ir::instruction::Inst;
     use shader_recompiler::ir::opcodes::Opcode;
-    use shader_recompiler::ir::types::{FpControl, TextureInstInfo};
+    use shader_recompiler::ir::types::{FpControl, TextureInstInfo, Type};
     use shader_recompiler::ir::value::{InstRef, Value};
     use shader_recompiler::ir::Program;
     use shader_recompiler::profile::Profile;
@@ -783,6 +784,79 @@ mod tests {
             size_shift: 0,
         });
         program.info.uses_rescaling_uniform = true;
+        program
+    }
+
+    fn structured_phi_program() -> Program {
+        let mut program = Program::new(Stage::Compute);
+        program.blocks = (0..3).map(|_| Block::new()).collect();
+        let cond =
+            program.blocks[0].append_new_inst(Opcode::ConditionRef, vec![Value::ImmU1(true)]);
+        let mut phi = Inst::phi();
+        phi.flags = Type::U32 as u32;
+        phi.add_phi_operand(0, Value::ImmU32(10));
+        phi.add_phi_operand(1, Value::ImmU32(20));
+        let phi = program.blocks[2].append_inst(phi);
+        program.blocks[2].append_new_inst(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef {
+                block: 2,
+                inst: phi,
+            })],
+        );
+        program.syntax_list = vec![
+            shader_recompiler::ir::SyntaxNode::Block(0),
+            shader_recompiler::ir::SyntaxNode::If {
+                cond: Value::Inst(InstRef {
+                    block: 0,
+                    inst: cond,
+                }),
+                body: 1,
+                merge: 2,
+            },
+            shader_recompiler::ir::SyntaxNode::Block(1),
+            shader_recompiler::ir::SyntaxNode::EndIf { merge: 2 },
+            shader_recompiler::ir::SyntaxNode::Block(2),
+            shader_recompiler::ir::SyntaxNode::Return,
+        ];
+        program
+    }
+
+    fn structured_loop_program() -> Program {
+        let mut program = Program::new(Stage::Compute);
+        program.blocks = (0..4).map(|_| Block::new()).collect();
+        let break_cond =
+            program.blocks[1].append_new_inst(Opcode::ConditionRef, vec![Value::ImmU1(false)]);
+        let repeat_cond =
+            program.blocks[2].append_new_inst(Opcode::ConditionRef, vec![Value::ImmU1(false)]);
+        program.syntax_list = vec![
+            shader_recompiler::ir::SyntaxNode::Block(0),
+            shader_recompiler::ir::SyntaxNode::Loop {
+                body: 1,
+                continue_block: 2,
+                merge: 3,
+            },
+            shader_recompiler::ir::SyntaxNode::Block(1),
+            shader_recompiler::ir::SyntaxNode::Break {
+                cond: Value::Inst(InstRef {
+                    block: 1,
+                    inst: break_cond,
+                }),
+                merge: 3,
+                skip: 2,
+            },
+            shader_recompiler::ir::SyntaxNode::Block(2),
+            shader_recompiler::ir::SyntaxNode::Repeat {
+                cond: Value::Inst(InstRef {
+                    block: 2,
+                    inst: repeat_cond,
+                }),
+                loop_header: 0,
+                merge: 3,
+            },
+            shader_recompiler::ir::SyntaxNode::Block(3),
+            shader_recompiler::ir::SyntaxNode::Return,
+        ];
         program
     }
 
@@ -1712,6 +1786,43 @@ mod tests {
         assert!(shader.source().source.contains("[[sample_id]]"));
         assert!(shader.source().source.contains("simd_is_helper_thread()"));
         assert!(shader.source().source.contains("discard_fragment()"));
+    }
+
+    #[test]
+    fn compiles_direct_msl_structured_control_flow_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+
+        for (name, program) in [
+            ("if-phi", structured_phi_program()),
+            ("loop", structured_loop_program()),
+        ] {
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::for_compute_device(
+                    device.profile(),
+                    program.workgroup_size,
+                ),
+            )
+            .unwrap_or_else(|error| panic!("active {name} SPIR-V/MSL must compile: {error}"));
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct {name} MSL must compile with the active ABI: {error}")
+            });
+
+            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(direct.execution(), active.execution());
+        }
     }
 
     #[test]

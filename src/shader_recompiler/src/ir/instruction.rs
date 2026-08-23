@@ -87,7 +87,14 @@ impl Inst {
 
     /// Get the return type of this instruction.
     pub fn return_type(&self) -> super::types::Type {
-        self.opcode.return_type()
+        if self.opcode == Opcode::Phi {
+            match super::types::Type::from_raw(self.flags) {
+                Some(super::types::Type::Void) | None => super::types::Type::Opaque,
+                Some(ty) => ty,
+            }
+        } else {
+            self.opcode.return_type()
+        }
     }
 
     /// Number of arguments.
@@ -242,8 +249,10 @@ mod tests {
     #[test]
     fn phi_argument_access_mutation_and_invalidation_match_upstream() {
         let mut inst = Inst::phi();
+        inst.flags = super::super::types::Type::U32 as u32;
         inst.add_phi_operand(3, Value::ImmU32(10));
 
+        assert_eq!(inst.return_type(), super::super::types::Type::U32);
         assert_eq!(inst.num_args(), 1);
         assert_eq!(*inst.arg(0), Value::ImmU32(10));
         inst.set_arg(0, Value::ImmU32(20));
@@ -252,6 +261,11 @@ mod tests {
         inst.invalidate();
         assert!(inst.phi_args.is_empty());
         assert_eq!(inst.opcode, Opcode::Void);
+    }
+
+    #[test]
+    fn phi_without_a_concrete_type_remains_opaque() {
+        assert_eq!(Inst::phi().return_type(), super::super::types::Type::Opaque);
     }
 
     #[test]

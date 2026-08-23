@@ -23,3 +23,12 @@ pub fn emit_bitcast(
         false,
     )
 }
+
+pub fn emit_condition_ref(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(inst_ref, Type::U1, value, false)
+}

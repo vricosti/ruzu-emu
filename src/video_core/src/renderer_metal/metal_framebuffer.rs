@@ -48,6 +48,30 @@ pub struct MetalFramebufferSignature {
     pub samples: u32,
 }
 
+/// Complete identity of an ordinary LOAD/STORE Metal render pass.
+///
+/// Metal has no persistent framebuffer object. Consecutive draws can keep one
+/// render encoder open only while every attachment view and descriptor-wide
+/// property remains identical. The visibility-result buffer is part of the
+/// pass descriptor as well, so it participates in the key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetalRenderPassKey {
+    color_attachments: [usize; NUM_RT],
+    depth_attachment: usize,
+    stencil_attachment: usize,
+    render_area: (u32, u32),
+    samples: u32,
+    layers: usize,
+    visibility_result_buffer: usize,
+}
+
+impl MetalRenderPassKey {
+    pub(crate) fn with_visibility_result_buffer(mut self, identity: usize) -> Self {
+        self.visibility_result_buffer = identity;
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MetalFramebufferClear {
     pub color: Option<(usize, [f32; 4])>,
@@ -176,6 +200,31 @@ impl MetalFramebuffer {
             descriptor.setDefaultRasterSampleCount(self.samples as usize);
         }
         descriptor
+    }
+
+    /// Return the exact pass identity consumed by
+    /// `MetalScheduler::begin_or_reuse_render_pass`.
+    pub fn render_pass_key(&self, visibility_result_buffer: usize) -> MetalRenderPassKey {
+        let texture_identity = |texture: &ProtocolObject<dyn MTLTexture>| {
+            let pointer: *const ProtocolObject<dyn MTLTexture> = texture;
+            pointer.cast::<()>() as usize
+        };
+        MetalRenderPassKey {
+            color_attachments: std::array::from_fn(|index| {
+                self.color_attachments[index]
+                    .as_deref()
+                    .map_or(0, texture_identity)
+            }),
+            depth_attachment: self.depth_attachment.as_deref().map_or(0, texture_identity),
+            stencil_attachment: self
+                .stencil_attachment
+                .as_deref()
+                .map_or(0, texture_identity),
+            render_area: self.render_area,
+            samples: self.samples,
+            layers: self.layers,
+            visibility_result_buffer,
+        }
     }
 
     pub fn render_pass_descriptor_for_layer(
@@ -370,6 +419,10 @@ mod tests {
         assert_eq!(framebuffer.render_area(), (640, 360));
         assert_eq!(framebuffer.num_color_buffers(), 1);
         assert_eq!(framebuffer.samples(), 1);
+        let pass_key = framebuffer.render_pass_key(0);
+        assert_ne!(pass_key.color_attachments[2], 0);
+        assert_eq!(pass_key.color_attachments[0], 0);
+        assert_ne!(pass_key, framebuffer.render_pass_key(0x1234));
         let descriptor = framebuffer.render_pass_descriptor();
         let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(2) };
         assert!(attachment.texture().is_some());

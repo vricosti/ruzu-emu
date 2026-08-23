@@ -14,6 +14,7 @@ use objc2_metal::{
 use thiserror::Error;
 
 use super::metal_device::MetalDevice;
+use super::metal_framebuffer::MetalRenderPassKey;
 
 #[derive(Debug, Error)]
 pub enum MetalSchedulerError {
@@ -41,6 +42,7 @@ pub struct MetalScheduler {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     active: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     active_encoder: Option<ActiveEncoder>,
+    active_render_pass_key: Option<MetalRenderPassKey>,
     in_flight: VecDeque<InFlightCommandBuffer>,
     next_tick: u64,
     known_gpu_tick: u64,
@@ -73,6 +75,7 @@ impl MetalScheduler {
             queue: device.retained_command_queue(),
             active: None,
             active_encoder: None,
+            active_render_pass_key: None,
             in_flight: VecDeque::new(),
             next_tick: 1,
             known_gpu_tick: 0,
@@ -152,6 +155,32 @@ impl MetalScheduler {
         descriptor: &MTLRenderPassDescriptor,
     ) -> Result<(), MetalSchedulerError> {
         self.end_active_encoder();
+        self.install_render_encoder(descriptor)
+    }
+
+    /// Keep the current render encoder when the complete attachment identity
+    /// is unchanged. This is the Metal equivalent of retaining Eden's active
+    /// render-pass operation context across compatible draws.
+    pub fn begin_or_reuse_render_pass(
+        &mut self,
+        descriptor: &MTLRenderPassDescriptor,
+        key: MetalRenderPassKey,
+    ) -> Result<(), MetalSchedulerError> {
+        if matches!(self.active_encoder.as_ref(), Some(ActiveEncoder::Render(_)))
+            && self.active_render_pass_key == Some(key)
+        {
+            return Ok(());
+        }
+        self.end_active_encoder();
+        self.install_render_encoder(descriptor)?;
+        self.active_render_pass_key = Some(key);
+        Ok(())
+    }
+
+    fn install_render_encoder(
+        &mut self,
+        descriptor: &MTLRenderPassDescriptor,
+    ) -> Result<(), MetalSchedulerError> {
         let command_buffer = self.active_command_buffer()?;
         let encoder = command_buffer
             .renderCommandEncoderWithDescriptor(descriptor)
@@ -181,6 +210,7 @@ impl MetalScheduler {
     }
 
     fn end_active_encoder(&mut self) {
+        self.active_render_pass_key = None;
         if let Some(encoder) = self.active_encoder.take() {
             encoder.end_encoding();
         }
@@ -315,6 +345,38 @@ fn is_terminal_status(status: MTLCommandBufferStatus) -> bool {
 mod tests {
     use super::*;
 
+    fn render_pass_descriptor(
+        device: &MetalDevice,
+    ) -> (
+        Retained<MTLRenderPassDescriptor>,
+        Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>,
+    ) {
+        use objc2_metal::{
+            MTLDevice, MTLLoadAction, MTLPixelFormat, MTLStoreAction, MTLTextureDescriptor,
+            MTLTextureUsage,
+        };
+
+        let texture_descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                1,
+                1,
+                false,
+            )
+        };
+        texture_descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        let texture = device
+            .device()
+            .newTextureWithDescriptor(&texture_descriptor)
+            .expect("render-target texture");
+        let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
+        let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        color.setTexture(Some(&texture));
+        color.setLoadAction(MTLLoadAction::DontCare);
+        color.setStoreAction(MTLStoreAction::DontCare);
+        (descriptor, texture)
+    }
+
     #[test]
     fn commits_and_waits_for_an_empty_native_command_buffer() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
@@ -348,6 +410,46 @@ mod tests {
         assert_eq!(scheduler.flush().unwrap(), Some(1));
         assert_eq!(scheduler.flush().unwrap(), None);
         scheduler.wait(1).unwrap();
+    }
+
+    #[test]
+    fn reuses_only_matching_render_pass_keys() {
+        let device = MetalDevice::new().expect("Metal device");
+        let mut scheduler = MetalScheduler::new(&device);
+        let (descriptor, _texture) = render_pass_descriptor(&device);
+        let first_key = MetalRenderPassKey::default();
+        scheduler
+            .begin_or_reuse_render_pass(&descriptor, first_key)
+            .unwrap();
+        let first = scheduler
+            .with_render_encoder(|encoder| {
+                let pointer: *const ProtocolObject<dyn MTLRenderCommandEncoder> = encoder;
+                pointer.cast::<()>() as usize
+            })
+            .unwrap();
+        scheduler
+            .begin_or_reuse_render_pass(&descriptor, first_key)
+            .unwrap();
+        let reused = scheduler
+            .with_render_encoder(|encoder| {
+                let pointer: *const ProtocolObject<dyn MTLRenderCommandEncoder> = encoder;
+                pointer.cast::<()>() as usize
+            })
+            .unwrap();
+        assert_eq!(first, reused);
+
+        let changed_key = first_key.with_visibility_result_buffer(1);
+        scheduler
+            .begin_or_reuse_render_pass(&descriptor, changed_key)
+            .unwrap();
+        let replaced = scheduler
+            .with_render_encoder(|encoder| {
+                let pointer: *const ProtocolObject<dyn MTLRenderCommandEncoder> = encoder;
+                pointer.cast::<()>() as usize
+            })
+            .unwrap();
+        assert_ne!(first, replaced);
+        scheduler.finish_all().unwrap();
     }
 
     #[test]

@@ -630,7 +630,22 @@ impl MetalRasterizer {
                 },
             );
 
-        let (render_pass, render_area, pipeline_key) = {
+        // Eden performs this after UpdateRenderTargets and before configuring
+        // the draw. Ending the current Metal encoder provides the required
+        // producer/consumer boundary without inventing a Vulkan-style layout.
+        let scheduler = self.scheduler.as_mut();
+        self.texture_cache
+            .base
+            .check_feedback_loop(&prepared.image_views, || scheduler.end_render_pass());
+
+        let visibility_query = self
+            .query_cache
+            .prepare_draw(self.scheduler.as_mut(), draw.zpass_pixel_count_enabled())?;
+        let visibility_result_buffer = visibility_query
+            .map(|_| self.query_cache.visibility_result_buffer_identity())
+            .unwrap_or(0);
+
+        let (render_pass, render_pass_key, render_area, pipeline_key) = {
             let framebuffer = self.texture_cache.base.get_framebuffer()?;
             let render_area = framebuffer.render_area();
             let pipeline_key = self
@@ -638,13 +653,11 @@ impl MetalRasterizer {
                 .make_render_pipeline_key(&stages, framebuffer)?;
             (
                 framebuffer.render_pass_descriptor(),
+                framebuffer.render_pass_key(visibility_result_buffer),
                 render_area,
                 pipeline_key,
             )
         };
-        let visibility_query = self
-            .query_cache
-            .prepare_draw(self.scheduler.as_mut(), draw.zpass_pixel_count_enabled())?;
         if visibility_query.is_some() {
             self.query_cache.attach_render_pass(&render_pass);
         }
@@ -687,7 +700,8 @@ impl MetalRasterizer {
         let scissor = metal_scissor(draw, render_area);
         let vertex_layouts = pipeline_key.vertex_input.layouts;
 
-        self.scheduler.begin_render_pass(&render_pass)?;
+        self.scheduler
+            .begin_or_reuse_render_pass(&render_pass, render_pass_key)?;
         self.scheduler.with_render_encoder(|encoder| {
             MetalQueryCache::configure_draw(encoder, visibility_query);
             encoder.setRenderPipelineState(&pipeline_state);

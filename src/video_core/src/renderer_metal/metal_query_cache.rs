@@ -101,6 +101,12 @@ impl MetalQueryCache {
         descriptor.setVisibilityResultBuffer(Some(self.visibility_buffer.handle()));
     }
 
+    pub fn visibility_result_buffer_identity(&self) -> usize {
+        let buffer: *const ProtocolObject<dyn objc2_metal::MTLBuffer> =
+            self.visibility_buffer.handle();
+        buffer.cast::<()>() as usize
+    }
+
     pub fn configure_draw(
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         query: Option<MetalVisibilityQuery>,

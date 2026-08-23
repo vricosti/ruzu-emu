@@ -180,6 +180,14 @@ pub fn texture_usage(profile: &MetalDeviceProfile, format: PixelFormat) -> MTLTe
     {
         usage |= MTLTextureUsage::ShaderWrite;
     }
+    if profile.supports_texture_atomics()
+        && matches!(
+            format,
+            PixelFormat::R32Uint | PixelFormat::R32Sint | PixelFormat::R32G32Uint
+        )
+    {
+        usage |= MTLTextureUsage::ShaderAtomic;
+    }
     usage
 }
 
@@ -287,5 +295,11 @@ mod tests {
         assert!(compressed.contains(MTLTextureUsage::ShaderRead));
         assert!(!compressed.contains(MTLTextureUsage::ShaderWrite));
         assert!(!compressed.contains(MTLTextureUsage::RenderTarget));
+
+        let atomic = texture_usage(device.profile(), PixelFormat::R32Uint);
+        assert_eq!(
+            atomic.contains(MTLTextureUsage::ShaderAtomic),
+            device.profile().supports_texture_atomics()
+        );
     }
 }

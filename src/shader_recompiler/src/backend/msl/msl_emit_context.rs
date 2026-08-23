@@ -36,8 +36,10 @@ pub struct MslEmitContext {
     uses_no_contraction_mul: bool,
     uses_no_contraction_fma: bool,
     uses_storage_subword_cas: bool,
+    uses_texture_cast: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
+    supports_texture_atomics: bool,
     supports_typeless_image_loads: bool,
     need_gather_subpixel_offset: bool,
     execution: MslExecutionInfo,
@@ -242,8 +244,10 @@ impl MslEmitContext {
             uses_no_contraction_mul: false,
             uses_no_contraction_fma: false,
             uses_storage_subword_cas: false,
+            uses_texture_cast: false,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
+            supports_texture_atomics: options.supports_texture_atomics,
             supports_typeless_image_loads: profile.support_typeless_image_loads,
             need_gather_subpixel_offset: profile.need_gather_subpixel_offset,
             execution: MslExecutionInfo {
@@ -487,6 +491,14 @@ impl MslEmitContext {
 
     pub fn supports_typeless_image_loads(&self) -> bool {
         self.supports_typeless_image_loads
+    }
+
+    pub fn supports_texture_atomics(&self) -> bool {
+        self.language_version >= MslVersion::V3_1 && self.supports_texture_atomics
+    }
+
+    pub fn require_texture_cast(&mut self) {
+        self.uses_texture_cast = true;
     }
 
     pub fn validate_texture(
@@ -868,6 +880,14 @@ impl MslEmitContext {
                 "            return;\n",
                 "        }\n",
                 "    }\n",
+                "}\n\n",
+            ));
+        }
+        if self.uses_texture_cast {
+            source.push_str(concat!(
+                "template<typename T, typename U>\n",
+                "T spvTextureCast(U image) {\n",
+                "    return reinterpret_cast<thread const T&>(image);\n",
                 "}\n\n",
             ));
         }

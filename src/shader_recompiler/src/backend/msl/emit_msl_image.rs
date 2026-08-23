@@ -107,7 +107,7 @@ fn append_fetch_coordinates(
     Ok(())
 }
 
-fn append_storage_coordinates(
+pub(super) fn append_storage_coordinates(
     arguments: &mut Vec<String>,
     texture_type: TextureType,
     coords: String,

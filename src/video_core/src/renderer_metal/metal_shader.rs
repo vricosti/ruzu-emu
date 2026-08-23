@@ -12,8 +12,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCompileOptions, MTLDevice, MTLFunction, MTLLanguageVersion, MTLLibrary, MTLMathMode,
-    MTLReadWriteTextureTier,
+    MTLCompileOptions, MTLDevice, MTLFunction, MTLGPUFamily, MTLLanguageVersion, MTLLibrary,
+    MTLMathMode, MTLReadWriteTextureTier,
 };
 use spirv_cross2::compile::msl::{
     BindTarget, CompilerOptions, MetalPlatform, MslVersion as SpirvCrossMslVersion, ResourceBinding,
@@ -705,15 +705,20 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
     active: &MetalShaderModule,
     bindings: &mut Bindings,
 ) -> Result<MetalShaderModule, DirectMslValidationError> {
+    let language_version = active.language_version();
     let artifact = shader_recompiler::backend::msl::emit_msl_with_options_and_bindings(
         program,
         profile,
         runtime_info,
         &shader_recompiler::backend::msl::MslOptions {
-            language_version: active.language_version(),
+            language_version,
             supports_query_texture_lod: device.supportsQueryTextureLOD(),
             supports_read_write_textures: device.readWriteTextureSupport()
                 != MTLReadWriteTextureTier::TierNone,
+            supports_texture_atomics: language_version
+                >= shader_recompiler::backend::msl::MslVersion::V3_1
+                && (device.supportsFamily(MTLGPUFamily::Apple6)
+                    || device.supportsFamily(MTLGPUFamily::Mac2)),
         },
         bindings,
     )?;
@@ -1063,6 +1068,49 @@ mod tests {
                 vec![Value::ImmU32(count.saturating_sub(1)), coords, color],
             );
             program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
+    fn storage_image_atomic_program() -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.uses_atomic_image_u32 = true;
+        program.info.image_descriptors.push(ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32Uint,
+            is_written: true,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = storage_coordinates(&mut program, TextureType::Color2D);
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            image_format: ImageFormat::R32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        for opcode in [
+            Opcode::ImageAtomicIAdd32,
+            Opcode::ImageAtomicSMin32,
+            Opcode::ImageAtomicUMin32,
+            Opcode::ImageAtomicSMax32,
+            Opcode::ImageAtomicUMax32,
+            Opcode::ImageAtomicAnd32,
+            Opcode::ImageAtomicOr32,
+            Opcode::ImageAtomicXor32,
+            Opcode::ImageAtomicExchange32,
+        ] {
+            let atomic = program.blocks[0].append_new_inst(
+                opcode,
+                vec![Value::ImmU32(0), coords, Value::ImmU32(0x8000_0001)],
+            );
+            program.blocks[0].inst_mut(atomic).flags = flags;
         }
         program
     }
@@ -1524,6 +1572,7 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .expect("minimal compute IR must lower directly to MSL");
@@ -1569,6 +1618,7 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .expect("supported vertex IR must lower directly to MSL");
@@ -1681,6 +1731,7 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .expect("scalar IR must lower directly to MSL");
@@ -1798,6 +1849,7 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .expect("native half/int64 IR must lower directly to MSL when supported");
@@ -2173,6 +2225,7 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .expect("PTP gather must lower directly to MSL");
@@ -2256,12 +2309,51 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .expect("direct storage-image descriptor array must lower");
         assert_eq!(artifact.bindings.resources[0].count.unwrap().get(), 2);
         compile_native_msl_artifact(device.device(), artifact)
             .expect("direct storage-image descriptor array must compile natively");
+    }
+
+    #[test]
+    fn compiles_direct_texture_atomics_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        if !device.profile().supports_texture_atomics() {
+            return;
+        }
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let program = storage_image_atomic_program();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active texture-atomic SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "direct texture-atomic MSL must compile: {error}\nactive MSL:\n{}",
+                active.source().source,
+            )
+        });
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert!(direct.source().source.contains("atomic_fetch_add"));
+        assert!(direct.source().source.contains("atomic_exchange"));
     }
 
     #[test]
@@ -2438,6 +2530,7 @@ mod tests {
                 language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: false,
             },
         )
         .expect("multisample fetch must lower at the MSL 2.3 baseline");
@@ -2673,6 +2766,7 @@ mod tests {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
             },
         )
         .unwrap();

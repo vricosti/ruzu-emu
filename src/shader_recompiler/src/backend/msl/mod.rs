@@ -15,6 +15,7 @@ mod emit_msl_context_get_set;
 mod emit_msl_convert;
 mod emit_msl_floating_point;
 mod emit_msl_image;
+mod emit_msl_image_atomic;
 mod emit_msl_integer;
 mod emit_msl_logical;
 mod emit_msl_memory;
@@ -52,6 +53,9 @@ pub struct MslOptions {
     /// `access::read_write`. This is negotiated from the device's read/write
     /// texture tier rather than inferred from the MSL language version.
     pub supports_read_write_textures: bool,
+    /// Whether native texture atomics are available on the selected Metal
+    /// device. The renderer derives this from both MSL version and GPU family.
+    pub supports_texture_atomics: bool,
 }
 
 impl Default for MslOptions {
@@ -60,6 +64,7 @@ impl Default for MslOptions {
             language_version: MslVersion::V2_3,
             supports_query_texture_lod: false,
             supports_read_write_textures: false,
+            supports_texture_atomics: false,
         }
     }
 }

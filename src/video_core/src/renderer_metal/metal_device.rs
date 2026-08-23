@@ -232,6 +232,12 @@ impl MetalDeviceProfile {
         self.read_write_texture_tier != MTLReadWriteTextureTier::TierNone
     }
 
+    pub fn supports_texture_atomics(&self) -> bool {
+        self.msl_language_version >= MslVersion::V3_1
+            && (self.highest_apple_family.is_some_and(|family| family >= 6)
+                || self.supports_mac2_family)
+    }
+
     pub fn argument_binding_model(&self) -> MetalArgumentBindingModel {
         if self.max_argument_buffer_sampler_count == 0 {
             return MetalArgumentBindingModel::Direct;
@@ -334,6 +340,8 @@ mod tests {
         profile.sample_counts = [true, true, true, false, false];
         profile.recommended_max_working_set_size = 1_000;
         profile.highest_apple_family = Some(7);
+        profile.msl_language_version = MslVersion::V3_0;
+        profile.supports_mac2_family = false;
         profile.max_argument_buffer_samplers_per_stage = 996;
 
         assert_eq!(
@@ -341,6 +349,7 @@ mod tests {
             MetalArgumentBindingModel::Tier1ArgumentBuffers
         );
         assert!(!profile.supports_read_write_textures());
+        assert!(!profile.supports_texture_atomics());
         assert_eq!(profile.best_supported_sample_count(16), 4);
         assert_eq!(profile.recommended_resource_budget(), 800);
         assert_eq!(profile.max_argument_buffer_samplers_per_stage, 996);
@@ -354,6 +363,7 @@ mod tests {
         profile.read_write_texture_tier = MTLReadWriteTextureTier::Tier2;
         profile.sample_counts = [true, true, true, true, true];
         profile.highest_apple_family = Some(10);
+        profile.msl_language_version = MslVersion::V4_0;
         profile.max_argument_buffer_samplers_per_stage = 500_000;
 
         assert_eq!(
@@ -361,6 +371,7 @@ mod tests {
             MetalArgumentBindingModel::Tier2ArgumentBuffers
         );
         assert!(profile.supports_read_write_textures());
+        assert!(profile.supports_texture_atomics());
         assert_eq!(profile.best_supported_sample_count(16), 16);
         assert_eq!(profile.max_argument_buffer_samplers_per_stage, 500_000);
     }

@@ -20,6 +20,7 @@ use super::emit_msl_context_get_set;
 use super::emit_msl_convert;
 use super::emit_msl_floating_point;
 use super::emit_msl_image;
+use super::emit_msl_image_atomic;
 use super::emit_msl_integer;
 use super::emit_msl_logical;
 use super::emit_msl_memory;
@@ -105,7 +106,6 @@ fn first_unsupported_program_feature(
         || info.uses_atomic_s32_min
         || info.uses_atomic_s32_max
         || info.uses_int64_bit_atomics
-        || info.uses_atomic_image_u32
     {
         return Some("memory operations");
     }
@@ -569,6 +569,19 @@ fn emit_inst(
         }
         Opcode::ImageRead => emit_msl_image::emit_image_read(context, program, inst_ref, inst),
         Opcode::ImageWrite => emit_msl_image::emit_image_write(context, inst_ref, inst),
+        Opcode::ImageAtomicIAdd32
+        | Opcode::ImageAtomicSMin32
+        | Opcode::ImageAtomicUMin32
+        | Opcode::ImageAtomicSMax32
+        | Opcode::ImageAtomicUMax32
+        | Opcode::ImageAtomicInc32
+        | Opcode::ImageAtomicDec32
+        | Opcode::ImageAtomicAnd32
+        | Opcode::ImageAtomicOr32
+        | Opcode::ImageAtomicXor32
+        | Opcode::ImageAtomicExchange32 => {
+            emit_msl_image_atomic::emit_image_atomic(context, inst_ref, inst)
+        }
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -700,7 +713,7 @@ pub fn emit_msl_with_options_and_bindings(
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::msl::MslResourceKind;
+    use crate::backend::msl::{MslResourceKind, MslVersion};
     use crate::ir::basic_block::Block;
     use crate::ir::emitter::Emitter;
     use crate::ir::opcodes::Opcode;
@@ -847,6 +860,36 @@ mod tests {
                 ],
             );
             program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
+    fn storage_image_atomic_program(index: Value, opcodes: &[Opcode]) -> ir::Program {
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_atomic_image_u32 = true;
+        program.info.image_descriptors.push(ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32Uint,
+            is_written: true,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = storage_coordinates(&mut program, TextureType::Color2D);
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            image_format: ImageFormat::R32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        for opcode in opcodes {
+            let atomic = program.blocks[0]
+                .append_new_inst(*opcode, vec![index, coords, Value::ImmU32(0x8000_0001)]);
+            program.blocks[0].inst_mut(atomic).flags = flags;
         }
         program
     }
@@ -2108,5 +2151,135 @@ mod tests {
         let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
         assert!(artifact.source.source.contains("= uint4(0u);"));
         assert!(!artifact.source.source.contains(".read("));
+    }
+
+    #[test]
+    fn emits_native_texture_atomics_and_signed_reinterpretation() {
+        let program = storage_image_atomic_program(
+            Value::ImmU32(0),
+            &[
+                Opcode::ImageAtomicIAdd32,
+                Opcode::ImageAtomicSMin32,
+                Opcode::ImageAtomicUMin32,
+                Opcode::ImageAtomicSMax32,
+                Opcode::ImageAtomicUMax32,
+                Opcode::ImageAtomicAnd32,
+                Opcode::ImageAtomicOr32,
+                Opcode::ImageAtomicXor32,
+                Opcode::ImageAtomicExchange32,
+            ],
+        );
+        let options = MslOptions {
+            language_version: MslVersion::V3_1,
+            supports_read_write_textures: true,
+            supports_texture_atomics: true,
+            ..MslOptions::default()
+        };
+        let artifact = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &options,
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+
+        for method in [
+            "atomic_fetch_add",
+            "atomic_fetch_min",
+            "atomic_fetch_max",
+            "atomic_fetch_and",
+            "atomic_fetch_or",
+            "atomic_fetch_xor",
+            "atomic_exchange",
+        ] {
+            assert!(source.contains(method), "missing {method} in:\n{source}");
+        }
+        assert!(source.contains("texture2d<uint, access::read_write> img0"));
+        assert!(source.contains("spvTextureCast<texture2d<int, access::read_write>>(img0)"));
+        assert!(source.contains("as_type<int>(0x80000001u)"));
+        assert!(source.contains("as_type<uint>(spvTextureCast"));
+        assert!(source.contains("reinterpret_cast<thread const T&>(image)"));
+        assert_eq!(source.matches(").x").count(), 9);
+    }
+
+    #[test]
+    fn texture_atomics_require_a_capable_device_and_zero_descriptor_index() {
+        let program = storage_image_atomic_program(Value::ImmU32(0), &[Opcode::ImageAtomicIAdd32]);
+        let msl_2_3 = MslOptions {
+            supports_read_write_textures: true,
+            supports_texture_atomics: true,
+            ..MslOptions::default()
+        };
+        assert_eq!(
+            emit_msl_with_options(
+                &program,
+                &Profile::default(),
+                &RuntimeInfo::default(),
+                &msl_2_3,
+            ),
+            Err(MslError::UnsupportedProgramFeature(
+                "texture atomics on this Metal device"
+            ))
+        );
+
+        let missing_device_capability = MslOptions {
+            language_version: MslVersion::V3_1,
+            supports_read_write_textures: true,
+            supports_texture_atomics: false,
+            ..MslOptions::default()
+        };
+        assert_eq!(
+            emit_msl_with_options(
+                &program,
+                &Profile::default(),
+                &RuntimeInfo::default(),
+                &missing_device_capability,
+            ),
+            Err(MslError::UnsupportedProgramFeature(
+                "texture atomics on this Metal device"
+            ))
+        );
+
+        let options = MslOptions {
+            language_version: MslVersion::V3_1,
+            supports_read_write_textures: true,
+            supports_texture_atomics: true,
+            ..MslOptions::default()
+        };
+        let indexed = storage_image_atomic_program(Value::ImmU32(1), &[Opcode::ImageAtomicIAdd32]);
+        assert_eq!(
+            emit_msl_with_options(
+                &indexed,
+                &Profile::default(),
+                &RuntimeInfo::default(),
+                &options,
+            ),
+            Err(MslError::UnsupportedProgramFeature(
+                "storage-image atomic descriptor indexing"
+            ))
+        );
+    }
+
+    #[test]
+    fn texture_atomic_inc_and_dec_match_upstream_unimplemented_state() {
+        let options = MslOptions {
+            language_version: MslVersion::V3_1,
+            supports_read_write_textures: true,
+            supports_texture_atomics: true,
+            ..MslOptions::default()
+        };
+        for opcode in [Opcode::ImageAtomicInc32, Opcode::ImageAtomicDec32] {
+            let program = storage_image_atomic_program(Value::ImmU32(0), &[opcode]);
+            assert!(matches!(
+                emit_msl_with_options(
+                    &program,
+                    &Profile::default(),
+                    &RuntimeInfo::default(),
+                    &options,
+                ),
+                Err(MslError::UnsupportedOpcode { opcode: found, .. }) if found == opcode
+            ));
+        }
     }
 }

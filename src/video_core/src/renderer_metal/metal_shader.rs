@@ -1257,6 +1257,83 @@ mod tests {
         program
     }
 
+    #[derive(Clone, Copy)]
+    enum GatherOffset {
+        None,
+        Single,
+        Ptp,
+    }
+
+    fn gathered_texture_program(
+        texture_type: TextureType,
+        is_depth: bool,
+        is_integer: bool,
+        offset_kind: GatherOffset,
+    ) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            is_depth,
+            is_multisample: false,
+            is_integer,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = sample_coordinates(&mut program, texture_type);
+        let make_u32x4 = |program: &mut Program, values: [u32; 4]| {
+            let inst = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x4,
+                values.into_iter().map(Value::ImmU32).collect(),
+            );
+            Value::Inst(InstRef { block: 0, inst })
+        };
+        let (offset, offset2) = match offset_kind {
+            GatherOffset::None => (Value::Void, Value::Void),
+            GatherOffset::Single => {
+                let inst = program.blocks[0].append_new_inst(
+                    Opcode::CompositeConstructU32x2,
+                    vec![Value::ImmU32(u32::MAX), Value::ImmU32(2)],
+                );
+                (Value::Inst(InstRef { block: 0, inst }), Value::Void)
+            }
+            GatherOffset::Ptp => (
+                make_u32x4(&mut program, [u32::MAX, 0, 2, u32::MAX]),
+                make_u32x4(&mut program, [0, 3, u32::MAX - 1, 1]),
+            ),
+        };
+        let opcode = if is_depth {
+            Opcode::ImageGatherDref
+        } else {
+            Opcode::ImageGather
+        };
+        let mut args = vec![Value::ImmU32(0), coords, offset, offset2];
+        if is_depth {
+            args.push(Value::ImmF32(0.5));
+        }
+        let gather = program.blocks[0].append_new_inst(opcode, args);
+        program.blocks[0].inst_mut(gather).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: match texture_type {
+                TextureType::Color2DRect => TextureType::Color2D as u8,
+                texture_type => texture_type as u8,
+            },
+            is_depth,
+            gather_component: 2,
+            ..Default::default()
+        }
+        .to_u32();
+        store_sample_result(&mut program, gather, true);
+        program
+    }
+
     fn empty_program(stage: Stage) -> Program {
         let mut program = Program::new(stage);
         program.blocks.push(Block::new());
@@ -1896,6 +1973,107 @@ mod tests {
             .expect("direct fetch variant must compile with the active ABI");
             assert_eq!(direct.bindings(), active.bindings());
         }
+    }
+
+    #[test]
+    fn compiles_direct_texture_gathers_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut programs = Vec::new();
+        for texture_type in [
+            TextureType::Color2D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+            TextureType::ColorCube,
+            TextureType::ColorArrayCube,
+        ] {
+            programs.push(gathered_texture_program(
+                texture_type,
+                false,
+                false,
+                GatherOffset::None,
+            ));
+            programs.push(gathered_texture_program(
+                texture_type,
+                true,
+                false,
+                GatherOffset::None,
+            ));
+        }
+        for texture_type in [
+            TextureType::Color2D,
+            TextureType::Color2DRect,
+            TextureType::ColorArray2D,
+        ] {
+            for offset_kind in [GatherOffset::Single, GatherOffset::Ptp] {
+                programs.push(gathered_texture_program(
+                    texture_type,
+                    false,
+                    false,
+                    offset_kind,
+                ));
+                programs.push(gathered_texture_program(
+                    texture_type,
+                    true,
+                    false,
+                    offset_kind,
+                ));
+            }
+        }
+        for offset_kind in [GatherOffset::None, GatherOffset::Single, GatherOffset::Ptp] {
+            programs.push(gathered_texture_program(
+                TextureType::Color2D,
+                false,
+                true,
+                offset_kind,
+            ));
+        }
+
+        for program in programs {
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .expect("active gather SPIR-V/MSL must compile");
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .expect("direct gather MSL must compile with the active ABI");
+            assert_eq!(direct.bindings(), active.bindings());
+            assert!(direct.source().source.contains(".gather"));
+        }
+    }
+
+    #[test]
+    fn direct_ptp_gather_uses_four_gathers_and_the_metal_w_lane() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let program =
+            gathered_texture_program(TextureType::Color2D, false, false, GatherOffset::Ptp);
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &profile,
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+            },
+        )
+        .expect("PTP gather must lower directly to MSL");
+        assert_eq!(artifact.source.source.matches(".gather(").count(), 4);
+        assert_eq!(artifact.source.source.matches(").w").count(), 4);
+        compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct PTP gather MSL must compile natively");
     }
 
     #[test]

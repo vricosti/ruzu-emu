@@ -559,6 +559,9 @@ fn emit_inst(
         Opcode::ImageSampleDrefImplicitLod | Opcode::ImageSampleDrefExplicitLod => {
             emit_msl_image::emit_image_sample_dref(context, inst_ref, inst)
         }
+        Opcode::ImageGather | Opcode::ImageGatherDref => {
+            emit_msl_image::emit_image_gather(context, program, inst_ref, inst)
+        }
         Opcode::ImageFetch => emit_msl_image::emit_image_fetch(context, inst_ref, inst),
         Opcode::ImageQueryDimensions => {
             emit_msl_image::emit_image_query_dimensions(context, inst_ref, inst)
@@ -997,6 +1000,49 @@ mod tests {
         program
     }
 
+    fn gather_program() -> ir::Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        );
+        let gather = program.blocks[0].append_new_inst(
+            Opcode::ImageGather,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::Void,
+                Value::Void,
+            ],
+        );
+        program.blocks[0].inst_mut(gather).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            gather_component: 2,
+            ..Default::default()
+        }
+        .to_u32();
+        program
+    }
+
     #[test]
     fn emits_minimal_vertex_entry_point_without_spirv() {
         let artifact = emit_msl(
@@ -1022,6 +1068,21 @@ mod tests {
             .to_ascii_lowercase()
             .contains("spir-v"));
         assert_eq!(artifact.bindings, Default::default());
+    }
+
+    #[test]
+    fn emits_profile_gated_gather_subpixel_offset() {
+        let profile = Profile {
+            need_gather_subpixel_offset: true,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&gather_program(), &profile, &RuntimeInfo::default())
+            .expect("2D gather must lower directly to MSL");
+
+        assert!(artifact.source.source.contains("0.001953125f"));
+        assert!(artifact.source.source.contains("tex0.get_width(0u)"));
+        assert!(artifact.source.source.contains("tex0.get_height(0u)"));
+        assert!(artifact.source.source.contains("component::z"));
     }
 
     #[test]

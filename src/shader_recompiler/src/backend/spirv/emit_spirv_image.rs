@@ -323,10 +323,7 @@ impl ImageOperands {
         let offset2 = resolve_ir_value(program, offset2);
         let mut operands = Self::default();
         if matches!(offset2, Value::Void) {
-            if !matches!(offset, Value::Void) {
-                let offset = ctx.resolve_value(&offset);
-                operands.add(spirv::ImageOperands::OFFSET, offset);
-            }
+            operands.add_offset(ctx, program, offset, true);
             return operands;
         }
 
@@ -363,17 +360,17 @@ impl ImageOperands {
             [second[0], second[1]],
             [second[2], second[3]],
         ];
+        let i32_vec2_type = ctx.builder.type_vector(ctx.i32_type, 2);
         let offsets = pairs
             .into_iter()
             .map(|pair| {
-                let x = ctx.constant_u32(pair[0]);
-                let y = ctx.constant_u32(pair[1]);
-                ctx.builder
-                    .constant_composite(ctx.u32_vec2_type, vec![x, y])
+                let x = ctx.constant_i32(pair[0] as i32);
+                let y = ctx.constant_i32(pair[1] as i32);
+                ctx.builder.constant_composite(i32_vec2_type, vec![x, y])
             })
             .collect::<Vec<_>>();
         let count = ctx.constant_u32(4);
-        let array_type = ctx.builder.type_array(ctx.u32_vec2_type, count);
+        let array_type = ctx.builder.type_array(i32_vec2_type, count);
         let offsets = ctx.builder.constant_composite(array_type, offsets);
         operands.add(spirv::ImageOperands::CONST_OFFSETS, offsets);
         operands

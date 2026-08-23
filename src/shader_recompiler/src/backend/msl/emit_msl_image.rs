@@ -157,6 +157,140 @@ fn immediate_offset_components(program: &Program, offset: Value) -> Option<Vec<i
     }
 }
 
+enum GatherOffsets {
+    None,
+    Single(String),
+    Ptp([[i32; 2]; 4]),
+}
+
+fn gather_offsets(
+    context: &MslEmitContext,
+    program: &Program,
+    inst_ref: InstRef,
+    texture_type: TextureType,
+    offset: Value,
+    offset2: Value,
+) -> Result<GatherOffsets, MslError> {
+    let supports_offsets = matches!(
+        texture_type,
+        TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D
+    );
+    if matches!(offset2, Value::Void) {
+        if matches!(offset, Value::Void) {
+            return Ok(GatherOffsets::None);
+        }
+        if !supports_offsets {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture gather offset for this Metal texture dimension",
+            ));
+        }
+        if let Some(components) = immediate_offset_components(program, offset) {
+            if components.len() != 2 {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "texture gather offset component count",
+                ));
+            }
+            return Ok(GatherOffsets::Single(format!(
+                "int2({}, {})",
+                components[0], components[1]
+            )));
+        }
+        let expression = context.value_expression(&offset, inst_ref, 2)?;
+        return Ok(GatherOffsets::Single(format!("int2({expression})")));
+    }
+
+    if !supports_offsets {
+        return Err(MslError::UnsupportedProgramFeature(
+            "PTP gather for this Metal texture dimension",
+        ));
+    }
+    let first = immediate_offset_components(program, offset);
+    let second = immediate_offset_components(program, offset2);
+    let (Some(first), Some(second)) = (first, second) else {
+        // Upstream ignores a PTP operand unless all eight components are
+        // immediate. Preserve that behavior instead of inventing dynamic PTP.
+        log::warn!("MSL: not all arguments in PTP are immediate, ignoring");
+        return Ok(GatherOffsets::None);
+    };
+    if first.len() != 4 || second.len() != 4 {
+        return Err(MslError::UnsupportedProgramFeature(
+            "invalid PTP gather operands",
+        ));
+    }
+    Ok(GatherOffsets::Ptp([
+        [first[0], first[1]],
+        [first[2], first[3]],
+        [second[0], second[1]],
+        [second[2], second[3]],
+    ]))
+}
+
+fn gather_coordinates(
+    context: &MslEmitContext,
+    texture: &str,
+    texture_type: TextureType,
+    coords: String,
+) -> String {
+    if !context.need_gather_subpixel_offset() {
+        return coords;
+    }
+    let nudge = format!(
+        "(float2(0.001953125f) / float2(float({texture}.get_width(0u)), float({texture}.get_height(0u))))"
+    );
+    match texture_type {
+        TextureType::Color2D | TextureType::Color2DRect => {
+            format!("(({coords}) + {nudge})")
+        }
+        TextureType::ColorArray2D | TextureType::ColorCube => {
+            format!("float3(({coords}).xy + {nudge}, ({coords}).z)")
+        }
+        _ => coords,
+    }
+}
+
+fn gather_arguments(
+    texture_type: TextureType,
+    sampler: &str,
+    coords: &str,
+) -> Result<Vec<String>, MslError> {
+    let mut arguments = vec![sampler.to_owned()];
+    match texture_type {
+        TextureType::Color2D | TextureType::Color2DRect => {
+            arguments.push(coords.to_owned());
+        }
+        TextureType::ColorArray2D => {
+            arguments.push(format!("({coords}).xy"));
+            arguments.push(format!("uint(({coords}).z)"));
+        }
+        TextureType::ColorCube => arguments.push(coords.to_owned()),
+        TextureType::ColorArrayCube => {
+            arguments.push(format!("({coords}).xyz"));
+            arguments.push(format!("uint(({coords}).w)"));
+        }
+        TextureType::Color1D | TextureType::ColorArray1D | TextureType::Color3D => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture gather for this Metal texture dimension",
+            ));
+        }
+        TextureType::Buffer => {
+            return Err(MslError::UnsupportedProgramFeature("texture buffer gather"));
+        }
+    }
+    Ok(arguments)
+}
+
+fn gather_component(component: u8) -> Result<&'static str, MslError> {
+    match component {
+        0 => Ok("component::x"),
+        1 => Ok("component::y"),
+        2 => Ok("component::z"),
+        3 => Ok("component::w"),
+        _ => Err(MslError::UnsupportedProgramFeature(
+            "texture gather component",
+        )),
+    }
+}
+
 fn gradient_expression(
     context: &MslEmitContext,
     inst_ref: InstRef,
@@ -395,6 +529,99 @@ pub fn emit_image_sample_dref(
         ),
         false,
     )
+}
+
+pub fn emit_image_gather(
+    context: &mut MslEmitContext,
+    program: &Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    if inst
+        .get_associated_pseudo(Opcode::GetSparseFromOp)
+        .is_some()
+    {
+        return Err(MslError::UnsupportedProgramFeature("sparse texture gather"));
+    }
+    let info = TextureInstInfo::from_u32(inst.flags);
+    context.validate_texture(info)?;
+    let texture = context.texture_expressions(info, inst.arg(0), inst_ref)?;
+    if texture.is_multisample {
+        return Err(MslError::UnsupportedProgramFeature(
+            "multisample texture gather",
+        ));
+    }
+    let is_dref = inst.opcode == Opcode::ImageGatherDref;
+    if is_dref != info.is_depth || is_dref != texture.is_depth {
+        return Err(MslError::UnsupportedProgramFeature(
+            "texture gather depth/color descriptor mismatch",
+        ));
+    }
+    let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let coords = gather_coordinates(context, &texture.texture, texture.texture_type, coords);
+    let base_arguments = gather_arguments(texture.texture_type, &texture.sampler, &coords)?;
+    let offsets = gather_offsets(
+        context,
+        program,
+        inst_ref,
+        texture.texture_type,
+        *inst.arg(2),
+        *inst.arg(3),
+    )?;
+    let dref = is_dref
+        .then(|| context.value_expression(inst.arg(4), inst_ref, 4))
+        .transpose()?;
+    let component = (!is_dref)
+        .then(|| gather_component(info.gather_component))
+        .transpose()?;
+
+    let make_gather = |offset: Option<String>| {
+        let mut arguments = base_arguments.clone();
+        if let Some(dref) = &dref {
+            arguments.push(dref.clone());
+        }
+        if let Some(offset) = offset {
+            arguments.push(offset);
+        } else if component.is_some()
+            && matches!(
+                texture.texture_type,
+                TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D
+            )
+        {
+            // In the Metal 2D gather overload the component follows the
+            // optional offset, so selecting a component requires spelling
+            // the default offset explicitly.
+            arguments.push("int2(0)".to_owned());
+        }
+        if let Some(component) = component {
+            arguments.push(component.to_owned());
+        }
+        let method = if is_dref { "gather_compare" } else { "gather" };
+        format!("{}.{method}({})", texture.texture, arguments.join(", "))
+    };
+
+    let gathered = match offsets {
+        GatherOffsets::None => make_gather(None),
+        GatherOffsets::Single(offset) => make_gather(Some(offset)),
+        GatherOffsets::Ptp(offsets) => {
+            let samples = offsets.map(|[x, y]| make_gather(Some(format!("int2({x}, {y})"))));
+            let result_type = if texture.is_integer {
+                "uint4"
+            } else {
+                "float4"
+            };
+            format!(
+                "{result_type}(({}).w, ({}).w, ({}).w, ({}).w)",
+                samples[0], samples[1], samples[2], samples[3]
+            )
+        }
+    };
+    let expression = if texture.is_integer {
+        format!("as_type<float4>({gathered})")
+    } else {
+        gathered
+    };
+    context.define(inst_ref, Type::F32x4, expression, false)
 }
 
 pub fn emit_image_fetch(

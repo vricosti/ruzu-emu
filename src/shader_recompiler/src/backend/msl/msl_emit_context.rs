@@ -37,6 +37,7 @@ pub struct MslEmitContext {
     uses_storage_subword_cas: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
+    need_gather_subpixel_offset: bool,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
 }
@@ -208,6 +209,7 @@ impl MslEmitContext {
             uses_storage_subword_cas: false,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
+            need_gather_subpixel_offset: profile.need_gather_subpixel_offset,
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
             },
@@ -358,6 +360,10 @@ impl MslEmitContext {
 
     pub fn supports_query_texture_lod(&self) -> bool {
         self.supports_query_texture_lod
+    }
+
+    pub fn need_gather_subpixel_offset(&self) -> bool {
+        self.need_gather_subpixel_offset
     }
 
     pub fn validate_texture(

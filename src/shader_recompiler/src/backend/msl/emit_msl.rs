@@ -689,9 +689,13 @@ fn emit_inst(
         | Opcode::LoadStorage32
         | Opcode::LoadStorage64
         | Opcode::LoadStorage128 => emit_msl_memory::emit_load_storage(context, inst_ref, inst),
-        Opcode::LoadGlobal32 | Opcode::LoadGlobal64 | Opcode::LoadGlobal128 => {
-            emit_msl_memory::emit_load_global(context, inst_ref, inst)
-        }
+        Opcode::LoadGlobalU8
+        | Opcode::LoadGlobalS8
+        | Opcode::LoadGlobalU16
+        | Opcode::LoadGlobalS16
+        | Opcode::LoadGlobal32
+        | Opcode::LoadGlobal64
+        | Opcode::LoadGlobal128 => emit_msl_memory::emit_load_global(context, inst_ref, inst),
         Opcode::WriteStorageU8
         | Opcode::WriteStorageS8
         | Opcode::WriteStorageU16
@@ -699,9 +703,13 @@ fn emit_inst(
         | Opcode::WriteStorage32
         | Opcode::WriteStorage64
         | Opcode::WriteStorage128 => emit_msl_memory::emit_write_storage(context, inst_ref, inst),
-        Opcode::WriteGlobal32 | Opcode::WriteGlobal64 | Opcode::WriteGlobal128 => {
-            emit_msl_memory::emit_write_global(context, inst_ref, inst)
-        }
+        Opcode::WriteGlobalU8
+        | Opcode::WriteGlobalS8
+        | Opcode::WriteGlobalU16
+        | Opcode::WriteGlobalS16
+        | Opcode::WriteGlobal32
+        | Opcode::WriteGlobal64
+        | Opcode::WriteGlobal128 => emit_msl_memory::emit_write_global(context, inst_ref, inst),
         Opcode::LoadSharedU8
         | Opcode::LoadSharedS8
         | Opcode::LoadSharedU16
@@ -2972,9 +2980,29 @@ mod tests {
                 is_written: true,
             });
         let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::LoadGlobalU8, vec![Value::ImmU64(0x1001)]);
+        block.append_new_inst(Opcode::LoadGlobalS8, vec![Value::ImmU64(0x1002)]);
+        block.append_new_inst(Opcode::LoadGlobalU16, vec![Value::ImmU64(0x1002)]);
+        block.append_new_inst(Opcode::LoadGlobalS16, vec![Value::ImmU64(0x1000)]);
         let load32 = block.append_new_inst(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]);
         let load64 = block.append_new_inst(Opcode::LoadGlobal64, vec![Value::ImmU64(0x1008)]);
         let load128 = block.append_new_inst(Opcode::LoadGlobal128, vec![Value::ImmU64(0x1010)]);
+        block.append_new_inst(
+            Opcode::WriteGlobalU8,
+            vec![Value::ImmU64(0x1041), Value::ImmU32(0xAB)],
+        );
+        block.append_new_inst(
+            Opcode::WriteGlobalS8,
+            vec![Value::ImmU64(0x1042), Value::ImmU32(0xFFFF_FF80)],
+        );
+        block.append_new_inst(
+            Opcode::WriteGlobalU16,
+            vec![Value::ImmU64(0x1042), Value::ImmU32(0xCDEF)],
+        );
+        block.append_new_inst(
+            Opcode::WriteGlobalS16,
+            vec![Value::ImmU64(0x1040), Value::ImmU32(0xFFFF_8000)],
+        );
         block.append_new_inst(
             Opcode::WriteGlobal32,
             vec![
@@ -3017,13 +3045,25 @@ mod tests {
         assert!(source.contains(
             "inline uint spvLoadGlobal32(ulong address, constant uint4* global_cbuf0, device uint* global_ssbo0)"
         ));
+        assert!(source.contains("inline uint spvLoadGlobalU8(ulong address"));
+        assert!(source.contains("inline uint spvLoadGlobalS16(ulong address"));
+        assert!(source
+            .contains("return extract_bits(global_ssbo0[byte_offset >> 2u], bit_offset, 8u);"));
+        assert!(source.contains(
+            "return as_type<uint>(extract_bits(as_type<int>(global_ssbo0[byte_offset >> 2u]), bit_offset, 16u));"
+        ));
+        assert!(source.contains("inline void spvWriteGlobalBits(device uint* pointer"));
+        assert!(source.contains(
+            "spvWriteGlobalBits(&global_ssbo0[byte_offset >> 2u], data, bit_offset, 8u);"
+        ));
+        assert!(source.contains("spvWriteGlobalU16(0x0000000000001042ul, 0x0000CDEFu"));
         assert!(source.contains(
             "as_type<ulong>(uint2(global_cbuf0[17u].x, global_cbuf0[17u].y)) & 0xFFFFFFFFFFFFFFF0ul"
         ));
         assert!(source.contains("ulong(global_cbuf0[17u].z)"));
         assert!(source.contains("const uint element = uint(address - ssbo_address) >> 4u;"));
-        assert!(source.contains("uint v_0_0 = spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0);"));
-        assert!(source.contains("spvWriteGlobal128(0x0000000000001030ul, v_0_2, c0, ssbo0);"));
+        assert!(source.contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0)"));
+        assert!(source.contains("spvWriteGlobal128(0x0000000000001030ul"));
         assert_eq!(artifact.bindings.buffer_count, 2);
         assert_eq!(artifact.bindings.resources.len(), 2);
     }

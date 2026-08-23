@@ -142,11 +142,21 @@ pub fn emit_load_global(
     inst: &ir::Inst,
 ) -> Result<(), MslError> {
     let (function, result_type) = match inst.opcode {
+        Opcode::LoadGlobalU8 => ("spvLoadGlobalU8", ir::Type::U32),
+        Opcode::LoadGlobalS8 => ("spvLoadGlobalS8", ir::Type::U32),
+        Opcode::LoadGlobalU16 => ("spvLoadGlobalU16", ir::Type::U32),
+        Opcode::LoadGlobalS16 => ("spvLoadGlobalS16", ir::Type::U32),
         Opcode::LoadGlobal32 => ("spvLoadGlobal32", ir::Type::U32),
         Opcode::LoadGlobal64 => ("spvLoadGlobal64", ir::Type::U32x2),
         Opcode::LoadGlobal128 => ("spvLoadGlobal128", ir::Type::U32x4),
         _ => unreachable!("non-global load opcode {:?}", inst.opcode),
     };
+    if matches!(
+        inst.opcode,
+        Opcode::LoadGlobalU8 | Opcode::LoadGlobalS8 | Opcode::LoadGlobalU16 | Opcode::LoadGlobalS16
+    ) {
+        context.require_global_subword_loads();
+    }
     let address = context.value_expression(inst.arg(0), inst_ref, 0)?;
     let expression = context.global_memory_call(function, &address, None);
     context.define(inst_ref, result_type, expression, false)
@@ -158,11 +168,24 @@ pub fn emit_write_global(
     inst: &ir::Inst,
 ) -> Result<(), MslError> {
     let function = match inst.opcode {
+        Opcode::WriteGlobalU8 => "spvWriteGlobalU8",
+        Opcode::WriteGlobalS8 => "spvWriteGlobalS8",
+        Opcode::WriteGlobalU16 => "spvWriteGlobalU16",
+        Opcode::WriteGlobalS16 => "spvWriteGlobalS16",
         Opcode::WriteGlobal32 => "spvWriteGlobal32",
         Opcode::WriteGlobal64 => "spvWriteGlobal64",
         Opcode::WriteGlobal128 => "spvWriteGlobal128",
         _ => unreachable!("non-global write opcode {:?}", inst.opcode),
     };
+    if matches!(
+        inst.opcode,
+        Opcode::WriteGlobalU8
+            | Opcode::WriteGlobalS8
+            | Opcode::WriteGlobalU16
+            | Opcode::WriteGlobalS16
+    ) {
+        context.require_global_subword_writes();
+    }
     let address = context.value_expression(inst.arg(0), inst_ref, 0)?;
     let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
     let call = context.global_memory_call(function, &address, Some(&value));

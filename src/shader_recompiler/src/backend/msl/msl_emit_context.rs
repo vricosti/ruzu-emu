@@ -36,6 +36,8 @@ pub struct MslEmitContext {
     global_memory_resources: Vec<MslGlobalMemoryResource>,
     global_atomic_helpers: Vec<Opcode>,
     uses_global_memory: bool,
+    uses_global_subword_loads: bool,
+    uses_global_subword_writes: bool,
     min_ssbo_alignment: u64,
     texture_buffers: Vec<MslTextureBufferDefinition>,
     image_buffers: Vec<MslImageBufferDefinition>,
@@ -658,6 +660,8 @@ impl MslEmitContext {
             global_memory_resources,
             global_atomic_helpers: Vec::new(),
             uses_global_memory: program.info.uses_global_memory,
+            uses_global_subword_loads: false,
+            uses_global_subword_writes: false,
             min_ssbo_alignment: profile.min_ssbo_alignment.max(1),
             texture_buffers,
             image_buffers,
@@ -1427,6 +1431,86 @@ impl MslEmitContext {
         )
     }
 
+    fn define_global_subword_memory_function(
+        source: &mut String,
+        resources: &[MslGlobalMemoryResource],
+        alignment: u64,
+        name: &str,
+        width: u32,
+        signed: bool,
+        write: bool,
+    ) {
+        let mut parameters = vec!["ulong address".to_owned()];
+        if write {
+            parameters.push("uint data".to_owned());
+        }
+        for index in 0..resources.len() {
+            parameters.push(format!("constant uint4* global_cbuf{index}"));
+            parameters.push(format!("device uint* global_ssbo{index}"));
+        }
+        let return_type = if write { "void" } else { "uint" };
+        source.push_str(&format!(
+            "inline {return_type} {name}({}) {{\n",
+            parameters.join(", ")
+        ));
+        let alignment_mask = !alignment.wrapping_sub(1);
+        let bit_mask = if width == 8 { 24 } else { 16 };
+        for (index, resource) in resources.iter().enumerate() {
+            let low = Self::global_cbuf_word(&format!("global_cbuf{index}"), resource.cbuf_offset);
+            let high =
+                Self::global_cbuf_word(&format!("global_cbuf{index}"), resource.cbuf_offset + 4);
+            let size =
+                Self::global_cbuf_word(&format!("global_cbuf{index}"), resource.cbuf_offset + 8);
+            source.push_str("    {\n");
+            source.push_str(&format!(
+                "        const ulong ssbo_address = as_type<ulong>(uint2({low}, {high})) & 0x{alignment_mask:016X}ul;\n"
+            ));
+            source.push_str(&format!(
+                "        const ulong ssbo_end = ssbo_address + ulong({size});\n"
+            ));
+            source.push_str("        if (address >= ssbo_address && address < ssbo_end) {\n");
+            source.push_str("            const uint byte_offset = uint(address - ssbo_address);\n");
+            source.push_str(&format!(
+                "            const uint bit_offset = (byte_offset << 3u) & {bit_mask}u;\n"
+            ));
+            if write {
+                source.push_str(&format!(
+                    "            spvWriteGlobalBits(&global_ssbo{index}[byte_offset >> 2u], data, bit_offset, {width}u);\n            return;\n"
+                ));
+            } else if signed {
+                source.push_str(&format!(
+                    "            return as_type<uint>(extract_bits(as_type<int>(global_ssbo{index}[byte_offset >> 2u]), bit_offset, {width}u));\n"
+                ));
+            } else {
+                source.push_str(&format!(
+                    "            return extract_bits(global_ssbo{index}[byte_offset >> 2u], bit_offset, {width}u);\n"
+                ));
+            }
+            source.push_str("        }\n");
+            source.push_str("    }\n");
+        }
+        if write {
+            source.push_str("}\n\n");
+        } else {
+            source.push_str("    return 0u;\n}\n\n");
+        }
+    }
+
+    fn define_global_subword_write_cas(source: &mut String) {
+        source.push_str(concat!(
+            "inline void spvWriteGlobalBits(device uint* pointer, uint value, uint bit_offset, uint bit_count) {\n",
+            "    device atomic_uint* atomic_pointer = reinterpret_cast<device atomic_uint*>(pointer);\n",
+            "    uint expected = atomic_load_explicit(atomic_pointer, memory_order_relaxed);\n",
+            "    while (true) {\n",
+            "        uint desired = insert_bits(expected, value, bit_offset, bit_count);\n",
+            "        if (atomic_compare_exchange_weak_explicit(atomic_pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
+            "            return;\n",
+            "        }\n",
+            "    }\n",
+            "}\n\n",
+        ));
+    }
+
     fn define_global_memory_function(
         source: &mut String,
         resources: &[MslGlobalMemoryResource],
@@ -1523,7 +1607,34 @@ impl MslEmitContext {
         source: &mut String,
         resources: &[MslGlobalMemoryResource],
         alignment: u64,
+        subword_loads: bool,
+        subword_writes: bool,
     ) {
+        if subword_loads {
+            for (name, width, signed) in [
+                ("spvLoadGlobalU8", 8, false),
+                ("spvLoadGlobalS8", 8, true),
+                ("spvLoadGlobalU16", 16, false),
+                ("spvLoadGlobalS16", 16, true),
+            ] {
+                Self::define_global_subword_memory_function(
+                    source, resources, alignment, name, width, signed, false,
+                );
+            }
+        }
+        if subword_writes {
+            Self::define_global_subword_write_cas(source);
+            for (name, width) in [
+                ("spvWriteGlobalU8", 8),
+                ("spvWriteGlobalS8", 8),
+                ("spvWriteGlobalU16", 16),
+                ("spvWriteGlobalS16", 16),
+            ] {
+                Self::define_global_subword_memory_function(
+                    source, resources, alignment, name, width, false, true,
+                );
+            }
+        }
         for (name, value_type, words, write) in [
             ("spvLoadGlobal32", "uint", 1, false),
             ("spvWriteGlobal32", "uint", 1, true),
@@ -1546,6 +1657,14 @@ impl MslEmitContext {
 
     pub fn require_storage_subword_cas(&mut self) {
         self.uses_storage_subword_cas = true;
+    }
+
+    pub fn require_global_subword_loads(&mut self) {
+        self.uses_global_subword_loads = true;
+    }
+
+    pub fn require_global_subword_writes(&mut self) {
+        self.uses_global_subword_writes = true;
     }
 
     pub fn require_shared_subword_cas(&mut self) {
@@ -1925,6 +2044,8 @@ impl MslEmitContext {
                 &mut source,
                 &self.global_memory_resources,
                 self.min_ssbo_alignment,
+                self.uses_global_subword_loads,
+                self.uses_global_subword_writes,
             );
         }
         if self.uses_cbuf_indirect {

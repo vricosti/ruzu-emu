@@ -3357,9 +3357,21 @@ mod tests {
                 is_written: true,
             });
         let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::LoadGlobalU8, vec![Value::ImmU64(0x1001)]);
+        block.append_new_inst(Opcode::LoadGlobalS8, vec![Value::ImmU64(0x1002)]);
+        block.append_new_inst(Opcode::LoadGlobalU16, vec![Value::ImmU64(0x1002)]);
+        block.append_new_inst(Opcode::LoadGlobalS16, vec![Value::ImmU64(0x1000)]);
         let load32 = block.append_new_inst(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]);
         let load64 = block.append_new_inst(Opcode::LoadGlobal64, vec![Value::ImmU64(0x1008)]);
         let load128 = block.append_new_inst(Opcode::LoadGlobal128, vec![Value::ImmU64(0x1010)]);
+        block.append_new_inst(
+            Opcode::WriteGlobalU8,
+            vec![Value::ImmU64(0x1041), Value::ImmU32(0xAB)],
+        );
+        block.append_new_inst(
+            Opcode::WriteGlobalS16,
+            vec![Value::ImmU64(0x1042), Value::ImmU32(0xFFFF_8000)],
+        );
         block.append_new_inst(
             Opcode::WriteGlobal32,
             vec![

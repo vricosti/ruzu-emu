@@ -1935,6 +1935,60 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_derivatives_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_derivatives = true;
+        program.info.stores_frag_color[0] = true;
+        let derivatives = [
+            (Opcode::DPdxFine, 1.0),
+            (Opcode::DPdxCoarse, 2.0),
+            (Opcode::DPdyFine, 3.0),
+            (Opcode::DPdyCoarse, 4.0),
+        ]
+        .map(|(opcode, value)| {
+            program.blocks[0].append_new_inst(opcode, vec![Value::ImmF32(value)])
+        });
+        for (component, derivative) in derivatives.into_iter().enumerate() {
+            program.blocks[0].append_new_inst(
+                Opcode::SetFragColor,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(component as u32),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: derivative,
+                    }),
+                ],
+            );
+        }
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active derivative SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct derivative MSL must compile with the active ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        let source = &direct.source().source;
+        assert_eq!(source.matches("dfdx(").count(), 2);
+        assert_eq!(source.matches("dfdy(").count(), 2);
+    }
+
+    #[test]
     fn compiles_direct_msl_compute_artifact_with_workgroup_metadata() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);

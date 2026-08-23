@@ -30,6 +30,7 @@ use super::emit_msl_memory;
 use super::emit_msl_select;
 use super::emit_msl_shared_memory;
 use super::emit_msl_special;
+use super::emit_msl_warp;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
 
@@ -94,6 +95,9 @@ fn first_unsupported_program_feature(
     }
     if info.uses_demote_to_helper_invocation && program.stage != crate::stage::Stage::Fragment {
         return Some("demote outside a fragment shader");
+    }
+    if info.uses_derivatives && program.stage != crate::stage::Stage::Fragment {
+        return Some("derivatives outside a fragment shader");
     }
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
@@ -172,7 +176,6 @@ fn first_unsupported_program_feature(
         || info.uses_image_1d
         || info.uses_sparse_residency
         || info.uses_fswzadd
-        || info.uses_derivatives
         || info.uses_typeless_image_reads
         || info.uses_typeless_image_writes
         || info.uses_image_buffers
@@ -629,6 +632,8 @@ fn emit_inst(
             emit_msl_shared_memory::emit_write_shared(context, inst_ref, inst)
         }
         Opcode::Barrier => emit_msl_barriers::emit_barrier(context),
+        Opcode::DPdxFine | Opcode::DPdxCoarse => emit_msl_warp::emit_dpdx(context, inst_ref, inst),
+        Opcode::DPdyFine | Opcode::DPdyCoarse => emit_msl_warp::emit_dpdy(context, inst_ref, inst),
         Opcode::SharedAtomicIAdd32
         | Opcode::SharedAtomicSMin32
         | Opcode::SharedAtomicUMin32
@@ -2614,6 +2619,49 @@ mod tests {
             source.contains("if (!(!isnan(output.color0.w) && !isnan(as_type<float>(0x3F000000u))")
         );
         assert!(source.contains("discard_fragment();"));
+    }
+
+    #[test]
+    fn emits_fragment_fine_and_coarse_derivatives_with_metal_semantics() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_derivatives = true;
+        program.info.stores_frag_color[0] = true;
+        let derivatives = [
+            (Opcode::DPdxFine, 1.0),
+            (Opcode::DPdxCoarse, 2.0),
+            (Opcode::DPdyFine, 3.0),
+            (Opcode::DPdyCoarse, 4.0),
+        ]
+        .map(|(opcode, value)| {
+            program.blocks[0].append_new_inst(opcode, vec![Value::ImmF32(value)])
+        });
+        for (component, derivative) in derivatives.into_iter().enumerate() {
+            program.blocks[0].append_new_inst(
+                Opcode::SetFragColor,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(component as u32),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: derivative,
+                    }),
+                ],
+            );
+        }
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("float v_0_0 = dfdx(as_type<float>(0x3F800000u));"));
+        assert!(source.contains("float v_0_1 = dfdx(as_type<float>(0x40000000u));"));
+        assert!(source.contains("float v_0_2 = dfdy(as_type<float>(0x40400000u));"));
+        assert!(source.contains("float v_0_3 = dfdy(as_type<float>(0x40800000u));"));
+
+        let mut invalid = program;
+        invalid.stage = Stage::VertexB;
+        assert_eq!(
+            emit_msl(&invalid, &Profile::default(), &RuntimeInfo::default()).unwrap_err(),
+            MslError::UnsupportedProgramFeature("derivatives outside a fragment shader")
+        );
     }
 
     #[test]

@@ -675,10 +675,10 @@ fn emit_inst(
             emit_msl_atomic::emit_storage_atomic(context, inst_ref, inst)
         }
         Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
-            emit_msl_image::emit_image_sample(context, inst_ref, inst)
+            emit_msl_image::emit_image_sample(context, program, inst_ref, inst)
         }
         Opcode::ImageSampleDrefImplicitLod | Opcode::ImageSampleDrefExplicitLod => {
-            emit_msl_image::emit_image_sample_dref(context, inst_ref, inst)
+            emit_msl_image::emit_image_sample_dref(context, program, inst_ref, inst)
         }
         Opcode::ImageGather | Opcode::ImageGatherDref => {
             emit_msl_image::emit_image_gather(context, program, inst_ref, inst)
@@ -968,6 +968,72 @@ mod tests {
         program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
             descriptor_index: 0,
             texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program
+    }
+
+    fn sampled_texture_operands_program(stage: Stage, is_depth: bool) -> ir::Program {
+        let mut program = empty_program(stage);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        );
+        let bias_lod_clamp = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.5), Value::ImmF32(1.25)],
+        );
+        let offset = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32((-1i32) as u32), Value::ImmU32(2)],
+        );
+        let value = |inst| Value::Inst(InstRef { block: 0, inst });
+        let (opcode, args) = if is_depth {
+            (
+                Opcode::ImageSampleDrefImplicitLod,
+                vec![
+                    Value::ImmU32(0),
+                    value(coords),
+                    Value::ImmF32(0.4),
+                    value(bias_lod_clamp),
+                    value(offset),
+                ],
+            )
+        } else {
+            (
+                Opcode::ImageSampleImplicitLod,
+                vec![
+                    Value::ImmU32(0),
+                    value(coords),
+                    value(bias_lod_clamp),
+                    value(offset),
+                ],
+            )
+        };
+        let sample = program.blocks[0].append_new_inst(opcode, args);
+        program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            is_depth,
+            has_bias: true,
+            has_lod_clamp: true,
+            ndv_is_active: true,
             ..Default::default()
         }
         .to_u32();
@@ -1652,27 +1718,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_sample_operands_instead_of_dropping_them() {
-        let mut program = sampled_texture_program(1, true);
-        program.blocks[0].inst_mut(1).args[3] = Value::ImmU32(1);
+    fn emits_sample_bias_lod_clamp_and_constant_offset() {
+        let color = emit_msl(
+            &sampled_texture_operands_program(Stage::Fragment, false),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        assert!(color.source.source.contains(
+            ".sample(samp0, v_0_0, bias((v_0_1).x), min_lod_clamp((v_0_1).y), int2(-1, 2))"
+        ));
 
-        assert_eq!(
-            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
-            Err(MslError::UnsupportedProgramFeature("texture sample offset"))
-        );
+        let depth = emit_msl(
+            &sampled_texture_operands_program(Stage::Fragment, true),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        assert!(depth.source.source.contains(
+            ".sample_compare(samp0, v_0_0, as_type<float>(0x3ECCCCCDu), bias((v_0_1).x), min_lod_clamp((v_0_1).y), int2(-1, 2))"
+        ));
+    }
 
-        program.blocks[0].inst_mut(1).args[3] = Value::Void;
-        program.blocks[0].inst_mut(1).flags = TextureInstInfo {
-            descriptor_index: 0,
-            texture_type: TextureType::Color2D as u8,
-            has_lod_clamp: true,
-            ..Default::default()
-        }
-        .to_u32();
-        assert_eq!(
-            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
-            Err(MslError::UnsupportedProgramFeature("texture LOD clamp"))
-        );
+    #[test]
+    fn implicit_non_fragment_depth_sample_does_not_emit_min_lod() {
+        let color = emit_msl(
+            &sampled_texture_operands_program(Stage::Compute, false),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        assert!(color
+            .source
+            .source
+            .contains(".sample(samp0, v_0_0, level(0.0f), min_lod_clamp(0.0f), int2(-1, 2))"));
+
+        let depth = emit_msl(
+            &sampled_texture_operands_program(Stage::Compute, true),
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        assert!(depth.source.source.contains(
+            ".sample_compare(samp0, v_0_0, as_type<float>(0x3ECCCCCDu), level(0.0f), int2(-1, 2))"
+        ));
+        assert!(!depth.source.source.contains("min_lod_clamp("));
     }
 
     #[test]

@@ -948,6 +948,71 @@ mod tests {
         program
     }
 
+    fn sampled_texture_operands_program(is_depth: bool) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let coords = sample_coordinates(&mut program, TextureType::Color2D);
+        let bias_lod_clamp = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.5), Value::ImmF32(1.25)],
+        );
+        let offset = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32((-1i32) as u32), Value::ImmU32(2)],
+        );
+        let value = |inst| Value::Inst(InstRef { block: 0, inst });
+        let (opcode, args) = if is_depth {
+            (
+                Opcode::ImageSampleDrefImplicitLod,
+                vec![
+                    Value::ImmU32(0),
+                    coords,
+                    Value::ImmF32(0.4),
+                    value(bias_lod_clamp),
+                    value(offset),
+                ],
+            )
+        } else {
+            (
+                Opcode::ImageSampleImplicitLod,
+                vec![
+                    Value::ImmU32(0),
+                    coords,
+                    value(bias_lod_clamp),
+                    value(offset),
+                ],
+            )
+        };
+        let sample = program.blocks[0].append_new_inst(opcode, args);
+        program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            is_depth,
+            has_bias: true,
+            has_lod_clamp: true,
+            ndv_is_active: true,
+            ..Default::default()
+        }
+        .to_u32();
+        store_sample_result(&mut program, sample, !is_depth);
+        program
+    }
+
     fn fetch_coordinates(program: &mut Program, texture_type: TextureType) -> Value {
         let (opcode, values) = match texture_type {
             TextureType::Color1D => return Value::ImmU32(4),
@@ -2748,6 +2813,77 @@ mod tests {
             });
             assert_eq!(direct.bindings(), active.bindings(), "{texture_type:?}");
             assert!(direct.source().source.contains(".sample_compare("));
+        }
+    }
+
+    #[test]
+    fn compiles_direct_sample_operands_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        for is_depth in [false, true] {
+            let program = sampled_texture_operands_program(is_depth);
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::default(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("active depth={is_depth} sample operands must compile: {error}")
+            });
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct depth={is_depth} sample operands must compile: {error}")
+            });
+
+            assert_eq!(direct.bindings(), active.bindings());
+            assert!(direct.source().source.contains("bias("));
+            assert!(direct.source().source.contains("min_lod_clamp("));
+            assert!(direct.source().source.contains("int2(-1, 2)"));
+        }
+    }
+
+    #[test]
+    fn compiles_direct_sample_operands_at_msl_2_3_baseline() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        for is_depth in [false, true] {
+            let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+                &sampled_texture_operands_program(is_depth),
+                &make_shader_profile(device.profile()),
+                &RuntimeInfo::default(),
+                &shader_recompiler::backend::msl::MslOptions {
+                    language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
+                    fixed_subgroup_size: 32,
+                    supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                    supports_read_write_textures: device.profile().supports_read_write_textures(),
+                    supports_texture_atomics: false,
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("direct depth={is_depth} sample operands must lower at MSL 2.3: {error}")
+            });
+            let shader =
+                compile_native_msl_artifact(device.device(), artifact).unwrap_or_else(|error| {
+                    panic!(
+                        "direct depth={is_depth} sample operands must compile at MSL 2.3: {error}"
+                    )
+                });
+            assert_eq!(
+                shader.language_version(),
+                shader_recompiler::backend::msl::MslVersion::V2_3
+            );
         }
     }
 

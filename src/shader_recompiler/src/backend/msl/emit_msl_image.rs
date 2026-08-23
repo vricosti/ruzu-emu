@@ -423,32 +423,117 @@ fn gradient_offset_expression(
     Ok(Some(expression))
 }
 
-fn validate_sample(context: &MslEmitContext, inst: &Inst) -> Result<TextureInstInfo, MslError> {
-    let info = TextureInstInfo::from_u32(inst.flags);
-    if info.has_bias {
-        return Err(MslError::UnsupportedProgramFeature("texture LOD bias"));
+fn sample_offset_expression(
+    program: &Program,
+    texture_type: TextureType,
+    offset: Value,
+) -> Result<Option<String>, MslError> {
+    if matches!(offset, Value::Void) {
+        return Ok(None);
     }
-    if info.has_lod_clamp {
-        return Err(MslError::UnsupportedProgramFeature("texture LOD clamp"));
-    }
-    if info.ndv_is_active {
+    let Some(components) = immediate_offset_components(program, offset) else {
+        // Eden's ImageOperands only emits ConstOffset for sampling. A
+        // non-immediate operand is deliberately omitted rather than lowered
+        // as a runtime offset.
+        return Ok(None);
+    };
+    let spatial_components = match texture_type {
+        // Native Metal 1D sampling has no offset overload. SPIRV-Cross drops
+        // the qualifier unless 1D textures are represented as 2D.
+        TextureType::Color1D | TextureType::ColorArray1D => return Ok(None),
+        TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D => 2,
+        TextureType::Color3D => 3,
+        TextureType::ColorCube | TextureType::ColorArrayCube => return Ok(None),
+        TextureType::Buffer => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "texture buffer sample offset",
+            ));
+        }
+    };
+    if components.len() < spatial_components {
         return Err(MslError::UnsupportedProgramFeature(
-            "texture non-dependent value tracking",
+            "texture sample offset component count",
         ));
     }
-    let offset_arg = match inst.opcode {
-        Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => 3,
-        _ => unreachable!("sample validation called for a non-sample opcode"),
-    };
-    if !matches!(inst.arg(offset_arg), Value::Void) {
-        return Err(MslError::UnsupportedProgramFeature("texture sample offset"));
+    Ok(Some(format!(
+        "int{}({})",
+        spatial_components,
+        components
+            .iter()
+            .take(spatial_components)
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+fn append_sample_operands(
+    arguments: &mut Vec<String>,
+    context: &MslEmitContext,
+    program: &Program,
+    inst_ref: InstRef,
+    info: TextureInstInfo,
+    texture_type: TextureType,
+    explicit_lod: bool,
+    implicit_non_fragment_lod_clamp: bool,
+    lod_or_bias: &Value,
+    lod_arg_index: u32,
+    offset: Value,
+) -> Result<(), MslError> {
+    let supports_lod = !matches!(
+        texture_type,
+        TextureType::Color1D | TextureType::ColorArray1D
+    );
+    if explicit_lod {
+        if supports_lod {
+            let lod = context.value_expression(lod_or_bias, inst_ref, lod_arg_index)?;
+            arguments.push(format!("level({lod})"));
+        }
+    } else if context.stage() == Stage::Fragment {
+        if info.has_bias && supports_lod {
+            let bias_lod_clamp = context.value_expression(lod_or_bias, inst_ref, lod_arg_index)?;
+            let bias = if info.has_lod_clamp {
+                format!("({bias_lod_clamp}).x")
+            } else {
+                bias_lod_clamp
+            };
+            arguments.push(format!("bias({bias})"));
+        }
+        if info.has_lod_clamp {
+            let bias_lod_clamp = context.value_expression(lod_or_bias, inst_ref, lod_arg_index)?;
+            let lod_clamp = if info.has_bias {
+                format!("({bias_lod_clamp}).y")
+            } else {
+                bias_lod_clamp
+            };
+            arguments.push(format!("min_lod_clamp({lod_clamp})"));
+        }
+    } else {
+        // Maxwell implicit samples outside fragment shaders behave as an
+        // explicit level-zero sample. Eden only reuses that zero as MinLod
+        // for color samples; the depth-reference path omits MinLod.
+        if supports_lod {
+            arguments.push("level(0.0f)".to_owned());
+        }
+        if info.has_lod_clamp && implicit_non_fragment_lod_clamp {
+            arguments.push("min_lod_clamp(0.0f)".to_owned());
+        }
     }
+    if let Some(offset) = sample_offset_expression(program, texture_type, offset)? {
+        arguments.push(offset);
+    }
+    Ok(())
+}
+
+fn validate_sample(context: &MslEmitContext, inst: &Inst) -> Result<TextureInstInfo, MslError> {
+    let info = TextureInstInfo::from_u32(inst.flags);
     context.validate_texture(info)?;
     Ok(info)
 }
 
 pub fn emit_image_sample(
     context: &mut MslEmitContext,
+    program: &Program,
     inst_ref: InstRef,
     inst: &Inst,
 ) -> Result<(), MslError> {
@@ -462,25 +547,19 @@ pub fn emit_image_sample(
     let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
     let mut arguments = vec![texture.sampler.clone()];
     append_sample_coordinates(&mut arguments, texture.texture_type, coords)?;
-    let lod = match inst.opcode {
-        Opcode::ImageSampleExplicitLod => {
-            let lod = context.value_expression(inst.arg(2), inst_ref, 2)?;
-            Some(lod)
-        }
-        Opcode::ImageSampleImplicitLod if context.stage() != Stage::Fragment => {
-            Some("0.0f".to_owned())
-        }
-        Opcode::ImageSampleImplicitLod => None,
-        _ => unreachable!("image sample emitter called for a non-sample opcode"),
-    };
-    if let Some(lod) = lod.filter(|_| {
-        !matches!(
-            texture.texture_type,
-            TextureType::Color1D | TextureType::ColorArray1D
-        )
-    }) {
-        arguments.push(format!("level({lod})"));
-    }
+    append_sample_operands(
+        &mut arguments,
+        context,
+        program,
+        inst_ref,
+        info,
+        texture.texture_type,
+        inst.opcode == Opcode::ImageSampleExplicitLod,
+        true,
+        inst.arg(2),
+        2,
+        *inst.arg(3),
+    )?;
     let sample = format!("{}.sample({})", texture.texture, arguments.join(", "));
     let expression = if texture.is_integer {
         format!("as_type<float4>({sample})")
@@ -492,6 +571,7 @@ pub fn emit_image_sample(
 
 pub fn emit_image_sample_dref(
     context: &mut MslEmitContext,
+    program: &Program,
     inst_ref: InstRef,
     inst: &Inst,
 ) -> Result<(), MslError> {
@@ -499,30 +579,6 @@ pub fn emit_image_sample_dref(
     if !info.is_depth {
         return Err(MslError::UnsupportedProgramFeature(
             "color texture used by a depth-reference sample",
-        ));
-    }
-    if info.has_bias {
-        return Err(MslError::UnsupportedProgramFeature(
-            "depth texture LOD bias",
-        ));
-    }
-    if info.has_lod_clamp {
-        return Err(MslError::UnsupportedProgramFeature(
-            "depth texture LOD clamp",
-        ));
-    }
-    if info.ndv_is_active {
-        return Err(MslError::UnsupportedProgramFeature(
-            "depth texture non-dependent value tracking",
-        ));
-    }
-    let offset_arg = match inst.opcode {
-        Opcode::ImageSampleDrefImplicitLod | Opcode::ImageSampleDrefExplicitLod => 4,
-        _ => unreachable!("depth sample emitter called for a non-depth-sample opcode"),
-    };
-    if !matches!(inst.arg(offset_arg), Value::Void) {
-        return Err(MslError::UnsupportedProgramFeature(
-            "depth texture sample offset",
         ));
     }
     context.validate_texture(info)?;
@@ -537,19 +593,19 @@ pub fn emit_image_sample_dref(
     let mut arguments = vec![texture.sampler.clone()];
     append_sample_coordinates(&mut arguments, texture.texture_type, coords)?;
     arguments.push(dref);
-    let lod = match inst.opcode {
-        Opcode::ImageSampleDrefExplicitLod => {
-            Some(context.value_expression(inst.arg(3), inst_ref, 3)?)
-        }
-        Opcode::ImageSampleDrefImplicitLod if context.stage() != Stage::Fragment => {
-            Some("0.0f".to_owned())
-        }
-        Opcode::ImageSampleDrefImplicitLod => None,
-        _ => unreachable!("depth sample emitter called for a non-depth-sample opcode"),
-    };
-    if let Some(lod) = lod {
-        arguments.push(format!("level({lod})"));
-    }
+    append_sample_operands(
+        &mut arguments,
+        context,
+        program,
+        inst_ref,
+        info,
+        texture.texture_type,
+        inst.opcode == Opcode::ImageSampleDrefExplicitLod,
+        false,
+        inst.arg(3),
+        3,
+        *inst.arg(4),
+    )?;
     context.define(
         inst_ref,
         Type::F32,

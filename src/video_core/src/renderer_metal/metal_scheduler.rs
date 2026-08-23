@@ -337,6 +337,14 @@ impl MetalScheduler {
     }
 }
 
+impl Drop for MetalScheduler {
+    fn drop(&mut self) {
+        // Metal requires every command encoder to receive `endEncoding`
+        // before its final release, including while unwinding from an error.
+        self.end_active_encoder();
+    }
+}
+
 fn is_terminal_status(status: MTLCommandBufferStatus) -> bool {
     status == MTLCommandBufferStatus::Completed || status == MTLCommandBufferStatus::Error
 }
@@ -424,7 +432,10 @@ mod tests {
         let first = scheduler
             .with_render_encoder(|encoder| {
                 let pointer: *const ProtocolObject<dyn MTLRenderCommandEncoder> = encoder;
-                pointer.cast::<()>() as usize
+                // Keep the ended encoder alive until after the replacement is
+                // allocated. Otherwise Metal may reuse the same object address
+                // immediately, making pointer identity an invalid assertion.
+                unsafe { Retained::retain(pointer.cast_mut()) }.unwrap()
             })
             .unwrap();
         scheduler
@@ -433,10 +444,10 @@ mod tests {
         let reused = scheduler
             .with_render_encoder(|encoder| {
                 let pointer: *const ProtocolObject<dyn MTLRenderCommandEncoder> = encoder;
-                pointer.cast::<()>() as usize
+                unsafe { Retained::retain(pointer.cast_mut()) }.unwrap()
             })
             .unwrap();
-        assert_eq!(first, reused);
+        assert_eq!(Retained::as_ptr(&first), Retained::as_ptr(&reused));
 
         let changed_key = first_key.with_visibility_result_buffer(1);
         scheduler
@@ -445,11 +456,23 @@ mod tests {
         let replaced = scheduler
             .with_render_encoder(|encoder| {
                 let pointer: *const ProtocolObject<dyn MTLRenderCommandEncoder> = encoder;
-                pointer.cast::<()>() as usize
+                unsafe { Retained::retain(pointer.cast_mut()) }.unwrap()
             })
             .unwrap();
-        assert_ne!(first, replaced);
+        assert_ne!(Retained::as_ptr(&first), Retained::as_ptr(&replaced));
         scheduler.finish_all().unwrap();
+    }
+
+    #[test]
+    fn dropping_scheduler_ends_active_encoder() {
+        let device = MetalDevice::new().expect("Metal device");
+        let (descriptor, _texture) = render_pass_descriptor(&device);
+        let mut scheduler = MetalScheduler::new(&device);
+        scheduler.begin_render_pass(&descriptor).unwrap();
+
+        // Metal aborts the process if the final encoder reference is released
+        // without `endEncoding`; successful scope exit verifies `Drop`.
+        drop(scheduler);
     }
 
     #[test]

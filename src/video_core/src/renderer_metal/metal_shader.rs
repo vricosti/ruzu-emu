@@ -1796,6 +1796,45 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_fragment_depth_mask_and_early_tests_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo {
+            convert_depth_mode: true,
+            force_early_z: true,
+            ..RuntimeInfo::default()
+        };
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_depth = true;
+        program.info.stores_sample_mask = true;
+        program.blocks[0].append_new_inst(Opcode::SetFragDepth, vec![Value::ImmF32(0.25)]);
+        program.blocks[0].append_new_inst(Opcode::SetSampleMask, vec![Value::ImmU32(0x5A)]);
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active fragment depth/mask SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct fragment depth/mask MSL must compile with the active ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        let source = &direct.source().source;
+        assert!(!source.contains("[[depth(any)]]"));
+        assert!(source.contains("[[sample_mask]]"));
+        assert!(source.contains("[[early_fragment_tests]] fragment"));
+    }
+
+    #[test]
     fn compiles_direct_msl_compute_artifact_with_workgroup_metadata() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);

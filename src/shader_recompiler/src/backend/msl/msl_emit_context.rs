@@ -50,6 +50,8 @@ pub struct MslEmitContext {
     execution: MslExecutionInfo,
     has_broken_robust: bool,
     support_vertex_instance_id: bool,
+    convert_depth_mode: bool,
+    emits_frag_depth: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +332,9 @@ impl MslEmitContext {
         let parameters = parameters.join(", ");
         let mut source = String::new();
         source.push_str(&stage_input);
+        // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
+        // SPIR-V makes that write ineffective, while Metal rejects the pair.
+        let emits_frag_depth = program.info.stores_frag_depth && !runtime_info.force_early_z;
         let returns_output = match stage {
             Stage::VertexB => {
                 source.push_str("struct MslVertexOut {\n");
@@ -349,21 +354,41 @@ impl MslEmitContext {
                 ));
                 true
             }
-            Stage::Fragment if program.info.stores_frag_color.iter().any(|store| *store) => {
+            Stage::Fragment
+                if program.info.stores_frag_color.iter().any(|store| *store)
+                    || emits_frag_depth
+                    || program.info.stores_sample_mask =>
+            {
                 source.push_str("struct MslFragmentOut {\n");
                 for (index, stored) in program.info.stores_frag_color.iter().enumerate() {
                     if *stored {
                         source.push_str(&format!("    float4 color{index} [[color({index})]];\n"));
                     }
                 }
+                if emits_frag_depth {
+                    source.push_str("    float depth [[depth(any)]];\n");
+                }
+                if program.info.stores_sample_mask {
+                    source.push_str("    uint sample_mask [[sample_mask]];\n");
+                }
+                let qualifier = if runtime_info.force_early_z {
+                    "[[early_fragment_tests]] fragment"
+                } else {
+                    "fragment"
+                };
                 source.push_str(&format!(
-                    "}};\n\nfragment MslFragmentOut main0({parameters}) {{\n"
+                    "}};\n\n{qualifier} MslFragmentOut main0({parameters}) {{\n"
                 ));
                 source.push_str("    MslFragmentOut output = {};\n");
                 true
             }
             Stage::Fragment => {
-                source.push_str(&format!("fragment void main0({parameters}) {{\n"));
+                let qualifier = if runtime_info.force_early_z {
+                    "[[early_fragment_tests]] fragment"
+                } else {
+                    "fragment"
+                };
+                source.push_str(&format!("{qualifier} void main0({parameters}) {{\n"));
                 false
             }
             Stage::Compute => {
@@ -415,6 +440,8 @@ impl MslEmitContext {
             },
             has_broken_robust: profile.has_broken_robust,
             support_vertex_instance_id: profile.support_vertex_instance_id,
+            convert_depth_mode: runtime_info.convert_depth_mode && !profile.support_native_ndc,
+            emits_frag_depth,
         })
     }
 
@@ -1071,6 +1098,36 @@ impl MslEmitContext {
         self.source.push_str(&format!(
             "    output.color{render_target}.{swizzle} = {expression};\n"
         ));
+        Ok(())
+    }
+
+    pub fn emit_set_sample_mask(
+        &mut self,
+        inst_ref: InstRef,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        let expression = self.value_expression(value, inst_ref, 0)?;
+        self.source
+            .push_str(&format!("    output.sample_mask = {expression};\n"));
+        Ok(())
+    }
+
+    pub fn emit_set_frag_depth(
+        &mut self,
+        inst_ref: InstRef,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        if !self.emits_frag_depth {
+            return Ok(());
+        }
+        let expression = self.value_expression(value, inst_ref, 0)?;
+        let expression = if self.convert_depth_mode {
+            format!("fma({expression}, 0.5f, 0.5f)")
+        } else {
+            expression
+        };
+        self.source
+            .push_str(&format!("    output.depth = {expression};\n"));
         Ok(())
     }
 

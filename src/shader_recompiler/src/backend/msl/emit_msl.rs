@@ -110,8 +110,8 @@ fn first_unsupported_program_feature(
         || info.loads_indexed_attributes
         || info.stores_indexed_attributes
         || (!supported_fragment_colors && info.stores_frag_color.iter().any(|store| *store))
-        || info.stores_sample_mask
-        || info.stores_frag_depth
+        || ((info.stores_sample_mask || info.stores_frag_depth)
+            && program.stage != crate::stage::Stage::Fragment)
         || info.stores_tess_level_outer
         || info.stores_tess_level_inner
         || !info.legacy_stores_mapping.is_empty()
@@ -704,6 +704,8 @@ fn emit_inst(
             }
             context.emit_set_frag_color(inst_ref, render_target, component, inst.arg(2))
         }
+        Opcode::SetSampleMask => context.emit_set_sample_mask(inst_ref, inst.arg(0)),
+        Opcode::SetFragDepth => context.emit_set_frag_depth(inst_ref, inst.arg(0)),
         opcode => Err(MslError::UnsupportedOpcode {
             block: inst_ref.block,
             inst: inst_ref.inst,
@@ -2459,6 +2461,50 @@ mod tests {
             .source
             .source
             .contains("output.color0.z = as_type<float>(0x3F000000u);"));
+    }
+
+    #[test]
+    fn emits_fragment_depth_sample_mask_and_early_tests() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_depth = true;
+        program.info.stores_sample_mask = true;
+        program.blocks[0].append_new_inst(Opcode::SetFragDepth, vec![Value::ImmF32(0.25)]);
+        program.blocks[0].append_new_inst(Opcode::SetSampleMask, vec![Value::ImmU32(0x5A)]);
+        let converted_runtime = RuntimeInfo {
+            convert_depth_mode: true,
+            ..RuntimeInfo::default()
+        };
+
+        let artifact = emit_msl(&program, &Profile::default(), &converted_runtime).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("float depth [[depth(any)]];"));
+        assert!(source.contains("uint sample_mask [[sample_mask]];"));
+        assert!(source.contains("output.depth = fma(as_type<float>(0x3E800000u), 0.5f, 0.5f);"));
+        assert!(source.contains("output.sample_mask = 0x0000005Au;"));
+
+        let native_ndc_profile = Profile {
+            support_native_ndc: true,
+            ..Profile::default()
+        };
+        let native_ndc = emit_msl(&program, &native_ndc_profile, &converted_runtime).unwrap();
+        assert!(native_ndc
+            .source
+            .source
+            .contains("output.depth = as_type<float>(0x3E800000u);"));
+        assert!(!native_ndc.source.source.contains("output.depth = fma("));
+
+        let early_runtime = RuntimeInfo {
+            force_early_z: true,
+            ..converted_runtime
+        };
+        let early = emit_msl(&program, &Profile::default(), &early_runtime).unwrap();
+        assert!(early
+            .source
+            .source
+            .contains("[[early_fragment_tests]] fragment MslFragmentOut main0("));
+        assert!(!early.source.source.contains("[[depth(any)]]"));
+        assert!(!early.source.source.contains("output.depth ="));
+        assert!(early.source.source.contains("[[sample_mask]]"));
     }
 
     #[test]

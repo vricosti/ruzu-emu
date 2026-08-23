@@ -4,6 +4,7 @@ pub mod exclusive_monitor;
 pub mod frontend;
 pub mod halt_reason;
 pub mod ir;
+pub mod interface;
 pub mod jit;
 pub mod jit_config;
 

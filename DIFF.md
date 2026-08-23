@@ -8248,3 +8248,27 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 - PASS for the reviewed metadata: vector operands retain full `U128` values and CRC8/16 retain the
   upstream `U32` bit pattern until the backend selects the instruction width. No serialized payload
   or ABI-visible structure changed.
+
+## 2026-08-23 — rdynarmic `interface/a32/coprocessor*.rs` vs Eden `interface/A32/coprocessor*.h`
+
+### Intentional differences
+- Rust expresses Eden's abstract class as a `Send + Sync` trait behind `Arc`, and its
+  `std::variant` actions as enums. `Option<Callback>` and explicit `CoprocessorException` variants
+  preserve the same compile-time decisions.
+- Callback functions use the platform C ABI and an optional raw `c_void` user pointer; this is the
+  Rust FFI counterpart of Eden's native function pointer and `std::optional<void*>`.
+
+### Unintentional differences (to fix)
+- The existing x64 and arm64 backend emitters still implement a hard-coded CP15 subset. They must
+  consume these interface actions through the configured 16-entry registry before the old paths
+  are removed.
+
+### Missing items
+- `interface/A32/config.h::UserConfig::coprocessors` is not yet wired into `JitConfig` and both
+  backend emit configurations.
+- Eden's seven compile-time coprocessor action dispatchers are the next prerequisite slice.
+
+### Binary layout verification
+- PASS: `CoprocReg` is `repr(u8)`, contiguous from C0 through C15, and focused tests verify its
+  size, alignment, discriminants, and conversion. Callback/action enums are host-only interfaces
+  and are never raw-copied into guest-visible storage.

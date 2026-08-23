@@ -291,38 +291,7 @@ impl SignExtendRotation {
     }
 }
 
-/// Coprocessor register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum CoprocReg {
-    C0 = 0,
-    C1,
-    C2,
-    C3,
-    C4,
-    C5,
-    C6,
-    C7,
-    C8,
-    C9,
-    C10,
-    C11,
-    C12,
-    C13,
-    C14,
-    C15,
-}
-
-impl CoprocReg {
-    pub fn from_u8(val: u8) -> Self {
-        assert!(val < 16, "Invalid coprocessor register: {}", val);
-        unsafe { std::mem::transmute(val) }
-    }
-
-    pub fn number(self) -> usize {
-        self as usize
-    }
-}
+pub use crate::interface::a32::coprocessor_util::CoprocReg;
 
 /// A32 exception type, passed to the `exception_raised` callback.
 ///

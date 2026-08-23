@@ -26,23 +26,22 @@ mod tests {
         0x50B0_0000_0000_0000
     }
 
-    /// Encode IADD with register source (opcode 0x5C10 on bits [63:48]).
+    /// Encode IADD with a register source (`0101 1100 0001 0---`).
     fn make_iadd_reg() -> u64 {
-        // IADD_reg: bits [63:57] = 0b0101110 → top9 = 0x0B8 >> 1 = ...
-        // Actually from the decoder: top9 = 0x10C for IADD variants
-        // Just use the known encoding: bits [63:52] for 12-bit field
-        // IADD_reg has top9 bits[63:55] = 0b0_0101_110_0 → 0x5C in high nibbles
-        0x5C10_0000_0000_0000u64
+        0x5C10_0000_0000_0000
     }
 
     #[test]
     fn test_decode_nop() {
-        // NOP is opcode 0x50B in the high bits
-        let insn = 0x50B0_0000_0000_0000u64;
-        let result = decode_opcode(insn);
-        // NOP may not be in our decoder (it's often skipped), but test that
-        // the decoder doesn't panic
-        let _ = result;
+        assert_eq!(decode_opcode(make_nop()), Some(MaxwellOpcode::NOP));
+    }
+
+    #[test]
+    fn test_decode_iadd_register() {
+        assert_eq!(
+            decode_opcode(make_iadd_reg()),
+            Some(MaxwellOpcode::IADD_reg)
+        );
     }
 
     #[test]

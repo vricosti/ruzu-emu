@@ -8034,3 +8034,19 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - N/A: the GDB remote protocol serializes explicit text and hexadecimal byte streams rather than
   raw host structures.
+
+## 2026-08-23 — `src/shader_recompiler/src/frontend/mod.rs` tests vs Eden `src/shader_recompiler/frontend/maxwell/{decode.cpp,maxwell.inc}`
+
+### Intentional differences
+- Ruzu keeps native Rust decoder smoke tests in the module root; Eden's C++ test tree is excluded
+  from the port, while the tested instruction words come directly from Eden's Maxwell table.
+
+### Unintentional differences (to fix)
+- The NOP and register-IADD instruction builders were unused, and the NOP test only checked that
+  decoding did not panic. Both encodings now assert Eden's exact decoded opcode.
+
+### Missing items
+- None for the two reviewed decoder encodings.
+
+### Binary layout verification
+- N/A: the tests pass explicit 64-bit Maxwell instruction words to the decoder.

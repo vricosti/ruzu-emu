@@ -1118,7 +1118,7 @@ impl Opcode {
             A64SetFPSR => OpcodeInfo { ret: V, args: &[U32] },
             A64CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
             A64ExceptionRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
-            A64DataCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
+            A64DataCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64, U64] },
             A64InstructionCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
             A64DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
             A64DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },

@@ -8,36 +8,22 @@ Audit and align every shared IR opcode signature in
 
 The name inventory is at 725/725 shared names, with 22 Ruzu-only operations.
 The committed audit-tool work found 126 signature mismatches among the shared
-names. The vector, CRC, and A32 coprocessor corrections reduce that inventory
-to one:
-
-- `A64DataCacheOperationRaised` is missing Eden's third `U64` argument.
+names. The vector, CRC, A32 coprocessor, and A64 cache-frontend corrections
+reduce that inventory to zero. This signature result is not yet a behavioral
+completion claim: A64 callback-config lowering and backend dispatch still
+have to consume the corrected contract.
 
 ## Missing prerequisites
 
-Changing metadata alone is forbidden because the remaining difference reflects
-divergent emitter, lowering, and callback contracts. Before resuming the global
-metadata slice:
+Before closing the global metadata slice:
 
-1. align A64 data-cache-operation construction, lowering, and dispatch;
-2. verify and commit the prerequisite in its upstream-owned Rust files;
-3. rerun the exact-signature audit, update `DIFF.md`, and remove this state
-   file only after the shared mismatch count reaches zero.
-
-## Newly discovered A64 cache-operation prerequisite
-
-Eden's callback-config pass lowers `DC ZVA` to memory writes tagged with
-`IR::AccType::DCZVA`. Rust's `ir/acc_type.rs` currently has no `Dczva` variant
-and its variant inventory/order does not match Eden `ir/acc_type.h`.
-
-Before the callback-config pass can be ported:
-
-1. restore the exact 16-value `AccType` inventory and discriminant order;
-2. rename the two active backend/frontend aliases to their Eden owners
-   (`OrderedRw` and `Ifetch`);
-3. add focused inventory/discriminant tests and verify all current users;
-4. commit this prerequisite independently, then resume the cache-operation
-   lowering.
+1. port `A64CallbackConfigPass`, including exact `DC ZVA` writes and invalidation
+   of every unhooked cache-operation instruction;
+2. forward the hook/DCZID configuration and port x64/arm64 callback argument
+   setup for data and instruction cache operations;
+3. verify focused behavior and every configured host target;
+4. update `DIFF.md` and remove this state file only after those behavioral
+   prerequisites are committed.
 
 ## Completed prerequisites
 
@@ -51,6 +37,11 @@ Before the callback-config pass can be ported:
   coprocessor actions instead of hard-coded CP15 subsets.
 - Core `DynarmicCP15` implements the interface directly; `ArmDynarmic32` owns it,
   installs slot 15 before JIT creation, and uses it for UPRW/URO and CNTPCT.
+- `ir/acc_type.rs` now has Eden's exact 16-value inventory and discriminant
+  order, including `Dczva`; backend ordering checks use the matching aliases.
+- A64 `sys_dc.rs` and `sys_ic.rs` now own all cache-maintenance visitors. The
+  former hard-coded/NOP implementations are removed from `simd.rs`, and
+  `A64IREmitter` emits Eden's exact typed operation IDs and location metadata.
 - CRC emitters and all A32/A64 frontend/backend call sites were re-read. They
   already pass and consume Eden's raw `U32` operand; the divergent metadata and
   arm64 routing test inputs are corrected.

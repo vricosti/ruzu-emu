@@ -8438,3 +8438,39 @@ Related Rust users: `src/rdynarmic/src/backend/{x64/emit_x64_memory,arm64/emit_a
 - PASS for the Rust IR representation: focused tests require size/alignment one byte and exact
   discriminants 0 through 15 in Eden declaration order. No guest or persisted binary structure
   contains this enum.
+
+## 2026-08-23 — rdynarmic A64 cache-maintenance frontend vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/interface/a64/config.rs`,
+`src/rdynarmic/src/frontend/a64/translate/{sys_dc,sys_ic}.rs`, and
+`src/rdynarmic/src/ir/{a64_emitter,opcode}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/interface/A64/config.h`,
+`src/dynarmic/src/dynarmic/frontend/A64/translate/impl/{sys_dc,sys_ic}.cpp`,
+`src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h`, and
+`src/dynarmic/src/dynarmic/ir/opcodes.inc`.
+
+### Intentional differences
+- Rust gives both cache-operation enums an explicit `repr(u8)` and Rust-style `Va` spelling. They
+  remain typed until `A64IREmitter` converts them to Eden's contiguous `U64` IR immediate.
+- Eden generates instruction dispatch from decoder tables; Rust's generated decoder feeds methods
+  in matching `sys_dc.rs` and `sys_ic.rs` owners. The decoded operands and visitor order are the
+  same.
+
+### Unintentional differences (to fix)
+- All non-ZVA cache operations were previously NOPs in the unrelated `simd.rs` owner, while ZVA
+  emitted eight hard-coded 64-bit normal stores. The nine DC visitors now emit Eden's exact typed
+  cache operation and register value; the callback-config pass owns any later ZVA lowering.
+- All three instruction-cache operations were previously NOPs. They now emit the exact operation
+  and value, write the next PC, and terminate with `CheckHalt(ReturnToDispatch)` in Eden's order.
+- `A64DataCacheOperationRaised` previously omitted the current location descriptor. Its emitter
+  and opcode metadata now have Eden's exact `Void(U64, U64, U64)` contract.
+
+### Missing items
+- None in the reviewed cache-operation enums, frontend visitors, or A64 IR-emitter contract. The
+  callback-config optimization and host backends are the recorded next prerequisite.
+
+### Binary layout verification
+- PASS: focused tests require the exact operation discriminants and all three data-cache IR
+  arguments, including the location descriptor. These enums and IR immediates are host-internal;
+  no guest-visible raw payload changes.

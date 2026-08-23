@@ -28,7 +28,6 @@ mod load_store_register_pair;
 mod load_store_single_structure;
 mod load_store_unprivileged;
 mod move_wide;
-mod simd;
 mod simd_across_lanes;
 mod simd_aes;
 mod simd_copy;
@@ -47,6 +46,8 @@ mod simd_three_different;
 mod simd_three_same;
 mod simd_two_register_misc;
 mod simd_vector_x_indexed_element;
+mod sys_dc;
+mod sys_ic;
 mod system;
 mod visitor;
 

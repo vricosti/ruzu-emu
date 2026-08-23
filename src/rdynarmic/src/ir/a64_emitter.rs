@@ -7,6 +7,7 @@ use crate::ir::opcode::Opcode;
 use crate::ir::terminal::Terminal;
 use crate::ir::types::Type;
 use crate::ir::value::Value;
+use crate::interface::a64::config::{DataCacheOperation, InstructionCacheOperation};
 
 /// A64-specific IR emitter. Extends IREmitter with A64 register/memory/system operations.
 pub struct A64IREmitter<'a> {
@@ -200,17 +201,22 @@ impl<'a> A64IREmitter<'a> {
         self.emit_void(Opcode::A64ExceptionRaised, &[pc, exc]);
     }
 
-    pub fn data_cache_operation_raised(&mut self, op: u64, value: Value) {
+    pub fn data_cache_operation_raised(&mut self, op: DataCacheOperation, value: Value) {
+        let location = self.imm_current_location_descriptor();
         self.emit_void(
             Opcode::A64DataCacheOperationRaised,
-            &[Value::ImmU64(op), value],
+            &[location, Value::ImmU64(op as u64), value],
         );
     }
 
-    pub fn instruction_cache_operation_raised(&mut self, op: u64, value: Value) {
+    pub fn instruction_cache_operation_raised(
+        &mut self,
+        op: InstructionCacheOperation,
+        value: Value,
+    ) {
         self.emit_void(
             Opcode::A64InstructionCacheOperationRaised,
-            &[Value::ImmU64(op), value],
+            &[Value::ImmU64(op as u64), value],
         );
     }
 

@@ -819,7 +819,8 @@ mod tests {
 
         let mut rp = RequestParser::from_buffer(&ctx);
         rp.set_current_offset(start);
-        let _: RawBlob = rp.pop_raw();
+        let blob: RawBlob = rp.pop_raw();
+        assert_eq!(blob.0, [0; 0x34]);
         assert_eq!(rp.get_current_offset(), start + 13);
         rp.align_for::<u64>();
         assert_eq!(rp.get_current_offset(), start + 14);

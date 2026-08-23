@@ -1402,11 +1402,6 @@ mod tests {
             .write_32(address, value);
     }
 
-    fn write_test_64(system: &System, address: u64, value: u64) {
-        write_test_32(system, address, value as u32);
-        write_test_32(system, address + 4, (value >> 32) as u32);
-    }
-
     fn read_test_32(system: &System, address: u64) -> u32 {
         if let Some(memory) = system.get_svc_memory() {
             return memory.lock().unwrap().read_32(address);
@@ -1445,23 +1440,6 @@ mod tests {
         write_test_32(system, tls_base + 0x14, 0);
         write_test_32(system, tls_base + 0x18, 0);
         write_test_32(system, tls_base + 0x1C, 0);
-    }
-
-    fn write_sm_get_service_request(system: &System, name: &str) {
-        let tls_base = get_tls_base(system);
-        let request_type = ipc::CommandType::Request as u32;
-        let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
-        let mut name_buf = [0u8; 8];
-        let copy_len = name.len().min(name_buf.len());
-        name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
-
-        write_test_32(system, tls_base, request_type);
-        write_test_32(system, tls_base + 4, 0);
-        write_test_32(system, tls_base + 0x10, sfci_magic);
-        write_test_32(system, tls_base + 0x14, 0);
-        write_test_32(system, tls_base + 0x18, 1);
-        write_test_32(system, tls_base + 0x1C, 0);
-        write_test_64(system, tls_base + 0x20, u64::from_le_bytes(name_buf));
     }
 
     fn write_control_query_pointer_buffer_size_request(system: &System) {

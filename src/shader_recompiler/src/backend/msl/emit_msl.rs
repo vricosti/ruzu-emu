@@ -173,12 +173,14 @@ fn first_unsupported_program_feature(
     if info.uses_int64 && !profile.support_int64 {
         return Some("64-bit integers on the selected Metal device");
     }
-    if info.uses_fp32_denorms_flush
-        || info.uses_fp32_denorms_preserve
-        || info.uses_image_1d
-        || info.uses_sparse_residency
-    {
-        return Some("shader capabilities");
+    if info.uses_fp32_denorms_preserve {
+        return Some("FP32 denorm preserve mode");
+    }
+    if info.uses_image_1d {
+        return Some("1D images");
+    }
+    if info.uses_sparse_residency {
+        return Some("sparse image residency");
     }
     None
 }
@@ -1837,6 +1839,23 @@ mod tests {
             .source
             .to_ascii_lowercase()
             .contains("spir-v"));
+    }
+
+    #[test]
+    fn fp32_denorm_capability_matches_upstream_host_fallback() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_fp32_denorms_flush = true;
+        emit_msl(&program, &Profile::default(), &RuntimeInfo::default())
+            .expect("upstream accepts FTZ when the host has no explicit float-control mode");
+
+        program.info.uses_fp32_denorms_flush = false;
+        program.info.uses_fp32_denorms_preserve = true;
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "FP32 denorm preserve mode"
+            ))
+        );
     }
 
     #[test]

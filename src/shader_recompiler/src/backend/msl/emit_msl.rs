@@ -56,6 +56,11 @@ fn first_unsupported_program_feature(
     {
         return Some("compute built-in outside a compute shader");
     }
+    if (info.uses_sample_id || info.uses_is_helper_invocation)
+        && program.stage != crate::stage::Stage::Fragment
+    {
+        return Some("fragment built-in outside a fragment shader");
+    }
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
     }
@@ -111,8 +116,6 @@ fn first_unsupported_program_feature(
     }
     if info.uses_invocation_id
         || info.uses_invocation_info
-        || info.uses_sample_id
-        || info.uses_is_helper_invocation
         || info.uses_subgroup_invocation_id
         || info.uses_subgroup_shuffles
         || info.uses_subgroup_vote
@@ -537,6 +540,10 @@ fn emit_inst(
         Opcode::WorkgroupId => emit_msl_context_get_set::emit_workgroup_id(context, inst_ref),
         Opcode::LocalInvocationId => {
             emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
+        }
+        Opcode::SampleId => emit_msl_context_get_set::emit_sample_id(context, inst_ref),
+        Opcode::IsHelperInvocation => {
+            emit_msl_context_get_set::emit_is_helper_invocation(context, inst_ref)
         }
         Opcode::LoadLocal => emit_msl_context_get_set::emit_load_local(context, inst_ref, inst),
         Opcode::WriteLocal => emit_msl_context_get_set::emit_write_local(context, inst_ref, inst),
@@ -1275,6 +1282,21 @@ mod tests {
             .source
             .to_ascii_lowercase()
             .contains("spir-v"));
+    }
+
+    #[test]
+    fn emits_fragment_sample_and_helper_invocation_builtins() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_sample_id = true;
+        program.info.uses_is_helper_invocation = true;
+        program.blocks[0].append_new_inst(Opcode::SampleId, vec![]);
+        program.blocks[0].append_new_inst(Opcode::IsHelperInvocation, vec![]);
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint sample_id [[sample_id]]"));
+        assert!(source.contains("uint v_0_0 = sample_id;"));
+        assert!(source.contains("bool v_0_1 = simd_is_helper_thread();"));
     }
 
     #[test]

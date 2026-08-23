@@ -199,6 +199,9 @@ impl MslEmitContext {
             parameters
                 .push("uint3 local_invocation_id [[thread_position_in_threadgroup]]".to_owned());
         }
+        if program.info.uses_sample_id {
+            parameters.push("uint sample_id [[sample_id]]".to_owned());
+        }
         let parameters = parameters.join(", ");
         let mut source = String::new();
         let returns_output = match stage {

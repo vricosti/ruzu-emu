@@ -1560,6 +1560,39 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_fragment_builtins_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_sample_id = true;
+        program.info.uses_is_helper_invocation = true;
+        program.blocks[0].append_new_inst(Opcode::SampleId, vec![]);
+        program.blocks[0].append_new_inst(Opcode::IsHelperInvocation, vec![]);
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active fragment built-in SPIR-V/MSL must compile");
+        let shader = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct fragment built-in MSL must compile with the active ABI");
+
+        assert_eq!(shader.bindings(), active.bindings());
+        assert!(shader.source().source.contains("[[sample_id]]"));
+        assert!(shader.source().source.contains("simd_is_helper_thread()"));
+    }
+
+    #[test]
     fn compiles_direct_msl_compute_artifact_with_workgroup_metadata() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);

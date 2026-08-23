@@ -89,6 +89,24 @@ pub fn emit_local_invocation_id(
     )
 }
 
+/// Emit Eden's `EmitSampleId` through Metal's fragment sample built-in.
+pub fn emit_sample_id(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
+    context.define(inst_ref, ir::Type::U32, "sample_id".to_owned(), false)
+}
+
+/// Emit Eden's `EmitIsHelperInvocation` while demote remains unsupported.
+pub fn emit_is_helper_invocation(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+) -> Result<(), MslError> {
+    context.define(
+        inst_ref,
+        ir::Type::U1,
+        "simd_is_helper_thread()".to_owned(),
+        false,
+    )
+}
+
 /// Emit Eden's `EmitLoadLocal`; the IR operand is already a 32-bit word index.
 pub fn emit_load_local(
     context: &mut MslEmitContext,

@@ -2497,6 +2497,7 @@ impl ArmDynarmic64 {
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
             code_cache_size: if cfg!(target_arch = "aarch64") {

@@ -159,6 +159,7 @@ mod tests {
 
     fn config() -> JitConfig {
         JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(TestCallbacks {
                 code: HashMap::from([(0x1000, 0x1400_0002)]),
             }),

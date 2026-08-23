@@ -249,6 +249,7 @@ fn pat_large(n: usize) -> Vec<u32> {
 fn make_jit(code: Vec<u32>, optimizations: OptimizationFlag) -> A32Jit {
     let env = BenchEnv::new(code, BASE_PC);
     let config = JitConfig {
+        coprocessors: JitConfig::default_coprocessors(),
         callbacks: Box::new(env),
         enable_cycle_counting: false,
         code_cache_size: 32 * 1024 * 1024,

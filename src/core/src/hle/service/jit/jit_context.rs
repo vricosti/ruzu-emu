@@ -447,6 +447,7 @@ impl JitContext {
         let state = Arc::new(Mutex::new(ContextState::new()));
         let callbacks = DynarmicCallbacks64::new(memory, Arc::clone(&state));
         let jit = A64Jit::new(JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: false,
             code_cache_size: JitConfig::DEFAULT_CODE_CACHE_SIZE,

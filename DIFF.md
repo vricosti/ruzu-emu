@@ -8272,3 +8272,24 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 - PASS: `CoprocReg` is `repr(u8)`, contiguous from C0 through C15, and focused tests verify its
   size, alignment, discriminants, and conversion. Callback/action enums are host-only interfaces
   and are never raw-copied into guest-visible storage.
+
+## 2026-08-23 — rdynarmic A32 coprocessor registry vs Eden `interface/A32/config.h`
+
+### Intentional differences
+- Ruzu's pre-existing combined `JitConfig` serves both A32 and A64, so the A32 registry is stored
+  there and ignored by A64. Its type and owner are defined in the matching
+  `interface/a32/config.rs` module.
+- Rust initializes `[Option<Arc<dyn Coprocessor>>; 16]` through a named constructor; this is the
+  direct ownership counterpart of Eden's zero-initialized `std::array<std::shared_ptr<...>, 16>`.
+
+### Unintentional differences (to fix)
+- The registry is now present at the public configuration boundary, but has not yet been forwarded
+  to x64/arm64 emit configuration or consulted by the seven coprocessor emitters.
+
+### Missing items
+- Backend action dispatch and the core CP15 implementation must populate and consume slot 15 before
+  replacing the current hard-coded CP15 subset.
+
+### Binary layout verification
+- N/A: the registry contains host-owned `Arc` trait objects and is never serialized or exposed to
+  guest memory. Focused tests verify exactly 16 empty default slots.

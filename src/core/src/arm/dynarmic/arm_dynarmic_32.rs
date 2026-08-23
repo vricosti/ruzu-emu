@@ -2677,6 +2677,7 @@ impl ArmDynarmic32 {
                 && !*settings.cpuopt_ignore_memory_aborts.get_value());
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
             code_cache_size,

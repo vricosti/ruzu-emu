@@ -392,6 +392,7 @@ fn main() {
     }
 
     let config = JitConfig {
+        coprocessors: JitConfig::default_coprocessors(),
         callbacks: Box::new(env),
         enable_cycle_counting: false,
         code_cache_size: 64 * 1024 * 1024,

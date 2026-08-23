@@ -4502,6 +4502,7 @@ mod tests {
         mapping.map_u32(0x2000, 0xCAFE_BABE);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4568,6 +4569,7 @@ mod tests {
         let page_table = vec![0usize; 1 << (16 - 12)];
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4627,6 +4629,7 @@ mod tests {
         page_table[3] = (page_memory.as_ptr() as usize).wrapping_sub(0x3000);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4689,6 +4692,7 @@ mod tests {
         mapping.map_u32(0x2000, 0xCAFE_BABE);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4741,6 +4745,7 @@ mod tests {
     #[test]
     fn a32_public_jit_uses_arm64_interface_on_aarch64() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[0xe1a0_0000])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4859,6 +4864,7 @@ mod tests {
         // MRS X1, CNTPCT_EL0; SVC #0
         let code: [u32; 2] = [0xD53B_E021, 0xD400_0001];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::with_cntpct(
                 0x1000,
                 &code,
@@ -4896,6 +4902,7 @@ mod tests {
             0xD400_0001,
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4933,6 +4940,7 @@ mod tests {
             0xD400_0001,
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -4966,6 +4974,7 @@ mod tests {
         // and emits ZeroExtendLongToQuad for the scalar SIMD destination.
         let code: [u32; 2] = [0x2F00_E41C, 0xD400_0001];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5012,6 +5021,7 @@ mod tests {
         // SBFM W1, W0, #4, #11; SBFM X2, X0, #4, #11; SVC #0
         let code: [u32; 3] = [sbfm_w(1, 0, 4, 11), sbfm_x(2, 0, 4, 11), 0xD400_0001];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5043,6 +5053,7 @@ mod tests {
         let code: [u32; 4] = [0xD503_3F9F, 0xD503_3FBF, 0xD503_3FDF, 0xD400_0001];
         let isb_count = Arc::new(AtomicU32::new(0));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::with_isb_sink(
                 0x1000,
                 &code,
@@ -5079,6 +5090,7 @@ mod tests {
 
         let isb_count = Arc::new(AtomicU32::new(0));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::with_isb_sink(
                 0x1000,
                 &code,
@@ -5131,6 +5143,7 @@ mod tests {
         let memory = Arc::new(Mutex::new(memory));
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory.clone())),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5190,6 +5203,7 @@ mod tests {
         let monitor_ptr = Some(&mut *monitor as *mut _);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory.clone())),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5259,6 +5273,7 @@ mod tests {
         let memory = Arc::new(Mutex::new(memory));
         let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5312,6 +5327,7 @@ mod tests {
         let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory.clone())),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5393,6 +5409,7 @@ mod tests {
         memory[0x1008..0x1010].copy_from_slice(&hi.to_le_bytes());
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5435,6 +5452,7 @@ mod tests {
         memory[0x100..0x108].copy_from_slice(&lo.to_le_bytes());
         memory[0x108..0x110].copy_from_slice(&hi.to_le_bytes());
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5475,6 +5493,7 @@ mod tests {
             memory.lock().unwrap()[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0x1000, memory.clone())),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5530,6 +5549,7 @@ mod tests {
         contents[0x108..0x110].copy_from_slice(&old_hi.to_le_bytes());
         let memory = Arc::new(Mutex::new(contents));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0x1000, memory.clone())),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5579,6 +5599,7 @@ mod tests {
         setup: impl FnOnce(&mut A64Jit),
     ) -> A64Jit {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -5994,6 +6015,7 @@ mod tests {
 
         let shared_memory = Arc::new(Mutex::new(memory));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(
                 0x1000,
                 Arc::clone(&shared_memory),
@@ -6297,6 +6319,7 @@ mod tests {
         memory[0x1000..0x1008].copy_from_slice(&0x0000_B0B5_0000_A140u64.to_le_bytes());
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6479,6 +6502,7 @@ mod tests {
         // V1 = [1,2,3,4], V2 = [5,6,7,8] → V0 = [5,12,21,32]
         let mut jit = {
             let config = JitConfig {
+                coprocessors: JitConfig::default_coprocessors(),
                 callbacks: Box::new(MockCallbacks::new(0x1000, code)),
                 enable_cycle_counting: false,
                 code_cache_size: 4 * 1024 * 1024,
@@ -6569,6 +6593,7 @@ mod tests {
     #[test]
     fn test_jit_creation() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[0xD4000001])),
             enable_cycle_counting: true,
             code_cache_size: 4 * 1024 * 1024, // 4 MB for tests
@@ -6593,6 +6618,7 @@ mod tests {
     #[test]
     fn test_jit_register_accessors() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6634,6 +6660,7 @@ mod tests {
     #[test]
     fn test_halt_execution() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6680,6 +6707,7 @@ mod tests {
                 0x17FF_FFFF, // b 0x1000
             ];
             let config = JitConfig {
+                coprocessors: JitConfig::default_coprocessors(),
                 callbacks: Box::new(MockCallbacks::with_memory_read_64_count(
                     0x1000,
                     &code,
@@ -6740,6 +6768,7 @@ mod tests {
             0xD400_04C1, // svc #0x26
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::with_svc_sink(0x1000, code, svc_sink.clone())),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6783,6 +6812,7 @@ mod tests {
         let mut callbacks = callbacks;
         callbacks.svc_sink = Some(svc_sink.clone());
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6839,6 +6869,7 @@ mod tests {
         let mut callbacks = callbacks;
         callbacks.svc_sink = Some(svc_sink.clone());
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6915,6 +6946,7 @@ mod tests {
         let mut callbacks = callbacks;
         callbacks.svc_sink = Some(svc_sink.clone());
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -6976,6 +7008,7 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7009,6 +7042,7 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7048,6 +7082,7 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7091,6 +7126,7 @@ mod tests {
             0xD4000021, // 0x1008: svc #1 (b.ne target)
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7114,6 +7150,7 @@ mod tests {
         assert!(halt.contains(HaltReason::SVC));
 
         let config2 = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7166,6 +7203,7 @@ mod tests {
             0xD4000021, // svc #1
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7190,6 +7228,7 @@ mod tests {
         assert!(halt.contains(HaltReason::SVC));
 
         let config2 = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7225,6 +7264,7 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7263,6 +7303,7 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7331,6 +7372,7 @@ mod tests {
         ];
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7361,6 +7403,7 @@ mod tests {
 
         // Now run again with x1 != x2 — b.ne SHOULD take the branch.
         let mut jit2 = A64Jit::new(JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7424,6 +7467,7 @@ mod tests {
                    expected_count: u64,
                    expected_result: u64| {
             let config = JitConfig {
+                coprocessors: JitConfig::default_coprocessors(),
                 callbacks: Box::new(MockCallbacks::new(0x1000, code)),
                 enable_cycle_counting: false,
                 code_cache_size: 4 * 1024 * 1024,
@@ -7476,6 +7520,7 @@ mod tests {
             0xD400_0021, // bad: svc #1
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7517,6 +7562,7 @@ mod tests {
             0xD65F_03C0, // ret
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7550,6 +7596,7 @@ mod tests {
         assert_eq!(decoded.id, crate::frontend::a32::decoder::ArmInstId::BFC);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[0xE7DF_0E1F])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7584,6 +7631,7 @@ mod tests {
         assert_eq!(decoded.id, crate::frontend::a32::decoder::ArmInstId::CLREX);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[0xF57F_F01F])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7639,6 +7687,7 @@ mod tests {
         assert_eq!(decoded.id, crate::frontend::a32::decoder::ArmInstId::UBFX);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &[0xE7E3_52D1])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -7676,6 +7725,7 @@ mod tests {
         // MOV r0, #42     = E3A0002A
         // SVC #0          = EF000000
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -7721,6 +7771,7 @@ mod tests {
     #[test]
     fn test_a32_scalar_saturation_results_and_q_flag() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -7770,6 +7821,7 @@ mod tests {
     fn test_a32_cmp_bne_loop_with_all_optimizations() {
         // Same loop but with all optimizations + block linking enabled
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -7816,6 +7868,7 @@ mod tests {
     fn test_a32_cmp_bne_with_vfp_no_getset_elim() {
         // Same VFP+CMP loop but WITHOUT GetSetElimination
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -7865,6 +7918,7 @@ mod tests {
     fn test_a32_cmp_bne_with_vfp_all_opts() {
         // Same loop WITH all optimizations including GetSetElimination
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -7912,6 +7966,7 @@ mod tests {
     #[test]
     fn test_vfp_cmp_bne_gse_only() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -7947,6 +8002,7 @@ mod tests {
     #[test]
     fn test_vfp_cmp_bne_gse_only_single_step_progress() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8011,6 +8067,7 @@ mod tests {
     #[test]
     fn test_vfp_cmp_bne_gse_only_with_cycle_counting() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8052,6 +8109,7 @@ mod tests {
     #[test]
     fn test_vfp_vmrs_apsr_then_bne_uses_equal_flags() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8115,6 +8173,7 @@ mod tests {
     #[test]
     fn test_vcvt_u32_f32_small_positive_float() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8162,6 +8221,7 @@ mod tests {
     #[test]
     fn test_vcvt_u32_f64_does_not_truncate_to_u16() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8220,6 +8280,7 @@ mod tests {
         memory[literal_addr..literal_addr + 8].copy_from_slice(&literal.to_le_bytes());
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(base, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -8270,6 +8331,7 @@ mod tests {
         memory[literal_addr..literal_addr + 8].copy_from_slice(&literal.to_le_bytes());
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(base, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -8332,6 +8394,7 @@ mod tests {
         memory[literal_addr..literal_addr + 8].copy_from_slice(&literal.to_le_bytes());
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(base, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -8378,6 +8441,7 @@ mod tests {
     #[test]
     fn test_vcvt_vsub_vmul_loop_reaches_zero_with_backedge() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8431,6 +8495,7 @@ mod tests {
     #[test]
     fn test_vcvt_vsub_vmul_loop_single_step_converges_to_zero() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8486,6 +8551,7 @@ mod tests {
 
     fn run_vcvt_vsub_vmul_loop_with_opts(optimizations: OptimizationFlag) -> (HaltReason, f64) {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8557,6 +8623,7 @@ mod tests {
     #[test]
     fn test_vfp_f64_vmrs_apsr_then_bne_uses_equal_flags() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8605,6 +8672,7 @@ mod tests {
     #[test]
     fn test_vfp_f64_vmrs_apsr_then_bne_branches_on_nonzero() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8675,6 +8743,7 @@ mod tests {
         ]);
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -8734,6 +8803,7 @@ mod tests {
         code.push(0xEF000000); // SVC #0
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -8791,6 +8861,7 @@ mod tests {
     #[test]
     fn test_a32_set_cpsr_nzc_empty_marker_backend_path() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8837,6 +8908,7 @@ mod tests {
     #[test]
     fn test_a32_cmp_addhs_subhs_division_tail_with_all_optimizations() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -8917,6 +8989,7 @@ mod tests {
         let callbacks = MockCallbacks::new(base, &code);
         let memory = callbacks.memory.clone();
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(callbacks),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -9010,6 +9083,7 @@ mod tests {
 
         let memory = Arc::new(Mutex::new(memory));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(
                 RTLD_BASE as u64,
                 memory.clone(),
@@ -9097,6 +9171,7 @@ mod tests {
 
         let memory = Arc::new(Mutex::new(memory));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(
                 RTLD_BASE as u64,
                 memory.clone(),
@@ -9187,6 +9262,7 @@ mod tests {
 
         let memory = Arc::new(Mutex::new(memory));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(
                 RTLD_BASE as u64,
                 memory.clone(),
@@ -9301,6 +9377,7 @@ mod tests {
     #[test]
     fn test_a32_tst_imm_beq_takes_zero_path() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -9345,6 +9422,7 @@ mod tests {
     #[test]
     fn test_vfp_cmp_bne_const_prop_only() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -9380,6 +9458,7 @@ mod tests {
     #[test]
     fn test_vfp_cmp_bne_block_linking_only() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -9456,6 +9535,7 @@ mod tests {
         ];
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -9559,6 +9639,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -9603,6 +9684,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -9656,6 +9738,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -9710,6 +9793,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -9764,6 +9848,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -10042,6 +10127,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -10098,6 +10184,7 @@ mod tests {
             0xD4000001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -10803,6 +10890,7 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(PC, &code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -10837,6 +10925,7 @@ mod tests {
         ];
         let read_address = Arc::new(AtomicU64::new(u64::MAX));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(
                 MockCallbacks::new(PC, &code)
                     .with_memory_read_address_sink(Arc::clone(&read_address)),
@@ -11056,6 +11145,7 @@ mod tests {
         memory[BYTE_ADDRESS] = 127;
 
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_memory(0, memory)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -11135,6 +11225,7 @@ mod tests {
 
         let memory = Arc::new(Mutex::new(memory));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0, Arc::clone(&memory))),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -11249,6 +11340,7 @@ mod tests {
 
         let memory = Arc::new(Mutex::new(memory));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::from_shared_memory(0, Arc::clone(&memory))),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
@@ -11291,6 +11383,7 @@ mod tests {
     #[test]
     fn test_a32_vmsr_vmrs_fpscr_uses_host_abi_registers() {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(
                 0x1000,
                 &[
@@ -11331,6 +11424,7 @@ mod tests {
     fn test_a32_svc_with_cycle_counting_matches_callback_contract() {
         let svc_sink = Arc::new(AtomicU32::new(u32::MAX));
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::with_svc_sink(
                 0x1000,
                 &[0xEF00_0026], // SVC #0x26
@@ -11402,6 +11496,7 @@ mod tests {
         let mapping = TestFastmemMapping::new(0x10_000);
         mapping.map_u32(0x2000, 0);
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(MockCallbacks::new(0x1000, code)),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,

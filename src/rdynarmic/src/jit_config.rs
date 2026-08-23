@@ -223,6 +223,11 @@ impl std::ops::Not for OptimizationFlag {
 
 /// Configuration for creating an A64Jit / A32Jit instance.
 pub struct JitConfig {
+    /// A32 coprocessors, indexed by the encoded coprocessor number.
+    ///
+    /// Matches upstream `A32::UserConfig::coprocessors`. A64 ignores this
+    /// registry.
+    pub coprocessors: crate::interface::a32::config::Coprocessors,
     /// Host callbacks for memory access, system calls, and tick counting.
     pub callbacks: Box<dyn UserCallbacks>,
     /// Whether cycle counting is enabled.
@@ -303,6 +308,10 @@ pub struct JitConfig {
 impl JitConfig {
     /// Default code cache size: 128 MB.
     pub const DEFAULT_CODE_CACHE_SIZE: usize = 128 * 1024 * 1024;
+
+    pub fn default_coprocessors() -> crate::interface::a32::config::Coprocessors {
+        crate::interface::a32::config::empty_coprocessors()
+    }
 
     /// Check whether a specific optimization flag is active.
     ///

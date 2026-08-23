@@ -1322,6 +1322,7 @@ mod tests {
 
     fn config_with(optimizations: OptimizationFlag, enable_cycle_counting: bool) -> JitConfig {
         JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(DummyCallbacks),
             enable_cycle_counting,
             code_cache_size: 0,

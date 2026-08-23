@@ -1277,6 +1277,7 @@ mod tests {
 
     fn config(code: Vec<u32>) -> JitConfig {
         JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(TestCallbacks {
                 code,
                 memory: [0; 64],

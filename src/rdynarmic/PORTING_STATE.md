@@ -32,8 +32,10 @@ global metadata slice:
 - The upstream-owned A32 coprocessor interface now exists under
   `src/interface/a32/`: `CoprocReg` has moved out of the frontend, and the
   callback/action/trait contracts match `coprocessor_util.h` and
-  `coprocessor.h`. The registry and backend dispatch are the next active
-  prerequisite; the old CP15-specific emitters are not yet removed.
+  `coprocessor.h`. `JitConfig` now also owns the exact 16-entry optional
+  registry from `config.h`; backend forwarding and action dispatch are the
+  next active prerequisite, and the old CP15-specific emitters are not yet
+  removed.
 - CRC emitters and all A32/A64 frontend/backend call sites were re-read. They
   already pass and consume Eden's raw `U32` operand; the divergent metadata and
   arm64 routing test inputs are corrected.

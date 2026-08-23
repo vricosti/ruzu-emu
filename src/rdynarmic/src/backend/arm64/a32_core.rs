@@ -158,6 +158,7 @@ mod tests {
 
     fn config() -> JitConfig {
         JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(TestCallbacks),
             enable_cycle_counting: false,
             code_cache_size: 4096,

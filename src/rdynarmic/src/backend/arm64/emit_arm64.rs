@@ -2074,6 +2074,7 @@ mod tests {
 
     fn config(unsafe_optimizations: bool) -> JitConfig {
         JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(DummyCallbacks),
             enable_cycle_counting: true,
             code_cache_size: 0,

@@ -130,6 +130,7 @@ mod tests {
 
     fn make_jit(env: TestEnv) -> A32Jit {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(env),
             enable_cycle_counting: true,
             code_cache_size: 4 * 1024 * 1024,
@@ -270,6 +271,7 @@ mod tests {
 
     fn make_jit_with_optimizations(env: SharedEnv, optimizations: OptimizationFlag) -> A32Jit {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(env),
             enable_cycle_counting: true,
             code_cache_size: 4 * 1024 * 1024,
@@ -1539,6 +1541,7 @@ mod tests {
 
     fn make_jit_no_cycles(env: TestEnv) -> A32Jit {
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(env),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,

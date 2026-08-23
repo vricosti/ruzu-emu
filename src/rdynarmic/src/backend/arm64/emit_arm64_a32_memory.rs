@@ -165,6 +165,7 @@ mod tests {
 
     fn config() -> EmitConfig {
         let mut jit_config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(DummyCallbacks),
             enable_cycle_counting: false,
             code_cache_size: 0,

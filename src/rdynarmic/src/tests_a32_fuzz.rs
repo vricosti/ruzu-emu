@@ -681,6 +681,7 @@ mod tests {
 
         let env = FuzzEnv::new(code_with_loop);
         let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(env),
             enable_cycle_counting: true,
             code_cache_size: 4 * 1024 * 1024,

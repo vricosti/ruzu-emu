@@ -424,6 +424,7 @@ mod tests {
 
     fn config_with_pointers(pointers: Option<Arc<Mutex<PointerState>>>) -> JitConfig {
         JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(TestCallbacks { pointers }),
             enable_cycle_counting: false,
             code_cache_size: 4096,

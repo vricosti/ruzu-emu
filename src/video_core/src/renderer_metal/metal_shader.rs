@@ -53,6 +53,8 @@ pub struct MetalShaderCompileOptions {
     pub enable_frag_depth_builtin: bool,
     pub enable_frag_stencil_ref_builtin: bool,
     pub enable_frag_output_mask: u32,
+    pub enable_point_size_builtin: bool,
+    pub disable_rasterization: bool,
     pub compute_workgroup_size: Option<[u32; 3]>,
 }
 
@@ -67,6 +69,8 @@ impl Default for MetalShaderCompileOptions {
             enable_frag_depth_builtin: true,
             enable_frag_stencil_ref_builtin: true,
             enable_frag_output_mask: u32::MAX,
+            enable_point_size_builtin: true,
+            disable_rasterization: false,
             compute_workgroup_size: None,
         }
     }
@@ -526,6 +530,8 @@ fn make_compiler_options(metal_options: &MetalShaderCompileOptions) -> CompilerO
     options.enable_frag_depth_builtin = metal_options.enable_frag_depth_builtin;
     options.enable_frag_stencil_ref_builtin = metal_options.enable_frag_stencil_ref_builtin;
     options.enable_frag_output_mask = metal_options.enable_frag_output_mask;
+    options.enable_point_size_builtin = metal_options.enable_point_size_builtin;
+    options.disable_rasterization = metal_options.disable_rasterization;
     options.pad_fragment_output_components = true;
     options.manual_helper_invocation_updates = true;
     options.readwrite_texture_fences = true;
@@ -677,6 +683,8 @@ fn direct_msl_options(
         supports_texture_atomics: options.language_version >= MslVersion::V3_1
             && (device.supportsFamily(MTLGPUFamily::Apple6)
                 || device.supportsFamily(MTLGPUFamily::Mac2)),
+        enable_point_size_builtin: options.enable_point_size_builtin,
+        disable_rasterization: options.disable_rasterization,
     }
 }
 
@@ -818,6 +826,7 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
 
 #[cfg(test)]
 mod tests {
+    use objc2_metal::{MTLDevice as _, MTLPrimitiveTopologyClass, MTLRenderPipelineDescriptor};
     use shader_recompiler::backend::emit_spirv;
     use shader_recompiler::ir::basic_block::Block;
     use shader_recompiler::ir::emitter::Emitter;
@@ -2288,6 +2297,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("compatibility vertex built-ins must lower directly");
@@ -2444,6 +2455,111 @@ mod tests {
     }
 
     #[test]
+    fn suppresses_point_size_for_triangle_render_pipelines() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo {
+            fixed_state_point_size: Some(2.5),
+            ..RuntimeInfo::default()
+        };
+        let mut program = empty_program(Stage::VertexB);
+        let point_size = shader_recompiler::ir::Attribute::POINT_SIZE;
+        program.info.stores.set(point_size.0 as usize, true);
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(point_size),
+                Value::ImmF32(1.5),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let options = MetalShaderCompileOptions {
+            enable_point_size_builtin: false,
+            ..MetalShaderCompileOptions::for_device(device.profile())
+        };
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let compatibility =
+            compile_native_shader(device.device(), device.profile(), &spirv, &options)
+                .expect("SPIRV-Cross must suppress PointSize for a triangle pipeline");
+        let direct = compile_direct_msl_shader_with_bindings(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &options,
+            &mut Bindings::default(),
+        )
+        .expect("direct MSL must suppress PointSize for a triangle pipeline");
+
+        for shader in [&compatibility, &direct] {
+            assert!(!shader.source().source.contains("[[point_size]]"));
+            let descriptor = MTLRenderPipelineDescriptor::new();
+            descriptor.setVertexFunction(Some(shader.function()));
+            unsafe {
+                descriptor.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+            }
+            device
+                .device()
+                .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                .expect("triangle pipeline must accept a shader that declared guest PointSize");
+        }
+    }
+
+    #[test]
+    fn disables_vertex_outputs_for_non_rasterizing_render_pipelines() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let mut program = empty_program(Stage::VertexB);
+        let position = shader_recompiler::ir::Attribute::POSITION_X;
+        program.info.stores.set(position.0 as usize, true);
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(position),
+                Value::ImmF32(1.0),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let options = MetalShaderCompileOptions {
+            disable_rasterization: true,
+            ..MetalShaderCompileOptions::for_device(device.profile())
+        };
+        let spirv = emit_spirv(&program, &profile, &RuntimeInfo::default());
+        let compatibility =
+            compile_native_shader(device.device(), device.profile(), &spirv, &options)
+                .expect("SPIRV-Cross must return void when rasterization is disabled");
+        let direct = compile_direct_msl_shader_with_bindings(
+            device.device(),
+            &program,
+            &profile,
+            &RuntimeInfo::default(),
+            &options,
+            &mut Bindings::default(),
+        )
+        .expect("direct MSL must return void when rasterization is disabled");
+
+        for shader in [&compatibility, &direct] {
+            assert!(shader.source().source.contains("vertex void main0("));
+            let descriptor = MTLRenderPipelineDescriptor::new();
+            descriptor.setVertexFunction(Some(shader.function()));
+            descriptor.setRasterizationEnabled(false);
+            unsafe {
+                descriptor.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+            }
+            device
+                .device()
+                .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                .expect("non-rasterizing pipeline must accept a void vertex entry point");
+        }
+    }
+
+    #[test]
     fn compiles_direct_msl_alpha_test_and_dual_source_with_active_abi() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let profile = make_shader_profile(device.profile());
@@ -2586,6 +2702,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("minimal compute IR must lower directly to MSL");
@@ -2716,6 +2834,8 @@ mod tests {
                 supports_query_texture_lod: false,
                 supports_read_write_textures: false,
                 supports_texture_atomics: false,
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("shared-memory compute IR must lower directly to MSL 2.3");
@@ -2743,6 +2863,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("memory-barrier IR must lower directly to MSL");
@@ -2987,6 +3109,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("supported vertex IR must lower directly to MSL");
@@ -3116,6 +3240,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("scalar IR must lower directly to MSL");
@@ -3247,6 +3373,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("native half/int64 IR must lower directly to MSL when supported");
@@ -3315,6 +3443,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("bitwise conversion IR must lower directly to MSL");
@@ -3413,6 +3543,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("global-memory IR must lower directly to MSL");
@@ -3521,6 +3653,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("global atomic IR must lower directly to MSL");
@@ -3775,6 +3909,8 @@ mod tests {
                     supports_query_texture_lod: device.profile().supports_query_texture_lod,
                     supports_read_write_textures: device.profile().supports_read_write_textures(),
                     supports_texture_atomics: false,
+                    enable_point_size_builtin: true,
+                    disable_rasterization: false,
                 },
             )
             .unwrap_or_else(|error| {
@@ -3963,6 +4099,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("PTP gather must lower directly to MSL");
@@ -4069,6 +4207,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("direct storage-image descriptor array must lower");
@@ -4145,6 +4285,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("direct image-buffer descriptor array must lower");
@@ -4409,6 +4551,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: false,
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .expect("multisample fetch must lower at the MSL 2.3 baseline");
@@ -4775,6 +4919,8 @@ mod tests {
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
+                enable_point_size_builtin: true,
+                disable_rasterization: false,
             },
         )
         .unwrap();

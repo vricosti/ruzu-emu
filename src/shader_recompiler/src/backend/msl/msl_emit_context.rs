@@ -537,11 +537,13 @@ impl MslEmitContext {
         // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
         // SPIR-V makes that write ineffective, while Metal rejects the pair.
         let emits_frag_depth = program.info.stores_frag_depth && !runtime_info.force_early_z;
-        let emits_point_size = program
-            .info
-            .stores
-            .get(crate::ir::value::Attribute::POINT_SIZE.0 as usize)
-            || runtime_info.fixed_state_point_size.is_some();
+        let emits_point_size = !options.disable_rasterization
+            && options.enable_point_size_builtin
+            && (program
+                .info
+                .stores
+                .get(crate::ir::value::Attribute::POINT_SIZE.0 as usize)
+                || runtime_info.fixed_state_point_size.is_some());
         if emits_point_size && stage != Stage::VertexB {
             return Err(MslError::UnsupportedProgramFeature(
                 "point-size output outside a vertex shader",
@@ -558,6 +560,10 @@ impl MslEmitContext {
             emits_frag_color[1] = true;
         }
         let returns_output = match stage {
+            Stage::VertexB if options.disable_rasterization => {
+                source.push_str(&format!("vertex void main0({parameters}) {{\n"));
+                false
+            }
             Stage::VertexB => {
                 source.push_str("struct MslVertexOut {\n");
                 source.push_str("    float4 position [[position]];\n");
@@ -1056,6 +1062,10 @@ impl MslEmitContext {
 
     pub fn stage(&self) -> Stage {
         self.stage
+    }
+
+    pub(crate) fn emits_vertex_outputs(&self) -> bool {
+        self.stage == Stage::VertexB && self.returns_output
     }
 
     pub(crate) fn converts_depth_mode(&self) -> bool {
@@ -1912,6 +1922,9 @@ impl MslEmitContext {
         component: u32,
         value: &Value,
     ) -> Result<(), MslError> {
+        if !self.returns_output {
+            return Ok(());
+        }
         let expression = self.value_expression(value, inst_ref, 1)?;
         let swizzle = ["x", "y", "z", "w"][component as usize];
         self.source
@@ -1924,6 +1937,9 @@ impl MslEmitContext {
         inst_ref: InstRef,
         value: &Value,
     ) -> Result<(), MslError> {
+        if !self.emits_point_size {
+            return Ok(());
+        }
         let expression = self.value_expression(value, inst_ref, 1)?;
         self.source
             .push_str(&format!("    output.point_size = {expression};\n"));
@@ -1936,6 +1952,9 @@ impl MslEmitContext {
         index: u32,
         value: &Value,
     ) -> Result<(), MslError> {
+        if !self.returns_output {
+            return Ok(());
+        }
         if index >= self.clip_distance_count {
             log::warn!(
                 "Ignoring clip distance store {} >= {} supported",
@@ -1974,6 +1993,9 @@ impl MslEmitContext {
         attribute: crate::ir::value::Attribute,
         value: &Value,
     ) -> Result<(), MslError> {
+        if !self.returns_output {
+            return Ok(());
+        }
         let expression = self.value_expression(value, inst_ref, 1)?;
         let index = attribute.generic_index();
         let swizzle = ["x", "y", "z", "w"][attribute.generic_element() as usize];

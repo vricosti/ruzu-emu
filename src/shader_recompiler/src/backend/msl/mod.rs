@@ -66,6 +66,14 @@ pub struct MslOptions {
     /// Whether native texture atomics are available on the selected Metal
     /// device. The renderer derives this from both MSL version and GPU family.
     pub supports_texture_atomics: bool,
+    /// Whether vertex `PointSize` stores are exposed as Metal's
+    /// `[[point_size]]` output. Metal rejects that builtin for non-point
+    /// pipeline topologies even when the guest shader declares it.
+    pub enable_point_size_builtin: bool,
+    /// Whether vertex-like entry points must return `void` because the
+    /// pipeline has rasterization disabled. Metal requires this shader
+    /// specialization instead of accepting unused stage outputs.
+    pub disable_rasterization: bool,
 }
 
 impl Default for MslOptions {
@@ -76,6 +84,8 @@ impl Default for MslOptions {
             supports_query_texture_lod: false,
             supports_read_write_textures: false,
             supports_texture_atomics: false,
+            enable_point_size_builtin: true,
+            disable_rasterization: false,
         }
     }
 }

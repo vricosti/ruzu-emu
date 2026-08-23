@@ -4225,6 +4225,72 @@ mod tests {
     }
 
     #[test]
+    fn suppresses_point_size_builtin_for_non_point_metal_pipelines() {
+        let mut program = empty_program(Stage::VertexB);
+        let point_size = crate::ir::Attribute::POINT_SIZE;
+        program.info.stores.set(point_size.0 as usize, true);
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(point_size),
+                Value::ImmF32(2.0),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let artifact = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo {
+                fixed_state_point_size: Some(3.0),
+                ..RuntimeInfo::default()
+            },
+            &MslOptions {
+                enable_point_size_builtin: false,
+                ..MslOptions::default()
+            },
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+        assert!(!source.contains("[[point_size]]"));
+        assert!(!source.contains("output.point_size"));
+    }
+
+    #[test]
+    fn disables_vertex_outputs_when_rasterization_is_disabled() {
+        let mut program = empty_program(Stage::VertexB);
+        let position = crate::ir::Attribute::POSITION_X;
+        program.info.stores.set(position.0 as usize, true);
+        program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(position),
+                Value::ImmF32(1.0),
+                Value::ImmU32(0),
+            ],
+        );
+        program.blocks[0].append_new_inst(Opcode::Epilogue, vec![]);
+
+        let artifact = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &MslOptions {
+                disable_rasterization: true,
+                ..MslOptions::default()
+            },
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("vertex void main0("));
+        assert!(!source.contains("MslVertexOut"));
+        assert!(!source.contains("output.position"), "{source}");
+    }
+
+    #[test]
     fn emits_ordered_alpha_test_and_dual_source_defaults() {
         use crate::runtime_info::CompareFunction;
 

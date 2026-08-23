@@ -1325,6 +1325,18 @@ impl MetalRasterizer {
 }
 
 impl RasterizerInterface for MetalRasterizer {
+    fn load_disk_resources(
+        &mut self,
+        title_id: u64,
+        stop_loading: crate::rasterizer_interface::DiskResourceLoadStop,
+        callback: crate::rasterizer_interface::DiskResourceLoadCallback,
+    ) {
+        let shader_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir);
+        self.pipeline_cache
+            .load_disk_resources(title_id, &shader_dir, stop_loading, callback);
+    }
+
     fn draw(&mut self, mut draw_view: Maxwell3DDrawView<'_>, instance_count: u32) {
         if let Err(error) = MetalRasterizer::draw(self, &mut draw_view, instance_count) {
             log::error!("Metal draw failed: {error}");

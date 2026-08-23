@@ -61,7 +61,7 @@ pub fn emit_prologue(context: &mut MslEmitContext, program: &ir::Program) {
         }
     }
 
-    if context.stage() == Stage::VertexB {
+    if context.emits_vertex_outputs() {
         context.emit_statement("output.position = float4(0.0f, 0.0f, 0.0f, 1.0f);");
         for index in 0..32 {
             if program.info.stores.generic_any(index) {
@@ -110,7 +110,7 @@ fn alpha_test(context: &mut MslEmitContext) {
 
 /// Emit Eden's `EmitEpilogue` behavior into the direct MSL entry point.
 pub fn emit_epilogue(context: &mut MslEmitContext) {
-    if context.stage() == Stage::VertexB && context.converts_depth_mode() {
+    if context.emits_vertex_outputs() && context.converts_depth_mode() {
         context
             .emit_statement("output.position.z = (output.position.z + output.position.w) * 0.5f;");
     }

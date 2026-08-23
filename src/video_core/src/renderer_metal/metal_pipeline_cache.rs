@@ -9,7 +9,11 @@
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use common::thread_worker::ThreadWorker;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -35,6 +39,9 @@ use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, DepthStencilInfo, PrimitiveTopology, StencilOp,
     VertexAttribSize, VertexAttribType,
 };
+use crate::rasterizer_interface::{
+    DiskResourceLoadCallback, DiskResourceLoadStop, LoadCallbackStage,
+};
 use crate::renderer_vulkan::fixed_pipeline_state::DynamicFeatures;
 use crate::renderer_vulkan::fixed_pipeline_state::FixedPipelineState;
 use crate::renderer_vulkan::graphics_pipeline::{buffer_cache_metadata, GraphicsPipelineKey};
@@ -43,7 +50,10 @@ use crate::renderer_vulkan::pipeline_cache::{
     TranslatedGraphicsShader, NUM_GRAPHICS_STAGES,
 };
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
-use crate::shader_environment::ComputeEnvironment;
+use crate::shader_environment::{
+    load_pipelines, serialize_pipeline, ComputeEnvironment, FileEnvironment, GraphicsEnvironment,
+    ShaderStage as EnvironmentStage,
+};
 
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
 use super::metal_framebuffer::MetalFramebuffer;
@@ -57,6 +67,7 @@ use super::metal_shader::{
 const SPIRV_1_5: u32 = 0x0001_0500;
 const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
 const METAL_MAX_USER_CLIP_DISTANCES: u32 = 8;
+const CACHE_VERSION: u32 = 1;
 
 fn validate_direct_msl_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -452,6 +463,52 @@ pub struct MetalComputePipelineKey {
     pub workgroup_size: [u32; 3],
 }
 
+impl MetalComputePipelineKey {
+    fn to_cache_bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.unique_hash.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.shared_memory_size.to_le_bytes());
+        for (index, value) in self.workgroup_size.into_iter().enumerate() {
+            let offset = 12 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
+        use std::io::Read;
+
+        let mut bytes = [0; 24];
+        file.read_exact(&mut bytes)?;
+        Ok(Self {
+            unique_hash: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            shared_memory_size: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            workgroup_size: std::array::from_fn(|index| {
+                let offset = 12 + index * 4;
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            }),
+        })
+    }
+}
+
+enum DiskPipelineBuildResult {
+    Compute(MetalComputePipelineKey, MetalComputePipeline),
+    Graphics(GraphicsPipelineKey, MetalGraphicsShaderStages),
+}
+
+#[derive(Default)]
+struct DiskResourceLoadState {
+    built: usize,
+    total: usize,
+}
+
+impl DiskResourceLoadState {
+    fn complete_one(&mut self, callback: &DiskResourceLoadCallback) {
+        self.built += 1;
+        callback(LoadCallbackStage::Build, self.built, self.total);
+    }
+}
+
 #[derive(Clone)]
 pub struct MetalComputePipeline {
     key: MetalComputePipelineKey,
@@ -630,6 +687,8 @@ pub struct MetalPipelineCache {
     graphics_shader_modules: HashMap<GraphicsPipelineKey, MetalGraphicsShaderStages>,
     graphics_key: GraphicsPipelineKey,
     dynamic_features: DynamicFeatures,
+    pipeline_cache_filename: PathBuf,
+    serialization_thread: ThreadWorker,
 }
 
 impl MetalPipelineCache {
@@ -652,6 +711,11 @@ impl MetalPipelineCache {
             // in the fixed key. Start with every Vulkan-only dynamic feature
             // disabled, then opt in only when the Metal rasterizer owns it.
             dynamic_features: DynamicFeatures::default(),
+            pipeline_cache_filename: PathBuf::new(),
+            serialization_thread: ThreadWorker::new_stateless(
+                1,
+                "MetalPipelineSerializer".to_owned(),
+            ),
         }
     }
 
@@ -665,6 +729,158 @@ impl MetalPipelineCache {
 
     pub fn host_info(&self) -> &HostTranslateInfo {
         &self.host_info
+    }
+
+    fn build_graphics_shader_stages(
+        device: &MetalDevice,
+        profile: &Profile,
+        host_info: &HostTranslateInfo,
+        key: &GraphicsPipelineKey,
+        environments: &mut GraphicsEnvironments,
+    ) -> Result<Option<MetalGraphicsShaderStages>, MetalPipelineError> {
+        let translated = catch_shader_exception(|| {
+            translate_graphics_stages_from_environments_with_features(
+                host_info,
+                key,
+                environments,
+                RuntimeInfoDeviceFeatures {
+                    transform_feedback: true,
+                    molten_vk: true,
+                },
+            )
+        })
+        .map_err(MetalPipelineError::ShaderTranslation)?;
+        let Some(translated) = translated else {
+            return Ok(None);
+        };
+        if translated[1].is_some() {
+            return Err(MetalPipelineError::UnsupportedGraphicsStage(
+                "tessellation control",
+            ));
+        }
+        if translated[2].is_some() {
+            return Err(MetalPipelineError::UnsupportedGraphicsStage(
+                "tessellation evaluation",
+            ));
+        }
+        if translated[3].is_some() {
+            return Err(MetalPipelineError::UnsupportedGraphicsStage("geometry"));
+        }
+        let stage_infos: [ShaderInfo; NUM_GRAPHICS_STAGES] = std::array::from_fn(|index| {
+            translated[index]
+                .as_ref()
+                .map(|stage| stage.program.info.clone())
+                .unwrap_or_default()
+        });
+        let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
+            buffer_cache_metadata(&stage_infos);
+        let mut vertex = None;
+        let mut fragment = None;
+        let mut options = MetalShaderCompileOptions::for_device(device.profile());
+        options.enable_point_size_builtin = key.fixed_state.topology() == PrimitiveTopology::Points;
+        options.disable_rasterization = !key.fixed_state.dynamic_state.rasterize_enable();
+        if use_direct_msl_enabled() {
+            let mut bindings = Bindings::default();
+            for translated_stage in translated.into_iter().flatten() {
+                let active = Arc::new(compile_direct_msl_shader_with_bindings(
+                    device.device(),
+                    &translated_stage.program,
+                    profile,
+                    &translated_stage.runtime_info,
+                    &options,
+                    &mut bindings,
+                )?);
+                match translated_stage.program.stage {
+                    Stage::VertexB => vertex = Some(active),
+                    Stage::Fragment => fragment = Some(active),
+                    stage => {
+                        return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
+                            Stage::VertexA => "unmerged vertex A",
+                            Stage::TessellationControl => "tessellation control",
+                            Stage::TessellationEval => "tessellation evaluation",
+                            Stage::Geometry => "geometry",
+                            Stage::Compute => "compute in graphics pipeline",
+                            Stage::VertexB | Stage::Fragment => unreachable!(),
+                        }))
+                    }
+                }
+            }
+        } else {
+            let emitted = catch_shader_exception(|| {
+                let mut bindings = Bindings::default();
+                let mut emitted: [Option<(TranslatedGraphicsShader, Vec<u32>, Bindings)>;
+                    NUM_GRAPHICS_STAGES] = Default::default();
+                for (index, translated_stage) in translated.into_iter().enumerate() {
+                    let Some(translated_stage) = translated_stage else {
+                        continue;
+                    };
+                    let binding_base = bindings.clone();
+                    let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+                        &translated_stage.program,
+                        profile,
+                        &translated_stage.runtime_info,
+                        &mut bindings,
+                    );
+                    emitted[index] = Some((translated_stage, spirv_words, binding_base));
+                }
+                emitted
+            })
+            .map_err(MetalPipelineError::ShaderTranslation)?;
+
+            for emitted_stage in emitted.into_iter().flatten() {
+                let (translated_stage, spirv_words, mut direct_bindings) = emitted_stage;
+                let active = Arc::new(compile_native_shader(
+                    device.device(),
+                    device.profile(),
+                    &spirv_words,
+                    &options,
+                )?);
+                if validate_direct_msl_enabled() {
+                    match validate_direct_msl_against_active_module_with_bindings(
+                        device.device(),
+                        &translated_stage.program,
+                        profile,
+                        &translated_stage.runtime_info,
+                        &active,
+                        &mut direct_bindings,
+                    ) {
+                        Ok(_) => log::info!(
+                            "Direct MSL validation passed for {:?} graphics shader in pipeline 0x{:016X}",
+                            translated_stage.program.stage,
+                            key.hash_value()
+                        ),
+                        Err(error) => log::warn!(
+                            "Direct MSL validation failed for {:?} graphics shader in pipeline 0x{:016X}: {error}",
+                            translated_stage.program.stage,
+                            key.hash_value()
+                        ),
+                    }
+                }
+                match translated_stage.program.stage {
+                    Stage::VertexB => vertex = Some(active),
+                    Stage::Fragment => fragment = Some(active),
+                    stage => {
+                        return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
+                            Stage::VertexA => "unmerged vertex A",
+                            Stage::TessellationControl => "tessellation control",
+                            Stage::TessellationEval => "tessellation evaluation",
+                            Stage::Geometry => "geometry",
+                            Stage::Compute => "compute in graphics pipeline",
+                            Stage::VertexB | Stage::Fragment => unreachable!(),
+                        }))
+                    }
+                }
+            }
+        }
+        let vertex = vertex.ok_or(MetalPipelineError::MissingVertexStage)?;
+        Ok(Some(MetalGraphicsShaderStages {
+            key: key.clone(),
+            vertex,
+            fragment,
+            stage_infos: Arc::new(stage_infos),
+            enabled_uniform_buffer_masks,
+            uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
+        }))
     }
 
     /// Port of Eden `PipelineCache::CurrentGraphicsPipeline` up through
@@ -684,150 +900,26 @@ impl MetalPipelineCache {
         if !self.graphics_shader_modules.contains_key(&key) {
             let mut environments = GraphicsEnvironments::default();
             shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
-            let translated = catch_shader_exception(|| {
-                translate_graphics_stages_from_environments_with_features(
-                    &self.host_info,
-                    &key,
-                    &mut environments,
-                    RuntimeInfoDeviceFeatures {
-                        transform_feedback: true,
-                        molten_vk: true,
-                    },
-                )
-            })
-            .map_err(MetalPipelineError::ShaderTranslation)?;
-            let Some(translated) = translated else {
+            let Some(stages) = Self::build_graphics_shader_stages(
+                &self.device,
+                &self.profile,
+                &self.host_info,
+                &key,
+                &mut environments,
+            )?
+            else {
                 return Ok(None);
             };
-            if translated[1].is_some() {
-                return Err(MetalPipelineError::UnsupportedGraphicsStage(
-                    "tessellation control",
-                ));
+            if !self.pipeline_cache_filename.as_os_str().is_empty() {
+                let key_bytes = key.to_cache_bytes();
+                let filename = self.pipeline_cache_filename.clone();
+                let envs: Vec<_> = environments.span().into_iter().cloned().collect();
+                self.serialization_thread.queue_stateless_work(move || {
+                    let env_refs: Vec<_> = envs.iter().collect();
+                    serialize_pipeline(&key_bytes, &env_refs, &filename, CACHE_VERSION);
+                });
             }
-            if translated[2].is_some() {
-                return Err(MetalPipelineError::UnsupportedGraphicsStage(
-                    "tessellation evaluation",
-                ));
-            }
-            if translated[3].is_some() {
-                return Err(MetalPipelineError::UnsupportedGraphicsStage("geometry"));
-            }
-            let stage_infos: [ShaderInfo; NUM_GRAPHICS_STAGES] = std::array::from_fn(|index| {
-                translated[index]
-                    .as_ref()
-                    .map(|stage| stage.program.info.clone())
-                    .unwrap_or_default()
-            });
-            let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
-                buffer_cache_metadata(&stage_infos);
-            let mut vertex = None;
-            let mut fragment = None;
-            if use_direct_msl_enabled() {
-                let options = MetalShaderCompileOptions::for_device(self.device.profile());
-                let mut bindings = Bindings::default();
-                for translated_stage in translated.into_iter().flatten() {
-                    let active = Arc::new(compile_direct_msl_shader_with_bindings(
-                        self.device.device(),
-                        &translated_stage.program,
-                        &self.profile,
-                        &translated_stage.runtime_info,
-                        &options,
-                        &mut bindings,
-                    )?);
-                    match translated_stage.program.stage {
-                        Stage::VertexB => vertex = Some(active),
-                        Stage::Fragment => fragment = Some(active),
-                        stage => {
-                            return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
-                                Stage::VertexA => "unmerged vertex A",
-                                Stage::TessellationControl => "tessellation control",
-                                Stage::TessellationEval => "tessellation evaluation",
-                                Stage::Geometry => "geometry",
-                                Stage::Compute => "compute in graphics pipeline",
-                                Stage::VertexB | Stage::Fragment => unreachable!(),
-                            }))
-                        }
-                    }
-                }
-            } else {
-                let emitted = catch_shader_exception(|| {
-                    let mut bindings = Bindings::default();
-                    let mut emitted: [Option<(TranslatedGraphicsShader, Vec<u32>, Bindings)>;
-                        NUM_GRAPHICS_STAGES] = Default::default();
-                    for (index, translated_stage) in translated.into_iter().enumerate() {
-                        let Some(translated_stage) = translated_stage else {
-                            continue;
-                        };
-                        let binding_base = bindings.clone();
-                        let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
-                            &translated_stage.program,
-                            &self.profile,
-                            &translated_stage.runtime_info,
-                            &mut bindings,
-                        );
-                        emitted[index] = Some((translated_stage, spirv_words, binding_base));
-                    }
-                    emitted
-                })
-                .map_err(MetalPipelineError::ShaderTranslation)?;
-
-                for emitted_stage in emitted.into_iter().flatten() {
-                    let (translated_stage, spirv_words, mut direct_bindings) = emitted_stage;
-                    let active = Arc::new(compile_native_shader(
-                        self.device.device(),
-                        self.device.profile(),
-                        &spirv_words,
-                        &MetalShaderCompileOptions::for_device(self.device.profile()),
-                    )?);
-                    if validate_direct_msl_enabled() {
-                        match validate_direct_msl_against_active_module_with_bindings(
-                            self.device.device(),
-                            &translated_stage.program,
-                            &self.profile,
-                            &translated_stage.runtime_info,
-                            &active,
-                            &mut direct_bindings,
-                        ) {
-                            Ok(_) => log::info!(
-                                "Direct MSL validation passed for {:?} graphics shader in pipeline 0x{:016X}",
-                                translated_stage.program.stage,
-                                key.hash_value()
-                            ),
-                            Err(error) => log::warn!(
-                                "Direct MSL validation failed for {:?} graphics shader in pipeline 0x{:016X}: {error}",
-                                translated_stage.program.stage,
-                                key.hash_value()
-                            ),
-                        }
-                    }
-                    match translated_stage.program.stage {
-                        Stage::VertexB => vertex = Some(active),
-                        Stage::Fragment => fragment = Some(active),
-                        stage => {
-                            return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
-                                Stage::VertexA => "unmerged vertex A",
-                                Stage::TessellationControl => "tessellation control",
-                                Stage::TessellationEval => "tessellation evaluation",
-                                Stage::Geometry => "geometry",
-                                Stage::Compute => "compute in graphics pipeline",
-                                Stage::VertexB | Stage::Fragment => unreachable!(),
-                            }))
-                        }
-                    }
-                }
-            }
-            let vertex = vertex.ok_or(MetalPipelineError::MissingVertexStage)?;
-            self.graphics_shader_modules.insert(
-                key.clone(),
-                MetalGraphicsShaderStages {
-                    key: key.clone(),
-                    vertex,
-                    fragment,
-                    stage_infos: Arc::new(stage_infos),
-                    enabled_uniform_buffer_masks,
-                    uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
-                },
-            );
+            self.graphics_shader_modules.insert(key.clone(), stages);
         }
         Ok(self.graphics_shader_modules.get(&key).cloned())
     }
@@ -1005,13 +1097,7 @@ impl MetalPipelineCache {
             workgroup_size: [1; 3],
         };
         if !self.compute_pipelines.contains_key(&key) {
-            let state = self
-                .device
-                .device()
-                .newComputePipelineStateWithFunction_error(shader.function())
-                .map_err(|error| {
-                    MetalPipelineError::ComputePipeline(error.localizedDescription().to_string())
-                })?;
+            let state = Self::create_compute_pipeline_state(&self.device, shader)?;
             self.compute_pipelines.insert(
                 key,
                 MetalComputePipeline {
@@ -1027,6 +1113,107 @@ impl MetalPipelineCache {
             .compute_pipelines
             .get(&key)
             .expect("pipeline inserted above"))
+    }
+
+    fn create_compute_pipeline_state(
+        device: &MetalDevice,
+        shader: &MetalShaderModule,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, MetalPipelineError> {
+        device
+            .device()
+            .newComputePipelineStateWithFunction_error(shader.function())
+            .map_err(|error| {
+                MetalPipelineError::ComputePipeline(error.localizedDescription().to_string())
+            })
+    }
+
+    fn build_compute_pipeline(
+        device: &MetalDevice,
+        profile: &Profile,
+        host_info: &HostTranslateInfo,
+        key: MetalComputePipelineKey,
+        environment: &mut ComputeEnvironment,
+    ) -> Result<Option<MetalComputePipeline>, MetalPipelineError> {
+        let code = environment
+            .generic_environment()
+            .cached_instruction_slice()
+            .to_vec();
+        let base_offset = environment.generic_environment().cached_instruction_start();
+        if code.is_empty() {
+            return Ok(None);
+        }
+
+        let runtime_info = RuntimeInfo::default();
+        let program = catch_shader_exception(|| {
+            shader_recompiler::translate_shader_from_env_with_host_info(
+                &code,
+                base_offset,
+                environment,
+                &runtime_info,
+                host_info,
+            )
+        })
+        .map_err(MetalPipelineError::ShaderTranslation)?;
+        let options =
+            MetalShaderCompileOptions::for_compute_device(device.profile(), key.workgroup_size);
+        let shader = if use_direct_msl_enabled() {
+            let mut bindings = Bindings::default();
+            Arc::new(compile_direct_msl_shader_with_bindings(
+                device.device(),
+                &program,
+                profile,
+                &runtime_info,
+                &options,
+                &mut bindings,
+            )?)
+        } else {
+            let spirv_words = catch_shader_exception(|| {
+                let mut bindings = Bindings::default();
+                shader_recompiler::backend::emit_spirv_with_bindings(
+                    &program,
+                    profile,
+                    &runtime_info,
+                    &mut bindings,
+                )
+            })
+            .map_err(MetalPipelineError::ShaderTranslation)?;
+            let shader = Arc::new(compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv_words,
+                &options,
+            )?);
+            if validate_direct_msl_enabled() {
+                match validate_direct_msl_against_active_module(
+                    device.device(),
+                    &program,
+                    profile,
+                    &runtime_info,
+                    &shader,
+                ) {
+                    Ok(_) => log::info!(
+                        "Direct MSL validation passed for compute shader 0x{:016X}",
+                        key.unique_hash
+                    ),
+                    Err(error) => log::warn!(
+                        "Direct MSL validation failed for compute shader 0x{:016X}: {error}",
+                        key.unique_hash
+                    ),
+                }
+            }
+            shader
+        };
+        let info = Arc::new(program.info);
+        let state = Self::create_compute_pipeline_state(device, &shader)?;
+        let mut uniform_buffer_sizes = [0; 8];
+        uniform_buffer_sizes.copy_from_slice(&info.constant_buffer_used_sizes[..8]);
+        Ok(Some(MetalComputePipeline {
+            key,
+            info,
+            uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
+            shader,
+            state,
+        }))
     }
 
     /// Port of Eden `PipelineCache::CurrentComputePipeline` through native
@@ -1059,98 +1246,234 @@ impl MetalPipelineCache {
             environment
                 .generic_environment_mut()
                 .set_cached_size(shader_size);
-            let code = environment
-                .generic_environment()
-                .cached_instruction_slice()
-                .to_vec();
-            let base_offset = environment.generic_environment().cached_instruction_start();
-            if code.is_empty() {
-                return Ok(None);
-            }
-
-            let runtime_info = RuntimeInfo::default();
-            let program = catch_shader_exception(|| {
-                shader_recompiler::translate_shader_from_env_with_host_info(
-                    &code,
-                    base_offset,
-                    &mut environment,
-                    &runtime_info,
-                    &self.host_info,
-                )
-            })
-            .map_err(MetalPipelineError::ShaderTranslation)?;
-            let options = MetalShaderCompileOptions::for_compute_device(
-                self.device.profile(),
-                key.workgroup_size,
-            );
-            let shader = if use_direct_msl_enabled() {
-                let mut bindings = Bindings::default();
-                Arc::new(compile_direct_msl_shader_with_bindings(
-                    self.device.device(),
-                    &program,
-                    &self.profile,
-                    &runtime_info,
-                    &options,
-                    &mut bindings,
-                )?)
-            } else {
-                let spirv_words = catch_shader_exception(|| {
-                    let mut bindings = Bindings::default();
-                    shader_recompiler::backend::emit_spirv_with_bindings(
-                        &program,
-                        &self.profile,
-                        &runtime_info,
-                        &mut bindings,
-                    )
-                })
-                .map_err(MetalPipelineError::ShaderTranslation)?;
-                let shader = Arc::new(compile_native_shader(
-                    self.device.device(),
-                    self.device.profile(),
-                    &spirv_words,
-                    &options,
-                )?);
-                if validate_direct_msl_enabled() {
-                    match validate_direct_msl_against_active_module(
-                        self.device.device(),
-                        &program,
-                        &self.profile,
-                        &runtime_info,
-                        &shader,
-                    ) {
-                        Ok(_) => log::info!(
-                            "Direct MSL validation passed for compute shader 0x{unique_hash:016X}"
-                        ),
-                        Err(error) => log::warn!(
-                            "Direct MSL validation failed for compute shader 0x{unique_hash:016X}: {error}"
-                        ),
-                    }
-                }
-                shader
-            };
-            let info = Arc::new(program.info);
-            let state = self
-                .device
-                .device()
-                .newComputePipelineStateWithFunction_error(shader.function())
-                .map_err(|error| {
-                    MetalPipelineError::ComputePipeline(error.localizedDescription().to_string())
-                })?;
-            let mut uniform_buffer_sizes = [0; 8];
-            uniform_buffer_sizes.copy_from_slice(&info.constant_buffer_used_sizes[..8]);
-            self.compute_pipelines.insert(
+            let Some(pipeline) = Self::build_compute_pipeline(
+                &self.device,
+                &self.profile,
+                &self.host_info,
                 key,
-                MetalComputePipeline {
-                    key,
-                    info,
-                    uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
-                    shader,
-                    state,
-                },
-            );
+                &mut environment,
+            )?
+            else {
+                return Ok(None);
+            };
+            if !self.pipeline_cache_filename.as_os_str().is_empty() {
+                let key_bytes = key.to_cache_bytes();
+                let filename = self.pipeline_cache_filename.clone();
+                let generic_environment = environment.generic_environment().clone();
+                self.serialization_thread.queue_stateless_work(move || {
+                    serialize_pipeline(
+                        &key_bytes,
+                        &[&generic_environment],
+                        &filename,
+                        CACHE_VERSION,
+                    );
+                });
+            }
+            self.compute_pipelines.insert(key, pipeline);
         }
         Ok(self.compute_pipelines.get(&key).cloned())
     }
+
+    fn graphics_environments_from_files(
+        environments: Vec<FileEnvironment>,
+    ) -> GraphicsEnvironments {
+        let mut result = GraphicsEnvironments::default();
+        for environment in environments {
+            let slot = match environment.shader_stage() {
+                EnvironmentStage::VertexA => 0,
+                EnvironmentStage::VertexB => 1,
+                EnvironmentStage::TessellationControl => 2,
+                EnvironmentStage::TessellationEval => 3,
+                EnvironmentStage::Geometry => 4,
+                EnvironmentStage::Fragment => 5,
+                EnvironmentStage::Compute => continue,
+            };
+            result.envs[slot] = GraphicsEnvironment::from_file_environment(environment);
+            result.env_ptrs[slot] = Some(slot);
+        }
+        result
+    }
+
+    /// Port of Eden `PipelineCache::LoadDiskResources` ownership and ordering
+    /// for the native Metal backend.
+    pub fn load_disk_resources(
+        &mut self,
+        title_id: u64,
+        shader_cache_dir: &Path,
+        stop_loading: DiskResourceLoadStop,
+        callback: DiskResourceLoadCallback,
+    ) {
+        let Some(filename) = metal_pipeline_cache_path(shader_cache_dir, title_id) else {
+            log::warn!("Skipping Metal disk pipeline cache load for title_id=0");
+            return;
+        };
+        let directory = filename
+            .parent()
+            .expect("Metal pipeline cache path must have a parent");
+        if let Err(error) = std::fs::create_dir_all(directory) {
+            log::error!("Failed to create Metal pipeline cache directory: {error}");
+            return;
+        }
+        self.pipeline_cache_filename = filename;
+        log::info!(
+            "Loading Metal disk pipeline cache title_id={title_id:016X} file={}",
+            self.pipeline_cache_filename.display()
+        );
+        callback(LoadCallbackStage::Prepare, 0, 0);
+
+        use std::cell::RefCell;
+        let compute_entries =
+            RefCell::new(Vec::<(MetalComputePipelineKey, FileEnvironment)>::new());
+        let graphics_entries =
+            RefCell::new(Vec::<(GraphicsPipelineKey, Vec<FileEnvironment>)>::new());
+        load_pipelines(
+            || stop_loading.load(Ordering::Acquire),
+            &self.pipeline_cache_filename,
+            CACHE_VERSION,
+            Box::new(|file, environment| {
+                let key = MetalComputePipelineKey::read_from_file(file)?;
+                compute_entries.borrow_mut().push((key, environment));
+                Ok(())
+            }),
+            Box::new(|file, environments| {
+                let key = GraphicsPipelineKey::read_from_file(file)?;
+                graphics_entries.borrow_mut().push((key, environments));
+                Ok(())
+            }),
+        );
+
+        let compute_entries = compute_entries.into_inner();
+        let graphics_entries = graphics_entries.into_inner();
+        let total = compute_entries.len() + graphics_entries.len();
+        callback(LoadCallbackStage::Build, 0, total);
+        if total == 0 || stop_loading.load(Ordering::Acquire) {
+            log::info!("Total Metal pipeline count: {total}");
+            return;
+        }
+
+        let worker_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .max(2)
+            - 1;
+        let workers = ThreadWorker::new_stateless(worker_count, "MetalShaderBuilder".to_owned());
+        let results = Arc::new(Mutex::new(Vec::<DiskPipelineBuildResult>::new()));
+        let state = Arc::new(Mutex::new(DiskResourceLoadState { built: 0, total }));
+
+        for (key, environment) in compute_entries {
+            if stop_loading.load(Ordering::Acquire) {
+                break;
+            }
+            let device = self.device.clone();
+            let profile = self.profile.clone();
+            let host_info = self.host_info.clone();
+            let results = Arc::clone(&results);
+            let state = Arc::clone(&state);
+            let callback = Arc::clone(&callback);
+            workers.queue_stateless_work(move || {
+                let mut environment = ComputeEnvironment::from_file_environment(environment);
+                match Self::build_compute_pipeline(
+                    &device,
+                    &profile,
+                    &host_info,
+                    key,
+                    &mut environment,
+                ) {
+                    Ok(Some(pipeline)) => results
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(DiskPipelineBuildResult::Compute(key, pipeline)),
+                    Ok(None) => {}
+                    Err(error) => log::error!(
+                        "Failed to rebuild cached Metal compute pipeline 0x{:016X}: {error}",
+                        key.unique_hash
+                    ),
+                }
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .complete_one(&callback);
+            });
+        }
+
+        for (key, environments) in graphics_entries {
+            if stop_loading.load(Ordering::Acquire) {
+                break;
+            }
+            let device = self.device.clone();
+            let profile = self.profile.clone();
+            let host_info = self.host_info.clone();
+            let results = Arc::clone(&results);
+            let state = Arc::clone(&state);
+            let callback = Arc::clone(&callback);
+            workers.queue_stateless_work(move || {
+                let mut environments = Self::graphics_environments_from_files(environments);
+                match Self::build_graphics_shader_stages(
+                    &device,
+                    &profile,
+                    &host_info,
+                    &key,
+                    &mut environments,
+                ) {
+                    Ok(Some(stages)) => results
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(DiskPipelineBuildResult::Graphics(key, stages)),
+                    Ok(None) => {}
+                    Err(error) => log::error!(
+                        "Failed to rebuild cached Metal graphics pipeline 0x{:016X}: {error}",
+                        key.hash_value()
+                    ),
+                }
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .complete_one(&callback);
+            });
+        }
+
+        workers.wait_for_requests_or_stop(&stop_loading);
+        let mut built = 0usize;
+        for result in results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            match result {
+                DiskPipelineBuildResult::Compute(key, pipeline) => {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.compute_pipelines.entry(key)
+                    {
+                        entry.insert(pipeline);
+                        built += 1;
+                    }
+                }
+                DiskPipelineBuildResult::Graphics(key, stages) => {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.graphics_shader_modules.entry(key)
+                    {
+                        entry.insert(stages);
+                        built += 1;
+                    }
+                }
+            }
+        }
+        log::info!("Total Metal pipeline count: {total} (built={built})");
+    }
+}
+
+impl Drop for MetalPipelineCache {
+    fn drop(&mut self) {
+        self.serialization_thread.wait_for_requests();
+    }
+}
+
+fn metal_pipeline_cache_path(shader_cache_dir: &Path, title_id: u64) -> Option<PathBuf> {
+    (title_id != 0).then(|| {
+        shader_cache_dir
+            .join(format!("{title_id:016x}"))
+            .join("metal.bin")
+    })
 }
 
 fn make_stencil_descriptor(state: MetalStencilFaceState) -> Retained<MTLStencilDescriptor> {
@@ -1836,6 +2159,62 @@ mod tests {
                 workgroup_size: [16, 4, 1],
                 ..base
             }
+        );
+    }
+
+    #[test]
+    fn compute_pipeline_key_cache_encoding_round_trips() {
+        let key = MetalComputePipelineKey {
+            unique_hash: 0x0123_4567_89ab_cdef,
+            shared_memory_size: 0x1020_3040,
+            workgroup_size: [3, 17, 257],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-metal-compute-key-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, key.to_cache_bytes()).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+
+        assert_eq!(
+            MetalComputePipelineKey::read_from_file(&mut file).unwrap(),
+            key
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn metal_pipeline_cache_path_is_title_scoped() {
+        let root = Path::new("shader");
+        assert_eq!(metal_pipeline_cache_path(root, 0), None);
+        assert_eq!(
+            metal_pipeline_cache_path(root, 0x0100_1520_0002_2000),
+            Some(root.join("0100152000022000").join("metal.bin"))
+        );
+    }
+
+    #[test]
+    fn disk_load_progress_counts_every_completed_pipeline() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let callback: DiskResourceLoadCallback = Arc::new(move |stage, value, total| {
+            callback_events.lock().unwrap().push((stage, value, total));
+        });
+        let mut state = DiskResourceLoadState { built: 0, total: 2 };
+
+        state.complete_one(&callback);
+        state.complete_one(&callback);
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                (LoadCallbackStage::Build, 1, 2),
+                (LoadCallbackStage::Build, 2, 2),
+            ]
         );
     }
 

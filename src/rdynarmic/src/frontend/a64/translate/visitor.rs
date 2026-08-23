@@ -311,23 +311,11 @@ impl<'a> TranslatorVisitor<'a> {
         vec: crate::frontend::a64::types::Vec,
         value: Value,
     ) {
-        let value_type = match value {
-            Value::Inst(inst_ref) => self.ir.base.block.inst_real_return_type(inst_ref),
-            value => value.get_type(),
-        };
-
-        let zero_extend_scalar_to_quad = |this: &mut Self, datasize: usize, value: Value| {
-            let value = match datasize {
-                8 => this.ir.ir().zero_extend_byte_to_long(value),
-                16 => this.ir.ir().zero_extend_half_to_long(value),
-                32 => this.ir.ir().zero_extend_word_to_long(value),
-                64 => value,
-                _ => panic!("Invalid FP/SIMD scalar datasize {}", datasize),
-            };
-            this.ir.ir().zero_extend_to_quad(value)
-        };
-
         if datasize == 128 {
+            let value_type = match value {
+                Value::Inst(inst_ref) => self.ir.base.block.inst_real_return_type(inst_ref),
+                value => value.get_type(),
+            };
             assert_eq!(
                 value_type,
                 crate::ir::types::Type::U128,
@@ -342,7 +330,7 @@ impl<'a> TranslatorVisitor<'a> {
             "Invalid FP/SIMD datasize {}",
             datasize
         );
-        let value = zero_extend_scalar_to_quad(self, datasize, value);
+        let value = self.ir.ir().zero_extend_to_quad(value);
         self.ir.set_q(vec, value);
     }
 
@@ -987,7 +975,21 @@ impl<'a> TranslatorVisitor<'a> {
             // SIMD scalar shift by immediate.
             USHR_1 => self.ushr_1(inst),
             SSHR_1 => self.sshr_1(inst),
+            USRA_1 => self.usra_1(inst),
+            SSRA_1 => self.ssra_1(inst),
+            URSHR_1 => self.urshr_1(inst),
+            SRSHR_1 => self.srshr_1(inst),
+            URSRA_1 => self.ursra_1(inst),
+            SRSRA_1 => self.srsra_1(inst),
+            SRI_1 => self.sri_1(inst),
+            SLI_1 => self.sli_1(inst),
             SHL_1 => self.shl_1(inst),
+            SQSHL_imm_1 => self.sqshl_imm_1(inst),
+            SQSHLU_1 => self.sqshlu_1(inst),
+            UQSHL_imm_1 => self.uqshl_imm_1(inst),
+            SQSHRN_1 => self.sqshrn_1(inst),
+            SQSHRUN_1 => self.sqshrun_1(inst),
+            UQSHRN_1 => self.uqshrn_1(inst),
             FCVTZS_fix_1 => self.fcvtzs_fix_1(inst),
             FCVTZU_fix_1 => self.fcvtzu_fix_1(inst),
             SCVTF_fix_1 => self.scvtf_fix_1(inst),

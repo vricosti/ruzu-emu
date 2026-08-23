@@ -9937,3 +9937,80 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify all
   four decoder identities, D/M/N register order, non-zero two-bit lane extraction, four result-lane
   writes, and the final destination write.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (generic extension and signed-to-unsigned saturated-shift builders)
+
+### Intentional differences
+- Rust resolves an instruction-backed `Value` through `Block::inst_real_return_type` because its
+  SSA references do not carry Eden's `UAny::GetType()` information inline. Immediate and
+  instruction inputs nevertheless select the same extension opcode.
+- Unsupported input types panic instead of reaching Eden's `UNREACHABLE`; both represent an
+  internal IR construction error rather than guest-visible validation.
+
+### Unintentional differences (to fix)
+- Fixed: `zero_extend_to_quad` directly emitted `ZeroExtendLongToQuad` for every input, omitting
+  Eden's preceding byte, half, or word extension. The generic sign/zero extension-to-word/long
+  helpers and indeterminate aliases now mirror the complete reviewed upstream helper family.
+- Fixed: `vector_signed_saturated_shift_left_unsigned` converted its U8 shift amount to a broadcast
+  U128 operand. It now passes the exact U8 immediate required by Eden's builder and opcode
+  signature.
+
+### Missing items
+- None for the reviewed generic extension helpers and
+  `VectorSignedSaturatedShiftLeftUnsigned` builder.
+
+### Binary layout verification
+- N/A: this slice changes SSA builder selection and operand typing only. Focused tests verify all
+  narrow-to-long opcode choices, identity behavior for already-wide values, the two-stage
+  narrow-to-quad chain, and the saturated-shift U8 operand without an extra broadcast.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/visitor.rs` vs Eden `frontend/A64/translate/impl/impl.cpp` (`V_scalar` write adapter)
+
+### Intentional differences
+- Rust retains a runtime U128 assertion for the 128-bit path because its `Value` type does not
+  encode Eden's compile-time `UAnyU128` constraint. Valid translated instructions observe the same
+  direct `SetQ` behavior.
+
+### Unintentional differences (to fix)
+- Fixed: scalar writes manually selected byte/half/word extensions from the requested data size
+  before calling the formerly U64-only quad helper. They now call the corrected generic
+  `zero_extend_to_quad(value)` exactly once, matching Eden's `V_scalar` implementation and the
+  value's actual IR type.
+
+### Missing items
+- None for the reviewed `V_scalar(bitsize, vec, value)` write behavior.
+
+### Binary layout verification
+- N/A: this adapter constructs SSA and defines no raw-copied payload. The generic extension tests
+  cover the resulting U8/U16/U32/U64-to-U128 chains.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_shift_by_immediate.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_shift_by_immediate.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract `immh`, `immb`, `Vn`, and `Vd` from `DecodedInst` before forwarding them
+  to file-local helpers; Eden's decoder passes those typed operands directly.
+- Rust uses `Fpcr::rmode()` and passes the resulting enum discriminant to its IR builders, which
+  store rounding mode as U8 metadata. This preserves Eden's FPCR-controlled conversion mode.
+- The unused `Narrowing::Truncation` variant is retained with a local dead-code allowance because
+  it belongs to Eden's helper enum even though this scalar instruction family currently invokes
+  only its two saturating modes.
+- Rust arithmetic builders take an explicit false carry input for Eden's non-flag-setting `Add`
+  operations.
+
+### Unintentional differences (to fix)
+- Fixed: SSRA, SRSHR, SRSRA, SQSHL-immediate, SQSHRN, USRA, URSHR, URSRA, SRI, SLI, SQSHLU,
+  UQSHL-immediate, SQSHRUN, and UQSHRN decoded but fell through to the non-upstream interpreter
+  terminal. All 14 now dispatch to their matching owner.
+- Fixed: the existing SSHR, USHR, SHL, FCVTZS, FCVTZU, SCVTF, and UCVTF visitors bypassed Eden's
+  file-local helper boundaries. The integer and FP paths now share the exact upstream helpers,
+  validation, operation ordering, and accumulation behavior.
+- Fixed: those existing integer and FP visitors applied `VectorGetElement` a second time to the
+  scalar returned by `v_scalar_read`. They now consume `V_scalar` directly as Eden does.
+
+### Missing items
+- None for the 21 visitors and six file-local helpers implemented by the reviewed Eden source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all 21
+  decoder identities, the six saturation opcodes, rounding/accumulation operation counts, single
+  scalar source extraction, and reserved-value handling without interpreter fallback.

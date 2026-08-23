@@ -2,6 +2,7 @@ use crate::ir::block::Block;
 use crate::ir::location::LocationDescriptor;
 use crate::ir::opcode::Opcode;
 use crate::ir::terminal::Terminal;
+use crate::ir::types::Type;
 use crate::ir::value::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,6 +49,13 @@ impl<'a> IREmitter<'a> {
     /// Internal: emit an instruction returning void (no result value).
     fn emit_void(&mut self, opcode: Opcode, args: &[Value]) {
         self.block.append(opcode, args);
+    }
+
+    fn value_type(&self, value: Value) -> Type {
+        match value {
+            Value::Inst(inst_ref) => self.block.inst_real_return_type(inst_ref),
+            value => value.get_type(),
+        }
     }
 
     /// Set the block terminal.
@@ -477,6 +485,26 @@ impl<'a> IREmitter<'a> {
 
     // --- Extensions ---
 
+    pub fn sign_extend_to_long(&mut self, a: Value) -> Value {
+        match self.value_type(a) {
+            Type::U8 => self.sign_extend_byte_to_long(a),
+            Type::U16 => self.sign_extend_half_to_long(a),
+            Type::U32 => self.sign_extend_word_to_long(a),
+            Type::U64 => a,
+            ty => panic!("Cannot sign-extend {ty:?} to U64"),
+        }
+    }
+
+    pub fn sign_extend_to_word(&mut self, a: Value) -> Value {
+        match self.value_type(a) {
+            Type::U8 => self.sign_extend_byte_to_word(a),
+            Type::U16 => self.sign_extend_half_to_word(a),
+            Type::U32 => a,
+            Type::U64 => self.least_significant_word(a),
+            ty => panic!("Cannot sign-extend {ty:?} to U32"),
+        }
+    }
+
     pub fn sign_extend_byte_to_word(&mut self, a: Value) -> Value {
         self.emit(Opcode::SignExtendByteToWord, &[a])
     }
@@ -517,8 +545,41 @@ impl<'a> IREmitter<'a> {
         self.emit(Opcode::ZeroExtendWordToLong, &[a])
     }
 
+    pub fn zero_extend_to_long(&mut self, a: Value) -> Value {
+        match self.value_type(a) {
+            Type::U8 => self.zero_extend_byte_to_long(a),
+            Type::U16 => self.zero_extend_half_to_long(a),
+            Type::U32 => self.zero_extend_word_to_long(a),
+            Type::U64 => a,
+            ty => panic!("Cannot zero-extend {ty:?} to U64"),
+        }
+    }
+
+    pub fn zero_extend_to_word(&mut self, a: Value) -> Value {
+        match self.value_type(a) {
+            Type::U8 => self.zero_extend_byte_to_word(a),
+            Type::U16 => self.zero_extend_half_to_word(a),
+            Type::U32 => a,
+            Type::U64 => self.least_significant_word(a),
+            ty => panic!("Cannot zero-extend {ty:?} to U32"),
+        }
+    }
+
     pub fn zero_extend_long_to_quad(&mut self, a: Value) -> Value {
         self.emit(Opcode::ZeroExtendLongToQuad, &[a])
+    }
+
+    pub fn zero_extend_to_quad(&mut self, a: Value) -> Value {
+        let extended = self.zero_extend_to_long(a);
+        self.zero_extend_long_to_quad(extended)
+    }
+
+    pub fn indeterminate_extend_to_word(&mut self, a: Value) -> Value {
+        self.zero_extend_to_word(a)
+    }
+
+    pub fn indeterminate_extend_to_long(&mut self, a: Value) -> Value {
+        self.zero_extend_to_long(a)
     }
 
     // --- Byte reverse ---
@@ -1176,7 +1237,6 @@ impl<'a> IREmitter<'a> {
         a: Value,
         shift: u8,
     ) -> Value {
-        let shift_vec = self.vector_broadcast(esize, Value::ImmU64(shift as u64));
         let op = match esize {
             8 => Opcode::VectorSignedSaturatedShiftLeftUnsigned8,
             16 => Opcode::VectorSignedSaturatedShiftLeftUnsigned16,
@@ -1184,7 +1244,7 @@ impl<'a> IREmitter<'a> {
             64 => Opcode::VectorSignedSaturatedShiftLeftUnsigned64,
             _ => panic!("Invalid esize {}", esize),
         };
-        self.emit(op, &[a, shift_vec])
+        self.emit(op, &[a, Value::ImmU8(shift)])
     }
 
     pub fn vector_unsigned_saturated_shift_left(
@@ -1770,10 +1830,6 @@ impl<'a> IREmitter<'a> {
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, Value::ImmU1(fpcr_controlled)])
-    }
-
-    pub fn zero_extend_to_quad(&mut self, a: Value) -> Value {
-        self.zero_extend_long_to_quad(a)
     }
 
     pub fn vector_interleave_lower(&mut self, esize: usize, a: Value, b: Value) -> Value {
@@ -2663,6 +2719,106 @@ mod tests {
         assert_eq!(block.inst_count(), 2);
         assert_eq!(block.get(InstRef(0)).opcode, Opcode::ZeroVector);
         assert_eq!(block.get(InstRef(1)).opcode, Opcode::VectorAdd32);
+    }
+
+    #[test]
+    fn generic_extension_helpers_select_upstream_opcodes_by_input_type() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let (
+            zero_byte,
+            zero_half,
+            zero_word,
+            zero_long,
+            sign_byte,
+            sign_half,
+            sign_word,
+            sign_long,
+        );
+        {
+            let mut e = IREmitter::new(&mut block);
+            zero_byte = e.zero_extend_to_long(Value::ImmU8(1));
+            zero_half = e.zero_extend_to_long(Value::ImmU16(2));
+            zero_word = e.zero_extend_to_long(Value::ImmU32(3));
+            zero_long = e.zero_extend_to_long(Value::ImmU64(4));
+            sign_byte = e.sign_extend_to_word(Value::ImmU8(5));
+            sign_half = e.sign_extend_to_word(Value::ImmU16(6));
+            sign_word = e.sign_extend_to_word(Value::ImmU32(7));
+            sign_long = e.sign_extend_to_word(Value::ImmU64(8));
+        }
+
+        assert_eq!(
+            block.get(zero_byte.inst_ref()).opcode,
+            Opcode::ZeroExtendByteToLong
+        );
+        assert_eq!(
+            block.get(zero_half.inst_ref()).opcode,
+            Opcode::ZeroExtendHalfToLong
+        );
+        assert_eq!(
+            block.get(zero_word.inst_ref()).opcode,
+            Opcode::ZeroExtendWordToLong
+        );
+        assert_eq!(zero_long, Value::ImmU64(4));
+        assert_eq!(
+            block.get(sign_byte.inst_ref()).opcode,
+            Opcode::SignExtendByteToWord
+        );
+        assert_eq!(
+            block.get(sign_half.inst_ref()).opcode,
+            Opcode::SignExtendHalfToWord
+        );
+        assert_eq!(sign_word, Value::ImmU32(7));
+        assert_eq!(
+            block.get(sign_long.inst_ref()).opcode,
+            Opcode::LeastSignificantWord
+        );
+    }
+
+    #[test]
+    fn zero_extend_to_quad_first_extends_narrow_inputs_to_long() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let (byte, half, word, long);
+        {
+            let mut e = IREmitter::new(&mut block);
+            byte = e.zero_extend_to_quad(Value::ImmU8(1));
+            half = e.zero_extend_to_quad(Value::ImmU16(2));
+            word = e.zero_extend_to_quad(Value::ImmU32(3));
+            long = e.zero_extend_to_quad(Value::ImmU64(4));
+        }
+
+        for (result, expected_inner) in [
+            (byte, Opcode::ZeroExtendByteToLong),
+            (half, Opcode::ZeroExtendHalfToLong),
+            (word, Opcode::ZeroExtendWordToLong),
+        ] {
+            let outer = block.get(result.inst_ref());
+            assert_eq!(outer.opcode, Opcode::ZeroExtendLongToQuad);
+            let inner = block.get(outer.args[0].inst_ref());
+            assert_eq!(inner.opcode, expected_inner);
+        }
+
+        let outer = block.get(long.inst_ref());
+        assert_eq!(outer.opcode, Opcode::ZeroExtendLongToQuad);
+        assert_eq!(outer.args[0], Value::ImmU64(4));
+    }
+
+    #[test]
+    fn signed_saturating_shift_left_unsigned_uses_upstream_u8_shift_operand() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let result;
+        {
+            let mut e = IREmitter::new(&mut block);
+            let operand = e.zero_vector();
+            result = e.vector_signed_saturated_shift_left_unsigned(16, operand, 7);
+        }
+
+        let inst = block.get(result.inst_ref());
+        assert_eq!(
+            inst.opcode,
+            Opcode::VectorSignedSaturatedShiftLeftUnsigned16
+        );
+        assert_eq!(inst.args[1], Value::ImmU8(7));
+        assert_eq!(block.inst_count(), 2);
     }
 
     #[test]

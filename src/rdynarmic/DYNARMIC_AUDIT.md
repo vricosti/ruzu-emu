@@ -131,7 +131,10 @@ validation blockers, not evidence against the focused slices.
   ownership change.
 - The A64 SM3/EOR3/BCAX crypto slice now owns and dispatches all seven visitors from Eden's
   `simd_crypto_four_register.cpp` and `simd_crypto_three_register.cpp`. This removes seven decoded
-  identities from the temporary interpreter fallback; 71 decoded A64 identities still require
-  their matching upstream translation owners before `Terminal::Interpret` can be removed.
+  identities from the temporary interpreter fallback.
+- The A64 scalar shift-by-immediate owner now contains all 21 Eden visitors and their six helper
+  boundaries. The 14 newly restored dispatch paths reduce the remaining decoded A64 interpreter
+  fallbacks to 57 identities. Its prerequisite also restored generic IR extension typing and the
+  signed-to-unsigned saturated-shift U8 operand.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

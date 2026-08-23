@@ -59,7 +59,7 @@ use super::metal_graphics_pipeline::{
 };
 use super::metal_pipeline_cache::MetalPipelineCache;
 use super::metal_pipeline_cache::MetalPipelineError;
-use super::metal_query_cache::{MetalQueryCache, MetalQueryCacheError};
+use super::metal_query_cache::{MetalQueryCache, MetalQueryCacheError, MetalQueryReport};
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 use super::metal_staging_buffer_pool::{MetalStagingBufferError, MetalStagingBufferPool};
 use super::metal_state_tracker::MetalStateTracker;
@@ -1367,16 +1367,20 @@ impl RasterizerInterface for MetalRasterizer {
         payload: u32,
         _subreport: u32,
     ) {
-        if let Err(error) = self.query_cache.report(
+        let report = self.query_cache.report(
             self.scheduler.as_mut(),
-            self.channel_memory_manager.as_deref(),
-            self.gpu_ticks_getter.as_ref(),
+            self.channel_memory_manager.clone(),
+            self.gpu_ticks_getter.clone(),
             gpu_addr,
             query_type,
             flags,
             payload,
-        ) {
-            log::error!("Metal query report failed: {error}");
+        );
+        match report {
+            Ok(MetalQueryReport::Complete) => {}
+            Ok(MetalQueryReport::SignalFence(operation)) => self.signal_fence(operation),
+            Ok(MetalQueryReport::SyncOperation(operation)) => self.sync_operation(operation),
+            Err(error) => log::error!("Metal query report failed: {error}"),
         }
     }
 

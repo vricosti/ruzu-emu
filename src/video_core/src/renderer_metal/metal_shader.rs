@@ -2322,6 +2322,7 @@ mod tests {
         let clip0 = shader_recompiler::ir::Attribute::CLIP_DISTANCE_0;
         program.info.stores.set(point_size.0 as usize, true);
         program.info.stores.set(clip0.0 as usize, true);
+        program.info.used_clip_distances = 1;
         program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
         program.blocks[0].append_new_inst(
             Opcode::SetAttribute,

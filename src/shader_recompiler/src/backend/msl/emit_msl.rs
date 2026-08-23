@@ -164,7 +164,6 @@ fn first_unsupported_program_feature(
         || info.uses_invocation_info
         || info.requires_layer_emulation
         || info.emulated_layer != 0
-        || info.used_clip_distances != 0
     {
         return Some("stage built-ins");
     }
@@ -3642,6 +3641,7 @@ mod tests {
         for attribute in [point_size, clip0, generic0_x] {
             program.info.stores.set(attribute.0 as usize, true);
         }
+        program.info.used_clip_distances = 1;
         program.blocks[0].append_new_inst(Opcode::Prologue, vec![]);
         program.blocks[0].append_new_inst(
             Opcode::SetAttribute,

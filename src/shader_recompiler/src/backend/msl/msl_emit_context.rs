@@ -49,6 +49,7 @@ pub struct MslEmitContext {
     uses_storage_subword_cas: bool,
     uses_shared_subword_cas: bool,
     uses_atomic_inc_dec_cas: bool,
+    storage_fp_cas_helpers: [bool; 7],
     uses_texture_cast: bool,
     tracks_helper_invocation: bool,
     uses_cbuf_indirect: bool,
@@ -667,6 +668,7 @@ impl MslEmitContext {
             uses_storage_subword_cas: false,
             uses_shared_subword_cas: false,
             uses_atomic_inc_dec_cas: false,
+            storage_fp_cas_helpers: [false; 7],
             uses_texture_cast: false,
             tracks_helper_invocation,
             uses_cbuf_indirect: program.info.uses_cbuf_indirect,
@@ -1549,6 +1551,20 @@ impl MslEmitContext {
         self.uses_atomic_inc_dec_cas = true;
     }
 
+    pub fn require_storage_fp_cas(&mut self, function: &str) {
+        let index = match function {
+            "spvAtomicAddF32" => 0,
+            "spvAtomicAddF16x2" => 1,
+            "spvAtomicAddF32x2" => 2,
+            "spvAtomicMinF16x2" => 3,
+            "spvAtomicMinF32x2" => 4,
+            "spvAtomicMaxF16x2" => 5,
+            "spvAtomicMaxF32x2" => 6,
+            _ => unreachable!("unknown storage FP CAS helper {function}"),
+        };
+        self.storage_fp_cas_helpers[index] = true;
+    }
+
     fn unsupported_value_name(value: &Value) -> &'static str {
         match value {
             Value::Inst(_) => "undefined instruction",
@@ -1730,6 +1746,34 @@ impl MslEmitContext {
             ty => ty,
         };
         self.define(inst_ref, ty, expression, false)
+    }
+
+    fn define_storage_fp_cas_helper(
+        source: &mut String,
+        name: &str,
+        value_type: &str,
+        unpack: &str,
+        operation: &str,
+        pack: &str,
+    ) {
+        source.push_str(&format!(
+            "inline {value_type} {name}(device atomic_uint* pointer, {value_type} value) {{\n"
+        ));
+        source.push_str(concat!(
+            "    uint expected = atomic_load_explicit(pointer, memory_order_relaxed);\n",
+            "    while (true) {\n",
+        ));
+        source.push_str(&format!("        {value_type} original = {unpack};\n"));
+        source.push_str(&format!(
+            "        {value_type} result = {operation};\n        uint desired = {pack};\n"
+        ));
+        source.push_str(concat!(
+            "        if (atomic_compare_exchange_weak_explicit(pointer, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {\n",
+            "            return original;\n",
+            "        }\n",
+            "    }\n",
+            "}\n\n",
+        ));
     }
 
     pub fn emit_set_position(
@@ -1950,6 +1994,73 @@ impl MslEmitContext {
                 "    }\n",
                 "}\n\n",
             ));
+        }
+        const STORAGE_FP_CAS_HELPERS: [(&str, &str, &str, &str, &str); 7] = [
+            (
+                "spvAtomicAddF32",
+                "float",
+                "as_type<float>(expected)",
+                "original + value",
+                "as_type<uint>(result)",
+            ),
+            (
+                "spvAtomicAddF16x2",
+                "half2",
+                "as_type<half2>(expected)",
+                "original + value",
+                "as_type<uint>(result)",
+            ),
+            (
+                "spvAtomicAddF32x2",
+                "float2",
+                "float2(as_type<half2>(expected))",
+                "original + value",
+                "as_type<uint>(half2(result))",
+            ),
+            (
+                "spvAtomicMinF16x2",
+                "half2",
+                "as_type<half2>(expected)",
+                "fmin(original, value)",
+                "as_type<uint>(result)",
+            ),
+            (
+                "spvAtomicMinF32x2",
+                "float2",
+                "float2(as_type<half2>(expected))",
+                "fmin(original, value)",
+                "as_type<uint>(half2(result))",
+            ),
+            (
+                "spvAtomicMaxF16x2",
+                "half2",
+                "as_type<half2>(expected)",
+                "fmax(original, value)",
+                "as_type<uint>(result)",
+            ),
+            (
+                "spvAtomicMaxF32x2",
+                "float2",
+                "float2(as_type<half2>(expected))",
+                "fmax(original, value)",
+                "as_type<uint>(half2(result))",
+            ),
+        ];
+        for (enabled, (name, value_type, unpack, operation, pack)) in self
+            .storage_fp_cas_helpers
+            .into_iter()
+            .zip(STORAGE_FP_CAS_HELPERS)
+        {
+            if enabled {
+                Self::define_storage_fp_cas_helper(
+                    &mut source,
+                    name,
+                    value_type,
+                    unpack,
+                    operation,
+                    pack,
+                );
+            }
         }
         if self.uses_texture_cast {
             source.push_str(concat!(

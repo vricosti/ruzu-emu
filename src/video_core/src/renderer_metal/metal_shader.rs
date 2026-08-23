@@ -2782,6 +2782,7 @@ mod tests {
             Opcode::StorageAtomicSMin32,
             vec![Value::ImmU32(0), Value::ImmU32(8), Value::ImmU32(u32::MAX)],
         );
+        shader_recompiler::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
         let spirv = emit_spirv(&program, &profile, &runtime_info);
         let active = compile_native_shader(
             device.device(),
@@ -2805,6 +2806,88 @@ mod tests {
         assert_eq!(shader.bindings(), active.bindings());
         assert!(shader.source().source.contains("spvAtomicInc"));
         assert!(shader.source().source.contains("atomic_fetch_min_explicit"));
+    }
+
+    #[test]
+    fn compiles_direct_msl_storage_fp_atomics_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Compute);
+        program.info.storage_buffers_descriptors.push(
+            shader_recompiler::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicAddF32,
+            vec![Value::ImmU32(0), Value::ImmU32(12), Value::ImmF32(0.5)],
+        );
+        let half_x =
+            program.blocks[0].append_new_inst(Opcode::ConvertF16F32, vec![Value::ImmF32(1.0)]);
+        let half_y =
+            program.blocks[0].append_new_inst(Opcode::ConvertF16F32, vec![Value::ImmF32(2.0)]);
+        let half_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF16x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: half_x,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: half_y,
+                }),
+            ],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicMinF16x2,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(16),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: half_value,
+                }),
+            ],
+        );
+        let float_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicMaxF32x2,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(20),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: float_value,
+                }),
+            ],
+        );
+        shader_recompiler::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+
+        let mut bindings = Bindings::default();
+        let shader = compile_direct_msl_shader_with_bindings(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+            &mut bindings,
+        )
+        .expect("direct floating-point storage atomic MSL must compile with Metal");
+
+        assert!(shader.source().source.contains("spvAtomicAddF32"));
+        assert!(shader.source().source.contains("spvAtomicMinF16x2"));
+        assert!(shader.source().source.contains("spvAtomicMaxF32x2"));
     }
 
     #[test]

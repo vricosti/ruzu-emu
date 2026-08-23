@@ -77,6 +77,14 @@ fn varying_mask_has_only_vertex_outputs(mask: &[u64; 8]) -> bool {
     })
 }
 
+fn program_uses_any_opcode(program: &ir::Program, opcodes: &[Opcode]) -> bool {
+    program
+        .blocks
+        .iter()
+        .flat_map(|block| block.iter())
+        .any(|inst| opcodes.contains(&inst.opcode))
+}
+
 fn first_unsupported_program_feature(
     program: &ir::Program,
     profile: &Profile,
@@ -147,16 +155,20 @@ fn first_unsupported_program_feature(
     if info.uses_global_memory && !profile.support_int64 {
         return Some("global memory without 64-bit integers");
     }
-    if info.uses_global_increment
-        || info.uses_global_decrement
-        || info.uses_atomic_f32_add
-        || info.uses_atomic_f16x2_add
-        || info.uses_atomic_f16x2_min
-        || info.uses_atomic_f16x2_max
-        || info.uses_atomic_f32x2_add
-        || info.uses_atomic_f32x2_min
-        || info.uses_atomic_f32x2_max
-        || info.uses_int64_bit_atomics
+    if program_uses_any_opcode(
+        program,
+        &[
+            Opcode::GlobalAtomicInc32,
+            Opcode::GlobalAtomicDec32,
+            Opcode::GlobalAtomicAddF32,
+            Opcode::GlobalAtomicAddF16x2,
+            Opcode::GlobalAtomicAddF32x2,
+            Opcode::GlobalAtomicMinF16x2,
+            Opcode::GlobalAtomicMinF32x2,
+            Opcode::GlobalAtomicMaxF16x2,
+            Opcode::GlobalAtomicMaxF32x2,
+        ],
+    ) || info.uses_int64_bit_atomics
     {
         return Some("memory operations");
     }
@@ -778,6 +790,15 @@ fn emit_inst(
         | Opcode::StorageAtomicXor32
         | Opcode::StorageAtomicExchange32 => {
             emit_msl_atomic::emit_storage_atomic(context, inst_ref, inst)
+        }
+        Opcode::StorageAtomicAddF32
+        | Opcode::StorageAtomicAddF16x2
+        | Opcode::StorageAtomicAddF32x2
+        | Opcode::StorageAtomicMinF16x2
+        | Opcode::StorageAtomicMinF32x2
+        | Opcode::StorageAtomicMaxF16x2
+        | Opcode::StorageAtomicMaxF32x2 => {
+            emit_msl_atomic::emit_storage_atomic_fp(context, inst_ref, inst)
         }
         Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
             emit_msl_image::emit_image_sample(context, program, inst_ref, inst)
@@ -3083,6 +3104,56 @@ mod tests {
                 vec![Value::ImmU32(0), Value::ImmU32(8), Value::ImmU32(9)],
             );
         }
+        block.append_new_inst(
+            Opcode::StorageAtomicAddF32,
+            vec![Value::ImmU32(0), Value::ImmU32(12), Value::ImmF32(1.5)],
+        );
+        let half_value = block.append_new_inst(
+            Opcode::CompositeConstructF16x2,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0x4000)],
+        );
+        let float_value = block.append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
+        );
+        for opcode in [
+            Opcode::StorageAtomicAddF16x2,
+            Opcode::StorageAtomicMinF16x2,
+            Opcode::StorageAtomicMaxF16x2,
+        ] {
+            block.append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(16),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: half_value,
+                    }),
+                ],
+            );
+        }
+        for opcode in [
+            Opcode::StorageAtomicAddF32x2,
+            Opcode::StorageAtomicMinF32x2,
+            Opcode::StorageAtomicMaxF32x2,
+        ] {
+            block.append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(20),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: float_value,
+                    }),
+                ],
+            );
+        }
+
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+        assert!(program.info.uses_global_increment);
+        assert!(program.info.uses_global_decrement);
 
         let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
         let source = &artifact.source.source;
@@ -3100,6 +3171,21 @@ mod tests {
         assert!(source.contains(
             "uint desired = expected == 0u || expected > limit ? limit : expected - 1u;"
         ));
+        for helper in [
+            "spvAtomicAddF32",
+            "spvAtomicAddF16x2",
+            "spvAtomicAddF32x2",
+            "spvAtomicMinF16x2",
+            "spvAtomicMinF32x2",
+            "spvAtomicMaxF16x2",
+            "spvAtomicMaxF32x2",
+        ] {
+            assert!(source.contains(helper), "missing {helper} in:\n{source}");
+        }
+        assert!(source.contains("float original = as_type<float>(expected);"));
+        assert!(source.contains("half2 original = as_type<half2>(expected);"));
+        assert!(source.contains("float2 original = float2(as_type<half2>(expected));"));
+        assert!(source.contains("uint desired = as_type<uint>(half2(result));"));
     }
 
     #[test]

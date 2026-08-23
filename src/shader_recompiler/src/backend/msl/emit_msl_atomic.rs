@@ -160,3 +160,65 @@ pub fn emit_storage_atomic(
         unsigned_atomic_expression(context, operation(inst.opcode), &pointer, "device", &value);
     context.define(inst_ref, Type::U32, expression, false)
 }
+
+pub fn emit_storage_atomic_fp(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let binding = immediate_binding(inst)?;
+    let word = context.storage_buffer_word_expression(inst_ref, binding, inst.arg(1), 0)?;
+    let value = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let (helper, result_type, expression) = match inst.opcode {
+        Opcode::StorageAtomicAddF32 => (
+            "spvAtomicAddF32",
+            Type::F32,
+            format!("spvAtomicAddF32(reinterpret_cast<device atomic_uint*>(&{word}), {value})"),
+        ),
+        Opcode::StorageAtomicAddF16x2 => (
+            "spvAtomicAddF16x2",
+            Type::U32,
+            format!(
+                "as_type<uint>(spvAtomicAddF16x2(reinterpret_cast<device atomic_uint*>(&{word}), {value}))"
+            ),
+        ),
+        Opcode::StorageAtomicAddF32x2 => (
+            "spvAtomicAddF32x2",
+            Type::U32,
+            format!(
+                "as_type<uint>(half2(spvAtomicAddF32x2(reinterpret_cast<device atomic_uint*>(&{word}), {value})))"
+            ),
+        ),
+        Opcode::StorageAtomicMinF16x2 => (
+            "spvAtomicMinF16x2",
+            Type::U32,
+            format!(
+                "as_type<uint>(spvAtomicMinF16x2(reinterpret_cast<device atomic_uint*>(&{word}), {value}))"
+            ),
+        ),
+        Opcode::StorageAtomicMinF32x2 => (
+            "spvAtomicMinF32x2",
+            Type::U32,
+            format!(
+                "as_type<uint>(half2(spvAtomicMinF32x2(reinterpret_cast<device atomic_uint*>(&{word}), {value})))"
+            ),
+        ),
+        Opcode::StorageAtomicMaxF16x2 => (
+            "spvAtomicMaxF16x2",
+            Type::U32,
+            format!(
+                "as_type<uint>(spvAtomicMaxF16x2(reinterpret_cast<device atomic_uint*>(&{word}), {value}))"
+            ),
+        ),
+        Opcode::StorageAtomicMaxF32x2 => (
+            "spvAtomicMaxF32x2",
+            Type::U32,
+            format!(
+                "as_type<uint>(half2(spvAtomicMaxF32x2(reinterpret_cast<device atomic_uint*>(&{word}), {value})))"
+            ),
+        ),
+        _ => unreachable!("not a floating-point storage atomic: {:?}", inst.opcode),
+    };
+    context.require_storage_fp_cas(helper);
+    context.define(inst_ref, result_type, expression, false)
+}

@@ -47,6 +47,7 @@ mod simd_shift_by_immediate;
 mod simd_table_lookup;
 mod simd_three_different;
 mod simd_three_same;
+mod simd_three_same_extra;
 mod simd_two_register_misc;
 mod simd_vector_x_indexed_element;
 mod sys_dc;

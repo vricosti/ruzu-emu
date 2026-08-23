@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1057 passed, 4 ignored). These are
+(1062 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -167,5 +167,9 @@ validation blockers, not evidence against the focused slices.
 - The A64 vector three-different owner now contains all 20 visitors defined by Eden and its four
   file-local helpers. PMULL and SQDMULL reduce the remaining decoded A64 interpreter fallbacks to
   four identities, with exact element-size validation and selected-half reads.
+- The A64 vector three-same-extra owner now mirrors Eden as its own file, with SDOT, UDOT, FCMLA,
+  FCADD, and the file-local dot-product helper. Restoring those final four dispatch paths leaves no
+  decoded A64 identity routed through the temporary interpreter fallback; signed/unsigned byte
+  extension, accumulation, complex rotations, fused operations, and size validation follow Eden.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

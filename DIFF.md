@@ -10289,3 +10289,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both
   restored identities at every encoded size, reserved combinations, selected lower/upper halves,
   and absence of interpreter fallback.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_three_same_extra.rs` vs Eden `frontend/A64/translate/impl/{simd_three_same_extra.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`;
+  the `DotProduct` helper and its extension-function parameter remain file-local.
+- Rust gives the extension-function pointer an explicit emitter lifetime because a C++ member
+  pointer has no direct Rust representation. It still selects the matching generic IR method at
+  the same two visitor call sites.
+- FCMLA and FCADD use initialized tuple values for each rotation because Rust forbids Eden's
+  declaration-then-assignment form. Each branch emits the same element reads and negations before
+  the same multiply-add or add operations.
+
+### Unintentional differences (to fix)
+- Fixed: SDOT, UDOT, FCMLA, and FCADD decoded but fell through to the temporary interpreter
+  terminal. All four now preserve Eden's size validation, vector widths, lane iteration,
+  signed/unsigned extension, accumulation, complex rotations, FP operation ordering, and writes.
+
+### Missing items
+- None for the four visitors and the file-local dot-product helper defined by the reviewed C++
+  source and header.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both dot
+  product signedness modes, rejected sizes, all FCMLA/FCADD rotations, 32/64-bit FP operation
+  selection, and absence of interpreter fallback.

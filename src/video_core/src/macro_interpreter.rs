@@ -660,40 +660,6 @@ mod tests {
         }
     }
 
-    // ── Helper: encode an opcode from fields ─────────────────────────────
-
-    /// Build an opcode from individual fields.
-    fn encode_opcode(
-        operation: u32,
-        result_op: u32,
-        is_exit: bool,
-        dst: u32,
-        src_a: u32,
-        src_b: u32,
-    ) -> u32 {
-        (operation & 0x7)
-            | ((result_op & 0x7) << 4)
-            | ((is_exit as u32) << 7)
-            | ((dst & 0x7) << 8)
-            | ((src_a & 0x7) << 11)
-            | ((src_b & 0x7) << 14)
-    }
-
-    /// Build an ALU opcode.
-    fn encode_alu(
-        alu_op: u32,
-        result_op: u32,
-        is_exit: bool,
-        dst: u32,
-        src_a: u32,
-        src_b: u32,
-    ) -> u32 {
-        let base = encode_opcode(0, result_op, is_exit, dst, src_a, src_b);
-        // ALU operation goes in bits[21:17], which overlaps bits[16:14] (src_b).
-        // Clear bits[31:14] and re-encode alu_op + src_b carefully.
-        (base & 0x3FFF) | ((src_b & 0x7) << 14) | ((alu_op & 0x1F) << 17)
-    }
-
     /// Build an AddImmediate opcode (operation=1). Immediate is in bits[31:14].
     fn encode_add_imm(result_op: u32, is_exit: bool, dst: u32, src_a: u32, imm: i32) -> u32 {
         let base = (1u32) // operation = AddImmediate

@@ -1146,26 +1146,25 @@ impl ComputeEnvironment {
 
     #[cfg(test)]
     fn qmd_for_test(&self) -> Option<(u32, [ConstBufferConfig; 8], u64, u32, bool)> {
-        unsafe { self.kepler_compute.as_ref() }
-            .map(|kepler_compute| {
-                let qmd = kepler_compute.launch_description();
-                (
-                    qmd.const_buffer_enable_mask,
-                    qmd.const_buffers,
-                    kepler_compute.tic_address(),
-                    kepler_compute.tic_limit(),
-                    qmd.linked_tsc,
-                )
-            })
-            .or_else(|| {
-                Some((
-                    self.detached_state.const_buffer_enable_mask,
-                    self.detached_state.const_buffers,
-                    self.detached_state.tic_address,
-                    self.detached_state.tic_limit,
-                    self.detached_state.linked_tsc,
-                ))
-            })
+        if !self.kepler_compute.is_null() {
+            let kepler_compute = self.kepler_compute();
+            let qmd = kepler_compute.launch_description();
+            Some((
+                qmd.const_buffer_enable_mask,
+                qmd.const_buffers,
+                kepler_compute.tic_address(),
+                kepler_compute.tic_limit(),
+                qmd.linked_tsc,
+            ))
+        } else {
+            Some((
+                self.detached_state.const_buffer_enable_mask,
+                self.detached_state.const_buffers,
+                self.detached_state.tic_address,
+                self.detached_state.tic_limit,
+                self.detached_state.linked_tsc,
+            ))
+        }
     }
 
     pub fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
@@ -1295,26 +1294,6 @@ impl ComputeEnvironment {
     /// mutable `GenericEnvironment` base owner.
     pub fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
         &mut self.base
-    }
-
-    #[cfg(test)]
-    fn set_detached_const_buffer_enable_mask(&mut self, enable_mask: u32) {
-        self.detached_state.const_buffer_enable_mask = enable_mask;
-        self.kepler_compute = std::ptr::null();
-    }
-
-    #[cfg(test)]
-    fn set_detached_const_buffer(&mut self, index: usize, cbuf: ConstBufferConfig) {
-        self.detached_state.const_buffers[index] = cbuf;
-        self.kepler_compute = std::ptr::null();
-    }
-
-    #[cfg(test)]
-    fn set_detached_texture_state(&mut self, tic_address: u64, tic_limit: u32, linked_tsc: bool) {
-        self.detached_state.tic_address = tic_address;
-        self.detached_state.tic_limit = tic_limit;
-        self.detached_state.linked_tsc = linked_tsc;
-        self.kepler_compute = std::ptr::null();
     }
 }
 
@@ -2241,18 +2220,6 @@ mod tests {
             }
         });
         (reader, log)
-    }
-
-    fn make_mapped_memory_manager(
-        gpu_base: u64,
-        cpu_base: u64,
-        size: u64,
-    ) -> Arc<ParkingLotMutex<MemoryManager>> {
-        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(gpu_base, cpu_base, size, 0, false);
-        memory_manager
     }
 
     fn make_owner_backed_memory_manager(

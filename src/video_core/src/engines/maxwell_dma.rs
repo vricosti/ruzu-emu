@@ -1390,6 +1390,10 @@ mod tests {
         // Trigger DMA launch
         eng.write_reg(LAUNCH_DMA, MULTI_LINE_PITCH_TO_PITCH_LAUNCH);
         assert!(eng.pending_launch);
+        assert_eq!(
+            eng.launch_data_transfer_type(),
+            LAUNCH_DATA_TRANSFER_NON_PIPELINED
+        );
     }
 
     #[test]

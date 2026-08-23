@@ -1153,6 +1153,10 @@ mod tests {
         };
         program.info.uses_typeless_image_reads = format == ImageFormat::Typeless && is_read;
         program.info.uses_typeless_image_writes = format == ImageFormat::Typeless && is_written;
+        program.info.uses_image_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        );
         program.info.image_descriptors.push(ImageDescriptor {
             texture_type,
             format,

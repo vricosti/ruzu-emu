@@ -174,9 +174,6 @@ fn first_unsupported_program_feature(
     if info.uses_int64 && !profile.support_int64 {
         return Some("64-bit integers on the selected Metal device");
     }
-    if info.uses_image_1d {
-        return Some("1D images");
-    }
     if info.uses_sparse_residency {
         return Some("sparse image residency");
     }
@@ -1340,6 +1337,10 @@ mod tests {
         };
         program.info.uses_typeless_image_reads = format == ImageFormat::Typeless && is_read;
         program.info.uses_typeless_image_writes = format == ImageFormat::Typeless && is_written;
+        program.info.uses_image_1d = matches!(
+            texture_type,
+            TextureType::Color1D | TextureType::ColorArray1D
+        );
         program.info.image_descriptors.push(ImageDescriptor {
             texture_type,
             format,

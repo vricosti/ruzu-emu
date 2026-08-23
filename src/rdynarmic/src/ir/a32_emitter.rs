@@ -1,4 +1,5 @@
 use crate::frontend::a32::types::{ExtReg, Reg};
+use crate::interface::a32::arch_version::ArchVersion;
 use crate::interface::a32::coprocessor_util::CoprocReg;
 use crate::ir::acc_type::AccType;
 use crate::ir::block::Block;
@@ -13,6 +14,7 @@ use crate::ir::value::Value;
 pub struct A32IREmitter<'a> {
     pub base: IREmitter<'a>,
     pub current_location: Option<A32LocationDescriptor>,
+    arch_version: ArchVersion,
 }
 
 impl<'a> A32IREmitter<'a> {
@@ -20,6 +22,7 @@ impl<'a> A32IREmitter<'a> {
         Self {
             base: IREmitter::new(block),
             current_location: None,
+            arch_version: ArchVersion::V8,
         }
     }
 
@@ -27,6 +30,36 @@ impl<'a> A32IREmitter<'a> {
         Self {
             base: IREmitter::new(block),
             current_location: Some(location),
+            arch_version: ArchVersion::V8,
+        }
+    }
+
+    /// Construct an A32 emitter with the configured guest architecture.
+    ///
+    /// Upstream owner: `A32::IREmitter::IREmitter`.
+    pub fn with_location_and_arch(
+        block: &'a mut Block,
+        location: A32LocationDescriptor,
+        arch_version: ArchVersion,
+    ) -> Self {
+        Self {
+            base: IREmitter::new(block),
+            current_location: Some(location),
+            arch_version,
+        }
+    }
+
+    /// Numeric guest architecture level.
+    ///
+    /// Upstream owner: `A32::IREmitter::ArchVersion`.
+    pub const fn arch_version(&self) -> usize {
+        match self.arch_version {
+            ArchVersion::V3 => 3,
+            ArchVersion::V4 | ArchVersion::V4T => 4,
+            ArchVersion::V5TE => 5,
+            ArchVersion::V6K | ArchVersion::V6T2 => 6,
+            ArchVersion::V7 => 7,
+            ArchVersion::V8 => 8,
         }
     }
 
@@ -622,9 +655,7 @@ impl<'a> A32IREmitter<'a> {
 
     pub fn alu_write_pc(&mut self, value: Value) {
         let loc = self.current_location.expect("current_location not set");
-        // ruzu currently executes Switch AArch32 codepaths, which follow
-        // dynarmic's ArchVersion() >= 7 behavior here.
-        if !loc.t_flag() {
+        if self.arch_version() >= 7 && !loc.t_flag() {
             self.bx_write_pc(value);
         } else {
             self.branch_write_pc(value);
@@ -632,7 +663,11 @@ impl<'a> A32IREmitter<'a> {
     }
 
     pub fn load_write_pc(&mut self, value: Value) {
-        self.bx_write_pc(value);
+        if self.arch_version() >= 5 {
+            self.bx_write_pc(value);
+        } else {
+            self.branch_write_pc(value);
+        }
     }
 
     pub fn align_pc(&self, alignment: u32) -> u32 {
@@ -656,6 +691,27 @@ mod tests {
     use crate::frontend::a32::types::Reg;
     use crate::ir::block::Block;
     use crate::ir::value::InstRef;
+
+    #[test]
+    fn arch_version_numbers_match_upstream_emitter() {
+        let loc = A32LocationDescriptor::at(0);
+        for (version, expected) in [
+            (ArchVersion::V3, 3),
+            (ArchVersion::V4, 4),
+            (ArchVersion::V4T, 4),
+            (ArchVersion::V5TE, 5),
+            (ArchVersion::V6K, 6),
+            (ArchVersion::V6T2, 6),
+            (ArchVersion::V7, 7),
+            (ArchVersion::V8, 8),
+        ] {
+            let mut block = Block::new(loc.to_location());
+            assert_eq!(
+                A32IREmitter::with_location_and_arch(&mut block, loc, version).arch_version(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn test_a32_emitter_register_ops() {
@@ -801,15 +857,45 @@ mod tests {
     }
 
     #[test]
-    fn test_a32_emitter_alu_write_pc_arm_uses_bx_write_pc() {
+    fn alu_write_pc_arm_uses_bx_from_arch_v7() {
         let loc = A32LocationDescriptor::at(0x5000).set_t_flag(false);
         let mut block = Block::new(loc.to_location());
         {
-            let mut e = A32IREmitter::with_location(&mut block, loc);
+            let mut e = A32IREmitter::with_location_and_arch(&mut block, loc, ArchVersion::V7);
             e.alu_write_pc(Value::ImmU32(0x1235));
         }
         assert_eq!(block.inst_count(), 1);
         assert_eq!(block.get(InstRef(0)).opcode, Opcode::A32BXWritePC);
+    }
+
+    #[test]
+    fn alu_write_pc_arm_uses_branch_before_arch_v7() {
+        let loc = A32LocationDescriptor::at(0x5000).set_t_flag(false);
+        let mut block = Block::new(loc.to_location());
+        {
+            let mut e = A32IREmitter::with_location_and_arch(&mut block, loc, ArchVersion::V6T2);
+            e.alu_write_pc(Value::ImmU32(0x1235));
+        }
+        assert_eq!(block.inst_count(), 2);
+        assert_eq!(block.get(InstRef(0)).opcode, Opcode::And32);
+        assert_eq!(block.get(InstRef(1)).opcode, Opcode::A32SetRegister);
+    }
+
+    #[test]
+    fn load_write_pc_switches_behavior_at_arch_v5() {
+        let loc = A32LocationDescriptor::at(0x5000);
+
+        let mut v4_block = Block::new(loc.to_location());
+        A32IREmitter::with_location_and_arch(&mut v4_block, loc, ArchVersion::V4)
+            .load_write_pc(Value::ImmU32(0x1235));
+        assert_eq!(v4_block.get(InstRef(0)).opcode, Opcode::And32);
+        assert_eq!(v4_block.get(InstRef(1)).opcode, Opcode::A32SetRegister);
+
+        let mut v5_block = Block::new(loc.to_location());
+        A32IREmitter::with_location_and_arch(&mut v5_block, loc, ArchVersion::V5TE)
+            .load_write_pc(Value::ImmU32(0x1235));
+        assert_eq!(v5_block.inst_count(), 1);
+        assert_eq!(v5_block.get(InstRef(0)).opcode, Opcode::A32BXWritePC);
     }
 
     #[test]

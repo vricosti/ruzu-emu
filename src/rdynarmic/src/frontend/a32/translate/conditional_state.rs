@@ -18,6 +18,8 @@ use crate::ir::location::A32LocationDescriptor;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
+use super::TranslationOptions;
+
 /// Tracks the conditional state during block translation.
 /// Matches upstream dynarmic `ConditionalState` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,12 +156,13 @@ pub fn translate_conditional_thumb16(
     ir: &mut A32IREmitter,
     decoded: &DecodedThumb16,
     cond: Cond,
+    options: TranslationOptions,
 ) -> bool {
     let nzcv = ir.get_cpsr();
     let passed = emit_cond_check(ir, cond, nzcv);
     ir.set_check_bit(passed);
 
-    let cont = super::translate_thumb16_instruction(ir, decoded);
+    let cont = super::translate_thumb16_instruction(ir, decoded, options);
 
     if cont {
         let loc = ir.current_location.expect("location not set");
@@ -178,12 +181,13 @@ pub fn translate_conditional_thumb32(
     ir: &mut A32IREmitter,
     decoded: &DecodedThumb32,
     cond: Cond,
+    options: TranslationOptions,
 ) -> bool {
     let nzcv = ir.get_cpsr();
     let passed = emit_cond_check(ir, cond, nzcv);
     ir.set_check_bit(passed);
 
-    let cont = super::translate_thumb32_instruction(ir, decoded);
+    let cont = super::translate_thumb32_instruction(ir, decoded, options);
 
     if cont {
         let loc = ir.current_location.expect("location not set");

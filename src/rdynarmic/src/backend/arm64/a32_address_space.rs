@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use crate::backend::common::a32_callbacks::{self, A32ExclusiveState};
 use crate::exclusive_monitor::ExclusiveMonitor;
-use crate::frontend::a32::translate::translate;
+use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
+use crate::frontend::a32::translate::{translate, TranslationOptions};
 use crate::ir::block::Block;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
@@ -721,8 +722,16 @@ impl A32AddressSpace {
 
     pub fn generate_ir(&self, descriptor: LocationDescriptor) -> Block {
         let a32_descriptor = A32LocationDescriptor::from_location(descriptor);
-        let read_code = |vaddr: u32| self.conf.callbacks.memory_read_code(vaddr as u64);
-        let mut block = translate(a32_descriptor, &read_code);
+        let callbacks = UserCallbacksAdapter::new(self.conf.callbacks.as_ref());
+        let mut block = translate(
+            a32_descriptor,
+            &callbacks,
+            TranslationOptions {
+                arch_version: self.conf.arch_version,
+                define_unpredictable_behaviour: self.conf.define_unpredictable_behaviour,
+                hook_hint_instructions: self.conf.hook_hint_instructions,
+            },
+        );
         dump_a32_ir_if_requested("pre-opt", &block);
 
         if self
@@ -1267,6 +1276,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,

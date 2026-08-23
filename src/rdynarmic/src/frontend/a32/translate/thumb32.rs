@@ -8,6 +8,8 @@ use crate::ir::acc_type::AccType;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
+use super::TranslationOptions;
+
 fn thumb32_unpredictable(ir: &mut A32IREmitter) -> bool {
     // Full RaiseException lifecycle (UpdateUpperLocationDescriptor +
     // BranchWritePC(PC+4) + terminal), not just the bare opcode + terminal.
@@ -15,7 +17,11 @@ fn thumb32_unpredictable(ir: &mut A32IREmitter) -> bool {
 }
 
 /// Translate a single Thumb32 instruction. Returns true to continue.
-pub fn translate_thumb32(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
+pub fn translate_thumb32(
+    ir: &mut A32IREmitter,
+    inst: &DecodedThumb32,
+    options: TranslationOptions,
+) -> bool {
     use Thumb32InstId::*;
     match inst.id {
         // Data processing (modified immediate)
@@ -152,12 +158,33 @@ pub fn translate_thumb32(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
         SVC => thumb32_svc(ir, inst),
         UDF | BKPT => thumb32_control::thumb32_udf(ir),
         NOP => thumb32_control::thumb32_nop(),
-        SEV => thumb32_control::thumb32_sev(),
-        WFE => thumb32_control::thumb32_wfe(ir),
-        WFI => thumb32_control::thumb32_wfi(ir),
-        YIELD => thumb32_control::thumb32_yield(ir),
+        SEV => thumb32_control::thumb32_sev(ir, options),
+        SEVL => thumb32_control::thumb32_sevl(ir, options),
+        WFE => thumb32_control::thumb32_wfe(ir, options),
+        WFI => thumb32_control::thumb32_wfi(ir, options),
+        YIELD => thumb32_control::thumb32_yield(ir, options),
 
-        PLD_imm | PLD_lit => true, // hints
+        PLD_lit => thumb32_control::thumb32_pld(ir, false, options),
+        PLD_imm8 | PLD_imm12 => {
+            let write_intent = ((inst.raw >> 21) & 1) != 0;
+            thumb32_control::thumb32_pld(ir, write_intent, options)
+        }
+        PLD_reg => {
+            if inst.rm() == Reg::PC {
+                super::unpredictable_instruction(ir)
+            } else {
+                let write_intent = ((inst.raw >> 21) & 1) != 0;
+                thumb32_control::thumb32_pld(ir, write_intent, options)
+            }
+        }
+        PLI_lit | PLI_imm8 | PLI_imm12 => thumb32_control::thumb32_pli(ir, options),
+        PLI_reg => {
+            if inst.rm() == Reg::PC {
+                super::unpredictable_instruction(ir)
+            } else {
+                thumb32_control::thumb32_pli(ir, options)
+            }
+        }
 
         // Unmatched Thumb32 encoding → UndefinedInstruction with the full
         // RaiseException lifecycle (PC+4 for a 4-byte Thumb32 instruction),
@@ -1345,6 +1372,24 @@ mod tests {
     use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
     use crate::ir::opcode::Opcode;
 
+    fn translated_exception(raw: u32, options: TranslationOptions) -> Option<u64> {
+        let loc = A32LocationDescriptor::at(0x1000).set_t_flag(true);
+        let decoded = decode_thumb32((raw >> 16) as u16, raw as u16);
+        let mut block = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut block, loc);
+            translate_thumb32(&mut ir, &decoded, options);
+        }
+        block
+            .instructions
+            .iter()
+            .find(|instruction| instruction.opcode == Opcode::A32ExceptionRaised)
+            .and_then(|instruction| match instruction.args[1] {
+                Value::ImmU64(value) => Some(value),
+                _ => None,
+            })
+    }
+
     #[test]
     fn thumb32_unknown_raises_undefined_with_full_lifecycle() {
         use crate::ir::terminal::Terminal;
@@ -1359,6 +1404,7 @@ mod tests {
                     raw: 0,
                     id: Thumb32InstId::Unknown,
                 },
+                TranslationOptions::default(),
             )
         };
         assert!(!cont);
@@ -1384,6 +1430,56 @@ mod tests {
             Terminal::CheckHalt { ref else_ }
                 if matches!(else_.as_ref(), Terminal::ReturnToDispatch)
         ));
+    }
+
+    #[test]
+    fn thumb32_hint_families_raise_upstream_exceptions() {
+        use crate::frontend::a32::types::Exception;
+
+        for (raw, expected) in [
+            (0xF3AF_8005, Exception::SendEventLocal),
+            (0xF81F_F123, Exception::PreloadData),
+            (0xF835_FC12, Exception::PreloadDataWithIntentToWrite),
+            (0xF895_F123, Exception::PreloadData),
+            (0xF91F_F123, Exception::PreloadInstruction),
+            (0xF915_FC12, Exception::PreloadInstruction),
+        ] {
+            assert_eq!(
+                translated_exception(raw, TranslationOptions::default()),
+                Some(expected.as_u32() as u64),
+                "raw={raw:08X}"
+            );
+            assert_eq!(
+                translated_exception(
+                    raw,
+                    TranslationOptions {
+                        hook_hint_instructions: false,
+                        ..TranslationOptions::default()
+                    }
+                ),
+                None,
+                "disabled raw={raw:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn thumb32_preload_register_pc_is_unpredictable_before_hook_option() {
+        use crate::frontend::a32::types::Exception;
+
+        for raw in [0xF815_F00F, 0xF915_F00F] {
+            assert_eq!(
+                translated_exception(
+                    raw,
+                    TranslationOptions {
+                        hook_hint_instructions: false,
+                        ..TranslationOptions::default()
+                    }
+                ),
+                Some(Exception::UnpredictableInstruction.as_u32() as u64),
+                "raw={raw:08X}"
+            );
+        }
     }
 
     #[test]

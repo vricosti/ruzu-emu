@@ -1,13 +1,19 @@
 use super::helpers::emit_imm_shift;
 use crate::frontend::a32::decoder_thumb16::{DecodedThumb16, Thumb16InstId};
-use crate::frontend::a32::types::{Reg, ShiftType};
+use crate::frontend::a32::types::{Exception, Reg, ShiftType};
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::acc_type::AccType;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
+use super::TranslationOptions;
+
 /// Translate a single Thumb16 instruction. Returns true to continue.
-pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
+pub fn translate_thumb16(
+    ir: &mut A32IREmitter,
+    inst: &DecodedThumb16,
+    options: TranslationOptions,
+) -> bool {
     use Thumb16InstId::*;
     match inst.id {
         // Shift immediate
@@ -97,13 +103,12 @@ pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
         REVSH => thumb16_revsh(ir, inst),
 
         // Misc
-        NOP | SEV | YIELD => true,
-        WFE | WFI => {
-            // Upstream: WFE/WFI are NOPs when hook_hint_instructions is false.
-            // They just continue execution (return true = continue translating).
-            // Only when hook_hint_instructions is true do they raise an exception.
-            true
-        }
+        NOP => true,
+        SEV => thumb16_hint(ir, options, Exception::SendEvent),
+        SEVL => thumb16_hint(ir, options, Exception::SendEventLocal),
+        WFE => thumb16_hint(ir, options, Exception::WaitForEvent),
+        WFI => thumb16_hint(ir, options, Exception::WaitForInterrupt),
+        YIELD => thumb16_hint(ir, options, Exception::Yield),
         BKPT => super::raise_exception_with_instruction_size(
             ir,
             crate::frontend::a32::types::Exception::Breakpoint,
@@ -129,6 +134,13 @@ pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
             2,
         ),
     }
+}
+
+fn thumb16_hint(ir: &mut A32IREmitter, options: TranslationOptions, exception: Exception) -> bool {
+    if !options.hook_hint_instructions {
+        return true;
+    }
+    super::raise_exception_with_instruction_size(ir, exception, 2)
 }
 
 // --- Shift immediate ---
@@ -1228,7 +1240,11 @@ mod tests {
             id: Thumb16InstId::UDF,
         };
 
-        assert!(!translate_thumb16(&mut ir, &inst));
+        assert!(!translate_thumb16(
+            &mut ir,
+            &inst,
+            TranslationOptions::default(),
+        ));
         let exception = block
             .instructions
             .iter()
@@ -1245,6 +1261,42 @@ mod tests {
                 && inst.args[0] == Value::ImmU32(0x4002)
                 && inst.args[1] == Value::ImmU32(0xFFFF_FFFE)
         }));
+    }
+
+    #[test]
+    fn thumb16_hint_option_selects_nop_or_exception() {
+        let loc = A32LocationDescriptor::new(0x4000, PSR::new(0x20), FPSCR::default(), false);
+        let inst = DecodedThumb16 {
+            raw: 0xBF30,
+            id: Thumb16InstId::WFI,
+        };
+
+        let mut disabled = Block::new(loc.to_location());
+        assert!(translate_thumb16(
+            &mut A32IREmitter::with_location(&mut disabled, loc),
+            &inst,
+            TranslationOptions {
+                hook_hint_instructions: false,
+                ..TranslationOptions::default()
+            },
+        ));
+        assert!(disabled.instructions.is_empty());
+
+        let mut enabled = Block::new(loc.to_location());
+        assert!(!translate_thumb16(
+            &mut A32IREmitter::with_location(&mut enabled, loc),
+            &inst,
+            TranslationOptions::default(),
+        ));
+        let exception = enabled
+            .instructions
+            .iter()
+            .find(|instruction| instruction.opcode == Opcode::A32ExceptionRaised)
+            .expect("missing A32ExceptionRaised");
+        assert_eq!(
+            exception.args[1],
+            Value::ImmU64(crate::frontend::a32::types::Exception::WaitForInterrupt.as_u32() as u64)
+        );
     }
 
     #[test]

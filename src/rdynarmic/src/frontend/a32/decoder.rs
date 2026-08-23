@@ -201,6 +201,7 @@ pub enum ArmInstId {
     PLD_imm,
     PLD_reg,
     SEV,
+    SEVL,
     WFE,
     WFI,
     YIELD,
@@ -501,25 +502,40 @@ pub fn decode_arm(instr: u32) -> DecodedArm {
     let op1 = (instr >> 25) & 0x7;
     let op = (instr >> 4) & 0xF;
 
-    let id = match (cond_bits, op1) {
-        // Unconditional instructions (cond=0xF)
-        (0xF, _) => decode_arm_unconditional(instr),
-        // Data processing & misc
-        (_, 0b000) => decode_arm_dp_misc(instr),
-        (_, 0b001) => decode_arm_dp_imm_misc(instr),
-        // Load/Store immediate offset
-        (_, 0b010) => decode_arm_ls_imm(instr),
-        // Load/Store register offset
-        (_, 0b011) if op & 1 == 0 => decode_arm_ls_reg(instr),
-        (_, 0b011) => decode_arm_media(instr),
-        // Load/Store multiple
-        (_, 0b100) => decode_arm_ls_multi(instr),
-        // Branch
-        (_, 0b101) => decode_arm_branch(instr),
-        // Coprocessor / SVC
-        (_, 0b110) => decode_arm_coproc_ls(instr),
-        (_, 0b111) => decode_arm_coproc_svc(instr),
-        _ => ArmInstId::Unknown,
+    // Upstream arm.inc lists the architectural hint encodings before the
+    // data-processing-immediate family. The low-nibble values 6..=15 are
+    // reserved hints and, like upstream's catch-all entry, decode as NOP.
+    let id = if matches_arm(instr, 0x0FFF_FFF0, 0x0320_F000) {
+        match instr & 0xF {
+            0 => ArmInstId::NOP,
+            1 => ArmInstId::YIELD,
+            2 => ArmInstId::WFE,
+            3 => ArmInstId::WFI,
+            4 => ArmInstId::SEV,
+            5 => ArmInstId::SEVL,
+            _ => ArmInstId::NOP,
+        }
+    } else {
+        match (cond_bits, op1) {
+            // Unconditional instructions (cond=0xF)
+            (0xF, _) => decode_arm_unconditional(instr),
+            // Data processing & misc
+            (_, 0b000) => decode_arm_dp_misc(instr),
+            (_, 0b001) => decode_arm_dp_imm_misc(instr),
+            // Load/Store immediate offset
+            (_, 0b010) => decode_arm_ls_imm(instr),
+            // Load/Store register offset
+            (_, 0b011) if op & 1 == 0 => decode_arm_ls_reg(instr),
+            (_, 0b011) => decode_arm_media(instr),
+            // Load/Store multiple
+            (_, 0b100) => decode_arm_ls_multi(instr),
+            // Branch
+            (_, 0b101) => decode_arm_branch(instr),
+            // Coprocessor / SVC
+            (_, 0b110) => decode_arm_coproc_ls(instr),
+            (_, 0b111) => decode_arm_coproc_svc(instr),
+            _ => ArmInstId::Unknown,
+        }
     };
 
     DecodedArm { raw: instr, id }
@@ -1634,6 +1650,21 @@ mod tests {
         // Upstream arm_PLD_reg: 11110111uz01nnnn1111iiiiitt0mmmm.
         let dec = decode_arm(0xF795_F000);
         assert_eq!(dec.id, ArmInstId::PLD_reg);
+    }
+
+    #[test]
+    fn test_decode_arm_hints_match_upstream_priority() {
+        for (raw, expected) in [
+            (0xE320_F000, ArmInstId::NOP),
+            (0x1320_F001, ArmInstId::YIELD),
+            (0x2320_F002, ArmInstId::WFE),
+            (0x3320_F003, ArmInstId::WFI),
+            (0x4320_F004, ArmInstId::SEV),
+            (0x5320_F005, ArmInstId::SEVL),
+            (0xE320_F00F, ArmInstId::NOP),
+        ] {
+            assert_eq!(decode_arm(raw).id, expected);
+        }
     }
 
     #[test]

@@ -907,6 +907,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,

@@ -174,13 +174,20 @@ pub enum Thumb32InstId {
     BKPT,
     NOP,
     SEV,
+    SEVL,
     WFE,
     WFI,
     YIELD,
 
     // Hints / IT
-    PLD_imm,
     PLD_lit,
+    PLD_reg,
+    PLD_imm8,
+    PLD_imm12,
+    PLI_lit,
+    PLI_reg,
+    PLI_imm8,
+    PLI_imm12,
 
     Unknown,
 }
@@ -423,7 +430,29 @@ pub fn thumb_expand_imm_c(imm12: u32, carry_in: bool) -> (u32, bool) {
 /// Decode a 32-bit Thumb instruction from two halfwords.
 pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
     let raw = ((hw1 as u32) << 16) | (hw2 as u32);
-    let id = if matches_thumb32(raw, 0xEFF0_0000, 0xEC40_0000) {
+    // Exact upstream thumb32.inc hint/preload encodings. These precede the
+    // broader load-byte and branch groups in the generated decoder.
+    let id = if raw == 0xF3AF_8005 {
+        Thumb32InstId::SEVL
+    } else if matches_thumb32(raw, 0xFF7F_F000, 0xF81F_F000)
+        || matches_thumb32(raw, 0xFF7F_F000, 0xF83F_F000)
+    {
+        Thumb32InstId::PLD_lit
+    } else if matches_thumb32(raw, 0xFFD0_FFC0, 0xF810_F000) {
+        Thumb32InstId::PLD_reg
+    } else if matches_thumb32(raw, 0xFFD0_FF00, 0xF810_FC00) {
+        Thumb32InstId::PLD_imm8
+    } else if matches_thumb32(raw, 0xFFD0_F000, 0xF890_F000) {
+        Thumb32InstId::PLD_imm12
+    } else if matches_thumb32(raw, 0xFF7F_F000, 0xF91F_F000) {
+        Thumb32InstId::PLI_lit
+    } else if matches_thumb32(raw, 0xFFF0_FFC0, 0xF910_F000) {
+        Thumb32InstId::PLI_reg
+    } else if matches_thumb32(raw, 0xFFF0_FF00, 0xF910_FC00) {
+        Thumb32InstId::PLI_imm8
+    } else if matches_thumb32(raw, 0xFFF0_F000, 0xF990_F000) {
+        Thumb32InstId::PLI_imm12
+    } else if matches_thumb32(raw, 0xEFF0_0000, 0xEC40_0000) {
         Thumb32InstId::MCRR
     } else if matches_thumb32(raw, 0xEFF0_0000, 0xEC50_0000) {
         Thumb32InstId::MRRC
@@ -698,6 +727,7 @@ fn decode_thumb32_hints(raw: u32) -> Thumb32InstId {
         2 => Thumb32InstId::WFE,
         3 => Thumb32InstId::WFI,
         4 => Thumb32InstId::SEV,
+        5 => Thumb32InstId::SEVL,
         _ if op == 4 => Thumb32InstId::DSB,
         _ if op == 5 => Thumb32InstId::DMB,
         _ if op == 6 => Thumb32InstId::ISB,
@@ -927,6 +957,28 @@ mod tests {
         let hw2: u16 = 0xD000; // J1=0, J2=1, imm11=0
         let dec = decode_thumb32(hw1, hw2);
         assert_eq!(dec.id, Thumb32InstId::BL);
+    }
+
+    #[test]
+    fn test_decode_thumb32_hint_and_preload_families() {
+        for (raw, expected) in [
+            (0xF3AF_8005u32, Thumb32InstId::SEVL),
+            (0xF81F_F123, Thumb32InstId::PLD_lit),
+            (0xF83F_F123, Thumb32InstId::PLD_lit),
+            (0xF815_F012, Thumb32InstId::PLD_reg),
+            (0xF835_FC12, Thumb32InstId::PLD_imm8),
+            (0xF895_F123, Thumb32InstId::PLD_imm12),
+            (0xF91F_F123, Thumb32InstId::PLI_lit),
+            (0xF915_F012, Thumb32InstId::PLI_reg),
+            (0xF915_FC12, Thumb32InstId::PLI_imm8),
+            (0xF995_F123, Thumb32InstId::PLI_imm12),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
     }
 
     #[test]

@@ -2515,6 +2515,8 @@ impl ArmDynarmic64 {
             fastmem_pointer,
             page_table_pointer,
             define_unpredictable_behaviour: true,
+            arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,
             cntfrq_el0: common::wall_clock::CNTFRQ as u32,

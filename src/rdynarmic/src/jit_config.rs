@@ -4,8 +4,44 @@
 /// access, system calls, tick counting, and other host interactions.
 pub trait UserCallbacks: Send {
     /// Read a 32-bit instruction word from guest memory.
-    /// Returns None if the address is unmapped.
-    fn memory_read_code(&self, vaddr: u64) -> Option<u32>;
+    ///
+    /// Upstream defaults this to `MemoryRead32`; users that model executable
+    /// permissions may override it and return `None` for unmapped code.
+    fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+        Some(self.memory_read_32(vaddr))
+    }
+
+    /// Called before an A32 instruction is read during translation.
+    /// Returning `false` stops translation and requires the callback to set a
+    /// terminal on `ir`.
+    ///
+    /// Upstream: `A32::UserCallbacks::PreCodeReadHook`.
+    fn pre_code_read_hook(
+        &self,
+        _is_thumb: bool,
+        _pc: u32,
+        _ir: &mut crate::ir::a32_emitter::A32IREmitter<'_>,
+    ) -> bool {
+        true
+    }
+
+    /// Called after an A32 instruction is read and before it is translated.
+    ///
+    /// Upstream: `A32::UserCallbacks::PreCodeTranslationHook`.
+    fn pre_code_translation_hook(
+        &self,
+        _is_thumb: bool,
+        _pc: u32,
+        _ir: &mut crate::ir::a32_emitter::A32IREmitter<'_>,
+    ) {
+    }
+
+    /// Return the guest tick cost of an A32 instruction.
+    ///
+    /// Upstream: `A32::UserCallbacks::GetTicksForCode`.
+    fn get_ticks_for_code(&self, _is_thumb: bool, _vaddr: u32, _instruction: u32) -> u64 {
+        1
+    }
 
     /// Read 8 bits from guest memory.
     fn memory_read_8(&self, vaddr: u64) -> u8;
@@ -263,6 +299,14 @@ pub struct JitConfig {
     /// Whether to define unpredictable behaviour.
     /// Matches upstream `A32::UserConfig::define_unpredictable_behaviour`.
     pub define_unpredictable_behaviour: bool,
+
+    /// A32 guest architecture version selected for translation.
+    /// Matches upstream `A32::UserConfig::arch_version`.
+    pub arch_version: crate::interface::a32::arch_version::ArchVersion,
+
+    /// Whether A32 hint instructions raise their corresponding exceptions.
+    /// Matches upstream `A32::UserConfig::hook_hint_instructions`.
+    pub hook_hint_instructions: bool,
 
     /// Processor ID for multi-core tracking.
     /// Matches upstream `A32::UserConfig::processor_id`.

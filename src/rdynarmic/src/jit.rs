@@ -9,6 +9,8 @@ use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn, DEFAULT_CO
 use crate::backend::x64::callback::ArgCallback;
 use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig, RawExclusiveWriteCallbacks};
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
+use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
+use crate::frontend::a32::translate::TranslationOptions as A32TranslationOptions;
 use crate::frontend::a64::translate::TranslationOptions;
 use crate::halt_reason::HaltReason;
 use crate::ir::location::LocationDescriptor;
@@ -3127,6 +3129,11 @@ impl A32Jit {
             emit_config,
             run_callbacks,
             effective_optimizations,
+            A32TranslationOptions {
+                arch_version: config.arch_version,
+                define_unpredictable_behaviour: config.define_unpredictable_behaviour,
+                hook_hint_instructions: config.hook_hint_instructions,
+            },
             cache_size,
         )?;
 
@@ -3162,7 +3169,7 @@ impl A32Jit {
         // does it compile (with EnableWriting/DisableWriting inside Emit()).
         // RunCode() just calls the stored function pointer — no mprotect ever.
         let location = LocationDescriptor::new(self.inner.jit_state.get_unique_hash());
-        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn UserCallbacks;
         let emitter = self.inner.emitter.as_mut().unwrap();
 
         // Fast path: block already compiled — no mprotect needed.
@@ -3170,16 +3177,13 @@ impl A32Jit {
             ptr
         } else {
             // Slow path: need to compile — toggle W^X protections.
-            let read_code = move |vaddr: u32| -> Option<u32> {
-                let inner = unsafe { &*inner_ptr };
-                inner.callbacks.memory_read_code(vaddr as u64)
-            };
-            let is_read_only = move |vaddr: u32| -> bool {
-                let inner = unsafe { &*inner_ptr };
-                inner.callbacks.is_read_only_memory(vaddr)
-            };
+            let callbacks = unsafe { &*callbacks_ptr };
+            let translate_callbacks = UserCallbacksAdapter::new(callbacks);
+            let is_read_only =
+                move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
             let _ = emitter.make_writable();
-            let ptr = emitter.get_or_compile_block_with_ro(location, &read_code, &is_read_only);
+            let ptr =
+                emitter.get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
             // Restore RX after compilation.
             let _ = unsafe { emitter.get_run_code_fn() };
             ptr
@@ -3220,27 +3224,22 @@ impl A32Jit {
         );
         let location = a32_loc.set_single_stepping(true).to_location();
 
-        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn UserCallbacks;
 
         if let Some(ref mut emitter) = self.inner.emitter {
             let _ = emitter.make_writable();
         }
 
-        let read_code = move |vaddr: u32| -> Option<u32> {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.memory_read_code(vaddr as u64)
-        };
-        let is_read_only = move |vaddr: u32| -> bool {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.is_read_only_memory(vaddr)
-        };
+        let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
+        let is_read_only =
+            move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
 
         let code_ptr = self
             .inner
             .emitter
             .as_mut()
             .unwrap()
-            .get_or_compile_block_with_ro(location, &read_code, &is_read_only);
+            .get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
 
         let step_fn = {
             let emitter = self.inner.emitter.as_mut().unwrap();
@@ -3513,26 +3512,21 @@ impl A32Jit {
         );
         let location = a32_loc.to_location();
 
-        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn UserCallbacks;
 
         if let Some(ref mut emitter) = self.inner.emitter {
             let _ = emitter.make_writable();
         }
 
-        let read_code = move |vaddr: u32| -> Option<u32> {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.memory_read_code(vaddr as u64)
-        };
-        let is_read_only = move |vaddr: u32| -> bool {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.is_read_only_memory(vaddr)
-        };
+        let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
+        let is_read_only =
+            move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
 
         self.inner
             .emitter
             .as_mut()
             .unwrap()
-            .get_or_compile_block_with_ro(location, &read_code, &is_read_only)
+            .get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only)
     }
 }
 
@@ -3792,6 +3786,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
 
     let location = LocationDescriptor::new(inner.jit_state.get_unique_hash());
 
+    let callbacks_ptr = inner.callbacks.as_ref() as *const dyn UserCallbacks;
     let emitter = inner.emitter.as_mut().unwrap();
 
     // Fast path: block already compiled — no mprotect needed.
@@ -3800,17 +3795,13 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
     }
 
     // Slow path: compile new block
-    let read_code = move |vaddr: u32| -> Option<u32> {
-        let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-        inner.callbacks.memory_read_code(vaddr as u64)
-    };
-    let is_read_only = move |vaddr: u32| -> bool {
-        let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-        inner.callbacks.is_read_only_memory(vaddr)
-    };
+    let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
+    let is_read_only =
+        move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
 
     let _ = emitter.make_writable();
-    let code_ptr = emitter.get_or_compile_block_with_ro(location, &read_code, &is_read_only);
+    let code_ptr =
+        emitter.get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
     let _ = unsafe { emitter.get_run_code_fn() };
     code_ptr as u64
 }
@@ -4501,6 +4492,8 @@ mod tests {
             fastmem_pointer: Some(mapping.ptr.cast()),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4572,6 +4565,8 @@ mod tests {
             fastmem_pointer: Some(mapping.ptr.cast()),
             page_table_pointer: Some(page_table.as_ptr().cast()),
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4635,6 +4630,8 @@ mod tests {
             fastmem_pointer: Some(mapping.ptr.cast()),
             page_table_pointer: Some(page_table.as_ptr().cast()),
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4701,6 +4698,8 @@ mod tests {
             fastmem_pointer: Some(mapping.ptr.cast()),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4758,6 +4757,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4880,6 +4881,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4918,6 +4921,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4960,6 +4965,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -4998,6 +5005,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5049,6 +5058,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5089,6 +5100,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5129,6 +5142,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5173,6 +5188,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5229,6 +5246,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5278,6 +5297,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5335,6 +5356,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5399,6 +5422,8 @@ mod tests {
             fastmem_pointer: Some(fastmem_pointer),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5472,6 +5497,8 @@ mod tests {
             fastmem_pointer: Some(fastmem_pointer),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5530,6 +5557,8 @@ mod tests {
             fastmem_pointer: Some(fastmem.ptr.cast()),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5615,6 +5644,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5662,6 +5693,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5707,6 +5740,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5767,6 +5802,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -5821,6 +5858,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -6246,6 +6285,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -6549,6 +6590,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -6736,6 +6779,8 @@ mod tests {
                 fastmem_pointer: None,
                 page_table_pointer: None,
                 define_unpredictable_behaviour: false,
+                arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+                hook_hint_instructions: false,
                 processor_id: 0,
                 wall_clock_cntpct: false,
                 cntfrq_el0: 600_000_000,
@@ -6831,6 +6876,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -6860,6 +6907,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -6906,6 +6955,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -6961,6 +7012,8 @@ mod tests {
                 fastmem_pointer: None,
                 page_table_pointer: None,
                 define_unpredictable_behaviour: false,
+                arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+                hook_hint_instructions: false,
                 processor_id: 0,
                 wall_clock_cntpct: false,
                 cntfrq_el0: 600_000_000,
@@ -7022,6 +7075,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7070,6 +7125,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7131,6 +7188,8 @@ mod tests {
             fastmem_pointer: Some(fastmem_pointer),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7211,6 +7270,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7277,6 +7338,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7315,6 +7378,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7359,6 +7424,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7407,6 +7474,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7435,6 +7504,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7492,6 +7563,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7521,6 +7594,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7561,6 +7636,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7604,6 +7681,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7677,6 +7756,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7712,6 +7793,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7780,6 +7863,8 @@ mod tests {
                 fastmem_pointer: None,
                 page_table_pointer: None,
                 define_unpredictable_behaviour: false,
+                arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+                hook_hint_instructions: false,
                 processor_id: 0,
                 wall_clock_cntpct: false,
                 cntfrq_el0: 600_000_000,
@@ -7837,6 +7922,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7883,6 +7970,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7921,6 +8010,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -7960,6 +8051,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8020,6 +8113,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8071,6 +8166,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8122,6 +8219,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8175,6 +8274,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8229,6 +8330,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8282,6 +8385,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8329,6 +8434,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8369,6 +8476,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8438,6 +8547,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8487,6 +8598,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8553,6 +8666,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8605,6 +8720,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8661,6 +8778,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8716,6 +8835,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8783,6 +8904,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8846,6 +8969,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8904,6 +9029,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -8964,6 +9091,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9037,6 +9166,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9092,6 +9223,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9156,6 +9289,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9220,6 +9355,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9290,6 +9427,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9349,6 +9488,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9418,6 +9559,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9519,6 +9662,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9611,6 +9756,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9706,6 +9853,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9833,6 +9982,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9877,6 +10028,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9917,6 +10070,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -9992,6 +10147,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10100,6 +10257,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10149,6 +10308,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10207,6 +10368,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10266,6 +10429,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10325,6 +10490,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10608,6 +10775,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -10669,6 +10838,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11379,6 +11550,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11421,6 +11594,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11642,6 +11817,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11726,6 +11903,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11845,6 +12024,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11899,6 +12080,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -11941,6 +12124,8 @@ mod tests {
             fastmem_pointer: None,
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
@@ -12013,6 +12198,8 @@ mod tests {
             fastmem_pointer: Some(mapping.ptr.cast()),
             page_table_pointer: None,
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,

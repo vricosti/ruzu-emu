@@ -2030,6 +2030,8 @@ mod tests {
             fastmem_pointer: Some(0x1000 as *mut u8),
             page_table_pointer: Some(0x2000 as *const u8),
             define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             processor_id: 3,
             wall_clock_cntpct: true,
             cntfrq_el0: 600_000_000,

@@ -1,8 +1,10 @@
 use crate::frontend::a32::decoder_thumb32::DecodedThumb32;
-use crate::frontend::a32::types::Reg;
+use crate::frontend::a32::types::{Exception, Reg};
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
+
+use super::TranslationOptions;
 
 /// Rust counterpart of upstream dynarmic
 /// `frontend/A32/translate/impl/thumb32_control.cpp`.
@@ -39,23 +41,44 @@ pub fn thumb32_nop() -> bool {
     true
 }
 
-pub fn thumb32_sev() -> bool {
-    true
+pub fn thumb32_sev(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::SendEvent)
 }
 
-pub fn thumb32_wfe(ir: &mut A32IREmitter) -> bool {
-    let _ = ir;
-    true
+pub fn thumb32_sevl(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::SendEventLocal)
 }
 
-pub fn thumb32_wfi(_ir: &mut A32IREmitter) -> bool {
-    // Upstream: NOP when hook_hint_instructions is false (default)
-    true
+pub fn thumb32_wfe(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::WaitForEvent)
 }
 
-pub fn thumb32_yield(ir: &mut A32IREmitter) -> bool {
-    let _ = ir;
-    true
+pub fn thumb32_wfi(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::WaitForInterrupt)
+}
+
+pub fn thumb32_yield(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::Yield)
+}
+
+pub fn thumb32_pld(ir: &mut A32IREmitter, write_intent: bool, options: TranslationOptions) -> bool {
+    let exception = if write_intent {
+        Exception::PreloadDataWithIntentToWrite
+    } else {
+        Exception::PreloadData
+    };
+    thumb32_hint(ir, options, exception)
+}
+
+pub fn thumb32_pli(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::PreloadInstruction)
+}
+
+fn thumb32_hint(ir: &mut A32IREmitter, options: TranslationOptions, exception: Exception) -> bool {
+    if !options.hook_hint_instructions {
+        return true;
+    }
+    super::raise_exception(ir, exception)
 }
 
 pub fn thumb32_udf(ir: &mut A32IREmitter) -> bool {

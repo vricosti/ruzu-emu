@@ -2697,6 +2697,8 @@ impl ArmDynarmic32 {
             page_table_pointer,
             // Upstream: config.define_unpredictable_behaviour = true
             define_unpredictable_behaviour: true,
+            arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
             // Upstream: config.processor_id = m_core_index
             processor_id: core_index as usize,
             // Upstream: config.wall_clock_cntpct = m_uses_wall_clock

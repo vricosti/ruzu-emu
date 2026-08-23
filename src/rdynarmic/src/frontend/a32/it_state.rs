@@ -33,6 +33,9 @@ impl ITState {
 
     /// Get the condition code for the current instruction in the IT block.
     pub fn cond(self) -> Cond {
+        if self.0 == 0 {
+            return Cond::AL;
+        }
         // Upper 4 bits encode the condition
         let c = (self.0 >> 4) & 0xF;
         Cond::from_u8(c)
@@ -56,6 +59,7 @@ mod tests {
     fn test_it_state_empty() {
         let it = ITState::new(0);
         assert!(!it.is_in_it_block());
+        assert_eq!(it.cond(), Cond::AL);
     }
 
     #[test]

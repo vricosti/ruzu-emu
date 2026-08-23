@@ -78,8 +78,19 @@ lowered to exact `DCZVA` writes using the configured block size. With hooking
 enabled, x64 and arm64 forward the operation/value pair to the user callback.
 `CTR_EL0` and `DCZID_EL0` are now configurable rather than backend constants.
 
+The A32 translation slice now mirrors Eden's `TranslateCallbacks` boundary and
+its separate ARM and Thumb loop owners. Both backends preserve the exact
+`PreCodeReadHook` → aligned code read → `PreCodeTranslationHook` →
+`GetTicksForCode` ordering, including early termination and custom cycle
+counts. `TranslationOptions` now carries the configured architecture version,
+unpredictable-behavior policy, and hint-hook policy. The architecture version
+also reaches `A32IREmitter::ALUWritePC` and `LoadWritePC` at Eden's v7/v5
+thresholds. The option audit additionally restored the missing `SEVL`, Thumb32
+`PLD/PLDW`, and Thumb32 `PLI` decoder and exception paths.
+
 Focused frontend, x64/arm64 emitter, CP15, IR-emitter, opcode-metadata, and A64
-cache runtime tests pass. The cache runtime and emitter tests pass natively on
+cache runtime tests pass. The A32 callback/options decoder and translation
+tests also pass. The cache runtime and emitter tests pass natively on
 x64 and under AArch64 QEMU; native Linux, Linux AArch64, and Windows x64 checks
 pass. The complete
 unit suite has a pre-existing x64 fastmem-test failure (`A32 fastmem path
@@ -95,6 +106,11 @@ the focused A32 coprocessor slice.
 - `common/fp/process_exception.rs` logs floating-point exception raising as
   unimplemented rather than following Eden's exception-state behavior.
 - The arm64 backend reports unimplemented vector-saturation opcodes.
+- A32 and A64 still share one public `JitConfig` instead of matching Eden's
+  separate `interface/A32/config.h` and `interface/A64/config.h` owners.
+- Several A32 instruction families remain aggregated in broad Rust modules;
+  notably the Thumb32 preload methods are not yet owned by a matching
+  `thumb32_load_byte.rs` counterpart.
 
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

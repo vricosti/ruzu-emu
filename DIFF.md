@@ -8608,11 +8608,96 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/translate/{translate_arm,tra
   emitters, and JIT guard exception are removed.
 
 ### Missing items
-- The reviewed Rust translation loop still lacks Eden's `PreCodeReadHook`,
-  `PreCodeTranslationHook`, and per-instruction `GetTicksForCode` callback ownership. This broader
-  callback/configuration gap predates the removed diagnostic and requires its own structural slice.
+- Resolved by the later A32 translation callbacks/options slice: the loop now owns
+  `PreCodeReadHook`, `PreCodeTranslationHook`, and per-instruction `GetTicksForCode` in matching
+  callback and ARM/Thumb modules.
 
 ### Binary layout verification
 - PASS: the removed opcode and its five operands were host-internal IR only and were not serialized,
   raw-copied, or guest-visible. The exact audit now reports 725 opcodes on both sides, zero missing
   or extra operations, zero shared-signature mismatches, and complete one-to-one metadata coverage.
+
+## 2026-08-23 — `src/rdynarmic/src/interface/a32/arch_version.rs`, `frontend/a32/translate/a32_translate.rs`, and `ir/a32_emitter.rs` vs Eden A32 architecture/translation options
+
+Eden files: `src/dynarmic/src/dynarmic/interface/A32/{arch_version.h,config.h}`,
+`frontend/A32/translate/a32_translate.{h,cpp}`, and
+`frontend/A32/a32_ir_emitter.{h,cpp}`.
+
+### Intentional differences
+- Rust's `ArchVersion` has `repr(u8)` and a `Default` of `V8`; the representation mirrors the C++
+  underlying type, while the default mirrors `A32::UserConfig`. `TranslationOptions::default()`
+  explicitly selects `V3`, preserving C++ value-initialization of `TranslationOptions{}`.
+- `translate` creates and returns its `Block`, rather than receiving an output reference. This is
+  an ownership-only adaptation; descriptor selection and ARM/Thumb dispatch order are unchanged.
+- `A32IREmitter::with_location` remains a V8 convenience for existing Rust unit callers.
+  Production A32 translation uses `with_location_and_arch` with the configured version.
+
+### Unintentional differences (to fix)
+- Ruzu still combines A32 and A64 public state in `JitConfig`, whereas Eden owns separate
+  `interface/A32/config.h::UserConfig` and `interface/A64/config.h::UserConfig` types. The new A32
+  fields are behaviorally forwarded, but this pre-existing structural split remains to be ported.
+
+### Missing items
+- The reviewed `ArchVersion`, `TranslationOptions`, `ALUWritePC`, and `LoadWritePC` contracts are
+  present. The remaining item is the broader A32/A64 public configuration ownership split above.
+
+### Binary layout verification
+- PASS: `ArchVersion` is an eight-value `repr(u8)` enum in Eden declaration order. Translation and
+  JIT options are host-only and are not raw-copied or serialized into guest-visible memory.
+
+## 2026-08-23 — A32 translation callbacks and loops vs Eden `translate_callbacks.h`, `translate_arm.cpp`, and `translate_thumb.cpp`
+
+Rust files: `src/rdynarmic/src/frontend/a32/translate/{translate_callbacks,translate_arm,translate_thumb}.rs`,
+`src/rdynarmic/src/jit_config.rs`, `src/rdynarmic/src/backend/x64/a32_emit_x64.rs`,
+`src/rdynarmic/src/backend/arm64/a32_address_space.rs`, and `src/rdynarmic/src/jit.rs`.
+
+### Intentional differences
+- `UserCallbacksAdapter` models C++ `UserCallbacks : TranslateCallbacks` by delegation because Rust
+  traits do not inherit stored trait objects. The frontend depends only on the translation-time
+  contract, while both host backends adapt the public callbacks at their compile boundary.
+- Rust briefly reconstructs `A32IREmitter` around each callback to satisfy exclusive borrowing.
+  It preserves the same block, architecture version, current location, callback order, and emitted
+  instruction order as Eden's single long-lived `TranslatorVisitor`.
+- ARM VFP/ASIMD/ARM and Thumb VFP/ASIMD/Thumb32 selection use Ruzu's unified decoder plus explicit
+  classification. The precedence matches Eden, but the decoder implementation is not generated as
+  three distinct matcher invocations.
+
+### Unintentional differences (to fix)
+- The per-instruction visitors are still coordinated by the broad Rust `translate/mod.rs`
+  dispatcher, while Eden retains one method per matching `translate/impl/*.cpp` owner. Splitting
+  those pre-existing ownership aggregates remains part of the structural audit.
+
+### Missing items
+- No callback or loop-order item remains in this slice: pre-read early termination, aligned code
+  reads, pre-translation hooks, custom ticks, NoExecuteFault advancement, conditional-state exit,
+  single-step terminals, and end-location updates are all wired and covered by focused tests.
+
+### Binary layout verification
+- N/A for guest layout: callbacks, options, and translation loop state are host-only. The adapter
+  passes A32 PCs/instructions as exact `u32` values and tick counts as `u64`, matching Eden widths.
+
+## 2026-08-23 — A32 hint/preload decoding and translation vs Eden decoder tables and hint owners
+
+Rust files: `src/rdynarmic/src/frontend/a32/{decoder,decoder_thumb16,decoder_thumb32}.rs` and
+`src/rdynarmic/src/frontend/a32/translate/{hint,thumb16,thumb32,thumb32_control}.rs`.
+
+Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
+`frontend/A32/translate/impl/{hint,thumb16,thumb32_control,thumb32_load_byte}.cpp`.
+
+### Intentional differences
+- Rust expresses generated decoder-table rows as explicit mask/value checks. The masks and values
+  are derived directly from Eden's bitstrings and are placed before the same broader decode groups.
+
+### Unintentional differences (to fix)
+- Thumb32 preload behavior currently shares the existing broad `thumb32.rs` and
+  `thumb32_control.rs` owners. Eden owns these methods in `thumb32_load_byte.cpp`; moving the whole
+  related Thumb32 load-byte family, rather than only the new methods, remains a structural slice.
+
+### Missing items
+- The reviewed hint family now includes ARM/Thumb16/Thumb32 `SEVL`, all four Thumb32 `PLD` forms,
+  all four Thumb32 `PLI` forms, the W-bit PLD/PLDW distinction, hook-disabled NOP behavior, and the
+  register-PC UnpredictableInstruction checks.
+
+### Binary layout verification
+- N/A: decoder identifiers and exception IR are host-internal. Focused tests verify the exact
+  16/32-bit encodings and exception discriminants rather than a raw guest payload.

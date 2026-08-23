@@ -46,6 +46,9 @@ pub struct MslEmitContext {
     supports_query_texture_lod: bool,
     supports_texture_atomics: bool,
     supports_typeless_image_loads: bool,
+    supports_subgroups: bool,
+    warp_size_potentially_larger_than_guest: bool,
+    fixed_subgroup_size: u32,
     need_gather_subpixel_offset: bool,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
@@ -221,6 +224,39 @@ impl MslEmitContext {
             )?;
             images.push(definition);
             *binding_counter += 1;
+        }
+        // Normal Metal vertex functions do not expose the SIMD-group lane
+        // builtin. Fragment and kernel functions do, and the renderer's
+        // profile advertises subgroup support only for those stages.
+        let supports_subgroups = profile.supports_subgroup_stage(stage)
+            && matches!(stage, Stage::Fragment | Stage::Compute);
+        if supports_subgroups && options.fixed_subgroup_size < 32 {
+            return Err(MslError::UnsupportedProgramFeature(
+                "Metal SIMD group narrower than the guest warp",
+            ));
+        }
+        if supports_subgroups
+            && options.fixed_subgroup_size > 32
+            && !profile.warp_size_potentially_larger_than_guest
+        {
+            return Err(MslError::UnsupportedProgramFeature(
+                "Metal SIMD group wider than the guest warp",
+            ));
+        }
+        if supports_subgroups && options.fixed_subgroup_size > 64 {
+            return Err(MslError::UnsupportedProgramFeature(
+                "Metal SIMD group wider than the ballot representation",
+            ));
+        }
+        let needs_subgroup_lane_id = supports_subgroups
+            && (program.info.uses_fswzadd
+                || program.info.uses_subgroup_invocation_id
+                || program.info.uses_subgroup_shuffles
+                || program.info.uses_subgroup_mask
+                || (profile.warp_size_potentially_larger_than_guest
+                    && program.info.uses_subgroup_vote));
+        if needs_subgroup_lane_id {
+            parameters.push("uint subgroup_lane_id [[thread_index_in_simdgroup]]".to_owned());
         }
         if program.info.uses_workgroup_id {
             parameters.push("uint3 workgroup_id [[threadgroup_position_in_grid]]".to_owned());
@@ -474,9 +510,14 @@ impl MslEmitContext {
             supports_query_texture_lod: options.supports_query_texture_lod,
             supports_texture_atomics: options.supports_texture_atomics,
             supports_typeless_image_loads: profile.support_typeless_image_loads,
+            supports_subgroups,
+            warp_size_potentially_larger_than_guest: profile
+                .warp_size_potentially_larger_than_guest,
+            fixed_subgroup_size: options.fixed_subgroup_size,
             need_gather_subpixel_offset: profile.need_gather_subpixel_offset,
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
+                fixed_subgroup_size: options.fixed_subgroup_size,
             },
             has_broken_robust: profile.has_broken_robust,
             support_vertex_instance_id: profile.support_vertex_instance_id,
@@ -785,6 +826,26 @@ impl MslEmitContext {
 
     pub fn supports_texture_atomics(&self) -> bool {
         self.language_version >= MslVersion::V3_1 && self.supports_texture_atomics
+    }
+
+    pub fn supports_subgroups(&self) -> bool {
+        self.supports_subgroups
+    }
+
+    pub fn warp_size_potentially_larger_than_guest(&self) -> bool {
+        self.warp_size_potentially_larger_than_guest
+    }
+
+    pub fn fixed_subgroup_size(&self) -> u32 {
+        self.fixed_subgroup_size
+    }
+
+    pub fn subgroup_lane_id_expression(&self) -> &'static str {
+        if self.supports_subgroups {
+            "subgroup_lane_id"
+        } else {
+            "0u"
+        }
     }
 
     pub fn require_texture_cast(&mut self) {

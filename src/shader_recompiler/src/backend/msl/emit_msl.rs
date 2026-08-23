@@ -155,10 +155,6 @@ fn first_unsupported_program_feature(
     }
     if info.uses_invocation_id
         || info.uses_invocation_info
-        || info.uses_subgroup_invocation_id
-        || info.uses_subgroup_shuffles
-        || info.uses_subgroup_vote
-        || info.uses_subgroup_mask
         || info.requires_layer_emulation
         || info.emulated_layer != 0
         || info.used_clip_distances != 0
@@ -175,7 +171,6 @@ fn first_unsupported_program_feature(
         || info.uses_fp32_denorms_preserve
         || info.uses_image_1d
         || info.uses_sparse_residency
-        || info.uses_fswzadd
         || info.uses_typeless_image_reads
         || info.uses_typeless_image_writes
         || info.uses_image_buffers
@@ -222,6 +217,8 @@ fn emit_inst(
         | Opcode::GetSignFromOp
         | Opcode::GetCarryFromOp
         | Opcode::GetOverflowFromOp
+        | Opcode::GetInBoundsFromOp
+        | Opcode::GetSparseFromOp
             if context.is_defined(inst_ref) =>
         {
             Ok(())
@@ -632,6 +629,23 @@ fn emit_inst(
             emit_msl_shared_memory::emit_write_shared(context, inst_ref, inst)
         }
         Opcode::Barrier => emit_msl_barriers::emit_barrier(context),
+        Opcode::VoteAll => emit_msl_warp::emit_vote_all(context, inst_ref, inst),
+        Opcode::VoteAny => emit_msl_warp::emit_vote_any(context, inst_ref, inst),
+        Opcode::VoteEqual => emit_msl_warp::emit_vote_equal(context, inst_ref, inst),
+        Opcode::LaneId => emit_msl_warp::emit_lane_id(context, inst_ref),
+        Opcode::SubgroupBallot => emit_msl_warp::emit_subgroup_ballot(context, inst_ref, inst),
+        Opcode::SubgroupEqMask
+        | Opcode::SubgroupLtMask
+        | Opcode::SubgroupLeMask
+        | Opcode::SubgroupGtMask
+        | Opcode::SubgroupGeMask => {
+            emit_msl_warp::emit_subgroup_mask(context, inst_ref, inst.opcode)
+        }
+        Opcode::ShuffleIndex
+        | Opcode::ShuffleUp
+        | Opcode::ShuffleDown
+        | Opcode::ShuffleButterfly => emit_msl_warp::emit_shuffle(context, inst_ref, inst),
+        Opcode::FSwizzleAdd => emit_msl_warp::emit_fswizzle_add(context, inst_ref, inst),
         Opcode::DPdxFine | Opcode::DPdxCoarse => emit_msl_warp::emit_dpdx(context, inst_ref, inst),
         Opcode::DPdyFine | Opcode::DPdyCoarse => emit_msl_warp::emit_dpdy(context, inst_ref, inst),
         Opcode::SharedAtomicIAdd32
@@ -858,6 +872,58 @@ mod tests {
     fn empty_program(stage: Stage) -> ir::Program {
         let mut program = ir::Program::new(stage);
         program.blocks.push(Block::new());
+        program
+    }
+
+    fn subgroup_program(stage: Stage) -> ir::Program {
+        let mut program = empty_program(stage);
+        program.info.uses_fswzadd = true;
+        program.info.uses_subgroup_invocation_id = true;
+        program.info.uses_subgroup_shuffles = true;
+        program.info.uses_subgroup_vote = true;
+        program.info.uses_subgroup_mask = true;
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.lane_id();
+            emitter.vote_all(Value::ImmU1(true));
+            emitter.vote_any(Value::ImmU1(false));
+            emitter.vote_equal(Value::ImmU1(true));
+            emitter.subgroup_ballot(Value::ImmU1(true));
+            emitter.subgroup_eq_mask();
+            emitter.subgroup_lt_mask();
+            emitter.subgroup_le_mask();
+            emitter.subgroup_gt_mask();
+            emitter.subgroup_ge_mask();
+            let shuffle = emitter.shuffle_index(
+                Value::ImmU32(0x1234_5678),
+                Value::ImmU32(3),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+            emitter.get_in_bounds_from_op(shuffle);
+            emitter.shuffle_up(
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+            emitter.shuffle_down(
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+            emitter.shuffle_butterfly(
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+        }
+        program.blocks[0].append_new_inst(
+            Opcode::FSwizzleAdd,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0), Value::ImmU32(0xE4)],
+        );
         program
     }
 
@@ -2662,6 +2728,65 @@ mod tests {
             emit_msl(&invalid, &Profile::default(), &RuntimeInfo::default()).unwrap_err(),
             MslError::UnsupportedProgramFeature("derivatives outside a fragment shader")
         );
+    }
+
+    #[test]
+    fn emits_complete_warp_family_and_scalar_stage_fallbacks() {
+        let program = subgroup_program(Stage::Fragment);
+        let options = MslOptions {
+            fixed_subgroup_size: 32,
+            ..MslOptions::default()
+        };
+        let artifact = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &options,
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint subgroup_lane_id [[thread_index_in_simdgroup]]"));
+        assert!(source.contains("simd_all(true)"));
+        assert!(source.contains("simd_any(false)"));
+        assert!(source.contains("simd_ballot(true)"));
+        assert!(source.contains("simd_shuffle("));
+        assert!(source.contains("float4(-1.0f, 1.0f, -1.0f, 0.0f)"));
+        assert!(source.contains("bool v_0_11 = as_type<int>"));
+
+        let mut no_subgroups = Profile::default();
+        no_subgroups.supported_subgroup_stages = 0;
+        let scalar =
+            emit_msl_with_options(&program, &no_subgroups, &RuntimeInfo::default(), &options)
+                .unwrap();
+        assert!(!scalar.source.source.contains("thread_index_in_simdgroup"));
+        assert!(!scalar.source.source.contains("simd_shuffle("));
+        assert!(!scalar.source.source.contains("simd_ballot("));
+
+        let wide_options = MslOptions {
+            fixed_subgroup_size: 64,
+            ..MslOptions::default()
+        };
+        assert_eq!(
+            emit_msl_with_options(
+                &program,
+                &Profile::default(),
+                &RuntimeInfo::default(),
+                &wide_options,
+            ),
+            Err(MslError::UnsupportedProgramFeature(
+                "Metal SIMD group wider than the guest warp"
+            ))
+        );
+        let mut wide_profile = Profile::default();
+        wide_profile.warp_size_potentially_larger_than_guest = true;
+        let wide = emit_msl_with_options(
+            &program,
+            &wide_profile,
+            &RuntimeInfo::default(),
+            &wide_options,
+        )
+        .unwrap();
+        assert!(wide.source.source.contains("[subgroup_lane_id >> 5u]"));
     }
 
     #[test]

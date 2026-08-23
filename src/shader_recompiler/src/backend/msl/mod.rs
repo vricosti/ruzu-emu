@@ -52,6 +52,9 @@ impl MslVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MslOptions {
     pub language_version: MslVersion,
+    /// SIMD-group width assumed by subgroup lowering. The active
+    /// SPIRV-Cross path fixes this to the Maxwell warp width as well.
+    pub fixed_subgroup_size: u32,
     /// Whether the selected Metal device supports the texture LOD query
     /// methods. This is a device capability, independent of the MSL version.
     pub supports_query_texture_lod: bool,
@@ -68,6 +71,7 @@ impl Default for MslOptions {
     fn default() -> Self {
         Self {
             language_version: MslVersion::V2_3,
+            fixed_subgroup_size: 32,
             supports_query_texture_lod: false,
             supports_read_write_textures: false,
             supports_texture_atomics: false,
@@ -115,9 +119,19 @@ pub struct MslShaderSource {
     pub stage: Stage,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MslExecutionInfo {
     pub workgroup_size: Option<[u32; 3]>,
+    pub fixed_subgroup_size: u32,
+}
+
+impl Default for MslExecutionInfo {
+    fn default() -> Self {
+        Self {
+            workgroup_size: None,
+            fixed_subgroup_size: 32,
+        }
+    }
 }
 
 /// MSL source plus the complete ABI required by its native entry point.

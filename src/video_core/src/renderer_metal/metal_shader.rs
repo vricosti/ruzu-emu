@@ -605,6 +605,7 @@ pub fn compile_native_shader(
             language_version: options.language_version,
             execution: MetalExecutionInfo {
                 workgroup_size: options.compute_workgroup_size,
+                fixed_subgroup_size: options.fixed_subgroup_size,
             },
         },
     )
@@ -712,6 +713,7 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
         runtime_info,
         &shader_recompiler::backend::msl::MslOptions {
             language_version,
+            fixed_subgroup_size: active.execution().fixed_subgroup_size,
             supports_query_texture_lod: device.supportsQueryTextureLOD(),
             supports_read_write_textures: device.readWriteTextureSupport()
                 != MTLReadWriteTextureTier::TierNone,
@@ -1489,6 +1491,58 @@ mod tests {
         program
     }
 
+    fn subgroup_program() -> Program {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_fswzadd = true;
+        program.info.uses_subgroup_invocation_id = true;
+        program.info.uses_subgroup_shuffles = true;
+        program.info.uses_subgroup_vote = true;
+        program.info.uses_subgroup_mask = true;
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.lane_id();
+            emitter.vote_all(Value::ImmU1(true));
+            emitter.vote_any(Value::ImmU1(false));
+            emitter.vote_equal(Value::ImmU1(true));
+            emitter.subgroup_ballot(Value::ImmU1(true));
+            emitter.subgroup_eq_mask();
+            emitter.subgroup_lt_mask();
+            emitter.subgroup_le_mask();
+            emitter.subgroup_gt_mask();
+            emitter.subgroup_ge_mask();
+            let shuffle = emitter.shuffle_index(
+                Value::ImmU32(0x1234_5678),
+                Value::ImmU32(3),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+            emitter.get_in_bounds_from_op(shuffle);
+            emitter.shuffle_up(
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+            emitter.shuffle_down(
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+            emitter.shuffle_butterfly(
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(31),
+                Value::ImmU32(0),
+            );
+        }
+        program.blocks[0].append_new_inst(
+            Opcode::FSwizzleAdd,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0), Value::ImmU32(0xE4)],
+        );
+        program
+    }
+
     #[test]
     fn translates_recompiler_vertex_spirv_to_msl() {
         let mut program = Program::new(Stage::VertexB);
@@ -1734,6 +1788,7 @@ mod tests {
             &runtime_info,
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -1989,6 +2044,37 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_warp_family_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let program = subgroup_program();
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active warp SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct warp MSL must compile with the active ABI");
+
+        assert_eq!(direct.bindings(), active.bindings());
+        let source = &direct.source().source;
+        assert!(source.contains("thread_index_in_simdgroup"));
+        assert!(source.contains("simd_ballot("));
+        assert!(source.contains("simd_shuffle("));
+    }
+
+    #[test]
     fn compiles_direct_msl_compute_artifact_with_workgroup_metadata() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);
@@ -1999,6 +2085,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -2126,6 +2213,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: false,
                 supports_read_write_textures: false,
                 supports_texture_atomics: false,
@@ -2219,6 +2307,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -2332,6 +2421,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -2450,6 +2540,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -2826,6 +2917,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -2910,6 +3002,7 @@ mod tests {
             &runtime_info,
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),
@@ -3131,6 +3224,7 @@ mod tests {
             &RuntimeInfo::default(),
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: false,
@@ -3367,6 +3461,7 @@ mod tests {
             &runtime_info,
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
                 supports_read_write_textures: device.profile().supports_read_write_textures(),
                 supports_texture_atomics: device.profile().supports_texture_atomics(),

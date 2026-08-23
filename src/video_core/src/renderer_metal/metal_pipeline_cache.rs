@@ -62,20 +62,12 @@ fn validate_direct_msl_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_VALIDATE_DIRECT_MSL").is_some())
 }
 
-fn all_shader_stage_bits() -> u32 {
+fn subgroup_shader_stage_bits() -> u32 {
     use shader_recompiler::stage::Stage;
 
-    [
-        Stage::VertexA,
-        Stage::VertexB,
-        Stage::TessellationControl,
-        Stage::TessellationEval,
-        Stage::Geometry,
-        Stage::Fragment,
-        Stage::Compute,
-    ]
-    .into_iter()
-    .fold(0, |mask, stage| mask | (1u32 << stage as u32))
+    [Stage::Fragment, Stage::Compute]
+        .into_iter()
+        .fold(0, |mask, stage| mask | (1u32 << stage as u32))
 }
 
 /// Build the shader-recompiler profile owned by `MetalPipelineCache`.
@@ -86,6 +78,7 @@ fn all_shader_stage_bits() -> u32 {
 /// consume it.
 pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
     let apple_family = device.highest_apple_family.unwrap_or_default();
+    let supports_subgroups = apple_family >= 6 || device.supports_mac2_family;
     Profile {
         supported_spirv: SPIRV_1_5,
         // A single monotonically increasing SPIR-V binding prevents UBO and
@@ -101,8 +94,14 @@ pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
         support_int64: apple_family >= 3,
         support_vertex_instance_id: true,
         support_float_controls: false,
-        support_vote: apple_family >= 6,
-        supported_subgroup_stages: all_shader_stage_bits(),
+        support_vote: supports_subgroups,
+        // Normal Metal vertex functions do not expose
+        // `thread_index_in_simdgroup`; fragment and kernel functions do.
+        supported_subgroup_stages: if supports_subgroups {
+            subgroup_shader_stage_bits()
+        } else {
+            0
+        },
         support_viewport_index_layer_non_geometry: false,
         support_viewport_mask: false,
         support_typeless_image_loads: false,
@@ -1359,10 +1358,25 @@ mod tests {
         assert!(cache.profile().support_vertex_instance_id);
         assert!(!cache.profile().support_native_ndc);
         assert!(!cache.profile().support_int64_atomics);
+        assert!(cache.profile().supports_subgroup_stage(Stage::Fragment));
+        assert!(cache.profile().supports_subgroup_stage(Stage::Compute));
+        assert!(!cache.profile().supports_subgroup_stage(Stage::VertexB));
         assert_eq!(cache.host_info().max_descriptor_set_samplers, 16);
         assert_eq!(cache.host_info().max_descriptor_set_sampled_images, 128);
         assert_eq!(cache.host_info().max_descriptor_set_uniform_buffers, 31);
         assert_eq!(cache.host_info().min_ssbo_alignment, 4);
+    }
+
+    #[test]
+    fn subgroup_profile_requires_a_capable_gpu_family() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut limited = device.profile().clone();
+        limited.highest_apple_family = None;
+        limited.supports_mac2_family = false;
+        let profile = make_shader_profile(&limited);
+
+        assert!(!profile.support_vote);
+        assert_eq!(profile.supported_subgroup_stages, 0);
     }
 
     fn enable_vertex_attribute(

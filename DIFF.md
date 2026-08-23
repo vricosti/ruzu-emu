@@ -10068,3 +10068,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all 13
   restored identities, scalar saturated opcode selection, corrected scalar/vector operand shapes,
   and reserved rounding-shift sizes without interpreter fallback.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_two_register_misc.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_two_register_misc.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract typed operands from `DecodedInst`; the two helper enums and three
+  file-local helper responsibilities otherwise mirror Eden.
+- Rust passes `fpcr_controlled=true` explicitly to FP vector comparisons and an explicit true
+  carry input to non-flag-setting subtraction. These values are implicit defaults in Eden's IR
+  builder API.
+- Rust's `SaturatedNarrow` equivalent accepts the upstream narrowing operation as a lifetime-bound
+  generic callable because a C++ member-function pointer cannot be represented directly across
+  Rust emitter lifetimes. The selected IR methods and call ordering are unchanged.
+
+### Unintentional differences (to fix)
+- Fixed: FCMLE, FCMLT, FCVTXN, SQABS, SQNEG, SUQADD, and USQADD decoded but fell through to the
+  temporary interpreter terminal. All seven now dispatch to their matching file owner.
+- Fixed: scalar FP zero comparisons read `V_scalar` rather than Eden's `V(datasize)`, and the LE/LT
+  comparison variants were absent. Reads, operand inversion, comparison opcodes, and scalar result
+  extraction now match Eden.
+- Fixed: ABS and NEG applied `VectorGetElement64` twice to values already returned by `V_scalar`.
+  Each now performs exactly one scalar source extraction.
+- Fixed: the conversion family encoded rounding modes as local integer constants and used invented
+  helper ownership. It now uses `FP::RoundingMode`'s Rust counterpart, `FPCR::RMode`, and Eden's
+  `ScalarFPConvertWithRound` boundary.
+- Fixed: the saturated narrowing family used an invented enum dispatcher and a 128-bit scalar read.
+  It now passes the matching IR operation to `SaturatedNarrow` and reads `V_scalar(2 * esize)`.
+
+### Missing items
+- None for the 34 visitors, two file-local enums, and three file-local helpers defined by the
+  reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all seven
+  restored decoder identities, comparison operand ordering, ToOdd conversion metadata, reserved
+  FCVTXN handling, scalar extraction counts, saturating accumulator reads, and narrowing opcodes.

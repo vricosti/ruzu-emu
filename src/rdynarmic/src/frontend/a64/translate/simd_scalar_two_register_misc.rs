@@ -1,83 +1,120 @@
-//! Port of upstream
-//! `dynarmic/frontend/A64/translate/impl/simd_scalar_two_register_misc.cpp`
-//! (subset: ABS_1, NEG_1, FCMEQ_zero_1, FCMGE_zero_2, FCMGT_zero_2,
-//! FCVTAS_2, FCVTAU_2, FCVTMS_2, FCVTMU_2, FCVTNS_2, FCVTNU_2,
-//! FCVTPS_2, FCVTPU_2, FCVTZS_int_2, FCVTZU_int_2, SCVTF_int_2,
-//! UCVTF_int_2, FRECPE_1, FRECPE_2, FRECPX_1, FRECPX_2, FRSQRTE_1,
-//! FRSQRTE_2).
+//! Port of upstream `dynarmic/frontend/A64/translate/impl/simd_scalar_two_register_misc.cpp`.
 
+use crate::common::fp::fpcr::Fpcr;
+use crate::common::fp::rounding_mode::RoundingMode;
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::Vec;
-
-const ROUND_TO_NEAREST_TIE_EVEN: u8 = 0;
-const ROUND_TOWARDS_PLUS_INFINITY: u8 = 1;
-const ROUND_TOWARDS_MINUS_INFINITY: u8 = 2;
-const ROUND_TOWARDS_ZERO: u8 = 3;
-const ROUND_TO_NEAREST_TIE_AWAY_FROM_ZERO: u8 = 4;
-
-fn current_fpcr_rounding_mode(visitor: &TranslatorVisitor<'_>) -> u8 {
-    ((visitor
-        .ir
-        .current_location
-        .expect("current_location not set")
-        .fpcr()
-        >> 22)
-        & 0x3) as u8
-}
+use crate::ir::emitter::IREmitter;
+use crate::ir::value::Value;
 
 #[derive(Copy, Clone)]
-enum FpZeroCmp {
+enum ComparisonTypeSstrm {
     Eq,
     Ge,
     Gt,
+    Le,
+    Lt,
 }
 
 #[derive(Copy, Clone)]
-enum SaturatedNarrowKind {
-    SignedToSigned,
-    SignedToUnsigned,
+enum SignednessSstrm {
+    Signed,
     Unsigned,
 }
 
-impl<'a> TranslatorVisitor<'a> {
-    fn saturated_narrow_1(&mut self, inst: &DecodedInst, kind: SaturatedNarrowKind) -> bool {
-        let size = inst.bits(23, 22);
-        if size == 0b11 {
-            return self.reserved_value();
-        }
+fn scalar_fp_compare_against_zero(
+    visitor: &mut TranslatorVisitor<'_>,
+    sz: bool,
+    vn: Vec,
+    vd: Vec,
+    comparison_type: ComparisonTypeSstrm,
+) -> bool {
+    let esize = if sz { 64 } else { 32 };
+    let datasize = esize;
 
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        let original_esize = 16usize << size as usize;
-        let source = self.v_scalar_read(128, vn);
-        let scalar = self.ir.ir().vector_get_element(original_esize, source, 0);
-        let operand = match original_esize {
-            16 => self.ir.ir().zero_extend_half_to_long(scalar),
-            32 => self.ir.ir().zero_extend_word_to_long(scalar),
-            64 => scalar,
-            _ => unreachable!(),
-        };
-        let operand = self.ir.ir().zero_extend_to_quad(operand);
-        let result = match kind {
-            SaturatedNarrowKind::SignedToSigned => self
-                .ir
-                .ir()
-                .vector_signed_saturated_narrow_to_signed(original_esize, operand),
-            SaturatedNarrowKind::SignedToUnsigned => self
-                .ir
-                .ir()
-                .vector_signed_saturated_narrow_to_unsigned(original_esize, operand),
-            SaturatedNarrowKind::Unsigned => self
-                .ir
-                .ir()
-                .vector_unsigned_saturated_narrow(original_esize, operand),
-        };
-        let result = self.ir.ir().vector_get_element(64, result, 0);
-        self.v_scalar_write(64, vd, result);
-        true
+    let operand = visitor.v_read(datasize, vn);
+    let zero = visitor.ir.ir().zero_vector();
+    let result = match comparison_type {
+        ComparisonTypeSstrm::Eq => visitor.ir.ir().fp_vector_equal(esize, operand, zero, true),
+        ComparisonTypeSstrm::Ge => visitor
+            .ir
+            .ir()
+            .fp_vector_greater_equal(esize, operand, zero, true),
+        ComparisonTypeSstrm::Gt => visitor
+            .ir
+            .ir()
+            .fp_vector_greater(esize, operand, zero, true),
+        ComparisonTypeSstrm::Le => visitor
+            .ir
+            .ir()
+            .fp_vector_greater_equal(esize, zero, operand, true),
+        ComparisonTypeSstrm::Lt => visitor
+            .ir
+            .ir()
+            .fp_vector_greater(esize, zero, operand, true),
+    };
+
+    let result = visitor.ir.ir().vector_get_element(esize, result, 0);
+    visitor.v_scalar_write(datasize, vd, result);
+    true
+}
+
+fn scalar_fp_convert_with_round(
+    visitor: &mut TranslatorVisitor<'_>,
+    sz: bool,
+    vn: Vec,
+    vd: Vec,
+    rmode: RoundingMode,
+    sign: SignednessSstrm,
+) -> bool {
+    let esize = if sz { 64 } else { 32 };
+
+    let operand = visitor.v_scalar_read(esize, vn);
+    let result = match (sz, sign) {
+        (true, SignednessSstrm::Signed) => {
+            visitor.ir.ir().fp_to_fixed_s64(operand, 64, 0, rmode as u8)
+        }
+        (true, SignednessSstrm::Unsigned) => {
+            visitor.ir.ir().fp_to_fixed_u64(operand, 64, 0, rmode as u8)
+        }
+        (false, SignednessSstrm::Signed) => {
+            visitor.ir.ir().fp_to_fixed_s32(operand, 32, 0, rmode as u8)
+        }
+        (false, SignednessSstrm::Unsigned) => {
+            visitor.ir.ir().fp_to_fixed_u32(operand, 32, 0, rmode as u8)
+        }
+    };
+
+    visitor.v_scalar_write(esize, vd, result);
+    true
+}
+
+fn saturated_narrow<'a, F>(
+    visitor: &mut TranslatorVisitor<'a>,
+    size: u32,
+    vn: Vec,
+    vd: Vec,
+    narrowing_fn: F,
+) -> bool
+where
+    F: FnOnce(&mut IREmitter<'a>, usize, Value) -> Value,
+{
+    if size == 0b11 {
+        return visitor.reserved_value();
     }
 
+    let esize = 8usize << size;
+    let operand = visitor.v_scalar_read(2 * esize, vn);
+    let operand = visitor.ir.ir().zero_extend_to_quad(operand);
+    let result = narrowing_fn(visitor.ir.ir(), 2 * esize, operand);
+
+    let result = visitor.ir.ir().vector_get_element(64, result, 0);
+    visitor.v_scalar_write(64, vd, result);
+    true
+}
+
+impl<'a> TranslatorVisitor<'a> {
     /// ABS (scalar). `01011110zz100000101110nnnnnddddd`. Only size==0b11 is valid.
     pub fn abs_1(&mut self, inst: &DecodedInst) -> bool {
         let size = inst.bits(23, 22);
@@ -86,14 +123,12 @@ impl<'a> TranslatorVisitor<'a> {
         }
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        let operand = self.v_scalar_read(64, vn);
-        let elem = self.ir.ir().vector_get_element(64, operand, 0);
-        // For 64-bit two's complement abs: x ^ (x>>63) - (x>>63).
+        let operand1 = self.v_scalar_read(64, vn);
         let shift = self.ir.ir().imm8(63);
-        let mask = self.ir.ir().arithmetic_shift_right_64(elem, shift);
-        let xored = self.ir.ir().eor_64(elem, mask);
+        let operand2 = self.ir.ir().arithmetic_shift_right_64(operand1, shift);
+        let xored = self.ir.ir().eor_64(operand1, operand2);
         let one = self.ir.ir().imm1(true);
-        let result = self.ir.ir().sub_64(xored, mask, one);
+        let result = self.ir.ir().sub_64(xored, operand2, one);
         self.v_scalar_write(64, vd, result);
         true
     }
@@ -107,24 +142,41 @@ impl<'a> TranslatorVisitor<'a> {
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
         let operand = self.v_scalar_read(64, vn);
-        let elem = self.ir.ir().vector_get_element(64, operand, 0);
         let zero = self.ir.ir().imm64(0);
         let one = self.ir.ir().imm1(true);
-        let result = self.ir.ir().sub_64(zero, elem, one);
+        let result = self.ir.ir().sub_64(zero, operand, one);
         self.v_scalar_write(64, vd, result);
         true
     }
 
     pub fn sqxtn_1(&mut self, inst: &DecodedInst) -> bool {
-        self.saturated_narrow_1(inst, SaturatedNarrowKind::SignedToSigned)
+        saturated_narrow(
+            self,
+            inst.bits(23, 22),
+            Vec::from_u32(inst.bits(9, 5)),
+            Vec::from_u32(inst.rd()),
+            IREmitter::vector_signed_saturated_narrow_to_signed,
+        )
     }
 
     pub fn sqxtun_1(&mut self, inst: &DecodedInst) -> bool {
-        self.saturated_narrow_1(inst, SaturatedNarrowKind::SignedToUnsigned)
+        saturated_narrow(
+            self,
+            inst.bits(23, 22),
+            Vec::from_u32(inst.bits(9, 5)),
+            Vec::from_u32(inst.rd()),
+            IREmitter::vector_signed_saturated_narrow_to_unsigned,
+        )
     }
 
     pub fn uqxtn_1(&mut self, inst: &DecodedInst) -> bool {
-        self.saturated_narrow_1(inst, SaturatedNarrowKind::Unsigned)
+        saturated_narrow(
+            self,
+            inst.bits(23, 22),
+            Vec::from_u32(inst.bits(9, 5)),
+            Vec::from_u32(inst.rd()),
+            IREmitter::vector_unsigned_saturated_narrow,
+        )
     }
 
     /// FCMEQ (zero, scalar, half-precision).
@@ -147,30 +199,7 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_compare_against_zero(sz, vn, vd, FpZeroCmp::Eq)
-    }
-
-    fn scalar_fp_compare_against_zero(
-        &mut self,
-        sz: bool,
-        vn: Vec,
-        vd: Vec,
-        kind: FpZeroCmp,
-    ) -> bool {
-        let esize = if sz { 64 } else { 32 };
-        let operand = self.v_scalar_read(esize, vn);
-        let zero = self.ir.ir().zero_vector();
-        let result = match kind {
-            FpZeroCmp::Eq => self.ir.ir().fp_vector_equal(esize, operand, zero, true),
-            FpZeroCmp::Ge => self
-                .ir
-                .ir()
-                .fp_vector_greater_equal(esize, operand, zero, true),
-            FpZeroCmp::Gt => self.ir.ir().fp_vector_greater(esize, operand, zero, true),
-        };
-        let r0 = self.ir.ir().vector_get_element(esize, result, 0);
-        self.v_scalar_write(esize, vd, r0);
-        true
+        scalar_fp_compare_against_zero(self, sz, vn, vd, ComparisonTypeSstrm::Eq)
     }
 
     /// FCMGE (zero, scalar). `011111101z100000110010nnnnnddddd`. sz at bit 22.
@@ -178,7 +207,7 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_compare_against_zero(sz, vn, vd, FpZeroCmp::Ge)
+        scalar_fp_compare_against_zero(self, sz, vn, vd, ComparisonTypeSstrm::Ge)
     }
 
     /// FCMGT (zero, scalar). `010111101z100000110010nnnnnddddd`. sz at bit 22.
@@ -186,27 +215,21 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_compare_against_zero(sz, vn, vd, FpZeroCmp::Gt)
+        scalar_fp_compare_against_zero(self, sz, vn, vd, ComparisonTypeSstrm::Gt)
     }
 
-    fn scalar_fp_to_fixed(
-        &mut self,
-        sz: bool,
-        vn: Vec,
-        vd: Vec,
-        signed: bool,
-        rounding: u8,
-    ) -> bool {
-        let esize = if sz { 64 } else { 32 };
-        let operand = self.v_scalar_read(esize, vn);
-        let result = match (sz, signed) {
-            (true, true) => self.ir.ir().fp_to_fixed_s64(operand, 64, 0, rounding),
-            (true, false) => self.ir.ir().fp_to_fixed_u64(operand, 64, 0, rounding),
-            (false, true) => self.ir.ir().fp_to_fixed_s32(operand, 32, 0, rounding),
-            (false, false) => self.ir.ir().fp_to_fixed_u32(operand, 32, 0, rounding),
-        };
-        self.v_scalar_write(esize, vd, result);
-        true
+    pub fn fcmle_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        scalar_fp_compare_against_zero(self, sz, vn, vd, ComparisonTypeSstrm::Le)
+    }
+
+    pub fn fcmlt_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        scalar_fp_compare_against_zero(self, sz, vn, vd, ComparisonTypeSstrm::Lt)
     }
 
     /// FCVTAS (vector, scalar). `010111100z100001110010nnnnnddddd`.
@@ -214,7 +237,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TO_NEAREST_TIE_AWAY_FROM_ZERO)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::ToNearestTieAwayFromZero,
+            SignednessSstrm::Signed,
+        )
     }
 
     /// FCVTAU (vector, scalar). `011111100z100001110010nnnnnddddd`.
@@ -222,7 +252,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TO_NEAREST_TIE_AWAY_FROM_ZERO)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::ToNearestTieAwayFromZero,
+            SignednessSstrm::Unsigned,
+        )
     }
 
     /// FCVTMS (vector, scalar). `010111100z100001101110nnnnnddddd`.
@@ -230,7 +267,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TOWARDS_MINUS_INFINITY)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::TowardsMinusInfinity,
+            SignednessSstrm::Signed,
+        )
     }
 
     /// FCVTMU (vector, scalar). `011111100z100001101110nnnnnddddd`.
@@ -238,7 +282,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TOWARDS_MINUS_INFINITY)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::TowardsMinusInfinity,
+            SignednessSstrm::Unsigned,
+        )
     }
 
     /// FCVTNS (vector, scalar). `010111100z100001101010nnnnnddddd`.
@@ -246,7 +297,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TO_NEAREST_TIE_EVEN)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::ToNearestTieEven,
+            SignednessSstrm::Signed,
+        )
     }
 
     /// FCVTNU (vector, scalar). `011111100z100001101010nnnnnddddd`.
@@ -254,7 +312,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TO_NEAREST_TIE_EVEN)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::ToNearestTieEven,
+            SignednessSstrm::Unsigned,
+        )
     }
 
     /// FCVTPS (vector, scalar). `010111101z100001101010nnnnnddddd`.
@@ -262,7 +327,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TOWARDS_PLUS_INFINITY)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::TowardsPlusInfinity,
+            SignednessSstrm::Signed,
+        )
     }
 
     /// FCVTPU (vector, scalar). `011111101z100001101010nnnnnddddd`.
@@ -270,7 +342,32 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TOWARDS_PLUS_INFINITY)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::TowardsPlusInfinity,
+            SignednessSstrm::Unsigned,
+        )
+    }
+
+    pub fn fcvtxn_1(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        if !sz {
+            return self.reserved_value();
+        }
+
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let element = self.v_scalar_read(64, vn);
+        let result = self
+            .ir
+            .ir()
+            .fp_double_to_single(element, RoundingMode::ToOdd as u8);
+
+        self.v_scalar_write(32, vd, result);
+        true
     }
 
     /// FCVTZS (vector, integer, scalar). `010111101z100001101110nnnnnddddd`.
@@ -278,7 +375,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TOWARDS_ZERO)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::TowardsZero,
+            SignednessSstrm::Signed,
+        )
     }
 
     /// FCVTZU (vector, integer, scalar). `011111101z100001101110nnnnnddddd`.
@@ -286,7 +390,14 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TOWARDS_ZERO)
+        scalar_fp_convert_with_round(
+            self,
+            sz,
+            vn,
+            vd,
+            RoundingMode::TowardsZero,
+            SignednessSstrm::Unsigned,
+        )
     }
 
     /// FRECPE (scalar, half-precision). `0101111011111001110110nnnnnddddd`.
@@ -352,29 +463,81 @@ impl<'a> TranslatorVisitor<'a> {
         true
     }
 
-    fn scalar_fixed_to_fp(&mut self, sz: bool, vn: Vec, vd: Vec, signed: bool) -> bool {
-        let esize = if sz { 64 } else { 32 };
-        let rounding = current_fpcr_rounding_mode(self);
-        let operand = self.v_scalar_read(esize, vn);
-        let result = if sz {
-            self.ir
-                .ir()
-                .fp_fixed_to_double(operand, 64, signed, 0, rounding)
-        } else {
-            self.ir
-                .ir()
-                .fp_fixed_to_single(operand, 32, signed, 0, rounding)
-        };
-        self.v_scalar_write(esize, vd, result);
-        true
-    }
-
     /// SCVTF (vector, integer, scalar). `010111100z100001110110nnnnnddddd`.
     pub fn scvtf_int_2(&mut self, inst: &DecodedInst) -> bool {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fixed_to_fp(sz, vn, vd, true)
+        let esize = if sz { 64 } else { 32 };
+        let rmode = Fpcr::new(
+            self.ir
+                .current_location
+                .expect("current_location not set")
+                .fpcr(),
+        )
+        .rmode() as u8;
+
+        let element = self.v_scalar_read(esize, vn);
+        let result = if esize == 32 {
+            self.ir.ir().fp_fixed_to_single(element, 32, true, 0, rmode)
+        } else {
+            self.ir.ir().fp_fixed_to_double(element, 64, true, 0, rmode)
+        };
+
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
+
+    pub fn sqabs_1(&mut self, inst: &DecodedInst) -> bool {
+        let size = inst.bits(23, 22);
+        let esize = 8usize << size;
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+
+        let operand = self.v_read(128, vn);
+        let operand = self.ir.ir().vector_get_element(esize, operand, 0);
+        let operand = self.ir.ir().zero_extend_to_quad(operand);
+        let result = self.ir.ir().vector_signed_saturated_abs(esize, operand);
+
+        self.v_write(128, vd, result);
+        true
+    }
+
+    pub fn sqneg_1(&mut self, inst: &DecodedInst) -> bool {
+        let size = inst.bits(23, 22);
+        let esize = 8usize << size;
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+
+        let operand = self.v_read(128, vn);
+        let operand = self.ir.ir().vector_get_element(esize, operand, 0);
+        let operand = self.ir.ir().zero_extend_to_quad(operand);
+        let result = self.ir.ir().vector_signed_saturated_neg(esize, operand);
+
+        self.v_write(128, vd, result);
+        true
+    }
+
+    pub fn suqadd_1(&mut self, inst: &DecodedInst) -> bool {
+        let size = inst.bits(23, 22);
+        let esize = 8usize << size;
+        let datasize = 64;
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+
+        let operand1 = self.v_read(datasize, vn);
+        let operand1 = self.ir.ir().vector_get_element(esize, operand1, 0);
+        let operand1 = self.ir.ir().zero_extend_to_quad(operand1);
+        let operand2 = self.v_read(datasize, vd);
+        let operand2 = self.ir.ir().vector_get_element(esize, operand2, 0);
+        let operand2 = self.ir.ir().zero_extend_to_quad(operand2);
+        let result = self
+            .ir
+            .ir()
+            .vector_signed_saturated_accumulate_unsigned(esize, operand1, operand2);
+
+        self.v_write(datasize, vd, result);
+        true
     }
 
     /// UCVTF (vector, integer, scalar). `011111100z100001110110nnnnnddddd`.
@@ -382,7 +545,50 @@ impl<'a> TranslatorVisitor<'a> {
         let sz = inst.bit(22);
         let vn = Vec::from_u32(inst.bits(9, 5));
         let vd = Vec::from_u32(inst.rd());
-        self.scalar_fixed_to_fp(sz, vn, vd, false)
+        let esize = if sz { 64 } else { 32 };
+        let rmode = Fpcr::new(
+            self.ir
+                .current_location
+                .expect("current_location not set")
+                .fpcr(),
+        )
+        .rmode() as u8;
+
+        let element = self.v_scalar_read(esize, vn);
+        let result = if esize == 32 {
+            self.ir
+                .ir()
+                .fp_fixed_to_single(element, 32, false, 0, rmode)
+        } else {
+            self.ir
+                .ir()
+                .fp_fixed_to_double(element, 64, false, 0, rmode)
+        };
+
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
+
+    pub fn usqadd_1(&mut self, inst: &DecodedInst) -> bool {
+        let size = inst.bits(23, 22);
+        let esize = 8usize << size;
+        let datasize = 64;
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+
+        let operand1 = self.v_read(datasize, vn);
+        let operand1 = self.ir.ir().vector_get_element(esize, operand1, 0);
+        let operand1 = self.ir.ir().zero_extend_to_quad(operand1);
+        let operand2 = self.v_read(datasize, vd);
+        let operand2 = self.ir.ir().vector_get_element(esize, operand2, 0);
+        let operand2 = self.ir.ir().zero_extend_to_quad(operand2);
+        let result = self
+            .ir
+            .ir()
+            .vector_unsigned_saturated_accumulate_signed(esize, operand1, operand2);
+
+        self.v_write(datasize, vd, result);
+        true
     }
 }
 
@@ -406,6 +612,14 @@ mod tests {
         let should_continue = visitor.dispatch(&decoded);
         drop(visitor);
         (block, should_continue)
+    }
+
+    fn opcode_count(block: &Block, opcode: Opcode) -> usize {
+        block
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode == opcode)
+            .count()
     }
 
     #[test]
@@ -525,6 +739,91 @@ mod tests {
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
             assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
+    }
+
+    #[test]
+    fn newly_ported_scalar_two_register_misc_visitors_dispatch() {
+        let cases = [
+            (0x7EA0_D800, Opcode::FPVectorGreaterEqual32), // FCMLE S0, #0.0
+            (0x5EA0_E800, Opcode::FPVectorGreater32),      // FCMLT S0, #0.0
+            (0x7E61_6800, Opcode::FPDoubleToSingle),       // FCVTXN S0, D0
+            (0x5E20_7800, Opcode::VectorSignedSaturatedAbs8),
+            (0x7E20_7800, Opcode::VectorSignedSaturatedNeg8),
+            (
+                0x5E20_3800,
+                Opcode::VectorSignedSaturatedAccumulateUnsigned8,
+            ),
+            (
+                0x7E20_3800,
+                Opcode::VectorUnsignedSaturatedAccumulateSigned8,
+            ),
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| inst.opcode == expected_opcode),
+                "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
+            );
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
+    }
+
+    #[test]
+    fn scalar_fp_zero_compare_reads_vector_once_then_extracts_result() {
+        let (block, should_continue) = translate_one(0x7EA0_D800);
+
+        assert!(should_continue);
+        assert_eq!(opcode_count(&block, Opcode::A64GetS), 1);
+        assert_eq!(opcode_count(&block, Opcode::A64GetQ), 0);
+        assert_eq!(opcode_count(&block, Opcode::VectorGetElement32), 1);
+    }
+
+    #[test]
+    fn scalar_abs_and_neg_extract_the_source_once() {
+        for encoding in [0x5EE0_B800, 0x7EE0_B800] {
+            let (block, should_continue) = translate_one(encoding);
+
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert_eq!(opcode_count(&block, Opcode::A64GetQ), 1);
+            assert_eq!(opcode_count(&block, Opcode::VectorGetElement64), 1);
+        }
+    }
+
+    #[test]
+    fn fcvtxn_uses_to_odd_and_rejects_the_reserved_sz_value() {
+        let (block, should_continue) = translate_one(0x7E61_6800);
+        assert!(should_continue);
+        let convert = block
+            .instructions
+            .iter()
+            .find(|inst| inst.opcode == Opcode::FPDoubleToSingle)
+            .expect("FCVTXN must emit FPDoubleToSingle");
+        assert_eq!(convert.arg(1), Value::ImmU8(RoundingMode::ToOdd as u8));
+
+        let (reserved, should_continue) = translate_one(0x7E21_6800);
+        assert!(!should_continue);
+        assert!(reserved
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A64ExceptionRaised));
+        assert!(!matches!(reserved.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn scalar_saturating_accumulate_reads_both_64_bit_vectors() {
+        for encoding in [0x5E20_3800, 0x7E20_3800] {
+            let (block, should_continue) = translate_one(encoding);
+
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert_eq!(opcode_count(&block, Opcode::A64GetD), 2);
+            assert_eq!(opcode_count(&block, Opcode::A64GetQ), 0);
+            assert_eq!(opcode_count(&block, Opcode::VectorGetElement8), 2);
         }
     }
 }

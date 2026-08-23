@@ -943,6 +943,8 @@ impl<'a> TranslatorVisitor<'a> {
             FCMEQ_zero_2 => self.fcmeq_zero_2(inst),
             FCMGE_zero_2 => self.fcmge_zero_2(inst),
             FCMGT_zero_2 => self.fcmgt_zero_2(inst),
+            FCMLE_2 => self.fcmle_2(inst),
+            FCMLT_2 => self.fcmlt_2(inst),
             FCMLE_4 => self.fcmle_4(inst),
             FCMLT_4 => self.fcmlt_4(inst),
             FCVTAS_2 => self.fcvtas_2(inst),
@@ -953,6 +955,7 @@ impl<'a> TranslatorVisitor<'a> {
             FCVTNU_2 => self.fcvtnu_2(inst),
             FCVTPS_2 => self.fcvtps_2(inst),
             FCVTPU_2 => self.fcvtpu_2(inst),
+            FCVTXN_1 => self.fcvtxn_1(inst),
             FCVTZS_int_2 => self.fcvtzs_int_2(inst),
             FCVTZU_int_2 => self.fcvtzu_int_2(inst),
             FRECPE_1 => self.frecpe_1(inst),
@@ -962,7 +965,11 @@ impl<'a> TranslatorVisitor<'a> {
             FRSQRTE_1 => self.frsqrte_1(inst),
             FRSQRTE_2 => self.frsqrte_2(inst),
             SCVTF_int_2 => self.scvtf_int_2(inst),
+            SQABS_1 => self.sqabs_1(inst),
+            SQNEG_1 => self.sqneg_1(inst),
+            SUQADD_1 => self.suqadd_1(inst),
             UCVTF_int_2 => self.ucvtf_int_2(inst),
+            USQADD_1 => self.usqadd_1(inst),
 
             // SIMD scalar pairwise.
             ADDP_pair => self.addp_pair(inst),

@@ -100,7 +100,9 @@ oracle does not complete. A bounded single-threaded run with those known tests
 excluded progressed through all frontend and JIT tests relevant to the current
 Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
-excluded, the remaining crate suite passes (1011 passed, 4 ignored). These are
+(`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
+`arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
+(1036 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -138,7 +140,11 @@ validation blockers, not evidence against the focused slices.
   signed-to-unsigned saturated-shift U8 operand.
 - The A64 scalar three-same owner now contains all 37 visitors defined by Eden and the exact three
   file-local helper boundaries. Thirteen restored dispatch paths reduce the remaining decoded A64
-  interpreter fallbacks to 44 identities; existing scalar-versus-vector operand shapes were also
+  interpreter fallbacks to 48 identities; existing scalar-versus-vector operand shapes were also
   corrected. Its prerequisite restored the five scalar saturated-arithmetic IR builders.
+- The A64 scalar two-register miscellaneous owner now contains all 34 visitors and Eden's three
+  file-local helper boundaries. Seven restored dispatch paths reduce the remaining decoded A64
+  interpreter fallbacks to 41 identities. Existing scalar/vector reads, inverted zero comparisons,
+  FP rounding modes, saturating operations, and reserved-value handling now follow Eden literally.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

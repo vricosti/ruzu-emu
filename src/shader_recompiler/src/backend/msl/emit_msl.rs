@@ -173,9 +173,6 @@ fn first_unsupported_program_feature(
     if info.uses_int64 && !profile.support_int64 {
         return Some("64-bit integers on the selected Metal device");
     }
-    if info.uses_fp32_denorms_preserve {
-        return Some("FP32 denorm preserve mode");
-    }
     if info.uses_image_1d {
         return Some("1D images");
     }
@@ -1000,6 +997,12 @@ pub fn emit_msl_with_options_and_bindings(
     options: &MslOptions,
     bindings: &mut Bindings,
 ) -> Result<MslShaderArtifact, MslError> {
+    if program.info.uses_fp32_denorms_preserve {
+        // Metal has no explicit denorm-preserve execution mode. Match
+        // upstream `SetupDenormControl` on a host without preserve support:
+        // report the limitation and emit using the host's default behavior.
+        log::debug!("MSL: FP32 denorm preserve requested without host control");
+    }
     if let Some(feature) = first_unsupported_program_feature(program, profile) {
         return Err(MslError::UnsupportedProgramFeature(feature));
     }
@@ -1846,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn fp32_denorm_capability_matches_upstream_host_fallback() {
+    fn fp32_denorm_modes_match_upstream_unsupported_host_fallback() {
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_fp32_denorms_flush = true;
         emit_msl(&program, &Profile::default(), &RuntimeInfo::default())
@@ -1854,11 +1857,8 @@ mod tests {
 
         program.info.uses_fp32_denorms_flush = false;
         program.info.uses_fp32_denorms_preserve = true;
-        assert_eq!(
-            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
-            Err(MslError::UnsupportedProgramFeature(
-                "FP32 denorm preserve mode"
-            ))
+        emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).expect(
+            "upstream reports but accepts preserve when the host has no float-control mode",
         );
     }
 

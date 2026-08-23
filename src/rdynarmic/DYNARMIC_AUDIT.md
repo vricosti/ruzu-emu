@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1047 passed, 4 ignored). These are
+(1050 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -156,5 +156,9 @@ validation blockers, not evidence against the focused slices.
 - The A64 SHA-512/SM3/SM4 owner now contains all ten visitors and its five principal file-local
   helpers. Their exact scalar/vector IR compositions reduce the remaining decoded A64 interpreter
   fallbacks to 24 identities.
+- The A64 vector shift-by-immediate owner now contains all 28 visitors and its six file-local
+  helpers. Nine restored dispatch paths reduce the remaining decoded A64 interpreter fallbacks to
+  15 identities; fixed-point conversion rounding, shift-insert masks, and saturating-shift forms
+  follow Eden's IR construction.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

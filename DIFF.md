@@ -10202,3 +10202,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all ten
   decoder identities, SHA-512 choice-versus-majority IR shapes, and the four SM4 rounds with four
   S-box substitutions per round.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_shift_by_immediate.rs` vs Eden `frontend/A64/translate/impl/{simd_shift_by_immediate.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`;
+  the six anonymous-namespace helpers remain file-local with the same responsibilities.
+- Rust passes `fpcr_controlled=true` explicitly to the four fixed-point vector conversion IR
+  builders. Eden's builder API supplies the same value as its default argument.
+- Rust computes Eden's `mcl::bit::ones<u64>(esize)` masks with an equivalent bounded `u64` shift.
+
+### Unintentional differences (to fix)
+- Fixed: SQSHL, SQSHLU, and UQSHL immediate, SRI, SLI, SCVTF, UCVTF, FCVTZS, and FCVTZU decoded but
+  fell through to the temporary interpreter terminal. All nine now preserve Eden's validation,
+  element-size and immediate calculations, source/destination reads, IR ordering, and writes.
+- Fixed: the four existing shift helpers were methods on `TranslatorVisitor`, obscuring their
+  anonymous-namespace ownership. They now have file-local ownership alongside the two restored
+  saturating-shift and floating-conversion helpers.
+
+### Missing items
+- None for the 28 visitors and six file-local helpers defined by the reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all nine
+  restored identities, all three saturation modes, both shift-insert directions, fixed-point
+  signedness/direction/fraction bits/rounding metadata, and absence of interpreter fallback.

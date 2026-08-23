@@ -728,6 +728,8 @@ fn emit_inst(
             emit_msl_shared_memory::emit_write_shared(context, inst_ref, inst)
         }
         Opcode::Barrier => emit_msl_barriers::emit_barrier(context),
+        Opcode::WorkgroupMemoryBarrier => emit_msl_barriers::emit_workgroup_memory_barrier(context),
+        Opcode::DeviceMemoryBarrier => emit_msl_barriers::emit_device_memory_barrier(context),
         Opcode::VoteAll => emit_msl_warp::emit_vote_all(context, inst_ref, inst),
         Opcode::VoteAny => emit_msl_warp::emit_vote_any(context, inst_ref, inst),
         Opcode::VoteEqual => emit_msl_warp::emit_vote_equal(context, inst_ref, inst),
@@ -3012,6 +3014,55 @@ mod tests {
         assert!(source.contains("uint desired = expected >= limit ? 0u : expected + 1u;"));
         assert!(source.contains(
             "uint desired = expected == 0u || expected > limit ? limit : expected - 1u;"
+        ));
+    }
+
+    #[test]
+    fn memory_barriers_use_language_version_specific_msl() {
+        let mut program = empty_program(Stage::Compute);
+        program.blocks[0].append_new_inst(Opcode::Barrier, vec![]);
+        program.blocks[0].append_new_inst(Opcode::WorkgroupMemoryBarrier, vec![]);
+        program.blocks[0].append_new_inst(Opcode::DeviceMemoryBarrier, vec![]);
+
+        let baseline = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &MslOptions {
+                language_version: MslVersion::V2_3,
+                ..MslOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(baseline
+            .source
+            .source
+            .contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
+        assert_eq!(
+            baseline
+                .source
+                .source
+                .matches("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);")
+                .count(),
+            2
+        );
+        assert!(!baseline.source.source.contains("atomic_thread_fence"));
+
+        let modern = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &MslOptions {
+                language_version: MslVersion::V3_2,
+                ..MslOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(modern.source.source.contains(
+            "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_threadgroup);"
+        ));
+        assert!(modern.source.source.contains(
+            "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);"
         ));
     }
 

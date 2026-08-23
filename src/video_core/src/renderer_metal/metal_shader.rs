@@ -2622,6 +2622,8 @@ mod tests {
             ],
         );
         program.blocks[0].append_new_inst(Opcode::Barrier, vec![]);
+        program.blocks[0].append_new_inst(Opcode::WorkgroupMemoryBarrier, vec![]);
+        program.blocks[0].append_new_inst(Opcode::DeviceMemoryBarrier, vec![]);
         let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
             &program,
             &Profile::default(),
@@ -2640,6 +2642,38 @@ mod tests {
             .expect("direct shared-memory MSL 2.3 must compile natively");
         assert_eq!(shader.source().stage, Stage::Compute);
         assert!(shader.source().source.contains("threadgroup uint smem[16]"));
+    }
+
+    #[test]
+    fn compiles_direct_msl_memory_fences_for_selected_language_version() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let mut program = empty_program(Stage::Compute);
+        program.blocks[0].append_new_inst(Opcode::WorkgroupMemoryBarrier, vec![]);
+        program.blocks[0].append_new_inst(Opcode::DeviceMemoryBarrier, vec![]);
+        let language_version = device.profile().msl_language_version;
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version,
+                fixed_subgroup_size: 32,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
+            },
+        )
+        .expect("memory-barrier IR must lower directly to MSL");
+        if language_version >= shader_recompiler::backend::msl::MslVersion::V3_2 {
+            assert!(artifact.source.source.contains("atomic_thread_fence"));
+        } else {
+            assert!(artifact.source.source.contains("threadgroup_barrier"));
+        }
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct memory-barrier MSL must compile as a native Metal function");
+        assert_eq!(shader.source().stage, Stage::Compute);
+        assert_eq!(shader.function().name().to_string(), "main0");
     }
 
     #[test]

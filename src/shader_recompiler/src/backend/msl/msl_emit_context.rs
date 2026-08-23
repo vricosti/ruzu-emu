@@ -1047,6 +1047,10 @@ impl MslEmitContext {
         self.language_version >= MslVersion::V3_1 && self.supports_texture_atomics
     }
 
+    pub fn language_version(&self) -> MslVersion {
+        self.language_version
+    }
+
     pub fn supports_subgroups(&self) -> bool {
         self.supports_subgroups
     }

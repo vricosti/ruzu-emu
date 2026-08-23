@@ -1560,14 +1560,16 @@ mod tests {
     }
 
     #[test]
-    fn compiles_direct_msl_fragment_builtins_with_active_abi() {
+    fn compiles_direct_msl_fragment_builtins_and_demote_with_active_abi() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let profile = make_shader_profile(device.profile());
         let runtime_info = RuntimeInfo::default();
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_sample_id = true;
         program.info.uses_is_helper_invocation = true;
+        program.info.uses_demote_to_helper_invocation = true;
         program.blocks[0].append_new_inst(Opcode::SampleId, vec![]);
+        program.blocks[0].append_new_inst(Opcode::DemoteToHelperInvocation, vec![]);
         program.blocks[0].append_new_inst(Opcode::IsHelperInvocation, vec![]);
 
         let spirv = emit_spirv(&program, &profile, &runtime_info);
@@ -1590,6 +1592,7 @@ mod tests {
         assert_eq!(shader.bindings(), active.bindings());
         assert!(shader.source().source.contains("[[sample_id]]"));
         assert!(shader.source().source.contains("simd_is_helper_thread()"));
+        assert!(shader.source().source.contains("discard_fragment()"));
     }
 
     #[test]

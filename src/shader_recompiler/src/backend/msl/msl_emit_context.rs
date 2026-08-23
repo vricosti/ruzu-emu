@@ -39,6 +39,7 @@ pub struct MslEmitContext {
     uses_shared_subword_cas: bool,
     uses_atomic_inc_dec_cas: bool,
     uses_texture_cast: bool,
+    tracks_helper_invocation: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
     supports_texture_atomics: bool,
@@ -249,6 +250,11 @@ impl MslEmitContext {
             let num_words = program.local_memory_size.div_ceil(4);
             source.push_str(&format!("    thread uint lmem[{num_words}];\n"));
         }
+        let tracks_helper_invocation =
+            program.info.uses_is_helper_invocation || program.info.uses_demote_to_helper_invocation;
+        if tracks_helper_invocation {
+            source.push_str("    bool helper_invocation = simd_is_helper_thread();\n");
+        }
 
         Ok(Self {
             stage,
@@ -267,6 +273,7 @@ impl MslEmitContext {
             uses_shared_subword_cas: false,
             uses_atomic_inc_dec_cas: false,
             uses_texture_cast: false,
+            tracks_helper_invocation,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
             supports_texture_atomics: options.supports_texture_atomics,
@@ -521,6 +528,14 @@ impl MslEmitContext {
 
     pub fn require_texture_cast(&mut self) {
         self.uses_texture_cast = true;
+    }
+
+    pub fn helper_invocation_expression(&self) -> &'static str {
+        if self.tracks_helper_invocation {
+            "helper_invocation"
+        } else {
+            "simd_is_helper_thread()"
+        }
     }
 
     pub fn validate_texture(

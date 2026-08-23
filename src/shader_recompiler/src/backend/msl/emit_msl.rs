@@ -19,6 +19,7 @@ use super::emit_msl_barriers;
 use super::emit_msl_bitwise_conversion;
 use super::emit_msl_composite;
 use super::emit_msl_context_get_set;
+use super::emit_msl_control_flow;
 use super::emit_msl_convert;
 use super::emit_msl_floating_point;
 use super::emit_msl_image;
@@ -60,6 +61,9 @@ fn first_unsupported_program_feature(
         && program.stage != crate::stage::Stage::Fragment
     {
         return Some("fragment built-in outside a fragment shader");
+    }
+    if info.uses_demote_to_helper_invocation && program.stage != crate::stage::Stage::Fragment {
+        return Some("demote outside a fragment shader");
     }
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
@@ -136,7 +140,6 @@ fn first_unsupported_program_feature(
         || info.uses_fp32_denorms_preserve
         || info.uses_image_1d
         || info.uses_sparse_residency
-        || info.uses_demote_to_helper_invocation
         || info.uses_fswzadd
         || info.uses_derivatives
         || info.uses_typeless_image_reads
@@ -170,6 +173,9 @@ fn emit_inst(
     let inst = program.block(inst_ref.block).inst(inst_ref.inst);
     match inst.opcode {
         Opcode::Void | Opcode::Prologue | Opcode::Epilogue => Ok(()),
+        Opcode::DemoteToHelperInvocation => {
+            emit_msl_control_flow::emit_demote_to_helper_invocation(context)
+        }
         Opcode::GetZeroFromOp
         | Opcode::GetSignFromOp
         | Opcode::GetCarryFromOp
@@ -1285,18 +1291,24 @@ mod tests {
     }
 
     #[test]
-    fn emits_fragment_sample_and_helper_invocation_builtins() {
+    fn emits_fragment_sample_helper_and_demote_semantics() {
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_sample_id = true;
         program.info.uses_is_helper_invocation = true;
+        program.info.uses_demote_to_helper_invocation = true;
         program.blocks[0].append_new_inst(Opcode::SampleId, vec![]);
+        program.blocks[0].append_new_inst(Opcode::DemoteToHelperInvocation, vec![]);
         program.blocks[0].append_new_inst(Opcode::IsHelperInvocation, vec![]);
 
         let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
         let source = &artifact.source.source;
         assert!(source.contains("uint sample_id [[sample_id]]"));
+        assert!(source.contains("bool helper_invocation = simd_is_helper_thread();"));
         assert!(source.contains("uint v_0_0 = sample_id;"));
-        assert!(source.contains("bool v_0_1 = simd_is_helper_thread();"));
+        assert!(source.contains("if (!helper_invocation) {"));
+        assert!(source.contains("helper_invocation = true;"));
+        assert!(source.contains("discard_fragment();"));
+        assert!(source.contains("bool v_0_2 = helper_invocation;"));
     }
 
     #[test]

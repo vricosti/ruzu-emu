@@ -102,7 +102,7 @@ pub fn emit_is_helper_invocation(
     context.define(
         inst_ref,
         ir::Type::U1,
-        "simd_is_helper_thread()".to_owned(),
+        context.helper_invocation_expression().to_owned(),
         false,
     )
 }

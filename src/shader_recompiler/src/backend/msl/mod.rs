@@ -14,6 +14,7 @@ mod emit_msl_barriers;
 mod emit_msl_bitwise_conversion;
 mod emit_msl_composite;
 mod emit_msl_context_get_set;
+mod emit_msl_control_flow;
 mod emit_msl_convert;
 mod emit_msl_floating_point;
 mod emit_msl_image;

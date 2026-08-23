@@ -1630,6 +1630,50 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_local_memory_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Compute);
+        program.local_memory_size = 18;
+        program.info.uses_local_memory = true;
+        let load = program.blocks[0].append_new_inst(Opcode::LoadLocal, vec![Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(
+            Opcode::WriteLocal,
+            vec![
+                Value::ImmU32(3),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load,
+                }),
+            ],
+        );
+
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+        )
+        .expect("active local-memory SPIR-V/MSL must compile");
+        let shader = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .expect("direct local-memory MSL must compile with the active ABI");
+
+        assert_eq!(shader.bindings(), active.bindings());
+        assert!(shader.source().source.contains("thread uint lmem[5]"));
+    }
+
+    #[test]
     fn compiles_direct_msl_shared_memory_at_msl_2_3_baseline() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);

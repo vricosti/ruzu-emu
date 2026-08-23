@@ -48,9 +48,6 @@ fn first_unsupported_program_feature(
 ) -> Option<&'static str> {
     let info = &program.info;
 
-    if program.local_memory_size != 0 {
-        return Some("local memory");
-    }
     if program.shared_memory_size != 0 && program.stage != crate::stage::Stage::Compute {
         return Some("shared memory outside a compute shader");
     }
@@ -98,7 +95,6 @@ fn first_unsupported_program_feature(
         return Some("tessellation patches");
     }
     if info.stores_global_memory
-        || info.uses_local_memory
         || info.uses_global_memory
         || info.uses_global_increment
         || info.uses_global_decrement
@@ -542,6 +538,8 @@ fn emit_inst(
         Opcode::LocalInvocationId => {
             emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
         }
+        Opcode::LoadLocal => emit_msl_context_get_set::emit_load_local(context, inst_ref, inst),
+        Opcode::WriteLocal => emit_msl_context_get_set::emit_write_local(context, inst_ref, inst),
         Opcode::LoadStorageU8
         | Opcode::LoadStorageS8
         | Opcode::LoadStorageU16
@@ -1304,6 +1302,30 @@ mod tests {
         assert!(source.contains("uint3 local_invocation_id [[thread_position_in_threadgroup]]"));
         assert!(source.contains("uint3 v_0_0 = workgroup_id;"));
         assert!(source.contains("uint3 v_0_1 = local_invocation_id;"));
+    }
+
+    #[test]
+    fn emits_private_local_memory_with_upstream_word_indexing() {
+        let mut program = empty_program(Stage::Compute);
+        program.local_memory_size = 18;
+        program.info.uses_local_memory = true;
+        let load = program.blocks[0].append_new_inst(Opcode::LoadLocal, vec![Value::ImmU32(2)]);
+        program.blocks[0].append_new_inst(
+            Opcode::WriteLocal,
+            vec![
+                Value::ImmU32(3),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load,
+                }),
+            ],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("thread uint lmem[5];"));
+        assert!(source.contains("uint v_0_0 = lmem[0x00000002u];"));
+        assert!(source.contains("lmem[0x00000003u] = v_0_0;"));
     }
 
     #[test]

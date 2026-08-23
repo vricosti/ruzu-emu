@@ -242,6 +242,10 @@ impl MslEmitContext {
             }
             _ => unreachable!("stage was validated above"),
         };
+        if program.local_memory_size != 0 {
+            let num_words = program.local_memory_size.div_ceil(4);
+            source.push_str(&format!("    thread uint lmem[{num_words}];\n"));
+        }
 
         Ok(Self {
             stage,

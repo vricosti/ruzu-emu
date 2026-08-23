@@ -88,3 +88,30 @@ pub fn emit_local_invocation_id(
         false,
     )
 }
+
+/// Emit Eden's `EmitLoadLocal`; the IR operand is already a 32-bit word index.
+pub fn emit_load_local(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let word_offset = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    context.define(
+        inst_ref,
+        ir::Type::U32,
+        format!("lmem[{word_offset}]"),
+        false,
+    )
+}
+
+/// Emit Eden's `EmitWriteLocal`; the IR operand is already a 32-bit word index.
+pub fn emit_write_local(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let word_offset = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    context.emit_statement(&format!("lmem[{word_offset}] = {value};"));
+    Ok(())
+}

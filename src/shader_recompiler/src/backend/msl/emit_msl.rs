@@ -330,25 +330,35 @@ fn emit_inst(
         Opcode::SelectU64 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U64),
         Opcode::SelectF16 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::F16),
         Opcode::SelectF32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::F32),
-        Opcode::BitCastU32F32 => emit_msl_bitwise_conversion::emit_bitcast(
-            context,
-            inst_ref,
-            inst,
-            ir::Type::U32,
-            "uint",
-        ),
-        Opcode::BitCastF32U32 => emit_msl_bitwise_conversion::emit_bitcast(
-            context,
-            inst_ref,
-            inst,
-            ir::Type::F32,
-            "float",
-        ),
+        Opcode::BitCastU16F16 => {
+            emit_msl_bitwise_conversion::emit_bit_cast_u16_f16(context, inst_ref, inst)
+        }
+        Opcode::BitCastU32F32 => {
+            emit_msl_bitwise_conversion::emit_bit_cast_u32_f32(context, inst_ref, inst)
+        }
+        Opcode::BitCastF16U16 => {
+            emit_msl_bitwise_conversion::emit_bit_cast_f16_u16(context, inst_ref, inst)
+        }
+        Opcode::BitCastF32U32 => {
+            emit_msl_bitwise_conversion::emit_bit_cast_f32_u32(context, inst_ref, inst)
+        }
+        Opcode::PackUint2x32 => {
+            emit_msl_bitwise_conversion::emit_pack_uint2x32(context, inst_ref, inst)
+        }
+        Opcode::UnpackUint2x32 => {
+            emit_msl_bitwise_conversion::emit_unpack_uint2x32(context, inst_ref, inst)
+        }
+        Opcode::PackFloat2x16 => {
+            emit_msl_bitwise_conversion::emit_pack_float2x16(context, inst_ref, inst)
+        }
         Opcode::UnpackFloat2x16 => {
             emit_msl_bitwise_conversion::emit_unpack_float2x16(context, inst_ref, inst)
         }
         Opcode::PackHalf2x16 => {
             emit_msl_bitwise_conversion::emit_pack_half2x16(context, inst_ref, inst)
+        }
+        Opcode::UnpackHalf2x16 => {
+            emit_msl_bitwise_conversion::emit_unpack_half2x16(context, inst_ref, inst)
         }
         Opcode::LogicalOr => emit_msl_logical::emit_binary(context, inst_ref, inst, "||"),
         Opcode::LogicalAnd => emit_msl_logical::emit_binary(context, inst_ref, inst, "&&"),
@@ -2325,6 +2335,59 @@ mod tests {
         let source = &artifact.source.source;
         assert!(source.contains("half2 v_0_0 = as_type<half2>(0xC0003C00u);"));
         assert!(source.contains("uint v_0_2 = as_type<uint>(half2(v_0_1));"));
+    }
+
+    #[test]
+    fn emits_non_fp64_bitwise_conversion_family() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.uses_fp16 = true;
+        program.info.uses_int64 = true;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::BitCastU16F16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(Opcode::BitCastF16U16, vec![Value::ImmU32(0x3C00)]);
+        let uint_pair = block.append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(0x89AB_CDEF), Value::ImmU32(0x0123_4567)],
+        );
+        let packed_uint = block.append_new_inst(
+            Opcode::PackUint2x32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: uint_pair,
+            })],
+        );
+        block.append_new_inst(
+            Opcode::UnpackUint2x32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: packed_uint,
+            })],
+        );
+        let half_pair = block.append_new_inst(
+            Opcode::CompositeConstructF16x2,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0xC000)],
+        );
+        block.append_new_inst(
+            Opcode::PackFloat2x16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: half_pair,
+            })],
+        );
+        block.append_new_inst(Opcode::UnpackHalf2x16, vec![Value::ImmU32(0xC000_3C00)]);
+
+        let profile = Profile {
+            support_int64: true,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint v_0_0 = uint(as_type<ushort>("));
+        assert!(source.contains("half v_0_1 = as_type<half>(ushort(0x00003C00u));"));
+        assert!(source.contains("ulong v_0_3 = as_type<ulong>(v_0_2);"));
+        assert!(source.contains("uint2 v_0_4 = as_type<uint2>(v_0_3);"));
+        assert!(source.contains("uint v_0_6 = as_type<uint>(v_0_5);"));
+        assert!(source.contains("float2 v_0_7 = float2(as_type<half2>(0xC0003C00u));"));
     }
 
     #[test]

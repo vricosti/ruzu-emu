@@ -2991,6 +2991,77 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_bitwise_conversion_family_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let mut program = empty_program(Stage::VertexB);
+        program.info.uses_fp16 = true;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::BitCastU16F16, vec![Value::ImmF16(0xBC00)]);
+        block.append_new_inst(Opcode::BitCastF16U16, vec![Value::ImmU32(0x3C00)]);
+        let half_pair = block.append_new_inst(
+            Opcode::CompositeConstructF16x2,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0xC000)],
+        );
+        block.append_new_inst(
+            Opcode::PackFloat2x16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: half_pair,
+            })],
+        );
+        block.append_new_inst(Opcode::UnpackHalf2x16, vec![Value::ImmU32(0xC000_3C00)]);
+        if profile.support_int64 {
+            program.info.uses_int64 = true;
+            let uint_pair = block.append_new_inst(
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(0x89AB_CDEF), Value::ImmU32(0x0123_4567)],
+            );
+            let packed = block.append_new_inst(
+                Opcode::PackUint2x32,
+                vec![Value::Inst(InstRef {
+                    block: 0,
+                    inst: uint_pair,
+                })],
+            );
+            block.append_new_inst(
+                Opcode::UnpackUint2x32,
+                vec![Value::Inst(InstRef {
+                    block: 0,
+                    inst: packed,
+                })],
+            );
+        }
+
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &profile,
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
+            },
+        )
+        .expect("bitwise conversion IR must lower directly to MSL");
+        assert!(artifact
+            .source
+            .source
+            .contains("float2(as_type<half2>(0xC0003C00u))"));
+        if profile.support_int64 {
+            assert!(artifact.source.source.contains("as_type<ulong>("));
+            assert!(artifact.source.source.contains("as_type<uint2>("));
+        }
+
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct bitwise-conversion MSL must compile as a native Metal function");
+        assert_eq!(shader.source().stage, Stage::VertexB);
+        assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
     fn direct_bindings_compact_independent_metal_namespaces() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let profile = make_shader_profile(device.profile());

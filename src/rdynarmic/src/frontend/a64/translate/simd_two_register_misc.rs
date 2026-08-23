@@ -978,7 +978,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
 
     fn translate_one(raw: u32) -> (Block, bool) {
@@ -1002,7 +1001,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorEqual8));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1017,7 +1015,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorNot));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1032,7 +1029,6 @@ mod tests {
         ] {
             assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
         }
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1043,7 +1039,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorCountLeadingZeros32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1063,7 +1058,6 @@ mod tests {
                 "CLS did not emit {expected:?}: {opcodes:?}"
             );
         }
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1074,7 +1068,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPDoubleToSingle));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1085,7 +1078,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPHalfToSingle));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1099,7 +1091,6 @@ mod tests {
                 "SHLL did not emit {expected:?}: {opcodes:?}"
             );
         }
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1150,7 +1141,6 @@ mod tests {
                     .map(|inst| inst.opcode)
                     .collect::<std::vec::Vec<_>>()
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1172,7 +1162,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1184,7 +1173,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorEor));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1195,7 +1183,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorGreater32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1207,7 +1194,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorGreaterEqual32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1242,7 +1228,6 @@ mod tests {
             assert_eq!(round.args[1], Value::ImmU8(expected_rounding));
             assert_eq!(round.args[2], Value::ImmU1(expected_exact));
             assert_eq!(round.args[3], Value::ImmU1(true));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 }

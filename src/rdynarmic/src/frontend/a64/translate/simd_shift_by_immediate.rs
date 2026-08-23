@@ -662,7 +662,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
 
     fn translate_one(raw: u32) -> (Block, bool) {
@@ -715,7 +714,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::ZeroExtendLongToQuad));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -739,7 +737,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -759,7 +756,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::A64SetQ));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -821,7 +817,6 @@ mod tests {
                 accumulating,
                 "encoding 0x{encoding:08X} accumulation mismatch"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -849,7 +844,6 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|inst| inst.opcode == expected_opcode));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -881,7 +875,6 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|inst| inst.opcode == Opcode::VectorOr));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -923,7 +916,6 @@ mod tests {
             assert_eq!(conversion.args[1], Value::ImmU8(29));
             assert_eq!(conversion.args[2], Value::ImmU8(expected_rounding));
             assert_eq!(conversion.args[3], Value::ImmU1(true));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 }

@@ -63,7 +63,6 @@ mod tests {
     use crate::frontend::a64::translate::{translate, TranslationOptions};
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_single(raw: u32) -> crate::ir::block::Block {
         let loc = A64LocationDescriptor::new(0x1000, 0, true);
@@ -83,7 +82,6 @@ mod tests {
     #[test]
     fn fccmp_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E22042A);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -101,7 +99,6 @@ mod tests {
     #[test]
     fn fccmpe_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E22043A);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()

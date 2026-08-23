@@ -3,7 +3,6 @@
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::Vec;
-use crate::ir::value::Value;
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -1505,7 +1504,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorPairedMinLowerU8));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1516,7 +1514,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorPairedMinU8));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1541,7 +1538,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorSub64));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1552,7 +1548,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorPairedAddLower32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1562,7 +1557,6 @@ mod tests {
         for opcode in [Opcode::VectorMinU8, Opcode::VectorEqual8, Opcode::VectorNot] {
             assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
         }
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1600,7 +1594,6 @@ mod tests {
                 accumulates,
                 "instruction 0x{raw:08X} accumulation mismatch"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1623,7 +1616,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "instruction 0x{raw:08X} should emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1646,7 +1638,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "instruction 0x{raw:08X} should emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1681,7 +1672,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "instruction 0x{raw:08X} should emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1713,7 +1703,6 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|inst| inst.opcode == expected_opcode));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1741,7 +1730,6 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|inst| inst.opcode == expected_opcode));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1763,7 +1751,6 @@ mod tests {
                     .any(|inst| inst.opcode == Opcode::FPVectorNeg16),
                 subtracts
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 

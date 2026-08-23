@@ -603,9 +603,7 @@ impl A64AddressSpace {
             block.recompute_use_counts();
             opt::dead_code_elimination(&mut block);
         }
-        if self.conf.has_optimization(OptimizationFlag::MISC_IR_OPT) {
-            opt::a64_merge_interpret_blocks(&mut block);
-        }
+        if self.conf.has_optimization(OptimizationFlag::MISC_IR_OPT) {}
         block.recompute_use_counts();
         #[cfg(debug_assertions)]
         opt::verification_pass(&block);

@@ -205,7 +205,7 @@ mod tests {
         }));
         assert!(matches!(
             &block.terminal,
-            Terminal::CheckHalt { .. } | Terminal::Interpret { .. } | Terminal::ReturnToDispatch
+            Terminal::CheckHalt { .. } | Terminal::ReturnToDispatch
         ));
     }
 }

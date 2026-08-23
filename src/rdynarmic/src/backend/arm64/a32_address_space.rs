@@ -117,7 +117,7 @@ fn classify_terminal(terminal: &Terminal) -> TerminalKind {
             }
         }
         Terminal::CheckHalt { else_ } => classify_terminal(else_),
-        Terminal::Invalid | Terminal::Interpret { .. } => TerminalKind::Other,
+        Terminal::Invalid => TerminalKind::Other,
     }
 }
 

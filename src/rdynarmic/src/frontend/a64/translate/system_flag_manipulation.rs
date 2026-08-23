@@ -70,7 +70,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
 
     fn translate_one(raw: u32) -> (Block, bool) {
@@ -101,7 +100,6 @@ mod tests {
             .instructions
             .iter()
             .any(|instruction| instruction.opcode == Opcode::A64SetNZCVRaw));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -139,7 +137,6 @@ mod tests {
                     .count(),
                 or_count
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 }

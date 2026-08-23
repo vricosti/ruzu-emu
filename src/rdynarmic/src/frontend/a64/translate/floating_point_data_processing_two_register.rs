@@ -208,7 +208,6 @@ mod tests {
     #[test]
     fn fadd_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E222820);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -218,7 +217,6 @@ mod tests {
     #[test]
     fn fnmul_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E228820);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()

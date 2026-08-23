@@ -350,9 +350,7 @@ impl A64EmitX64 {
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
         }
-        if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {
-            opt::a64_merge_interpret_blocks(&mut block);
-        }
+        if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {}
         block.rebuild_pseudo_op_links();
 
         // Build inst_info for register allocator.

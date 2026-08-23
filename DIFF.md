@@ -10507,3 +10507,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 - N/A: the enum only selects translation control flow; no SSA or guest payload layout changes.
+
+## 2026-08-24 — `src/rdynarmic/src/{ir/terminal.rs,ir/opt,frontend/a64/translate/visitor.rs,backend/{x64,arm64}}` vs Eden `ir/terminal.h`, `frontend/A64/translate/impl/impl.cpp`, and host terminal emitters (terminal inventory)
+
+### Intentional differences
+- Rust represents the C++ variant surface as an enum and uses `Box` for recursive storage. Backend
+  emitters remain split according to Rust's existing host modules rather than C++ class overloads.
+- Translation tests retain their positive opcode/exception/terminal assertions; 118 negative
+  `Terminal::Interpret` assertions were removed because absence of the variant makes them
+  tautological rather than behavioral checks.
+
+### Unintentional differences (to fix)
+- Fixed: Rust invented `Terminal::Interpret`, an A64 `interpret_this_instruction` producer, x64 and
+  arm64 emitter cases, and a no-op `a64_merge_interpret_blocks` optimization. Eden has none of
+  these; the variant, producer, optimizer, calls, and emitter paths are removed.
+- Rust still permits conditional terminals to contain another recursive `Terminal`, whereas Eden
+  restricts `If`, `CheckBit`, and `CheckHalt` children to `LeafTerminal`. Aligning this type-level
+  invariant is a broader terminal-ownership refactor and remains outstanding.
+
+### Missing items
+- A distinct Rust `LeafTerminal` owner enforcing Eden's non-recursive conditional children.
+
+### Binary layout verification
+- N/A: terminals are compiler-owned control-flow values and are not raw-copied across an ABI. The
+  bounded crate suite passes with 1075 tests and four ignored after removing the two extra
+  Interpret-specific tests.

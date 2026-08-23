@@ -251,7 +251,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_one(raw: u32) -> (Block, bool) {
         let decoded = decode(raw).expect("instruction should decode");
@@ -273,10 +272,6 @@ mod tests {
         // NOT fall back to the interpreter (PrefetchAbort at runtime).
         let (block, should_continue) = translate_one(0x4F03F600);
         assert!(should_continue);
-        assert!(
-            !matches!(block.terminal, Terminal::Interpret { .. }),
-            "FMOV V0.4S, #imm must not fall back to Interpret"
-        );
     }
 
     #[test]
@@ -318,10 +313,6 @@ mod tests {
                 .iter()
                 .any(|insn| insn.opcode == Opcode::ZeroExtendLongToQuad),
             "expected MOVI d28, #0 to materialize a 64-bit immediate and zero-extend it"
-        );
-        assert!(
-            !matches!(block.terminal, Terminal::Interpret { .. }),
-            "movi d28, #0 must not fall back to Interpret"
         );
     }
 }

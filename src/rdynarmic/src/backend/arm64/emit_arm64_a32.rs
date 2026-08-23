@@ -960,7 +960,6 @@ fn emit_a32_terminal_inner(
 ) -> Result<(), String> {
     match terminal {
         Terminal::Invalid => Err("Invalid A32 terminal".to_string()),
-        Terminal::Interpret { .. } => Err("Interpret should never be emitted".to_string()),
         Terminal::ReturnToDispatch => {
             emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
         }

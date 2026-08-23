@@ -127,7 +127,6 @@ mod tests {
     use crate::frontend::a64::translate::{translate, TranslationOptions};
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_single(raw: u32) -> crate::ir::block::Block {
         let loc = A64LocationDescriptor::new(0x1000, 0, true);
@@ -147,7 +146,6 @@ mod tests {
     #[test]
     fn fmadd_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1f020c20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| matches!(
             inst.opcode,
             Opcode::FPMulAdd16 | Opcode::FPMulAdd32 | Opcode::FPMulAdd64
@@ -157,7 +155,6 @@ mod tests {
     #[test]
     fn fmsub_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1f028c20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| matches!(
             inst.opcode,
             Opcode::FPMulSub16 | Opcode::FPMulSub32 | Opcode::FPMulSub64
@@ -167,7 +164,6 @@ mod tests {
     #[test]
     fn fnmadd_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1f220c20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| {
             matches!(
                 inst.opcode,
@@ -184,7 +180,6 @@ mod tests {
     #[test]
     fn fnmsub_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1f228c20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| {
             matches!(
                 inst.opcode,

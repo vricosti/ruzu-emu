@@ -182,7 +182,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::A64ReadMemory128));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -197,7 +196,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::ZeroExtendLongToQuad));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]

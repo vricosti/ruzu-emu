@@ -233,7 +233,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_one(raw: u32) -> (Block, bool) {
         let decoded = decode(raw).expect("instruction should decode");
@@ -285,7 +284,6 @@ mod tests {
             assert_eq!(opcode_count(&block, expected_extension), 16);
             assert_eq!(opcode_count(&block, Opcode::Mul32), 8);
             assert_eq!(opcode_count(&block, Opcode::VectorSetElement32), 2);
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -310,7 +308,6 @@ mod tests {
             assert_eq!(opcode_count(&block, Opcode::FPNeg32), negations);
             assert_eq!(opcode_count(&block, Opcode::FPMulAdd32), 2);
             assert_eq!(opcode_count(&block, Opcode::VectorSetElement32), 2);
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -323,7 +320,6 @@ mod tests {
             assert_eq!(opcode_count(&block, Opcode::FPNeg32), 1);
             assert_eq!(opcode_count(&block, Opcode::FPAdd32), 2);
             assert_eq!(opcode_count(&block, Opcode::VectorSetElement32), 2);
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 

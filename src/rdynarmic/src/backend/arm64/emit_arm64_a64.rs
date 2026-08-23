@@ -189,27 +189,6 @@ fn emit_a64_terminal_inner(
 ) -> Result<(), String> {
     match terminal {
         Terminal::Invalid => Err("Invalid A64 terminal".to_string()),
-        Terminal::Interpret {
-            next,
-            num_instructions,
-        } => {
-            let next = A64LocationDescriptor::from_location(next);
-            ctx.reg_alloc
-                .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
-            emit_mov_x_imm(code, X1, next.pc())?;
-            code.write_u32(inst::str_x_unsigned(
-                X1,
-                XSTATE,
-                core::mem::offset_of!(A64JitState, pc) as u32,
-            ))?;
-            emit_mov_x_imm(code, X2, num_instructions as u64)?;
-            emit_relocation(
-                code,
-                ctx.emitted_block_info,
-                LinkTarget::InterpreterFallback,
-            )?;
-            emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnFromRunCode)
-        }
         Terminal::ReturnToDispatch => {
             emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
         }

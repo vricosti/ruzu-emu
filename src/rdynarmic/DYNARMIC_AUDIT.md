@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1077 passed, 4 ignored). These are
+(1075 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -145,6 +145,10 @@ validation blockers, not evidence against the focused slices.
 - The A64 exclusive load/store owner now matches both upstream shared helpers and all twelve
   visitors, including option-controlled store aliases, validation order, pair packing, access
   types, and limited/full ordered operations.
+- The extra `Terminal::Interpret` lifecycle and its no-op merge pass have been removed from the IR,
+  A64 frontend, and both host terminal emitters. The remaining interpreter-fallback callback and
+  trampoline fields are dead plumbing scheduled for the immediately following callback-owner
+  slice.
 - The A64 SM3/EOR3/BCAX crypto slice now owns and dispatches all seven visitors from Eden's
   `simd_crypto_four_register.cpp` and `simd_crypto_three_register.cpp`. This removes seven decoded
   identities from the temporary interpreter fallback.

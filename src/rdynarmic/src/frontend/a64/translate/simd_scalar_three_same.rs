@@ -598,12 +598,11 @@ impl<'a> TranslatorVisitor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontend::a64::decoder::{A64InstructionName, decode};
+    use crate::frontend::a64::decoder::{decode, A64InstructionName};
     use crate::frontend::a64::translate::TranslationOptions;
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn integer_encoding(unsigned: bool, size: u32, opcode: u32) -> u32 {
         (if unsigned { 0x7e20_0000 } else { 0x5e20_0000 })
@@ -672,7 +671,6 @@ mod tests {
             let (name, block, should_continue) = translate_one(raw);
             assert_eq!(name, expected_name, "encoding 0x{raw:08x}");
             assert!(should_continue, "encoding 0x{raw:08x}");
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -739,24 +737,19 @@ mod tests {
         );
 
         let (_, cmtst, _) = translate_one(integer_encoding(false, 3, 35));
-        assert!(
-            !cmtst
-                .instructions
-                .iter()
-                .any(|inst| inst.opcode == Opcode::VectorGetElement64)
-        );
+        assert!(!cmtst
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::VectorGetElement64));
     }
 
     #[test]
     fn invalid_rounding_shift_size_is_reserved_not_interpreted() {
         let (_, block, should_continue) = translate_one(integer_encoding(false, 2, 21));
         assert!(!should_continue);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
-        assert!(
-            block
-                .instructions
-                .iter()
-                .any(|inst| inst.opcode == Opcode::A64ExceptionRaised)
-        );
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A64ExceptionRaised));
     }
 }

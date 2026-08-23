@@ -649,7 +649,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorMul32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -687,7 +686,6 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|inst| inst.opcode == Opcode::VectorMultiply32));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -729,7 +727,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -765,7 +762,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorNeg32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -778,7 +774,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorMulX32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -802,7 +797,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -814,6 +808,5 @@ mod tests {
         assert!(block.instructions.iter().any(|inst| {
             inst.opcode == Opcode::VectorSignedSaturatedDoublingMultiplyHighRounding16
         }));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 }

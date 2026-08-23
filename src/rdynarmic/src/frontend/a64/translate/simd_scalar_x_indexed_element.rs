@@ -279,7 +279,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_one(raw: u32) -> (Block, bool) {
         let decoded = decode(raw).expect("instruction should decode");
@@ -316,7 +315,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPMul32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -337,7 +335,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPMulX32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -360,7 +357,6 @@ mod tests {
                     .any(|instruction| instruction.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -403,7 +399,6 @@ mod tests {
                     .any(|instruction| instruction.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -416,7 +411,6 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|instruction| instruction.opcode == Opcode::A64ExceptionRaised));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 }

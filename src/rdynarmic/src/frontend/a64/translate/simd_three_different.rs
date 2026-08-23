@@ -401,7 +401,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_one(raw: u32) -> (Block, bool) {
         let decoded = decode(raw).expect("instruction should decode");
@@ -436,7 +435,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::A64SetQ));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -451,7 +449,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorAdd16));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -473,7 +470,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -523,7 +519,6 @@ mod tests {
                     "encoding 0x{encoding:08X} did not emit {combine_opcode:?}"
                 );
             }
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -550,7 +545,6 @@ mod tests {
                     .instructions
                     .iter()
                     .any(|inst| inst.opcode == expected_opcode));
-                assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
             } else {
                 assert!(!should_continue, "encoding 0x{encoding:08X}");
                 assert!(block
@@ -584,7 +578,6 @@ mod tests {
                     .instructions
                     .iter()
                     .any(|inst| inst.opcode == expected_opcode));
-                assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
             } else {
                 assert!(!should_continue, "encoding 0x{encoding:08X}");
                 assert!(block

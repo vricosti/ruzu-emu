@@ -9,12 +9,6 @@ pub enum Terminal {
     /// Invalid/unset terminal.
     Invalid,
 
-    /// Fall back to interpreter starting at `next` for `num_instructions` instructions.
-    Interpret {
-        next: LocationDescriptor,
-        num_instructions: usize,
-    },
-
     /// Return control to the dispatcher (which reads current CPU state).
     ReturnToDispatch,
 
@@ -54,13 +48,6 @@ impl Terminal {
         matches!(self, Terminal::Invalid)
     }
 
-    pub fn interpret(next: LocationDescriptor) -> Self {
-        Terminal::Interpret {
-            next,
-            num_instructions: 1,
-        }
-    }
-
     pub fn link_block(next: LocationDescriptor) -> Self {
         Terminal::LinkBlock { next }
     }
@@ -95,10 +82,6 @@ impl fmt::Display for Terminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Terminal::Invalid => write!(f, "Invalid"),
-            Terminal::Interpret {
-                next,
-                num_instructions,
-            } => write!(f, "Interpret({}, n={})", next, num_instructions),
             Terminal::ReturnToDispatch => write!(f, "ReturnToDispatch"),
             Terminal::LinkBlock { next } => write!(f, "LinkBlock({})", next),
             Terminal::LinkBlockFast { next } => write!(f, "LinkBlockFast({})", next),

@@ -141,7 +141,6 @@ mod tests {
             TranslationOptions::default(),
         );
 
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -163,7 +162,6 @@ mod tests {
             TranslationOptions::default(),
         );
 
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -189,7 +187,6 @@ mod tests {
             TranslationOptions::default(),
         );
 
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -221,7 +218,6 @@ mod tests {
                 TranslationOptions::default(),
             );
 
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
             assert!(block
                 .instructions
                 .iter()
@@ -254,7 +250,6 @@ mod tests {
                 TranslationOptions::default(),
             );
 
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
             assert!(block
                 .instructions
                 .iter()

@@ -40,7 +40,6 @@ mod tests {
     use crate::frontend::a64::translate::{translate, TranslationOptions};
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_single(raw: u32) -> crate::ir::block::Block {
         let loc = A64LocationDescriptor::new(0x1000, 0, true);
@@ -61,7 +60,6 @@ mod tests {
     fn fcsel_float_translates_without_interpret_terminal() {
         // FCSEL S0, S1, S2, EQ
         let block = translate_single(0x1E220C20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| matches!(
             inst.opcode,
             Opcode::ConditionalSelect32 | Opcode::ConditionalSelect64

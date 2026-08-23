@@ -381,37 +381,6 @@ impl<'a> TranslatorVisitor<'a> {
 
     // --- Error handlers ---
 
-    /// Fallback: interpret this instruction.
-    pub fn interpret_this_instruction(&mut self) -> bool {
-        let loc = self.ir.current_location.expect("location not set");
-        // RUZU_LOG_INTERPRET_PC=1 — log every PC where translation fell back
-        // to the interpret terminal. Useful for finding interpret-fallback
-        // instructions in tight loops (each occurrence costs a JIT
-        // exit/re-enter at ~10µs/iter, easily wedging boot if hit millions
-        // of times).
-        if std::env::var_os("RUZU_LOG_INTERPRET_PC").is_some() {
-            static COUNTS: std::sync::OnceLock<
-                std::sync::Mutex<std::collections::HashMap<u64, u64>>,
-            > = std::sync::OnceLock::new();
-            let pc = loc.pc();
-            let mut counts = COUNTS
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-                .lock()
-                .unwrap();
-            let n = counts.entry(pc).and_modify(|c| *c += 1).or_insert(1);
-            // Log first occurrence + powers of 16 (1, 16, 256, 4k, 65k, 1M, 16M, ...)
-            // so a hot fallback shows growth without spamming.
-            if *n == 1 || n.is_power_of_two() && (*n).trailing_zeros() % 4 == 0 {
-                eprintln!("[INTERPRET_FALLBACK] pc=0x{:016X} count={}", pc, *n);
-            }
-        }
-        self.ir.set_term(Terminal::Interpret {
-            next: loc.to_location(),
-            num_instructions: 1,
-        });
-        false
-    }
-
     /// Unpredictable instruction — treat as interpret.
     pub fn unpredictable_instruction(&mut self) -> bool {
         self.raise_exception(Exception::UnpredictableInstruction)
@@ -1342,27 +1311,6 @@ mod tests {
         drop(visitor);
 
         assert_exception_terminal(&block);
-    }
-
-    #[test]
-    fn interpret_this_instruction_uses_current_location_like_upstream() {
-        let loc = A64LocationDescriptor::new(0x1000, 0, false);
-        let mut block = Block::new(loc.to_location());
-        let mut visitor = TranslatorVisitor::new(&mut block, loc, TranslationOptions::default());
-
-        assert!(!visitor.interpret_this_instruction());
-        drop(visitor);
-
-        match &block.terminal {
-            Terminal::Interpret {
-                next,
-                num_instructions,
-            } => {
-                assert_eq!(*next, loc.to_location());
-                assert_eq!(*num_instructions, 1);
-            }
-            other => panic!("expected Interpret terminal, got {other:?}"),
-        }
     }
 
     #[test]

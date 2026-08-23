@@ -120,6 +120,25 @@ fn family_limits(highest_apple_family: Option<u8>) -> MetalFamilyLimits {
     }
 }
 
+fn select_msl_language_version(is_apple_silicon: bool) -> MslVersion {
+    // Apple only exposes language standards 3.2 and newer on Apple silicon.
+    // Intel Macs remain capped at 3.1 even when the host OS ships a newer
+    // compiler.
+    if is_apple_silicon && objc2::available!(macos = 26.0, ..) {
+        MslVersion::V4_0
+    } else if is_apple_silicon && objc2::available!(macos = 15.0, ..) {
+        MslVersion::V3_2
+    } else if objc2::available!(macos = 14.0, ..) {
+        MslVersion::V3_1
+    } else if objc2::available!(macos = 13.0, ..) {
+        MslVersion::V3_0
+    } else if objc2::available!(macos = 12.0, ..) {
+        MslVersion::V2_4
+    } else {
+        MslVersion::V2_3
+    }
+}
+
 impl MetalDeviceProfile {
     fn query(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let highest_apple_family = [
@@ -142,19 +161,7 @@ impl MetalDeviceProfile {
             objc2::available!(macos = 13.0, ..) && device.supportsFamily(MTLGPUFamily::Metal3);
         let supports_metal4_family =
             objc2::available!(macos = 26.0, ..) && device.supportsFamily(MTLGPUFamily::Metal4);
-        let msl_language_version = if objc2::available!(macos = 26.0, ..) {
-            MslVersion::V4_0
-        } else if objc2::available!(macos = 15.0, ..) {
-            MslVersion::V3_2
-        } else if objc2::available!(macos = 14.0, ..) {
-            MslVersion::V3_1
-        } else if objc2::available!(macos = 13.0, ..) {
-            MslVersion::V3_0
-        } else if objc2::available!(macos = 12.0, ..) {
-            MslVersion::V2_4
-        } else {
-            MslVersion::V2_3
-        };
+        let msl_language_version = select_msl_language_version(highest_apple_family.is_some());
         // Apple publishes these implementation limits by GPU family rather
         // than through individual MTLDevice selectors. All Apple Silicon
         // devices are Apple7 or newer; direct binding limits remain stable,
@@ -315,20 +322,13 @@ mod tests {
         assert!(!Retained::as_ptr(&device.command_queue).is_null());
         assert!(device.profile().supports_sample_count(1));
         assert!(device.profile().highest_apple_family.is_some());
-        let expected_msl = if objc2::available!(macos = 26.0, ..) {
-            MslVersion::V4_0
-        } else if objc2::available!(macos = 15.0, ..) {
-            MslVersion::V3_2
-        } else if objc2::available!(macos = 14.0, ..) {
-            MslVersion::V3_1
-        } else if objc2::available!(macos = 13.0, ..) {
-            MslVersion::V3_0
-        } else if objc2::available!(macos = 12.0, ..) {
-            MslVersion::V2_4
-        } else {
-            MslVersion::V2_3
-        };
+        let expected_msl = select_msl_language_version(true);
         assert_eq!(device.profile().msl_language_version, expected_msl);
+    }
+
+    #[test]
+    fn intel_devices_never_select_apple_silicon_only_msl() {
+        assert!(select_msl_language_version(false) <= MslVersion::V3_1);
     }
 
     #[test]

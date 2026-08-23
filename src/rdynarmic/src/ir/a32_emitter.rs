@@ -218,21 +218,6 @@ impl<'a> A32IREmitter<'a> {
         self.emit_void(Opcode::A32CallSupervisor, &[Value::ImmU32(imm)]);
     }
 
-    /// Debug-only per-instruction PC execution hook (RUZU_A32_PC_EXEC). `pc` is
-    /// the guest PC of the instruction this hook precedes; it becomes the hook's
-    /// aggregation tag. Only emitted by the translator when the PC is in the
-    /// configured target set, so there is zero cost when the env var is unset.
-    pub fn pc_exec_hook(&mut self, pc: u32) {
-        let args = [
-            Value::ImmU32(pc),
-            self.get_register(Reg::R0),
-            self.get_register(Reg::R1),
-            self.get_register(Reg::R2),
-            self.get_register(Reg::LR),
-        ];
-        self.emit_void(Opcode::A32PcExecHook, &args);
-    }
-
     pub fn exception_raised(&mut self, exception: crate::frontend::a32::types::Exception) {
         let loc_desc = self.imm_current_location_descriptor();
         let pc = match loc_desc {

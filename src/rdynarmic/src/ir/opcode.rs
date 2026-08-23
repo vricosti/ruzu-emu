@@ -731,11 +731,6 @@ pub enum Opcode {
     A32BXWritePC,
     A32UpdateUpperLocationDescriptor,
     A32CallSupervisor,
-    /// Debug-only: per-instruction PC execution hook (RUZU_A32_PC_EXEC). Arg is
-    /// the guest PC. Lowered to a host call into `a32_pc_trace_hook` after a
-    /// guest-register flush, so the callback observes accurate r0-r15. Gated by
-    /// an env var at translate time; no-op (not emitted) when unset.
-    A32PcExecHook,
     A32ExceptionRaised,
     A32DataSynchronizationBarrier,
     A32DataMemoryBarrier,
@@ -826,7 +821,7 @@ impl Opcode {
             A32SetCpsrNZ | A32SetCpsrNZC | A32OrQFlag |
             A32SetGEFlags | A32SetGEFlagsCompressed |
             A32BXWritePC | A32UpdateUpperLocationDescriptor |
-            A32CallSupervisor | A32PcExecHook | A32ExceptionRaised |
+            A32CallSupervisor | A32ExceptionRaised |
             A32DataSynchronizationBarrier | A32DataMemoryBarrier |
             A32InstructionSynchronizationBarrier |
             A32SetFpscr | A32SetFpscrNZCV |
@@ -1008,7 +1003,6 @@ impl Opcode {
                 | A32BXWritePC
                 | A32UpdateUpperLocationDescriptor
                 | A32CallSupervisor
-                | A32PcExecHook
                 | A32ExceptionRaised
                 | A32DataSynchronizationBarrier
                 | A32DataMemoryBarrier
@@ -1592,7 +1586,6 @@ impl Opcode {
             A32BXWritePC => OpcodeInfo { ret: V, args: &[U32] },
             A32UpdateUpperLocationDescriptor => OpcodeInfo { ret: V, args: &[] },
             A32CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
-            A32PcExecHook => OpcodeInfo { ret: V, args: &[U32, U32, U32, U32, U32] },
             A32ExceptionRaised => OpcodeInfo { ret: V, args: &[U32, U64] },
             A32DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
             A32DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },

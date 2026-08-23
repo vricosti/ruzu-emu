@@ -1744,7 +1744,6 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 a32::emit_a32_update_upper_location_descriptor(ctx, ra, inst_ref, inst)
             }
             Opcode::A32CallSupervisor => a32::emit_a32_call_supervisor(ctx, ra, inst_ref, inst),
-            Opcode::A32PcExecHook => a32::emit_a32_pc_exec_hook(ctx, ra, inst_ref, inst),
             Opcode::A32ExceptionRaised => a32::emit_a32_exception_raised(ctx, ra, inst_ref, inst),
             Opcode::A32DataSynchronizationBarrier => a32::emit_a32_dsb(ctx, ra, inst_ref, inst),
             Opcode::A32DataMemoryBarrier => a32::emit_a32_dmb(ctx, ra, inst_ref, inst),

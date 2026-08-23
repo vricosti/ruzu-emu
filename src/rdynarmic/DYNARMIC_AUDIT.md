@@ -29,17 +29,17 @@ After the opcode naming, broadcast-element, reduction, and multi-result
 multiply slices:
 
 - Eden opcodes: 725
-- rdynarmic opcodes: 726
+- rdynarmic opcodes: 725
 - missing in rdynarmic: 0
-- extra in rdynarmic: 1
+- extra in rdynarmic: 0
 
 The dead insertion-point and shuffle opcodes have been removed: Eden represents
 insertion points as `IREmitter` state, and no Rust frontend produced the three
 shuffle opcodes. The sixteen dedicated comparison opcodes have also been
-replaced with Eden's exact `Greater`/`Equal`/`Or`/`Not` IR compositions. The
-remaining extra is Ruzu's environment-gated A32 execution-hook opcode; it still
-requires an individual audit and is not counted as upstream parity merely
-because it compiles.
+replaced with Eden's exact `Greater`/`Equal`/`Or`/`Not` IR compositions. Ruzu's
+environment-gated per-instruction A32 execution hook has also been removed from
+the translator, IR, and both host backends. The opcode inventories now match
+exactly; this proves IR surface parity only, not structural or behavioral parity.
 
 The first slice restored Eden's exact names for 73 already-equivalent opcodes,
 including `BitRotateRight*`, `PackedAbsDiffSumU8`, and the vector `S`/`U`
@@ -68,8 +68,9 @@ The opcode audit now compares exact return/argument signatures in addition to
 names, and rejects duplicate or missing Rust metadata entries. It exposed 126
 shared-signature mismatches. The vector/CRC, A32 coprocessor, and A64 cache
 slices have now removed all of them: all 725 shared names have Eden's exact
-return/argument signature. This is metadata parity, not a behavioral claim for
-the one Rust-only operation that remains to be reviewed individually.
+return/argument signature. Together with the extra-opcode review, this proves
+exact opcode-name and metadata parity for all 725 operations, not behavioral
+parity for their producers, optimization passes, or host emitters.
 
 The A64 cache slice also ports the upstream callback-configuration pass. With
 hooking disabled, all data-cache callback IR is invalidated and `DC ZVA` is

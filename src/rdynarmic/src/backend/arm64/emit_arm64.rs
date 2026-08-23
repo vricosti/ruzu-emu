@@ -583,7 +583,6 @@ fn emit_ir_instruction(
             code.write_u32(inst::blr(XSCRATCH0))?;
             Ok(())
         }
-        Opcode::A32PcExecHook => emit_a32_pc_exec_hook(code, ctx, inst_ref),
         Opcode::PushRSB => emit_push_rsb(code, ctx, inst_ref),
         Opcode::Pack2x32To1x64 => emit_pack_2x32_to_1x64(code, ctx, inst_ref),
         Opcode::Pack2x64To1x128 => emit_pack_2x64_to_1x128(code, ctx, inst_ref),
@@ -1707,48 +1706,6 @@ fn emit_a64_get_dczid(
     let value = value.realize(code, ctx.block)? as u8;
     emit_mov_w_imm(code, value, ctx.conf.dczid_el0)?;
     Ok(())
-}
-
-fn emit_a32_pc_exec_hook(
-    code: &mut BlockOfCode,
-    ctx: &mut EmitContext<'_>,
-    inst_ref: InstRef,
-) -> Result<(), String> {
-    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
-    let pc = args[0].get_immediate_u64();
-
-    // The trace hook reads A32JitState. Make the guest-register values explicit
-    // IR operands and materialize them into the state before the host call;
-    // otherwise A32 get/set elimination can leave the state with stale values.
-    const REG_INDEXES: [usize; 4] = [0, 1, 2, 14];
-    for (arg_index, reg_index) in REG_INDEXES.iter().copied().enumerate() {
-        let mut value = ctx.reg_alloc.read_w(args[arg_index + 1]);
-        let value_reg = value.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::str_w_unsigned(
-            value_reg,
-            XSTATE,
-            a32_gpr_offset(reg_index),
-        ))?;
-    }
-
-    ctx.reg_alloc
-        .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
-
-    // a32_pc_trace_hook(jit_state_ptr: XSTATE, fastmem_base: XFASTMEM, tag: pc).
-    code.write_u32(inst::mov_x(0, XSTATE))?;
-    code.write_u32(inst::mov_x(1, XFASTMEM))?;
-    emit_mov_x_imm(code, 2, pc)?;
-    emit_mov_x_imm(
-        code,
-        XSCRATCH0,
-        crate::jit::a32_pc_trace_hook as usize as u64,
-    )?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
-    Ok(())
-}
-
-fn a32_gpr_offset(reg_index: usize) -> u32 {
-    (core::mem::offset_of!(A32JitState, regs) + core::mem::size_of::<u32>() * reg_index) as u32
 }
 
 fn emit_a64_set_tpidr(

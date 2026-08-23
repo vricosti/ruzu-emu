@@ -829,21 +829,6 @@ pub fn a32_pc_trace_target() -> Option<u64> {
     })
 }
 
-/// True when the per-instruction `RUZU_A32_PC_EXEC` hook is active. Cached so
-/// the `a32_pc_trace_hook` entry guard does not do a per-hit env lookup. The
-/// per-instruction hook (emitted by the A32 translator) shares the same
-/// aggregation as `RUZU_A32_PC_TRACE`, so the hook must NOT early-return when
-/// only `RUZU_A32_PC_EXEC` is set.
-pub fn a32_pc_exec_active() -> bool {
-    use std::sync::OnceLock;
-    static A: OnceLock<bool> = OnceLock::new();
-    *A.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_EXEC")
-            .ok()
-            .is_some_and(|s| !s.trim().is_empty())
-    })
-}
-
 /// Aggregated capture state: per-(r6 value) hit counts + last seen GPR snapshot.
 struct A32PcTraceAgg {
     total: u64,
@@ -1078,7 +1063,7 @@ fn a32_pc_trace_match_count() -> &'static std::sync::atomic::AtomicU64 {
 /// Reads the 16 GPRs, tallies r0/r6, and (if RUZU_A32_PC_TRACE_MEM set) reads
 /// guest memory at [rN+off] via fastmem_base. Buffered aggregate; no per-hit I/O.
 pub(crate) extern "C" fn a32_pc_trace_hook(jit_state_ptr: u64, fastmem_base: u64, tag: u64) {
-    if a32_pc_trace_target().is_none() && !a32_pc_exec_active() {
+    if a32_pc_trace_target().is_none() {
         return;
     }
     // The x64 and arm64 backends intentionally mirror their upstream JitState

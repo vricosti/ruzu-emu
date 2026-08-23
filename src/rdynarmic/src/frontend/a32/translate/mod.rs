@@ -81,33 +81,6 @@ pub(crate) fn decode_error(ir: &mut A32IREmitter) -> bool {
 /// Raised from 64 to 1024 to be closer to upstream behavior.
 const MAX_BLOCK_INSTRUCTIONS: usize = 1024;
 
-/// Debug-only: guest PCs at which to emit a per-instruction execution hook.
-/// Parsed once from `RUZU_A32_PC_EXEC=0xPC1,0xPC2,...`. When the env var is
-/// unset this is empty and no hook is ever emitted (zero codegen cost). Unlike
-/// the block-entry `RUZU_A32_PC_TRACE`, this fires regardless of dynarmic block
-/// boundaries, so it can observe a precise mid-block PC. Captured registers are
-/// aggregated by `crate::jit::a32_pc_trace_hook` (tagged by PC); needs
-/// `RUZU_A32_PC_TRACE` UNSET-safe — the hook self-dumps independent of it.
-fn a32_pc_exec_targets() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static TARGETS: OnceLock<Vec<u32>> = OnceLock::new();
-    TARGETS.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_EXEC")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|tok| {
-                        let h = tok.trim_start_matches("0x").trim_start_matches("0X");
-                        u32::from_str_radix(h, 16).ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThumbInstSize {
     Thumb16,
@@ -444,13 +417,6 @@ fn translate_arm(
         // Translate the instruction (condition already handled above).
         let mut ir = A32IREmitter::with_location(block, *current);
         should_continue = translate_arm_instruction(&mut ir, &decoded);
-        // Debug-only per-instruction PC execution hook (RUZU_A32_PC_EXEC).
-        // Emitted after the instruction's IR so call-argument setup sequences
-        // can be observed by targeting the final MOV before BL. Empty target
-        // set => never emitted.
-        if a32_pc_exec_targets().contains(&pc) {
-            ir.pc_exec_hook(pc);
-        }
 
         // If state machine requested a break (e.g. condition changed mid-block),
         // stop immediately. Matches upstream check after instruction decode.

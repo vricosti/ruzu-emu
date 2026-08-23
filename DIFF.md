@@ -8583,3 +8583,36 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{ir_emitter.h,opcodes.inc}` and
   IR dependencies, and owner selection. The removed enum variants were host-internal and never
   serialized or raw-copied. The exact audit now reports 725 Eden opcodes, 726 Rust opcodes, no
   missing/shared-signature mismatches, and one remaining Rust-only diagnostic opcode.
+
+## 2026-08-23 — rdynarmic A32 translation/IR diagnostic hook vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/frontend/a32/translate/mod.rs`,
+`src/rdynarmic/src/ir/{a32_emitter,opcode}.rs`,
+`src/rdynarmic/src/backend/x64/{emit,a32_emit_a32}.rs`,
+`src/rdynarmic/src/backend/arm64/emit_arm64.rs`, and `src/rdynarmic/src/jit.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/frontend/A32/translate/{translate_arm,translate_thumb}.cpp`,
+`src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.{h,cpp}`,
+`src/dynarmic/src/dynarmic/ir/opcodes.inc`, and the A32 x64/arm64 emitter owners.
+
+### Intentional differences
+- Ruzu's separate environment-gated block-entry `RUZU_A32_PC_TRACE` diagnostic remains outside the
+  IR surface. Removing the per-instruction opcode restores normal translation parity without
+  changing that disabled-by-default diagnostic facility.
+
+### Unintentional differences (to fix)
+- `RUZU_A32_PC_EXEC` formerly parsed a list of ARM guest PCs and appended a Rust-only host-call IR
+  instruction after matching ARM instructions. Eden has no such opcode or translation step, and
+  the Rust path did not cover Thumb instructions. Its environment parser, translator injection,
+  A32 emitter method, opcode/metadata, side-effect classification, x64/arm64 dispatch and host-call
+  emitters, and JIT guard exception are removed.
+
+### Missing items
+- The reviewed Rust translation loop still lacks Eden's `PreCodeReadHook`,
+  `PreCodeTranslationHook`, and per-instruction `GetTicksForCode` callback ownership. This broader
+  callback/configuration gap predates the removed diagnostic and requires its own structural slice.
+
+### Binary layout verification
+- PASS: the removed opcode and its five operands were host-internal IR only and were not serialized,
+  raw-copied, or guest-visible. The exact audit now reports 725 opcodes on both sides, zero missing
+  or extra operations, zero shared-signature mismatches, and complete one-to-one metadata coverage.

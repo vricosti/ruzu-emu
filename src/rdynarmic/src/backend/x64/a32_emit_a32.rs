@@ -1268,42 +1268,6 @@ pub fn emit_a32_call_supervisor(
     }
 }
 
-/// A32PcExecHook: debug-only per-instruction PC execution hook.
-///
-/// Lowered exactly like `emit_a32_call_supervisor` (so `host_call` flushes the
-/// guest register file back into `A32JitState` before the call — the hook can
-/// therefore read accurate r0-r15 even though this fires MID-block). Instead of
-/// the SVC callback it calls the free function `crate::jit::a32_pc_trace_hook`
-/// with `(jit_state=R15, fastmem_base=R13, tag=pc)`, reusing the existing
-/// aggregation that `RUZU_A32_PC_TRACE` already feeds. Emitted only for guest
-/// PCs in the `RUZU_A32_PC_EXEC` target set, so unset = no codegen at all.
-pub fn emit_a32_pc_exec_hook(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    let mut no_args: [Option<&mut Argument>; 0] = [];
-    ra.host_call(None, &mut no_args);
-    ra.end_of_alloc_scope();
-
-    let args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let pc = args[0].value.get_imm_as_u64();
-
-    // a32_pc_trace_hook(jit_state_ptr: R15, fastmem_base: R13, tag: pc).
-    ra.asm.mov(abi::ABI_PARAMS[0].to_reg64(), R15).unwrap();
-    ra.asm
-        .mov(abi::ABI_PARAMS[1].to_reg64(), rxbyak::R13)
-        .unwrap();
-    ra.asm
-        .mov(abi::ABI_PARAMS[2].to_reg64(), pc as i64)
-        .unwrap();
-    ra.asm
-        .mov(RAX, crate::jit::a32_pc_trace_hook as usize as i64)
-        .unwrap();
-    ra.asm.call_reg(RAX).unwrap();
-}
-
 /// A32ExceptionRaised: call exception callback.
 ///
 /// The host callback decides whether the exception should halt execution

@@ -1,6 +1,7 @@
 use crate::frontend::a64::decoder::{A64InstructionName, DecodedInst};
 use crate::frontend::a64::types::{Exception, Reg};
 use crate::ir::a64_emitter::A64IREmitter;
+use crate::ir::acc_type::AccType;
 use crate::ir::block::Block;
 use crate::ir::location::A64LocationDescriptor;
 use crate::ir::terminal::Terminal;
@@ -160,6 +161,57 @@ impl<'a> TranslatorVisitor<'a> {
             8 => self.ir.write_memory_64(address, value, acc_type),
             16 => self.ir.write_memory_128(address, value, acc_type),
             _ => panic!("Invalid memory write size {}", bytes),
+        }
+    }
+
+    /// Read exclusive memory by size.
+    pub(crate) fn exclusive_mem_read(
+        &mut self,
+        address: Value,
+        bytes: usize,
+        acc_type: AccType,
+    ) -> Value {
+        match bytes {
+            1 => self.ir.exclusive_read_memory_8(address, acc_type),
+            2 => self.ir.exclusive_read_memory_16(address, acc_type),
+            4 => self.ir.exclusive_read_memory_32(address, acc_type),
+            8 => self.ir.exclusive_read_memory_64(address, acc_type),
+            16 => self.ir.exclusive_read_memory_128(address, acc_type),
+            _ => unreachable!("invalid exclusive memory read size {bytes}"),
+        }
+    }
+
+    /// Write exclusive memory by size and return the store status.
+    pub(crate) fn exclusive_mem_write(
+        &mut self,
+        address: Value,
+        bytes: usize,
+        acc_type: AccType,
+        value: Value,
+    ) -> Value {
+        match bytes {
+            1 => self.ir.exclusive_write_memory_8(address, value, acc_type),
+            2 => self.ir.exclusive_write_memory_16(address, value, acc_type),
+            4 => self.ir.exclusive_write_memory_32(address, value, acc_type),
+            8 => self.ir.exclusive_write_memory_64(address, value, acc_type),
+            16 => self.ir.exclusive_write_memory_128(address, value, acc_type),
+            _ => unreachable!("invalid exclusive memory write size {bytes}"),
+        }
+    }
+
+    pub(crate) fn sign_extend(&mut self, value: Value, to_size: usize) -> Value {
+        match to_size {
+            32 => self.ir.ir().sign_extend_to_word(value),
+            64 => self.ir.ir().sign_extend_to_long(value),
+            _ => unreachable!("invalid sign-extension destination size {to_size}"),
+        }
+    }
+
+    pub(crate) fn zero_extend(&mut self, value: Value, to_size: usize) -> Value {
+        match to_size {
+            32 => self.ir.ir().zero_extend_to_word(value),
+            64 => self.ir.ir().zero_extend_to_long(value),
+            _ => unreachable!("invalid zero-extension destination size {to_size}"),
         }
     }
 
@@ -1159,6 +1211,82 @@ mod tests {
     use super::*;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
+
+    #[test]
+    fn generic_exclusive_memory_helpers_select_all_upstream_widths() {
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        {
+            let mut visitor =
+                TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+            let address = Value::ImmU64(0x2000);
+            let values = [
+                (1, Value::ImmU8(1)),
+                (2, Value::ImmU16(2)),
+                (4, Value::ImmU32(4)),
+                (8, Value::ImmU64(8)),
+            ];
+            for (bytes, value) in values {
+                let _ = visitor.exclusive_mem_read(address, bytes, AccType::Atomic);
+                let _ = visitor.exclusive_mem_write(address, bytes, AccType::Atomic, value);
+            }
+            let vector = visitor.ir.ir().zero_vector();
+            let _ = visitor.exclusive_mem_read(address, 16, AccType::Atomic);
+            let _ = visitor.exclusive_mem_write(address, 16, AccType::Atomic, vector);
+        }
+
+        let opcodes: Vec<_> = block
+            .instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            [
+                Opcode::A64ExclusiveReadMemory8,
+                Opcode::A64ExclusiveWriteMemory8,
+                Opcode::A64ExclusiveReadMemory16,
+                Opcode::A64ExclusiveWriteMemory16,
+                Opcode::A64ExclusiveReadMemory32,
+                Opcode::A64ExclusiveWriteMemory32,
+                Opcode::A64ExclusiveReadMemory64,
+                Opcode::A64ExclusiveWriteMemory64,
+                Opcode::ZeroVector,
+                Opcode::A64ExclusiveReadMemory128,
+                Opcode::A64ExclusiveWriteMemory128,
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_extension_helpers_select_upstream_destination_widths() {
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        {
+            let mut visitor =
+                TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+            let byte = Value::ImmU8(0x80);
+            let _ = visitor.sign_extend(byte, 32);
+            let _ = visitor.sign_extend(byte, 64);
+            let _ = visitor.zero_extend(byte, 32);
+            let _ = visitor.zero_extend(byte, 64);
+        }
+
+        let opcodes: Vec<_> = block
+            .instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            [
+                Opcode::SignExtendByteToWord,
+                Opcode::SignExtendByteToLong,
+                Opcode::ZeroExtendByteToWord,
+                Opcode::ZeroExtendByteToLong,
+            ]
+        );
+    }
 
     fn assert_exception_terminal(block: &Block) {
         assert!(matches!(

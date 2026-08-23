@@ -10411,3 +10411,25 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 - N/A: these visitors construct SSA and define no raw-copied payload.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/visitor.rs` vs Eden `frontend/A64/translate/impl/{impl.cpp,impl.h}` (`ExclusiveMem`, `SignExtend`, and `ZeroExtend` helpers)
+
+### Intentional differences
+- Rust names Eden's overloaded `ExclusiveMem` methods `exclusive_mem_read` and
+  `exclusive_mem_write` because Rust has no function overloading. The write helper keeps Eden's
+  address, byte-size, access-type, value order.
+- Invalid sizes use Rust `unreachable!` diagnostics where Eden uses `UNREACHABLE()` after its
+  switches.
+
+### Unintentional differences (to fix)
+- Fixed: the generic exclusive-memory overloads were absent, forcing instruction owners to repeat
+  width dispatch and making exact helper-boundary parity impossible.
+- Fixed: the visitor-level destination-directed `SignExtend` and `ZeroExtend` helpers were absent;
+  the existing broader signedness helper did not preserve Eden's method ownership.
+
+### Missing items
+- None for the four reviewed visitor-helper methods.
+
+### Binary layout verification
+- N/A: these helpers construct SSA and define no raw-copied payload. Focused tests verify all ten
+  exclusive read/write width selections and all four byte-to-word/long extension selections.

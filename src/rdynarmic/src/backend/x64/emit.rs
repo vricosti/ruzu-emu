@@ -22,6 +22,7 @@ use crate::backend::x64::emit_vector_misc as vmisc;
 use crate::backend::x64::emit_vector_multiply as vmul;
 use crate::backend::x64::emit_vector_saturated as vsat;
 use crate::backend::x64::emit_vector_shift as vshift;
+use crate::backend::x64::emit_x64_vector;
 use crate::backend::x64::hostloc::HOST_RCX;
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::{PatchEntry, PatchType};
@@ -1239,6 +1240,27 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             }
             Opcode::VectorBroadcastLower32 => {
                 varr::emit_vector_broadcast_lower32(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElementLower8 => {
+                emit_x64_vector::emit_vector_broadcast_element_lower8(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElementLower16 => {
+                emit_x64_vector::emit_vector_broadcast_element_lower16(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElementLower32 => {
+                emit_x64_vector::emit_vector_broadcast_element_lower32(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElement8 => {
+                emit_x64_vector::emit_vector_broadcast_element8(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElement16 => {
+                emit_x64_vector::emit_vector_broadcast_element16(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElement32 => {
+                emit_x64_vector::emit_vector_broadcast_element32(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorBroadcastElement64 => {
+                emit_x64_vector::emit_vector_broadcast_element64(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorExtract => varr::emit_vector_extract(ctx, ra, inst_ref, inst),
             Opcode::VectorExtractLower => varr::emit_vector_extract_lower(ctx, ra, inst_ref, inst),

@@ -267,6 +267,13 @@ pub enum Opcode {
     VectorBroadcast16,
     VectorBroadcast32,
     VectorBroadcast64,
+    VectorBroadcastElementLower8,
+    VectorBroadcastElementLower16,
+    VectorBroadcastElementLower32,
+    VectorBroadcastElement8,
+    VectorBroadcastElement16,
+    VectorBroadcastElement32,
+    VectorBroadcastElement64,
     VectorCountLeadingZeros8,
     VectorCountLeadingZeros16,
     VectorCountLeadingZeros32,
@@ -1407,6 +1414,11 @@ impl Opcode {
                 => OpcodeInfo { ret: U128, args: &[U32] },
             VectorBroadcast64
                 => OpcodeInfo { ret: U128, args: &[U64] },
+            VectorBroadcastElementLower8 | VectorBroadcastElementLower16 |
+            VectorBroadcastElementLower32 | VectorBroadcastElement8 |
+            VectorBroadcastElement16 | VectorBroadcastElement32 |
+            VectorBroadcastElement64
+                => OpcodeInfo { ret: U128, args: &[U128, U8] },
 
             // Vector extract
             VectorExtract => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },

@@ -278,6 +278,29 @@ fn emit_broadcast(
     Ok(())
 }
 
+fn emit_broadcast_element(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+    size: u8,
+    q: bool,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    let index = args[1].get_immediate_u8();
+    assert!((index as u16) * (size as u16) < 128);
+    let mut result = ctx.reg_alloc.write_q(inst_ref);
+    let mut value = ctx.reg_alloc.read_q(args[0]);
+    RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut value])?;
+    code.write_u32(inst::dup_v_from_element(
+        result.index().expect("result realized") as u8,
+        value.index().expect("value realized") as u8,
+        size,
+        index,
+        q,
+    ))?;
+    Ok(())
+}
+
 pub fn emit_zero_vector(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -632,6 +655,27 @@ pub fn emit_vector_instruction(
         Opcode::VectorBroadcast16 => emit_broadcast(code, ctx, inst_ref, 16, true),
         Opcode::VectorBroadcast32 => emit_broadcast(code, ctx, inst_ref, 32, true),
         Opcode::VectorBroadcast64 => emit_broadcast(code, ctx, inst_ref, 64, true),
+        Opcode::VectorBroadcastElementLower8 => {
+            emit_broadcast_element(code, ctx, inst_ref, 8, false)
+        }
+        Opcode::VectorBroadcastElementLower16 => {
+            emit_broadcast_element(code, ctx, inst_ref, 16, false)
+        }
+        Opcode::VectorBroadcastElementLower32 => {
+            emit_broadcast_element(code, ctx, inst_ref, 32, false)
+        }
+        Opcode::VectorBroadcastElement8 => {
+            emit_broadcast_element(code, ctx, inst_ref, 8, true)
+        }
+        Opcode::VectorBroadcastElement16 => {
+            emit_broadcast_element(code, ctx, inst_ref, 16, true)
+        }
+        Opcode::VectorBroadcastElement32 => {
+            emit_broadcast_element(code, ctx, inst_ref, 32, true)
+        }
+        Opcode::VectorBroadcastElement64 => {
+            emit_broadcast_element(code, ctx, inst_ref, 64, true)
+        }
         Opcode::VectorAbs8 => emit_two_op_arranged(code, ctx, inst_ref, 8, inst::abs_v),
         Opcode::VectorAbs16 => emit_two_op_arranged(code, ctx, inst_ref, 16, inst::abs_v),
         Opcode::VectorAbs32 => emit_two_op_arranged(code, ctx, inst_ref, 32, inst::abs_v),

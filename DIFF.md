@@ -8070,3 +8070,34 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 - PASS for this naming-only slice: enum cardinality and discriminants are unchanged; no serialized
   or ABI-visible structure changed.
+
+## 2026-08-23 — rdynarmic vector broadcast-element IR/backends vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/ir/{opcode,emitter}.rs`,
+`src/rdynarmic/src/backend/x64/{emit,emit_x64_vector}.rs`, and
+`src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_vector}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
+`src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`, and
+`src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`.
+
+### Intentional differences
+- Rust dispatches enum variants through explicit `match` arms and passes `InstRef` into its register
+  allocators; Eden uses generated x64 member dispatch and arm64 `EmitIR` template specializations.
+  The opcode ownership, argument order, validation, emitted host instructions and value-definition
+  order are preserved.
+- The arm64 Rust helper takes `size` and `q` as runtime values; it is the direct counterpart of
+  Eden's templated `EmitBroadcastElement<size>` helper and emits the same `DUP` encoding.
+
+### Unintentional differences (to fix)
+- The newly ported x64 methods now have the correct upstream owner, but older methods from Eden's
+  `emit_x64_vector.cpp` are still distributed across several legacy `emit_vector_*.rs` files. That
+  broader ownership migration remains part of the directory audit.
+
+### Missing items
+- Eight Eden IR opcodes remain absent after this slice: `VectorReduceAdd8/16/32/64` and
+  `VectorSignedMultiply16/32` / `VectorUnsignedMultiply16/32`.
+
+### Binary layout verification
+- PASS: all seven opcodes use Eden's exact `U128(U128, U8)` metadata. No raw-memory payload or ABI
+  structure is introduced; x64 instruction bytes and arm64 `DUP` encodings have focused coverage.

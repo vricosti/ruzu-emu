@@ -1131,6 +1131,17 @@ impl<'a> IREmitter<'a> {
         self.emit(op, &[a])
     }
 
+    pub fn vector_broadcast_element_lower(&mut self, esize: usize, a: Value, index: u8) -> Value {
+        assert!(esize * (index as usize) < 128, "Invalid index");
+        let op = match esize {
+            8 => Opcode::VectorBroadcastElementLower8,
+            16 => Opcode::VectorBroadcastElementLower16,
+            32 => Opcode::VectorBroadcastElementLower32,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a, Value::ImmU8(index)])
+    }
+
     pub fn vector_count_leading_zeros(&mut self, esize: usize, a: Value) -> Value {
         let op = match esize {
             8 => Opcode::VectorCountLeadingZeros8,
@@ -2045,11 +2056,16 @@ impl<'a> IREmitter<'a> {
         self.emit(op, &[a, b, Value::ImmU1(fpcr_controlled)])
     }
 
-    /// Extract element `index` from vector `a` and broadcast it to all lanes.
-    /// Matches upstream `IREmitter::VectorBroadcastElement(esize, vector, index)`.
     pub fn vector_broadcast_element(&mut self, esize: usize, a: Value, index: u8) -> Value {
-        let element = self.vector_get_element(esize, a, index);
-        self.vector_broadcast(esize, element)
+        assert!(esize * (index as usize) < 128, "Invalid index");
+        let op = match esize {
+            8 => Opcode::VectorBroadcastElement8,
+            16 => Opcode::VectorBroadcastElement16,
+            32 => Opcode::VectorBroadcastElement32,
+            64 => Opcode::VectorBroadcastElement64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a, Value::ImmU8(index)])
     }
 
     pub fn fp_vector_rsqrt_step_fused(
@@ -2454,6 +2470,34 @@ mod tests {
             block.get(InstRef(3)).opcode,
             Opcode::VectorCountLeadingZeros32
         );
+    }
+
+    #[test]
+    fn vector_broadcast_element_selects_upstream_opcodes_and_immediate_index() {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut e = IREmitter::new(&mut block);
+            let z = e.zero_vector();
+            let _lower16 = e.vector_broadcast_element_lower(16, z, 5);
+            let _full64 = e.vector_broadcast_element(64, z, 1);
+        }
+
+        let lower16 = block.get(InstRef(1));
+        assert_eq!(lower16.opcode, Opcode::VectorBroadcastElementLower16);
+        assert_eq!(lower16.args[1], Value::ImmU8(5));
+
+        let full64 = block.get(InstRef(2));
+        assert_eq!(full64.opcode, Opcode::VectorBroadcastElement64);
+        assert_eq!(full64.args[1], Value::ImmU8(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid index")]
+    fn vector_broadcast_element_rejects_an_out_of_range_index() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let mut e = IREmitter::new(&mut block);
+        let z = e.zero_vector();
+        let _ = e.vector_broadcast_element(32, z, 4);
     }
 
     #[test]

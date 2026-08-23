@@ -845,6 +845,13 @@ fn emit_ir_instruction(
         | Opcode::VectorBroadcast16
         | Opcode::VectorBroadcast32
         | Opcode::VectorBroadcast64
+        | Opcode::VectorBroadcastElementLower8
+        | Opcode::VectorBroadcastElementLower16
+        | Opcode::VectorBroadcastElementLower32
+        | Opcode::VectorBroadcastElement8
+        | Opcode::VectorBroadcastElement16
+        | Opcode::VectorBroadcastElement32
+        | Opcode::VectorBroadcastElement64
         | Opcode::VectorAbs8
         | Opcode::VectorAbs16
         | Opcode::VectorAbs32

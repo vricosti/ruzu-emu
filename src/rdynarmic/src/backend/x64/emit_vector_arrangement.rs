@@ -809,35 +809,6 @@ pub fn emit_vector_transpose64(
     ra.define_value(inst_ref, lower);
 }
 
-// ---------------------------------------------------------------------------
-// VectorShuffle — native SSE: pshufd/pshufhw/pshuflw
-// ---------------------------------------------------------------------------
-
-pub fn emit_vector_shuffle_words(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshufd);
-}
-pub fn emit_vector_shuffle_high_halfwords(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshufhw);
-}
-pub fn emit_vector_shuffle_low_halfwords(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshuflw);
-}
-
 // Narrow16: truncate 8×u16 from a to 8×u8 in the low half, zero upper half.
 pub fn emit_vector_narrow16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -1187,7 +1158,6 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_deinterleave_even8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_deinterleave_odd64;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_transpose8;
-        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_shuffle_words;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_narrow16;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend64;

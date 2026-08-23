@@ -65,10 +65,6 @@ pub enum Opcode {
     NZCVFromPackedFlags,
     // AddWithCarry returns a combined result + flags
     // handled via GetCarryFromOp/GetOverflowFromOp
-    // --- Pseudo ---
-    SetInsertionPoint,
-    GetInsertionPoint,
-
     // --- ALU 32-bit ---
     Pack2x32To1x64,
     Pack2x64To1x128,
@@ -449,9 +445,6 @@ pub enum Opcode {
     VectorRoundingShiftLeftU16,
     VectorRoundingShiftLeftU32,
     VectorRoundingShiftLeftU64,
-    VectorShuffleHighHalfwords,
-    VectorShuffleLowHalfwords,
-    VectorShuffleWords,
     VectorSignExtend8,
     VectorSignExtend16,
     VectorSignExtend32,
@@ -1145,9 +1138,6 @@ impl Opcode {
             GetCFlagFromNZCV => OpcodeInfo { ret: U1, args: &[NZCV] },
             NZCVFromPackedFlags => OpcodeInfo { ret: NZCV, args: &[U32] },
 
-            // Pseudo
-            SetInsertionPoint | GetInsertionPoint => OpcodeInfo { ret: V, args: &[] },
-
             // Pack/extract
             Pack2x32To1x64 => OpcodeInfo { ret: U64, args: &[U32, U32] },
             Pack2x64To1x128 => OpcodeInfo { ret: U128, args: &[U64, U64] },
@@ -1433,10 +1423,6 @@ impl Opcode {
             VectorExtract => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
             VectorExtractLower => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
             VectorRotateWholeVectorRight => OpcodeInfo { ret: U128, args: &[U128, U8] },
-
-            // Vector shuffle (imm8 control)
-            VectorShuffleHighHalfwords | VectorShuffleLowHalfwords | VectorShuffleWords
-                => OpcodeInfo { ret: U128, args: &[U128, U8] },
 
             // Vector table lookup
             VectorTable => OpcodeInfo { ret: Type::Table, args: &[OPQ, OPQ, OPQ, OPQ] },

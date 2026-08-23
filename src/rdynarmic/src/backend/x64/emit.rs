@@ -1330,13 +1330,6 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorTranspose16 => varr::emit_vector_transpose16(ctx, ra, inst_ref, inst),
             Opcode::VectorTranspose32 => varr::emit_vector_transpose32(ctx, ra, inst_ref, inst),
             Opcode::VectorTranspose64 => varr::emit_vector_transpose64(ctx, ra, inst_ref, inst),
-            Opcode::VectorShuffleWords => varr::emit_vector_shuffle_words(ctx, ra, inst_ref, inst),
-            Opcode::VectorShuffleHighHalfwords => {
-                varr::emit_vector_shuffle_high_halfwords(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorShuffleLowHalfwords => {
-                varr::emit_vector_shuffle_low_halfwords(ctx, ra, inst_ref, inst)
-            }
             Opcode::VectorNarrow16 => varr::emit_vector_narrow16(ctx, ra, inst_ref, inst),
             Opcode::VectorNarrow32 => varr::emit_vector_narrow32(ctx, ra, inst_ref, inst),
             Opcode::VectorNarrow64 => varr::emit_vector_narrow64(ctx, ra, inst_ref, inst),

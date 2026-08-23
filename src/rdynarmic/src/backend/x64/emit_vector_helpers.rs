@@ -44,27 +44,6 @@ pub fn emit_vector_op_imm(
 }
 
 // ---------------------------------------------------------------------------
-// Native SSE binary op with imm8 (3-operand form like pshufd/palignr):
-//   result = op(arg0, arg1, imm)
-// ScratchXmm → op(dst, src, imm) → DefineValue
-// ---------------------------------------------------------------------------
-
-pub fn emit_vector_shuffle_op(
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-    op: fn(&mut rxbyak::CodeAssembler, Reg, Reg, u8) -> rxbyak::Result<()>,
-) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let src = ra.use_xmm(&mut args[0]);
-    let imm = args[1].get_immediate_u8();
-    let result = ra.scratch_xmm();
-    op(&mut *ra.asm, result, src, imm).unwrap();
-    ra.release(src);
-    ra.define_value(inst_ref, result);
-}
-
-// ---------------------------------------------------------------------------
 // Native SSE unary op: result = op(arg0)
 // For ops where dst and src are the same register (e.g., pabsb dst,src)
 // ---------------------------------------------------------------------------

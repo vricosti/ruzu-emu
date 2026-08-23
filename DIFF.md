@@ -8514,3 +8514,31 @@ Eden files: `src/dynarmic/src/dynarmic/ir/opt_passes.cpp`,
 - PASS: the new configuration fields are host-only Rust values and are not serialized or copied to
   guest memory. Cache-operation IR keeps Eden's exact `Void(U64, U64, U64)` / `Void(U64, U64)`
   signatures, and focused native plus AArch64-QEMU tests verify callback argument bit patterns.
+
+## 2026-08-23 — rdynarmic dead IR opcodes vs Eden Dynarmic IR/backend owners
+
+Rust files: `src/rdynarmic/src/ir/opcode.rs` and
+`src/rdynarmic/src/backend/x64/{emit,emit_vector_arrangement,emit_vector_helpers}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}` and
+`src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`.
+
+### Intentional differences
+- None in this slice. Rust retains its index-based insertion-point state, but that state is not an
+  IR opcode, matching Eden's separation between `IREmitter` state and the opcode inventory.
+
+### Unintentional differences (to fix)
+- The Rust opcode enum formerly exposed `SetInsertionPoint` and `GetInsertionPoint` as void IR
+  instructions. Neither had a producer or backend consumer; Eden exposes insertion-point changes
+  solely as `IREmitter` methods. The two dead opcodes and their metadata are removed.
+- Rust formerly exposed three immediate shuffle opcodes and x64 emitters with no frontend producer.
+  Eden has no such IR opcodes and uses host shuffles locally inside the emitters that require them.
+  The dead opcodes, dispatch arms, emitter functions, helper, and signature-only test are removed.
+
+### Missing items
+- None for the reviewed insertion-point state or the three dead shuffle operations.
+
+### Binary layout verification
+- PASS: the removed values were host-internal IR enum variants with no producer, persisted format,
+  raw-memory payload, or guest-visible representation. The exact opcode audit now reports 725 Eden
+  opcodes, 742 Rust opcodes, zero missing/shared-signature mismatches, and 17 remaining Rust extras.

@@ -1048,7 +1048,7 @@ mod tests {
     use crate::ir::types::TextureInstInfo;
     use crate::ir::value::Value;
     use crate::profile::Profile;
-    use crate::runtime_info::RuntimeInfo;
+    use crate::runtime_info::{AttributeType, RuntimeInfo};
     use crate::shader_info::{
         ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
         StorageBufferDescriptor, TextureBufferDescriptor, TextureDescriptor, TextureType,
@@ -3586,6 +3586,31 @@ mod tests {
             .source
             .source
             .contains("output.color0.z = as_type<float>(0x3F000000u);"));
+    }
+
+    #[test]
+    fn fragment_color_outputs_match_integer_render_target_types() {
+        let mut program = empty_program(Stage::Fragment);
+        program.info.stores_frag_color[0] = true;
+        program.info.stores_frag_color[1] = true;
+        program.blocks[0].append_new_inst(
+            Opcode::SetFragColor,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmF32(1.0)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SetFragColor,
+            vec![Value::ImmU32(1), Value::ImmU32(1), Value::ImmF32(-1.0)],
+        );
+        let mut runtime = RuntimeInfo::default();
+        runtime.frag_color_types[0] = AttributeType::UnsignedInt;
+        runtime.frag_color_types[1] = AttributeType::SignedInt;
+
+        let artifact = emit_msl(&program, &Profile::default(), &runtime).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint4 color0 [[color(0)]];"));
+        assert!(source.contains("int4 color1 [[color(1)]];"));
+        assert!(source.contains("output.color0.x = as_type<uint>(as_type<float>(0x3F800000u));"));
+        assert!(source.contains("output.color1.y = as_type<int>(as_type<float>(0xBF800000u));"));
     }
 
     #[test]

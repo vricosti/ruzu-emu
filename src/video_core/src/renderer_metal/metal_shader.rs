@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SPIR-V to Metal Shading Language translation.
+//! Metal Shading Language compilation.
 //!
-//! SPIR-V is used only as the shader compiler's backend-neutral binary IR.
-//! Runtime compilation and resource binding are native MSL/Metal operations.
+//! The compatibility path lowers SPIR-V through SPIRV-Cross. The native path
+//! consumes the shader recompiler's backend-neutral IR and emits MSL directly.
+//! Both paths finish at the same native Metal module and resource ABI.
 
 use std::num::NonZeroU32;
 
@@ -136,6 +137,21 @@ pub enum DirectMslValidationError {
     BindingLayoutMismatch,
     #[error("direct MSL execution metadata differs from the active SPIR-V/MSL metadata")]
     ExecutionInfoMismatch,
+}
+
+#[derive(Debug, Error)]
+pub enum DirectMslCompileError {
+    #[error(transparent)]
+    Emission(#[from] MslError),
+    #[error(transparent)]
+    Compilation(#[from] MetalShaderError),
+    #[error(
+        "direct MSL execution metadata {emitted:?} differs from requested metadata {requested:?}"
+    )]
+    ExecutionInfoMismatch {
+        emitted: MetalExecutionInfo,
+        requested: MetalExecutionInfo,
+    },
 }
 
 /// Native shader objects retained for the lifetime of a Metal pipeline.
@@ -648,6 +664,71 @@ pub fn compile_native_msl_artifact(
     })
 }
 
+fn direct_msl_options(
+    device: &ProtocolObject<dyn MTLDevice>,
+    options: &MetalShaderCompileOptions,
+) -> shader_recompiler::backend::msl::MslOptions {
+    shader_recompiler::backend::msl::MslOptions {
+        language_version: options.language_version,
+        fixed_subgroup_size: options.fixed_subgroup_size,
+        supports_query_texture_lod: device.supportsQueryTextureLOD(),
+        supports_read_write_textures: device.readWriteTextureSupport()
+            != MTLReadWriteTextureTier::TierNone,
+        supports_texture_atomics: options.language_version >= MslVersion::V3_1
+            && (device.supportsFamily(MTLGPUFamily::Apple6)
+                || device.supportsFamily(MTLGPUFamily::Mac2)),
+    }
+}
+
+fn emit_direct_msl_artifact_with_bindings(
+    device: &ProtocolObject<dyn MTLDevice>,
+    program: &Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MetalShaderCompileOptions,
+    bindings: &mut Bindings,
+) -> Result<MetalShaderArtifact, MslError> {
+    shader_recompiler::backend::msl::emit_msl_with_options_and_bindings(
+        program,
+        profile,
+        runtime_info,
+        &direct_msl_options(device, options),
+        bindings,
+    )
+}
+
+/// Emit MSL directly from Maxwell IR and compile it into a native Metal
+/// module. An unsupported feature is an error; this path never falls back to
+/// SPIR-V or SPIRV-Cross.
+pub fn compile_direct_msl_shader_with_bindings(
+    device: &ProtocolObject<dyn MTLDevice>,
+    program: &Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MetalShaderCompileOptions,
+    bindings: &mut Bindings,
+) -> Result<MetalShaderModule, DirectMslCompileError> {
+    let artifact = emit_direct_msl_artifact_with_bindings(
+        device,
+        program,
+        profile,
+        runtime_info,
+        options,
+        bindings,
+    )?;
+    let requested_execution = MetalExecutionInfo {
+        workgroup_size: options.compute_workgroup_size,
+        fixed_subgroup_size: options.fixed_subgroup_size,
+    };
+    if artifact.execution != requested_execution {
+        return Err(DirectMslCompileError::ExecutionInfoMismatch {
+            emitted: artifact.execution,
+            requested: requested_execution,
+        });
+    }
+    Ok(compile_native_msl_artifact(device, artifact)?)
+}
+
 fn metal_language_version(version: MslVersion) -> Result<MTLLanguageVersion, MetalShaderError> {
     let available = match version {
         MslVersion::V2_3 => Some(MTLLanguageVersion::Version2_3),
@@ -706,22 +787,18 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
     active: &MetalShaderModule,
     bindings: &mut Bindings,
 ) -> Result<MetalShaderModule, DirectMslValidationError> {
-    let language_version = active.language_version();
-    let artifact = shader_recompiler::backend::msl::emit_msl_with_options_and_bindings(
+    let options = MetalShaderCompileOptions {
+        language_version: active.language_version(),
+        fixed_subgroup_size: active.execution().fixed_subgroup_size,
+        compute_workgroup_size: active.execution().workgroup_size,
+        ..MetalShaderCompileOptions::default()
+    };
+    let artifact = emit_direct_msl_artifact_with_bindings(
+        device,
         program,
         profile,
         runtime_info,
-        &shader_recompiler::backend::msl::MslOptions {
-            language_version,
-            fixed_subgroup_size: active.execution().fixed_subgroup_size,
-            supports_query_texture_lod: device.supportsQueryTextureLOD(),
-            supports_read_write_textures: device.readWriteTextureSupport()
-                != MTLReadWriteTextureTier::TierNone,
-            supports_texture_atomics: language_version
-                >= shader_recompiler::backend::msl::MslVersion::V3_1
-                && (device.supportsFamily(MTLGPUFamily::Apple6)
-                    || device.supportsFamily(MTLGPUFamily::Mac2)),
-        },
+        &options,
         bindings,
     )?;
     if artifact.source.stage != active.source().stage {
@@ -4280,6 +4357,47 @@ mod tests {
         }
         assert_eq!(spirv_bindings.unified, 2);
         assert_eq!(direct_bindings.unified, 2);
+    }
+
+    #[test]
+    fn compiles_direct_graphics_stages_with_shared_bindings_without_spirv() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let mut vertex = empty_program(Stage::VertexB);
+        vertex
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        let mut fragment = empty_program(Stage::Fragment);
+        fragment
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 1, count: 1 });
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let options = MetalShaderCompileOptions::for_device(device.profile());
+        let mut bindings = Bindings::default();
+
+        for (expected_binding, program) in [vertex, fragment].iter().enumerate() {
+            let direct = compile_direct_msl_shader_with_bindings(
+                device.device(),
+                program,
+                &profile,
+                &runtime_info,
+                &options,
+                &mut bindings,
+            )
+            .expect("direct graphics MSL must compile without a SPIR-V module");
+
+            assert_eq!(direct.source().stage, program.stage);
+            assert_eq!(direct.bindings().resources.len(), 1);
+            assert_eq!(
+                direct.bindings().resources[0].binding,
+                expected_binding as u32
+            );
+        }
+        assert_eq!(bindings.unified, 2);
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub struct MslEmitContext {
     alpha_test_reference: f32,
     dual_source_blend: bool,
     emits_frag_color: [bool; 8],
+    frag_color_types: [AttributeType; 8],
 }
 
 #[derive(Debug, Clone)]
@@ -584,12 +585,17 @@ impl MslEmitContext {
                 source.push_str("struct MslFragmentOut {\n");
                 for (index, stored) in emits_frag_color.iter().enumerate() {
                     if *stored {
+                        let color_type = match runtime_info.frag_color_types[index] {
+                            AttributeType::UnsignedInt => "uint4",
+                            AttributeType::SignedInt => "int4",
+                            _ => "float4",
+                        };
                         let attribute = if runtime_info.dual_source_blend && index <= 1 {
                             format!("[[color(0), index({index})]]")
                         } else {
                             format!("[[color({index})]]")
                         };
-                        source.push_str(&format!("    float4 color{index} {attribute};\n"));
+                        source.push_str(&format!("    {color_type} color{index} {attribute};\n"));
                     }
                 }
                 if emits_frag_depth {
@@ -692,6 +698,7 @@ impl MslEmitContext {
             alpha_test_reference: runtime_info.alpha_test_reference,
             dual_source_blend: runtime_info.dual_source_blend,
             emits_frag_color,
+            frag_color_types: runtime_info.frag_color_types,
         })
     }
 
@@ -1067,6 +1074,10 @@ impl MslEmitContext {
 
     pub(crate) fn emits_frag_color(&self, index: usize) -> bool {
         self.emits_frag_color[index]
+    }
+
+    pub(crate) fn frag_color_type(&self, index: usize) -> AttributeType {
+        self.frag_color_types[index]
     }
 
     pub fn support_vertex_instance_id(&self) -> bool {
@@ -1806,6 +1817,11 @@ impl MslEmitContext {
         value: &Value,
     ) -> Result<(), MslError> {
         let expression = self.value_expression(value, inst_ref, 2)?;
+        let expression = match self.frag_color_types[render_target as usize] {
+            AttributeType::UnsignedInt => format!("as_type<uint>({expression})"),
+            AttributeType::SignedInt => format!("as_type<int>({expression})"),
+            _ => expression,
+        };
         let swizzle = ["x", "y", "z", "w"][component as usize];
         self.source.push_str(&format!(
             "    output.color{render_target}.{swizzle} = {expression};\n"

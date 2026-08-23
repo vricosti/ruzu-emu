@@ -8,7 +8,7 @@
 
 use crate::ir;
 use crate::ir::value::{Attribute, InstRef};
-use crate::runtime_info::CompareFunction;
+use crate::runtime_info::{AttributeType, CompareFunction};
 use crate::stage::Stage;
 
 use super::msl_emit_context::MslEmitContext;
@@ -40,13 +40,22 @@ fn set_fixed_pipeline_point_size(context: &mut MslEmitContext) {
     }
 }
 
+fn default_frag_color(context: &MslEmitContext, index: usize) -> &'static str {
+    match context.frag_color_type(index) {
+        AttributeType::UnsignedInt => "uint4(0u, 0u, 0u, 0x3F800000u)",
+        AttributeType::SignedInt => "as_type<int4>(float4(0.0f, 0.0f, 0.0f, 1.0f))",
+        _ => "float4(0.0f, 0.0f, 0.0f, 1.0f)",
+    }
+}
+
 /// Emit Eden's `EmitPrologue` behavior into the direct MSL entry point.
 pub fn emit_prologue(context: &mut MslEmitContext, program: &ir::Program) {
     if context.stage() == Stage::Fragment && context.dual_source_blend() {
         for index in 0..2 {
             if context.emits_frag_color(index) {
                 context.emit_statement(&format!(
-                    "output.color{index} = float4(0.0f, 0.0f, 0.0f, 1.0f);"
+                    "output.color{index} = {};",
+                    default_frag_color(context, index)
                 ));
             }
         }
@@ -79,7 +88,10 @@ fn alpha_test(context: &mut MslEmitContext) {
         return;
     }
 
-    let alpha = "output.color0.w";
+    let alpha = match context.frag_color_type(0) {
+        AttributeType::UnsignedInt | AttributeType::SignedInt => "as_type<float>(output.color0.w)",
+        _ => "output.color0.w",
+    };
     let reference = float_bits(reference);
     let condition = match comparison {
         CompareFunction::Never => "false".to_owned(),

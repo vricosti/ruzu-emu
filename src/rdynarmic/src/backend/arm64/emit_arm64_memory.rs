@@ -51,7 +51,7 @@ fn inline_watch_ranges() -> &'static [(u64, u64)] {
 fn is_ordered(acc_type: AccType) -> bool {
     matches!(
         acc_type,
-        AccType::Ordered | AccType::OrderedAtomic | AccType::LimitedOrdered
+        AccType::Ordered | AccType::OrderedRw | AccType::LimitedOrdered
     )
 }
 

@@ -8411,3 +8411,30 @@ Related Rust owner: `src/core/src/arm/dynarmic/arm_dynarmic_32.rs`; related Eden
 - N/A: CP15 is a host-side polymorphic service object and is never serialized or raw-copied to
   guest memory. Focused tests verify that the two thread-register actions expose distinct stable
   words and that every accepted/rejected compile action matches Eden.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/acc_type.rs` vs Eden `ir/acc_type.h`
+
+Related Rust users: `src/rdynarmic/src/backend/{x64/emit_x64_memory,arm64/emit_arm64_memory}.rs`.
+
+### Intentional differences
+- Rust spells Eden's uppercase enumerators with Rust `UpperCamelCase` (`ORDEREDRW` becomes
+  `OrderedRw`, `DCZVA` becomes `Dczva`) and uses `repr(u8)`. The value is a typed IR immediate and
+  is never passed through the host ABI or raw-copied; the explicit representation makes the exact
+  contiguous discriminants reviewable.
+
+### Unintentional differences (to fix)
+- The former Rust enum had 15 values from a different access-type vocabulary and lacked Eden's
+  `PTW`, `DC`, `IC`, `DCZVA`, `AT`, and `SWAP` entries. It now has Eden's exact 16-value inventory
+  and declaration order.
+- The active `OrderedAtomic` and `IfetchOrdered` aliases are renamed to the corresponding upstream
+  `OrderedRw` and `Ifetch` values in both backend ordering checks and focused tests.
+- The unused fallback conversion silently mapped every invalid byte to `Normal`, behavior with no
+  upstream counterpart. It is removed; IR construction uses typed `AccType` values throughout.
+
+### Missing items
+- None for the `AccType` inventory or the reviewed backend ordering predicate.
+
+### Binary layout verification
+- PASS for the Rust IR representation: focused tests require size/alignment one byte and exact
+  discriminants 0 through 15 in Eden declaration order. No guest or persisted binary structure
+  contains this enum.

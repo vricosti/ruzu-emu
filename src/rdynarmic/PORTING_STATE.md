@@ -24,6 +24,21 @@ metadata slice:
 3. rerun the exact-signature audit, update `DIFF.md`, and remove this state
    file only after the shared mismatch count reaches zero.
 
+## Newly discovered A64 cache-operation prerequisite
+
+Eden's callback-config pass lowers `DC ZVA` to memory writes tagged with
+`IR::AccType::DCZVA`. Rust's `ir/acc_type.rs` currently has no `Dczva` variant
+and its variant inventory/order does not match Eden `ir/acc_type.h`.
+
+Before the callback-config pass can be ported:
+
+1. restore the exact 16-value `AccType` inventory and discriminant order;
+2. rename the two active backend/frontend aliases to their Eden owners
+   (`OrderedRw` and `Ifetch`);
+3. add focused inventory/discriminant tests and verify all current users;
+4. commit this prerequisite independently, then resume the cache-operation
+   lowering.
+
 ## Completed prerequisites
 
 - The upstream-owned A32 coprocessor interface exists under

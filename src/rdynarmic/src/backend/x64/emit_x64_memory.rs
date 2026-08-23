@@ -48,12 +48,12 @@ pub const PAGE_MASK: usize = PAGE_SIZE - 1;
 ///
 /// Matches upstream `inline bool IsOrdered(IR::AccType acctype)` in
 /// `emit_x64_memory.h:382-384`. ARM's "ORDEREDRW" maps to rdynarmic's
-/// `OrderedAtomic`.
+/// `OrderedRw`.
 #[inline]
 pub fn is_ordered(acc: AccType) -> bool {
     matches!(
         acc,
-        AccType::Ordered | AccType::OrderedAtomic | AccType::LimitedOrdered
+        AccType::Ordered | AccType::OrderedRw | AccType::LimitedOrdered
     )
 }
 
@@ -533,10 +533,10 @@ mod tests {
         assert!(!is_ordered(AccType::Vec));
         assert!(!is_ordered(AccType::Atomic));
         assert!(is_ordered(AccType::Ordered));
-        assert!(is_ordered(AccType::OrderedAtomic));
+        assert!(is_ordered(AccType::OrderedRw));
         assert!(is_ordered(AccType::LimitedOrdered));
         assert!(!is_ordered(AccType::Unpriv));
-        assert!(!is_ordered(AccType::IfetchOrdered));
+        assert!(!is_ordered(AccType::Ifetch));
     }
 
     /// `mov eax, dword [r13+rax]` should be 5 bytes

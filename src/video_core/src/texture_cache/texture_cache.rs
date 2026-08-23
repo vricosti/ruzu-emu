@@ -4194,8 +4194,6 @@ mod tests {
 
     #[test]
     fn texture_cache_reserves_zero_for_null_resources() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
         let mut cache = test_cache();
         let mut descriptor = crate::textures::texture::TscEntry::default();
         descriptor.raw[0] = 0x0000_03A2_0002_6080;
@@ -4224,8 +4222,6 @@ mod tests {
     #[test]
     fn sampler_budget_reclaims_only_inactive_sampler_slots_once_per_frame() {
         use crate::control::channel_state::ChannelState;
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let channel = ChannelState::new(10);
@@ -4605,8 +4601,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_registers_presentable_view() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
@@ -4664,8 +4658,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_passes_guest_size_for_range_translation() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -4703,8 +4695,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_forwards_raw_msaa_mode_to_image_info() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -4841,8 +4831,6 @@ mod tests {
     #[test]
     fn update_render_targets_from_snapshot_with_clean_render_targets_preserves_state_like_upstream()
     {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         cache.render_targets.draw_buffers = [7, 6, 5, 4, 3, 2, 1, 0];
@@ -4892,8 +4880,6 @@ mod tests {
     #[test]
     fn update_render_targets_from_snapshot_uses_virtual_invalid_fallback_for_color_translation_miss(
     ) {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -4926,8 +4912,6 @@ mod tests {
     #[test]
     fn update_render_targets_from_snapshot_uses_virtual_invalid_fallback_for_zeta_translation_miss()
     {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -4988,8 +4972,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_ignores_slots_past_rt_control_count() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -5039,8 +5021,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_dirty_flags_preserve_clean_color_slot() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -5092,8 +5072,6 @@ mod tests {
 
     #[test]
     fn bind_same_preemptive_render_target_view_has_no_download() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -5129,9 +5107,7 @@ mod tests {
 
     #[test]
     fn try_find_framebuffer_image_view_emplaces_display_specific_view() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::texture_cache::image_view_info::SwizzleSource;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -5185,8 +5161,6 @@ mod tests {
 
     #[test]
     fn try_find_framebuffer_image_view_unknown_format_uses_upstream_default() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -5254,9 +5228,7 @@ mod tests {
 
     #[test]
     fn get_flush_area_marks_gpu_modified_image_views_preemptive() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::texture_cache::image_view_base::ImageViewFlagBits;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -5311,8 +5283,6 @@ mod tests {
 
     #[test]
     fn is_region_gpu_modified_checks_registered_overlapping_images() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -5339,8 +5309,6 @@ mod tests {
 
     #[test]
     fn mark_modification_preserves_cpu_modified_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -5367,8 +5335,6 @@ mod tests {
 
     #[test]
     fn write_memory_marks_registered_image_cpu_modified_and_untracks() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -5439,8 +5405,6 @@ mod tests {
 
     #[test]
     fn insert_image_uses_virtual_invalid_cpu_space_when_untranslated() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -5633,8 +5597,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_reuses_stable_virtual_invalid_range_for_unmapped_gpu_address() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -5658,9 +5620,7 @@ mod tests {
 
     #[test]
     fn sparse_insert_without_channel_memory_does_not_allocate_virtual_state() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::panic::{catch_unwind, AssertUnwindSafe};
-        use std::sync::Arc;
 
         let mut cache = unbound_test_cache();
         let mut info = ImageInfo {
@@ -5690,7 +5650,6 @@ mod tests {
 
     #[test]
     fn track_sparse_unregistered_image_uses_submapped_segments_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -5821,7 +5780,6 @@ mod tests {
     #[test]
     fn unmap_gpu_memory_marks_overlapping_images_cpu_modified_and_remapped() {
         use crate::control::channel_state::ChannelState;
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -5858,7 +5816,6 @@ mod tests {
 
     #[test]
     fn write_downloaded_image_prefers_channel_gpu_memory() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -5917,7 +5874,6 @@ mod tests {
 
     #[test]
     fn write_downloaded_image_uses_guest_writer_when_channel_memory_is_locked() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::{Arc, Mutex};
@@ -5978,8 +5934,6 @@ mod tests {
 
     #[test]
     fn register_image_updates_gpu_page_table_and_unregister_clears_it() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6135,8 +6089,6 @@ mod tests {
         use crate::dirty_flags;
         use crate::engines::draw_manager::Maxwell3DAccess;
         use crate::engines::maxwell_3d::Maxwell3D;
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut channel = ChannelState::new(10);
@@ -6178,7 +6130,6 @@ mod tests {
     #[test]
     fn gpu_page_table_storage_is_shared_per_address_space() {
         use crate::control::channel_state::ChannelState;
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6227,7 +6178,6 @@ mod tests {
 
     #[test]
     fn join_images_deletes_exact_sparse_gpu_overlap() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6283,7 +6233,6 @@ mod tests {
 
     #[test]
     fn join_images_inserts_replacement_before_deleting_ignored_overlap_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6325,7 +6274,6 @@ mod tests {
 
     #[test]
     fn join_images_deletes_ignored_overlap_from_typed_slot() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6364,7 +6312,6 @@ mod tests {
 
     #[test]
     fn join_images_continues_after_gpu_modified_ignored_overlap_fail_soft() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6407,7 +6354,6 @@ mod tests {
 
     #[test]
     fn backend_join_continues_after_gpu_modified_ignored_overlap_fail_soft() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6449,8 +6395,6 @@ mod tests {
 
     #[test]
     fn unmap_memory_unregisters_untracks_and_deletes_image() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6482,8 +6426,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_reuses_cpu_region_view_compatible_image() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let first = ImageInfo {
@@ -6514,8 +6456,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_reuses_existing_image_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6551,8 +6491,6 @@ mod tests {
 
     #[test]
     fn join_images_registers_common_cache_immediately_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6597,8 +6535,6 @@ mod tests {
 
     #[test]
     fn direct_find_or_insert_returns_fully_registered_image() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6624,8 +6560,6 @@ mod tests {
 
     #[test]
     fn explicit_find_or_insert_result_path_returns_registered_image() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6790,8 +6724,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot perform upstream Fermi2D image preparation")]
     fn common_blit_image_rejects_backendless_path() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let _ = cache.blit_image(&(), &(), &());
@@ -6799,7 +6731,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_continues_after_gpu_modified_ignored_overlap_fail_soft() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
@@ -6852,8 +6783,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_does_not_reuse_cpu_region_incompatible_samples_or_layers() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let existing = ImageInfo {
@@ -6894,10 +6823,8 @@ mod tests {
 
     #[test]
     fn delete_image_removes_view_references_and_framebuffers() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::texture_cache::render_targets::RenderTargets;
         use common::slot_vector::SlotId;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let descriptor = color_2d_tic(0x5000_0000, 0);
@@ -6944,8 +6871,6 @@ mod tests {
     #[test]
     fn delete_image_invalidates_all_active_channel_image_views() {
         use crate::control::channel_state::ChannelState;
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut channel_a = ChannelState::new(10);
@@ -7002,8 +6927,6 @@ mod tests {
     #[test]
     fn invalidate_scale_shared_tail_invalidates_all_active_channel_image_views() {
         use crate::control::channel_state::ChannelState;
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut channel_a = ChannelState::new(10);
@@ -7046,10 +6969,8 @@ mod tests {
 
     #[test]
     fn invalidate_scale_removes_views_framebuffers_and_marks_deleted() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::texture_cache::render_targets::RenderTargets;
         use common::slot_vector::SlotId;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         cache.frame_tick = 7;
@@ -7141,8 +7062,6 @@ mod tests {
 
     #[test]
     fn insert_image_registers_and_delete_removes_image_alloc_entry() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -7170,8 +7089,6 @@ mod tests {
 
     #[test]
     fn join_images_records_incompatible_overlaps() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let first = ImageInfo {
@@ -7209,8 +7126,6 @@ mod tests {
 
     #[test]
     fn join_images_applies_bad_overlap_relations_before_return() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let first = ImageInfo {
@@ -7251,8 +7166,6 @@ mod tests {
 
     #[test]
     fn join_images_applies_alias_relations_before_return() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut full = ImageInfo {
@@ -7302,8 +7215,6 @@ mod tests {
 
     #[test]
     fn join_images_preserves_gpu_modified_alias_source_and_registers_result() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut full = ImageInfo {
@@ -7392,8 +7303,6 @@ mod tests {
 
     #[test]
     fn join_images_registers_result_after_gpu_modified_overlap_classification() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut full = ImageInfo {
@@ -7443,8 +7352,6 @@ mod tests {
 
     #[test]
     fn create_image_view_uses_try_find_base_layer() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
@@ -7461,8 +7368,6 @@ mod tests {
 
     #[test]
     fn create_image_view_with_gpu_to_cpu_uses_virtual_invalid_fallback_like_upstream_insert() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
@@ -7479,8 +7384,6 @@ mod tests {
 
     #[test]
     fn typed_create_image_view_uses_virtual_invalid_fallback_like_upstream_insert() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
@@ -7555,8 +7458,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "TextureCache::FindRenderTargetView TryFindBase failed")]
     fn find_render_target_view_panics_when_try_find_base_fails_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -7605,8 +7506,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_skips_color_target_alias_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let image_id = insert_test_image(&mut cache, 0x6000_0000);
@@ -7630,8 +7529,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_detects_depth_target_alias() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let image_id = insert_test_image(&mut cache, 0x6100_0000);
@@ -7654,8 +7551,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_ignores_unrelated_and_null_views() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let sampled_image_id = insert_test_image(&mut cache, 0x6200_0000);
@@ -7685,8 +7580,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_cache_is_invalidated_by_texture_binding_serial() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
 
         let mut cache = test_cache();
         let depth_image_id = insert_test_image(&mut cache, 0x6400_0000);

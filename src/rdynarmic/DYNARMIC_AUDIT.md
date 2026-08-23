@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1040 passed, 4 ignored). These are
+(1044 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -150,5 +150,8 @@ validation blockers, not evidence against the focused slices.
   three file-local helper boundaries. Three restored dispatch paths reduce the remaining decoded
   A64 interpreter fallbacks to 38 identities. Indexed operands now use Eden's vector reads before
   element extraction instead of passing scalar values through vector operations.
+- The A64 system flag manipulation/format owners now mirror Eden's CFINV, RMIF, XAFlag, and AXFlag
+  IR construction. Restoring their decoder patterns and dispatch reduces the remaining decoded A64
+  interpreter fallbacks to 34 identities.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

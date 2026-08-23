@@ -10152,3 +10152,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: decoder patterns are generated metadata, not raw-copied payloads. A focused test verifies
   the four affected encodings decode to their exact upstream instruction identities.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/system_flag_{manipulation,format}.rs` vs Eden `frontend/A64/translate/impl/system_flag_{manipulation,format}.cpp` and `impl.h`
+
+### Intentional differences
+- Rust visitors accept an unused `DecodedInst` for Eden's operand-free CFINV, XAFlag, and AXFlag
+  because all dispatch methods share the generated decoder interface.
+- Rust passes an explicit false carry input to 32-bit logical shifts. Eden's generic IR builder
+  supplies the same non-flag-setting default implicitly.
+- SETF8 and SETF16 are declarations only in Eden's `impl.h`; their decoder table entries are
+  commented out and the reviewed snapshot provides no C++ definitions, so Rust does not invent
+  unreachable implementations.
+
+### Unintentional differences (to fix)
+- Fixed: CFINV, RMIF, XAFlag, and AXFlag had active decoder entries but no matching Rust owner files
+  or visitor methods. All four now dispatch and preserve Eden's exact raw-NZCV masks, rotations,
+  conditional fast paths, boolean compositions, and final write ordering.
+
+### Missing items
+- None for the four visitors defined by the two reviewed C++ sources.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify CFINV's
+  carry mask, RMIF's zero/full/partial mask paths, both flag-format operation shapes, raw-NZCV
+  writes, and absence of interpreter fallback.

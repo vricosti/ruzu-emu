@@ -51,6 +51,16 @@ pub fn emit_convert_s16_f16(
     })
 }
 
+pub fn emit_convert_s16_f32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::U32, |value| {
+        format!("as_type<uint>(int(short({value})))")
+    })
+}
+
 pub fn emit_convert_s32_f16(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
@@ -81,6 +91,16 @@ pub fn emit_convert_u32_f32(
 }
 
 pub fn emit_convert_u16_f16(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    define_cast(context, inst_ref, inst, Type::U32, |value| {
+        format!("uint(ushort({value}))")
+    })
+}
+
+pub fn emit_convert_u16_f32(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
     inst: &Inst,

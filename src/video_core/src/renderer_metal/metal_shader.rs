@@ -2833,6 +2833,16 @@ mod tests {
         block.append_new_inst(Opcode::ConvertF32S16, vec![Value::ImmU32(0x1234_FFFE)]);
         block.append_new_inst(Opcode::ConvertF32U8, vec![Value::ImmU32(0x1234_12FE)]);
         block.append_new_inst(Opcode::ConvertF32U16, vec![Value::ImmU32(0x1234_FFFE)]);
+        block.append_new_inst(Opcode::ConvertS16F32, vec![Value::ImmF32(-2.0)]);
+        block.append_new_inst(Opcode::ConvertU16F32, vec![Value::ImmF32(65535.0)]);
+        block.append_new_inst(
+            Opcode::SelectU16,
+            vec![
+                Value::ImmU1(true),
+                Value::ImmU32(0x1234),
+                Value::ImmU32(0x5678),
+            ],
+        );
 
         let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
             &program,

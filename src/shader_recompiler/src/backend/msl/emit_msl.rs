@@ -326,6 +326,7 @@ fn emit_inst(
         | Opcode::CompositeInsertF32x3
         | Opcode::CompositeInsertF32x4 => emit_msl_composite::emit_insert(context, inst_ref, inst),
         Opcode::SelectU1 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U1),
+        Opcode::SelectU16 => emit_msl_select::emit_select_u16(context, inst_ref, inst),
         Opcode::SelectU32 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U32),
         Opcode::SelectU64 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::U64),
         Opcode::SelectF16 => emit_msl_select::emit_select(context, inst_ref, inst, ir::Type::F16),
@@ -618,12 +619,14 @@ fn emit_inst(
         }
         Opcode::FPIsNan16 => emit_msl_floating_point::emit_is_nan_16(context, inst_ref, inst),
         Opcode::ConvertS16F16 => emit_msl_convert::emit_convert_s16_f16(context, inst_ref, inst),
+        Opcode::ConvertS16F32 => emit_msl_convert::emit_convert_s16_f32(context, inst_ref, inst),
         Opcode::ConvertS32F16 => emit_msl_convert::emit_convert_s32_f16(context, inst_ref, inst),
         Opcode::ConvertS64F16 | Opcode::ConvertS64F32 => {
             emit_msl_convert::emit_convert_s64_float(context, inst_ref, inst)
         }
         Opcode::ConvertS32F32 => emit_msl_convert::emit_convert_s32_f32(context, inst_ref, inst),
         Opcode::ConvertU16F16 => emit_msl_convert::emit_convert_u16_f16(context, inst_ref, inst),
+        Opcode::ConvertU16F32 => emit_msl_convert::emit_convert_u16_f32(context, inst_ref, inst),
         Opcode::ConvertU32F16 => emit_msl_convert::emit_convert_u32_f16(context, inst_ref, inst),
         Opcode::ConvertU64F16 | Opcode::ConvertU64F32 => {
             emit_msl_convert::emit_convert_u64_float(context, inst_ref, inst)
@@ -2388,6 +2391,32 @@ mod tests {
         assert!(source.contains("uint2 v_0_4 = as_type<uint2>(v_0_3);"));
         assert!(source.contains("uint v_0_6 = as_type<uint>(v_0_5);"));
         assert!(source.contains("float2 v_0_7 = float2(as_type<half2>(0xC0003C00u));"));
+    }
+
+    #[test]
+    fn emits_lowered_fp16_narrow_results_and_select() {
+        let mut program = empty_program(Stage::Fragment);
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::ConvertS16F32, vec![Value::ImmF32(-2.0)]);
+        block.append_new_inst(Opcode::ConvertU16F32, vec![Value::ImmF32(65535.0)]);
+        block.append_new_inst(
+            Opcode::SelectU16,
+            vec![
+                Value::ImmU1(true),
+                Value::ImmU32(0x1234),
+                Value::ImmU32(0x5678),
+            ],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(
+            source.contains("uint v_0_0 = as_type<uint>(int(short(as_type<float>(0xC0000000u))));")
+        );
+        assert!(source.contains("uint v_0_1 = uint(ushort(as_type<float>(0x477FFF00u)));"));
+        assert!(
+            source.contains("uint v_0_2 = uint(ushort((true) ? (0x00001234u) : (0x00005678u)));")
+        );
     }
 
     #[test]

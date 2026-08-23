@@ -24,3 +24,19 @@ pub fn emit_select(
         false,
     )
 }
+
+pub fn emit_select_u16(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let condition = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let true_value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let false_value = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    context.define(
+        inst_ref,
+        Type::U32,
+        format!("uint(ushort(({condition}) ? ({true_value}) : ({false_value})))"),
+        false,
+    )
+}

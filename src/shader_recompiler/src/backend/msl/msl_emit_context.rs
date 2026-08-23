@@ -15,7 +15,9 @@ use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
 use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
-use crate::shader_info::{ImageDescriptor, TextureDescriptor, TextureType};
+use crate::shader_info::{
+    ImageBufferDescriptor, ImageDescriptor, TextureBufferDescriptor, TextureDescriptor, TextureType,
+};
 use crate::stage::Stage;
 
 use super::{
@@ -29,6 +31,8 @@ pub struct MslEmitContext {
     definitions: HashMap<InstRef, String>,
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
+    texture_buffers: Vec<MslTextureBufferDefinition>,
+    image_buffers: Vec<MslImageBufferDefinition>,
     textures: Vec<MslTextureDefinition>,
     images: Vec<MslImageDefinition>,
     input_generics: [Option<MslInputGenericDefinition>; 32],
@@ -77,6 +81,19 @@ struct MslTextureDefinition {
     is_depth: bool,
     is_integer: bool,
     is_multisample: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MslTextureBufferDefinition {
+    texture_name: String,
+    count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MslImageBufferDefinition {
+    image_name: String,
+    count: u32,
+    is_integer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +153,8 @@ impl MslEmitContext {
         let mut bindings = MslBindingLayout::default();
         let mut constant_buffers = HashMap::new();
         let mut storage_buffers = HashMap::new();
+        let mut texture_buffers = Vec::new();
+        let mut image_buffers = Vec::new();
         let mut textures = Vec::new();
         let mut images = Vec::new();
         let mut parameters = Vec::new();
@@ -236,6 +255,43 @@ impl MslEmitContext {
                 storage_buffers.insert(storage_index + alias, name.clone());
             }
             storage_index += descriptor.count;
+        }
+        let binding_counter = if profile.unified_descriptor_binding {
+            &mut binding_counters.unified
+        } else {
+            &mut binding_counters.texture
+        };
+        for (descriptor_index, descriptor) in
+            program.info.texture_buffer_descriptors.iter().enumerate()
+        {
+            let definition = Self::define_texture_buffer(
+                descriptor_index as u32,
+                descriptor,
+                *binding_counter,
+                &mut bindings,
+                &mut parameters,
+            )?;
+            texture_buffers.push(definition);
+            *binding_counter += 1;
+        }
+        let binding_counter = if profile.unified_descriptor_binding {
+            &mut binding_counters.unified
+        } else {
+            &mut binding_counters.image
+        };
+        for (descriptor_index, descriptor) in
+            program.info.image_buffer_descriptors.iter().enumerate()
+        {
+            let definition = Self::define_image_buffer(
+                descriptor_index as u32,
+                descriptor,
+                *binding_counter,
+                options.supports_read_write_textures,
+                &mut bindings,
+                &mut parameters,
+            )?;
+            image_buffers.push(definition);
+            *binding_counter += 1;
         }
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
@@ -541,6 +597,8 @@ impl MslEmitContext {
             definitions: HashMap::new(),
             constant_buffers,
             storage_buffers,
+            texture_buffers,
+            image_buffers,
             textures,
             images,
             input_generics,
@@ -625,6 +683,105 @@ impl MslEmitContext {
             Type::F32x4 => Ok("float4"),
             _ => Err(MslError::UnsupportedType(ty)),
         }
+    }
+
+    /// Native-MSL counterpart of Eden `EmitContext::DefineTextureBuffers`.
+    fn define_texture_buffer(
+        descriptor_index: u32,
+        descriptor: &TextureBufferDescriptor,
+        descriptor_binding: u32,
+        bindings: &mut MslBindingLayout,
+        parameters: &mut Vec<String>,
+    ) -> Result<MslTextureBufferDefinition, MslError> {
+        if descriptor.count != 1 {
+            return Err(MslError::UnsupportedProgramFeature(
+                "array of texture buffers",
+            ));
+        }
+        let texture_index = bindings.texture_count;
+        bindings.texture_count += 1;
+        bindings.resources.push(MslResourceBinding {
+            descriptor_set: 0,
+            binding: descriptor_binding,
+            kind: MslResourceKind::SeparateImage,
+            buffer_index: 0,
+            texture_index,
+            sampler_index: 0,
+            count: None,
+        });
+        let texture_name = format!("texbuf{descriptor_index}");
+        parameters.push(format!(
+            "texture_buffer<float, access::read> {texture_name} [[texture({texture_index})]]"
+        ));
+        Ok(MslTextureBufferDefinition {
+            texture_name,
+            count: descriptor.count,
+        })
+    }
+
+    /// Native-MSL counterpart of Eden `EmitContext::DefineImageBuffers`.
+    fn define_image_buffer(
+        descriptor_index: u32,
+        descriptor: &ImageBufferDescriptor,
+        descriptor_binding: u32,
+        supports_read_write_textures: bool,
+        bindings: &mut MslBindingLayout,
+        parameters: &mut Vec<String>,
+    ) -> Result<MslImageBufferDefinition, MslError> {
+        if descriptor.count == 0 {
+            return Err(MslError::UnsupportedProgramFeature(
+                "zero-sized image-buffer descriptor array",
+            ));
+        }
+        let access = match (descriptor.is_read, descriptor.is_written) {
+            (true, false) => "read",
+            (false, true) => "write",
+            (true, true) if supports_read_write_textures => "read_write",
+            (true, true) => {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "read/write image buffer on this Metal device",
+                ));
+            }
+            (false, false) => {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "image buffer with no declared access",
+                ));
+            }
+        };
+        let component = if descriptor.is_integer {
+            "uint"
+        } else {
+            "float"
+        };
+        let image_type = format!("texture_buffer<{component}, access::{access}>");
+        let texture_index = bindings.texture_count;
+        bindings.texture_count += descriptor.count;
+        bindings.resources.push(MslResourceBinding {
+            descriptor_set: 0,
+            binding: descriptor_binding,
+            kind: MslResourceKind::StorageImage,
+            buffer_index: 0,
+            texture_index,
+            sampler_index: 0,
+            count: (descriptor.count > 1)
+                .then(|| std::num::NonZeroU32::new(descriptor.count).unwrap()),
+        });
+        let image_name = format!("imgbuf{descriptor_index}");
+        if descriptor.count > 1 {
+            parameters.push(format!(
+                "array<{image_type}, {}> {image_name} [[texture({texture_index})]]",
+                descriptor.count
+            ));
+        } else {
+            parameters.push(format!(
+                "{image_type} {image_name} [[texture({texture_index})]]"
+            ));
+        }
+        Ok(MslImageBufferDefinition {
+            image_name,
+            count: descriptor.count,
+            is_integer: descriptor.is_integer,
+        })
     }
 
     fn define_texture(
@@ -936,11 +1093,17 @@ impl MslEmitContext {
         &self,
         info: crate::ir::types::TextureInstInfo,
     ) -> Result<(), MslError> {
+        let instruction_type = TextureType::from_u8(info.texture_type);
+        if instruction_type == TextureType::Buffer {
+            self.texture_buffers
+                .get(info.descriptor_index as usize)
+                .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
+            return Ok(());
+        }
         let definition = self
             .textures
             .get(info.descriptor_index as usize)
             .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
-        let instruction_type = TextureType::from_u8(info.texture_type);
         let matches = definition.texture_type == instruction_type
             || (definition.texture_type == TextureType::Color2DRect
                 && instruction_type == TextureType::Color2D);
@@ -958,6 +1121,26 @@ impl MslEmitContext {
         index: &Value,
         inst_ref: InstRef,
     ) -> Result<MslTextureExpressions, MslError> {
+        if TextureType::from_u8(info.texture_type) == TextureType::Buffer {
+            let definition = self
+                .texture_buffers
+                .get(info.descriptor_index as usize)
+                .ok_or(MslError::MissingTexture(info.descriptor_index.into()))?;
+            let texture = if definition.count == 1 {
+                definition.texture_name.clone()
+            } else {
+                let index = self.value_expression(index, inst_ref, 0)?;
+                format!("{}[{index}]", definition.texture_name)
+            };
+            return Ok(MslTextureExpressions {
+                texture,
+                sampler: String::new(),
+                texture_type: TextureType::Buffer,
+                is_depth: false,
+                is_integer: false,
+                is_multisample: false,
+            });
+        }
         let definition = self
             .textures
             .get(info.descriptor_index as usize)
@@ -989,11 +1172,28 @@ impl MslEmitContext {
         index: &Value,
         inst_ref: InstRef,
     ) -> Result<MslImageExpressions, MslError> {
+        let instruction_type = TextureType::from_u8(info.texture_type);
+        if instruction_type == TextureType::Buffer {
+            let definition = self
+                .image_buffers
+                .get(info.descriptor_index as usize)
+                .ok_or(MslError::MissingImage(info.descriptor_index.into()))?;
+            let image = if definition.count == 1 {
+                definition.image_name.clone()
+            } else {
+                let index = self.value_expression(index, inst_ref, 0)?;
+                format!("{}[{index}]", definition.image_name)
+            };
+            return Ok(MslImageExpressions {
+                image,
+                texture_type: TextureType::Buffer,
+                is_integer: definition.is_integer,
+            });
+        }
         let definition = self
             .images
             .get(info.descriptor_index as usize)
             .ok_or(MslError::MissingImage(info.descriptor_index.into()))?;
-        let instruction_type = TextureType::from_u8(info.texture_type);
         if definition.texture_type != instruction_type {
             return Err(MslError::UnsupportedProgramFeature(
                 "storage image instruction/descriptor type mismatch",

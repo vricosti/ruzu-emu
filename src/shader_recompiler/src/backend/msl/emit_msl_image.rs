@@ -100,9 +100,7 @@ fn append_fetch_coordinates(
             arguments.push(format!("({coords}).z"));
             arguments.push(format!("({coords}).w"));
         }
-        TextureType::Buffer => {
-            return Err(MslError::UnsupportedProgramFeature("texture buffer fetch"));
-        }
+        TextureType::Buffer => arguments.push(coords),
     }
     Ok(())
 }
@@ -124,11 +122,7 @@ pub(super) fn append_storage_coordinates(
             arguments.push(format!("({coords}).z"));
         }
         TextureType::Color3D => arguments.push(coords),
-        TextureType::Buffer => {
-            return Err(MslError::UnsupportedProgramFeature(
-                "image buffer in storage image operation",
-            ));
-        }
+        TextureType::Buffer => arguments.push(coords),
         TextureType::ColorCube | TextureType::ColorArrayCube | TextureType::Color2DRect => {
             return Err(MslError::UnsupportedProgramFeature(
                 "invalid storage image texture type",
@@ -737,7 +731,7 @@ pub fn emit_image_fetch(
     } else if !matches!(inst.arg(3), Value::Void)
         && !matches!(
             texture.texture_type,
-            TextureType::Color1D | TextureType::ColorArray1D
+            TextureType::Buffer | TextureType::Color1D | TextureType::ColorArray1D
         )
     {
         arguments.push(context.value_expression(inst.arg(3), inst_ref, 3)?);
@@ -762,15 +756,10 @@ pub fn emit_image_query_dimensions(
     let info = TextureInstInfo::from_u32(inst.flags);
     context.validate_texture(info)?;
     let texture = context.texture_expressions(info, inst.arg(0), inst_ref)?;
-    if texture.texture_type == TextureType::Buffer {
-        return Err(MslError::UnsupportedProgramFeature(
-            "texture buffer dimension query",
-        ));
-    }
     let lod = if texture.is_multisample
         || matches!(
             texture.texture_type,
-            TextureType::Color1D | TextureType::ColorArray1D
+            TextureType::Buffer | TextureType::Color1D | TextureType::ColorArray1D
         ) {
         None
     } else {
@@ -783,7 +772,7 @@ pub fn emit_image_query_dimensions(
     let skip_mips = inst.args.get(2).map(Value::imm_u1).unwrap_or(false);
     let mips = if skip_mips {
         "0u".to_owned()
-    } else if texture.is_multisample {
+    } else if texture.is_multisample || texture.texture_type == TextureType::Buffer {
         "1u".to_owned()
     } else {
         format!("{}.get_num_mip_levels()", texture.texture)
@@ -808,7 +797,7 @@ pub fn emit_image_query_dimensions(
             query("get_height"),
             query("get_depth")
         ),
-        TextureType::Buffer => unreachable!("texture buffers were rejected above"),
+        TextureType::Buffer => format!("uint4({width}, 0u, 0u, {mips})"),
     };
     context.define(inst_ref, Type::U32x4, expression, false)
 }

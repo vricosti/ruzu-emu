@@ -132,9 +132,6 @@ fn first_unsupported_program_feature(
     if !info.storage_buffers_descriptors.is_empty() && profile.support_descriptor_aliasing {
         return Some("descriptor-aliasing storage buffers");
     }
-    if !info.texture_buffer_descriptors.is_empty() || !info.image_buffer_descriptors.is_empty() {
-        return Some("resource bindings");
-    }
     if !info.constant_buffer_descriptors.is_empty() && profile.support_descriptor_aliasing {
         return Some("descriptor-aliasing constant buffers");
     }
@@ -180,7 +177,6 @@ fn first_unsupported_program_feature(
         || info.uses_fp32_denorms_preserve
         || info.uses_image_1d
         || info.uses_sparse_residency
-        || info.uses_image_buffers
         || info.uses_cbuf_indirect
     {
         return Some("shader capabilities");
@@ -1020,7 +1016,10 @@ mod tests {
     use crate::ir::value::Value;
     use crate::profile::Profile;
     use crate::runtime_info::RuntimeInfo;
-    use crate::shader_info::{ImageDescriptor, ImageFormat, TextureDescriptor, TextureType};
+    use crate::shader_info::{
+        ImageBufferDescriptor, ImageDescriptor, ImageFormat, TextureBufferDescriptor,
+        TextureDescriptor, TextureType,
+    };
     use crate::stage::Stage;
 
     use super::*;
@@ -1352,6 +1351,125 @@ mod tests {
                 ],
             );
             program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
+    fn texture_buffer_program() -> ir::Program {
+        let mut program = empty_program(Stage::Compute);
+        program
+            .info
+            .texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 0,
+            });
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        let fetch = program.blocks[0].append_new_inst(
+            Opcode::ImageFetch,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(7),
+                Value::ImmU32(2),
+                Value::ImmU32(4),
+                Value::Void,
+            ],
+        );
+        program.blocks[0].inst_mut(fetch).flags = flags;
+        let query = program.blocks[0].append_new_inst(
+            Opcode::ImageQueryDimensions,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU1(false)],
+        );
+        program.blocks[0].inst_mut(query).flags = flags;
+        program
+    }
+
+    fn image_buffer_program(is_read: bool, is_written: bool) -> ir::Program {
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_image_buffers = true;
+        program
+            .info
+            .image_buffer_descriptors
+            .push(ImageBufferDescriptor {
+                format: ImageFormat::R32Uint,
+                is_written,
+                is_read,
+                is_integer: true,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                size_shift: 0,
+            });
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            image_format: ImageFormat::R32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        if is_read {
+            let read = program.blocks[0]
+                .append_new_inst(Opcode::ImageRead, vec![Value::ImmU32(0), Value::ImmU32(7)]);
+            program.blocks[0].inst_mut(read).flags = flags;
+        }
+        if is_written {
+            let color = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x4,
+                vec![
+                    Value::ImmU32(1),
+                    Value::ImmU32(2),
+                    Value::ImmU32(3),
+                    Value::ImmU32(4),
+                ],
+            );
+            let write = program.blocks[0].append_new_inst(
+                Opcode::ImageWrite,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(7),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: color,
+                    }),
+                ],
+            );
+            program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
+    fn image_buffer_atomic_program(opcodes: &[Opcode]) -> ir::Program {
+        let mut program = image_buffer_program(true, true);
+        program.info.uses_atomic_image_u32 = true;
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            image_format: ImageFormat::R32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        for &opcode in opcodes {
+            let atomic = program.blocks[0].append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(7),
+                    Value::ImmU32(0x8000_0001),
+                ],
+            );
+            program.blocks[0].inst_mut(atomic).flags = flags;
         }
         program
     }
@@ -3470,6 +3588,65 @@ mod tests {
     }
 
     #[test]
+    fn emits_texture_and_image_buffers_in_upstream_binding_order() {
+        let texture = texture_buffer_program();
+        let texture = emit_msl(&texture, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert_eq!(texture.bindings.resources.len(), 1);
+        assert_eq!(
+            texture.bindings.resources[0].kind,
+            MslResourceKind::SeparateImage
+        );
+        assert!(texture
+            .source
+            .source
+            .contains("texture_buffer<float, access::read> texbuf0 [[texture(0)]]"));
+        assert!(texture
+            .source
+            .source
+            .contains("texbuf0.read(((0x00000007u) + (0x00000002u)))"));
+        assert!(texture
+            .source
+            .source
+            .contains("uint4(texbuf0.get_width(), 0u, 0u, 1u)"));
+
+        let options = MslOptions {
+            supports_read_write_textures: true,
+            ..MslOptions::default()
+        };
+        let image = image_buffer_program(true, true);
+        let image = emit_msl_with_options(
+            &image,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(image.bindings.resources.len(), 1);
+        assert_eq!(
+            image.bindings.resources[0].kind,
+            MslResourceKind::StorageImage
+        );
+        assert!(image
+            .source
+            .source
+            .contains("texture_buffer<uint, access::read_write> imgbuf0 [[texture(0)]]"));
+        assert!(image.source.source.contains("imgbuf0.read(0x00000007u)"));
+        assert!(image.source.source.contains("imgbuf0.write("));
+    }
+
+    #[test]
+    fn texture_buffer_array_preserves_upstream_rejection() {
+        let mut program = texture_buffer_program();
+        program.info.texture_buffer_descriptors[0].count = 2;
+        assert_eq!(
+            emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "array of texture buffers"
+            ))
+        );
+    }
+
+    #[test]
     fn storage_image_access_qualifiers_follow_descriptor_usage() {
         let read = storage_image_program(TextureType::Color2D, 1, true, true, false);
         let read = emit_msl(&read, &Profile::default(), &RuntimeInfo::default()).unwrap();
@@ -3564,6 +3741,49 @@ mod tests {
         assert!(source.contains("as_type<uint>(spvTextureCast"));
         assert!(source.contains("reinterpret_cast<thread const T&>(image)"));
         assert_eq!(source.matches(").x").count(), 9);
+    }
+
+    #[test]
+    fn emits_native_image_buffer_atomics_and_signed_reinterpretation() {
+        let program = image_buffer_atomic_program(&[
+            Opcode::ImageAtomicIAdd32,
+            Opcode::ImageAtomicSMin32,
+            Opcode::ImageAtomicUMin32,
+            Opcode::ImageAtomicSMax32,
+            Opcode::ImageAtomicUMax32,
+            Opcode::ImageAtomicAnd32,
+            Opcode::ImageAtomicOr32,
+            Opcode::ImageAtomicXor32,
+            Opcode::ImageAtomicExchange32,
+        ]);
+        let options = MslOptions {
+            language_version: MslVersion::V3_1,
+            supports_read_write_textures: true,
+            supports_texture_atomics: true,
+            ..MslOptions::default()
+        };
+        let artifact = emit_msl_with_options(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &options,
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+
+        assert!(source.contains("texture_buffer<uint, access::read_write> imgbuf0"));
+        assert!(source.contains("spvTextureCast<texture_buffer<int, access::read_write>>(imgbuf0)"));
+        for method in [
+            "atomic_fetch_add",
+            "atomic_fetch_min",
+            "atomic_fetch_max",
+            "atomic_fetch_and",
+            "atomic_fetch_or",
+            "atomic_fetch_xor",
+            "atomic_exchange",
+        ] {
+            assert!(source.contains(method), "missing {method} in:\n{source}");
+        }
     }
 
     #[test]

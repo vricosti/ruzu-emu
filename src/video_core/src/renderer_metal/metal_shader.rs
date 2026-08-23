@@ -752,8 +752,9 @@ mod tests {
     use shader_recompiler::profile::Profile;
     use shader_recompiler::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
     use shader_recompiler::shader_info::{
-        ConstantBufferDescriptor, ImageDescriptor, ImageFormat, Interpolation,
-        StorageBufferDescriptor, TextureDescriptor, TextureType,
+        ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
+        Interpolation, StorageBufferDescriptor, TextureBufferDescriptor, TextureDescriptor,
+        TextureType,
     };
     use shader_recompiler::stage::Stage;
 
@@ -1211,6 +1212,144 @@ mod tests {
                 vec![Value::ImmU32(count.saturating_sub(1)), coords, color],
             );
             program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
+    fn texture_buffer_program() -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program
+            .info
+            .texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 0,
+            });
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        let fetch = program.blocks[0].append_new_inst(
+            Opcode::ImageFetch,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(7),
+                Value::ImmU32(2),
+                Value::ImmU32(4),
+                Value::Void,
+            ],
+        );
+        program.blocks[0].inst_mut(fetch).flags = flags;
+        store_sample_result(&mut program, fetch, true);
+        let query = program.blocks[0].append_new_inst(
+            Opcode::ImageQueryDimensions,
+            // SPIRV-Cross currently emits the invalid
+            // `texture_buffer::get_num_mip_levels()` call unless the IR asks
+            // to skip mip levels. Direct MSL's non-skipping `mips = 1` path
+            // is covered independently in shader_recompiler tests.
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU1(true)],
+        );
+        program.blocks[0].inst_mut(query).flags = flags;
+        store_query_result(&mut program, query);
+        program
+    }
+
+    fn image_buffer_program(is_read: bool, is_written: bool) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.uses_image_buffers = true;
+        program
+            .info
+            .image_buffer_descriptors
+            .push(ImageBufferDescriptor {
+                format: ImageFormat::R32Uint,
+                is_written,
+                is_read,
+                is_integer: true,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                size_shift: 0,
+            });
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            image_format: ImageFormat::R32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        if is_read {
+            let read = program.blocks[0]
+                .append_new_inst(Opcode::ImageRead, vec![Value::ImmU32(0), Value::ImmU32(7)]);
+            program.blocks[0].inst_mut(read).flags = flags;
+            store_query_result(&mut program, read);
+        }
+        if is_written {
+            let color = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x4,
+                vec![
+                    Value::ImmU32(1),
+                    Value::ImmU32(2),
+                    Value::ImmU32(3),
+                    Value::ImmU32(4),
+                ],
+            );
+            let write = program.blocks[0].append_new_inst(
+                Opcode::ImageWrite,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(7),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: color,
+                    }),
+                ],
+            );
+            program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
+    fn image_buffer_atomic_program() -> Program {
+        let mut program = image_buffer_program(true, true);
+        program.info.uses_atomic_image_u32 = true;
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            image_format: ImageFormat::R32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        for opcode in [
+            Opcode::ImageAtomicIAdd32,
+            Opcode::ImageAtomicSMin32,
+            Opcode::ImageAtomicUMin32,
+            Opcode::ImageAtomicSMax32,
+            Opcode::ImageAtomicUMax32,
+            Opcode::ImageAtomicAnd32,
+            Opcode::ImageAtomicOr32,
+            Opcode::ImageAtomicXor32,
+            Opcode::ImageAtomicExchange32,
+        ] {
+            let atomic = program.blocks[0].append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(7),
+                    Value::ImmU32(0x8000_0001),
+                ],
+            );
+            program.blocks[0].inst_mut(atomic).flags = flags;
         }
         program
     }
@@ -3383,6 +3522,82 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_texture_and_image_buffers_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let mut programs = vec![
+            (texture_buffer_program(), MetalResourceKind::SeparateImage),
+            (
+                image_buffer_program(true, false),
+                MetalResourceKind::StorageImage,
+            ),
+            (
+                image_buffer_program(false, true),
+                MetalResourceKind::StorageImage,
+            ),
+        ];
+        if device.profile().supports_read_write_textures() {
+            programs.push((
+                image_buffer_program(true, true),
+                MetalResourceKind::StorageImage,
+            ));
+        }
+
+        for (program, expected_kind) in programs {
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::for_device(device.profile()),
+            )
+            .expect("active buffer-image SPIR-V/MSL must compile");
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "direct buffer-image MSL must compile: {error}\nactive MSL:\n{}",
+                    active.source().source,
+                )
+            });
+
+            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(direct.bindings().resources.len(), 1);
+            assert_eq!(direct.bindings().resources[0].kind, expected_kind);
+        }
+
+        // Eden carries image-buffer array counts through shader metadata.
+        // SPIR-V reflection does not preserve that count reliably, so prove
+        // the native declaration and ABI independently.
+        let mut array = image_buffer_program(true, false);
+        array.info.image_buffer_descriptors[0].count = 2;
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &array,
+            &profile,
+            &runtime_info,
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
+            },
+        )
+        .expect("direct image-buffer descriptor array must lower");
+        assert_eq!(artifact.bindings.resources[0].count.unwrap().get(), 2);
+        compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct image-buffer descriptor array must compile natively");
+    }
+
+    #[test]
     fn compiles_direct_texture_atomics_with_active_abi() {
         let Ok(device) = MetalDevice::new() else {
             return;
@@ -3416,6 +3631,48 @@ mod tests {
         });
 
         assert_eq!(direct.bindings(), active.bindings());
+        assert!(direct.source().source.contains("atomic_fetch_add"));
+        assert!(direct.source().source.contains("atomic_exchange"));
+    }
+
+    #[test]
+    fn compiles_direct_image_buffer_atomics_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        if !device.profile().supports_texture_atomics() {
+            return;
+        }
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+        let program = image_buffer_atomic_program();
+        let spirv = emit_spirv(&program, &profile, &runtime_info);
+        let active = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active image-buffer atomic SPIR-V/MSL must compile");
+        let direct = validate_direct_msl_against_active_module(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &active,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "direct image-buffer atomic MSL must compile: {error}\nactive MSL:\n{}",
+                active.source().source,
+            )
+        });
+
+        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(
+            direct.bindings().resources[0].kind,
+            MetalResourceKind::StorageImage
+        );
         assert!(direct.source().source.contains("atomic_fetch_add"));
         assert!(direct.source().source.contains("atomic_exchange"));
     }

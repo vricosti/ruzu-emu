@@ -36,9 +36,7 @@ fn signed_texture_type(texture_type: TextureType) -> Result<&'static str, MslErr
         TextureType::Color2D => Ok("texture2d<int, access::read_write>"),
         TextureType::ColorArray2D => Ok("texture2d_array<int, access::read_write>"),
         TextureType::Color3D => Ok("texture3d<int, access::read_write>"),
-        TextureType::Buffer => Err(MslError::UnsupportedProgramFeature(
-            "image-buffer atomic operation",
-        )),
+        TextureType::Buffer => Ok("texture_buffer<int, access::read_write>"),
         TextureType::ColorCube | TextureType::ColorArrayCube | TextureType::Color2DRect => Err(
             MslError::UnsupportedProgramFeature("invalid storage-image atomic texture type"),
         ),

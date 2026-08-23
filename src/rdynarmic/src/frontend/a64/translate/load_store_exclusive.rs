@@ -27,7 +27,7 @@ impl<'a> TranslatorVisitor<'a> {
             8 => self
                 .ir
                 .exclusive_write_memory_64(address, data, AccType::Atomic),
-            _ => return self.interpret_this_instruction(),
+            _ => unreachable!("exclusive store size is derived from a two-bit field"),
         };
         self.set_x(32, rs, status);
         true
@@ -57,7 +57,7 @@ impl<'a> TranslatorVisitor<'a> {
             8 => self
                 .ir
                 .exclusive_write_memory_64(address, data, AccType::Ordered),
-            _ => return self.interpret_this_instruction(),
+            _ => unreachable!("exclusive store size is derived from a two-bit field"),
         };
         self.set_x(32, rs, status);
         true
@@ -78,7 +78,7 @@ impl<'a> TranslatorVisitor<'a> {
             2 => self.ir.exclusive_read_memory_16(address, AccType::Atomic),
             4 => self.ir.exclusive_read_memory_32(address, AccType::Atomic),
             8 => self.ir.exclusive_read_memory_64(address, AccType::Atomic),
-            _ => return self.interpret_this_instruction(),
+            _ => unreachable!("exclusive load size is derived from a two-bit field"),
         };
 
         let extended = self.sign_or_zero_extend(data, datasize, regsize, false);
@@ -101,7 +101,7 @@ impl<'a> TranslatorVisitor<'a> {
             2 => self.ir.exclusive_read_memory_16(address, AccType::Ordered),
             4 => self.ir.exclusive_read_memory_32(address, AccType::Ordered),
             8 => self.ir.exclusive_read_memory_64(address, AccType::Ordered),
-            _ => return self.interpret_this_instruction(),
+            _ => unreachable!("exclusive load size is derived from a two-bit field"),
         };
 
         let extended = self.sign_or_zero_extend(data, datasize, regsize, false);

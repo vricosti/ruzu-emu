@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1062 passed, 4 ignored). These are
+(1068 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -131,6 +131,11 @@ validation blockers, not evidence against the focused slices.
   performs encoding validation inside each visitor before
   `ArmConditionPassed`; restoring that ordering requires a frontend-wide
   ownership change.
+- A64 block/single-instruction translation and `TranslationOptions` now live in the matching
+  `a64_translate.rs` owner. All three option defaults match Eden, the runtime propagates
+  `define_unpredictable_behaviour` and `wall_clock_cntpct` on both host backends, undecodable
+  instructions raise `UnallocatedEncoding`, and every active decoder identity has exhaustive
+  dispatch instead of a catch-all interpreter path.
 - The A64 SM3/EOR3/BCAX crypto slice now owns and dispatches all seven visitors from Eden's
   `simd_crypto_four_register.cpp` and `simd_crypto_three_register.cpp`. This removes seven decoded
   identities from the temporary interpreter fallback.

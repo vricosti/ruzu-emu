@@ -405,7 +405,7 @@ mod tests {
         let mut visitor = TranslatorVisitor::new(
             &mut block,
             A64LocationDescriptor::new(0x1000, 0, false),
-            crate::frontend::a64::translate::visitor::TranslationOptions::default(),
+            crate::frontend::a64::translate::TranslationOptions::default(),
         );
         let should_continue = visitor.dispatch(&decoded);
         drop(visitor);

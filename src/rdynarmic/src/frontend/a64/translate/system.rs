@@ -55,8 +55,7 @@ impl<'a> TranslatorVisitor<'a> {
             x if x == SystemRegister::CNTPCT_EL0 as u16 => {
                 // If not at block start and not wall_clock, restart block
                 if self.ir.base.block.inst_count() > 0 && !self.options.wall_clock_cntpct {
-                    self.ir.base.block.cycle_count =
-                        self.ir.base.block.cycle_count.saturating_sub(1);
+                    self.ir.base.block.cycle_count -= 1;
                     let loc = self.ir.current_location.unwrap();
                     self.ir.set_term(Terminal::LinkBlock {
                         next: loc.to_location(),
@@ -102,7 +101,7 @@ impl<'a> TranslatorVisitor<'a> {
                 self.set_x(64, rt, val);
                 true
             }
-            _ => self.interpret_this_instruction(),
+            _ => unreachable!("decoded unsupported MRS system register"),
         }
     }
 
@@ -137,15 +136,8 @@ impl<'a> TranslatorVisitor<'a> {
                 self.ir.set_tpidr(val);
                 true
             }
-            _ => self.interpret_this_instruction(),
+            _ => unreachable!("decoded unsupported MSR system register"),
         }
-    }
-
-    /// MSR (immediate) - Write immediate to PSTATE field
-    pub fn msr_imm(&mut self, _inst: &DecodedInst) -> bool {
-        // Most MSR immediate forms (SPSel, DAIFSet, DAIFClr) aren't
-        // relevant for EL0 emulation. Fallback to interpreter.
-        self.interpret_this_instruction()
     }
 
     /// NOP
@@ -225,10 +217,35 @@ impl<'a> TranslatorVisitor<'a> {
         self.ir.set_term(Terminal::ReturnToDispatch);
         false
     }
+}
 
-    /// SYS - System instruction
-    pub fn sys(&mut self, _inst: &DecodedInst) -> bool {
-        // Fallback - DC/IC operations would need specific handling
-        self.interpret_this_instruction()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::a64::decoder::{decode, A64InstructionName};
+    use crate::frontend::a64::translate::TranslationOptions;
+    use crate::ir::block::Block;
+    use crate::ir::location::A64LocationDescriptor;
+
+    fn dispatch(raw: u32, expected_name: A64InstructionName) {
+        let decoded = decode(raw).expect("instruction should decode");
+        assert_eq!(decoded.name, expected_name);
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        let mut visitor =
+            TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+        visitor.dispatch(&decoded);
+    }
+
+    #[test]
+    #[should_panic(expected = "decoded unsupported MRS system register")]
+    fn unsupported_decoded_mrs_is_unreachable_like_upstream() {
+        dispatch(0xD530_0000, A64InstructionName::MRS);
+    }
+
+    #[test]
+    #[should_panic(expected = "decoded unsupported MSR system register")]
+    fn unsupported_decoded_msr_is_unreachable_like_upstream() {
+        dispatch(0xD510_0000, A64InstructionName::MSR_reg);
     }
 }

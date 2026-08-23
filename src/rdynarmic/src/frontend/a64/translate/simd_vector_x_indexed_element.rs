@@ -106,9 +106,7 @@ impl<'a> TranslatorVisitor<'a> {
         }
 
         let esize = 8usize << size;
-        if esize == 16 {
-            return self.interpret_this_instruction();
-        }
+        assert_ne!(esize, 16, "half-precision floating point is unsupported");
 
         let index = if size == 0b01 { (h << 1) | l } else { h };
         let vm = Vec::from_u32((m << 4) | vmlo);
@@ -635,7 +633,7 @@ mod tests {
         let mut visitor = TranslatorVisitor::new(
             &mut block,
             A64LocationDescriptor::new(0x1000, 0, false),
-            crate::frontend::a64::translate::visitor::TranslationOptions::default(),
+            crate::frontend::a64::translate::TranslationOptions::default(),
         );
         let should_continue = visitor.dispatch(&decoded);
         drop(visitor);
@@ -733,6 +731,12 @@ mod tests {
             );
             assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "half-precision floating point is unsupported")]
+    fn fcmla_half_precision_asserts_like_upstream() {
+        let _ = translate_one(0x6F40_1000);
     }
 
     #[test]

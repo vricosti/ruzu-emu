@@ -229,7 +229,7 @@ impl<'a> TranslatorVisitor<'a> {
 mod tests {
     use super::*;
     use crate::frontend::a64::decoder::decode;
-    use crate::frontend::a64::translate::visitor::TranslationOptions;
+    use crate::frontend::a64::translate::TranslationOptions;
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;

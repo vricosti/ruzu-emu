@@ -10315,3 +10315,99 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both dot
   product signedness modes, rejected sizes, all FCMLA/FCADD rotations, 32/64-bit FP operation
   selection, and absence of interpreter fallback.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/a64_translate.rs` vs Eden `frontend/A64/translate/a64_translate.{h,cpp}` and backend translation call sites
+
+### Intentional differences
+- Rust's block-level `translate` allocates and returns its `Block`; Eden receives a reset block by
+  mutable reference from each backend. Instruction loop ordering, terminal assertion, cycle count,
+  single-step link, and end-location update remain the same.
+- Rust represents `MemoryReadCodeFuncType` as a borrowed `dyn Fn` and uses `Option::map` for the
+  single-instruction decoder result. Both preserve Eden's optional-code and decoder semantics.
+- The implementation lives in its own `a64_translate.rs`; `translate/mod.rs` only declares and
+  re-exports the owner, matching Rust module mechanics without retaining behavior in the dispatcher.
+
+### Unintentional differences (to fix)
+- Fixed: `TranslationOptions` lived in `visitor.rs`, omitted `define_unpredictable_behaviour`, and
+  derived a false `hook_hint_instructions` default instead of Eden's true default.
+- Fixed: both runtime backends discarded the configured define-unpredictable value; x64 also
+  discarded `wall_clock_cntpct`. Both now construct the same option values as Eden.
+- Fixed: block translation routed decoder misses to the extra interpreter terminal instead of
+  raising `UnallocatedEncoding`, and Rust lacked Eden's `TranslateSingleInstruction` counterpart.
+- Fixed: dispatch used a catch-all interpreter arm even though every active generated decoder
+  identity now has an explicit visitor arm. The match is exhaustive.
+
+### Missing items
+- None for the options, memory-code callback type, block translation, and single-instruction
+  translation declared and defined by the reviewed upstream pair.
+
+### Binary layout verification
+- N/A: translation options are passed as Rust values and no raw-memory ABI is exposed. Focused
+  tests verify all defaults plus decoded and undecodable single-instruction bookkeeping.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/system.rs` vs Eden `frontend/A64/translate/impl/{system.cpp,impl.h}` (interpreter-producer audit)
+
+### Intentional differences
+- Rust packs the decoded system-register fields into a `repr(u16)` enum while Eden uses its generic
+  immediate concatenation into a `u32` enum. Every constant bit pattern is identical and the enum
+  is not raw-copied or exposed through an ABI.
+- Rust visitor methods receive `DecodedInst`; active methods extract the same operands before
+  executing Eden's switch cases.
+- `MSR_imm` and `SYS` remain declarations only in Eden's header: their decoder entries are
+  commented out and this snapshot has no C++ definitions. Rust no longer invents dead fallback
+  implementations for them.
+
+### Unintentional differences (to fix)
+- Fixed: unsupported decoded MRS/MSR register values produced the extra interpreter terminal;
+  Eden reaches `UNREACHABLE()` after its switch. Rust now does the same and has focused panic tests.
+- Fixed: CNTPCT block splitting used saturating subtraction for the cycle count. The nonempty-block
+  guard makes Eden's literal decrement valid, so Rust now preserves it exactly.
+
+### Missing items
+- None among the active decoder identities defined by `system.cpp`.
+
+### Binary layout verification
+- N/A: system-register encodings are compile-time discriminants, not serialized payloads. Their
+  values are preserved bit-for-bit.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_exclusive.rs` vs Eden `frontend/A64/translate/impl/{load_store_exclusive.cpp,impl.h}` (interpreter-producer audit)
+
+### Intentional differences
+- Rust visitors extract operands from `DecodedInst`; the encoded two-bit size can only produce the
+  1, 2, 4, and 8-byte single-register cases.
+
+### Unintentional differences (to fix)
+- Fixed locally: the four impossible single-register size defaults produced the extra interpreter
+  terminal. They now match Eden's unreachable default.
+- The Rust owner still splits Eden's `ExclusiveSharedDecodeAndOperation` into per-operation and
+  pair helpers. It consequently omits the single-store status-register alias checks and always
+  rejects pair-store aliases instead of honoring `define_unpredictable_behaviour`. This is the
+  immediately resumed owner after the now-completed translation-option prerequisite.
+
+### Missing items
+- The matching generic `ExclusiveMem` helper overloads from `impl.cpp` are not yet present in the
+  Rust visitor owner; restoring them is the prerequisite to the shared exclusive helper port.
+
+### Binary layout verification
+- N/A: these methods construct SSA and define no raw-copied payload.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_vector_x_indexed_element.rs` vs Eden `frontend/A64/translate/impl/{simd_vector_x_indexed_element.cpp,impl.h}` (FCMLA fallback audit)
+
+### Intentional differences
+- Rust extracts operands from `DecodedInst` and initializes FCMLA's rotation-selected elements as
+  tuples because Rust forbids Eden's declaration-then-assignment form.
+
+### Unintentional differences (to fix)
+- Fixed: FCMLA by element used the extra interpreter terminal for the unsupported half-precision
+  form. Eden asserts that `esize != 16`; Rust now asserts at the identical point and has a focused
+  regression test.
+- The six anonymous-namespace helpers are currently visitor methods or duplicated field-extraction
+  logic, including an extra `fp_multiply_by_element_fields` dispatcher. Their ownership must be
+  restored in a later full owner slice; all 21 upstream visitor definitions are present.
+
+### Missing items
+- No visitor definition is missing; the remaining gap is the ownership/boundary mismatch for the
+  six file-local helpers.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload.

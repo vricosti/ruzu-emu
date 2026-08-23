@@ -6,14 +6,7 @@ use crate::ir::location::A64LocationDescriptor;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
-/// Options controlling translation behavior.
-#[derive(Debug, Clone, Default)]
-pub struct TranslationOptions {
-    /// Hook hint instructions (YIELD, WFE, WFI, SEV, SEVL) as exceptions.
-    pub hook_hint_instructions: bool,
-    /// Use wall clock for CNTPCT (instead of cycle-accurate).
-    pub wall_clock_cntpct: bool,
-}
+use super::a64_translate::TranslationOptions;
 
 /// Translator visitor: translates decoded ARM64 instructions into IR.
 pub struct TranslatorVisitor<'a> {
@@ -448,9 +441,8 @@ impl<'a> TranslatorVisitor<'a> {
             // SBFM aliases — separate handlers matching upstream
             // `data_processing_bitfield.cpp:87-134`. These have more
             // specific encoding patterns than SBFM, so the decoder picks
-            // them first. Without explicit handlers the block fell into
-            // `interpret_this_instruction()` (a no-op) and silently
-            // skipped the shift/sign-extend — STK's NVN driver at
+            // them first. Without explicit handlers the shift/sign-extend
+            // was skipped — STK's NVN driver at
             // NRO+0xE43F4C uses `asr w1, w0, #2` and without the
             // dispatch the result was wrong → bad pointer reads → no
             // display.
@@ -1158,9 +1150,6 @@ impl<'a> TranslatorVisitor<'a> {
             IC_IALLUIS => self.ic_ialluis(inst),
             IC_IVAU => self.ic_ivau(inst),
             UnallocatedEncoding => self.unallocated_encoding(),
-
-            // Unimplemented — fallback to interpreter
-            _ => self.interpret_this_instruction(),
         }
     }
 }

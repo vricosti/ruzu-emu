@@ -1622,7 +1622,11 @@ impl A64Jit {
             hook_isb: config.hook_isb,
         };
 
-        let translation_options = TranslationOptions::default();
+        let translation_options = TranslationOptions {
+            define_unpredictable_behaviour: config.define_unpredictable_behaviour,
+            wall_clock_cntpct: config.wall_clock_cntpct,
+            ..TranslationOptions::default()
+        };
 
         // Phase 3: Create the emitter (contains code buffer + dispatcher + cache)
         let mut emitter = A64EmitX64::new(

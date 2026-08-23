@@ -1,3 +1,4 @@
+mod a64_translate;
 mod branch;
 mod data_processing_addsub;
 mod data_processing_bitfield;
@@ -57,80 +58,16 @@ mod system_flag_format;
 mod system_flag_manipulation;
 mod visitor;
 
-pub use visitor::{TranslationOptions, TranslatorVisitor};
-
-use crate::frontend::a64::decoder::decode;
-use crate::frontend::a64::types::Exception;
-use crate::ir::block::Block;
-use crate::ir::location::A64LocationDescriptor;
-use crate::ir::terminal::Terminal;
-
-/// Callback for reading instruction memory.
-pub type MemoryReadCodeFn<'a> = dyn Fn(u64) -> Option<u32> + 'a;
-
-/// Translate a block of ARM64 instructions into IR.
-pub fn translate(
-    descriptor: A64LocationDescriptor,
-    memory_read_code: &MemoryReadCodeFn<'_>,
-    options: TranslationOptions,
-) -> Block {
-    let single_step = descriptor.single_stepping();
-
-    let mut block = Block::new(descriptor.to_location());
-    let mut visitor = TranslatorVisitor::new(&mut block, descriptor, options);
-
-    let mut should_continue;
-    loop {
-        let pc = visitor.ir.pc();
-
-        if let Some(instruction) = memory_read_code(pc) {
-            if instruction & 0xffff_0000 == 0 {
-                should_continue = visitor.unallocated_encoding();
-            } else if let Some(decoded) = decode(instruction) {
-                should_continue = visitor.dispatch(&decoded);
-            } else {
-                should_continue = visitor.interpret_this_instruction();
-            }
-        } else {
-            should_continue = visitor.raise_exception(Exception::NoExecuteFault);
-        }
-
-        let new_loc = visitor
-            .ir
-            .current_location
-            .expect("location not set")
-            .advance_pc(4);
-        visitor.ir.current_location = Some(new_loc);
-        visitor.ir.base.block.cycle_count += 1;
-
-        if !should_continue || single_step {
-            break;
-        }
-    }
-
-    let final_loc = visitor.ir.current_location;
-    #[allow(clippy::drop_non_drop)]
-    drop(visitor);
-
-    if single_step && should_continue {
-        if let Some(loc) = final_loc {
-            block.set_terminal(Terminal::LinkBlock {
-                next: loc.to_location(),
-            });
-        }
-    }
-
-    assert!(!block.terminal.is_invalid(), "Terminal has not been set");
-    if let Some(loc) = final_loc {
-        block.end_location = loc.to_location();
-    }
-
-    block
-}
+pub use a64_translate::{
+    translate, translate_single_instruction, MemoryReadCodeFn, TranslationOptions,
+};
+pub use visitor::TranslatorVisitor;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::location::A64LocationDescriptor;
+    use crate::ir::terminal::Terminal;
 
     #[test]
     fn test_translate_simple_add() {

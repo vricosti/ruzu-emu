@@ -576,8 +576,9 @@ impl A64AddressSpace {
             a64_descriptor,
             &read_code,
             TranslationOptions {
-                hook_hint_instructions: false,
+                define_unpredictable_behaviour: self.conf.define_unpredictable_behaviour,
                 wall_clock_cntpct: self.conf.wall_clock_cntpct,
+                ..TranslationOptions::default()
             },
         );
 

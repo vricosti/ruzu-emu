@@ -89,8 +89,8 @@ pub enum Opcode {
     LogicalShiftRight64,
     ArithmeticShiftRight32,
     ArithmeticShiftRight64,
-    RotateRight32,
-    RotateRight64,
+    BitRotateRight32,
+    BitRotateRight64,
     RotateRightExtended,
     LogicalShiftLeftMasked32,
     LogicalShiftLeftMasked64,
@@ -208,7 +208,7 @@ pub enum Opcode {
     PackedSaturatedAddS16,
     PackedSaturatedSubU16,
     PackedSaturatedSubS16,
-    PackedAbsDiffSumS8,
+    PackedAbsDiffSumU8,
     PackedSelect,
 
     // --- CRC32 ---
@@ -301,10 +301,10 @@ pub enum Opcode {
     VectorGreaterEqualUnsigned16,
     VectorGreaterEqualUnsigned32,
     VectorGreaterEqualUnsigned64,
-    VectorGreaterSigned8,
-    VectorGreaterSigned16,
-    VectorGreaterSigned32,
-    VectorGreaterSigned64,
+    VectorGreaterS8,
+    VectorGreaterS16,
+    VectorGreaterS32,
+    VectorGreaterS64,
     VectorLessEqualSigned8,
     VectorLessEqualSigned16,
     VectorLessEqualSigned32,
@@ -313,18 +313,18 @@ pub enum Opcode {
     VectorLessSigned16,
     VectorLessSigned32,
     VectorLessSigned64,
-    VectorHalvingAddSigned8,
-    VectorHalvingAddSigned16,
-    VectorHalvingAddSigned32,
-    VectorHalvingAddUnsigned8,
-    VectorHalvingAddUnsigned16,
-    VectorHalvingAddUnsigned32,
-    VectorHalvingSubSigned8,
-    VectorHalvingSubSigned16,
-    VectorHalvingSubSigned32,
-    VectorHalvingSubUnsigned8,
-    VectorHalvingSubUnsigned16,
-    VectorHalvingSubUnsigned32,
+    VectorHalvingAddS8,
+    VectorHalvingAddS16,
+    VectorHalvingAddS32,
+    VectorHalvingAddU8,
+    VectorHalvingAddU16,
+    VectorHalvingAddU32,
+    VectorHalvingSubS8,
+    VectorHalvingSubS16,
+    VectorHalvingSubS32,
+    VectorHalvingSubU8,
+    VectorHalvingSubU16,
+    VectorHalvingSubU32,
     VectorInterleaveLower8,
     VectorInterleaveLower16,
     VectorInterleaveLower32,
@@ -345,22 +345,22 @@ pub enum Opcode {
     VectorLogicalVShift16,
     VectorLogicalVShift32,
     VectorLogicalVShift64,
-    VectorMaxSigned8,
-    VectorMaxSigned16,
-    VectorMaxSigned32,
-    VectorMaxSigned64,
-    VectorMaxUnsigned8,
-    VectorMaxUnsigned16,
-    VectorMaxUnsigned32,
-    VectorMaxUnsigned64,
-    VectorMinSigned8,
-    VectorMinSigned16,
-    VectorMinSigned32,
-    VectorMinSigned64,
-    VectorMinUnsigned8,
-    VectorMinUnsigned16,
-    VectorMinUnsigned32,
-    VectorMinUnsigned64,
+    VectorMaxS8,
+    VectorMaxS16,
+    VectorMaxS32,
+    VectorMaxS64,
+    VectorMaxU8,
+    VectorMaxU16,
+    VectorMaxU32,
+    VectorMaxU64,
+    VectorMinS8,
+    VectorMinS16,
+    VectorMinS32,
+    VectorMinS64,
+    VectorMinU8,
+    VectorMinU16,
+    VectorMinU32,
+    VectorMinU64,
     VectorMultiply8,
     VectorMultiply16,
     VectorMultiply32,
@@ -389,30 +389,30 @@ pub enum Opcode {
     VectorPairedAddUnsignedWiden8,
     VectorPairedAddUnsignedWiden16,
     VectorPairedAddUnsignedWiden32,
-    VectorPairedMaxSigned8,
-    VectorPairedMaxSigned16,
-    VectorPairedMaxSigned32,
-    VectorPairedMaxUnsigned8,
-    VectorPairedMaxUnsigned16,
-    VectorPairedMaxUnsigned32,
-    VectorPairedMaxSignedLower8,
-    VectorPairedMaxSignedLower16,
-    VectorPairedMaxSignedLower32,
-    VectorPairedMaxUnsignedLower8,
-    VectorPairedMaxUnsignedLower16,
-    VectorPairedMaxUnsignedLower32,
-    VectorPairedMinSigned8,
-    VectorPairedMinSigned16,
-    VectorPairedMinSigned32,
-    VectorPairedMinUnsigned8,
-    VectorPairedMinUnsigned16,
-    VectorPairedMinUnsigned32,
-    VectorPairedMinSignedLower8,
-    VectorPairedMinSignedLower16,
-    VectorPairedMinSignedLower32,
-    VectorPairedMinUnsignedLower8,
-    VectorPairedMinUnsignedLower16,
-    VectorPairedMinUnsignedLower32,
+    VectorPairedMaxS8,
+    VectorPairedMaxS16,
+    VectorPairedMaxS32,
+    VectorPairedMaxU8,
+    VectorPairedMaxU16,
+    VectorPairedMaxU32,
+    VectorPairedMaxLowerS8,
+    VectorPairedMaxLowerS16,
+    VectorPairedMaxLowerS32,
+    VectorPairedMaxLowerU8,
+    VectorPairedMaxLowerU16,
+    VectorPairedMaxLowerU32,
+    VectorPairedMinS8,
+    VectorPairedMinS16,
+    VectorPairedMinS32,
+    VectorPairedMinU8,
+    VectorPairedMinU16,
+    VectorPairedMinU32,
+    VectorPairedMinLowerS8,
+    VectorPairedMinLowerS16,
+    VectorPairedMinLowerS32,
+    VectorPairedMinLowerU8,
+    VectorPairedMinLowerU16,
+    VectorPairedMinLowerU32,
     VectorPolynomialMultiply8,
     VectorPolynomialMultiplyLong8,
     VectorPolynomialMultiplyLong64,
@@ -424,20 +424,20 @@ pub enum Opcode {
     VectorReverseElementsInLongGroups8,
     VectorReverseElementsInLongGroups16,
     VectorReverseElementsInLongGroups32,
-    VectorRoundingHalvingAddSigned8,
-    VectorRoundingHalvingAddSigned16,
-    VectorRoundingHalvingAddSigned32,
-    VectorRoundingHalvingAddUnsigned8,
-    VectorRoundingHalvingAddUnsigned16,
-    VectorRoundingHalvingAddUnsigned32,
-    VectorRoundingShiftLeftSigned8,
-    VectorRoundingShiftLeftSigned16,
-    VectorRoundingShiftLeftSigned32,
-    VectorRoundingShiftLeftSigned64,
-    VectorRoundingShiftLeftUnsigned8,
-    VectorRoundingShiftLeftUnsigned16,
-    VectorRoundingShiftLeftUnsigned32,
-    VectorRoundingShiftLeftUnsigned64,
+    VectorRoundingHalvingAddS8,
+    VectorRoundingHalvingAddS16,
+    VectorRoundingHalvingAddS32,
+    VectorRoundingHalvingAddU8,
+    VectorRoundingHalvingAddU16,
+    VectorRoundingHalvingAddU32,
+    VectorRoundingShiftLeftS8,
+    VectorRoundingShiftLeftS16,
+    VectorRoundingShiftLeftS32,
+    VectorRoundingShiftLeftS64,
+    VectorRoundingShiftLeftU8,
+    VectorRoundingShiftLeftU16,
+    VectorRoundingShiftLeftU32,
+    VectorRoundingShiftLeftU64,
     VectorShuffleHighHalfwords,
     VectorShuffleLowHalfwords,
     VectorShuffleWords,
@@ -1159,8 +1159,8 @@ impl Opcode {
             LogicalShiftRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
             ArithmeticShiftRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
             ArithmeticShiftRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
-            RotateRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            RotateRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
+            BitRotateRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
+            BitRotateRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
             RotateRightExtended => OpcodeInfo { ret: U32, args: &[U32, U1] },
             LogicalShiftLeftMasked32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
             LogicalShiftLeftMasked64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
@@ -1265,7 +1265,7 @@ impl Opcode {
             PackedSaturatedAddU8 | PackedSaturatedAddS8 | PackedSaturatedSubU8 | PackedSaturatedSubS8 |
             PackedSaturatedAddU16 | PackedSaturatedAddS16 | PackedSaturatedSubU16 | PackedSaturatedSubS16
                 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            PackedAbsDiffSumS8 => OpcodeInfo { ret: U32, args: &[U32, U32] },
+            PackedAbsDiffSumU8 => OpcodeInfo { ret: U32, args: &[U32, U32] },
             PackedSelect => OpcodeInfo { ret: U32, args: &[U32, U32, U32] },
 
             // CRC32
@@ -1327,34 +1327,34 @@ impl Opcode {
             VectorEqual8 | VectorEqual16 | VectorEqual32 | VectorEqual64 | VectorEqual128 |
             VectorGreaterEqualSigned8 | VectorGreaterEqualSigned16 | VectorGreaterEqualSigned32 | VectorGreaterEqualSigned64 |
             VectorGreaterEqualUnsigned8 | VectorGreaterEqualUnsigned16 | VectorGreaterEqualUnsigned32 | VectorGreaterEqualUnsigned64 |
-            VectorGreaterSigned8 | VectorGreaterSigned16 | VectorGreaterSigned32 | VectorGreaterSigned64 |
+            VectorGreaterS8 | VectorGreaterS16 | VectorGreaterS32 | VectorGreaterS64 |
             VectorLessEqualSigned8 | VectorLessEqualSigned16 | VectorLessEqualSigned32 | VectorLessEqualSigned64 |
             VectorLessSigned8 | VectorLessSigned16 | VectorLessSigned32 | VectorLessSigned64 |
-            VectorHalvingAddSigned8 | VectorHalvingAddSigned16 | VectorHalvingAddSigned32 |
-            VectorHalvingAddUnsigned8 | VectorHalvingAddUnsigned16 | VectorHalvingAddUnsigned32 |
-            VectorHalvingSubSigned8 | VectorHalvingSubSigned16 | VectorHalvingSubSigned32 |
-            VectorHalvingSubUnsigned8 | VectorHalvingSubUnsigned16 | VectorHalvingSubUnsigned32 |
-            VectorMaxSigned8 | VectorMaxSigned16 | VectorMaxSigned32 | VectorMaxSigned64 |
-            VectorMaxUnsigned8 | VectorMaxUnsigned16 | VectorMaxUnsigned32 | VectorMaxUnsigned64 |
-            VectorMinSigned8 | VectorMinSigned16 | VectorMinSigned32 | VectorMinSigned64 |
-            VectorMinUnsigned8 | VectorMinUnsigned16 | VectorMinUnsigned32 | VectorMinUnsigned64 |
+            VectorHalvingAddS8 | VectorHalvingAddS16 | VectorHalvingAddS32 |
+            VectorHalvingAddU8 | VectorHalvingAddU16 | VectorHalvingAddU32 |
+            VectorHalvingSubS8 | VectorHalvingSubS16 | VectorHalvingSubS32 |
+            VectorHalvingSubU8 | VectorHalvingSubU16 | VectorHalvingSubU32 |
+            VectorMaxS8 | VectorMaxS16 | VectorMaxS32 | VectorMaxS64 |
+            VectorMaxU8 | VectorMaxU16 | VectorMaxU32 | VectorMaxU64 |
+            VectorMinS8 | VectorMinS16 | VectorMinS32 | VectorMinS64 |
+            VectorMinU8 | VectorMinU16 | VectorMinU32 | VectorMinU64 |
             VectorPairedAdd8 | VectorPairedAdd16 | VectorPairedAdd32 | VectorPairedAdd64 |
             VectorPairedAddLower8 | VectorPairedAddLower16 | VectorPairedAddLower32 |
             VectorPairedAddSignedWiden8 | VectorPairedAddSignedWiden16 | VectorPairedAddSignedWiden32 |
             VectorPairedAddUnsignedWiden8 | VectorPairedAddUnsignedWiden16 | VectorPairedAddUnsignedWiden32 |
-            VectorPairedMaxSigned8 | VectorPairedMaxSigned16 | VectorPairedMaxSigned32 |
-            VectorPairedMaxUnsigned8 | VectorPairedMaxUnsigned16 | VectorPairedMaxUnsigned32 |
-            VectorPairedMaxSignedLower8 | VectorPairedMaxSignedLower16 | VectorPairedMaxSignedLower32 |
-            VectorPairedMaxUnsignedLower8 | VectorPairedMaxUnsignedLower16 | VectorPairedMaxUnsignedLower32 |
-            VectorPairedMinSigned8 | VectorPairedMinSigned16 | VectorPairedMinSigned32 |
-            VectorPairedMinUnsigned8 | VectorPairedMinUnsigned16 | VectorPairedMinUnsigned32 |
-            VectorPairedMinSignedLower8 | VectorPairedMinSignedLower16 | VectorPairedMinSignedLower32 |
-            VectorPairedMinUnsignedLower8 | VectorPairedMinUnsignedLower16 | VectorPairedMinUnsignedLower32 |
+            VectorPairedMaxS8 | VectorPairedMaxS16 | VectorPairedMaxS32 |
+            VectorPairedMaxU8 | VectorPairedMaxU16 | VectorPairedMaxU32 |
+            VectorPairedMaxLowerS8 | VectorPairedMaxLowerS16 | VectorPairedMaxLowerS32 |
+            VectorPairedMaxLowerU8 | VectorPairedMaxLowerU16 | VectorPairedMaxLowerU32 |
+            VectorPairedMinS8 | VectorPairedMinS16 | VectorPairedMinS32 |
+            VectorPairedMinU8 | VectorPairedMinU16 | VectorPairedMinU32 |
+            VectorPairedMinLowerS8 | VectorPairedMinLowerS16 | VectorPairedMinLowerS32 |
+            VectorPairedMinLowerU8 | VectorPairedMinLowerU16 | VectorPairedMinLowerU32 |
             VectorPolynomialMultiply8 | VectorPolynomialMultiplyLong8 | VectorPolynomialMultiplyLong64 |
-            VectorRoundingHalvingAddSigned8 | VectorRoundingHalvingAddSigned16 | VectorRoundingHalvingAddSigned32 |
-            VectorRoundingHalvingAddUnsigned8 | VectorRoundingHalvingAddUnsigned16 | VectorRoundingHalvingAddUnsigned32 |
-            VectorRoundingShiftLeftSigned8 | VectorRoundingShiftLeftSigned16 | VectorRoundingShiftLeftSigned32 | VectorRoundingShiftLeftSigned64 |
-            VectorRoundingShiftLeftUnsigned8 | VectorRoundingShiftLeftUnsigned16 | VectorRoundingShiftLeftUnsigned32 | VectorRoundingShiftLeftUnsigned64 |
+            VectorRoundingHalvingAddS8 | VectorRoundingHalvingAddS16 | VectorRoundingHalvingAddS32 |
+            VectorRoundingHalvingAddU8 | VectorRoundingHalvingAddU16 | VectorRoundingHalvingAddU32 |
+            VectorRoundingShiftLeftS8 | VectorRoundingShiftLeftS16 | VectorRoundingShiftLeftS32 | VectorRoundingShiftLeftS64 |
+            VectorRoundingShiftLeftU8 | VectorRoundingShiftLeftU16 | VectorRoundingShiftLeftU32 | VectorRoundingShiftLeftU64 |
             VectorSignedAbsoluteDifference8 | VectorSignedAbsoluteDifference16 | VectorSignedAbsoluteDifference32 |
             VectorSignedMultiplyLong16 | VectorSignedMultiplyLong32 |
             VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32 |

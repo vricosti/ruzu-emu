@@ -705,8 +705,8 @@ fn emit_ir_instruction(
         Opcode::LogicalShiftRight64 => emit_logical_shift_right64(code, ctx, inst_ref),
         Opcode::ArithmeticShiftRight32 => emit_arithmetic_shift_right32(code, ctx, inst_ref),
         Opcode::ArithmeticShiftRight64 => emit_arithmetic_shift_right64(code, ctx, inst_ref),
-        Opcode::RotateRight32 => emit_rotate_right32(code, ctx, inst_ref),
-        Opcode::RotateRight64 => emit_rotate_right64(code, ctx, inst_ref),
+        Opcode::BitRotateRight32 => emit_rotate_right32(code, ctx, inst_ref),
+        Opcode::BitRotateRight64 => emit_rotate_right64(code, ctx, inst_ref),
         Opcode::LogicalShiftLeftMasked32 => emit_logical_shift_left_masked32(code, ctx, inst_ref),
         Opcode::LogicalShiftLeftMasked64 => emit_logical_shift_left_masked64(code, ctx, inst_ref),
         Opcode::LogicalShiftRightMasked32 => emit_logical_shift_right_masked32(code, ctx, inst_ref),
@@ -897,10 +897,10 @@ fn emit_ir_instruction(
         | Opcode::VectorEqual16
         | Opcode::VectorEqual32
         | Opcode::VectorEqual64
-        | Opcode::VectorGreaterSigned8
-        | Opcode::VectorGreaterSigned16
-        | Opcode::VectorGreaterSigned32
-        | Opcode::VectorGreaterSigned64
+        | Opcode::VectorGreaterS8
+        | Opcode::VectorGreaterS16
+        | Opcode::VectorGreaterS32
+        | Opcode::VectorGreaterS64
         | Opcode::VectorGreaterEqualSigned8
         | Opcode::VectorGreaterEqualSigned16
         | Opcode::VectorGreaterEqualSigned32
@@ -917,30 +917,30 @@ fn emit_ir_instruction(
         | Opcode::VectorLessEqualSigned16
         | Opcode::VectorLessEqualSigned32
         | Opcode::VectorLessEqualSigned64
-        | Opcode::VectorHalvingAddSigned8
-        | Opcode::VectorHalvingAddSigned16
-        | Opcode::VectorHalvingAddSigned32
-        | Opcode::VectorHalvingAddUnsigned8
-        | Opcode::VectorHalvingAddUnsigned16
-        | Opcode::VectorHalvingAddUnsigned32
-        | Opcode::VectorHalvingSubSigned8
-        | Opcode::VectorHalvingSubSigned16
-        | Opcode::VectorHalvingSubSigned32
-        | Opcode::VectorHalvingSubUnsigned8
-        | Opcode::VectorHalvingSubUnsigned16
-        | Opcode::VectorHalvingSubUnsigned32
-        | Opcode::VectorMaxSigned8
-        | Opcode::VectorMaxSigned16
-        | Opcode::VectorMaxSigned32
-        | Opcode::VectorMaxUnsigned8
-        | Opcode::VectorMaxUnsigned16
-        | Opcode::VectorMaxUnsigned32
-        | Opcode::VectorMinSigned8
-        | Opcode::VectorMinSigned16
-        | Opcode::VectorMinSigned32
-        | Opcode::VectorMinUnsigned8
-        | Opcode::VectorMinUnsigned16
-        | Opcode::VectorMinUnsigned32
+        | Opcode::VectorHalvingAddS8
+        | Opcode::VectorHalvingAddS16
+        | Opcode::VectorHalvingAddS32
+        | Opcode::VectorHalvingAddU8
+        | Opcode::VectorHalvingAddU16
+        | Opcode::VectorHalvingAddU32
+        | Opcode::VectorHalvingSubS8
+        | Opcode::VectorHalvingSubS16
+        | Opcode::VectorHalvingSubS32
+        | Opcode::VectorHalvingSubU8
+        | Opcode::VectorHalvingSubU16
+        | Opcode::VectorHalvingSubU32
+        | Opcode::VectorMaxS8
+        | Opcode::VectorMaxS16
+        | Opcode::VectorMaxS32
+        | Opcode::VectorMaxU8
+        | Opcode::VectorMaxU16
+        | Opcode::VectorMaxU32
+        | Opcode::VectorMinS8
+        | Opcode::VectorMinS16
+        | Opcode::VectorMinS32
+        | Opcode::VectorMinU8
+        | Opcode::VectorMinU16
+        | Opcode::VectorMinU32
         | Opcode::VectorPairedAddLower8
         | Opcode::VectorPairedAddLower16
         | Opcode::VectorPairedAddLower32
@@ -954,30 +954,30 @@ fn emit_ir_instruction(
         | Opcode::VectorPairedAddUnsignedWiden8
         | Opcode::VectorPairedAddUnsignedWiden16
         | Opcode::VectorPairedAddUnsignedWiden32
-        | Opcode::VectorPairedMaxSigned8
-        | Opcode::VectorPairedMaxSigned16
-        | Opcode::VectorPairedMaxSigned32
-        | Opcode::VectorPairedMaxUnsigned8
-        | Opcode::VectorPairedMaxUnsigned16
-        | Opcode::VectorPairedMaxUnsigned32
-        | Opcode::VectorPairedMaxSignedLower8
-        | Opcode::VectorPairedMaxSignedLower16
-        | Opcode::VectorPairedMaxSignedLower32
-        | Opcode::VectorPairedMaxUnsignedLower8
-        | Opcode::VectorPairedMaxUnsignedLower16
-        | Opcode::VectorPairedMaxUnsignedLower32
-        | Opcode::VectorPairedMinSigned8
-        | Opcode::VectorPairedMinSigned16
-        | Opcode::VectorPairedMinSigned32
-        | Opcode::VectorPairedMinUnsigned8
-        | Opcode::VectorPairedMinUnsigned16
-        | Opcode::VectorPairedMinUnsigned32
-        | Opcode::VectorPairedMinSignedLower8
-        | Opcode::VectorPairedMinSignedLower16
-        | Opcode::VectorPairedMinSignedLower32
-        | Opcode::VectorPairedMinUnsignedLower8
-        | Opcode::VectorPairedMinUnsignedLower16
-        | Opcode::VectorPairedMinUnsignedLower32
+        | Opcode::VectorPairedMaxS8
+        | Opcode::VectorPairedMaxS16
+        | Opcode::VectorPairedMaxS32
+        | Opcode::VectorPairedMaxU8
+        | Opcode::VectorPairedMaxU16
+        | Opcode::VectorPairedMaxU32
+        | Opcode::VectorPairedMaxLowerS8
+        | Opcode::VectorPairedMaxLowerS16
+        | Opcode::VectorPairedMaxLowerS32
+        | Opcode::VectorPairedMaxLowerU8
+        | Opcode::VectorPairedMaxLowerU16
+        | Opcode::VectorPairedMaxLowerU32
+        | Opcode::VectorPairedMinS8
+        | Opcode::VectorPairedMinS16
+        | Opcode::VectorPairedMinS32
+        | Opcode::VectorPairedMinU8
+        | Opcode::VectorPairedMinU16
+        | Opcode::VectorPairedMinU32
+        | Opcode::VectorPairedMinLowerS8
+        | Opcode::VectorPairedMinLowerS16
+        | Opcode::VectorPairedMinLowerS32
+        | Opcode::VectorPairedMinLowerU8
+        | Opcode::VectorPairedMinLowerU16
+        | Opcode::VectorPairedMinLowerU32
         | Opcode::VectorPolynomialMultiply8
         | Opcode::VectorPolynomialMultiplyLong8
         | Opcode::VectorPolynomialMultiplyLong64
@@ -989,26 +989,26 @@ fn emit_ir_instruction(
         | Opcode::VectorLogicalVShift16
         | Opcode::VectorLogicalVShift32
         | Opcode::VectorLogicalVShift64
-        | Opcode::VectorRoundingShiftLeftSigned8
-        | Opcode::VectorRoundingShiftLeftSigned16
-        | Opcode::VectorRoundingShiftLeftSigned32
-        | Opcode::VectorRoundingShiftLeftSigned64
-        | Opcode::VectorRoundingShiftLeftUnsigned8
-        | Opcode::VectorRoundingShiftLeftUnsigned16
-        | Opcode::VectorRoundingShiftLeftUnsigned32
-        | Opcode::VectorRoundingShiftLeftUnsigned64
+        | Opcode::VectorRoundingShiftLeftS8
+        | Opcode::VectorRoundingShiftLeftS16
+        | Opcode::VectorRoundingShiftLeftS32
+        | Opcode::VectorRoundingShiftLeftS64
+        | Opcode::VectorRoundingShiftLeftU8
+        | Opcode::VectorRoundingShiftLeftU16
+        | Opcode::VectorRoundingShiftLeftU32
+        | Opcode::VectorRoundingShiftLeftU64
         | Opcode::VectorSignedAbsoluteDifference8
         | Opcode::VectorSignedAbsoluteDifference16
         | Opcode::VectorSignedAbsoluteDifference32
         | Opcode::VectorUnsignedAbsoluteDifference8
         | Opcode::VectorUnsignedAbsoluteDifference16
         | Opcode::VectorUnsignedAbsoluteDifference32
-        | Opcode::VectorRoundingHalvingAddSigned8
-        | Opcode::VectorRoundingHalvingAddSigned16
-        | Opcode::VectorRoundingHalvingAddSigned32
-        | Opcode::VectorRoundingHalvingAddUnsigned8
-        | Opcode::VectorRoundingHalvingAddUnsigned16
-        | Opcode::VectorRoundingHalvingAddUnsigned32
+        | Opcode::VectorRoundingHalvingAddS8
+        | Opcode::VectorRoundingHalvingAddS16
+        | Opcode::VectorRoundingHalvingAddS32
+        | Opcode::VectorRoundingHalvingAddU8
+        | Opcode::VectorRoundingHalvingAddU16
+        | Opcode::VectorRoundingHalvingAddU32
         | Opcode::VectorSignedSaturatedAbs8
         | Opcode::VectorSignedSaturatedAbs16
         | Opcode::VectorSignedSaturatedAbs32

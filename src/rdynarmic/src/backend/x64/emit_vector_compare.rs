@@ -326,7 +326,7 @@ pub fn emit_vector_greater_equal_unsigned64(
 
 // ---------------------------------------------------------------------------
 // VectorMinSigned — native SSE4.1: pminsb/pminsw/pminsd
-// VectorMinSigned64 — fallback
+// VectorMinS64 — fallback
 // ---------------------------------------------------------------------------
 
 pub fn emit_vector_min_signed8(
@@ -354,7 +354,7 @@ pub fn emit_vector_min_signed32(
     emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pminsd);
 }
 
-// VectorMinSigned64: pcmpgtq(a,b) gives mask where a>b; blendvpd selects b where a>b, else a
+// VectorMinS64: pcmpgtq(a,b) gives mask where a>b; blendvpd selects b where a>b, else a
 // result = min(a,b): where a > b, pick b; otherwise pick a
 // Upstream: pcmpgtq(tmp=a, b) → XMM0=tmp → blendvpd(a, b, XMM0) → result=a
 pub fn emit_vector_min_signed64(
@@ -381,7 +381,7 @@ pub fn emit_vector_min_signed64(
 
 // ---------------------------------------------------------------------------
 // VectorMaxSigned — native SSE4.1: pmaxsb/pmaxsw/pmaxsd
-// VectorMaxSigned64 — fallback
+// VectorMaxS64 — fallback
 // ---------------------------------------------------------------------------
 
 pub fn emit_vector_max_signed8(
@@ -409,7 +409,7 @@ pub fn emit_vector_max_signed32(
     emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmaxsd);
 }
 
-// VectorMaxSigned64: pcmpgtq(a,b) gives mask where a>b; blendvpd selects a where a>b, else b
+// VectorMaxS64: pcmpgtq(a,b) gives mask where a>b; blendvpd selects a where a>b, else b
 // result = max(a,b): where a > b, pick a; otherwise pick b
 pub fn emit_vector_max_signed64(
     _ctx: &EmitContext,
@@ -435,7 +435,7 @@ pub fn emit_vector_max_signed64(
 
 // ---------------------------------------------------------------------------
 // VectorMinUnsigned — native SSE4.1: pminub/pminuw/pminud
-// VectorMinUnsigned64 — fallback
+// VectorMinU64 — fallback
 // ---------------------------------------------------------------------------
 
 pub fn emit_vector_min_unsigned8(
@@ -463,7 +463,7 @@ pub fn emit_vector_min_unsigned32(
     emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pminud);
 }
 
-// VectorMinUnsigned64: XOR sign bits to convert unsigned → signed comparison, then blendvpd
+// VectorMinU64: XOR sign bits to convert unsigned → signed comparison, then blendvpd
 // Upstream: sign_bit = 0x8000000000000000; a_s = a^sign; b_s = b^sign; pcmpgtq(a_s,b_s) → blend
 pub fn emit_vector_min_unsigned64(
     _ctx: &EmitContext,
@@ -500,7 +500,7 @@ pub fn emit_vector_min_unsigned64(
 
 // ---------------------------------------------------------------------------
 // VectorMaxUnsigned — native SSE4.1: pmaxub/pmaxuw/pmaxud
-// VectorMaxUnsigned64 — fallback
+// VectorMaxU64 — fallback
 // ---------------------------------------------------------------------------
 
 pub fn emit_vector_max_unsigned8(
@@ -528,7 +528,7 @@ pub fn emit_vector_max_unsigned32(
     emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmaxud);
 }
 
-// VectorMaxUnsigned64: same sign-flip trick, but pick a where a>b
+// VectorMaxU64: same sign-flip trick, but pick a where a>b
 pub fn emit_vector_max_unsigned64(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,

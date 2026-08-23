@@ -8050,3 +8050,23 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: the tests pass explicit 64-bit Maxwell instruction words to the decoder.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `src/dynarmic/src/dynarmic/ir/{opcodes.inc,opcodes.h}`
+
+### Intentional differences
+- Rust retains 26 internal or decomposed opcodes that are not present in Eden's opcode enum. Their
+  ownership and necessity remain active audit items; they are not treated as upstream parity.
+
+### Unintentional differences (to fix)
+- Seventy-three existing opcodes used semantic Rust renames such as `RotateRight32`,
+  `VectorMaxSigned8`, and `PackedAbsDiffSumS8`. Their enum variants, metadata, emit dispatch,
+  frontend calls, optimization matches, and tests now use Eden's exact opcode names.
+
+### Missing items
+- Fifteen Eden opcodes remain absent: seven `VectorBroadcastElement*`, four `VectorReduceAdd*`, and
+  four `Vector{Signed,Unsigned}Multiply*` forms. Their existing composite or differently-owned Rust
+  behavior must be replaced in prerequisite-backed slices.
+
+### Binary layout verification
+- PASS for this naming-only slice: enum cardinality and discriminants are unchanged; no serialized
+  or ABI-visible structure changed.

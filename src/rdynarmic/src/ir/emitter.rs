@@ -158,11 +158,11 @@ impl<'a> IREmitter<'a> {
     }
 
     pub fn rotate_right_32(&mut self, value: Value, shift: Value, carry_in: Value) -> Value {
-        self.emit(Opcode::RotateRight32, &[value, shift, carry_in])
+        self.emit(Opcode::BitRotateRight32, &[value, shift, carry_in])
     }
 
     pub fn rotate_right_64(&mut self, value: Value, shift: Value) -> Value {
-        self.emit(Opcode::RotateRight64, &[value, shift])
+        self.emit(Opcode::BitRotateRight64, &[value, shift])
     }
 
     pub fn rotate_right_extended(&mut self, value: Value, carry_in: Value) -> Value {
@@ -727,9 +727,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_max_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMaxSigned8,
-            16 => Opcode::VectorPairedMaxSigned16,
-            32 => Opcode::VectorPairedMaxSigned32,
+            8 => Opcode::VectorPairedMaxS8,
+            16 => Opcode::VectorPairedMaxS16,
+            32 => Opcode::VectorPairedMaxS32,
             _ => panic!("Invalid esize {} for VectorPairedMaxSigned", esize),
         };
         self.emit(op, &[a, b])
@@ -737,9 +737,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_max_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMaxUnsigned8,
-            16 => Opcode::VectorPairedMaxUnsigned16,
-            32 => Opcode::VectorPairedMaxUnsigned32,
+            8 => Opcode::VectorPairedMaxU8,
+            16 => Opcode::VectorPairedMaxU16,
+            32 => Opcode::VectorPairedMaxU32,
             _ => panic!("Invalid esize {} for VectorPairedMaxUnsigned", esize),
         };
         self.emit(op, &[a, b])
@@ -747,9 +747,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_min_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMinSigned8,
-            16 => Opcode::VectorPairedMinSigned16,
-            32 => Opcode::VectorPairedMinSigned32,
+            8 => Opcode::VectorPairedMinS8,
+            16 => Opcode::VectorPairedMinS16,
+            32 => Opcode::VectorPairedMinS32,
             _ => panic!("Invalid esize {} for VectorPairedMinSigned", esize),
         };
         self.emit(op, &[a, b])
@@ -757,9 +757,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_min_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMinUnsigned8,
-            16 => Opcode::VectorPairedMinUnsigned16,
-            32 => Opcode::VectorPairedMinUnsigned32,
+            8 => Opcode::VectorPairedMinU8,
+            16 => Opcode::VectorPairedMinU16,
+            32 => Opcode::VectorPairedMinU32,
             _ => panic!("Invalid esize {} for VectorPairedMinUnsigned", esize),
         };
         self.emit(op, &[a, b])
@@ -767,9 +767,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_max_signed_lower(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMaxSignedLower8,
-            16 => Opcode::VectorPairedMaxSignedLower16,
-            32 => Opcode::VectorPairedMaxSignedLower32,
+            8 => Opcode::VectorPairedMaxLowerS8,
+            16 => Opcode::VectorPairedMaxLowerS16,
+            32 => Opcode::VectorPairedMaxLowerS32,
             _ => panic!("Invalid esize {} for VectorPairedMaxSignedLower", esize),
         };
         self.emit(op, &[a, b])
@@ -777,9 +777,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_max_unsigned_lower(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMaxUnsignedLower8,
-            16 => Opcode::VectorPairedMaxUnsignedLower16,
-            32 => Opcode::VectorPairedMaxUnsignedLower32,
+            8 => Opcode::VectorPairedMaxLowerU8,
+            16 => Opcode::VectorPairedMaxLowerU16,
+            32 => Opcode::VectorPairedMaxLowerU32,
             _ => panic!("Invalid esize {} for VectorPairedMaxUnsignedLower", esize),
         };
         self.emit(op, &[a, b])
@@ -787,9 +787,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_min_signed_lower(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMinSignedLower8,
-            16 => Opcode::VectorPairedMinSignedLower16,
-            32 => Opcode::VectorPairedMinSignedLower32,
+            8 => Opcode::VectorPairedMinLowerS8,
+            16 => Opcode::VectorPairedMinLowerS16,
+            32 => Opcode::VectorPairedMinLowerS32,
             _ => panic!("Invalid esize {} for VectorPairedMinSignedLower", esize),
         };
         self.emit(op, &[a, b])
@@ -797,9 +797,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_paired_min_unsigned_lower(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorPairedMinUnsignedLower8,
-            16 => Opcode::VectorPairedMinUnsignedLower16,
-            32 => Opcode::VectorPairedMinUnsignedLower32,
+            8 => Opcode::VectorPairedMinLowerU8,
+            16 => Opcode::VectorPairedMinLowerU16,
+            32 => Opcode::VectorPairedMinLowerU32,
             _ => panic!("Invalid esize {} for VectorPairedMinUnsignedLower", esize),
         };
         self.emit(op, &[a, b])
@@ -807,10 +807,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_greater_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorGreaterSigned8,
-            16 => Opcode::VectorGreaterSigned16,
-            32 => Opcode::VectorGreaterSigned32,
-            64 => Opcode::VectorGreaterSigned64,
+            8 => Opcode::VectorGreaterS8,
+            16 => Opcode::VectorGreaterS16,
+            32 => Opcode::VectorGreaterS32,
+            64 => Opcode::VectorGreaterS64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1068,10 +1068,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_max_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorMaxSigned8,
-            16 => Opcode::VectorMaxSigned16,
-            32 => Opcode::VectorMaxSigned32,
-            64 => Opcode::VectorMaxSigned64,
+            8 => Opcode::VectorMaxS8,
+            16 => Opcode::VectorMaxS16,
+            32 => Opcode::VectorMaxS32,
+            64 => Opcode::VectorMaxS64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1079,10 +1079,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_max_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorMaxUnsigned8,
-            16 => Opcode::VectorMaxUnsigned16,
-            32 => Opcode::VectorMaxUnsigned32,
-            64 => Opcode::VectorMaxUnsigned64,
+            8 => Opcode::VectorMaxU8,
+            16 => Opcode::VectorMaxU16,
+            32 => Opcode::VectorMaxU32,
+            64 => Opcode::VectorMaxU64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1090,10 +1090,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_min_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorMinSigned8,
-            16 => Opcode::VectorMinSigned16,
-            32 => Opcode::VectorMinSigned32,
-            64 => Opcode::VectorMinSigned64,
+            8 => Opcode::VectorMinS8,
+            16 => Opcode::VectorMinS16,
+            32 => Opcode::VectorMinS32,
+            64 => Opcode::VectorMinS64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1101,10 +1101,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_min_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorMinUnsigned8,
-            16 => Opcode::VectorMinUnsigned16,
-            32 => Opcode::VectorMinUnsigned32,
-            64 => Opcode::VectorMinUnsigned64,
+            8 => Opcode::VectorMinU8,
+            16 => Opcode::VectorMinU16,
+            32 => Opcode::VectorMinU32,
+            64 => Opcode::VectorMinU64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1148,9 +1148,9 @@ impl<'a> IREmitter<'a> {
         b: Value,
     ) -> Value {
         let op = match esize {
-            8 => Opcode::VectorRoundingHalvingAddSigned8,
-            16 => Opcode::VectorRoundingHalvingAddSigned16,
-            32 => Opcode::VectorRoundingHalvingAddSigned32,
+            8 => Opcode::VectorRoundingHalvingAddS8,
+            16 => Opcode::VectorRoundingHalvingAddS16,
+            32 => Opcode::VectorRoundingHalvingAddS32,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1163,9 +1163,9 @@ impl<'a> IREmitter<'a> {
         b: Value,
     ) -> Value {
         let op = match esize {
-            8 => Opcode::VectorRoundingHalvingAddUnsigned8,
-            16 => Opcode::VectorRoundingHalvingAddUnsigned16,
-            32 => Opcode::VectorRoundingHalvingAddUnsigned32,
+            8 => Opcode::VectorRoundingHalvingAddU8,
+            16 => Opcode::VectorRoundingHalvingAddU16,
+            32 => Opcode::VectorRoundingHalvingAddU32,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1173,9 +1173,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_halving_add_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorHalvingAddSigned8,
-            16 => Opcode::VectorHalvingAddSigned16,
-            32 => Opcode::VectorHalvingAddSigned32,
+            8 => Opcode::VectorHalvingAddS8,
+            16 => Opcode::VectorHalvingAddS16,
+            32 => Opcode::VectorHalvingAddS32,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1183,9 +1183,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_halving_add_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorHalvingAddUnsigned8,
-            16 => Opcode::VectorHalvingAddUnsigned16,
-            32 => Opcode::VectorHalvingAddUnsigned32,
+            8 => Opcode::VectorHalvingAddU8,
+            16 => Opcode::VectorHalvingAddU16,
+            32 => Opcode::VectorHalvingAddU32,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1193,9 +1193,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_halving_sub_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorHalvingSubSigned8,
-            16 => Opcode::VectorHalvingSubSigned16,
-            32 => Opcode::VectorHalvingSubSigned32,
+            8 => Opcode::VectorHalvingSubS8,
+            16 => Opcode::VectorHalvingSubS16,
+            32 => Opcode::VectorHalvingSubS32,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1203,9 +1203,9 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_halving_sub_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorHalvingSubUnsigned8,
-            16 => Opcode::VectorHalvingSubUnsigned16,
-            32 => Opcode::VectorHalvingSubUnsigned32,
+            8 => Opcode::VectorHalvingSubU8,
+            16 => Opcode::VectorHalvingSubU16,
+            32 => Opcode::VectorHalvingSubU32,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1333,10 +1333,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn vector_rounding_shift_left_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
-            8 => Opcode::VectorRoundingShiftLeftSigned8,
-            16 => Opcode::VectorRoundingShiftLeftSigned16,
-            32 => Opcode::VectorRoundingShiftLeftSigned32,
-            64 => Opcode::VectorRoundingShiftLeftSigned64,
+            8 => Opcode::VectorRoundingShiftLeftS8,
+            16 => Opcode::VectorRoundingShiftLeftS16,
+            32 => Opcode::VectorRoundingShiftLeftS32,
+            64 => Opcode::VectorRoundingShiftLeftS64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
@@ -1349,10 +1349,10 @@ impl<'a> IREmitter<'a> {
         b: Value,
     ) -> Value {
         let op = match esize {
-            8 => Opcode::VectorRoundingShiftLeftUnsigned8,
-            16 => Opcode::VectorRoundingShiftLeftUnsigned16,
-            32 => Opcode::VectorRoundingShiftLeftUnsigned32,
-            64 => Opcode::VectorRoundingShiftLeftUnsigned64,
+            8 => Opcode::VectorRoundingShiftLeftU8,
+            16 => Opcode::VectorRoundingShiftLeftU16,
+            32 => Opcode::VectorRoundingShiftLeftU32,
+            64 => Opcode::VectorRoundingShiftLeftU64,
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])

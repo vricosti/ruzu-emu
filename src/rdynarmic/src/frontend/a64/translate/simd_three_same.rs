@@ -1191,7 +1191,7 @@ mod tests {
         assert!(block
             .instructions
             .iter()
-            .any(|inst| inst.opcode == Opcode::VectorPairedMinUnsignedLower8));
+            .any(|inst| inst.opcode == Opcode::VectorPairedMinLowerU8));
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
@@ -1202,7 +1202,7 @@ mod tests {
         assert!(block
             .instructions
             .iter()
-            .any(|inst| inst.opcode == Opcode::VectorPairedMinUnsigned8));
+            .any(|inst| inst.opcode == Opcode::VectorPairedMinU8));
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
@@ -1284,10 +1284,10 @@ mod tests {
     #[test]
     fn halving_add_family_uses_matching_ir_opcodes() {
         let cases = [
-            (0x0E34_0400, Opcode::VectorHalvingAddSigned8),
-            (0x0E34_1400, Opcode::VectorRoundingHalvingAddSigned8),
-            (0x2E34_0400, Opcode::VectorHalvingAddUnsigned8),
-            (0x2E34_1400, Opcode::VectorRoundingHalvingAddUnsigned8),
+            (0x0E34_0400, Opcode::VectorHalvingAddS8),
+            (0x0E34_1400, Opcode::VectorRoundingHalvingAddS8),
+            (0x2E34_0400, Opcode::VectorHalvingAddU8),
+            (0x2E34_1400, Opcode::VectorRoundingHalvingAddU8),
         ];
 
         for (raw, expected_opcode) in cases {
@@ -1344,8 +1344,8 @@ mod tests {
     #[test]
     fn halving_sub_family_uses_matching_ir_opcodes() {
         let cases = [
-            (0x4E61_24E1, Opcode::VectorHalvingSubSigned16),
-            (0x6E61_24E1, Opcode::VectorHalvingSubUnsigned16),
+            (0x4E61_24E1, Opcode::VectorHalvingSubS16),
+            (0x6E61_24E1, Opcode::VectorHalvingSubU16),
         ];
 
         for (raw, expected_opcode) in cases {

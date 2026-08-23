@@ -383,8 +383,8 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::ArithmeticShiftRight64 => {
                 dp::emit_arithmetic_shift_right64(ctx, ra, inst_ref, inst)
             }
-            Opcode::RotateRight32 => dp::emit_rotate_right32(ctx, ra, inst_ref, inst),
-            Opcode::RotateRight64 => dp::emit_rotate_right64(ctx, ra, inst_ref, inst),
+            Opcode::BitRotateRight32 => dp::emit_rotate_right32(ctx, ra, inst_ref, inst),
+            Opcode::BitRotateRight64 => dp::emit_rotate_right64(ctx, ra, inst_ref, inst),
             Opcode::RotateRightExtended => dp::emit_rotate_right_extended(ctx, ra, inst_ref, inst),
 
             // --- ALU: shifts (masked, no clamping) ---
@@ -808,7 +808,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::PackedSaturatedSubS16 => {
                 packed::emit_packed_saturated_sub_s16(ctx, ra, inst_ref, inst)
             }
-            Opcode::PackedAbsDiffSumS8 => {
+            Opcode::PackedAbsDiffSumU8 => {
                 packed::emit_packed_abs_diff_sum_s8(ctx, ra, inst_ref, inst)
             }
             Opcode::PackedSelect => packed::emit_packed_select(ctx, ra, inst_ref, inst),
@@ -903,16 +903,16 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorEqual32 => vcmp::emit_vector_equal32(ctx, ra, inst_ref, inst),
             Opcode::VectorEqual64 => vcmp::emit_vector_equal64(ctx, ra, inst_ref, inst),
             Opcode::VectorEqual128 => vcmp::emit_vector_equal128(ctx, ra, inst_ref, inst),
-            Opcode::VectorGreaterSigned8 => {
+            Opcode::VectorGreaterS8 => {
                 vcmp::emit_vector_greater_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorGreaterSigned16 => {
+            Opcode::VectorGreaterS16 => {
                 vcmp::emit_vector_greater_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorGreaterSigned32 => {
+            Opcode::VectorGreaterS32 => {
                 vcmp::emit_vector_greater_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorGreaterSigned64 => {
+            Opcode::VectorGreaterS64 => {
                 vcmp::emit_vector_greater_signed64(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorGreaterEqualSigned8 => {
@@ -955,32 +955,32 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorLessSigned16 => vcmp::emit_vector_less_signed16(ctx, ra, inst_ref, inst),
             Opcode::VectorLessSigned32 => vcmp::emit_vector_less_signed32(ctx, ra, inst_ref, inst),
             Opcode::VectorLessSigned64 => vcmp::emit_vector_less_signed64(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinSigned8 => vcmp::emit_vector_min_signed8(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinSigned16 => vcmp::emit_vector_min_signed16(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinSigned32 => vcmp::emit_vector_min_signed32(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinSigned64 => vcmp::emit_vector_min_signed64(ctx, ra, inst_ref, inst),
-            Opcode::VectorMaxSigned8 => vcmp::emit_vector_max_signed8(ctx, ra, inst_ref, inst),
-            Opcode::VectorMaxSigned16 => vcmp::emit_vector_max_signed16(ctx, ra, inst_ref, inst),
-            Opcode::VectorMaxSigned32 => vcmp::emit_vector_max_signed32(ctx, ra, inst_ref, inst),
-            Opcode::VectorMaxSigned64 => vcmp::emit_vector_max_signed64(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinUnsigned8 => vcmp::emit_vector_min_unsigned8(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinUnsigned16 => {
+            Opcode::VectorMinS8 => vcmp::emit_vector_min_signed8(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinS16 => vcmp::emit_vector_min_signed16(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinS32 => vcmp::emit_vector_min_signed32(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinS64 => vcmp::emit_vector_min_signed64(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxS8 => vcmp::emit_vector_max_signed8(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxS16 => vcmp::emit_vector_max_signed16(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxS32 => vcmp::emit_vector_max_signed32(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxS64 => vcmp::emit_vector_max_signed64(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinU8 => vcmp::emit_vector_min_unsigned8(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinU16 => {
                 vcmp::emit_vector_min_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorMinUnsigned32 => {
+            Opcode::VectorMinU32 => {
                 vcmp::emit_vector_min_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorMinUnsigned64 => {
+            Opcode::VectorMinU64 => {
                 vcmp::emit_vector_min_unsigned64(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorMaxUnsigned8 => vcmp::emit_vector_max_unsigned8(ctx, ra, inst_ref, inst),
-            Opcode::VectorMaxUnsigned16 => {
+            Opcode::VectorMaxU8 => vcmp::emit_vector_max_unsigned8(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxU16 => {
                 vcmp::emit_vector_max_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorMaxUnsigned32 => {
+            Opcode::VectorMaxU32 => {
                 vcmp::emit_vector_max_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorMaxUnsigned64 => {
+            Opcode::VectorMaxU64 => {
                 vcmp::emit_vector_max_unsigned64(ctx, ra, inst_ref, inst)
             }
 
@@ -1045,28 +1045,28 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorArithmeticVShift64 => {
                 vshift::emit_vector_arithmetic_vshift64(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftSigned8 => {
+            Opcode::VectorRoundingShiftLeftS8 => {
                 vshift::emit_vector_rounding_shift_left_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftSigned16 => {
+            Opcode::VectorRoundingShiftLeftS16 => {
                 vshift::emit_vector_rounding_shift_left_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftSigned32 => {
+            Opcode::VectorRoundingShiftLeftS32 => {
                 vshift::emit_vector_rounding_shift_left_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftSigned64 => {
+            Opcode::VectorRoundingShiftLeftS64 => {
                 vshift::emit_vector_rounding_shift_left_signed64(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftUnsigned8 => {
+            Opcode::VectorRoundingShiftLeftU8 => {
                 vshift::emit_vector_rounding_shift_left_unsigned8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftUnsigned16 => {
+            Opcode::VectorRoundingShiftLeftU16 => {
                 vshift::emit_vector_rounding_shift_left_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftUnsigned32 => {
+            Opcode::VectorRoundingShiftLeftU32 => {
                 vshift::emit_vector_rounding_shift_left_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingShiftLeftUnsigned64 => {
+            Opcode::VectorRoundingShiftLeftU64 => {
                 vshift::emit_vector_rounding_shift_left_unsigned64(ctx, ra, inst_ref, inst)
             }
 
@@ -1145,76 +1145,76 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorPairedAddUnsignedWiden32 => {
                 vmul::emit_vector_paired_add_unsigned_widen32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxSigned8 => {
+            Opcode::VectorPairedMaxS8 => {
                 vmul::emit_vector_paired_max_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxSigned16 => {
+            Opcode::VectorPairedMaxS16 => {
                 vmul::emit_vector_paired_max_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxSigned32 => {
+            Opcode::VectorPairedMaxS32 => {
                 vmul::emit_vector_paired_max_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxUnsigned8 => {
+            Opcode::VectorPairedMaxU8 => {
                 vmul::emit_vector_paired_max_unsigned8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxUnsigned16 => {
+            Opcode::VectorPairedMaxU16 => {
                 vmul::emit_vector_paired_max_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxUnsigned32 => {
+            Opcode::VectorPairedMaxU32 => {
                 vmul::emit_vector_paired_max_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxSignedLower8 => {
+            Opcode::VectorPairedMaxLowerS8 => {
                 vmul::emit_vector_paired_max_signed_lower8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxSignedLower16 => {
+            Opcode::VectorPairedMaxLowerS16 => {
                 vmul::emit_vector_paired_max_signed_lower16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxSignedLower32 => {
+            Opcode::VectorPairedMaxLowerS32 => {
                 vmul::emit_vector_paired_max_signed_lower32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxUnsignedLower8 => {
+            Opcode::VectorPairedMaxLowerU8 => {
                 vmul::emit_vector_paired_max_unsigned_lower8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxUnsignedLower16 => {
+            Opcode::VectorPairedMaxLowerU16 => {
                 vmul::emit_vector_paired_max_unsigned_lower16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMaxUnsignedLower32 => {
+            Opcode::VectorPairedMaxLowerU32 => {
                 vmul::emit_vector_paired_max_unsigned_lower32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinSigned8 => {
+            Opcode::VectorPairedMinS8 => {
                 vmul::emit_vector_paired_min_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinSigned16 => {
+            Opcode::VectorPairedMinS16 => {
                 vmul::emit_vector_paired_min_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinSigned32 => {
+            Opcode::VectorPairedMinS32 => {
                 vmul::emit_vector_paired_min_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinUnsigned8 => {
+            Opcode::VectorPairedMinU8 => {
                 vmul::emit_vector_paired_min_unsigned8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinUnsigned16 => {
+            Opcode::VectorPairedMinU16 => {
                 vmul::emit_vector_paired_min_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinUnsigned32 => {
+            Opcode::VectorPairedMinU32 => {
                 vmul::emit_vector_paired_min_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinSignedLower8 => {
+            Opcode::VectorPairedMinLowerS8 => {
                 vmul::emit_vector_paired_min_signed_lower8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinSignedLower16 => {
+            Opcode::VectorPairedMinLowerS16 => {
                 vmul::emit_vector_paired_min_signed_lower16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinSignedLower32 => {
+            Opcode::VectorPairedMinLowerS32 => {
                 vmul::emit_vector_paired_min_signed_lower32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinUnsignedLower8 => {
+            Opcode::VectorPairedMinLowerU8 => {
                 vmul::emit_vector_paired_min_unsigned_lower8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinUnsignedLower16 => {
+            Opcode::VectorPairedMinLowerU16 => {
                 vmul::emit_vector_paired_min_unsigned_lower16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorPairedMinUnsignedLower32 => {
+            Opcode::VectorPairedMinLowerU32 => {
                 vmul::emit_vector_paired_min_unsigned_lower32(ctx, ra, inst_ref, inst)
             }
 
@@ -1516,40 +1516,40 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorSignedSaturatedDoublingMultiplyLong32 => {
                 vsat::emit_vector_signed_saturated_doubling_multiply_long32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingAddSigned8 => {
+            Opcode::VectorHalvingAddS8 => {
                 vsat::emit_vector_halving_add_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingAddSigned16 => {
+            Opcode::VectorHalvingAddS16 => {
                 vsat::emit_vector_halving_add_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingAddSigned32 => {
+            Opcode::VectorHalvingAddS32 => {
                 vsat::emit_vector_halving_add_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingAddUnsigned8 => {
+            Opcode::VectorHalvingAddU8 => {
                 vsat::emit_vector_halving_add_unsigned8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingAddUnsigned16 => {
+            Opcode::VectorHalvingAddU16 => {
                 vsat::emit_vector_halving_add_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingAddUnsigned32 => {
+            Opcode::VectorHalvingAddU32 => {
                 vsat::emit_vector_halving_add_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingSubSigned8 => {
+            Opcode::VectorHalvingSubS8 => {
                 vsat::emit_vector_halving_sub_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingSubSigned16 => {
+            Opcode::VectorHalvingSubS16 => {
                 vsat::emit_vector_halving_sub_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingSubSigned32 => {
+            Opcode::VectorHalvingSubS32 => {
                 vsat::emit_vector_halving_sub_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingSubUnsigned8 => {
+            Opcode::VectorHalvingSubU8 => {
                 vsat::emit_vector_halving_sub_unsigned8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingSubUnsigned16 => {
+            Opcode::VectorHalvingSubU16 => {
                 vsat::emit_vector_halving_sub_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorHalvingSubUnsigned32 => {
+            Opcode::VectorHalvingSubU32 => {
                 vsat::emit_vector_halving_sub_unsigned32(ctx, ra, inst_ref, inst)
             }
 
@@ -1572,22 +1572,22 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorUnsignedAbsoluteDifference32 => {
                 vmisc::emit_vector_unsigned_absolute_difference32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingHalvingAddSigned8 => {
+            Opcode::VectorRoundingHalvingAddS8 => {
                 vmisc::emit_vector_rounding_halving_add_signed8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingHalvingAddSigned16 => {
+            Opcode::VectorRoundingHalvingAddS16 => {
                 vmisc::emit_vector_rounding_halving_add_signed16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingHalvingAddSigned32 => {
+            Opcode::VectorRoundingHalvingAddS32 => {
                 vmisc::emit_vector_rounding_halving_add_signed32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingHalvingAddUnsigned8 => {
+            Opcode::VectorRoundingHalvingAddU8 => {
                 vmisc::emit_vector_rounding_halving_add_unsigned8(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingHalvingAddUnsigned16 => {
+            Opcode::VectorRoundingHalvingAddU16 => {
                 vmisc::emit_vector_rounding_halving_add_unsigned16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorRoundingHalvingAddUnsigned32 => {
+            Opcode::VectorRoundingHalvingAddU32 => {
                 vmisc::emit_vector_rounding_halving_add_unsigned32(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorTable => vmisc::emit_vector_table(ctx, ra, inst_ref, inst),

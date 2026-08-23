@@ -165,7 +165,7 @@ pub fn emit_packed_saturated_sub_s16(
 }
 
 // ---------------------------------------------------------------------------
-// PackedAbsDiffSumS8 (native SSE: psadbw)
+// PackedAbsDiffSumU8 (native SSE: psadbw)
 // ---------------------------------------------------------------------------
 
 pub fn emit_packed_abs_diff_sum_s8(

@@ -167,9 +167,17 @@ fn first_unsupported_program_feature(
             Opcode::GlobalAtomicMinF32x2,
             Opcode::GlobalAtomicMaxF16x2,
             Opcode::GlobalAtomicMaxF32x2,
+            Opcode::GlobalAtomicIAdd64,
+            Opcode::GlobalAtomicSMin64,
+            Opcode::GlobalAtomicUMin64,
+            Opcode::GlobalAtomicSMax64,
+            Opcode::GlobalAtomicUMax64,
+            Opcode::GlobalAtomicAnd64,
+            Opcode::GlobalAtomicOr64,
+            Opcode::GlobalAtomicXor64,
+            Opcode::GlobalAtomicExchange64,
         ],
-    ) || info.uses_int64_bit_atomics
-    {
+    ) {
         return Some("memory operations");
     }
     if info.uses_invocation_id
@@ -778,6 +786,9 @@ fn emit_inst(
         | Opcode::SharedAtomicExchange32 => {
             emit_msl_atomic::emit_shared_atomic(context, inst_ref, inst)
         }
+        Opcode::SharedAtomicExchange64 | Opcode::SharedAtomicExchange32x2 => {
+            emit_msl_atomic::emit_shared_atomic_wide_fallback(context, inst_ref, inst)
+        }
         Opcode::StorageAtomicIAdd32
         | Opcode::StorageAtomicSMin32
         | Opcode::StorageAtomicUMin32
@@ -790,6 +801,26 @@ fn emit_inst(
         | Opcode::StorageAtomicXor32
         | Opcode::StorageAtomicExchange32 => {
             emit_msl_atomic::emit_storage_atomic(context, inst_ref, inst)
+        }
+        Opcode::StorageAtomicIAdd64
+        | Opcode::StorageAtomicSMin64
+        | Opcode::StorageAtomicUMin64
+        | Opcode::StorageAtomicSMax64
+        | Opcode::StorageAtomicUMax64
+        | Opcode::StorageAtomicAnd64
+        | Opcode::StorageAtomicOr64
+        | Opcode::StorageAtomicXor64
+        | Opcode::StorageAtomicExchange64
+        | Opcode::StorageAtomicIAdd32x2
+        | Opcode::StorageAtomicSMin32x2
+        | Opcode::StorageAtomicUMin32x2
+        | Opcode::StorageAtomicSMax32x2
+        | Opcode::StorageAtomicUMax32x2
+        | Opcode::StorageAtomicAnd32x2
+        | Opcode::StorageAtomicOr32x2
+        | Opcode::StorageAtomicXor32x2
+        | Opcode::StorageAtomicExchange32x2 => {
+            emit_msl_atomic::emit_storage_atomic_wide_fallback(context, inst_ref, inst)
         }
         Opcode::StorageAtomicAddF32
         | Opcode::StorageAtomicAddF16x2
@@ -3186,6 +3217,115 @@ mod tests {
         assert!(source.contains("half2 original = as_type<half2>(expected);"));
         assert!(source.contains("float2 original = float2(as_type<half2>(expected));"));
         assert!(source.contains("uint desired = as_type<uint>(half2(result));"));
+    }
+
+    #[test]
+    fn emits_upstream_wide_atomic_fallbacks_without_native_int64_atomics() {
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 64;
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        let pair = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(5)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SharedAtomicExchange64,
+            vec![Value::ImmU32(0), Value::ImmU64(7)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SharedAtomicExchange32x2,
+            vec![
+                Value::ImmU32(8),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: pair,
+                }),
+            ],
+        );
+        for opcode in [
+            Opcode::StorageAtomicIAdd64,
+            Opcode::StorageAtomicSMin64,
+            Opcode::StorageAtomicUMin64,
+            Opcode::StorageAtomicSMax64,
+            Opcode::StorageAtomicUMax64,
+            Opcode::StorageAtomicAnd64,
+            Opcode::StorageAtomicOr64,
+            Opcode::StorageAtomicXor64,
+            Opcode::StorageAtomicExchange64,
+        ] {
+            program.blocks[0].append_new_inst(
+                opcode,
+                vec![Value::ImmU32(0), Value::ImmU32(16), Value::ImmU64(9)],
+            );
+        }
+        for opcode in [
+            Opcode::StorageAtomicIAdd32x2,
+            Opcode::StorageAtomicSMin32x2,
+            Opcode::StorageAtomicUMin32x2,
+            Opcode::StorageAtomicSMax32x2,
+            Opcode::StorageAtomicUMax32x2,
+            Opcode::StorageAtomicAnd32x2,
+            Opcode::StorageAtomicOr32x2,
+            Opcode::StorageAtomicXor32x2,
+            Opcode::StorageAtomicExchange32x2,
+        ] {
+            program.blocks[0].append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU32(0),
+                    Value::ImmU32(24),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: pair,
+                    }),
+                ],
+            );
+        }
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+        assert!(program.info.uses_int64_bit_atomics);
+
+        let profile = Profile {
+            support_int64: true,
+            support_int64_atomics: false,
+            support_shared_int64_atomics: false,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint2 spv_shared_wide_0_1_words"));
+        assert!(source.contains("ulong spv_shared_wide_0_1_original"));
+        assert!(source.contains("as_type<ulong>(min(as_type<long>"));
+        assert!(source.contains("as_type<uint2>(min(as_type<int2>"));
+        assert!(source.contains("ssbo0[4u] = spv_storage_wide_"));
+        assert!(source.contains("ssbo0[6u] = spv_storage_wide_"));
+        assert!(!source.contains("atomic_ulong"));
+    }
+
+    #[test]
+    fn rejects_global_int64_atomics_like_upstream() {
+        let mut program = empty_program(Stage::Compute);
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicIAdd64,
+            vec![Value::ImmU64(0), Value::ImmU64(1)],
+        );
+        assert_eq!(
+            emit_msl(
+                &program,
+                &Profile {
+                    support_int64: true,
+                    ..Profile::default()
+                },
+                &RuntimeInfo::default(),
+            ),
+            Err(MslError::UnsupportedProgramFeature("memory operations"))
+        );
     }
 
     #[test]

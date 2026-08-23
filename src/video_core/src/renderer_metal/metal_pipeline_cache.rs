@@ -112,8 +112,9 @@ pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
         support_viewport_mask: false,
         support_typeless_image_loads: false,
         support_demote_to_helper_invocation: true,
-        // Some recent Apple families expose 64-bit atomics, but the native
-        // MSL resource/atomic backend does not implement their ABI yet.
+        // Apple8 exposes only 64-bit min/max, and the full operation set is
+        // limited to Apple9+. Keep the coarse shader profile disabled until
+        // each guest operation is selected from a per-operation capability.
         support_int64_atomics: false,
         support_shared_int64_atomics: false,
         support_derivative_control: true,

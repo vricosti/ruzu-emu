@@ -222,3 +222,128 @@ pub fn emit_storage_atomic_fp(
     context.require_storage_fp_cas(helper);
     context.define(inst_ref, result_type, expression, false)
 }
+
+fn wide_operation_expression(opcode: Opcode, original: &str, value: &str) -> String {
+    match opcode {
+        Opcode::StorageAtomicIAdd64 | Opcode::StorageAtomicIAdd32x2 => {
+            format!("({original}) + ({value})")
+        }
+        Opcode::StorageAtomicSMin64 => {
+            format!("as_type<ulong>(min(as_type<long>({original}), as_type<long>({value})))")
+        }
+        Opcode::StorageAtomicSMin32x2 => {
+            format!("as_type<uint2>(min(as_type<int2>({original}), as_type<int2>({value})))")
+        }
+        Opcode::StorageAtomicUMin64 | Opcode::StorageAtomicUMin32x2 => {
+            format!("min({original}, {value})")
+        }
+        Opcode::StorageAtomicSMax64 => {
+            format!("as_type<ulong>(max(as_type<long>({original}), as_type<long>({value})))")
+        }
+        Opcode::StorageAtomicSMax32x2 => {
+            format!("as_type<uint2>(max(as_type<int2>({original}), as_type<int2>({value})))")
+        }
+        Opcode::StorageAtomicUMax64 | Opcode::StorageAtomicUMax32x2 => {
+            format!("max({original}, {value})")
+        }
+        Opcode::StorageAtomicAnd64 | Opcode::StorageAtomicAnd32x2 => {
+            format!("({original}) & ({value})")
+        }
+        Opcode::StorageAtomicOr64 | Opcode::StorageAtomicOr32x2 => {
+            format!("({original}) | ({value})")
+        }
+        Opcode::StorageAtomicXor64 | Opcode::StorageAtomicXor32x2 => {
+            format!("({original}) ^ ({value})")
+        }
+        Opcode::StorageAtomicExchange64 | Opcode::StorageAtomicExchange32x2 => value.to_owned(),
+        _ => unreachable!("not a wide storage atomic fallback: {opcode:?}"),
+    }
+}
+
+pub fn emit_shared_atomic_wide_fallback(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let offset = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let prefix = format!("spv_shared_wide_{}_{}", inst_ref.block, inst_ref.inst);
+    let words = format!("{prefix}_words");
+    let replacement = format!("{prefix}_replacement");
+    context.emit_statement(&format!(
+        "uint2 {words} = uint2(smem[((({offset}) >> 2u))], smem[((({offset}) >> 2u)) + 1u]);"
+    ));
+    let (result_type, original) = match inst.opcode {
+        Opcode::SharedAtomicExchange64 => {
+            let original = format!("{prefix}_original");
+            context.emit_statement(&format!("ulong {original} = as_type<ulong>({words});"));
+            context.emit_statement(&format!("uint2 {replacement} = as_type<uint2>({value});"));
+            (Type::U64, original)
+        }
+        Opcode::SharedAtomicExchange32x2 => {
+            context.emit_statement(&format!("uint2 {replacement} = {value};"));
+            (Type::U32x2, words)
+        }
+        _ => unreachable!("not a wide shared exchange fallback: {:?}", inst.opcode),
+    };
+    context.emit_statement(&format!("smem[((({offset}) >> 2u))] = {replacement}.x;"));
+    context.emit_statement(&format!(
+        "smem[((({offset}) >> 2u)) + 1u] = {replacement}.y;"
+    ));
+    context.define(inst_ref, result_type, original, false)
+}
+
+pub fn emit_storage_atomic_wide_fallback(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    // The SPIR-V backend gates this fallback on descriptor aliasing because it
+    // needs both u64 and u32x2 typed views of one descriptor. MSL storage
+    // buffers are already emitted as raw device uint arrays, so the same
+    // two-word fallback has no typed-descriptor aliasing prerequisite.
+    let binding = immediate_binding(inst)?;
+    let low = context.storage_buffer_word_expression(inst_ref, binding, inst.arg(1), 0)?;
+    let high = context.storage_buffer_word_expression(inst_ref, binding, inst.arg(1), 1)?;
+    let value = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let prefix = format!("spv_storage_wide_{}_{}", inst_ref.block, inst_ref.inst);
+    let words = format!("{prefix}_words");
+    let original = format!("{prefix}_original");
+    let result = format!("{prefix}_result");
+    let result_words = format!("{prefix}_result_words");
+    context.emit_statement(&format!("uint2 {words} = uint2({low}, {high});"));
+    let (result_type, original_expression) = match inst.opcode {
+        Opcode::StorageAtomicIAdd64
+        | Opcode::StorageAtomicSMin64
+        | Opcode::StorageAtomicUMin64
+        | Opcode::StorageAtomicSMax64
+        | Opcode::StorageAtomicUMax64
+        | Opcode::StorageAtomicAnd64
+        | Opcode::StorageAtomicOr64
+        | Opcode::StorageAtomicXor64
+        | Opcode::StorageAtomicExchange64 => {
+            context.emit_statement(&format!("ulong {original} = as_type<ulong>({words});"));
+            let expression = wide_operation_expression(inst.opcode, &original, &value);
+            context.emit_statement(&format!("ulong {result} = {expression};"));
+            (Type::U64, original)
+        }
+        Opcode::StorageAtomicIAdd32x2
+        | Opcode::StorageAtomicSMin32x2
+        | Opcode::StorageAtomicUMin32x2
+        | Opcode::StorageAtomicSMax32x2
+        | Opcode::StorageAtomicUMax32x2
+        | Opcode::StorageAtomicAnd32x2
+        | Opcode::StorageAtomicOr32x2
+        | Opcode::StorageAtomicXor32x2
+        | Opcode::StorageAtomicExchange32x2 => {
+            let expression = wide_operation_expression(inst.opcode, &words, &value);
+            context.emit_statement(&format!("uint2 {result} = {expression};"));
+            (Type::U32x2, words.clone())
+        }
+        _ => unreachable!("not a wide storage atomic fallback: {:?}", inst.opcode),
+    };
+    context.emit_statement(&format!("uint2 {result_words} = as_type<uint2>({result});"));
+    context.emit_statement(&format!("{low} = {result_words}.x;"));
+    context.emit_statement(&format!("{high} = {result_words}.y;"));
+    context.define(inst_ref, result_type, original_expression, false)
+}

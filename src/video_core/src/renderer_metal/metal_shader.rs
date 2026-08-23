@@ -2891,6 +2891,68 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_wide_atomic_fallbacks_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        if !profile.support_int64 {
+            return;
+        }
+        let runtime_info = RuntimeInfo::default();
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 64;
+        program.info.storage_buffers_descriptors.push(
+            shader_recompiler::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        let pair = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(5)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::SharedAtomicExchange64,
+            vec![Value::ImmU32(0), Value::ImmU64(7)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicSMin64,
+            vec![Value::ImmU32(0), Value::ImmU32(8), Value::ImmU64(9)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicSMax32x2,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(16),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: pair,
+                }),
+            ],
+        );
+        shader_recompiler::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+
+        let mut bindings = Bindings::default();
+        let shader = compile_direct_msl_shader_with_bindings(
+            device.device(),
+            &program,
+            &profile,
+            &runtime_info,
+            &MetalShaderCompileOptions::for_compute_device(
+                device.profile(),
+                program.workgroup_size,
+            ),
+            &mut bindings,
+        )
+        .expect("direct wide atomic fallback MSL must compile with Metal");
+
+        assert!(shader.source().source.contains("spv_shared_wide_"));
+        assert!(shader.source().source.contains("as_type<ulong>(min"));
+        assert!(shader.source().source.contains("as_type<uint2>(max"));
+    }
+
+    #[test]
     fn compiles_direct_msl_ssa_and_vertex_output_with_metal() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::VertexB);

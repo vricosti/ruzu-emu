@@ -754,12 +754,19 @@ impl<'a> TranslatorVisitor<'a> {
             MLA_vec => self.mla_vec(inst),
             MLS_vec => self.mls_vec(inst),
             MUL_vec => self.mul_vec(inst),
+            PMUL => self.pmul(inst),
+            SQDMULH_vec_2 => self.sqdmulh_vec_2(inst),
+            SQRDMULH_vec_2 => self.sqrdmulh_vec_2(inst),
             FMAXNMP_vec_2 => self.fmaxnmp_vec_2(inst),
             FMAXP_vec_2 => self.fmaxp_vec_2(inst),
             FMINNMP_vec_2 => self.fminnmp_vec_2(inst),
             FMINP_vec_2 => self.fminp_vec_2(inst),
             SSHL_2 => self.sshl_2(inst),
+            SQSHL_reg_2 => self.sqshl_reg_2(inst),
+            SRSHL_2 => self.srshl_2(inst),
             USHL_2 => self.ushl_2(inst),
+            UQSHL_reg_2 => self.uqshl_reg_2(inst),
+            URSHL_2 => self.urshl_2(inst),
             AND_asimd => self.and_asimd(inst),
             BIC_asimd_reg => self.bic_asimd_reg(inst),
             ORR_asimd_reg => self.orr_asimd_reg(inst),
@@ -774,6 +781,8 @@ impl<'a> TranslatorVisitor<'a> {
             FCMGT_reg_4 => self.fcmgt_reg_4(inst),
             FADD_2 => self.fadd_2(inst),
             FSUB_2 => self.fsub_2(inst),
+            FMLA_vec_1 => self.fmla_vec_1(inst),
+            FMLS_vec_1 => self.fmls_vec_1(inst),
 
             // SIMD two-register misc: compare against zero (CMEQ #0).
             // Same strlen loop reduces UMINP results then compares to 0

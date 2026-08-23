@@ -10227,3 +10227,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all nine
   restored identities, all three saturation modes, both shift-insert directions, fixed-point
   signedness/direction/fraction bits/rounding metadata, and absence of interpreter fallback.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_three_same.rs` vs Eden `frontend/A64/translate/impl/{simd_three_same.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`.
+  Three tuple helpers mechanically share identical operand extraction among visitors; they do not
+  own IR behavior or merge differing validation rules.
+- Rust passes `fpcr_controlled=true` explicitly to FP vector builders. Eden's builder API supplies
+  the same value as its default argument.
+- `FPPairedMinMax` selects its four Rust emitter methods through a file-local enum because C++
+  member-function pointers do not map directly across Rust emitter lifetimes. Lane iteration,
+  operation selection, and writes remain in the matching helper and preserve Eden's order.
+- `FMLAL_vec_{1,2}`, `FMLSL_vec_{1,2}`, `SQRSHL_2`, and `UQRSHL_2` are declarations only in Eden's
+  `impl.h`; their decoder entries are commented out and the reviewed source has no definitions, so
+  Rust does not invent unreachable visitors.
+
+### Unintentional differences (to fix)
+- Fixed: FP16 FMLA/FMLS, PMUL, SQDMULH/SQRDMULH, SQSHL/SRSHL, and UQSHL/URSHL decoded but fell
+  through to the temporary interpreter terminal. All nine now preserve Eden's validation,
+  vector reads, IR operation selection, FP negation/multiply-add order, and destination writes.
+- Fixed: the 12 anonymous-namespace helpers were implemented as visitor methods or replaced with
+  broader invented dispatchers. Their ownership and responsibilities now mirror Eden; unsigned
+  UABA/UABD behavior is once again owned directly by those visitors.
+- Fixed: SMAX, SMIN, UMAX, and UMIN accepted `size=0b11` when Q was set because they shared the
+  looser validation used by ADD and comparisons. Eden reserves size 3 for all four min/max visitors.
+- Fixed: CMEQ, CMGE, CMHS, BIC, and ORN omitted the explicit `VectorZeroUpper` emitted by their
+  visitor before Eden's common 64-bit destination write performs its own upper-zero operation.
+
+### Missing items
+- None for the 84 visitors and 12 file-local helpers defined by the reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all nine
+  restored identities, reserved size combinations, all restored helper operation families, the
+  corrected min/max validation, and explicit lower-vector zeroing order.

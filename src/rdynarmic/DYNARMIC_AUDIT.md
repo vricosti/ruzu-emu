@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1050 passed, 4 ignored). These are
+(1055 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -160,5 +160,9 @@ validation blockers, not evidence against the focused slices.
   helpers. Nine restored dispatch paths reduce the remaining decoded A64 interpreter fallbacks to
   15 identities; fixed-point conversion rounding, shift-insert masks, and saturating-shift forms
   follow Eden's IR construction.
+- The A64 vector three-same owner now contains all 84 visitors defined by Eden and its 12 file-local
+  helpers. Nine restored dispatch paths reduce the remaining decoded A64 interpreter fallbacks to
+  six identities. Existing min/max size validation, signed/unsigned absolute-difference ownership,
+  and explicit lower-vector zeroing now follow Eden's control flow and IR ordering.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

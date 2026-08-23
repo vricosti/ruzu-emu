@@ -747,10 +747,10 @@ mod tests {
     use shader_recompiler::ir::value::{InstRef, Value};
     use shader_recompiler::ir::Program;
     use shader_recompiler::profile::Profile;
-    use shader_recompiler::runtime_info::RuntimeInfo;
+    use shader_recompiler::runtime_info::{AttributeType, RuntimeInfo};
     use shader_recompiler::shader_info::{
-        ConstantBufferDescriptor, ImageDescriptor, ImageFormat, StorageBufferDescriptor,
-        TextureDescriptor, TextureType,
+        ConstantBufferDescriptor, ImageDescriptor, ImageFormat, Interpolation,
+        StorageBufferDescriptor, TextureDescriptor, TextureType,
     };
     use shader_recompiler::stage::Stage;
 
@@ -1593,6 +1593,92 @@ mod tests {
         assert!(shader.source().source.contains("[[sample_id]]"));
         assert!(shader.source().source.contains("simd_is_helper_thread()"));
         assert!(shader.source().source.contains("discard_fragment()"));
+    }
+
+    #[test]
+    fn compiles_direct_msl_generic_stage_interfaces_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+
+        let mut vertex = empty_program(Stage::VertexB);
+        let vertex_attribute = shader_recompiler::ir::Attribute::generic(0, 0);
+        vertex.info.loads.set(vertex_attribute.0 as usize, true);
+        vertex.info.stores.set(vertex_attribute.0 as usize, true);
+        let value = vertex.blocks[0].append_new_inst(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(vertex_attribute), Value::ImmU32(0)],
+        );
+        vertex.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(vertex_attribute),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: value,
+                }),
+                Value::ImmU32(0),
+            ],
+        );
+        let mut vertex_runtime = RuntimeInfo::default();
+        vertex_runtime
+            .previous_stage_stores
+            .set(vertex_attribute.0 as usize, true);
+        vertex_runtime.generic_input_types[0] = AttributeType::Float;
+
+        let vertex_spirv = emit_spirv(&vertex, &profile, &vertex_runtime);
+        let active_vertex = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &vertex_spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active generic vertex SPIR-V/MSL must compile");
+        let direct_vertex = validate_direct_msl_against_active_module(
+            device.device(),
+            &vertex,
+            &profile,
+            &vertex_runtime,
+            &active_vertex,
+        )
+        .expect("direct generic vertex MSL must compile with the active ABI");
+        assert_eq!(direct_vertex.bindings(), active_vertex.bindings());
+        assert!(direct_vertex.source().source.contains("[[attribute(0)]]"));
+        assert!(direct_vertex.source().source.contains("[[user(locn0)]]"));
+
+        let mut fragment = empty_program(Stage::Fragment);
+        let fragment_attribute = shader_recompiler::ir::Attribute::generic(0, 0);
+        fragment.info.loads.set(fragment_attribute.0 as usize, true);
+        fragment.info.interpolation[0] = Interpolation::NoPerspective;
+        fragment.blocks[0].append_new_inst(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(fragment_attribute), Value::ImmU32(0)],
+        );
+        let mut fragment_runtime = RuntimeInfo::default();
+        fragment_runtime
+            .previous_stage_stores
+            .set(fragment_attribute.0 as usize, true);
+
+        let fragment_spirv = emit_spirv(&fragment, &profile, &fragment_runtime);
+        let active_fragment = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &fragment_spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active generic fragment SPIR-V/MSL must compile");
+        let direct_fragment = validate_direct_msl_against_active_module(
+            device.device(),
+            &fragment,
+            &profile,
+            &fragment_runtime,
+            &active_fragment,
+        )
+        .expect("direct generic fragment MSL must compile with the active ABI");
+        assert_eq!(direct_fragment.bindings(), active_fragment.bindings());
+        assert!(direct_fragment
+            .source()
+            .source
+            .contains("[[user(locn0), center_no_perspective]]"));
     }
 
     #[test]

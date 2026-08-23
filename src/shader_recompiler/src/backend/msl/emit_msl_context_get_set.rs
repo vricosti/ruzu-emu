@@ -133,3 +133,32 @@ pub fn emit_write_local(
     context.emit_statement(&format!("lmem[{word_offset}] = {value};"));
     Ok(())
 }
+
+/// Emit Eden's generic `GetAttribute` path for vertex/fragment stage inputs.
+pub fn emit_get_attribute(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let Value::Attribute(attribute) = inst.arg(0) else {
+        return Err(MslError::ExpectedImmediate {
+            opcode: inst.opcode,
+            arg: 0,
+            expected: "attribute",
+        });
+    };
+    if !attribute.is_generic() {
+        return Err(MslError::UnsupportedAttribute(attribute.0));
+    }
+    if !matches!(inst.arg(1), Value::ImmU32(0)) {
+        return Err(MslError::UnsupportedProgramFeature(
+            "per-vertex input indexing",
+        ));
+    }
+    context.define(
+        inst_ref,
+        ir::Type::F32,
+        context.generic_input_expression(*attribute),
+        false,
+    )
+}

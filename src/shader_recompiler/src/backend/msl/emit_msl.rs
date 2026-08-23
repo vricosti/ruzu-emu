@@ -32,12 +32,25 @@ use super::emit_msl_shared_memory;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
 
-fn varying_mask_has_only_position(mask: &[u64; 8]) -> bool {
+fn varying_mask_has_only_generics(mask: &[u64; 8]) -> bool {
     mask.iter().enumerate().all(|(word_index, word)| {
-        let allowed = if word_index == 0 {
-            (0b1111u64) << 28
-        } else {
-            0
+        let allowed = match word_index {
+            0 => u64::MAX << 32,
+            1 => u64::MAX,
+            2 => u32::MAX as u64,
+            _ => 0,
+        };
+        word & !allowed == 0
+    })
+}
+
+fn varying_mask_has_only_vertex_outputs(mask: &[u64; 8]) -> bool {
+    mask.iter().enumerate().all(|(word_index, word)| {
+        let allowed = match word_index {
+            0 => u64::MAX << 28,
+            1 => u64::MAX,
+            2 => u32::MAX as u64,
+            _ => 0,
         };
         word & !allowed == 0
     })
@@ -74,11 +87,15 @@ fn first_unsupported_program_feature(
     if program.is_geometry_passthrough {
         return Some("geometry passthrough");
     }
-    let supported_vertex_position_stores = program.stage == crate::stage::Stage::VertexB
-        && varying_mask_has_only_position(&info.stores.mask);
+    let supported_generic_loads = matches!(
+        program.stage,
+        crate::stage::Stage::VertexB | crate::stage::Stage::Fragment
+    ) && varying_mask_has_only_generics(&info.loads.mask);
+    let supported_vertex_stores = program.stage == crate::stage::Stage::VertexB
+        && varying_mask_has_only_vertex_outputs(&info.stores.mask);
     let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
-    if info.loads.mask.iter().any(|word| *word != 0)
-        || (!supported_vertex_position_stores && info.stores.mask.iter().any(|word| *word != 0))
+    if (!supported_generic_loads && info.loads.mask.iter().any(|word| *word != 0))
+        || (!supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
         || info.passthrough.mask.iter().any(|word| *word != 0)
         || info.loads_indexed_attributes
         || info.stores_indexed_attributes
@@ -553,6 +570,9 @@ fn emit_inst(
         }
         Opcode::LoadLocal => emit_msl_context_get_set::emit_load_local(context, inst_ref, inst),
         Opcode::WriteLocal => emit_msl_context_get_set::emit_write_local(context, inst_ref, inst),
+        Opcode::GetAttribute => {
+            emit_msl_context_get_set::emit_get_attribute(context, inst_ref, inst)
+        }
         Opcode::LoadStorageU8
         | Opcode::LoadStorageS8
         | Opcode::LoadStorageU16
@@ -655,6 +675,9 @@ fn emit_inst(
                     "per-vertex output indexing",
                 ));
             }
+            if attribute.is_generic() {
+                return context.emit_set_generic(inst_ref, *attribute, inst.arg(1));
+            }
             if !attribute.is_position() {
                 return Err(MslError::UnsupportedAttribute(attribute.0));
             }
@@ -718,11 +741,11 @@ pub fn emit_msl(
 pub fn emit_msl_with_options(
     program: &ir::Program,
     profile: &Profile,
-    _runtime_info: &RuntimeInfo,
+    runtime_info: &RuntimeInfo,
     options: &MslOptions,
 ) -> Result<MslShaderArtifact, MslError> {
     let mut bindings = Bindings::default();
-    emit_msl_with_options_and_bindings(program, profile, _runtime_info, options, &mut bindings)
+    emit_msl_with_options_and_bindings(program, profile, runtime_info, options, &mut bindings)
 }
 
 pub fn emit_msl_with_bindings(
@@ -743,14 +766,14 @@ pub fn emit_msl_with_bindings(
 pub fn emit_msl_with_options_and_bindings(
     program: &ir::Program,
     profile: &Profile,
-    _runtime_info: &RuntimeInfo,
+    runtime_info: &RuntimeInfo,
     options: &MslOptions,
     bindings: &mut Bindings,
 ) -> Result<MslShaderArtifact, MslError> {
     if let Some(feature) = first_unsupported_program_feature(program, profile) {
         return Err(MslError::UnsupportedProgramFeature(feature));
     }
-    let mut context = MslEmitContext::new(program, profile, options, bindings)?;
+    let mut context = MslEmitContext::new(program, profile, runtime_info, options, bindings)?;
     if program.syntax_list.is_empty() {
         for block_index in 0..program.blocks.len() as u32 {
             emit_block(&mut context, program, block_index)?;
@@ -2115,9 +2138,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_stage_interfaces_even_without_instructions() {
+    fn rejects_unported_builtin_stage_interfaces_even_without_instructions() {
         let mut program = empty_program(Stage::Fragment);
-        program.info.loads.mask[0] = 1u64 << 32;
+        program
+            .info
+            .loads
+            .set(crate::ir::Attribute::POSITION_X.0 as usize, true);
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),
@@ -2328,6 +2354,128 @@ mod tests {
             .source
             .source
             .contains("output.color0.z = as_type<float>(0x3F000000u);"));
+    }
+
+    #[test]
+    fn emits_typed_generic_vertex_interfaces_and_default_values() {
+        use crate::runtime_info::AttributeType;
+
+        let mut program = empty_program(Stage::VertexB);
+        let attributes = [
+            crate::ir::Attribute::generic(0, 0),
+            crate::ir::Attribute::generic(1, 1),
+            crate::ir::Attribute::generic(2, 2),
+            crate::ir::Attribute::generic(3, 3),
+            crate::ir::Attribute::generic(4, 0),
+            crate::ir::Attribute::generic(31, 3),
+        ];
+        for attribute in attributes {
+            program.info.loads.set(attribute.0 as usize, true);
+        }
+        program
+            .info
+            .stores
+            .set(crate::ir::Attribute::generic(0, 0).0 as usize, true);
+        let loaded = attributes.map(|attribute| {
+            program.blocks[0].append_new_inst(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            )
+        });
+        program.blocks[0].append_new_inst(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(crate::ir::Attribute::generic(0, 0)),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: loaded[0],
+                }),
+                Value::ImmU32(0),
+            ],
+        );
+
+        let mut runtime_info = RuntimeInfo::default();
+        for attribute in attributes {
+            runtime_info
+                .previous_stage_stores
+                .set(attribute.0 as usize, true);
+        }
+        runtime_info.generic_input_types[0] = AttributeType::Float;
+        runtime_info.generic_input_types[1] = AttributeType::SignedInt;
+        runtime_info.generic_input_types[2] = AttributeType::SignedScaled;
+        runtime_info.generic_input_types[3] = AttributeType::Disabled;
+        runtime_info.generic_input_types[4] = AttributeType::UnsignedScaled;
+        runtime_info.generic_input_types[31] = AttributeType::UnsignedInt;
+
+        let artifact = emit_msl(&program, &Profile::default(), &runtime_info).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("float4 in_attr0 [[attribute(0)]];"));
+        assert!(source.contains("int4 in_attr1 [[attribute(1)]];"));
+        assert!(source.contains("int4 in_attr2 [[attribute(2)]];"));
+        assert!(!source.contains("in_attr3 [[attribute(3)]]"));
+        assert!(source.contains("uint4 in_attr4 [[attribute(4)]];"));
+        assert!(source.contains("uint4 in_attr31 [[attribute(31)]];"));
+        assert!(source.contains("float v_0_0 = input.in_attr0.x;"));
+        assert!(source.contains("float v_0_1 = as_type<float>(input.in_attr1.y);"));
+        assert!(source.contains("float v_0_2 = float(input.in_attr2.z);"));
+        assert!(source.contains("float v_0_3 = 1.0f;"));
+        assert!(source.contains("float v_0_4 = float(input.in_attr4.x);"));
+        assert!(source.contains("float v_0_5 = as_type<float>(input.in_attr31.w);"));
+        assert!(source.contains("float4 out_attr0 [[user(locn0)]];"));
+        assert!(source.contains("output.out_attr0.x = v_0_0;"));
+
+        let mut scaled_profile = Profile::default();
+        scaled_profile.support_scaled_attributes = true;
+        let scaled = emit_msl(&program, &scaled_profile, &runtime_info).unwrap();
+        assert!(scaled
+            .source
+            .source
+            .contains("float4 in_attr2 [[attribute(2)]];"));
+        assert!(scaled
+            .source
+            .source
+            .contains("float4 in_attr4 [[attribute(4)]];"));
+        assert!(scaled
+            .source
+            .source
+            .contains("float v_0_2 = input.in_attr2.z;"));
+        assert!(scaled
+            .source
+            .source
+            .contains("float v_0_4 = input.in_attr4.x;"));
+    }
+
+    #[test]
+    fn emits_fragment_generic_interpolation_matching_spirv_cross() {
+        use crate::runtime_info::AttributeType;
+        use crate::shader_info::Interpolation;
+
+        let mut program = empty_program(Stage::Fragment);
+        for index in 0..3 {
+            let attribute = crate::ir::Attribute::generic(index, 0);
+            program.info.loads.set(attribute.0 as usize, true);
+            program.blocks[0].append_new_inst(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+        }
+        program.info.interpolation[0] = Interpolation::NoPerspective;
+        program.info.interpolation[1] = Interpolation::Smooth;
+        program.info.interpolation[2] = Interpolation::Flat;
+
+        let mut runtime_info = RuntimeInfo::default();
+        for index in 0..3 {
+            runtime_info
+                .previous_stage_stores
+                .set(crate::ir::Attribute::generic(index, 0).0 as usize, true);
+        }
+        runtime_info.generic_input_types[1] = AttributeType::SignedInt;
+
+        let artifact = emit_msl(&program, &Profile::default(), &runtime_info).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("float4 in_attr0 [[user(locn0), center_no_perspective]];"));
+        assert!(source.contains("int4 in_attr1 [[user(locn1)]];"));
+        assert!(source.contains("float4 in_attr2 [[user(locn2), flat]];"));
     }
 
     #[test]

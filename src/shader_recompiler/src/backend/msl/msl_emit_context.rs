@@ -14,6 +14,7 @@ use crate::ir::instruction::Inst;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
+use crate::runtime_info::{AttributeType, RuntimeInfo};
 use crate::shader_info::{ImageDescriptor, TextureDescriptor, TextureType};
 use crate::stage::Stage;
 
@@ -30,6 +31,7 @@ pub struct MslEmitContext {
     storage_buffers: HashMap<u32, String>,
     textures: Vec<MslTextureDefinition>,
     images: Vec<MslImageDefinition>,
+    input_generics: [Option<MslInputGenericDefinition>; 32],
     bindings: MslBindingLayout,
     returns_output: bool,
     uses_no_contraction_add: bool,
@@ -68,6 +70,20 @@ struct MslImageDefinition {
     is_integer: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MslInputGenericLoadOp {
+    None,
+    Bitcast,
+    SignedToFloat,
+    UnsignedToFloat,
+}
+
+#[derive(Debug, Clone)]
+struct MslInputGenericDefinition {
+    name: String,
+    load_op: MslInputGenericLoadOp,
+}
+
 pub(super) struct MslTextureExpressions {
     pub texture: String,
     pub sampler: String,
@@ -87,6 +103,7 @@ impl MslEmitContext {
     pub fn new(
         program: &crate::ir::Program,
         profile: &Profile,
+        runtime_info: &RuntimeInfo,
         options: &MslOptions,
         binding_counters: &mut Bindings,
     ) -> Result<Self, MslError> {
@@ -105,6 +122,8 @@ impl MslEmitContext {
         let mut textures = Vec::new();
         let mut images = Vec::new();
         let mut parameters = Vec::new();
+        let mut input_generics: [Option<MslInputGenericDefinition>; 32] =
+            std::array::from_fn(|_| None);
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
         } else {
@@ -203,15 +222,74 @@ impl MslEmitContext {
         if program.info.uses_sample_id {
             parameters.push("uint sample_id [[sample_id]]".to_owned());
         }
+        let mut stage_input = String::new();
+        for index in 0..32 {
+            let input_type = runtime_info.generic_input_types[index];
+            if !runtime_info.previous_stage_stores.generic_any(index)
+                || !program.info.loads.generic_any(index)
+                || input_type == AttributeType::Disabled
+            {
+                continue;
+            }
+            if stage_input.is_empty() {
+                let name = match stage {
+                    Stage::VertexB => "MslVertexIn",
+                    Stage::Fragment => "MslFragmentIn",
+                    _ => {
+                        return Err(MslError::UnsupportedProgramFeature(
+                            "generic inputs for this stage",
+                        ));
+                    }
+                };
+                stage_input.push_str(&format!("struct {name} {{\n"));
+            }
+            let (type_name, load_op, is_integer) = Self::generic_input_type(profile, input_type);
+            let attribute = match stage {
+                Stage::VertexB => format!("[[attribute({index})]]"),
+                Stage::Fragment => {
+                    let interpolation = if is_integer {
+                        ""
+                    } else {
+                        match program.info.interpolation[index] {
+                            crate::shader_info::Interpolation::Smooth => "",
+                            crate::shader_info::Interpolation::NoPerspective => {
+                                ", center_no_perspective"
+                            }
+                            crate::shader_info::Interpolation::Flat => ", flat",
+                        }
+                    };
+                    format!("[[user(locn{index}){interpolation}]]")
+                }
+                _ => unreachable!(),
+            };
+            let name = format!("in_attr{index}");
+            stage_input.push_str(&format!("    {type_name} {name} {attribute};\n"));
+            input_generics[index] = Some(MslInputGenericDefinition { name, load_op });
+        }
+        if !stage_input.is_empty() {
+            stage_input.push_str("};\n\n");
+            let parameter = match stage {
+                Stage::VertexB => "MslVertexIn input [[stage_in]]",
+                Stage::Fragment => "MslFragmentIn input [[stage_in]]",
+                _ => unreachable!(),
+            };
+            parameters.insert(0, parameter.to_owned());
+        }
         let parameters = parameters.join(", ");
         let mut source = String::new();
+        source.push_str(&stage_input);
         let returns_output = match stage {
             Stage::VertexB => {
-                source.push_str(concat!(
-                    "struct MslVertexOut {\n",
-                    "    float4 position [[position]];\n",
-                    "};\n\n",
-                ));
+                source.push_str("struct MslVertexOut {\n");
+                source.push_str("    float4 position [[position]];\n");
+                for index in 0..32 {
+                    if program.info.stores.generic_any(index) {
+                        source.push_str(&format!(
+                            "    float4 out_attr{index} [[user(locn{index})]];\n"
+                        ));
+                    }
+                }
+                source.push_str("};\n\n");
                 source.push_str(&format!("vertex MslVertexOut main0({parameters}) {{\n"));
                 source.push_str(concat!(
                     "    MslVertexOut output = {};\n",
@@ -264,6 +342,7 @@ impl MslEmitContext {
             storage_buffers,
             textures,
             images,
+            input_generics,
             bindings,
             returns_output,
             uses_no_contraction_add: false,
@@ -284,6 +363,28 @@ impl MslEmitContext {
             },
             has_broken_robust: profile.has_broken_robust,
         })
+    }
+
+    fn generic_input_type(
+        profile: &Profile,
+        attribute_type: AttributeType,
+    ) -> (&'static str, MslInputGenericLoadOp, bool) {
+        match attribute_type {
+            AttributeType::Float => ("float4", MslInputGenericLoadOp::None, false),
+            AttributeType::SignedInt => ("int4", MslInputGenericLoadOp::Bitcast, true),
+            AttributeType::UnsignedInt => ("uint4", MslInputGenericLoadOp::Bitcast, true),
+            AttributeType::SignedScaled if profile.support_scaled_attributes => {
+                ("float4", MslInputGenericLoadOp::None, false)
+            }
+            AttributeType::SignedScaled => ("int4", MslInputGenericLoadOp::SignedToFloat, true),
+            AttributeType::UnsignedScaled if profile.support_scaled_attributes => {
+                ("float4", MslInputGenericLoadOp::None, false)
+            }
+            AttributeType::UnsignedScaled => {
+                ("uint4", MslInputGenericLoadOp::UnsignedToFloat, true)
+            }
+            AttributeType::Disabled => unreachable!("disabled generic inputs are not declared"),
+        }
     }
 
     pub(crate) fn type_name(ty: Type) -> Result<&'static str, MslError> {
@@ -866,6 +967,38 @@ impl MslEmitContext {
         let swizzle = ["x", "y", "z", "w"][component as usize];
         self.source
             .push_str(&format!("    output.position.{swizzle} = {expression};\n"));
+        Ok(())
+    }
+
+    pub fn generic_input_expression(&self, attribute: crate::ir::value::Attribute) -> String {
+        let index = attribute.generic_index() as usize;
+        let component = attribute.generic_element() as usize;
+        let Some(definition) = &self.input_generics[index] else {
+            return if component == 3 { "1.0f" } else { "0.0f" }.to_owned();
+        };
+        let swizzle = ["x", "y", "z", "w"][component];
+        let expression = format!("input.{}.{swizzle}", definition.name);
+        match definition.load_op {
+            MslInputGenericLoadOp::None => expression,
+            MslInputGenericLoadOp::Bitcast => format!("as_type<float>({expression})"),
+            MslInputGenericLoadOp::SignedToFloat | MslInputGenericLoadOp::UnsignedToFloat => {
+                format!("float({expression})")
+            }
+        }
+    }
+
+    pub fn emit_set_generic(
+        &mut self,
+        inst_ref: InstRef,
+        attribute: crate::ir::value::Attribute,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        let expression = self.value_expression(value, inst_ref, 1)?;
+        let index = attribute.generic_index();
+        let swizzle = ["x", "y", "z", "w"][attribute.generic_element() as usize];
+        self.source.push_str(&format!(
+            "    output.out_attr{index}.{swizzle} = {expression};\n"
+        ));
         Ok(())
     }
 

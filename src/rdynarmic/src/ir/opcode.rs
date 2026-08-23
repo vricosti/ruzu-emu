@@ -296,26 +296,10 @@ pub enum Opcode {
     VectorExtract,
     VectorExtractLower,
     VectorRotateWholeVectorRight,
-    VectorGreaterEqualSigned8,
-    VectorGreaterEqualSigned16,
-    VectorGreaterEqualSigned32,
-    VectorGreaterEqualSigned64,
-    VectorGreaterEqualUnsigned8,
-    VectorGreaterEqualUnsigned16,
-    VectorGreaterEqualUnsigned32,
-    VectorGreaterEqualUnsigned64,
     VectorGreaterS8,
     VectorGreaterS16,
     VectorGreaterS32,
     VectorGreaterS64,
-    VectorLessEqualSigned8,
-    VectorLessEqualSigned16,
-    VectorLessEqualSigned32,
-    VectorLessEqualSigned64,
-    VectorLessSigned8,
-    VectorLessSigned16,
-    VectorLessSigned32,
-    VectorLessSigned64,
     VectorHalvingAddS8,
     VectorHalvingAddS16,
     VectorHalvingAddS32,
@@ -1333,11 +1317,7 @@ impl Opcode {
             VectorMultiplyUnsignedWiden8 | VectorMultiplyUnsignedWiden16 | VectorMultiplyUnsignedWiden32 |
             VectorAnd | VectorAndNot | VectorEor | VectorOr |
             VectorEqual8 | VectorEqual16 | VectorEqual32 | VectorEqual64 | VectorEqual128 |
-            VectorGreaterEqualSigned8 | VectorGreaterEqualSigned16 | VectorGreaterEqualSigned32 | VectorGreaterEqualSigned64 |
-            VectorGreaterEqualUnsigned8 | VectorGreaterEqualUnsigned16 | VectorGreaterEqualUnsigned32 | VectorGreaterEqualUnsigned64 |
             VectorGreaterS8 | VectorGreaterS16 | VectorGreaterS32 | VectorGreaterS64 |
-            VectorLessEqualSigned8 | VectorLessEqualSigned16 | VectorLessEqualSigned32 | VectorLessEqualSigned64 |
-            VectorLessSigned8 | VectorLessSigned16 | VectorLessSigned32 | VectorLessSigned64 |
             VectorHalvingAddS8 | VectorHalvingAddS16 | VectorHalvingAddS32 |
             VectorHalvingAddU8 | VectorHalvingAddU16 | VectorHalvingAddU32 |
             VectorHalvingSubS8 | VectorHalvingSubS16 | VectorHalvingSubS32 |

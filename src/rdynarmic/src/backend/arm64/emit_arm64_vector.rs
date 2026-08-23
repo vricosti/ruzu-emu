@@ -182,18 +182,6 @@ fn emit_three_op_arranged_saturated_widen(
     Ok(())
 }
 
-fn emit_three_op_arranged_swapped(
-    code: &mut BlockOfCode,
-    ctx: &mut EmitContext<'_>,
-    inst_ref: InstRef,
-    size: u8,
-    emit: ThreeOpEmitter,
-) -> Result<(), String> {
-    emit_three_op(code, ctx, inst_ref, |rd, rn, rm| {
-        emit(rd, rm, rn, size, true)
-    })
-}
-
 fn emit_imm_shift_saturated(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -780,54 +768,6 @@ pub fn emit_vector_instruction(
         Opcode::VectorGreaterS16 => emit_three_op_arranged(code, ctx, inst_ref, 16, inst::cmgt_v),
         Opcode::VectorGreaterS32 => emit_three_op_arranged(code, ctx, inst_ref, 32, inst::cmgt_v),
         Opcode::VectorGreaterS64 => emit_three_op_arranged(code, ctx, inst_ref, 64, inst::cmgt_v),
-        Opcode::VectorGreaterEqualSigned8 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 8, inst::cmge_v)
-        }
-        Opcode::VectorGreaterEqualSigned16 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 16, inst::cmge_v)
-        }
-        Opcode::VectorGreaterEqualSigned32 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 32, inst::cmge_v)
-        }
-        Opcode::VectorGreaterEqualSigned64 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 64, inst::cmge_v)
-        }
-        Opcode::VectorGreaterEqualUnsigned8 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 8, inst::cmhs_v)
-        }
-        Opcode::VectorGreaterEqualUnsigned16 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 16, inst::cmhs_v)
-        }
-        Opcode::VectorGreaterEqualUnsigned32 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 32, inst::cmhs_v)
-        }
-        Opcode::VectorGreaterEqualUnsigned64 => {
-            emit_three_op_arranged(code, ctx, inst_ref, 64, inst::cmhs_v)
-        }
-        Opcode::VectorLessSigned8 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 8, inst::cmgt_v)
-        }
-        Opcode::VectorLessSigned16 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 16, inst::cmgt_v)
-        }
-        Opcode::VectorLessSigned32 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 32, inst::cmgt_v)
-        }
-        Opcode::VectorLessSigned64 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 64, inst::cmgt_v)
-        }
-        Opcode::VectorLessEqualSigned8 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 8, inst::cmge_v)
-        }
-        Opcode::VectorLessEqualSigned16 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 16, inst::cmge_v)
-        }
-        Opcode::VectorLessEqualSigned32 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 32, inst::cmge_v)
-        }
-        Opcode::VectorLessEqualSigned64 => {
-            emit_three_op_arranged_swapped(code, ctx, inst_ref, 64, inst::cmge_v)
-        }
         Opcode::VectorHalvingAddS8 => emit_three_op_arranged(code, ctx, inst_ref, 8, inst::shadd_v),
         Opcode::VectorHalvingAddS16 => {
             emit_three_op_arranged(code, ctx, inst_ref, 16, inst::shadd_v)

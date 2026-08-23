@@ -844,14 +844,9 @@ impl<'a> IREmitter<'a> {
     }
 
     pub fn vector_greater_equal_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
-        let op = match esize {
-            8 => Opcode::VectorGreaterEqualSigned8,
-            16 => Opcode::VectorGreaterEqualSigned16,
-            32 => Opcode::VectorGreaterEqualSigned32,
-            64 => Opcode::VectorGreaterEqualSigned64,
-            _ => panic!("Invalid esize {}", esize),
-        };
-        self.emit(op, &[a, b])
+        let greater = self.vector_greater_signed(esize, a, b);
+        let equal = self.vector_equal(esize, a, b);
+        self.vector_or(greater, equal)
     }
 
     pub fn vector_greater_equal_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
@@ -859,26 +854,33 @@ impl<'a> IREmitter<'a> {
         self.vector_equal(esize, max, a)
     }
 
+    pub fn vector_greater_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
+        let min = self.vector_min_unsigned(esize, a, b);
+        let equal = self.vector_equal(esize, min, a);
+        self.vector_not(equal)
+    }
+
     pub fn vector_less_equal_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
-        let op = match esize {
-            8 => Opcode::VectorLessEqualSigned8,
-            16 => Opcode::VectorLessEqualSigned16,
-            32 => Opcode::VectorLessEqualSigned32,
-            64 => Opcode::VectorLessEqualSigned64,
-            _ => panic!("Invalid esize {}", esize),
-        };
-        self.emit(op, &[a, b])
+        let greater = self.vector_greater_signed(esize, a, b);
+        self.vector_not(greater)
+    }
+
+    pub fn vector_less_equal_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
+        let min = self.vector_min_unsigned(esize, a, b);
+        self.vector_equal(esize, min, a)
     }
 
     pub fn vector_less_signed(&mut self, esize: usize, a: Value, b: Value) -> Value {
-        let op = match esize {
-            8 => Opcode::VectorLessSigned8,
-            16 => Opcode::VectorLessSigned16,
-            32 => Opcode::VectorLessSigned32,
-            64 => Opcode::VectorLessSigned64,
-            _ => panic!("Invalid esize {}", esize),
-        };
-        self.emit(op, &[a, b])
+        let greater = self.vector_greater_signed(esize, a, b);
+        let equal = self.vector_equal(esize, a, b);
+        let greater_or_equal = self.vector_or(greater, equal);
+        self.vector_not(greater_or_equal)
+    }
+
+    pub fn vector_less_unsigned(&mut self, esize: usize, a: Value, b: Value) -> Value {
+        let max = self.vector_max_unsigned(esize, a, b);
+        let equal = self.vector_equal(esize, max, a);
+        self.vector_not(equal)
     }
 
     pub fn vector_extract(&mut self, a: Value, b: Value, position: u8) -> Value {
@@ -2483,6 +2485,123 @@ mod tests {
         assert_eq!(block.inst_count(), 2);
         assert_eq!(block.get(InstRef(0)).opcode, Opcode::ZeroVector);
         assert_eq!(block.get(InstRef(1)).opcode, Opcode::VectorAdd32);
+    }
+
+    #[test]
+    fn vector_signed_comparisons_expand_in_edens_exact_order() {
+        for (esize, greater, equal) in [
+            (8, Opcode::VectorGreaterS8, Opcode::VectorEqual8),
+            (16, Opcode::VectorGreaterS16, Opcode::VectorEqual16),
+            (32, Opcode::VectorGreaterS32, Opcode::VectorEqual32),
+            (64, Opcode::VectorGreaterS64, Opcode::VectorEqual64),
+        ] {
+            let mut greater_equal = Block::new(LocationDescriptor(0));
+            {
+                let mut e = IREmitter::new(&mut greater_equal);
+                let value = e.zero_vector();
+                let _ = e.vector_greater_equal_signed(esize, value, value);
+            }
+            assert_eq!(greater_equal.inst_count(), 4);
+            assert_eq!(greater_equal.get(InstRef(1)).opcode, greater);
+            assert_eq!(greater_equal.get(InstRef(2)).opcode, equal);
+            assert_eq!(greater_equal.get(InstRef(3)).opcode, Opcode::VectorOr);
+            assert_eq!(
+                &greater_equal.get(InstRef(3)).args[..2],
+                &[Value::Inst(InstRef(1)), Value::Inst(InstRef(2))]
+            );
+
+            let mut less_equal = Block::new(LocationDescriptor(0));
+            {
+                let mut e = IREmitter::new(&mut less_equal);
+                let value = e.zero_vector();
+                let _ = e.vector_less_equal_signed(esize, value, value);
+            }
+            assert_eq!(less_equal.inst_count(), 3);
+            assert_eq!(less_equal.get(InstRef(1)).opcode, greater);
+            assert_eq!(less_equal.get(InstRef(2)).opcode, Opcode::VectorNot);
+            assert_eq!(less_equal.get(InstRef(2)).args[0], Value::Inst(InstRef(1)));
+
+            let mut less = Block::new(LocationDescriptor(0));
+            {
+                let mut e = IREmitter::new(&mut less);
+                let value = e.zero_vector();
+                let _ = e.vector_less_signed(esize, value, value);
+            }
+            assert_eq!(less.inst_count(), 5);
+            assert_eq!(less.get(InstRef(1)).opcode, greater);
+            assert_eq!(less.get(InstRef(2)).opcode, equal);
+            assert_eq!(less.get(InstRef(3)).opcode, Opcode::VectorOr);
+            assert_eq!(less.get(InstRef(4)).opcode, Opcode::VectorNot);
+            assert_eq!(less.get(InstRef(4)).args[0], Value::Inst(InstRef(3)));
+        }
+    }
+
+    #[test]
+    fn vector_unsigned_comparisons_expand_in_edens_exact_order() {
+        for (esize, min, max, equal) in [
+            (
+                8,
+                Opcode::VectorMinU8,
+                Opcode::VectorMaxU8,
+                Opcode::VectorEqual8,
+            ),
+            (
+                16,
+                Opcode::VectorMinU16,
+                Opcode::VectorMaxU16,
+                Opcode::VectorEqual16,
+            ),
+            (
+                32,
+                Opcode::VectorMinU32,
+                Opcode::VectorMaxU32,
+                Opcode::VectorEqual32,
+            ),
+            (
+                64,
+                Opcode::VectorMinU64,
+                Opcode::VectorMaxU64,
+                Opcode::VectorEqual64,
+            ),
+        ] {
+            for (greater_equal, first) in [(true, max), (false, min)] {
+                let mut block = Block::new(LocationDescriptor(0));
+                {
+                    let mut e = IREmitter::new(&mut block);
+                    let value = e.zero_vector();
+                    if greater_equal {
+                        let _ = e.vector_greater_equal_unsigned(esize, value, value);
+                    } else {
+                        let _ = e.vector_less_equal_unsigned(esize, value, value);
+                    }
+                }
+                assert_eq!(block.inst_count(), 3);
+                assert_eq!(block.get(InstRef(1)).opcode, first);
+                assert_eq!(block.get(InstRef(2)).opcode, equal);
+                assert_eq!(
+                    &block.get(InstRef(2)).args[..2],
+                    &[Value::Inst(InstRef(1)), Value::Inst(InstRef(0))]
+                );
+            }
+
+            for (greater, first) in [(true, min), (false, max)] {
+                let mut block = Block::new(LocationDescriptor(0));
+                {
+                    let mut e = IREmitter::new(&mut block);
+                    let value = e.zero_vector();
+                    if greater {
+                        let _ = e.vector_greater_unsigned(esize, value, value);
+                    } else {
+                        let _ = e.vector_less_unsigned(esize, value, value);
+                    }
+                }
+                assert_eq!(block.inst_count(), 4);
+                assert_eq!(block.get(InstRef(1)).opcode, first);
+                assert_eq!(block.get(InstRef(2)).opcode, equal);
+                assert_eq!(block.get(InstRef(3)).opcode, Opcode::VectorNot);
+                assert_eq!(block.get(InstRef(3)).args[0], Value::Inst(InstRef(2)));
+            }
+        }
     }
 
     #[test]

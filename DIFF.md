@@ -8542,3 +8542,44 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}` and
 - PASS: the removed values were host-internal IR enum variants with no producer, persisted format,
   raw-memory payload, or guest-visible representation. The exact opcode audit now reports 725 Eden
   opcodes, 742 Rust opcodes, zero missing/shared-signature mismatches, and 17 remaining Rust extras.
+
+## 2026-08-23 — rdynarmic signed vector comparison IR vs Eden `ir_emitter.h`
+
+Rust files: `src/rdynarmic/src/ir/{emitter,opcode}.rs`,
+`src/rdynarmic/src/backend/x64/{emit,emit_vector_compare}.rs`,
+`src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_vector}.rs`, and
+`src/rdynarmic/src/frontend/{a32/translate/asimd_three_regs,a64/translate/simd_scalar_three_same,a64/translate/simd_three_same,a64/translate/simd_two_register_misc}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/{ir_emitter.h,opcodes.inc}` and
+`src/dynarmic/src/dynarmic/backend/{x64/emit_x64_vector.cpp,arm64/emit_arm64_vector.cpp}`.
+
+### Intentional differences
+- Rust uses locals for intermediate `Value`s because nested mutable method calls cannot borrow the
+  emitter repeatedly in one expression. The generated instruction order and dependencies are the
+  same as Eden's nested expressions.
+
+### Unintentional differences (to fix)
+- `vector_greater_equal_signed` formerly emitted one of four Rust-only opcodes. It now emits
+  `VectorGreaterS*`, then `VectorEqual*`, then `VectorOr`, matching Eden exactly.
+- `vector_less_equal_signed` formerly emitted one of four Rust-only opcodes. It now emits
+  `VectorGreaterS*` followed by `VectorNot`, matching Eden exactly.
+- `vector_less_signed` formerly emitted one of four Rust-only opcodes. It now emits
+  `VectorGreaterS*`, `VectorEqual*`, `VectorOr`, and `VectorNot` in Eden's order.
+- Four dedicated unsigned-greater-or-equal opcodes had no producer because Rust already used Eden's
+  max-plus-equal composition. All sixteen non-upstream comparison opcodes, metadata entries, x64
+  emitters/fallback, arm64 emitters, dispatch arms, and signature-only tests are removed.
+- `VectorGreaterUnsigned`, `VectorLessEqualUnsigned`, and `VectorLessUnsigned` were missing from
+  Rust's `IREmitter`; three frontends instead expanded equivalent but differently ordered IR.
+  The helpers now live with Eden's other comparison helpers and the A32/A64 comparison visitors call
+  their exact upstream owners. A64 scalar signed `LE`/`LT` now likewise call the matching signed
+  helpers instead of swapping operands into `GE`/`GT`.
+
+### Missing items
+- None for the seven reviewed signed/unsigned comparison helper compositions or their primitive
+  backend operations.
+
+### Binary layout verification
+- PASS: focused emitter and A32/A64 frontend tests verify all four element sizes, instruction order,
+  IR dependencies, and owner selection. The removed enum variants were host-internal and never
+  serialized or raw-copied. The exact audit now reports 725 Eden opcodes, 726 Rust opcodes, no
+  missing/shared-signature mismatches, and one remaining Rust-only diagnostic opcode.

@@ -29,15 +29,17 @@ After the opcode naming, broadcast-element, reduction, and multi-result
 multiply slices:
 
 - Eden opcodes: 725
-- rdynarmic opcodes: 742
+- rdynarmic opcodes: 726
 - missing in rdynarmic: 0
-- extra in rdynarmic: 17
+- extra in rdynarmic: 1
 
 The dead insertion-point and shuffle opcodes have been removed: Eden represents
 insertion points as `IREmitter` state, and no Rust frontend produced the three
-shuffle opcodes. The remaining 17 extras comprise an A32 execution-hook opcode
-and comparison operations that Eden builds from other IR. They remain audit
-items and are not counted as upstream parity merely because they compile.
+shuffle opcodes. The sixteen dedicated comparison opcodes have also been
+replaced with Eden's exact `Greater`/`Equal`/`Or`/`Not` IR compositions. The
+remaining extra is Ruzu's environment-gated A32 execution-hook opcode; it still
+requires an individual audit and is not counted as upstream parity merely
+because it compiles.
 
 The first slice restored Eden's exact names for 73 already-equivalent opcodes,
 including `BitRotateRight*`, `PackedAbsDiffSumU8`, and the vector `S`/`U`
@@ -67,7 +69,7 @@ names, and rejects duplicate or missing Rust metadata entries. It exposed 126
 shared-signature mismatches. The vector/CRC, A32 coprocessor, and A64 cache
 slices have now removed all of them: all 725 shared names have Eden's exact
 return/argument signature. This is metadata parity, not a behavioral claim for
-the 17 Rust-only operations that remain to be reviewed individually.
+the one Rust-only operation that remains to be reviewed individually.
 
 The A64 cache slice also ports the upstream callback-configuration pass. With
 hooking disabled, all data-cache callback IR is invalidated and `DC ZVA` is

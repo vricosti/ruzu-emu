@@ -56,30 +56,22 @@ impl<'a> TranslatorVisitor<'a> {
                 .ir
                 .ir()
                 .vector_greater_signed(esize, operand1, operand2),
-            CmpKind::Hi => {
-                // a > b unsigned <=> NOT(b >= a unsigned)
-                let ge = self
-                    .ir
-                    .ir()
-                    .vector_greater_equal_unsigned(esize, operand2, operand1);
-                self.ir.ir().vector_not(ge)
-            }
+            CmpKind::Hi => self
+                .ir
+                .ir()
+                .vector_greater_unsigned(esize, operand1, operand2),
             CmpKind::Hs => self
                 .ir
                 .ir()
                 .vector_greater_equal_unsigned(esize, operand1, operand2),
-            CmpKind::Le => {
-                // a <= b signed <=> b >= a signed
-                self.ir
-                    .ir()
-                    .vector_greater_equal_signed(esize, operand2, operand1)
-            }
-            CmpKind::Lt => {
-                // a < b signed <=> b > a signed
-                self.ir
-                    .ir()
-                    .vector_greater_signed(esize, operand2, operand1)
-            }
+            CmpKind::Le => self
+                .ir
+                .ir()
+                .vector_less_equal_signed(esize, operand1, operand2),
+            CmpKind::Lt => self
+                .ir
+                .ir()
+                .vector_less_signed(esize, operand1, operand2),
         };
         let elem = self.ir.ir().vector_get_element(esize, result, 0);
         self.v_scalar_write(esize, vd, elem);
@@ -443,6 +435,42 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|inst| inst.opcode == expected_opcode));
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
+    }
+
+    #[test]
+    fn scalar_integer_comparisons_use_edens_ir_helpers() {
+        let cases = [
+            (
+                0x7EE2_3420,
+                A64InstructionName::CMHI_1,
+                vec![Opcode::VectorMinU64, Opcode::VectorEqual64, Opcode::VectorNot],
+            ),
+            (
+                0x7EE0_9820,
+                A64InstructionName::CMLE_1,
+                vec![Opcode::VectorGreaterS64, Opcode::VectorNot],
+            ),
+            (
+                0x5EE0_A820,
+                A64InstructionName::CMLT_1,
+                vec![
+                    Opcode::VectorGreaterS64,
+                    Opcode::VectorEqual64,
+                    Opcode::VectorOr,
+                    Opcode::VectorNot,
+                ],
+            ),
+        ];
+
+        for (encoding, expected_name, expected_opcodes) in cases {
+            let (block, should_continue, name) = translate_one(encoding);
+            assert_eq!(name, expected_name);
+            assert!(should_continue);
+            for opcode in expected_opcodes {
+                assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
+            }
             assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }

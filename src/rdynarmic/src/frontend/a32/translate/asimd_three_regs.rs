@@ -188,8 +188,7 @@ fn integer_comparison(ir: &mut A32IREmitter, inst: &DecodedArm, comparison: Comp
     let result = match comparison {
         Comparison::GreaterThan => {
             if u {
-                let ge = ir.ir().vector_greater_equal_unsigned(esize, reg_m, reg_n);
-                ir.ir().vector_not(ge)
+                ir.ir().vector_greater_unsigned(esize, reg_n, reg_m)
             } else {
                 ir.ir().vector_greater_signed(esize, reg_n, reg_m)
             }
@@ -923,6 +922,21 @@ mod tests {
         );
         assert!(opcodes.contains(&Opcode::FPVectorSub32));
         assert!(opcodes.contains(&Opcode::FPVectorAbs32));
+    }
+
+    #[test]
+    fn unsigned_vcgt_uses_edens_min_equal_not_helper_sequence() {
+        let opcodes = translate_with(
+            DecodedArm {
+                raw: 0xF300_0300,
+                id: ArmInstId::ASIMD_VCGT_reg_int,
+            },
+            arm_asimd_vcgt_reg_int,
+        );
+        for opcode in [Opcode::VectorMinU8, Opcode::VectorEqual8, Opcode::VectorNot] {
+            assert!(opcodes.contains(&opcode));
+        }
+        assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
     }
 }
 

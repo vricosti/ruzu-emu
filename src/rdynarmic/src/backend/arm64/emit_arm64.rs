@@ -920,22 +920,6 @@ fn emit_ir_instruction(
         | Opcode::VectorGreaterS16
         | Opcode::VectorGreaterS32
         | Opcode::VectorGreaterS64
-        | Opcode::VectorGreaterEqualSigned8
-        | Opcode::VectorGreaterEqualSigned16
-        | Opcode::VectorGreaterEqualSigned32
-        | Opcode::VectorGreaterEqualSigned64
-        | Opcode::VectorGreaterEqualUnsigned8
-        | Opcode::VectorGreaterEqualUnsigned16
-        | Opcode::VectorGreaterEqualUnsigned32
-        | Opcode::VectorGreaterEqualUnsigned64
-        | Opcode::VectorLessSigned8
-        | Opcode::VectorLessSigned16
-        | Opcode::VectorLessSigned32
-        | Opcode::VectorLessSigned64
-        | Opcode::VectorLessEqualSigned8
-        | Opcode::VectorLessEqualSigned16
-        | Opcode::VectorLessEqualSigned32
-        | Opcode::VectorLessEqualSigned64
         | Opcode::VectorHalvingAddS8
         | Opcode::VectorHalvingAddS16
         | Opcode::VectorHalvingAddS32

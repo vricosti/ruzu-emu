@@ -579,17 +579,13 @@ impl<'a> TranslatorVisitor<'a> {
         true
     }
 
-    /// CMHI (vector): a > b unsigned. No direct VectorGreaterUnsigned IR op,
-    /// so synthesize as `NOT(VectorGreaterEqualUnsigned(b, a))` — equivalent
-    /// to upstream's `VectorGreaterUnsigned(a, b)` lowering on x64.
     pub fn cmhi_2(&mut self, inst: &DecodedInst) -> bool {
         let Some((esize, datasize, rm, rn, rd)) = self.three_same_inputs(inst) else {
             return self.reserved_value();
         };
         let n = self.v_read(datasize, rn);
         let m = self.v_read(datasize, rm);
-        let ge = self.ir.ir().vector_greater_equal_unsigned(esize, m, n);
-        let r = self.ir.ir().vector_not(ge);
+        let r = self.ir.ir().vector_greater_unsigned(esize, n, m);
         self.v_write(datasize, rd, r);
         true
     }
@@ -1239,6 +1235,16 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorPairedAddLower32));
+        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn cmhi_2_uses_edens_min_equal_not_helper_sequence() {
+        let (block, should_continue) = translate_one(0x2E22_3420);
+        assert!(should_continue);
+        for opcode in [Opcode::VectorMinU8, Opcode::VectorEqual8, Opcode::VectorNot] {
+            assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
+        }
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 

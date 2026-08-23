@@ -1006,24 +1006,32 @@ mod tests {
     }
 
     #[test]
-    fn cmle_2_uses_vector_less_equal_signed_opcode() {
+    fn cmle_2_uses_edens_greater_then_not_sequence() {
         let (block, should_continue) = translate_one(0x2E209820);
         assert!(should_continue);
         assert!(block
             .instructions
             .iter()
-            .any(|inst| inst.opcode == Opcode::VectorLessEqualSigned8));
+            .any(|inst| inst.opcode == Opcode::VectorGreaterS8));
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::VectorNot));
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
-    fn cmlt_2_uses_vector_less_signed_opcode() {
+    fn cmlt_2_uses_edens_greater_equal_or_not_sequence() {
         let (block, should_continue) = translate_one(0x0E20A820);
         assert!(should_continue);
-        assert!(block
-            .instructions
-            .iter()
-            .any(|inst| inst.opcode == Opcode::VectorLessSigned8));
+        for opcode in [
+            Opcode::VectorGreaterS8,
+            Opcode::VectorEqual8,
+            Opcode::VectorOr,
+            Opcode::VectorNot,
+        ] {
+            assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
+        }
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 

@@ -909,46 +909,6 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorGreaterS16 => vcmp::emit_vector_greater_signed16(ctx, ra, inst_ref, inst),
             Opcode::VectorGreaterS32 => vcmp::emit_vector_greater_signed32(ctx, ra, inst_ref, inst),
             Opcode::VectorGreaterS64 => vcmp::emit_vector_greater_signed64(ctx, ra, inst_ref, inst),
-            Opcode::VectorGreaterEqualSigned8 => {
-                vcmp::emit_vector_greater_equal_signed8(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualSigned16 => {
-                vcmp::emit_vector_greater_equal_signed16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualSigned32 => {
-                vcmp::emit_vector_greater_equal_signed32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualSigned64 => {
-                vcmp::emit_vector_greater_equal_signed64(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualUnsigned8 => {
-                vcmp::emit_vector_greater_equal_unsigned8(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualUnsigned16 => {
-                vcmp::emit_vector_greater_equal_unsigned16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualUnsigned32 => {
-                vcmp::emit_vector_greater_equal_unsigned32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterEqualUnsigned64 => {
-                vcmp::emit_vector_greater_equal_unsigned64(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorLessEqualSigned8 => {
-                vcmp::emit_vector_less_equal_signed8(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorLessEqualSigned16 => {
-                vcmp::emit_vector_less_equal_signed16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorLessEqualSigned32 => {
-                vcmp::emit_vector_less_equal_signed32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorLessEqualSigned64 => {
-                vcmp::emit_vector_less_equal_signed64(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorLessSigned8 => vcmp::emit_vector_less_signed8(ctx, ra, inst_ref, inst),
-            Opcode::VectorLessSigned16 => vcmp::emit_vector_less_signed16(ctx, ra, inst_ref, inst),
-            Opcode::VectorLessSigned32 => vcmp::emit_vector_less_signed32(ctx, ra, inst_ref, inst),
-            Opcode::VectorLessSigned64 => vcmp::emit_vector_less_signed64(ctx, ra, inst_ref, inst),
             Opcode::VectorMinS8 => vcmp::emit_vector_min_signed8(ctx, ra, inst_ref, inst),
             Opcode::VectorMinS16 => vcmp::emit_vector_min_signed16(ctx, ra, inst_ref, inst),
             Opcode::VectorMinS32 => vcmp::emit_vector_min_signed32(ctx, ra, inst_ref, inst),

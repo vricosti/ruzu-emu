@@ -1,12 +1,7 @@
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::{AccType, Reg, Vec};
-
-#[derive(Clone, Copy)]
-enum SimdMemOp {
-    Store,
-    Load,
-}
+use crate::ir::emitter::MemOp;
 
 impl<'a> TranslatorVisitor<'a> {
     fn simd_scale(&mut self, inst: &DecodedInst) -> Option<usize> {
@@ -47,7 +42,7 @@ impl<'a> TranslatorVisitor<'a> {
         postindex: bool,
         scale: usize,
         offset_value: u64,
-        memop: SimdMemOp,
+        memop: MemOp,
         rn: Reg,
         vt: Vec,
     ) -> bool {
@@ -60,7 +55,7 @@ impl<'a> TranslatorVisitor<'a> {
         }
 
         match memop {
-            SimdMemOp::Store => {
+            MemOp::Store => {
                 if datasize == 128 {
                     let data = self.ir.get_q(vt);
                     self.mem_write(address, data, 16, AccType::Vec);
@@ -70,7 +65,7 @@ impl<'a> TranslatorVisitor<'a> {
                     self.mem_write(address, data, datasize / 8, AccType::Vec);
                 }
             }
-            SimdMemOp::Load => {
+            MemOp::Load => {
                 let data = self.mem_read(address, datasize / 8, AccType::Vec);
                 if datasize == 128 {
                     self.ir.set_q(vt, data);
@@ -79,6 +74,7 @@ impl<'a> TranslatorVisitor<'a> {
                     self.ir.set_q(vt, data);
                 }
             }
+            MemOp::Prefetch => unreachable!(),
         }
 
         if wback {
@@ -271,7 +267,7 @@ impl<'a> TranslatorVisitor<'a> {
             !not_postindex,
             scale,
             imm9 as u64,
-            SimdMemOp::Store,
+            MemOp::Store,
             rn,
             rt,
         )
@@ -286,7 +282,7 @@ impl<'a> TranslatorVisitor<'a> {
         let rn = Reg::from_u32(inst.rn());
         let rt = Vec::from_u32(inst.rd());
         let offset_val = (imm12 as u64) << scale;
-        self.load_store_simd(false, false, scale, offset_val, SimdMemOp::Store, rn, rt)
+        self.load_store_simd(false, false, scale, offset_val, MemOp::Store, rn, rt)
     }
 
     /// LDR (immediate, SIMD&FP) - Pre/post-index 9-bit offset
@@ -303,7 +299,7 @@ impl<'a> TranslatorVisitor<'a> {
             !not_postindex,
             scale,
             imm9 as u64,
-            SimdMemOp::Load,
+            MemOp::Load,
             rn,
             rt,
         )
@@ -318,7 +314,7 @@ impl<'a> TranslatorVisitor<'a> {
         let rn = Reg::from_u32(inst.rn());
         let rt = Vec::from_u32(inst.rd());
         let offset_val = (imm12 as u64) << scale;
-        self.load_store_simd(false, false, scale, offset_val, SimdMemOp::Load, rn, rt)
+        self.load_store_simd(false, false, scale, offset_val, MemOp::Load, rn, rt)
     }
 
     /// STUR (SIMD&FP) - Unscaled immediate
@@ -329,7 +325,7 @@ impl<'a> TranslatorVisitor<'a> {
         let imm9 = inst.imm9_sext();
         let rn = Reg::from_u32(inst.rn());
         let rt = Vec::from_u32(inst.rd());
-        self.load_store_simd(false, false, scale, imm9 as u64, SimdMemOp::Store, rn, rt)
+        self.load_store_simd(false, false, scale, imm9 as u64, MemOp::Store, rn, rt)
     }
 
     /// LDUR (SIMD&FP) - Unscaled immediate
@@ -340,7 +336,7 @@ impl<'a> TranslatorVisitor<'a> {
         let imm9 = inst.imm9_sext();
         let rn = Reg::from_u32(inst.rn());
         let rt = Vec::from_u32(inst.rd());
-        self.load_store_simd(false, false, scale, imm9 as u64, SimdMemOp::Load, rn, rt)
+        self.load_store_simd(false, false, scale, imm9 as u64, MemOp::Load, rn, rt)
     }
 
     // --- PRFM instructions (prefetch hints - treated as NOP) ---

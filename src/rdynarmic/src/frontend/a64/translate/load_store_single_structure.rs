@@ -4,12 +4,7 @@
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::{AccType, Reg, Vec};
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MemOp {
-    Load,
-    Store,
-}
+use crate::ir::emitter::MemOp;
 
 impl<'a> TranslatorVisitor<'a> {
     fn single_structure_shared_decode_and_operation(
@@ -99,6 +94,7 @@ impl<'a> TranslatorVisitor<'a> {
                         let element = self.ir.ir().vector_get_element(esize, current, index as u8);
                         self.mem_write(addr, element, ebytes, AccType::Vec);
                     }
+                    MemOp::Prefetch => unreachable!(),
                 }
 
                 let delta = self.ir.ir().imm64(ebytes as u64);

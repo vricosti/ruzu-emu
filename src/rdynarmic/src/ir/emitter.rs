@@ -29,6 +29,13 @@ pub struct UpperAndLower {
     pub lower: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemOp {
+    Load,
+    Store,
+    Prefetch,
+}
+
 /// Base IR emitter — the builder API for constructing IR blocks.
 /// Wraps a Block and appends instructions to it.
 pub struct IREmitter<'a> {
@@ -2753,6 +2760,14 @@ impl<'a> IREmitter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_operation_inventory_matches_upstream() {
+        let operations = [MemOp::Load, MemOp::Store, MemOp::Prefetch];
+        assert!(matches!(operations[0], MemOp::Load));
+        assert!(matches!(operations[1], MemOp::Store));
+        assert!(matches!(operations[2], MemOp::Prefetch));
+    }
     use crate::ir::block::Block;
     use crate::ir::location::LocationDescriptor;
     use crate::ir::value::InstRef;

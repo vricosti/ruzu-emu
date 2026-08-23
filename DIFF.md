@@ -10373,23 +10373,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_exclusive.rs` vs Eden `frontend/A64/translate/impl/{load_store_exclusive.cpp,impl.h}` (interpreter-producer audit)
 
 ### Intentional differences
-- Rust visitors extract operands from `DecodedInst`; the encoded two-bit size can only produce the
-  1, 2, 4, and 8-byte single-register cases.
+- Rust visitors extract operands from `DecodedInst`; pair visitors reconstruct Eden's
+  `concatenate(Imm<1>{1}, sz)` from the encoded size bits before invoking the same shared helper.
+- Rust represents Eden's optional registers with `Option<Reg>` and names the overloaded
+  `ExclusiveMem` helpers `exclusive_mem_read` and `exclusive_mem_write`.
 
 ### Unintentional differences (to fix)
-- Fixed locally: the four impossible single-register size defaults produced the extra interpreter
-  terminal. They now match Eden's unreachable default.
-- The Rust owner still splits Eden's `ExclusiveSharedDecodeAndOperation` into per-operation and
-  pair helpers. It consequently omits the single-store status-register alias checks and always
-  rejects pair-store aliases instead of honoring `define_unpredictable_behaviour`. This is the
-  immediately resumed owner after the now-completed translation-option prerequisite.
+- Fixed: separate single/pair load/store implementations duplicated and reordered Eden's shared
+  decode. The owner now has direct counterparts for `ExclusiveSharedDecodeAndOperation` and
+  `OrderedSharedDecodeAndOperation`, including the exact alias-validation `else if` order.
+- Fixed: STXR/STLXR omitted the `Rs == Rt` and `Rs == Rn` constrained-unpredictable checks, while
+  STXP/STLXP unconditionally rejected `Rs == Rt` or `Rs == Rt2`. Both single and pair stores now
+  honor `define_unpredictable_behaviour` and execute Eden's `Constraint_NONE` case when enabled.
+- Fixed: the four impossible direct-width fallbacks produced an extra interpreter terminal. All
+  width selection now goes through the shared `ExclusiveMem` helpers with unreachable defaults.
 
 ### Missing items
-- The matching generic `ExclusiveMem` helper overloads from `impl.cpp` are not yet present in the
-  Rust visitor owner; restoring them is the prerequisite to the shared exclusive helper port.
+- None among the two file-local helpers and twelve visitor definitions in the reviewed upstream
+  source and header.
 
 ### Binary layout verification
-- N/A: these methods construct SSA and define no raw-copied payload.
+- N/A: these methods construct SSA and define no raw-copied payload. Focused tests cover all twelve
+  decoded visitors, exclusive and ordered access tags, pair widths, alias failures, option-controlled
+  `Constraint_NONE`, and the validation-order interaction when `Rs`, `Rn`, and `Rt` alias.
 
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_vector_x_indexed_element.rs` vs Eden `frontend/A64/translate/impl/{simd_vector_x_indexed_element.cpp,impl.h}` (FCMLA fallback audit)
 
@@ -10433,3 +10439,71 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: these helpers construct SSA and define no raw-copied payload. Focused tests verify all ten
   exclusive read/write width selections and all four byte-to-word/long extension selections.
+
+## 2026-08-24 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`MemOp` ownership)
+
+### Intentional differences
+- Rust applies PascalCase variant spelling and derives comparison/debug traits; the enum remains a
+  control-flow type and is not encoded into SSA or exposed through the JIT ABI.
+
+### Unintentional differences (to fix)
+- Fixed: `MemOp` was absent from the generic IR emitter owner, forcing A64 translation files to
+  duplicate partial local enums. The shared owner now exposes Eden's Load, Store, and Prefetch
+  inventory in the same conceptual location.
+
+### Missing items
+- None for the reviewed `MemOp` declaration.
+
+### Binary layout verification
+- N/A: neither implementation serializes or raw-copies this control-flow enum. A focused inventory
+  test constructs all three upstream variants.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_multiple_structures.rs` vs Eden `frontend/A64/translate/impl/load_store_multiple_structures.cpp` (`MemOp` ownership)
+
+### Intentional differences
+- Rust uses an explicit unreachable match arm for Prefetch; this upstream helper is called only by
+  load and store decoder identities.
+
+### Unintentional differences (to fix)
+- Fixed: the file owned a duplicate two-variant `MemOp`. Its shared decode helper now consumes the
+  generic IR-owner enum used by Eden.
+
+### Missing items
+- None for this ownership correction.
+
+### Binary layout verification
+- N/A: the enum only selects translation control flow. Existing focused multiple-structure tests
+  pass unchanged after the owner migration.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_single_structure.rs` vs Eden `frontend/A64/translate/impl/load_store_single_structure.cpp` (`MemOp` ownership)
+
+### Intentional differences
+- Rust uses an explicit unreachable match arm for Prefetch; no single-structure decoder identity
+  supplies that operation.
+
+### Unintentional differences (to fix)
+- Fixed: the file owned a duplicate two-variant `MemOp`. Its shared decode helper now consumes the
+  generic IR-owner enum used by Eden.
+
+### Missing items
+- None for this ownership correction.
+
+### Binary layout verification
+- N/A: the enum only selects translation control flow. Existing focused single-structure tests
+  pass unchanged after the owner migration.
+
+## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_register_immediate.rs` vs Eden `frontend/A64/translate/impl/load_store_register_immediate.cpp` (`LoadStoreSIMD` `MemOp` ownership)
+
+### Intentional differences
+- Rust uses an explicit unreachable Prefetch arm in `load_store_simd`, matching Eden's default
+  unreachable path because only SIMD load and store visitors call that helper.
+
+### Unintentional differences (to fix)
+- Fixed: `LoadStoreSIMD` accepted a file-local `SimdMemOp` instead of Eden's generic `IR::MemOp`.
+  It now consumes the enum from the IR emitter owner.
+
+### Missing items
+- None for the reviewed SIMD-helper ownership correction.
+
+### Binary layout verification
+- N/A: the enum only selects translation control flow; no SSA or guest payload layout changes.

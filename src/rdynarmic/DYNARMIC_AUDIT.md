@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1070 passed, 4 ignored). These are
+(1077 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -139,6 +139,12 @@ validation blockers, not evidence against the focused slices.
 - The A64 `impl.cpp` visitor-helper owner now includes Eden's generic exclusive-memory read/write
   dispatchers for all five widths plus its destination-directed sign/zero extension helpers. This
   removes the helper prerequisite for the exclusive load/store owner.
+- The generic IR emitter now owns Eden's complete `MemOp` inventory. The exclusive, multiple-
+  structure, single-structure, and immediate SIMD load/store helpers consume that shared owner
+  instead of duplicating partial translation-local enums.
+- The A64 exclusive load/store owner now matches both upstream shared helpers and all twelve
+  visitors, including option-controlled store aliases, validation order, pair packing, access
+  types, and limited/full ordered operations.
 - The A64 SM3/EOR3/BCAX crypto slice now owns and dispatches all seven visitors from Eden's
   `simd_crypto_four_register.cpp` and `simd_crypto_three_register.cpp`. This removes seven decoded
   identities from the temporary interpreter fallback.

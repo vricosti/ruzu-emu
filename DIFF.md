@@ -8723,3 +8723,25 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: this slice emits host x86-64 instructions and changes no raw-copied or serialized guest
   structure. The focused regression covers both 32-bit and 64-bit widths with an immediate `lsb`.
+
+## 2026-08-23 — `src/rdynarmic/src/backend/arm64/inst.rs` prerequisites for Eden `backend/arm64/emit_arm64_packed.cpp`
+
+### Intentional differences
+- Eden delegates AArch64 encoding to Oaknut. Ruzu owns its equivalent bit encoders in `inst.rs`;
+  the new helpers keep that existing platform-adaptation boundary and expose the exact instruction
+  forms used by the upstream packed emitter.
+
+### Unintentional differences (to fix)
+- Fixed prerequisite: Ruzu lacked the 64-bit-vector forms of `MOVI`, `AND`, `EOR`, and `BSL`, the
+  compare-against-zero forms of `CMGE`/`CMEQ`, and encoders for `UADDLV` and `SHRN`. The former
+  `movi_v16b_imm` also accepted only two hard-coded immediates; its shared encoder now accepts the
+  full `imm8` field while preserving its existing encodings.
+
+### Missing items
+- The encoders required by the complete `emit_arm64_packed.cpp` port are present. The packed
+  emitter itself remains the next slice and is not claimed complete by this prerequisite commit.
+
+### Binary layout verification
+- PASS: focused encoder tests compare every new form against exact 32-bit words independently
+  assembled with GNU AArch64 binutils, including both MOVI masks, all element widths used by
+  `SHRN`/`UADDLV`, and the 64-bit vector logical/compare forms.

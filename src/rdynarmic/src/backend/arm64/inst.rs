@@ -2186,13 +2186,22 @@ pub fn sha256su1_v4s(rd: u8, rn: u8, rm: u8) -> u32 {
     0x5e00_6000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
 }
 
+fn movi_v_imm(rd: u8, imm: u8, q: bool) -> u32 {
+    0x0f00_e400
+        | ((q as u32) << 30)
+        | (((imm as u32) & 0xe0) << 11)
+        | (((imm as u32) & 0x1f) << 5)
+        | reg5(rd)
+}
+
+/// `movi vD.8b, #imm`.
+pub fn movi_v8b_imm(rd: u8, imm: u8) -> u32 {
+    movi_v_imm(rd, imm, false)
+}
+
 /// `movi vD.16b, #imm`.
 pub fn movi_v16b_imm(rd: u8, imm: u8) -> u32 {
-    match imm {
-        0x08 => 0x4f00_e500 | reg5(rd),
-        0x18 => 0x4f00_e700 | reg5(rd),
-        _ => panic!("unsupported MOVI v.16b immediate: {imm:#x}"),
-    }
+    movi_v_imm(rd, imm, true)
 }
 
 /// `umov wD/xD, vN.<T>[index]`.
@@ -2471,6 +2480,11 @@ pub fn and_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
     0x4e20_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// `and vD.8b, vN.8b, vM.8b`.
+pub fn and_v8b(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x0e20_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `bic vD.16b, vN.16b, vM.16b`.
 pub fn bic_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
     0x4e60_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
@@ -2479,6 +2493,16 @@ pub fn bic_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
 /// `eor vD.16b, vN.16b, vM.16b`.
 pub fn eor_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
     0x6e20_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `eor vD.8b, vN.8b, vM.8b`.
+pub fn eor_v8b(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x2e20_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `bsl vD.8b, vN.8b, vM.8b`.
+pub fn bsl_v8b(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x2e60_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
 }
 
 /// `orr vD.16b, vN.16b, vM.16b`.
@@ -2504,6 +2528,16 @@ pub fn cmgt_v(rd: u8, rn: u8, rm: u8, size: u8, q: bool) -> u32 {
 /// `cmge vD.<T>, vN.<T>, vM.<T>`.
 pub fn cmge_v(rd: u8, rn: u8, rm: u8, size: u8, q: bool) -> u32 {
     simd_three_same(0x0e20_3c00, rd, rn, rm, size, q)
+}
+
+/// `cmge vD.<T>, vN.<T>, #0`.
+pub fn cmge_v_zero(rd: u8, rn: u8, size: u8, q: bool) -> u32 {
+    simd_two_same(0x2e20_8800, rd, rn, size, q)
+}
+
+/// `cmeq vD.<T>, vN.<T>, #0`.
+pub fn cmeq_v_zero(rd: u8, rn: u8, size: u8, q: bool) -> u32 {
+    simd_two_same(0x0e20_9800, rd, rn, size, q)
 }
 
 /// `cmhi vD.<T>, vN.<T>, vM.<T>`.
@@ -2544,6 +2578,11 @@ pub fn addp_v(rd: u8, rn: u8, rm: u8, size: u8, q: bool) -> u32 {
 /// `addv <Bd/Hd/Sd>, vN.<16B/8H/4S>`.
 pub fn addv_from_v(rd: u8, rn: u8, size: u8) -> u32 {
     0x4e31_b800 | (simd_size(size) << 22) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `uaddlv <Hd/Sd/Dd>, vN.<8B/4H/4S>` (or the corresponding 128-bit source).
+pub fn uaddlv_from_v(rd: u8, rn: u8, size: u8, q: bool) -> u32 {
+    0x2e30_3800 | simd_arrange(size, q) | (reg5(rn) << 5) | reg5(rd)
 }
 
 /// `addp Dd, vN.2D`.
@@ -2888,6 +2927,15 @@ pub fn sxtl_v(rd: u8, rn: u8, size: u8) -> u32 {
 /// `xtn vD.<narrow T>, vN.<wide T>`.
 pub fn xtn_v(rd: u8, rn: u8, source_size: u8) -> u32 {
     simd_narrow(0x0e20_2800, rd, rn, source_size)
+}
+
+/// `shrn vD.<narrow T>, vN.<wide T>, #shift`.
+pub fn shrn_v(rd: u8, rn: u8, source_size: u8, shift: u8) -> u32 {
+    assert!(
+        (1..=source_size / 2).contains(&shift),
+        "AArch64 SHRN shift out of range"
+    );
+    simd_shift_right(0x0f00_8400, rd, rn, source_size, shift, false)
 }
 
 /// `sqxtn vD.<narrow T>, vN.<wide T>`.
@@ -3459,6 +3507,8 @@ mod tests {
         assert_eq!(mov_v_d1_from_v_d0(2, 3), 0x6e18_0462);
         assert_eq!(mov_v16b(13, 14), 0x4eae_1dcd);
         assert_eq!(movi_d_imm0(16), 0x2f00_e410);
+        assert_eq!(movi_v8b_imm(2, 0x0f), 0x0f00_e5e2);
+        assert_eq!(movi_v8b_imm(2, 0xf0), 0x0f07_e602);
         assert_eq!(movi_v16b_imm(2, 0x08), 0x4f00_e502);
         assert_eq!(movi_v16b_imm(2, 0x18), 0x4f00_e702);
         assert_eq!(umov_from_v(16, 17, 8, 7), 0x0e0f_3e30);
@@ -3537,14 +3587,21 @@ mod tests {
         assert_eq!(pmull_v(16, 17, 18, 64), 0x0ef2_e230);
         assert_eq!(sqdmull_v(16, 17, 18, 16), 0x0e72_d230);
         assert_eq!(and_v16b(16, 17, 18), 0x4e32_1e30);
+        assert_eq!(and_v8b(9, 10, 11), 0x0e2b_1d49);
         assert_eq!(bic_v16b(16, 17, 18), 0x4e72_1e30);
         assert_eq!(eor_v16b(16, 17, 18), 0x6e32_1e30);
+        assert_eq!(eor_v8b(9, 10, 11), 0x2e2b_1d49);
+        assert_eq!(bsl_v8b(9, 10, 11), 0x2e6b_1d49);
         assert_eq!(orr_v16b(16, 17, 18), 0x4eb2_1e30);
         assert_eq!(orr_v8b(2, 3, 2), 0x0ea2_1c62);
         assert_eq!(cmeq_v(16, 17, 18, 8, true), 0x6e32_8e30);
         assert_eq!(cmgt_v(16, 17, 18, 8, true), 0x4e32_3630);
         assert_eq!(cmhi_v(16, 17, 18, 8, true), 0x6e32_3630);
         assert_eq!(cmge_v(16, 17, 18, 8, true), 0x4e32_3e30);
+        assert_eq!(cmge_v_zero(3, 4, 8, false), 0x2e20_8883);
+        assert_eq!(cmge_v_zero(3, 4, 16, false), 0x2e60_8883);
+        assert_eq!(cmeq_v_zero(3, 4, 8, false), 0x0e20_9883);
+        assert_eq!(cmeq_v_zero(3, 4, 16, false), 0x0e60_9883);
         assert_eq!(cmhs_v(16, 17, 18, 8, true), 0x6e32_3e30);
         assert_eq!(smax_v(16, 17, 18, 8, true), 0x4e32_6630);
         assert_eq!(umax_v(16, 17, 18, 8, true), 0x6e32_6630);
@@ -3555,6 +3612,9 @@ mod tests {
         assert_eq!(addv_from_v(0, 1, 8), 0x4e31_b820);
         assert_eq!(addv_from_v(2, 3, 16), 0x4e71_b862);
         assert_eq!(addv_from_v(4, 5, 32), 0x4eb1_b8a4);
+        assert_eq!(uaddlv_from_v(7, 8, 8, false), 0x2e30_3907);
+        assert_eq!(uaddlv_from_v(7, 8, 16, false), 0x2e70_3907);
+        assert_eq!(uaddlv_from_v(7, 8, 32, true), 0x6eb0_3907);
         assert_eq!(addp_d_from_v2d(6, 7), 0x5ef1_b8e6);
         assert_eq!(smaxp_v(16, 17, 18, 8, true), 0x4e32_a630);
         assert_eq!(umaxp_v(16, 17, 18, 8, true), 0x6e32_a630);
@@ -3579,6 +3639,9 @@ mod tests {
         assert_eq!(pmul_v(16, 17, 18, 8, true), 0x6e32_9e30);
         assert_eq!(sqdmulh_v(16, 17, 18, 16, true), 0x4e72_b630);
         assert_eq!(sqrdmulh_v(16, 17, 18, 16, true), 0x6e72_b630);
+        assert_eq!(shrn_v(5, 6, 16, 8), 0x0f08_84c5);
+        assert_eq!(shrn_v(5, 6, 32, 16), 0x0f10_84c5);
+        assert_eq!(shrn_v(5, 6, 64, 32), 0x0f20_84c5);
         assert_eq!(sqshl_v(16, 17, 18, 8, true), 0x4e32_4e30);
         assert_eq!(uqshl_v(16, 17, 18, 8, true), 0x6e32_4e30);
         assert_eq!(zip1_v(16, 17, 18, 8, true), 0x4e12_3a30);

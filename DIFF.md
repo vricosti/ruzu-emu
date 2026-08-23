@@ -10103,3 +10103,33 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all seven
   restored decoder identities, comparison operand ordering, ToOdd conversion metadata, reserved
   FCVTXN handling, scalar extraction counts, saturating accumulator reads, and narrowing opcodes.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_x_indexed_element.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_x_indexed_element.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`.
+  `CombineScalar`, `ExtraBehavior`, `MultiplyByElement`, and `MultiplyByElementHalfPrecision`
+  otherwise remain file-local with the same responsibilities and branch ordering.
+- Eden uses `ASSERT` for the unreachable half-precision plain/extended multiply modes; Rust uses
+  `assert!` because the two decoded half-precision visitors select only accumulate or subtract.
+- Six declarations in Eden's `impl.h` (`SQDMLAL_elt_1`, `SQDMLSL_elt_1`, `FMUL_elt_1`,
+  `SQRDMLAH_elt_1`, `SQRDMLSH_elt_1`, and `FMULX_elt_1`) have no decoder identities or C++
+  definitions in the reviewed snapshot. Rust does not invent unreachable implementations.
+
+### Unintentional differences (to fix)
+- Fixed: SQDMULL, SQDMULH, and SQRDMULH scalar-by-element identities decoded but fell through to
+  the temporary interpreter terminal. All three now preserve Eden's size validation, combined
+  index/register selection, scalar/vector operand shapes, saturation opcodes, and destination form.
+- Fixed: the existing floating-point helpers used `V_scalar(idxdsize, Vm)` for the indexed source,
+  then passed that scalar through `VectorGetElement`. They now read `V(idxdsize, Vm)` as Eden does.
+- Fixed: the three upstream helpers lived as methods on `TranslatorVisitor`, obscuring their
+  anonymous-namespace ownership, and `CombineScalar` was open-coded only in the floating-point
+  path. All three helpers now have their matching file-local ownership.
+
+### Missing items
+- None for the nine visitors and three file-local helpers defined by the reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both
+  `CombineScalar` layouts, all three restored identities at 16/32 bits, reserved 8/64-bit sizes,
+  indexed vector-read shape, and the existing floating-point family.

@@ -8701,3 +8701,25 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: decoder identifiers and exception IR are host-internal. Focused tests verify the exact
   16/32-bit encodings and exception discriminants rather than a raw guest payload.
+
+## 2026-08-23 — `src/rdynarmic/src/backend/x64/emit_data_processing.rs` vs Eden `backend/x64/emit_x64_data_processing.cpp` (`ExtractRegister`)
+
+### Intentional differences
+- Rust's `change_bit` and assembler methods return `Result`; the emitter unwraps them at the same
+  points where Eden relies on Xbyak assertions/errors. Register allocation and emission ownership
+  remain in the matching x64 data-processing module.
+
+### Unintentional differences (to fix)
+- Fixed: Ruzu previously branched on whether `lsb` was immediate and advertised dynamic
+  `ExtractRegister32`/`ExtractRegister64` paths that only panicked. Eden has one shared helper,
+  obtains `lsb` through `GetImmediateU8`, and unconditionally emits `SHRD`; Ruzu now does the same,
+  including Eden's scratch/source allocation and immediate-extraction order.
+
+### Missing items
+- None in the reviewed x64 `ExtractRegister32`/`ExtractRegister64` emitter slice. Dynamic `lsb` is
+  not an upstream feature: both opcode signatures accept `U8`, while both host backends require an
+  immediate at emission time.
+
+### Binary layout verification
+- N/A: this slice emits host x86-64 instructions and changes no raw-copied or serialized guest
+  structure. The focused regression covers both 32-bit and 64-bit widths with an immediate `lsb`.

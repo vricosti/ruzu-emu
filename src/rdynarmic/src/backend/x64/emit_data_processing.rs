@@ -1836,47 +1836,39 @@ pub fn emit_byte_reverse_half(
 // Extract / Pack
 // ---------------------------------------------------------------------------
 
-/// ExtractRegister32: result = (b:a) >> lsb  (EXTR instruction)
+fn emit_extract_register(ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bit_size: u16) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+
+    let result = ra
+        .use_scratch_gpr(&mut args[0])
+        .change_bit(bit_size)
+        .unwrap();
+    let operand = ra.use_gpr(&mut args[1]).change_bit(bit_size).unwrap();
+    let lsb = args[2].get_immediate_u8();
+
+    ra.asm.shrd(result, operand, lsb).unwrap();
+
+    ra.define_value(inst_ref, result);
+}
+
+/// ExtractRegister32: result = (b:a) >> lsb.
 pub fn emit_extract_register32(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-
-    if args[2].is_immediate() {
-        let lsb = args[2].get_immediate_u8();
-        let op1 = ra.use_scratch_gpr(&mut args[0]);
-        let op2 = ra.use_gpr(&mut args[1]);
-        // shrd op1, op2, imm: shifts op2:op1 right by imm, storing result in op1
-        ra.asm
-            .shrd(op1.cvt32().unwrap(), op2.cvt32().unwrap(), lsb)
-            .unwrap();
-        ra.define_value(inst_ref, op1);
-    } else {
-        unimplemented!("Dynamic ExtractRegister32");
-    }
+    emit_extract_register(ra, inst_ref, inst, 32);
 }
 
-/// ExtractRegister64: result = (b:a) >> lsb
+/// ExtractRegister64: result = (b:a) >> lsb.
 pub fn emit_extract_register64(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-
-    if args[2].is_immediate() {
-        let lsb = args[2].get_immediate_u8();
-        let op1 = ra.use_scratch_gpr(&mut args[0]);
-        let op2 = ra.use_gpr(&mut args[1]);
-        ra.asm.shrd(op1, op2, lsb).unwrap();
-        ra.define_value(inst_ref, op1);
-    } else {
-        unimplemented!("Dynamic ExtractRegister64");
-    }
+    emit_extract_register(ra, inst_ref, inst, 64);
 }
 
 /// Pack2x32To1x64: result = (high << 32) | low
@@ -2258,6 +2250,54 @@ mod tests {
 
     fn make_inst_info(count: usize) -> Vec<(u32, usize)> {
         vec![(1, 64); count]
+    }
+
+    #[test]
+    fn extract_register_immediates_emit_shrd_for_both_widths() {
+        for opcode in [Opcode::ExtractRegister32, Opcode::ExtractRegister64] {
+            let mut asm = CodeAssembler::new(4096).unwrap();
+            let inst_info = make_inst_info(3);
+            let mut ra = RegAlloc::new_default(&mut asm, inst_info);
+            let lhs = ra.scratch_gpr();
+            ra.define_value(InstRef(0), lhs);
+            ra.end_of_alloc_scope();
+            let rhs = ra.scratch_gpr();
+            ra.define_value(InstRef(1), rhs);
+            ra.end_of_alloc_scope();
+
+            let inst = Inst::new(
+                opcode,
+                &[
+                    Value::Inst(InstRef(0)),
+                    Value::Inst(InstRef(1)),
+                    Value::ImmU8(7),
+                ],
+            );
+            let config = dummy_emit_config();
+            let ctx = EmitContext::new(LocationDescriptor::new(0), &config);
+            let start = ra.asm.size();
+
+            match opcode {
+                Opcode::ExtractRegister32 => {
+                    emit_extract_register32(&ctx, &mut ra, InstRef(2), &inst)
+                }
+                Opcode::ExtractRegister64 => {
+                    emit_extract_register64(&ctx, &mut ra, InstRef(2), &inst)
+                }
+                _ => unreachable!(),
+            }
+            ra.end_of_alloc_scope();
+
+            let code = &ra.asm.code()[start..];
+            let shrd = code
+                .windows(2)
+                .position(|bytes| bytes == [0x0f, 0xac])
+                .unwrap_or_else(|| panic!("missing SHRD for {opcode:?}: {code:02x?}"));
+            assert_eq!(code.last(), Some(&7), "opcode={opcode:?}");
+
+            let has_rex_w = shrd > 0 && code[shrd - 1] & 0xf8 == 0x48;
+            assert_eq!(has_rex_w, opcode == Opcode::ExtractRegister64);
+        }
     }
 
     #[test]

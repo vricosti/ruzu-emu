@@ -101,8 +101,9 @@ the focused A32 coprocessor slice.
 
 ## Known behavioral gaps found during baseline
 
-- `backend/x64/emit_data_processing.rs` still contains dynamic
-  `ExtractRegister32` and `ExtractRegister64` `unimplemented!()` paths.
+- Resolved: `ExtractRegister32` and `ExtractRegister64` do not have dynamic-lsb
+  paths upstream. The x64 emitter now mirrors Eden's shared helper, immediate
+  extraction order, register-width conversion, and unconditional `SHRD`.
 - `common/fp/process_exception.rs` logs floating-point exception raising as
   unimplemented rather than following Eden's exception-state behavior.
 - The arm64 backend reports unimplemented vector-saturation opcodes.

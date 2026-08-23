@@ -113,13 +113,13 @@ validation blockers, not evidence against the focused slices.
 - A32/A64 exception types and A64 cache-operation types now live in their matching configuration
   owners with Eden's four-byte enum representation. Frontend type modules retain temporary
   compatibility re-exports until their consumers are migrated.
-- A32 and A64 still share one public `JitConfig` instead of matching Eden's
-  separate `interface/A32/config.h` and `interface/A64/config.h` owners.
-- The temporary shared callback trait no longer invents separate exclusive-read, exclusive-clear,
-  or interpreter-fallback host events: all backends use `MemoryRead*`, clear only resets backend
-  reservation state, and unsupported instructions follow Eden's translator exception/assertion
-  paths. Splitting the remaining architecture-specific callback surface is the active prerequisite
-  for splitting `JitConfig`.
+- A32 and A64 now own callback traits with Eden's exact architecture-specific address widths,
+  vectors, typed events, translation hooks, timing methods, and default implementations. Runtime
+  consumers still reach them through the temporary shared `jit_config::UserCallbacks` bridge; the
+  next owner slices migrate A32 and A64 consumers before deleting that bridge.
+- A32 and A64 still share one public `JitConfig` instead of matching Eden's separate
+  `interface/A32/config.h` and `interface/A64/config.h` owners. That split resumes after the runtime
+  callback migration.
 - Several A32 instruction families remain aggregated in broad Rust modules;
   the Thumb32 byte/preload, halfword-load, word-load, store-single,
   dual/exclusive/table-branch, and load/store-multiple owners are now split.

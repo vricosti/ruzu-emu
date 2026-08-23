@@ -9746,8 +9746,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   configuration interface. The complete thirteen-value enum now lives beside the A32 configuration.
 
 ### Missing items
-- None for the reviewed A32 exception inventory. `UserCallbacks` and `UserConfig` remain part of the
-  following configuration-ownership slice.
+- None for the reviewed A32 exception inventory. `UserCallbacks` was restored in the later
+  2026-08-24 configuration-owner slice; `UserConfig` remains outstanding.
 
 ### Binary layout verification
 - PASS: `repr(i32)` matches the default C++ scoped-enum underlying representation used by Eden;
@@ -9767,8 +9767,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the default C++ scoped-enum representation. Both now use `repr(i32)`.
 
 ### Missing items
-- None for the three reviewed A64 public enums. `UserCallbacks` and `UserConfig` remain part of the
-  following configuration-ownership slice.
+- None for the three reviewed A64 public enums. `UserCallbacks` was restored in the later
+  2026-08-24 configuration-owner slice; `UserConfig` remains outstanding.
 
 ### Binary layout verification
 - PASS: focused tests verify all discriminants and four-byte size/alignment for `Exception`,
@@ -9793,9 +9793,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   traits before the `UserConfig` split resumes.
 
 ### Missing items
-- Separate `interface/a32/config.rs::UserCallbacks` and
-  `interface/a64/config.rs::UserCallbacks` owners remain to be completed in the active prerequisite
-  slice.
+- The architecture-owned traits were added in the later 2026-08-24 configuration-owner slice.
+  Runtime consumers still use this shared trait through explicit compatibility implementations.
 
 ### Binary layout verification
 - N/A: Rust trait objects are not copied into guest or JIT binary payloads; this review verifies
@@ -10558,3 +10557,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: callback adapters, function pointers, and relocation discriminants are internal JIT
   plumbing and are not raw-copied guest payloads. Backend construction tests compile against the
   reduced callback inventory, and the bounded crate suite validates both host-independent paths.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/{a32,a64}/config.rs` vs Eden `interface/{A32,A64}/config.h` (`UserCallbacks` owners)
+
+### Intentional differences
+- Rust uses one architecture-owned trait per C++ callback struct. A32's four translation methods
+  are repeated on that trait and forwarded by `UserCallbacksAdapter`, because Rust cannot override
+  inherited trait defaults in the C++ manner while retaining the standalone `TranslateCallbacks`
+  interface.
+- Read callbacks take `&self` and write/event callbacks take `&mut self`; this expresses the
+  mutation boundary that C++ leaves implicit without changing callback order or values.
+- `jit_config.rs` temporarily implements both architecture traits for its legacy shared trait
+  object. This mechanical bridge keeps existing callers buildable while backend ownership is
+  migrated in the immediately following slices.
+
+### Unintentional differences (to fix)
+- Fixed: the matching A32 and A64 configuration owners lacked their `UserCallbacks` interfaces.
+  They now expose Eden's exact architecture-specific method inventories, `u32` versus `u64`
+  addresses, A64 vector shape, typed exceptions/cache operations, timing methods, and defaults.
+- Fixed: the A32 frontend adapter depended directly on the unrelated shared callback trait. It is
+  now generic over the A32-owned callback interface and forwards all four translation methods.
+- The legacy shared trait and its raw integer event surface remain in use by runtime/backend
+  consumers. They must be removed after those consumers migrate to the new typed owners.
+
+### Missing items
+- `UserConfig` remains missing from both architecture owners.
+- Direct A32 and A64 runtime/backend consumption of the new traits remains the next prerequisite
+  before the legacy shared callback trait can be deleted.
+
+### Binary layout verification
+- PASS: A32/A64 exception and cache-event enums retain their verified four-byte layouts; A64
+  `Vector = [u64; 2]` is verified as 16 bytes with eight-byte alignment. Trait objects themselves
+  are host-side interfaces and are not raw-copied guest payloads.

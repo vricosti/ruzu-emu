@@ -1,5 +1,5 @@
+use crate::interface::a32::config::UserCallbacks;
 use crate::ir::a32_emitter::A32IREmitter;
-use crate::jit_config::UserCallbacks;
 
 /// Translation-time callbacks used by the A32 frontend.
 ///
@@ -40,19 +40,19 @@ where
 /// Adapts the public JIT callback interface to the smaller translation-time
 /// contract, preserving the upstream `UserCallbacks : TranslateCallbacks`
 /// relationship without making the frontend depend on runtime callbacks.
-pub struct UserCallbacksAdapter<'a> {
-    callbacks: &'a dyn UserCallbacks,
+pub struct UserCallbacksAdapter<'a, T: UserCallbacks + ?Sized> {
+    callbacks: &'a T,
 }
 
-impl<'a> UserCallbacksAdapter<'a> {
-    pub fn new(callbacks: &'a dyn UserCallbacks) -> Self {
+impl<'a, T: UserCallbacks + ?Sized> UserCallbacksAdapter<'a, T> {
+    pub fn new(callbacks: &'a T) -> Self {
         Self { callbacks }
     }
 }
 
-impl TranslateCallbacks for UserCallbacksAdapter<'_> {
+impl<T: UserCallbacks + ?Sized> TranslateCallbacks for UserCallbacksAdapter<'_, T> {
     fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
-        self.callbacks.memory_read_code(vaddr as u64)
+        self.callbacks.memory_read_code(vaddr)
     }
 
     fn pre_code_read_hook(&self, is_thumb: bool, pc: u32, ir: &mut A32IREmitter<'_>) -> bool {

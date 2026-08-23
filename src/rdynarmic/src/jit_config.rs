@@ -147,6 +147,231 @@ pub trait UserCallbacks: Send {
     fn set_upper_location_descriptor_ptr(&mut self, _ptr: *const u32) {}
 }
 
+// Temporary compatibility bridge while callers move from the legacy shared
+// callback trait to the architecture-owned A32 and A64 interfaces.
+impl crate::interface::a32::config::UserCallbacks for dyn UserCallbacks + '_ {
+    fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
+        UserCallbacks::memory_read_code(self, vaddr as u64)
+    }
+
+    fn pre_code_read_hook(
+        &self,
+        is_thumb: bool,
+        pc: u32,
+        ir: &mut crate::ir::a32_emitter::A32IREmitter<'_>,
+    ) -> bool {
+        UserCallbacks::pre_code_read_hook(self, is_thumb, pc, ir)
+    }
+
+    fn pre_code_translation_hook(
+        &self,
+        is_thumb: bool,
+        pc: u32,
+        ir: &mut crate::ir::a32_emitter::A32IREmitter<'_>,
+    ) {
+        UserCallbacks::pre_code_translation_hook(self, is_thumb, pc, ir);
+    }
+
+    fn get_ticks_for_code(&self, is_thumb: bool, vaddr: u32, instruction: u32) -> u64 {
+        UserCallbacks::get_ticks_for_code(self, is_thumb, vaddr, instruction)
+    }
+
+    fn memory_read_8(&self, vaddr: u32) -> u8 {
+        UserCallbacks::memory_read_8(self, vaddr as u64)
+    }
+
+    fn memory_read_16(&self, vaddr: u32) -> u16 {
+        UserCallbacks::memory_read_16(self, vaddr as u64)
+    }
+
+    fn memory_read_32(&self, vaddr: u32) -> u32 {
+        UserCallbacks::memory_read_32(self, vaddr as u64)
+    }
+
+    fn memory_read_64(&self, vaddr: u32) -> u64 {
+        UserCallbacks::memory_read_64(self, vaddr as u64)
+    }
+
+    fn memory_write_8(&mut self, vaddr: u32, value: u8) {
+        UserCallbacks::memory_write_8(self, vaddr as u64, value);
+    }
+
+    fn memory_write_16(&mut self, vaddr: u32, value: u16) {
+        UserCallbacks::memory_write_16(self, vaddr as u64, value);
+    }
+
+    fn memory_write_32(&mut self, vaddr: u32, value: u32) {
+        UserCallbacks::memory_write_32(self, vaddr as u64, value);
+    }
+
+    fn memory_write_64(&mut self, vaddr: u32, value: u64) {
+        UserCallbacks::memory_write_64(self, vaddr as u64, value);
+    }
+
+    fn memory_write_exclusive_8(&mut self, vaddr: u32, value: u8, expected: u8) -> bool {
+        UserCallbacks::exclusive_write_8(self, vaddr as u64, value, expected)
+    }
+
+    fn memory_write_exclusive_16(&mut self, vaddr: u32, value: u16, expected: u16) -> bool {
+        UserCallbacks::exclusive_write_16(self, vaddr as u64, value, expected)
+    }
+
+    fn memory_write_exclusive_32(&mut self, vaddr: u32, value: u32, expected: u32) -> bool {
+        UserCallbacks::exclusive_write_32(self, vaddr as u64, value, expected)
+    }
+
+    fn memory_write_exclusive_64(&mut self, vaddr: u32, value: u64, expected: u64) -> bool {
+        UserCallbacks::exclusive_write_64(self, vaddr as u64, value, expected)
+    }
+
+    fn is_read_only_memory(&self, vaddr: u32) -> bool {
+        UserCallbacks::is_read_only_memory(self, vaddr)
+    }
+
+    fn call_svc(&mut self, swi: u32) {
+        UserCallbacks::call_supervisor(self, swi);
+    }
+
+    fn exception_raised(&mut self, pc: u32, exception: crate::interface::a32::config::Exception) {
+        UserCallbacks::exception_raised(self, pc as u64, exception.as_u32() as u64);
+    }
+
+    fn instruction_synchronization_barrier_raised(&mut self) {
+        UserCallbacks::instruction_synchronization_barrier_raised(self);
+    }
+
+    fn add_ticks(&mut self, ticks: u64) {
+        UserCallbacks::add_ticks(self, ticks);
+    }
+
+    fn get_ticks_remaining(&self) -> u64 {
+        UserCallbacks::get_ticks_remaining(self)
+    }
+}
+
+impl crate::interface::a64::config::UserCallbacks for dyn UserCallbacks + '_ {
+    fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+        UserCallbacks::memory_read_code(self, vaddr)
+    }
+
+    fn memory_read_8(&self, vaddr: u64) -> u8 {
+        UserCallbacks::memory_read_8(self, vaddr)
+    }
+
+    fn memory_read_16(&self, vaddr: u64) -> u16 {
+        UserCallbacks::memory_read_16(self, vaddr)
+    }
+
+    fn memory_read_32(&self, vaddr: u64) -> u32 {
+        UserCallbacks::memory_read_32(self, vaddr)
+    }
+
+    fn memory_read_64(&self, vaddr: u64) -> u64 {
+        UserCallbacks::memory_read_64(self, vaddr)
+    }
+
+    fn memory_read_128(&self, vaddr: u64) -> crate::interface::a64::config::Vector {
+        let (lo, hi) = UserCallbacks::memory_read_128(self, vaddr);
+        [lo, hi]
+    }
+
+    fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        UserCallbacks::memory_write_8(self, vaddr, value);
+    }
+
+    fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        UserCallbacks::memory_write_16(self, vaddr, value);
+    }
+
+    fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        UserCallbacks::memory_write_32(self, vaddr, value);
+    }
+
+    fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        UserCallbacks::memory_write_64(self, vaddr, value);
+    }
+
+    fn memory_write_128(&mut self, vaddr: u64, value: crate::interface::a64::config::Vector) {
+        UserCallbacks::memory_write_128(self, vaddr, value[0], value[1]);
+    }
+
+    fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        UserCallbacks::exclusive_write_8(self, vaddr, value, expected)
+    }
+
+    fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        UserCallbacks::exclusive_write_16(self, vaddr, value, expected)
+    }
+
+    fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        UserCallbacks::exclusive_write_32(self, vaddr, value, expected)
+    }
+
+    fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        UserCallbacks::exclusive_write_64(self, vaddr, value, expected)
+    }
+
+    fn memory_write_exclusive_128(
+        &mut self,
+        vaddr: u64,
+        value: crate::interface::a64::config::Vector,
+        expected: crate::interface::a64::config::Vector,
+    ) -> bool {
+        UserCallbacks::exclusive_write_128(
+            self,
+            vaddr,
+            value[0],
+            value[1],
+            expected[0],
+            expected[1],
+        )
+    }
+
+    fn is_read_only_memory(&self, vaddr: u64) -> bool {
+        UserCallbacks::is_read_only_memory(self, vaddr as u32)
+    }
+
+    fn call_svc(&mut self, swi: u32) {
+        UserCallbacks::call_supervisor(self, swi);
+    }
+
+    fn exception_raised(&mut self, pc: u64, exception: crate::interface::a64::config::Exception) {
+        UserCallbacks::exception_raised(self, pc, exception as u64);
+    }
+
+    fn data_cache_operation_raised(
+        &mut self,
+        op: crate::interface::a64::config::DataCacheOperation,
+        value: u64,
+    ) {
+        UserCallbacks::data_cache_operation(self, op as u64, value);
+    }
+
+    fn instruction_cache_operation_raised(
+        &mut self,
+        op: crate::interface::a64::config::InstructionCacheOperation,
+        value: u64,
+    ) {
+        UserCallbacks::instruction_cache_operation(self, op as u64, value);
+    }
+
+    fn instruction_synchronization_barrier_raised(&mut self) {
+        UserCallbacks::instruction_synchronization_barrier_raised(self);
+    }
+
+    fn add_ticks(&mut self, ticks: u64) {
+        UserCallbacks::add_ticks(self, ticks);
+    }
+
+    fn get_ticks_remaining(&self) -> u64 {
+        UserCallbacks::get_ticks_remaining(self)
+    }
+
+    fn get_cntpct(&self) -> u64 {
+        UserCallbacks::get_cntpct(self)
+    }
+}
+
 // Compatibility re-export while the legacy shared `JitConfig` is split into
 // its upstream A32/A64 owners.
 pub use crate::interface::optimization_flags::OptimizationFlag;

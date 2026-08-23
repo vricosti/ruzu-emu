@@ -1725,7 +1725,7 @@ mod tests {
             .is_some());
 
         let client_session_object_id = process.handle_table.get_object(lm_handle).unwrap();
-        let client_session = process
+        let _client_session = process
             .get_client_session_by_object_id(client_session_object_id)
             .unwrap();
         let parent_id = process

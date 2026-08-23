@@ -110,9 +110,5 @@ the focused A32 coprocessor slice.
   performs encoding validation inside each visitor before
   `ArmConditionPassed`; restoring that ordering requires a frontend-wide
   ownership change.
-- The AArch64 backend has no `emit_arm64_packed.rs` counterpart for Eden's
-  `emit_arm64_packed.cpp`; its 36 implemented packed IR emitters are absent
-  from the ARM64 dispatcher.
-
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

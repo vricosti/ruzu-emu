@@ -8819,3 +8819,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct internal SSA and serialize no guest payload. Focused tests verify
   immediate address operands, absence of synthetic Add32/Sub32 operations, exception terminals,
   LDR-to-PC dispatch, LDRD access atomicity, and endian-dependent opcode ordering.
+
+## 2026-08-23 — `src/rdynarmic/src/backend/arm64/emit_arm64_packed.rs` vs Eden `backend/arm64/emit_arm64_packed.cpp`
+
+### Intentional differences
+- Eden emits through Oaknut register wrappers. Ruzu propagates encoder/allocation failures with
+  `Result` and passes realized vector-register indexes to its existing `inst.rs` encoder boundary;
+  the upstream helper ownership and instruction ordering remain local to the matching packed file.
+- Eden declares generic `EmitIR` specializations through `emit_arm64.h`. Ruzu's central dispatcher
+  routes the same opcode set to `emit_packed_instruction`, while each implementation remains owned
+  by the new file corresponding to `emit_arm64_packed.cpp`.
+
+### Unintentional differences (to fix)
+- Fixed: the ARM64 dispatcher rejected all 34 packed opcodes. The matching Rust owner now emits
+  Eden's eight add/sub operations and optional GE results, eight mixed add/sub operations, twelve
+  halving operations, eight saturating operations, absolute-difference sum, and packed selection.
+- Fixed: the mixed add/sub family now preserves Eden's V0/V1/V2 scratch sequence, lane rotation,
+  signed/unsigned widening and halving, GE mask construction, and final narrowing order.
+- Fixed: saturating operations spill the deferred FPSR state before modifying host QC, matching
+  Eden's lifecycle order rather than allowing a later FPSR restore to overwrite the result.
+
+### Missing items
+- None among the 34 explicit `EmitIR` specializations in the reviewed Eden file.
+
+### Binary layout verification
+- N/A: this file defines no raw-copied payload. AArch64 tests run under QEMU route all 34 opcodes
+  and compare parity-sensitive GE, scratch-register, saturation, absolute-difference, and select
+  sequences against exact 32-bit instruction words from the independently verified encoders.

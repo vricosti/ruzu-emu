@@ -84,6 +84,7 @@ use crate::backend::arm64::emit_arm64_floating_point::{
     emit_fp_single_to_fixed_u64, emit_fp_single_to_half, emit_fp_sqrt32, emit_fp_sqrt64,
     emit_fp_sub32, emit_fp_sub64,
 };
+use crate::backend::arm64::emit_arm64_packed::emit_packed_instruction;
 use crate::backend::arm64::emit_arm64_saturation::{
     emit_signed_saturated_add_with_flag32, emit_signed_saturated_sub_with_flag32,
     emit_signed_saturation, emit_unsigned_saturation,
@@ -761,6 +762,40 @@ fn emit_ir_instruction(
         Opcode::SHA256Hash => emit_sha256_hash(code, ctx, inst_ref),
         Opcode::SHA256MessageSchedule0 => emit_sha256_message_schedule_0(code, ctx, inst_ref),
         Opcode::SHA256MessageSchedule1 => emit_sha256_message_schedule_1(code, ctx, inst_ref),
+        Opcode::PackedAddU8
+        | Opcode::PackedAddS8
+        | Opcode::PackedSubU8
+        | Opcode::PackedSubS8
+        | Opcode::PackedAddU16
+        | Opcode::PackedAddS16
+        | Opcode::PackedSubU16
+        | Opcode::PackedSubS16
+        | Opcode::PackedAddSubU16
+        | Opcode::PackedAddSubS16
+        | Opcode::PackedSubAddU16
+        | Opcode::PackedSubAddS16
+        | Opcode::PackedHalvingAddU8
+        | Opcode::PackedHalvingAddS8
+        | Opcode::PackedHalvingSubU8
+        | Opcode::PackedHalvingSubS8
+        | Opcode::PackedHalvingAddU16
+        | Opcode::PackedHalvingAddS16
+        | Opcode::PackedHalvingSubU16
+        | Opcode::PackedHalvingSubS16
+        | Opcode::PackedHalvingAddSubU16
+        | Opcode::PackedHalvingAddSubS16
+        | Opcode::PackedHalvingSubAddU16
+        | Opcode::PackedHalvingSubAddS16
+        | Opcode::PackedSaturatedAddU8
+        | Opcode::PackedSaturatedAddS8
+        | Opcode::PackedSaturatedSubU8
+        | Opcode::PackedSaturatedSubS8
+        | Opcode::PackedSaturatedAddU16
+        | Opcode::PackedSaturatedAddS16
+        | Opcode::PackedSaturatedSubU16
+        | Opcode::PackedSaturatedSubS16
+        | Opcode::PackedAbsDiffSumU8
+        | Opcode::PackedSelect => emit_packed_instruction(code, ctx, inst_ref),
         Opcode::VectorSignedSaturatedAdd8
         | Opcode::VectorSignedSaturatedAdd16
         | Opcode::VectorSignedSaturatedAdd32
@@ -2131,6 +2166,166 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn emit_arm64_routes_all_eden_packed_opcodes() {
+        let binary_opcodes = [
+            Opcode::PackedAddU8,
+            Opcode::PackedAddS8,
+            Opcode::PackedSubU8,
+            Opcode::PackedSubS8,
+            Opcode::PackedAddU16,
+            Opcode::PackedAddS16,
+            Opcode::PackedSubU16,
+            Opcode::PackedSubS16,
+            Opcode::PackedAddSubU16,
+            Opcode::PackedAddSubS16,
+            Opcode::PackedSubAddU16,
+            Opcode::PackedSubAddS16,
+            Opcode::PackedHalvingAddU8,
+            Opcode::PackedHalvingAddS8,
+            Opcode::PackedHalvingSubU8,
+            Opcode::PackedHalvingSubS8,
+            Opcode::PackedHalvingAddU16,
+            Opcode::PackedHalvingAddS16,
+            Opcode::PackedHalvingSubU16,
+            Opcode::PackedHalvingSubS16,
+            Opcode::PackedHalvingAddSubU16,
+            Opcode::PackedHalvingAddSubS16,
+            Opcode::PackedHalvingSubAddU16,
+            Opcode::PackedHalvingSubAddS16,
+            Opcode::PackedSaturatedAddU8,
+            Opcode::PackedSaturatedAddS8,
+            Opcode::PackedSaturatedSubU8,
+            Opcode::PackedSaturatedSubS8,
+            Opcode::PackedSaturatedAddU16,
+            Opcode::PackedSaturatedAddS16,
+            Opcode::PackedSaturatedSubU16,
+            Opcode::PackedSaturatedSubS16,
+            Opcode::PackedAbsDiffSumU8,
+        ];
+
+        for opcode in binary_opcodes {
+            let mut block = return_to_dispatch_block();
+            block.append(
+                opcode,
+                &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
+            );
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap_or_else(|error| panic!("{opcode:?} failed ARM64 emission: {error}"));
+        }
+
+        let mut block = return_to_dispatch_block();
+        block.append(
+            Opcode::PackedSelect,
+            &[
+                Value::ImmU32(0x00ff_00ff),
+                Value::ImmU32(0x1122_3344),
+                Value::ImmU32(0xaabb_ccdd),
+            ],
+        );
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&config(false)),
+        )
+        .expect("PackedSelect must be routed to the packed emitter");
+    }
+
+    #[test]
+    fn emit_arm64_packed_add_u8_emits_eden_ge_sequence() {
+        let mut block = return_to_dispatch_block();
+        let result = block.append(
+            Opcode::PackedAddU8,
+            &[Value::ImmU32(0xffff_00ff), Value::ImmU32(0x0102_0304)],
+        );
+        let ge = block.append(Opcode::GetGEFromOp, &[Value::Inst(result)]);
+        block.append(
+            Opcode::A64SetW,
+            &[Value::ImmA64Reg(A64Reg::R0), Value::Inst(result)],
+        );
+        block.append(
+            Opcode::A64SetW,
+            &[Value::ImmA64Reg(A64Reg::R1), Value::Inst(ge)],
+        );
+        block.rebuild_pseudo_op_links();
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+
+        let info = emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&config(false)),
+        )
+        .unwrap();
+        let words = (0..info.size)
+            .step_by(4)
+            .map(|offset| read_instruction(&code, offset))
+            .collect::<Vec<_>>();
+
+        assert!(words.contains(&inst::add_v(8, 9, 10, 8, false)));
+        assert!(words.contains(&inst::cmhi_v(11, 9, 8, 8, false)));
+    }
+
+    #[test]
+    fn emit_arm64_packed_complex_sequences_match_eden_scratch_usage() {
+        let mut block = return_to_dispatch_block();
+        block.append(
+            Opcode::PackedAddSubU16,
+            &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
+        );
+        block.append(
+            Opcode::PackedSaturatedAddU16,
+            &[Value::ImmU32(0xffff_ffff), Value::ImmU32(0x0001_0001)],
+        );
+        block.append(
+            Opcode::PackedAbsDiffSumU8,
+            &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
+        );
+        block.append(
+            Opcode::PackedSelect,
+            &[
+                Value::ImmU32(0x00ff_00ff),
+                Value::ImmU32(0x1122_3344),
+                Value::ImmU32(0xaabb_ccdd),
+            ],
+        );
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+
+        let info = emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&config(false)),
+        )
+        .unwrap();
+        let words = (0..info.size)
+            .step_by(4)
+            .map(|offset| read_instruction(&code, offset))
+            .collect::<Vec<_>>();
+
+        assert!(words.contains(&inst::uxtl_v(0, 9, 16)));
+        assert!(words.contains(&inst::uxtl_v(1, 10, 16)));
+        assert!(words.contains(&inst::ext_v16b(1, 1, 1, 4, false)));
+        assert!(words.contains(&inst::movi_v8b_imm(2, 0xf0)));
+        assert!(words.contains(&inst::eor_v8b(1, 1, 2)));
+        assert!(words.contains(&inst::sub_v(8, 0, 1, 32, false)));
+        assert!(words.contains(&inst::xtn_v(8, 8, 32)));
+        assert!(words.iter().any(|word| {
+            *word == inst::uqadd_v(8, 9, 10, 16, false)
+                || *word == inst::uqadd_v(9, 10, 11, 16, false)
+        }));
+        assert!(words.contains(&inst::uabd_v(8, 9, 10, 8, false)));
+        assert!(words.contains(&inst::and_v8b(8, 8, 2)));
+        assert!(words.contains(&inst::uaddlv_from_v(8, 8, 8, false)));
+        assert!(words.contains(&inst::fmov_d(8, 9)));
+        assert!(words.contains(&inst::bsl_v8b(8, 11, 10)));
     }
 
     #[test]

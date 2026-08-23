@@ -8745,3 +8745,77 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused encoder tests compare every new form against exact 32-bit words independently
   assembled with GNU AArch64 binutils, including both MOVI masks, all element widths used by
   `SHRN`/`UADDLV`, and the 64-bit vector logical/compare forms.
+
+## 2026-08-23 — `src/rdynarmic/src/backend/arm64/a32_address_space.rs` vs Eden `backend/arm64/a32_address_space.cpp` (`GenerateIR` constant reads)
+
+### Intentional differences
+- Eden's central `Optimization::Optimize` obtains `MemoryReadCode` and `IsReadOnlyMemory` through
+  `A32::UserCallbacks`. Ruzu invokes the already-separated Rust passes explicitly and supplies two
+  closures over the same callback owner.
+
+### Unintentional differences (to fix)
+- Fixed: the ARM64 address space called `a32_constant_memory_reads` with an undefined `read_code`
+  identifier. Native x86-64 builds did not compile this target-specific owner, but AArch64 builds
+  failed. The closure now delegates `u32` A32 addresses to `UserCallbacks::memory_read_code` with
+  the same widening used by the translation callback adapter.
+
+### Missing items
+- No constant-memory callback is missing in the reviewed `GenerateIR` path. Broader optimization
+  pass order and ownership remain tracked separately from this compile-blocking correction.
+
+### Binary layout verification
+- N/A: this change only restores a host callback passed to an IR optimization; it changes no
+  raw-copied or serialized guest structure and preserves the guest address as an unsigned 32-bit
+  value before widening it to the public callback's `u64` parameter.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder.rs` vs Eden `frontend/A32/decoder/arm.inc` (literal loads)
+
+### Intentional differences
+- Eden generates its ARM decoder from per-instruction bit-pattern declarations in `arm.inc`.
+  Ruzu's existing decoder is a handwritten decision tree, so the six literal patterns are routed
+  explicitly inside the matching load/store decode families.
+
+### Unintentional differences (to fix)
+- Fixed: the extra-load/store decoder never produced `LDRD_lit`, `LDRH_lit`, `LDRSB_lit`, or
+  `LDRSH_lit`, even though their identifiers existed. It now matches Eden's Rn=PC pattern priority
+  and preserves Eden's fixed P=1/W=0 constraints for the doubleword and signed literal forms.
+
+### Missing items
+- None among Eden's six reviewed ARM literal-load patterns: `LDR`, `LDRB`, `LDRD`, `LDRH`,
+  `LDRSB`, and `LDRSH` all have reachable Rust decoder identifiers.
+
+### Binary layout verification
+- N/A: the decoder classifies fixed 32-bit instruction words and defines no raw-copied payload.
+  Focused tests cover all six Eden patterns plus non-literal PC encodings that must remain routed
+  to immediate visitors and raise UnpredictableInstruction there.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/{load_store.rs,mod.rs}` vs Eden `frontend/A32/translate/impl/{load_store.cpp,a32_translate_impl.h}` (load visitors)
+
+### Intentional differences
+- Rust extracts typed fields from `DecodedArm` inside each matching snake-case visitor; Eden's
+  generated decoder passes them as typed parameters. ARM condition-state bookkeeping remains in
+  Ruzu's block translator rather than being repeated in every visitor.
+- Rust uses `wrapping_add`/`wrapping_sub` to state C++ unsigned-`u32` address wraparound explicitly,
+  and `Reg::from_u32` replaces Eden's register `operator+` after the same validity checks.
+
+### Unintentional differences (to fix)
+- Fixed: all six literal-load identifiers shared immediate visitors. Dedicated Rust visitors now
+  own Eden's exact immediate PC-relative address calculation, access width/type, extension,
+  destination handling, terminal choice, and LDRD endian-sensitive split order.
+- Fixed: immediate and register-offset load visitors omitted Eden's register/writeback validation;
+  LDR register-to-PC also omitted Eden's PopRSBHint branch. The reviewed `LDR`, `LDRB`, `LDRD`,
+  `LDRH`, `LDRSB`, and `LDRSH` load methods now preserve those checks before reading operands.
+- Frontend-wide pre-existing difference: Ruzu performs condition-state setup before dispatch,
+  whereas Eden performs each visitor's encoding validation before `ArmConditionPassed`. Correcting
+  that ordering requires restoring visitor-owned condition state across the A32 frontend, not a
+  load/store-local helper, and remains a separate structural slice.
+
+### Missing items
+- None among the reviewed literal, immediate, and register variants of `LDR`, `LDRB`, `LDRD`,
+  `LDRH`, `LDRSB`, and `LDRSH`. Store visitors and the unprivileged `*T` methods were not claimed
+  by this prerequisite slice.
+
+### Binary layout verification
+- N/A: these visitors construct internal SSA and serialize no guest payload. Focused tests verify
+  immediate address operands, absence of synthetic Add32/Sub32 operations, exception terminals,
+  LDR-to-PC dispatch, LDRD access atomicity, and endian-dependent opcode ordering.

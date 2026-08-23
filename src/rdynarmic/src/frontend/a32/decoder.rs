@@ -1052,18 +1052,25 @@ fn decode_arm_extra_ls(instr: u32) -> ArmInstId {
     let op2 = (instr >> 5) & 3;
     let load = op1 & 1 != 0;
     let imm = op1 & 0x4 != 0; // bit 22
+    let rn = (instr >> 16) & 0xF;
+    let p = instr & (1 << 24) != 0;
+    let w = instr & (1 << 21) != 0;
 
     match (load, op2) {
         (false, 0b01) if imm => ArmInstId::STRH_imm,
         (false, 0b01) => ArmInstId::STRH_reg,
+        (false, 0b10) if imm && rn == 15 && p && !w => ArmInstId::LDRD_lit,
         (false, 0b10) if imm => ArmInstId::LDRD_imm,
         (false, 0b10) => ArmInstId::LDRD_reg,
         (false, 0b11) if imm => ArmInstId::STRD_imm,
         (false, 0b11) => ArmInstId::STRD_reg,
+        (true, 0b01) if imm && rn == 15 => ArmInstId::LDRH_lit,
         (true, 0b01) if imm => ArmInstId::LDRH_imm,
         (true, 0b01) => ArmInstId::LDRH_reg,
+        (true, 0b10) if imm && rn == 15 && p && !w => ArmInstId::LDRSB_lit,
         (true, 0b10) if imm => ArmInstId::LDRSB_imm,
         (true, 0b10) => ArmInstId::LDRSB_reg,
+        (true, 0b11) if imm && rn == 15 && p && !w => ArmInstId::LDRSH_lit,
         (true, 0b11) if imm => ArmInstId::LDRSH_imm,
         (true, 0b11) => ArmInstId::LDRSH_reg,
         _ => ArmInstId::Unknown,
@@ -1603,6 +1610,42 @@ mod tests {
         let instr = 0xE591_0004;
         let dec = decode_arm(instr);
         assert_eq!(dec.id, ArmInstId::LDR_imm);
+    }
+
+    #[test]
+    fn test_decode_arm_literal_loads_match_upstream_patterns() {
+        for (instruction, expected) in [
+            (0xE59F_0000, ArmInstId::LDR_lit),
+            (0xE5DF_0000, ArmInstId::LDRB_lit),
+            (0xE1DF_00B0, ArmInstId::LDRH_lit),
+            (0xE1DF_00D0, ArmInstId::LDRSB_lit),
+            (0xE1DF_00F0, ArmInstId::LDRSH_lit),
+            (0xE1CF_00D0, ArmInstId::LDRD_lit),
+        ] {
+            assert_eq!(
+                decode_arm(instruction).id,
+                expected,
+                "instruction 0x{instruction:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_invalid_pc_based_extra_loads_stay_immediate() {
+        // Eden's LDRD/LDRSB/LDRSH literal patterns require P=1 and W=0.
+        // Other PC-based encodings must reach their immediate visitors, which
+        // report UnpredictableInstruction.
+        for (instruction, expected) in [
+            (0xE0EF_00D0, ArmInstId::LDRD_imm),
+            (0xE0FF_00D0, ArmInstId::LDRSB_imm),
+            (0xE0FF_00F0, ArmInstId::LDRSH_imm),
+        ] {
+            assert_eq!(
+                decode_arm(instruction).id,
+                expected,
+                "instruction 0x{instruction:08X}"
+            );
+        }
     }
 
     #[test]

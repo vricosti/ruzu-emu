@@ -743,6 +743,7 @@ impl A32AddressSpace {
             opt::dead_code_elimination(&mut block);
         }
         if self.conf.has_optimization(OptimizationFlag::CONST_PROP) {
+            let read_code = |vaddr: u32| self.conf.callbacks.memory_read_code(vaddr as u64);
             let is_read_only = |vaddr: u32| self.conf.callbacks.is_read_only_memory(vaddr);
             opt::a32_constant_memory_reads(&mut block, &read_code, &is_read_only);
             opt::constant_propagation(&mut block);
@@ -1139,6 +1140,7 @@ mod tests {
     use crate::backend::common::emit_context::MemoryEmitConfig;
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
+    use crate::ir::opcode::Opcode;
     use crate::jit_config::UserCallbacks;
 
     struct TestCallbacks {
@@ -1150,6 +1152,10 @@ mod tests {
         fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
             let index = (vaddr / 4) as usize;
             self.code.get(index).copied()
+        }
+
+        fn is_read_only_memory(&self, _vaddr: u32) -> bool {
+            true
         }
 
         fn memory_read_8(&self, _vaddr: u64) -> u8 {
@@ -1354,6 +1360,43 @@ mod tests {
             A32LocationDescriptor::from_location(block.end_location()).pc(),
             4
         );
+    }
+
+    #[test]
+    fn generate_ir_const_prop_reads_code_through_callbacks() {
+        let mut conf = config(vec![0xe59f_0000, 0xe1a0_0000, 0x1234_5678]);
+        conf.optimizations = OptimizationFlag::CONST_PROP;
+        let address_space = A32AddressSpace::new(conf).unwrap();
+        assert!(address_space
+            .config()
+            .has_optimization(OptimizationFlag::CONST_PROP));
+        assert!(address_space.config().callbacks.is_read_only_memory(8));
+        assert_eq!(
+            address_space.config().callbacks.memory_read_code(8),
+            Some(0x1234_5678)
+        );
+        let descriptor = A32LocationDescriptor::at(0)
+            .set_single_stepping(true)
+            .to_location();
+
+        let block = address_space.generate_ir(descriptor);
+        let active = block
+            .instructions
+            .iter()
+            .filter(|inst| !inst.is_tombstone())
+            .collect::<Vec<_>>();
+
+        assert!(
+            active
+                .iter()
+                .all(|inst| inst.opcode != Opcode::A32ReadMemory32),
+            "active IR: {active:#?}"
+        );
+        assert!(block
+            .instructions
+            .iter()
+            .flat_map(|inst| inst.args.iter())
+            .any(|value| *value == crate::ir::value::Value::ImmU32(0x1234_5678)));
     }
 
     #[test]

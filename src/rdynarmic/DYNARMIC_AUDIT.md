@@ -101,17 +101,18 @@ the focused A32 coprocessor slice.
 
 ## Known behavioral gaps found during baseline
 
-- Resolved: `ExtractRegister32` and `ExtractRegister64` do not have dynamic-lsb
-  paths upstream. The x64 emitter now mirrors Eden's shared helper, immediate
-  extraction order, register-width conversion, and unconditional `SHRD`.
-- `common/fp/process_exception.rs` logs floating-point exception raising as
-  unimplemented rather than following Eden's exception-state behavior.
-- The arm64 backend reports unimplemented vector-saturation opcodes.
 - A32 and A64 still share one public `JitConfig` instead of matching Eden's
   separate `interface/A32/config.h` and `interface/A64/config.h` owners.
 - Several A32 instruction families remain aggregated in broad Rust modules;
   notably the Thumb32 preload methods are not yet owned by a matching
   `thumb32_load_byte.rs` counterpart.
+- A32 condition-state setup is centralized before visitor dispatch, while Eden
+  performs encoding validation inside each visitor before
+  `ArmConditionPassed`; restoring that ordering requires a frontend-wide
+  ownership change.
+- The AArch64 backend has no `emit_arm64_packed.rs` counterpart for Eden's
+  `emit_arm64_packed.cpp`; its 36 implemented packed IR emitters are absent
+  from the ARM64 dispatcher.
 
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

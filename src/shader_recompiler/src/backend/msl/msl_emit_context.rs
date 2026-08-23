@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use crate::backend::bindings::Bindings;
 use crate::ir::instruction::Inst;
+use crate::ir::opcodes::Opcode;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
@@ -33,6 +34,7 @@ pub struct MslEmitContext {
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
     global_memory_resources: Vec<MslGlobalMemoryResource>,
+    global_atomic_helpers: Vec<Opcode>,
     uses_global_memory: bool,
     min_ssbo_alignment: u64,
     texture_buffers: Vec<MslTextureBufferDefinition>,
@@ -49,7 +51,7 @@ pub struct MslEmitContext {
     uses_storage_subword_cas: bool,
     uses_shared_subword_cas: bool,
     uses_atomic_inc_dec_cas: bool,
-    storage_fp_cas_helpers: [bool; 7],
+    fp_cas_helpers: [bool; 7],
     uses_texture_cast: bool,
     tracks_helper_invocation: bool,
     uses_cbuf_indirect: bool,
@@ -113,10 +115,10 @@ struct MslImageDefinition {
 }
 
 #[derive(Debug, Clone)]
-struct MslGlobalMemoryResource {
+pub(super) struct MslGlobalMemoryResource {
     cbuf_name: String,
     storage_name: String,
-    cbuf_offset: u32,
+    pub cbuf_offset: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +259,7 @@ impl MslEmitContext {
             &mut binding_counters.storage_buffer
         };
         let mut storage_index = 0u32;
+        let mut storage_descriptor_names = Vec::new();
         for descriptor in &program.info.storage_buffers_descriptors {
             let descriptor_binding = *binding_counter;
             *binding_counter += descriptor.count;
@@ -273,6 +276,7 @@ impl MslEmitContext {
             });
             let name = format!("ssbo{storage_index}");
             parameters.push(format!("device uint* {name} [[buffer({buffer_index})]]"));
+            storage_descriptor_names.push(name.clone());
             for alias in 0..descriptor.count {
                 storage_buffers.insert(storage_index + alias, name.clone());
             }
@@ -294,8 +298,8 @@ impl MslEmitContext {
                             .get(&descriptor.cbuf_index)
                             .cloned()
                             .ok_or(MslError::MissingConstantBuffer(descriptor.cbuf_index))?,
-                        storage_name: storage_buffers
-                            .get(&(index as u32))
+                        storage_name: storage_descriptor_names
+                            .get(index)
                             .cloned()
                             .ok_or(MslError::MissingStorageBuffer(index as u32))?,
                         cbuf_offset: descriptor.cbuf_offset,
@@ -652,6 +656,7 @@ impl MslEmitContext {
             constant_buffers,
             storage_buffers,
             global_memory_resources,
+            global_atomic_helpers: Vec::new(),
             uses_global_memory: program.info.uses_global_memory,
             min_ssbo_alignment: profile.min_ssbo_alignment.max(1),
             texture_buffers,
@@ -668,7 +673,7 @@ impl MslEmitContext {
             uses_storage_subword_cas: false,
             uses_shared_subword_cas: false,
             uses_atomic_inc_dec_cas: false,
-            storage_fp_cas_helpers: [false; 7],
+            fp_cas_helpers: [false; 7],
             uses_texture_cast: false,
             tracks_helper_invocation,
             uses_cbuf_indirect: program.info.uses_cbuf_indirect,
@@ -1413,7 +1418,7 @@ impl MslEmitContext {
         format!("{function}({})", arguments.join(", "))
     }
 
-    fn global_cbuf_word(name: &str, offset: u32) -> String {
+    pub(super) fn global_cbuf_word(name: &str, offset: u32) -> String {
         const COMPONENTS: [&str; 4] = ["x", "y", "z", "w"];
         format!(
             "{name}[{}u].{}",
@@ -1551,7 +1556,13 @@ impl MslEmitContext {
         self.uses_atomic_inc_dec_cas = true;
     }
 
-    pub fn require_storage_fp_cas(&mut self, function: &str) {
+    pub fn require_global_atomic_helper(&mut self, opcode: Opcode) {
+        if !self.global_atomic_helpers.contains(&opcode) {
+            self.global_atomic_helpers.push(opcode);
+        }
+    }
+
+    pub fn require_fp_cas(&mut self, function: &str) {
         let index = match function {
             "spvAtomicAddF32" => 0,
             "spvAtomicAddF16x2" => 1,
@@ -1560,9 +1571,9 @@ impl MslEmitContext {
             "spvAtomicMinF32x2" => 4,
             "spvAtomicMaxF16x2" => 5,
             "spvAtomicMaxF32x2" => 6,
-            _ => unreachable!("unknown storage FP CAS helper {function}"),
+            _ => unreachable!("unknown FP CAS helper {function}"),
         };
-        self.storage_fp_cas_helpers[index] = true;
+        self.fp_cas_helpers[index] = true;
     }
 
     fn unsupported_value_name(value: &Value) -> &'static str {
@@ -2046,10 +2057,8 @@ impl MslEmitContext {
                 "as_type<uint>(half2(result))",
             ),
         ];
-        for (enabled, (name, value_type, unpack, operation, pack)) in self
-            .storage_fp_cas_helpers
-            .into_iter()
-            .zip(STORAGE_FP_CAS_HELPERS)
+        for (enabled, (name, value_type, unpack, operation, pack)) in
+            self.fp_cas_helpers.into_iter().zip(STORAGE_FP_CAS_HELPERS)
         {
             if enabled {
                 Self::define_storage_fp_cas_helper(
@@ -2062,6 +2071,12 @@ impl MslEmitContext {
                 );
             }
         }
+        super::emit_msl_atomic::define_global_atomic_functions(
+            &mut source,
+            &self.global_memory_resources,
+            self.min_ssbo_alignment,
+            &self.global_atomic_helpers,
+        );
         if self.uses_texture_cast {
             source.push_str(concat!(
                 "template<typename T, typename U>\n",

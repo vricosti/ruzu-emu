@@ -3411,6 +3411,114 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_global_atomics_with_metal() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        assert!(profile.support_int64);
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_global_memory = true;
+        program.info.stores_global_memory = true;
+        program.info.uses_int64 = true;
+        program.info.nvn_buffer_used = 1;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x110,
+                count: 1,
+                is_written: true,
+            });
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicIAdd32,
+            vec![Value::ImmU64(0x1000), Value::ImmU32(1)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicInc32,
+            vec![Value::ImmU64(0x1004), Value::ImmU32(7)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicSMin64,
+            vec![Value::ImmU64(0x1008), Value::ImmU64(9)],
+        );
+        let address = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(0x1010), Value::ImmU32(0)],
+        );
+        let pair = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(5)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicSMax32x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: address,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: pair,
+                }),
+            ],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicAddF32,
+            vec![Value::ImmU64(0x1018), Value::ImmF32(0.5)],
+        );
+        let half_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF16x2,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0x4000)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicMinF16x2,
+            vec![
+                Value::ImmU64(0x101C),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: half_value,
+                }),
+            ],
+        );
+        let float_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicMaxF32x2,
+            vec![
+                Value::ImmU64(0x1020),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: float_value,
+                }),
+            ],
+        );
+
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &program,
+            &profile,
+            &RuntimeInfo::default(),
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+                fixed_subgroup_size: 32,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
+            },
+        )
+        .expect("global atomic IR must lower directly to MSL");
+        let shader = compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct global atomic MSL must compile as a native Metal function");
+        assert_eq!(shader.source().stage, Stage::Compute);
+        assert_eq!(shader.function().name().to_string(), "main0");
+    }
+
+    #[test]
     fn direct_bindings_compact_independent_metal_namespaces() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let profile = make_shader_profile(device.profile());

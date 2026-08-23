@@ -77,14 +77,6 @@ fn varying_mask_has_only_vertex_outputs(mask: &[u64; 8]) -> bool {
     })
 }
 
-fn program_uses_any_opcode(program: &ir::Program, opcodes: &[Opcode]) -> bool {
-    program
-        .blocks
-        .iter()
-        .flat_map(|block| block.iter())
-        .any(|inst| opcodes.contains(&inst.opcode))
-}
-
 fn first_unsupported_program_feature(
     program: &ir::Program,
     profile: &Profile,
@@ -154,31 +146,6 @@ fn first_unsupported_program_feature(
     }
     if info.uses_global_memory && !profile.support_int64 {
         return Some("global memory without 64-bit integers");
-    }
-    if program_uses_any_opcode(
-        program,
-        &[
-            Opcode::GlobalAtomicInc32,
-            Opcode::GlobalAtomicDec32,
-            Opcode::GlobalAtomicAddF32,
-            Opcode::GlobalAtomicAddF16x2,
-            Opcode::GlobalAtomicAddF32x2,
-            Opcode::GlobalAtomicMinF16x2,
-            Opcode::GlobalAtomicMinF32x2,
-            Opcode::GlobalAtomicMaxF16x2,
-            Opcode::GlobalAtomicMaxF32x2,
-            Opcode::GlobalAtomicIAdd64,
-            Opcode::GlobalAtomicSMin64,
-            Opcode::GlobalAtomicUMin64,
-            Opcode::GlobalAtomicSMax64,
-            Opcode::GlobalAtomicUMax64,
-            Opcode::GlobalAtomicAnd64,
-            Opcode::GlobalAtomicOr64,
-            Opcode::GlobalAtomicXor64,
-            Opcode::GlobalAtomicExchange64,
-        ],
-    ) {
-        return Some("memory operations");
     }
     if info.uses_invocation_id
         || info.uses_invocation_info
@@ -830,6 +797,44 @@ fn emit_inst(
         | Opcode::StorageAtomicMaxF16x2
         | Opcode::StorageAtomicMaxF32x2 => {
             emit_msl_atomic::emit_storage_atomic_fp(context, inst_ref, inst)
+        }
+        Opcode::GlobalAtomicIAdd32
+        | Opcode::GlobalAtomicSMin32
+        | Opcode::GlobalAtomicUMin32
+        | Opcode::GlobalAtomicSMax32
+        | Opcode::GlobalAtomicUMax32
+        | Opcode::GlobalAtomicInc32
+        | Opcode::GlobalAtomicDec32
+        | Opcode::GlobalAtomicAnd32
+        | Opcode::GlobalAtomicOr32
+        | Opcode::GlobalAtomicXor32
+        | Opcode::GlobalAtomicExchange32
+        | Opcode::GlobalAtomicIAdd64
+        | Opcode::GlobalAtomicSMin64
+        | Opcode::GlobalAtomicUMin64
+        | Opcode::GlobalAtomicSMax64
+        | Opcode::GlobalAtomicUMax64
+        | Opcode::GlobalAtomicAnd64
+        | Opcode::GlobalAtomicOr64
+        | Opcode::GlobalAtomicXor64
+        | Opcode::GlobalAtomicExchange64
+        | Opcode::GlobalAtomicIAdd32x2
+        | Opcode::GlobalAtomicSMin32x2
+        | Opcode::GlobalAtomicUMin32x2
+        | Opcode::GlobalAtomicSMax32x2
+        | Opcode::GlobalAtomicUMax32x2
+        | Opcode::GlobalAtomicAnd32x2
+        | Opcode::GlobalAtomicOr32x2
+        | Opcode::GlobalAtomicXor32x2
+        | Opcode::GlobalAtomicExchange32x2
+        | Opcode::GlobalAtomicAddF32
+        | Opcode::GlobalAtomicAddF16x2
+        | Opcode::GlobalAtomicAddF32x2
+        | Opcode::GlobalAtomicMinF16x2
+        | Opcode::GlobalAtomicMinF32x2
+        | Opcode::GlobalAtomicMaxF16x2
+        | Opcode::GlobalAtomicMaxF32x2 => {
+            emit_msl_atomic::emit_global_atomic(context, inst_ref, inst)
         }
         Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
             emit_msl_image::emit_image_sample(context, program, inst_ref, inst)
@@ -3309,23 +3314,266 @@ mod tests {
     }
 
     #[test]
-    fn rejects_global_int64_atomics_like_upstream() {
+    fn emits_all_global_atomic_families_through_nvn_storage_buffers() {
         let mut program = empty_program(Stage::Compute);
-        program.blocks[0].append_new_inst(
+        program.info.uses_global_memory = true;
+        program.info.stores_global_memory = true;
+        program.info.uses_int64 = true;
+        program.info.nvn_buffer_used = 1;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x110,
+                count: 1,
+                is_written: true,
+            });
+
+        for opcode in [
+            Opcode::GlobalAtomicIAdd32,
+            Opcode::GlobalAtomicSMin32,
+            Opcode::GlobalAtomicUMin32,
+            Opcode::GlobalAtomicSMax32,
+            Opcode::GlobalAtomicUMax32,
+            Opcode::GlobalAtomicInc32,
+            Opcode::GlobalAtomicDec32,
+            Opcode::GlobalAtomicAnd32,
+            Opcode::GlobalAtomicOr32,
+            Opcode::GlobalAtomicXor32,
+            Opcode::GlobalAtomicExchange32,
+        ] {
+            program.blocks[0]
+                .append_new_inst(opcode, vec![Value::ImmU64(0x1000), Value::ImmU32(7)]);
+        }
+        for opcode in [
             Opcode::GlobalAtomicIAdd64,
-            vec![Value::ImmU64(0), Value::ImmU64(1)],
+            Opcode::GlobalAtomicSMin64,
+            Opcode::GlobalAtomicUMin64,
+            Opcode::GlobalAtomicSMax64,
+            Opcode::GlobalAtomicUMax64,
+            Opcode::GlobalAtomicAnd64,
+            Opcode::GlobalAtomicOr64,
+            Opcode::GlobalAtomicXor64,
+            Opcode::GlobalAtomicExchange64,
+        ] {
+            program.blocks[0]
+                .append_new_inst(opcode, vec![Value::ImmU64(0x1008), Value::ImmU64(9)]);
+        }
+        let pair = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(0x1010), Value::ImmU32(0)],
         );
-        assert_eq!(
-            emit_msl(
-                &program,
-                &Profile {
-                    support_int64: true,
-                    ..Profile::default()
-                },
-                &RuntimeInfo::default(),
-            ),
-            Err(MslError::UnsupportedProgramFeature("memory operations"))
+        let pair_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(5)],
         );
+        for opcode in [
+            Opcode::GlobalAtomicIAdd32x2,
+            Opcode::GlobalAtomicSMin32x2,
+            Opcode::GlobalAtomicUMin32x2,
+            Opcode::GlobalAtomicSMax32x2,
+            Opcode::GlobalAtomicUMax32x2,
+            Opcode::GlobalAtomicAnd32x2,
+            Opcode::GlobalAtomicOr32x2,
+            Opcode::GlobalAtomicXor32x2,
+            Opcode::GlobalAtomicExchange32x2,
+        ] {
+            program.blocks[0].append_new_inst(
+                opcode,
+                vec![
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: pair,
+                    }),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: pair_value,
+                    }),
+                ],
+            );
+        }
+        program.blocks[0].append_new_inst(
+            Opcode::GlobalAtomicAddF32,
+            vec![Value::ImmU64(0x1018), Value::ImmF32(1.5)],
+        );
+        let half_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF16x2,
+            vec![Value::ImmF16(0x3C00), Value::ImmF16(0x4000)],
+        );
+        let float_value = program.blocks[0].append_new_inst(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
+        );
+        for opcode in [
+            Opcode::GlobalAtomicAddF16x2,
+            Opcode::GlobalAtomicMinF16x2,
+            Opcode::GlobalAtomicMaxF16x2,
+        ] {
+            program.blocks[0].append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU64(0x101C),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: half_value,
+                    }),
+                ],
+            );
+        }
+        for opcode in [
+            Opcode::GlobalAtomicAddF32x2,
+            Opcode::GlobalAtomicMinF32x2,
+            Opcode::GlobalAtomicMaxF32x2,
+        ] {
+            program.blocks[0].append_new_inst(
+                opcode,
+                vec![
+                    Value::ImmU64(0x1020),
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: float_value,
+                    }),
+                ],
+            );
+        }
+
+        let artifact = emit_msl(
+            &program,
+            &Profile {
+                support_int64: true,
+                unified_descriptor_binding: true,
+                min_ssbo_alignment: 16,
+                ..Profile::default()
+            },
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        let source = &artifact.source.source;
+        for opcode in [
+            Opcode::GlobalAtomicIAdd32,
+            Opcode::GlobalAtomicSMin32,
+            Opcode::GlobalAtomicUMin32,
+            Opcode::GlobalAtomicSMax32,
+            Opcode::GlobalAtomicUMax32,
+            Opcode::GlobalAtomicInc32,
+            Opcode::GlobalAtomicDec32,
+            Opcode::GlobalAtomicAnd32,
+            Opcode::GlobalAtomicOr32,
+            Opcode::GlobalAtomicXor32,
+            Opcode::GlobalAtomicExchange32,
+        ] {
+            assert!(
+                source.contains(&format!("inline uint spv{}(", opcode.name())),
+                "missing global atomic helper for {opcode:?}"
+            );
+        }
+        for opcode in [
+            Opcode::GlobalAtomicIAdd64,
+            Opcode::GlobalAtomicSMin64,
+            Opcode::GlobalAtomicUMin64,
+            Opcode::GlobalAtomicSMax64,
+            Opcode::GlobalAtomicUMax64,
+            Opcode::GlobalAtomicAnd64,
+            Opcode::GlobalAtomicOr64,
+            Opcode::GlobalAtomicXor64,
+            Opcode::GlobalAtomicExchange64,
+        ] {
+            assert!(
+                source.contains(&format!("inline ulong spv{}(", opcode.name())),
+                "missing global atomic helper for {opcode:?}"
+            );
+        }
+        for opcode in [
+            Opcode::GlobalAtomicIAdd32x2,
+            Opcode::GlobalAtomicSMin32x2,
+            Opcode::GlobalAtomicUMin32x2,
+            Opcode::GlobalAtomicSMax32x2,
+            Opcode::GlobalAtomicUMax32x2,
+            Opcode::GlobalAtomicAnd32x2,
+            Opcode::GlobalAtomicOr32x2,
+            Opcode::GlobalAtomicXor32x2,
+            Opcode::GlobalAtomicExchange32x2,
+        ] {
+            assert!(
+                source.contains(&format!("inline uint2 spv{}(", opcode.name())),
+                "missing global atomic helper for {opcode:?}"
+            );
+        }
+        assert!(source.contains("inline float spvGlobalAtomicAddF32("));
+        for opcode in [
+            Opcode::GlobalAtomicAddF16x2,
+            Opcode::GlobalAtomicAddF32x2,
+            Opcode::GlobalAtomicMinF16x2,
+            Opcode::GlobalAtomicMinF32x2,
+            Opcode::GlobalAtomicMaxF16x2,
+            Opcode::GlobalAtomicMaxF32x2,
+        ] {
+            assert!(
+                source.contains(&format!("inline uint spv{}(", opcode.name())),
+                "missing global atomic helper for {opcode:?}"
+            );
+        }
+        assert!(source.contains("reinterpret_cast<device atomic_uint*>(&global_ssbo0[element])"));
+        assert!(source.contains("reinterpret_cast<device atomic_int*>(pointer)"));
+        assert!(source.contains("return spvAtomicInc(pointer, value);"));
+        assert!(source.contains("return spvAtomicDec(pointer, value);"));
+        assert!(source.contains("uint2 original_words = uint2(global_ssbo0[base_word]"));
+        assert!(source.contains("as_type<ulong>(min(as_type<long>(original)"));
+        assert!(source.contains("as_type<uint2>(min(as_type<int2>(original_words)"));
+        assert!(source.contains("return spvAtomicAddF32(pointer, value);"));
+        assert!(source.contains("as_type<uint>(half2(spvAtomicMaxF32x2(pointer, value)))"));
+        assert!(source.contains("as_type<ulong>(v_0_20)"));
+    }
+
+    #[test]
+    fn global_memory_uses_descriptor_owner_after_array_storage_descriptor() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_global_memory = true;
+        program.info.uses_int64 = true;
+        program.info.nvn_buffer_used = 1 << 1;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x100,
+                count: 2,
+                is_written: false,
+            });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x110,
+                count: 1,
+                is_written: false,
+            });
+        program.blocks[0].append_new_inst(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]);
+
+        let artifact = emit_msl(
+            &program,
+            &Profile {
+                support_int64: true,
+                unified_descriptor_binding: true,
+                ..Profile::default()
+            },
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo2)"));
     }
 
     #[test]

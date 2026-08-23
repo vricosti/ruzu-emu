@@ -59,8 +59,7 @@ use super::metal_device::{MetalDevice, MetalDeviceProfile};
 use super::metal_framebuffer::MetalFramebuffer;
 use super::metal_shader::{
     compile_direct_msl_shader_with_bindings, compile_native_shader,
-    validate_direct_msl_against_active_module,
-    validate_direct_msl_against_active_module_with_bindings, DirectMslCompileError,
+    validate_direct_msl_module_against_compatibility, DirectMslCompileError,
     MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
 };
 
@@ -72,11 +71,6 @@ const CACHE_VERSION: u32 = 1;
 fn validate_direct_msl_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_VALIDATE_DIRECT_MSL").is_some())
-}
-
-fn use_direct_msl_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_USE_DIRECT_MSL").is_some())
 }
 
 fn subgroup_shader_stage_bits() -> u32 {
@@ -695,9 +689,7 @@ impl MetalPipelineCache {
     pub fn new(device: MetalDevice) -> Self {
         let profile = make_shader_profile(device.profile());
         let host_info = make_host_translate_info(device.profile());
-        if use_direct_msl_enabled() {
-            log::info!("Metal pipeline cache is using strict direct Maxwell IR to MSL compilation");
-        }
+        log::info!("Metal pipeline cache is using direct Maxwell IR to MSL compilation");
         Self {
             device,
             profile,
@@ -779,97 +771,91 @@ impl MetalPipelineCache {
         let mut options = MetalShaderCompileOptions::for_device(device.profile());
         options.enable_point_size_builtin = key.fixed_state.topology() == PrimitiveTopology::Points;
         options.disable_rasterization = !key.fixed_state.dynamic_state.rasterize_enable();
-        if use_direct_msl_enabled() {
-            let mut bindings = Bindings::default();
-            for translated_stage in translated.into_iter().flatten() {
-                let active = Arc::new(compile_direct_msl_shader_with_bindings(
-                    device.device(),
-                    &translated_stage.program,
-                    profile,
-                    &translated_stage.runtime_info,
-                    &options,
-                    &mut bindings,
-                )?);
-                match translated_stage.program.stage {
-                    Stage::VertexB => vertex = Some(active),
-                    Stage::Fragment => fragment = Some(active),
-                    stage => {
-                        return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
-                            Stage::VertexA => "unmerged vertex A",
-                            Stage::TessellationControl => "tessellation control",
-                            Stage::TessellationEval => "tessellation evaluation",
-                            Stage::Geometry => "geometry",
-                            Stage::Compute => "compute in graphics pipeline",
-                            Stage::VertexB | Stage::Fragment => unreachable!(),
-                        }))
-                    }
+        let mut direct_bindings = Bindings::default();
+        for translated_stage in translated.iter().flatten() {
+            let active = Arc::new(compile_direct_msl_shader_with_bindings(
+                device.device(),
+                &translated_stage.program,
+                profile,
+                &translated_stage.runtime_info,
+                &options,
+                &mut direct_bindings,
+            )?);
+            match translated_stage.program.stage {
+                Stage::VertexB => vertex = Some(active),
+                Stage::Fragment => fragment = Some(active),
+                stage => {
+                    return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
+                        Stage::VertexA => "unmerged vertex A",
+                        Stage::TessellationControl => "tessellation control",
+                        Stage::TessellationEval => "tessellation evaluation",
+                        Stage::Geometry => "geometry",
+                        Stage::Compute => "compute in graphics pipeline",
+                        Stage::VertexB | Stage::Fragment => unreachable!(),
+                    }))
                 }
             }
-        } else {
-            let emitted = catch_shader_exception(|| {
-                let mut bindings = Bindings::default();
-                let mut emitted: [Option<(TranslatedGraphicsShader, Vec<u32>, Bindings)>;
-                    NUM_GRAPHICS_STAGES] = Default::default();
-                for (index, translated_stage) in translated.into_iter().enumerate() {
-                    let Some(translated_stage) = translated_stage else {
-                        continue;
-                    };
-                    let binding_base = bindings.clone();
-                    let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
-                        &translated_stage.program,
-                        profile,
-                        &translated_stage.runtime_info,
-                        &mut bindings,
-                    );
-                    emitted[index] = Some((translated_stage, spirv_words, binding_base));
-                }
-                emitted
-            })
-            .map_err(MetalPipelineError::ShaderTranslation)?;
+        }
 
-            for emitted_stage in emitted.into_iter().flatten() {
-                let (translated_stage, spirv_words, mut direct_bindings) = emitted_stage;
-                let active = Arc::new(compile_native_shader(
-                    device.device(),
-                    device.profile(),
-                    &spirv_words,
-                    &options,
-                )?);
-                if validate_direct_msl_enabled() {
-                    match validate_direct_msl_against_active_module_with_bindings(
-                        device.device(),
-                        &translated_stage.program,
-                        profile,
-                        &translated_stage.runtime_info,
-                        &active,
-                        &mut direct_bindings,
-                    ) {
-                        Ok(_) => log::info!(
-                            "Direct MSL validation passed for {:?} graphics shader in pipeline 0x{:016X}",
-                            translated_stage.program.stage,
-                            key.hash_value()
-                        ),
-                        Err(error) => log::warn!(
-                            "Direct MSL validation failed for {:?} graphics shader in pipeline 0x{:016X}: {error}",
-                            translated_stage.program.stage,
-                            key.hash_value()
-                        ),
+        if validate_direct_msl_enabled() {
+            let validation = catch_shader_exception(|| {
+                let mut bindings = Bindings::default();
+                translated
+                    .iter()
+                    .flatten()
+                    .map(|translated_stage| {
+                        let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+                            &translated_stage.program,
+                            profile,
+                            &translated_stage.runtime_info,
+                            &mut bindings,
+                        );
+                        (translated_stage.program.stage, spirv_words)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            match validation {
+                Ok(emitted) => {
+                    for (stage, spirv_words) in emitted {
+                        let compatibility = compile_native_shader(
+                            device.device(),
+                            device.profile(),
+                            &spirv_words,
+                            &options,
+                        );
+                        let direct = match stage {
+                            Stage::VertexB => vertex.as_deref(),
+                            Stage::Fragment => fragment.as_deref(),
+                            _ => None,
+                        };
+                        match (direct, compatibility) {
+                            (Some(direct), Ok(compatibility)) => {
+                                match validate_direct_msl_module_against_compatibility(
+                                    direct,
+                                    &compatibility,
+                                ) {
+                                    Ok(()) => log::info!(
+                                        "Direct MSL validation passed for {stage:?} graphics shader in pipeline 0x{:016X}",
+                                        key.hash_value()
+                                    ),
+                                    Err(error) => log::warn!(
+                                        "Direct MSL validation failed for {stage:?} graphics shader in pipeline 0x{:016X}: {error}",
+                                        key.hash_value()
+                                    ),
+                                }
+                            }
+                            (Some(_), Err(error)) => log::warn!(
+                                "SPIRV-Cross validation compilation failed for {stage:?} graphics shader in pipeline 0x{:016X}: {error}",
+                                key.hash_value()
+                            ),
+                            (None, _) => unreachable!("validated graphics stage was not compiled"),
+                        }
                     }
                 }
-                match translated_stage.program.stage {
-                    Stage::VertexB => vertex = Some(active),
-                    Stage::Fragment => fragment = Some(active),
-                    stage => {
-                        return Err(MetalPipelineError::UnsupportedGraphicsStage(match stage {
-                            Stage::VertexA => "unmerged vertex A",
-                            Stage::TessellationControl => "tessellation control",
-                            Stage::TessellationEval => "tessellation evaluation",
-                            Stage::Geometry => "geometry",
-                            Stage::Compute => "compute in graphics pipeline",
-                            Stage::VertexB | Stage::Fragment => unreachable!(),
-                        }))
-                    }
-                }
+                Err(error) => log::warn!(
+                    "SPIR-V validation emission failed for graphics pipeline 0x{:016X}: {error}",
+                    key.hash_value()
+                ),
             }
         }
         let vertex = vertex.ok_or(MetalPipelineError::MissingVertexStage)?;
@@ -1156,18 +1142,17 @@ impl MetalPipelineCache {
         .map_err(MetalPipelineError::ShaderTranslation)?;
         let options =
             MetalShaderCompileOptions::for_compute_device(device.profile(), key.workgroup_size);
-        let shader = if use_direct_msl_enabled() {
-            let mut bindings = Bindings::default();
-            Arc::new(compile_direct_msl_shader_with_bindings(
-                device.device(),
-                &program,
-                profile,
-                &runtime_info,
-                &options,
-                &mut bindings,
-            )?)
-        } else {
-            let spirv_words = catch_shader_exception(|| {
+        let mut bindings = Bindings::default();
+        let shader = Arc::new(compile_direct_msl_shader_with_bindings(
+            device.device(),
+            &program,
+            profile,
+            &runtime_info,
+            &options,
+            &mut bindings,
+        )?);
+        if validate_direct_msl_enabled() {
+            let compatibility = catch_shader_exception(|| {
                 let mut bindings = Bindings::default();
                 shader_recompiler::backend::emit_spirv_with_bindings(
                     &program,
@@ -1175,34 +1160,40 @@ impl MetalPipelineCache {
                     &runtime_info,
                     &mut bindings,
                 )
-            })
-            .map_err(MetalPipelineError::ShaderTranslation)?;
-            let shader = Arc::new(compile_native_shader(
-                device.device(),
-                device.profile(),
-                &spirv_words,
-                &options,
-            )?);
-            if validate_direct_msl_enabled() {
-                match validate_direct_msl_against_active_module(
+            });
+            match compatibility {
+                Ok(spirv_words) => match compile_native_shader(
                     device.device(),
-                    &program,
-                    profile,
-                    &runtime_info,
-                    &shader,
+                    device.profile(),
+                    &spirv_words,
+                    &options,
                 ) {
-                    Ok(_) => log::info!(
-                        "Direct MSL validation passed for compute shader 0x{:016X}",
-                        key.unique_hash
-                    ),
+                    Ok(compatibility) => {
+                        match validate_direct_msl_module_against_compatibility(
+                            &shader,
+                            &compatibility,
+                        ) {
+                            Ok(()) => log::info!(
+                                "Direct MSL validation passed for compute shader 0x{:016X}",
+                                key.unique_hash
+                            ),
+                            Err(error) => log::warn!(
+                                "Direct MSL validation failed for compute shader 0x{:016X}: {error}",
+                                key.unique_hash
+                            ),
+                        }
+                    }
                     Err(error) => log::warn!(
-                        "Direct MSL validation failed for compute shader 0x{:016X}: {error}",
+                        "SPIRV-Cross validation compilation failed for compute shader 0x{:016X}: {error}",
                         key.unique_hash
                     ),
-                }
+                },
+                Err(error) => log::warn!(
+                    "SPIR-V validation emission failed for compute shader 0x{:016X}: {error}",
+                    key.unique_hash
+                ),
             }
-            shader
-        };
+        }
         let info = Arc::new(program.info);
         let state = Self::create_compute_pipeline_state(device, &shader)?;
         let mut uniform_buffer_sizes = [0; 8];

@@ -3,9 +3,10 @@
 
 //! Metal Shading Language compilation.
 //!
-//! The compatibility path lowers SPIR-V through SPIRV-Cross. The native path
-//! consumes the shader recompiler's backend-neutral IR and emits MSL directly.
-//! Both paths finish at the same native Metal module and resource ABI.
+//! The runtime path consumes the shader recompiler's backend-neutral IR and
+//! emits MSL directly. The SPIR-V/SPIRV-Cross path remains available only as a
+//! validation oracle and for focused compatibility tests. Both paths finish at
+//! the same native Metal module and resource ABI.
 
 use std::num::NonZeroU32;
 
@@ -809,19 +810,30 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
         &options,
         bindings,
     )?;
-    if artifact.source.stage != active.source().stage {
+    let direct = compile_native_msl_artifact(device, artifact)?;
+    validate_direct_msl_module_against_compatibility(&direct, active)?;
+    Ok(direct)
+}
+
+/// Compare an already-compiled direct-MSL module with the validation-only
+/// SPIRV-Cross module produced from the same backend-neutral IR.
+pub fn validate_direct_msl_module_against_compatibility(
+    direct: &MetalShaderModule,
+    compatibility: &MetalShaderModule,
+) -> Result<(), DirectMslValidationError> {
+    if direct.source().stage != compatibility.source().stage {
         return Err(DirectMslValidationError::StageMismatch {
-            direct: artifact.source.stage,
-            active: active.source().stage,
+            direct: direct.source().stage,
+            active: compatibility.source().stage,
         });
     }
-    if artifact.bindings != *active.bindings() {
+    if direct.bindings() != compatibility.bindings() {
         return Err(DirectMslValidationError::BindingLayoutMismatch);
     }
-    if artifact.execution != active.execution() {
+    if direct.execution() != compatibility.execution() {
         return Err(DirectMslValidationError::ExecutionInfoMismatch);
     }
-    Ok(compile_native_msl_artifact(device, artifact)?)
+    Ok(())
 }
 
 #[cfg(test)]

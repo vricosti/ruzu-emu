@@ -213,6 +213,8 @@ fn main() {
 fn parse_inst_line(line: &str) -> Option<Pattern> {
     // INST(NAME, "display", "bitstring")
     let line = line.strip_prefix("INST(")?;
+    let closing_parenthesis = line.rfind(')')?;
+    let line = &line[..=closing_parenthesis];
     let line = line.strip_suffix(')')?;
 
     let mut parts = Vec::new();

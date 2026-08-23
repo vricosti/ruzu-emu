@@ -10133,3 +10133,22 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both
   `CombineScalar` layouts, all three restored identities at 16/32 bits, reserved 8/64-bit sizes,
   indexed vector-read shape, and the existing floating-point family.
+
+## 2026-08-23 — `src/rdynarmic/{build.rs,src/frontend/a64/decoder.rs}` vs Eden `frontend/A64/decoder/{a64.h,a64.inc}` (trailing instruction comments)
+
+### Intentional differences
+- Eden consumes `a64.inc` through C++ macros, while Rust's build script parses the same pattern
+  table and generates its enum and two-tier lookup table. The parser therefore locates the closing
+  `INST(...)` parenthesis explicitly before processing its three fields.
+
+### Unintentional differences (to fix)
+- Fixed: Rust required an active `INST(...)` line to end exactly at `)`. The trailing ARM-version
+  comments on CFINV, RMIF, XAFlag, and AXFlag caused all four patterns to be silently omitted from
+  the generated decoder, unlike Eden's preprocessor inclusion.
+
+### Missing items
+- None for active A64 instruction patterns with trailing comments in the reviewed table.
+
+### Binary layout verification
+- N/A: decoder patterns are generated metadata, not raw-copied payloads. A focused test verifies
+  the four affected encodings decode to their exact upstream instruction identities.

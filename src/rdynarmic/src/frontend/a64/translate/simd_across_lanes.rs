@@ -76,18 +76,6 @@ impl<'a> TranslatorVisitor<'a> {
         self.fp_min_max(inst, MinMaxOperation::Min)
     }
 
-    /// ADDV — Add across vector. Sums all `esize` lanes of `Vn`,
-    /// stores the truncated `esize`-bit result into the low lane of
-    /// `Vd` (rest zeroed).
-    ///
-    /// Encoding: `0Q001110 zz110001 101110nn nnnddddd`
-    /// - `Q` (bit 30): half (0 → 64-bit operand) or full (1 → 128-bit)
-    /// - `size` (bits 23:22): element size — 00=B, 01=H, 10=S
-    /// - Rn (bits 9:5), Rd (bits 4:0)
-    ///
-    /// Reserved encodings:
-    /// - `size == 0b10 && !Q` (would be 2×32b — not enough lanes)
-    /// - `size == 0b11`        (64b lanes — no element-wise reduction)
     pub fn addv(&mut self, inst: &DecodedInst) -> bool {
         let q = inst.bit(30);
         let size = inst.bits(23, 22);
@@ -98,40 +86,8 @@ impl<'a> TranslatorVisitor<'a> {
         let vd = Vec::from_u32(inst.rd());
         let esize = 8usize << size as usize;
         let datasize = if q { 128 } else { 64 };
-        let elements = datasize / esize;
-
         let operand = self.v_read(datasize, vn);
-
-        // Read element 0 and zero-extend to U64. Then add subsequent
-        // elements one by one. Mirrors upstream `VectorReduceAdd`
-        // semantics expanded inline (we don't have a dedicated IR
-        // opcode for cross-lane reduce yet).
-        let zero_carry = self.ir.ir().imm1(false);
-        let mut sum = self.read_and_extend_to_u64(esize, operand, 0);
-        for i in 1..elements {
-            let elem = self.read_and_extend_to_u64(esize, operand, i);
-            sum = self.ir.ir().add_64(sum, elem, zero_carry);
-        }
-
-        // Truncate to esize and zero-extend to 128-bit Vd.
-        let result = match esize {
-            8 => {
-                let lsb = self.ir.ir().least_significant_byte(sum);
-                let widened = self.ir.ir().zero_extend_byte_to_long(lsb);
-                self.ir.ir().zero_extend_to_quad(widened)
-            }
-            16 => {
-                let lsb = self.ir.ir().least_significant_half(sum);
-                let widened = self.ir.ir().zero_extend_half_to_long(lsb);
-                self.ir.ir().zero_extend_to_quad(widened)
-            }
-            32 => {
-                let lsb = self.ir.ir().least_significant_word(sum);
-                let widened = self.ir.ir().zero_extend_word_to_long(lsb);
-                self.ir.ir().zero_extend_to_quad(widened)
-            }
-            _ => unreachable!("esize {} excluded by reserved-value check", esize),
-        };
+        let result = self.ir.ir().vector_reduce_add(esize, operand);
         self.v_write(128, vd, result);
         true
     }
@@ -368,5 +324,29 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn addv_uses_edens_dedicated_vector_reduce_add_opcodes() {
+        let cases = [
+            (0x0E31_B800, Opcode::VectorReduceAdd8),
+            (0x0E71_B800, Opcode::VectorReduceAdd16),
+            (0x4EB1_B800, Opcode::VectorReduceAdd32),
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert_eq!(
+                block
+                    .instructions
+                    .iter()
+                    .filter(|instruction| instruction.opcode == expected_opcode)
+                    .count(),
+                1,
+                "encoding 0x{encoding:08X} did not emit one {expected_opcode:?}"
+            );
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
     }
 }

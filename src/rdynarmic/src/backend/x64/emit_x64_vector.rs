@@ -5,6 +5,7 @@ use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
+use rxbyak::{xmmword_ptr, XMM0};
 
 pub fn emit_vector_broadcast_element_lower8(
     ctx: &EmitContext,
@@ -153,10 +154,103 @@ pub fn emit_vector_broadcast_element64(
     ra.define_value(inst_ref, result);
 }
 
+pub fn emit_vector_reduce_add8(
+    _ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let data = ra.use_scratch_xmm(&mut args[0]);
+
+    ra.asm.pshufd(XMM0, data, 0b01_00_11_10).unwrap();
+    ra.asm.paddb(data, XMM0).unwrap();
+    ra.asm.pxor(XMM0, XMM0).unwrap();
+    ra.asm.psadbw(data, XMM0).unwrap();
+    ra.asm.pslldq(data, 15).unwrap();
+    ra.asm.psrldq(data, 15).unwrap();
+
+    ra.define_value(inst_ref, data);
+}
+
+pub fn emit_vector_reduce_add16(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let data = ra.use_scratch_xmm(&mut args[0]);
+
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        ra.asm.pxor(XMM0, XMM0).unwrap();
+        ra.asm.phaddw(data, XMM0).unwrap();
+        ra.asm.phaddw(data, XMM0).unwrap();
+        ra.asm.phaddw(data, XMM0).unwrap();
+    } else {
+        ra.asm.pshufd(XMM0, data, 0b00_01_10_11).unwrap();
+        ra.asm.paddw(data, XMM0).unwrap();
+
+        let constant = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0001_0001_0001_0001, 0x0001_0001_0001_0001);
+        ra.asm.movdqa(XMM0, xmmword_ptr(constant)).unwrap();
+        ra.asm.pmaddwd(data, XMM0).unwrap();
+
+        ra.asm.pshufd(XMM0, data, 0b10_11_00_01).unwrap();
+        ra.asm.paddd(data, XMM0).unwrap();
+        ra.asm.pslldq(data, 14).unwrap();
+        ra.asm.psrldq(data, 14).unwrap();
+    }
+
+    ra.define_value(inst_ref, data);
+}
+
+pub fn emit_vector_reduce_add32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let data = ra.use_scratch_xmm(&mut args[0]);
+
+    ra.asm.pshufd(XMM0, data, 0b00_01_10_11).unwrap();
+    ra.asm.paddd(data, XMM0).unwrap();
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        ra.asm.phaddd(data, data).unwrap();
+    } else {
+        ra.asm.pshufd(XMM0, data, 0b10_11_00_01).unwrap();
+        ra.asm.paddd(data, XMM0).unwrap();
+    }
+    ra.asm.psrldq(data, 12).unwrap();
+
+    ra.define_value(inst_ref, data);
+}
+
+pub fn emit_vector_reduce_add64(
+    _ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let data = ra.use_scratch_xmm(&mut args[0]);
+
+    ra.asm.pshufd(XMM0, data, 0b01_00_11_10).unwrap();
+    ra.asm.paddq(data, XMM0).unwrap();
+    ra.asm.movq(data, data).unwrap();
+
+    ra.define_value(inst_ref, data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::x64::callback::Callback;
+    use crate::backend::x64::constant_pool::ConstantPool;
     use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig};
     use crate::ir::location::LocationDescriptor;
     use crate::ir::opcode::Opcode;
@@ -231,7 +325,10 @@ mod tests {
 
     fn emit_with_features(opcode: Opcode, index: u8, features: HostFeature) -> Vec<u8> {
         let mut asm = CodeAssembler::new(4096).unwrap();
+        let mut constant_pool = ConstantPool::new(1024);
+        constant_pool.set_pool_base(unsafe { asm.top().add(3072) as *mut u8 });
         let mut ra = RegAlloc::new_default(&mut asm, vec![(1, 128), (0, 128)]);
+        ra.constant_pool = Some(&mut constant_pool);
         let source = ra.scratch_xmm();
         ra.define_value(InstRef(0), source);
         ra.end_of_alloc_scope();
@@ -239,7 +336,17 @@ mod tests {
         let config = dummy_emit_config();
         let mut ctx = EmitContext::new(LocationDescriptor::new(0), &config);
         ctx.host_features = features;
-        let inst = Inst::new(opcode, &[Value::Inst(InstRef(0)), Value::ImmU8(index)]);
+        let inst = if matches!(
+            opcode,
+            Opcode::VectorReduceAdd8
+                | Opcode::VectorReduceAdd16
+                | Opcode::VectorReduceAdd32
+                | Opcode::VectorReduceAdd64
+        ) {
+            Inst::new(opcode, &[Value::Inst(InstRef(0))])
+        } else {
+            Inst::new(opcode, &[Value::Inst(InstRef(0)), Value::ImmU8(index)])
+        };
         match opcode {
             Opcode::VectorBroadcastElementLower8 => {
                 emit_vector_broadcast_element_lower8(&ctx, &mut ra, InstRef(1), &inst)
@@ -262,6 +369,10 @@ mod tests {
             Opcode::VectorBroadcastElement64 => {
                 emit_vector_broadcast_element64(&ctx, &mut ra, InstRef(1), &inst)
             }
+            Opcode::VectorReduceAdd8 => emit_vector_reduce_add8(&ctx, &mut ra, InstRef(1), &inst),
+            Opcode::VectorReduceAdd16 => emit_vector_reduce_add16(&ctx, &mut ra, InstRef(1), &inst),
+            Opcode::VectorReduceAdd32 => emit_vector_reduce_add32(&ctx, &mut ra, InstRef(1), &inst),
+            Opcode::VectorReduceAdd64 => emit_vector_reduce_add64(&ctx, &mut ra, InstRef(1), &inst),
             _ => unreachable!("test helper only covers selected broadcast-element opcodes"),
         }
         ra.end_of_alloc_scope();
@@ -269,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn function_signatures_match_the_seven_upstream_emitters() {
+    fn function_signatures_match_the_upstream_broadcast_and_reduce_emitters() {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
             emit_vector_broadcast_element_lower8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
@@ -280,6 +391,10 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_broadcast_element16;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_broadcast_element32;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_broadcast_element64;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add8;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add16;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add32;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add64;
     }
 
     #[test]
@@ -367,5 +482,58 @@ mod tests {
                 .any(|bytes| bytes[0] == 0xc4 && bytes[3] == 0x05 && bytes[5] == 3),
             "{code:02x?}"
         );
+    }
+
+    #[test]
+    fn reduce_add8_uses_edens_byte_sum_sequence() {
+        let code = emit_with_features(Opcode::VectorReduceAdd8, 0, HostFeature::empty());
+        assert!(code
+            .windows(3)
+            .any(|bytes| bytes[..3] == [0x66, 0x0f, 0xfc]));
+        assert!(code
+            .windows(3)
+            .any(|bytes| bytes[..3] == [0x66, 0x0f, 0xf6]));
+        assert_eq!(code.last(), Some(&15));
+    }
+
+    #[test]
+    fn reduce_add16_ssse3_emits_three_horizontal_adds() {
+        let code = emit_with_features(Opcode::VectorReduceAdd16, 0, HostFeature::SSSE3);
+        assert_eq!(
+            code.windows(4)
+                .filter(|bytes| bytes[..4] == [0x66, 0x0f, 0x38, 0x01])
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn reduce_add16_sse2_uses_edens_multiply_add_fallback() {
+        let code = emit_with_features(Opcode::VectorReduceAdd16, 0, HostFeature::empty());
+        assert!(code
+            .windows(3)
+            .any(|bytes| bytes[..3] == [0x66, 0x0f, 0xf5]));
+        assert!(code.windows(5).any(|bytes| bytes[0] == 0x66
+            && bytes[1] == 0x0f
+            && bytes[2] == 0x73
+            && bytes[4] == 14));
+        assert_eq!(code.last(), Some(&14));
+    }
+
+    #[test]
+    fn reduce_add32_and_64_use_edens_final_reduction_steps() {
+        let reduce32 = emit_with_features(Opcode::VectorReduceAdd32, 0, HostFeature::SSSE3);
+        assert!(reduce32
+            .windows(4)
+            .any(|bytes| bytes[..4] == [0x66, 0x0f, 0x38, 0x02]));
+        assert_eq!(reduce32.last(), Some(&12));
+
+        let reduce64 = emit_with_features(Opcode::VectorReduceAdd64, 0, HostFeature::empty());
+        assert!(reduce64
+            .windows(3)
+            .any(|bytes| bytes[..3] == [0x66, 0x0f, 0xd4]));
+        assert!(reduce64
+            .windows(3)
+            .any(|bytes| bytes[..3] == [0xf3, 0x0f, 0x7e]));
     }
 }

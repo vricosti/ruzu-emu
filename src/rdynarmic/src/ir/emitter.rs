@@ -1610,6 +1610,17 @@ impl<'a> IREmitter<'a> {
         self.emit(Opcode::VectorReverseBits, &[a])
     }
 
+    pub fn vector_reduce_add(&mut self, esize: usize, a: Value) -> Value {
+        let op = match esize {
+            8 => Opcode::VectorReduceAdd8,
+            16 => Opcode::VectorReduceAdd16,
+            32 => Opcode::VectorReduceAdd32,
+            64 => Opcode::VectorReduceAdd64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a])
+    }
+
     /// Reverse byte order within each `group_esize`-bit element of a vector
     /// where each element is composed of `byte_esize`-bit lanes. Used by
     /// AArch64 REV16/REV32/REV64 (vector form).
@@ -2498,6 +2509,28 @@ mod tests {
         let mut e = IREmitter::new(&mut block);
         let z = e.zero_vector();
         let _ = e.vector_broadcast_element(32, z, 4);
+    }
+
+    #[test]
+    fn vector_reduce_add_selects_the_four_upstream_opcodes() {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut e = IREmitter::new(&mut block);
+            let z = e.zero_vector();
+            for esize in [8, 16, 32, 64] {
+                let _ = e.vector_reduce_add(esize, z);
+            }
+        }
+
+        let expected = [
+            Opcode::VectorReduceAdd8,
+            Opcode::VectorReduceAdd16,
+            Opcode::VectorReduceAdd32,
+            Opcode::VectorReduceAdd64,
+        ];
+        for (index, opcode) in expected.into_iter().enumerate() {
+            assert_eq!(block.get(InstRef(index as u32 + 1)).opcode, opcode);
+        }
     }
 
     #[test]

@@ -28,15 +28,15 @@ python3 tools/audit_dynarmic_opcodes.py /path/to/eden/src/dynarmic/src/dynarmic/
 After the opcode naming and vector broadcast-element slices:
 
 - Eden opcodes: 725
-- rdynarmic opcodes: 743
-- missing in rdynarmic: 8
+- rdynarmic opcodes: 747
+- missing in rdynarmic: 4
 - extra in rdynarmic: 26
 
-The eight missing opcodes are the four `VectorReduceAdd*` forms and four
-`Vector{Signed,Unsigned}Multiply*` forms. The 26 extra opcodes include internal
-insertion-point and A32 execution-hook operations, comparison/shuffle
-operations that Eden builds from other IR, and four widening-multiply
-operations whose ownership differs from Eden's multi-result multiply opcodes.
+The four missing opcodes are the `Vector{Signed,Unsigned}Multiply16/32` forms.
+The 26 extra opcodes include internal insertion-point and A32 execution-hook
+operations, comparison/shuffle operations that Eden builds from other IR, and
+four widening-multiply operations whose ownership differs from Eden's
+multi-result multiply opcodes.
 
 The first slice restored Eden's exact names for 73 already-equivalent opcodes,
 including `BitRotateRight*`, `PackedAbsDiffSumU8`, and the vector `S`/`U`
@@ -46,6 +46,10 @@ The second slice replaced the composite extract-plus-broadcast lowering with
 Eden's seven dedicated `VectorBroadcastElement*` opcodes, including their exact
 IR metadata, index validation, x64 AVX/SSE paths, and arm64 `DUP` paths. The x64
 methods now live in the matching `backend/x64/emit_x64_vector.rs` owner.
+
+The third slice replaced ADDV's expanded per-lane loop with Eden's four
+dedicated `VectorReduceAdd*` opcodes. It ports the exact x64 SSSE3/SSE2 paths,
+arm64 scalar `ADDV`/`ADDP` paths, frontend validation and result write order.
 
 ## Known behavioral gaps found during baseline
 

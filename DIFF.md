@@ -8120,3 +8120,36 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 ### Binary layout verification
 - PASS: GNU AArch64 binutils independently assembled the covered instructions as `0x4e31b820`,
   `0x4e71b862`, `0x4eb1b8a4`, and `0x5ef1b8e6`; focused Rust assertions require the same words.
+
+## 2026-08-23 — rdynarmic vector reduce-add IR/frontend/backends vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/ir/{opcode,emitter}.rs`,
+`src/rdynarmic/src/frontend/a64/translate/simd_across_lanes.rs`,
+`src/rdynarmic/src/backend/x64/{emit,emit_x64_vector}.rs`, and
+`src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_vector}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
+`src/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_across_lanes.cpp`,
+`src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`, and
+`src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`.
+
+### Intentional differences
+- Rust uses explicit opcode matches and direct host-instruction APIs. Eden uses generated x64
+  member dispatch and arm64 template specializations; operand realization and value-definition
+  ordering remain the same.
+- The arm64 Rust `emit_reduce` helper selects its element size at runtime; it directly corresponds
+  to Eden's `EmitReduce<size>` template and selects the same scalar instruction for every size.
+
+### Unintentional differences (to fix)
+- ADDV previously expanded every lane into scalar IR additions and truncations. It now emits Eden's
+  single dedicated reduction opcode after the same reserved-value check and operand read, removing
+  both the behavioral and ownership divergence.
+
+### Missing items
+- Four Eden IR opcodes remain absent: `VectorSignedMultiply16/32` and
+  `VectorUnsignedMultiply16/32`.
+
+### Binary layout verification
+- PASS: all four opcodes use Eden's exact `U128(U128)` metadata. The x64 instruction sequences are
+  covered for SSSE3 and SSE2, and arm64 encodings were independently verified in the prerequisite
+  slice; no raw guest-visible payload is introduced.

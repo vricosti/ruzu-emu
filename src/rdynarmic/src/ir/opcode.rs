@@ -431,6 +431,10 @@ pub enum Opcode {
     VectorReverseElementsInLongGroups8,
     VectorReverseElementsInLongGroups16,
     VectorReverseElementsInLongGroups32,
+    VectorReduceAdd8,
+    VectorReduceAdd16,
+    VectorReduceAdd32,
+    VectorReduceAdd64,
     VectorRoundingHalvingAddS8,
     VectorRoundingHalvingAddS16,
     VectorRoundingHalvingAddS32,
@@ -1311,6 +1315,7 @@ impl Opcode {
             VectorReverseElementsInHalfGroups8 |
             VectorReverseElementsInWordGroups8 | VectorReverseElementsInWordGroups16 |
             VectorReverseElementsInLongGroups8 | VectorReverseElementsInLongGroups16 | VectorReverseElementsInLongGroups32 |
+            VectorReduceAdd8 | VectorReduceAdd16 | VectorReduceAdd32 | VectorReduceAdd64 |
             VectorSignExtend8 | VectorSignExtend16 | VectorSignExtend32 | VectorSignExtend64 |
             VectorZeroExtend8 | VectorZeroExtend16 | VectorZeroExtend32 | VectorZeroExtend64 |
             VectorZeroUpper |

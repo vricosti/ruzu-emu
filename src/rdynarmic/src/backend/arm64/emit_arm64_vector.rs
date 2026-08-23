@@ -32,6 +32,27 @@ fn emit_two_op(
     Ok(())
 }
 
+fn emit_reduce(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+    size: u8,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    let mut result = ctx.reg_alloc.write_q(inst_ref);
+    let mut operand = ctx.reg_alloc.read_q(args[0]);
+    RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
+    let rd = result.index().expect("result realized") as u8;
+    let rn = operand.index().expect("operand realized") as u8;
+    let encoding = match size {
+        8 | 16 | 32 => inst::addv_from_v(rd, rn, size),
+        64 => inst::addp_d_from_v2d(rd, rn),
+        _ => unreachable!("invalid vector reduction element size"),
+    };
+    code.write_u32(encoding)?;
+    Ok(())
+}
+
 fn emit_two_op_arranged(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -710,6 +731,10 @@ pub fn emit_vector_instruction(
         Opcode::VectorReverseElementsInLongGroups32 => {
             emit_two_op_arranged(code, ctx, inst_ref, 32, inst::rev64_v)
         }
+        Opcode::VectorReduceAdd8 => emit_reduce(code, ctx, inst_ref, 8),
+        Opcode::VectorReduceAdd16 => emit_reduce(code, ctx, inst_ref, 16),
+        Opcode::VectorReduceAdd32 => emit_reduce(code, ctx, inst_ref, 32),
+        Opcode::VectorReduceAdd64 => emit_reduce(code, ctx, inst_ref, 64),
         Opcode::VectorZeroExtend8 => emit_widen(code, ctx, inst_ref, 8, inst::uxtl_v),
         Opcode::VectorZeroExtend16 => emit_widen(code, ctx, inst_ref, 16, inst::uxtl_v),
         Opcode::VectorZeroExtend32 => emit_widen(code, ctx, inst_ref, 32, inst::uxtl_v),

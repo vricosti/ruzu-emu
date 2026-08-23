@@ -868,6 +868,10 @@ fn emit_ir_instruction(
         | Opcode::VectorReverseElementsInLongGroups8
         | Opcode::VectorReverseElementsInLongGroups16
         | Opcode::VectorReverseElementsInLongGroups32
+        | Opcode::VectorReduceAdd8
+        | Opcode::VectorReduceAdd16
+        | Opcode::VectorReduceAdd32
+        | Opcode::VectorReduceAdd64
         | Opcode::VectorZeroExtend8
         | Opcode::VectorZeroExtend16
         | Opcode::VectorZeroExtend32

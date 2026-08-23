@@ -1262,6 +1262,18 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorBroadcastElement64 => {
                 emit_x64_vector::emit_vector_broadcast_element64(ctx, ra, inst_ref, inst)
             }
+            Opcode::VectorReduceAdd8 => {
+                emit_x64_vector::emit_vector_reduce_add8(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorReduceAdd16 => {
+                emit_x64_vector::emit_vector_reduce_add16(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorReduceAdd32 => {
+                emit_x64_vector::emit_vector_reduce_add32(ctx, ra, inst_ref, inst)
+            }
+            Opcode::VectorReduceAdd64 => {
+                emit_x64_vector::emit_vector_reduce_add64(ctx, ra, inst_ref, inst)
+            }
             Opcode::VectorExtract => varr::emit_vector_extract(ctx, ra, inst_ref, inst),
             Opcode::VectorExtractLower => varr::emit_vector_extract_lower(ctx, ra, inst_ref, inst),
             Opcode::VectorRotateWholeVectorRight => {

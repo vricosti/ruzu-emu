@@ -102,7 +102,7 @@ Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
 With the external-oracle/fuzz module and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
 `arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1044 passed, 4 ignored). These are
+(1047 passed, 4 ignored). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -153,5 +153,8 @@ validation blockers, not evidence against the focused slices.
 - The A64 system flag manipulation/format owners now mirror Eden's CFINV, RMIF, XAFlag, and AXFlag
   IR construction. Restoring their decoder patterns and dispatch reduces the remaining decoded A64
   interpreter fallbacks to 34 identities.
+- The A64 SHA-512/SM3/SM4 owner now contains all ten visitors and its five principal file-local
+  helpers. Their exact scalar/vector IR compositions reduce the remaining decoded A64 interpreter
+  fallbacks to 24 identities.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

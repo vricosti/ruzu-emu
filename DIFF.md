@@ -10176,3 +10176,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify CFINV's
   carry mask, RMIF's zero/full/partial mask paths, both flag-format operation shapes, raw-NZCV
   writes, and absence of interpreter fallback.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_sha512.rs` vs Eden `frontend/A64/translate/impl/{simd_sha512.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract typed decoder operands from `DecodedInst`; all ten methods remain in the
+  matching file owner.
+- Rust's 32-bit rotate and 64-bit add builders require explicit carry inputs, so two mechanical
+  file-local adapters supply Eden's implicit false carry without changing operation ordering.
+- Eden's two lambdas inside `SHA512Hash` are represented by file-local Rust functions because
+  simultaneous closures borrowing the mutable emitter cannot coexist. They retain the same
+  captured hash-part and upper/lower-Y inputs and are called at the same points.
+
+### Unintentional differences (to fix)
+- Fixed: SHA512SU0, SHA512SU1, SHA512H, SHA512H2, RAX1, XAR, SM3PARTW1, SM3PARTW2, SM4E, and
+  SM4EKEY decoded but fell through to the temporary interpreter terminal. All ten now preserve
+  Eden's exact register-read order, rotations, boolean functions, nested additions, lane updates,
+  four-round SM4 loop, substitution-box calls, and destination writes.
+
+### Missing items
+- None for the ten visitors, two helper enums, and five principal file-local helpers defined by the
+  reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all ten
+  decoder identities, SHA-512 choice-versus-majority IR shapes, and the four SM4 rounds with four
+  S-box substitutions per round.

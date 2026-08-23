@@ -42,6 +42,7 @@ mod simd_scalar_three_same;
 mod simd_scalar_two_register_misc;
 mod simd_scalar_x_indexed_element;
 mod simd_sha;
+mod simd_sha512;
 mod simd_shift_by_immediate;
 mod simd_table_lookup;
 mod simd_three_different;

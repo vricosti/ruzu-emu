@@ -1280,9 +1280,9 @@ impl Opcode {
             PackedSelect => OpcodeInfo { ret: U32, args: &[U32, U32, U32] },
 
             // CRC32
-            CRC32Castagnoli8 | CRC32ISO8 => OpcodeInfo { ret: U32, args: &[U32, U8] },
-            CRC32Castagnoli16 | CRC32ISO16 => OpcodeInfo { ret: U32, args: &[U32, U16] },
-            CRC32Castagnoli32 | CRC32ISO32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
+            CRC32Castagnoli8 | CRC32Castagnoli16 | CRC32Castagnoli32 |
+            CRC32ISO8 | CRC32ISO16 | CRC32ISO32
+                => OpcodeInfo { ret: U32, args: &[U32, U32] },
             CRC32Castagnoli64 | CRC32ISO64 => OpcodeInfo { ret: U32, args: &[U32, U64] },
 
             // AES
@@ -1316,6 +1316,8 @@ impl Opcode {
             VectorReverseElementsInWordGroups8 | VectorReverseElementsInWordGroups16 |
             VectorReverseElementsInLongGroups8 | VectorReverseElementsInLongGroups16 | VectorReverseElementsInLongGroups32 |
             VectorReduceAdd8 | VectorReduceAdd16 | VectorReduceAdd32 | VectorReduceAdd64 |
+            VectorPairedAddSignedWiden8 | VectorPairedAddSignedWiden16 | VectorPairedAddSignedWiden32 |
+            VectorPairedAddUnsignedWiden8 | VectorPairedAddUnsignedWiden16 | VectorPairedAddUnsignedWiden32 |
             VectorSignExtend8 | VectorSignExtend16 | VectorSignExtend32 | VectorSignExtend64 |
             VectorZeroExtend8 | VectorZeroExtend16 | VectorZeroExtend32 | VectorZeroExtend64 |
             VectorZeroUpper |
@@ -1356,8 +1358,6 @@ impl Opcode {
             VectorMinU8 | VectorMinU16 | VectorMinU32 | VectorMinU64 |
             VectorPairedAdd8 | VectorPairedAdd16 | VectorPairedAdd32 | VectorPairedAdd64 |
             VectorPairedAddLower8 | VectorPairedAddLower16 | VectorPairedAddLower32 |
-            VectorPairedAddSignedWiden8 | VectorPairedAddSignedWiden16 | VectorPairedAddSignedWiden32 |
-            VectorPairedAddUnsignedWiden8 | VectorPairedAddUnsignedWiden16 | VectorPairedAddUnsignedWiden32 |
             VectorPairedMaxS8 | VectorPairedMaxS16 | VectorPairedMaxS32 |
             VectorPairedMaxU8 | VectorPairedMaxU16 | VectorPairedMaxU32 |
             VectorPairedMaxLowerS8 | VectorPairedMaxLowerS16 | VectorPairedMaxLowerS32 |
@@ -1372,7 +1372,9 @@ impl Opcode {
             VectorRoundingShiftLeftS8 | VectorRoundingShiftLeftS16 | VectorRoundingShiftLeftS32 | VectorRoundingShiftLeftS64 |
             VectorRoundingShiftLeftU8 | VectorRoundingShiftLeftU16 | VectorRoundingShiftLeftU32 | VectorRoundingShiftLeftU64 |
             VectorSignedAbsoluteDifference8 | VectorSignedAbsoluteDifference16 | VectorSignedAbsoluteDifference32 |
-            VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32 |
+            VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32
+                => OpcodeInfo { ret: U128, args: &[U128, U128] },
+
             // Vector shifts: the non-V (scalar) forms take an immediate U8
             // shift amount. Upstream `opcodes.inc` signature:
             // `OPCODE(VectorLogicalShiftLeft32, U128, U128, U8)`.
@@ -1702,6 +1704,73 @@ mod tests {
         ] {
             assert_eq!(opcode.return_type(), Type::Void);
             assert_eq!(opcode.arg_types(), &[Type::U128, Type::U128]);
+        }
+
+        for opcode in [
+            Opcode::CRC32Castagnoli8,
+            Opcode::CRC32Castagnoli16,
+            Opcode::CRC32Castagnoli32,
+            Opcode::CRC32ISO8,
+            Opcode::CRC32ISO16,
+            Opcode::CRC32ISO32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U32);
+            assert_eq!(opcode.arg_types(), &[Type::U32, Type::U32]);
+        }
+        for opcode in [Opcode::CRC32Castagnoli64, Opcode::CRC32ISO64] {
+            assert_eq!(opcode.return_type(), Type::U32);
+            assert_eq!(opcode.arg_types(), &[Type::U32, Type::U64]);
+        }
+    }
+
+    #[test]
+    fn test_vector_operand_metadata_matches_upstream_groups() {
+        for opcode in [
+            Opcode::VectorAdd8,
+            Opcode::VectorAnd,
+            Opcode::VectorEqual128,
+            Opcode::VectorGreaterS64,
+            Opcode::VectorHalvingSubU32,
+            Opcode::VectorMaxS64,
+            Opcode::VectorMinU64,
+            Opcode::VectorMultiply64,
+            Opcode::VectorMultiplySignedWiden32,
+            Opcode::VectorMultiplyUnsignedWiden32,
+            Opcode::VectorPairedAdd64,
+            Opcode::VectorPairedAddLower32,
+            Opcode::VectorPairedMaxLowerU32,
+            Opcode::VectorPairedMinLowerS32,
+            Opcode::VectorPolynomialMultiplyLong64,
+            Opcode::VectorRoundingHalvingAddU32,
+            Opcode::VectorRoundingShiftLeftS64,
+            Opcode::VectorSignedAbsoluteDifference32,
+            Opcode::VectorSub64,
+            Opcode::VectorUnsignedAbsoluteDifference32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U128);
+            assert_eq!(opcode.arg_types(), &[Type::U128, Type::U128]);
+        }
+
+        for opcode in [
+            Opcode::VectorPairedAddSignedWiden8,
+            Opcode::VectorPairedAddSignedWiden16,
+            Opcode::VectorPairedAddSignedWiden32,
+            Opcode::VectorPairedAddUnsignedWiden8,
+            Opcode::VectorPairedAddUnsignedWiden16,
+            Opcode::VectorPairedAddUnsignedWiden32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U128);
+            assert_eq!(opcode.arg_types(), &[Type::U128]);
+        }
+
+        for opcode in [
+            Opcode::VectorArithmeticShiftRight8,
+            Opcode::VectorLogicalShiftLeft32,
+            Opcode::VectorLogicalShiftRight64,
+            Opcode::VectorSignedSaturatedShiftLeftUnsigned16,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U128);
+            assert_eq!(opcode.arg_types(), &[Type::U128, Type::U8]);
         }
     }
 

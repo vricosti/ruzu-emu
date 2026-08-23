@@ -61,6 +61,13 @@ also removes four dead `*MultiplyLong*` operations that had no Eden equivalent
 and had incompatible IR metadata. Eden marks the four producers unreachable
 in its arm64 backend; rdynarmic now preserves that behavior explicitly.
 
+The opcode audit now compares exact return/argument signatures in addition to
+names, and rejects duplicate or missing Rust metadata entries. It exposed 126
+shared-signature mismatches. The vector/CRC metadata slice fixes 123 of them:
+all reviewed binary vector operations now take two `U128` operands, paired
+widening-add operations are unary, and CRC8/16 retain Eden's raw `U32` input.
+Three prerequisite-backed signature differences remain.
+
 Focused x64 emitter, IR-emitter, and opcode-metadata tests pass. Native Linux,
 Linux AArch64, and Windows x64 checks pass. The complete single-threaded unit
 suite progressed through its long JIT section but exceeded a 55-second audit
@@ -75,10 +82,10 @@ limit; the broader `multiply` filter also exposes the pre-existing unrelated
   unimplemented rather than following Eden's exception-state behavior.
 - A32 non-VFP coprocessor translation/emission contains explicit no-op stubs.
 - The arm64 backend reports unimplemented vector-saturation opcodes.
-- The broad binary-vector metadata arm in `ir/opcode.rs` still assigns
-  `U128(U128, U8)` to operations for which Eden declares `U128(U128, U128)`.
-  This affects many pre-existing opcodes and requires a separate metadata
-  audit rather than being folded into the multiply slice.
+- `A32CoprocLoadWords` and `A32CoprocStoreWords` still carry an extra `U1`
+  argument, while their backend support is still incomplete.
+- `A64DataCacheOperationRaised` still omits Eden's location-descriptor
+  argument, and the corresponding callback/lowering paths are incomplete.
 
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

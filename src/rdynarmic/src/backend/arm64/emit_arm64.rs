@@ -2543,15 +2543,15 @@ mod tests {
     #[test]
     fn emit_arm64_routes_crc32_to_cryptography_owner() {
         for (opcode, data) in [
-            (Opcode::CRC32Castagnoli8, Value::ImmU8(0x12)),
-            (Opcode::CRC32Castagnoli16, Value::ImmU16(0x1234)),
+            (Opcode::CRC32Castagnoli8, Value::ImmU32(0x12)),
+            (Opcode::CRC32Castagnoli16, Value::ImmU32(0x1234)),
             (Opcode::CRC32Castagnoli32, Value::ImmU32(0x1234_5678)),
             (
                 Opcode::CRC32Castagnoli64,
                 Value::ImmU64(0x1234_5678_9abc_def0),
             ),
-            (Opcode::CRC32ISO8, Value::ImmU8(0x12)),
-            (Opcode::CRC32ISO16, Value::ImmU16(0x1234)),
+            (Opcode::CRC32ISO8, Value::ImmU32(0x12)),
+            (Opcode::CRC32ISO16, Value::ImmU32(0x1234)),
             (Opcode::CRC32ISO32, Value::ImmU32(0x1234_5678)),
             (Opcode::CRC32ISO64, Value::ImmU64(0x1234_5678_9abc_def0)),
         ] {

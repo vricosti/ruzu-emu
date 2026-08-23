@@ -8223,3 +8223,28 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 ### Binary layout verification
 - PASS: all four producer opcodes use Eden's exact `Void(U128, U128)` signature and both pseudo
   results remain full `U128` values. No raw-memory payload or guest ABI structure is introduced.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `ir/opcodes.inc`
+
+### Intentional differences
+- Rust stores opcode metadata in an explicit `match`, whereas Eden generates it from
+  `opcodes.inc`. The audit tool now expands every Rust grouped arm and compares all 725 shared
+  return/argument signatures to retain line-item traceability.
+
+### Unintentional differences (to fix)
+- The audit found 126 shared signature mismatches. This slice fixes all 119 vector mismatches and
+  all four CRC mismatches. `A32CoprocLoadWords`, `A32CoprocStoreWords`, and
+  `A64DataCacheOperationRaised` remain intentionally stopped on their recorded behavioral
+  prerequisites rather than receiving metadata-only changes.
+
+### Missing items
+- A32 coprocessor load/store construction and backend dispatch must be ported before removing their
+  extra `U1` metadata argument.
+- A64 data-cache callbacks and non-hooked lowering must be ported before adding the missing location
+  descriptor argument.
+- The 22 Ruzu-only opcode variants still require individual ownership and behavior review.
+
+### Binary layout verification
+- PASS for the reviewed metadata: vector operands retain full `U128` values and CRC8/16 retain the
+  upstream `U32` bit pattern until the backend selects the instruction width. No serialized payload
+  or ABI-visible structure changed.

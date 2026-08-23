@@ -147,18 +147,87 @@ pub fn emit_get_attribute(
             expected: "attribute",
         });
     };
-    if !attribute.is_generic() {
-        return Err(MslError::UnsupportedAttribute(attribute.0));
-    }
     if !matches!(inst.arg(1), Value::ImmU32(0)) {
         return Err(MslError::UnsupportedProgramFeature(
             "per-vertex input indexing",
         ));
     }
-    context.define(
-        inst_ref,
-        ir::Type::F32,
-        context.generic_input_expression(*attribute),
-        false,
-    )
+    let expression = if attribute.is_generic() {
+        context.generic_input_expression(*attribute)
+    } else {
+        match *attribute {
+            crate::ir::value::Attribute::PRIMITIVE_ID => "as_type<float>(primitive_id)".to_owned(),
+            crate::ir::value::Attribute::LAYER => "as_type<float>(layer)".to_owned(),
+            attribute if attribute.is_position() => {
+                let swizzle = ["x", "y", "z", "w"][attribute.position_element() as usize];
+                format!("fragment_position.{swizzle}")
+            }
+            crate::ir::value::Attribute::INSTANCE_ID => {
+                if context.support_vertex_instance_id() {
+                    "as_type<float>(instance_id)".to_owned()
+                } else {
+                    "as_type<float>(instance_index - base_instance)".to_owned()
+                }
+            }
+            crate::ir::value::Attribute::VERTEX_ID => {
+                if context.support_vertex_instance_id() {
+                    "as_type<float>(vertex_id)".to_owned()
+                } else {
+                    "as_type<float>(vertex_index)".to_owned()
+                }
+            }
+            crate::ir::value::Attribute::BASE_INSTANCE => {
+                "as_type<float>(base_instance)".to_owned()
+            }
+            crate::ir::value::Attribute::BASE_VERTEX => "as_type<float>(base_vertex)".to_owned(),
+            crate::ir::value::Attribute::FRONT_FACE => {
+                "as_type<float>(front_face ? 0xFFFFFFFFu : 0u)".to_owned()
+            }
+            crate::ir::value::Attribute::POINT_SPRITE_S => "point_coord.x".to_owned(),
+            crate::ir::value::Attribute::POINT_SPRITE_T => "point_coord.y".to_owned(),
+            _ => return Err(MslError::UnsupportedAttribute(attribute.0)),
+        }
+    };
+    context.define(inst_ref, ir::Type::F32, expression, false)
+}
+
+/// Emit Eden's integer system-value attribute path without the float bitcast.
+pub fn emit_get_attribute_u32(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let Value::Attribute(attribute) = inst.arg(0) else {
+        return Err(MslError::ExpectedImmediate {
+            opcode: inst.opcode,
+            arg: 0,
+            expected: "attribute",
+        });
+    };
+    if !matches!(inst.arg(1), Value::ImmU32(0)) {
+        return Err(MslError::UnsupportedProgramFeature(
+            "per-vertex input indexing",
+        ));
+    }
+    let expression = match *attribute {
+        crate::ir::value::Attribute::PRIMITIVE_ID => "primitive_id".to_owned(),
+        crate::ir::value::Attribute::INSTANCE_ID => {
+            if context.support_vertex_instance_id() {
+                "instance_id".to_owned()
+            } else {
+                "instance_index - base_instance".to_owned()
+            }
+        }
+        crate::ir::value::Attribute::VERTEX_ID => {
+            if context.support_vertex_instance_id() {
+                "vertex_id".to_owned()
+            } else {
+                "vertex_index".to_owned()
+            }
+        }
+        crate::ir::value::Attribute::BASE_INSTANCE => "base_instance".to_owned(),
+        crate::ir::value::Attribute::BASE_VERTEX => "base_vertex".to_owned(),
+        _ => return Err(MslError::UnsupportedAttribute(attribute.0)),
+    };
+    context.define(inst_ref, ir::Type::U32, expression, false)
 }

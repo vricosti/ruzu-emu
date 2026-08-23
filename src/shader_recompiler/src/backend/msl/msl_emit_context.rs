@@ -49,6 +49,7 @@ pub struct MslEmitContext {
     need_gather_subpixel_offset: bool,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
+    support_vertex_instance_id: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +223,57 @@ impl MslEmitContext {
         if program.info.uses_sample_id {
             parameters.push("uint sample_id [[sample_id]]".to_owned());
         }
+        let loads = &program.info.loads;
+        match stage {
+            Stage::VertexB => {
+                if loads.get(crate::ir::value::Attribute::INSTANCE_ID.0 as usize) {
+                    if profile.support_vertex_instance_id {
+                        parameters.push("uint instance_id [[instance_id]]".to_owned());
+                        if loads.get(crate::ir::value::Attribute::BASE_INSTANCE.0 as usize) {
+                            parameters.push("uint base_instance [[base_instance]]".to_owned());
+                        }
+                    } else {
+                        parameters.push("uint instance_index [[instance_id]]".to_owned());
+                        parameters.push("uint base_instance [[base_instance]]".to_owned());
+                    }
+                } else if loads.get(crate::ir::value::Attribute::BASE_INSTANCE.0 as usize) {
+                    parameters.push("uint base_instance [[base_instance]]".to_owned());
+                }
+                if loads.get(crate::ir::value::Attribute::VERTEX_ID.0 as usize) {
+                    if profile.support_vertex_instance_id {
+                        parameters.push("uint vertex_id [[vertex_id]]".to_owned());
+                        if loads.get(crate::ir::value::Attribute::BASE_VERTEX.0 as usize) {
+                            parameters.push("uint base_vertex [[base_vertex]]".to_owned());
+                        }
+                    } else {
+                        parameters.push("uint vertex_index [[vertex_id]]".to_owned());
+                        parameters.push("uint base_vertex [[base_vertex]]".to_owned());
+                    }
+                } else if loads.get(crate::ir::value::Attribute::BASE_VERTEX.0 as usize) {
+                    parameters.push("uint base_vertex [[base_vertex]]".to_owned());
+                }
+            }
+            Stage::Fragment => {
+                if loads.get(crate::ir::value::Attribute::PRIMITIVE_ID.0 as usize) {
+                    parameters.push("uint primitive_id [[primitive_id]]".to_owned());
+                }
+                if loads.get(crate::ir::value::Attribute::LAYER.0 as usize) {
+                    parameters.push("uint layer [[render_target_array_index]]".to_owned());
+                }
+                if loads.any_component(crate::ir::value::Attribute::POSITION_X.0 as usize) {
+                    parameters.push("float4 fragment_position [[position]]".to_owned());
+                }
+                if loads.get(crate::ir::value::Attribute::FRONT_FACE.0 as usize) {
+                    parameters.push("bool front_face [[front_facing]]".to_owned());
+                }
+                if loads.get(crate::ir::value::Attribute::POINT_SPRITE_S.0 as usize)
+                    || loads.get(crate::ir::value::Attribute::POINT_SPRITE_T.0 as usize)
+                {
+                    parameters.push("float2 point_coord [[point_coord]]".to_owned());
+                }
+            }
+            _ => {}
+        }
         let mut stage_input = String::new();
         for index in 0..32 {
             let input_type = runtime_info.generic_input_types[index];
@@ -362,6 +414,7 @@ impl MslEmitContext {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
             },
             has_broken_robust: profile.has_broken_robust,
+            support_vertex_instance_id: profile.support_vertex_instance_id,
         })
     }
 
@@ -609,6 +662,10 @@ impl MslEmitContext {
 
     pub fn stage(&self) -> Stage {
         self.stage
+    }
+
+    pub fn support_vertex_instance_id(&self) -> bool {
+        self.support_vertex_instance_id
     }
 
     pub fn supports_query_texture_lod(&self) -> bool {

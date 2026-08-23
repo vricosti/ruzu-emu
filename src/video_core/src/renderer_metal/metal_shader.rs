@@ -1682,6 +1682,120 @@ mod tests {
     }
 
     #[test]
+    fn compiles_direct_msl_stage_builtins_with_active_abi() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let profile = make_shader_profile(device.profile());
+        let runtime_info = RuntimeInfo::default();
+
+        let mut vertex = empty_program(Stage::VertexB);
+        for attribute in [
+            shader_recompiler::ir::Attribute::INSTANCE_ID,
+            shader_recompiler::ir::Attribute::VERTEX_ID,
+            shader_recompiler::ir::Attribute::BASE_INSTANCE,
+            shader_recompiler::ir::Attribute::BASE_VERTEX,
+        ] {
+            vertex.info.loads.set(attribute.0 as usize, true);
+            vertex.blocks[0].append_new_inst(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+            vertex.blocks[0].append_new_inst(
+                Opcode::GetAttributeU32,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+        }
+        let vertex_spirv = emit_spirv(&vertex, &profile, &runtime_info);
+        let active_vertex = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &vertex_spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active vertex built-in SPIR-V/MSL must compile");
+        let direct_vertex = validate_direct_msl_against_active_module(
+            device.device(),
+            &vertex,
+            &profile,
+            &runtime_info,
+            &active_vertex,
+        )
+        .expect("direct vertex built-in MSL must compile with the active ABI");
+        assert_eq!(direct_vertex.bindings(), active_vertex.bindings());
+        assert!(direct_vertex.source().source.contains("[[vertex_id]]"));
+        assert!(direct_vertex.source().source.contains("[[instance_id]]"));
+        assert!(direct_vertex.source().source.contains("[[base_vertex]]"));
+        assert!(direct_vertex.source().source.contains("[[base_instance]]"));
+
+        let mut compatibility_profile = profile.clone();
+        compatibility_profile.support_vertex_instance_id = false;
+        let compatibility = shader_recompiler::backend::msl::emit_msl_with_options(
+            &vertex,
+            &compatibility_profile,
+            &runtime_info,
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
+                supports_texture_atomics: device.profile().supports_texture_atomics(),
+            },
+        )
+        .expect("compatibility vertex built-ins must lower directly");
+        assert!(compatibility
+            .source
+            .source
+            .contains("instance_index - base_instance"));
+        compile_native_msl_artifact(device.device(), compatibility)
+            .expect("compatibility vertex built-ins must compile natively");
+
+        let mut fragment = empty_program(Stage::Fragment);
+        for attribute in [
+            shader_recompiler::ir::Attribute::PRIMITIVE_ID,
+            shader_recompiler::ir::Attribute::LAYER,
+            shader_recompiler::ir::Attribute::POSITION_X,
+            shader_recompiler::ir::Attribute::POSITION_W,
+            shader_recompiler::ir::Attribute::FRONT_FACE,
+            shader_recompiler::ir::Attribute::POINT_SPRITE_S,
+            shader_recompiler::ir::Attribute::POINT_SPRITE_T,
+        ] {
+            fragment.info.loads.set(attribute.0 as usize, true);
+            fragment.blocks[0].append_new_inst(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+        }
+        fragment.blocks[0].append_new_inst(
+            Opcode::GetAttributeU32,
+            vec![
+                Value::Attribute(shader_recompiler::ir::Attribute::PRIMITIVE_ID),
+                Value::ImmU32(0),
+            ],
+        );
+        let fragment_spirv = emit_spirv(&fragment, &profile, &runtime_info);
+        let active_fragment = compile_native_shader(
+            device.device(),
+            device.profile(),
+            &fragment_spirv,
+            &MetalShaderCompileOptions::for_device(device.profile()),
+        )
+        .expect("active fragment built-in SPIR-V/MSL must compile");
+        let direct_fragment = validate_direct_msl_against_active_module(
+            device.device(),
+            &fragment,
+            &profile,
+            &runtime_info,
+            &active_fragment,
+        )
+        .expect("direct fragment built-in MSL must compile with the active ABI");
+        assert_eq!(direct_fragment.bindings(), active_fragment.bindings());
+        let source = &direct_fragment.source().source;
+        assert!(source.contains("[[primitive_id]]"));
+        assert!(source.contains("[[render_target_array_index]]"));
+        assert!(source.contains("[[position]]"));
+        assert!(source.contains("[[front_facing]]"));
+        assert!(source.contains("[[point_coord]]"));
+    }
+
+    #[test]
     fn compiles_direct_msl_compute_artifact_with_workgroup_metadata() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
         let mut program = empty_program(Stage::Compute);

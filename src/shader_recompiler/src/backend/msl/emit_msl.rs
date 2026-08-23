@@ -32,15 +32,28 @@ use super::emit_msl_shared_memory;
 use super::msl_emit_context::MslEmitContext;
 use super::{MslError, MslOptions, MslShaderArtifact};
 
-fn varying_mask_has_only_generics(mask: &[u64; 8]) -> bool {
+fn varying_mask_has_only_stage_inputs(stage: crate::stage::Stage, mask: &[u64; 8]) -> bool {
     mask.iter().enumerate().all(|(word_index, word)| {
-        let allowed = match word_index {
-            0 => u64::MAX << 32,
-            1 => u64::MAX,
-            2 => u32::MAX as u64,
-            _ => 0,
-        };
-        word & !allowed == 0
+        let mut remaining = *word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as usize;
+            let attribute = word_index * 64 + bit;
+            let is_generic = (32..160).contains(&attribute);
+            let allowed = match stage {
+                crate::stage::Stage::VertexB => {
+                    is_generic || matches!(attribute, 190 | 191 | 256 | 257)
+                }
+                crate::stage::Stage::Fragment => {
+                    is_generic || matches!(attribute, 24 | 25 | 28..=31 | 184 | 185 | 255)
+                }
+                _ => false,
+            };
+            if !allowed {
+                return false;
+            }
+            remaining &= remaining - 1;
+        }
+        true
     })
 }
 
@@ -87,14 +100,11 @@ fn first_unsupported_program_feature(
     if program.is_geometry_passthrough {
         return Some("geometry passthrough");
     }
-    let supported_generic_loads = matches!(
-        program.stage,
-        crate::stage::Stage::VertexB | crate::stage::Stage::Fragment
-    ) && varying_mask_has_only_generics(&info.loads.mask);
+    let supported_stage_loads = varying_mask_has_only_stage_inputs(program.stage, &info.loads.mask);
     let supported_vertex_stores = program.stage == crate::stage::Stage::VertexB
         && varying_mask_has_only_vertex_outputs(&info.stores.mask);
     let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
-    if (!supported_generic_loads && info.loads.mask.iter().any(|word| *word != 0))
+    if (!supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
         || (!supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
         || info.passthrough.mask.iter().any(|word| *word != 0)
         || info.loads_indexed_attributes
@@ -572,6 +582,9 @@ fn emit_inst(
         Opcode::WriteLocal => emit_msl_context_get_set::emit_write_local(context, inst_ref, inst),
         Opcode::GetAttribute => {
             emit_msl_context_get_set::emit_get_attribute(context, inst_ref, inst)
+        }
+        Opcode::GetAttributeU32 => {
+            emit_msl_context_get_set::emit_get_attribute_u32(context, inst_ref, inst)
         }
         Opcode::LoadStorageU8
         | Opcode::LoadStorageS8
@@ -2138,12 +2151,104 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_builtin_stage_interfaces_even_without_instructions() {
+    fn emits_fragment_builtin_stage_inputs_with_maxwell_value_semantics() {
         let mut program = empty_program(Stage::Fragment);
+        let attributes = [
+            crate::ir::Attribute::PRIMITIVE_ID,
+            crate::ir::Attribute::LAYER,
+            crate::ir::Attribute::POSITION_X,
+            crate::ir::Attribute::POSITION_W,
+            crate::ir::Attribute::FRONT_FACE,
+            crate::ir::Attribute::POINT_SPRITE_S,
+            crate::ir::Attribute::POINT_SPRITE_T,
+        ];
+        for attribute in attributes {
+            program.info.loads.set(attribute.0 as usize, true);
+            program.blocks[0].append_new_inst(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+        }
+        program.blocks[0].append_new_inst(
+            Opcode::GetAttributeU32,
+            vec![
+                Value::Attribute(crate::ir::Attribute::PRIMITIVE_ID),
+                Value::ImmU32(0),
+            ],
+        );
+
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains("uint primitive_id [[primitive_id]]"));
+        assert!(source.contains("uint layer [[render_target_array_index]]"));
+        assert!(source.contains("float4 fragment_position [[position]]"));
+        assert!(source.contains("bool front_face [[front_facing]]"));
+        assert!(source.contains("float2 point_coord [[point_coord]]"));
+        assert!(source.contains("float v_0_0 = as_type<float>(primitive_id);"));
+        assert!(source.contains("float v_0_1 = as_type<float>(layer);"));
+        assert!(source.contains("float v_0_2 = fragment_position.x;"));
+        assert!(source.contains("float v_0_3 = fragment_position.w;"));
+        assert!(source.contains("float v_0_4 = as_type<float>(front_face ? 0xFFFFFFFFu : 0u);"));
+        assert!(source.contains("float v_0_5 = point_coord.x;"));
+        assert!(source.contains("float v_0_6 = point_coord.y;"));
+        assert!(source.contains("uint v_0_7 = primitive_id;"));
+    }
+
+    #[test]
+    fn emits_vertex_ids_for_both_upstream_profile_modes() {
+        let mut program = empty_program(Stage::VertexB);
+        let attributes = [
+            crate::ir::Attribute::INSTANCE_ID,
+            crate::ir::Attribute::VERTEX_ID,
+            crate::ir::Attribute::BASE_INSTANCE,
+            crate::ir::Attribute::BASE_VERTEX,
+        ];
+        for attribute in attributes {
+            program.info.loads.set(attribute.0 as usize, true);
+            program.blocks[0].append_new_inst(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+            program.blocks[0].append_new_inst(
+                Opcode::GetAttributeU32,
+                vec![Value::Attribute(attribute), Value::ImmU32(0)],
+            );
+        }
+
+        let fallback = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = &fallback.source.source;
+        assert!(source.contains("uint instance_index [[instance_id]]"));
+        assert!(source.contains("uint vertex_index [[vertex_id]]"));
+        assert!(source.contains("uint base_instance [[base_instance]]"));
+        assert!(source.contains("uint base_vertex [[base_vertex]]"));
+        assert!(source.contains("float v_0_0 = as_type<float>(instance_index - base_instance);"));
+        assert!(source.contains("uint v_0_1 = instance_index - base_instance;"));
+        assert!(source.contains("float v_0_2 = as_type<float>(vertex_index);"));
+        assert!(source.contains("uint v_0_3 = vertex_index;"));
+
+        let native_profile = Profile {
+            support_vertex_instance_id: true,
+            ..Profile::default()
+        };
+        let native = emit_msl(&program, &native_profile, &RuntimeInfo::default()).unwrap();
+        let source = &native.source.source;
+        assert!(source.contains("uint instance_id [[instance_id]]"));
+        assert!(source.contains("uint vertex_id [[vertex_id]]"));
+        assert!(!source.contains("instance_index"));
+        assert!(!source.contains("vertex_index"));
+        assert!(source.contains("float v_0_0 = as_type<float>(instance_id);"));
+        assert!(source.contains("uint v_0_1 = instance_id;"));
+        assert!(source.contains("float v_0_2 = as_type<float>(vertex_id);"));
+        assert!(source.contains("uint v_0_3 = vertex_id;"));
+    }
+
+    #[test]
+    fn rejects_draw_id_until_its_internal_metal_buffer_is_ported() {
+        let mut program = empty_program(Stage::VertexB);
         program
             .info
             .loads
-            .set(crate::ir::Attribute::POSITION_X.0 as usize, true);
+            .set(crate::ir::Attribute::DRAW_ID.0 as usize, true);
 
         assert_eq!(
             emit_msl(&program, &Profile::default(), &RuntimeInfo::default()),

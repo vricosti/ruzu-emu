@@ -2702,6 +2702,10 @@ impl ArmDynarmic32 {
             // Upstream: config.wall_clock_cntpct = m_uses_wall_clock
             wall_clock_cntpct: uses_wall_clock,
             cntfrq_el0: common::wall_clock::CNTFRQ as u32,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
             tpidrro_el0: None,
             tpidr_el0: None,
             // Upstream `ArmDynarmic32::MakeJit` configures A32 with the
@@ -2718,7 +2722,6 @@ impl ArmDynarmic32 {
             // rejection above (that stays driven by `page_table_pointer_mask_bits`
             // + `recompile_on_fastmem_failure`).
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
                 fastmem_address_space_bits: 32,
                 silently_mirror_fastmem: true,
                 fastmem_exclusive_access,

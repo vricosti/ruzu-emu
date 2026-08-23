@@ -1395,7 +1395,7 @@ pub fn emit_a32_dmb(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _
 
 /// A32InstructionSynchronizationBarrier: invoke the configured user callback.
 pub fn emit_a32_isb(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
-    if !ctx.config.memory.hook_isb {
+    if !ctx.config.hook_isb {
         return;
     }
     ctx.config
@@ -2833,6 +2833,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         }
     }
 

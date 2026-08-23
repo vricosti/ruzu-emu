@@ -25,7 +25,8 @@ use crate::backend::arm64::emit_arm64_a32_memory::{
 };
 use crate::backend::arm64::emit_arm64_a64::{
     emit_a64_call_supervisor, emit_a64_check_memory_abort, emit_a64_cond,
-    emit_a64_condition_failed_terminal, emit_a64_exception_raised, emit_a64_terminal,
+    emit_a64_condition_failed_terminal, emit_a64_data_cache_operation_raised,
+    emit_a64_exception_raised, emit_a64_instruction_cache_operation_raised, emit_a64_terminal,
 };
 use crate::backend::arm64::emit_arm64_a64_memory::{
     emit_a64_clear_exclusive, emit_a64_exclusive_read_memory, emit_a64_exclusive_write_memory,
@@ -265,7 +266,7 @@ impl EmitConfig {
             coprocessors: config.coprocessors.clone(),
             is_a32: true,
             optimizations: effective_optimizations(config),
-            hook_isb: config.memory.hook_isb,
+            hook_isb: config.hook_isb,
             cntfreq_el0: 0,
             ctr_el0: 0,
             dczid_el0: 0,
@@ -307,13 +308,13 @@ impl EmitConfig {
             coprocessors: crate::interface::a32::config::empty_coprocessors(),
             is_a32: false,
             optimizations: effective_optimizations(config),
-            hook_isb: config.memory.hook_isb,
+            hook_isb: config.hook_isb,
             // Upstream A64::UserConfig::cntfrq_el0 — forwarded from the
             // emulator (yuzu sets the Switch's 19'200'000 Hz; the dynarmic
             // default of 600'000'000 only applies when left unconfigured).
             cntfreq_el0: config.cntfrq_el0 as u64,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
+            ctr_el0: config.ctr_el0,
+            dczid_el0: config.dczid_el0,
             tpidrro_el0: config.tpidrro_el0.unwrap_or(core::ptr::null()),
             tpidr_el0: config.tpidr_el0.unwrap_or(core::ptr::null_mut()),
             check_halt_on_memory_access: memory.check_halt_on_memory_access,
@@ -1269,6 +1270,12 @@ fn emit_ir_instruction(
         Opcode::A64SetFPSR => emit_a64_set_fpsr(code, ctx, inst_ref),
         Opcode::A64CallSupervisor => emit_a64_call_supervisor(code, ctx, inst_ref),
         Opcode::A64ExceptionRaised => emit_a64_exception_raised(code, ctx, inst_ref),
+        Opcode::A64DataCacheOperationRaised => {
+            emit_a64_data_cache_operation_raised(code, ctx, inst_ref)
+        }
+        Opcode::A64InstructionCacheOperationRaised => {
+            emit_a64_instruction_cache_operation_raised(code, ctx, inst_ref)
+        }
         Opcode::A64DataSynchronizationBarrier => emit_a64_data_synchronization_barrier(code),
         Opcode::A64DataMemoryBarrier => emit_a64_data_memory_barrier(code),
         Opcode::A64InstructionSynchronizationBarrier => {
@@ -2085,6 +2092,10 @@ mod tests {
             processor_id: 3,
             wall_clock_cntpct: true,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: MemoryEmitConfig::default(),

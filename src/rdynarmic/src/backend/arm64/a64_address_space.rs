@@ -584,6 +584,13 @@ impl A64AddressSpace {
             },
         );
 
+        opt::polyfill(&mut block, opt::PolyfillOptions::default());
+        opt::a64_callback_config(
+            &mut block,
+            self.conf.hook_data_cache_operations,
+            self.conf.dczid_el0,
+        );
+
         if self
             .conf
             .has_optimization(OptimizationFlag::GET_SET_ELIMINATION)
@@ -1032,6 +1039,10 @@ mod tests {
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: MemoryEmitConfig::default(),

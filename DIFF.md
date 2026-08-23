@@ -8474,3 +8474,43 @@ Eden files: `src/dynarmic/src/dynarmic/interface/A64/config.h`,
 - PASS: focused tests require the exact operation discriminants and all three data-cache IR
   arguments, including the location descriptor. These enums and IR immediates are host-internal;
   no guest-visible raw payload changes.
+
+## 2026-08-23 — rdynarmic A64 cache callback/config/backends vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/ir/opt/a64_callback_config.rs`,
+`src/rdynarmic/src/backend/x64/{a64_emit_x64,emit_a64,emit_context}.rs`,
+`src/rdynarmic/src/backend/arm64/{a64_address_space,emit_arm64,emit_arm64_a64}.rs`,
+`src/rdynarmic/src/{jit,jit_config}.rs`, and
+`src/core/src/arm/dynarmic/arm_dynarmic_64.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/opt_passes.cpp`,
+`src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp`,
+`src/dynarmic/src/dynarmic/backend/arm64/{a64_address_space,emit_arm64_a64}.{cpp,h}`,
+`src/dynarmic/src/dynarmic/interface/A64/config.h`, and
+`src/core/arm/dynarmic/arm_dynarmic_64.cpp`.
+
+### Intentional differences
+- Rust's index-backed IR arena renumbers later `InstRef` values after each insertion and recomputes
+  use counts after the pass. Eden's list-backed iterator keeps instruction addresses stable; the
+  emitted instruction order and operands are otherwise identical.
+- Host callbacks use the existing Rust trait-object trampolines and register-allocation APIs. x64
+  still reserves its callback-context ABI argument, while arm64 reserves `X0`; the guest operation
+  and value therefore occupy the same two effective callback parameters as Eden.
+
+### Unintentional differences (to fix)
+- Ruzu still exposes one combined `JitConfig` for A32 and A64 instead of the two upstream
+  `interface/{A32,A64}/config.h::UserConfig` owners. The newly reviewed `ctr_el0`, `dczid_el0`, and
+  `hook_data_cache_operations` state is at least kept at that public configuration level rather
+  than in backend memory options, but the broader configuration split remains structural debt.
+- The pre-existing `hook_isb` field lived in `MemoryEmitConfig`. It now sits beside the other
+  callback-policy state in the public combined `JitConfig` and is forwarded explicitly to both
+  backends; splitting that combined owner remains part of the broader structural debt above.
+
+### Missing items
+- None in the reviewed A64 cache callback, unhooked lowering, x64 emission, arm64 emission, or
+  configurable CTR/DCZID behavior.
+
+### Binary layout verification
+- PASS: the new configuration fields are host-only Rust values and are not serialized or copied to
+  guest memory. Cache-operation IR keeps Eden's exact `Void(U64, U64, U64)` / `Void(U64, U64)`
+  signatures, and focused native plus AArch64-QEMU tests verify callback argument bit patterns.

@@ -280,6 +280,25 @@ pub struct JitConfig {
     /// Switch's 19'200'000 Hz), as yuzu does in `arm_dynarmic_64.cpp`.
     pub cntfrq_el0: u32,
 
+    /// A64 cache-type register returned for `MRS CTR_EL0`.
+    /// Matches upstream `A64::UserConfig::ctr_el0`.
+    pub ctr_el0: u32,
+
+    /// A64 data-cache zero ID register returned for `MRS DCZID_EL0` and used
+    /// to determine the block size lowered for `DC ZVA`.
+    /// Matches upstream `A64::UserConfig::dczid_el0`.
+    pub dczid_el0: u32,
+
+    /// Whether A64 data-cache maintenance instructions invoke the user
+    /// callback. When false, `DC ZVA` is lowered to zeroing stores and other
+    /// data-cache operations are discarded.
+    /// Matches upstream `A64::UserConfig::hook_data_cache_operations`.
+    pub hook_data_cache_operations: bool,
+
+    /// Whether ISB instructions invoke the user callback.
+    /// Matches upstream A32/A64 `UserConfig::hook_isb`.
+    pub hook_isb: bool,
+
     /// A64 TPIDRRO_EL0 backing storage.
     ///
     /// Matches upstream `A64::UserConfig::tpidrro_el0`. Generated A64 code

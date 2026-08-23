@@ -302,6 +302,11 @@ impl A64EmitX64 {
                 vector_multiply_widen: true,
             },
         );
+        opt::a64_callback_config(
+            &mut block,
+            self.emit_config.hook_data_cache_operations,
+            self.emit_config.dczid_el0,
+        );
         let skip_getset_at_pc: Vec<u64> = std::env::var("RUZU_SKIP_GETSET_AT_PC")
             .ok()
             .map(|s| {
@@ -1043,6 +1048,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
@@ -1114,6 +1123,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
@@ -1179,6 +1192,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         };
 
         // Create a single-stepping location descriptor

@@ -2518,6 +2518,10 @@ impl ArmDynarmic64 {
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,
             cntfrq_el0: common::wall_clock::CNTFRQ as u32,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
             tpidrro_el0: Some(tpidrro_el0_ptr),
             tpidr_el0: Some(tpidr_el0_ptr),
             // Memory emit options matching upstream zuyu's
@@ -2528,7 +2532,6 @@ impl ArmDynarmic64 {
             // Auto/unsafe-fastmem-check may widen only the fastmem side to
             // 64 bits below, matching the upstream accuracy switch.
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
                 fastmem_address_space_bits,
                 silently_mirror_fastmem: false,
                 fastmem_exclusive_access,

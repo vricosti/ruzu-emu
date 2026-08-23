@@ -63,15 +63,21 @@ in its arm64 backend; rdynarmic now preserves that behavior explicitly.
 
 The opcode audit now compares exact return/argument signatures in addition to
 names, and rejects duplicate or missing Rust metadata entries. It exposed 126
-shared-signature mismatches. The vector/CRC metadata slice fixed 123 of them,
-and the A32 coprocessor slice fixed two more: all reviewed binary vector
-operations now take two `U128` operands, paired widening-add operations are
-unary, CRC8/16 retain Eden's raw `U32` input, and coprocessor load/store use
-Eden's packed transfer metadata. One prerequisite-backed signature difference
-remains: `A64DataCacheOperationRaised`.
+shared-signature mismatches. The vector/CRC, A32 coprocessor, and A64 cache
+slices have now removed all of them: all 725 shared names have Eden's exact
+return/argument signature. This is metadata parity, not a behavioral claim for
+the 22 Rust-only operations that remain to be reviewed individually.
 
-Focused frontend, x64/arm64 emitter, CP15, IR-emitter, and opcode-metadata tests
-pass. Native Linux, Linux AArch64, and Windows x64 checks pass. The complete
+The A64 cache slice also ports the upstream callback-configuration pass. With
+hooking disabled, all data-cache callback IR is invalidated and `DC ZVA` is
+lowered to exact `DCZVA` writes using the configured block size. With hooking
+enabled, x64 and arm64 forward the operation/value pair to the user callback.
+`CTR_EL0` and `DCZID_EL0` are now configurable rather than backend constants.
+
+Focused frontend, x64/arm64 emitter, CP15, IR-emitter, opcode-metadata, and A64
+cache runtime tests pass. The cache runtime and emitter tests pass natively on
+x64 and under AArch64 QEMU; native Linux, Linux AArch64, and Windows x64 checks
+pass. The complete
 unit suite has a pre-existing x64 fastmem-test failure (`A32 fastmem path
 requires fallback table`) reproduced at the parent commit in an isolated
 worktree; differential oracle tests can also fail when the external Eden
@@ -85,8 +91,6 @@ the focused A32 coprocessor slice.
 - `common/fp/process_exception.rs` logs floating-point exception raising as
   unimplemented rather than following Eden's exception-state behavior.
 - The arm64 backend reports unimplemented vector-saturation opcodes.
-- `A64DataCacheOperationRaised` still omits Eden's location-descriptor
-  argument, and the corresponding callback/lowering paths are incomplete.
 
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

@@ -2249,6 +2249,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         }
     }
 

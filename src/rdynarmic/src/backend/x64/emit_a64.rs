@@ -813,9 +813,20 @@ pub fn emit_a64_exception_raised(
 pub fn emit_a64_data_cache_operation_raised(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
-    _inst_ref: InstRef,
-    _inst: &Inst,
+    inst_ref: InstRef,
+    inst: &Inst,
 ) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let (location_and_operation, value) = args.split_at_mut(2);
+    ra.host_call(
+        None,
+        &mut [
+            None,
+            Some(&mut location_and_operation[1]),
+            Some(&mut value[0]),
+            None,
+        ],
+    );
     ctx.config
         .callbacks
         .data_cache_operation
@@ -827,9 +838,15 @@ pub fn emit_a64_data_cache_operation_raised(
 pub fn emit_a64_instruction_cache_operation_raised(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
-    _inst_ref: InstRef,
-    _inst: &Inst,
+    inst_ref: InstRef,
+    inst: &Inst,
 ) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let (operation, value) = args.split_at_mut(1);
+    ra.host_call(
+        None,
+        &mut [None, Some(&mut operation[0]), Some(&mut value[0]), None],
+    );
     ctx.config
         .callbacks
         .instruction_cache_operation
@@ -848,7 +865,7 @@ pub fn emit_a64_dmb(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _
 }
 
 pub fn emit_a64_isb(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
-    if !ctx.config.memory.hook_isb {
+    if !ctx.config.hook_isb {
         return;
     }
     ctx.config
@@ -884,20 +901,19 @@ pub fn emit_a64_get_cntpct(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstR
         .unwrap();
 }
 
-pub fn emit_a64_get_ctr(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
+pub fn emit_a64_get_ctr(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
     let result = ra.scratch_gpr();
-    // CTR_EL0: typical value with 64-byte cache lines
-    // IminLine=4 (16 words=64 bytes), DminLine=4 (16 words=64 bytes)
     ra.asm
-        .mov(result.cvt32().unwrap(), 0x8444_C004u32 as i32)
+        .mov(result.cvt32().unwrap(), ctx.config.ctr_el0 as i32)
         .unwrap();
     ra.define_value(inst_ref, result);
 }
 
-pub fn emit_a64_get_dczid(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
+pub fn emit_a64_get_dczid(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
     let result = ra.scratch_gpr();
-    // DCZID_EL0: DZP=0 (DC ZVA permitted), BS=4 (64 bytes)
-    ra.asm.mov(result.cvt32().unwrap(), 4i32).unwrap();
+    ra.asm
+        .mov(result.cvt32().unwrap(), ctx.config.dczid_el0 as i32)
+        .unwrap();
     ra.define_value(inst_ref, result);
 }
 

@@ -6,9 +6,9 @@ use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
+use crate::interface::a32::config::Coprocessors;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
 use crate::jit_config::OptimizationFlag;
-use crate::interface::a32::config::Coprocessors;
 
 pub use crate::backend::common::emit_context::MemoryEmitConfig;
 
@@ -288,6 +288,15 @@ pub struct EmitConfig {
     /// Counter-timer frequency returned for `MRS CNTFRQ_EL0`.
     /// Upstream `A64::UserConfig::cntfrq_el0`; forwarded from `JitConfig`.
     pub cntfrq_el0: u32,
+    /// Cache-type register returned for `MRS CTR_EL0`.
+    pub ctr_el0: u32,
+    /// Data-cache zero ID register returned for `MRS DCZID_EL0` and consumed
+    /// by the A64 callback-configuration pass.
+    pub dczid_el0: u32,
+    /// Whether data-cache maintenance operations reach the user callback.
+    pub hook_data_cache_operations: bool,
+    /// Whether ISB instructions reach the user callback.
+    pub hook_isb: bool,
 }
 
 /// Per-block emission context.

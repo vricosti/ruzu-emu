@@ -150,6 +150,36 @@ pub fn emit_a64_exception_raised(
     Ok(())
 }
 
+pub fn emit_a64_data_cache_operation_raised(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    ctx.reg_alloc
+        .prepare_for_call(code, ctx.fpsr, [None, Some(args[1]), Some(args[2]), None])?;
+    emit_relocation(
+        code,
+        ctx.emitted_block_info,
+        LinkTarget::DataCacheOperationRaised,
+    )
+}
+
+pub fn emit_a64_instruction_cache_operation_raised(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    ctx.reg_alloc
+        .prepare_for_call(code, ctx.fpsr, [None, Some(args[0]), Some(args[1]), None])?;
+    emit_relocation(
+        code,
+        ctx.emitted_block_info,
+        LinkTarget::InstructionCacheOperationRaised,
+    )
+}
+
 fn emit_a64_terminal_inner(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -401,6 +431,8 @@ mod tests {
     use crate::backend::arm64::fpsr_manager::FpsrManager;
     use crate::backend::arm64::reg_alloc::RegAlloc;
     use crate::ir::block::Block;
+    use crate::ir::opcode::Opcode;
+    use crate::ir::value::Value;
     use crate::jit_config::{JitConfig, UserCallbacks};
     use std::collections::HashMap;
 
@@ -491,6 +523,10 @@ mod tests {
             processor_id: 0,
             wall_clock_cntpct: false,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
             tpidrro_el0: None,
             tpidr_el0: None,
             memory: Default::default(),
@@ -556,6 +592,70 @@ mod tests {
             f(code, &mut ctx);
         }
         info
+    }
+
+    #[test]
+    fn data_cache_callback_uses_operation_and_value_arguments() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
+        let inst_ref = block.append(
+            Opcode::A64DataCacheOperationRaised,
+            &[
+                Value::ImmU64(0x1000),
+                Value::ImmU64(7),
+                Value::ImmU64(0x1234),
+            ],
+        );
+
+        let info = with_context(&mut block, &mut code, |code, ctx| {
+            emit_a64_data_cache_operation_raised(code, ctx, inst_ref).unwrap();
+        });
+
+        assert_eq!(
+            emitted_words(&code),
+            vec![
+                inst::movz_x(X1, 7, 0),
+                inst::movz_x(X2, 0x1234, 0),
+                inst::nop(),
+            ]
+        );
+        assert_eq!(
+            info.relocations,
+            vec![Relocation {
+                code_offset: 8,
+                target: LinkTarget::DataCacheOperationRaised,
+            }]
+        );
+    }
+
+    #[test]
+    fn instruction_cache_callback_uses_operation_and_value_arguments() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
+        let inst_ref = block.append(
+            Opcode::A64InstructionCacheOperationRaised,
+            &[Value::ImmU64(2), Value::ImmU64(0x5678)],
+        );
+
+        let info = with_context(&mut block, &mut code, |code, ctx| {
+            emit_a64_instruction_cache_operation_raised(code, ctx, inst_ref).unwrap();
+        });
+
+        assert_eq!(
+            emitted_words(&code),
+            vec![
+                inst::movz_x(X1, 2, 0),
+                inst::movz_x(X2, 0x5678, 0),
+                inst::nop(),
+            ]
+        );
+        assert_eq!(
+            info.relocations,
+            vec![Relocation {
+                code_offset: 8,
+                target: LinkTarget::InstructionCacheOperationRaised,
+            }]
+        );
     }
 
     #[test]

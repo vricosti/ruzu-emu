@@ -323,8 +323,6 @@ mod tests {
     use super::*;
     use crate::sink::sink::new_sink_handle;
     use crate::sink::NullSink;
-    use parking_lot::Mutex;
-
     fn make_system() -> SharedSystem {
         crate::make_test_system()
     }

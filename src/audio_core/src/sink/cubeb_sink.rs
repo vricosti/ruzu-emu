@@ -430,8 +430,6 @@ impl Sink for CubebSink {
 mod tests {
     use super::*;
     use crate::sink::sink_stream::{SinkBuffer, StreamType};
-    use parking_lot::Mutex;
-
     fn make_system() -> SharedSystem {
         crate::make_test_system()
     }

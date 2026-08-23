@@ -108,8 +108,6 @@ impl Sink for NullSink {
 mod tests {
     use super::*;
     use crate::sink::sink_stream::SinkBuffer;
-    use parking_lot::Mutex;
-
     fn make_system() -> SharedSystem {
         crate::make_test_system()
     }

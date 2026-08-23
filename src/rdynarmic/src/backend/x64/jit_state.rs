@@ -390,13 +390,6 @@ pub struct A32JitState {
     /// to exclusive write (STREX) for CAS. Two u64s for 128-bit support.
     pub exclusive_value: [u64; 2],
 
-    /// CP15 TPIDR_UPRW (User Read/Write Thread Pointer, C13 C0 opc2=2).
-    /// Matching dynarmic's `DynarmicCP15::uprw`.
-    pub cp15_uprw: u32,
-    /// CP15 TPIDR_URO (User Read-Only Thread Pointer, C13 C0 opc2=3).
-    /// Matching dynarmic's `DynarmicCP15::uro`.
-    pub cp15_uro: u32,
-
     /// CNTPCT (Physical Count Timer).
     /// Set by the host before `run()` to provide the current tick count.
     /// Read by MRRC p15, 0, Rt, Rt2, c14.
@@ -426,8 +419,6 @@ impl A32JitState {
             fpsr_qc: 0,
             fpsr_nzcv: 0,
             exclusive_value: [0; 2],
-            cp15_uprw: 0,
-            cp15_uro: 0,
             cntpct: 0,
         };
         state.reset_rsb();
@@ -666,14 +657,6 @@ impl A32JitState {
 
     pub const fn offset_of_exclusive_value() -> usize {
         core::mem::offset_of!(A32JitState, exclusive_value)
-    }
-
-    pub const fn offset_of_cp15_uprw() -> usize {
-        core::mem::offset_of!(A32JitState, cp15_uprw)
-    }
-
-    pub const fn offset_of_cp15_uro() -> usize {
-        core::mem::offset_of!(A32JitState, cp15_uro)
     }
 
     pub const fn offset_of_cntpct() -> usize {

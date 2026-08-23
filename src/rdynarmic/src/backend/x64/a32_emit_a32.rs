@@ -11,6 +11,7 @@ use crate::backend::x64::abi;
 use crate::backend::x64::block_of_code::{
     emit_switch_mxcsr_on_entry, emit_switch_mxcsr_on_exit, STACK_LAYOUT_RSP_OFFSET,
 };
+use crate::backend::x64::callback::{Callback as X64Callback, SimpleCallback};
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_x64_memory::{
     emit_read_memory_mov, emit_vaddr_lookup_a32, emit_write_memory_mov, is_ordered,
@@ -22,6 +23,10 @@ use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
+use crate::interface::a32::coprocessor::{
+    Callback as CoprocessorCallback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords,
+};
+use crate::interface::a32::coprocessor_util::CoprocReg;
 
 fn emit_bitsize_read_mov(
     ra: &mut RegAlloc,
@@ -2450,96 +2455,94 @@ pub fn emit_a32_clear_exclusive(
 }
 
 // ---------------------------------------------------------------------------
-// Coprocessor operations — CP15 (system control) with TPIDR support
+// Coprocessor operations
 // ---------------------------------------------------------------------------
 
-/// Unpack coproc_info u64 into its fields.
-/// Layout: [0]=coproc_no, [1]=two, [2]=opc1, [3]=CRn, [4]=CRm, [6]=opc2
-fn unpack_coproc_info(info: u64) -> (u8, u8, u8, u8, u8, u8) {
-    let coproc_no = (info & 0xFF) as u8;
-    let two = ((info >> 8) & 0xFF) as u8;
-    let opc1 = ((info >> 16) & 0xFF) as u8;
-    let crn = ((info >> 24) & 0xFF) as u8;
-    let crm = ((info >> 32) & 0xFF) as u8;
-    let opc2 = ((info >> 48) & 0xFF) as u8;
-    (coproc_no, two, opc1, crn, crm, opc2)
+fn emit_coprocessor_exception() -> ! {
+    unreachable!("A32 coprocessor operation has no compile-time action")
+}
+
+fn call_coproc_callback(
+    ra: &mut RegAlloc,
+    callback: CoprocessorCallback,
+    inst_ref: Option<InstRef>,
+    arg0: Option<&mut Argument>,
+    arg1: Option<&mut Argument>,
+) {
+    ra.host_call(inst_ref, &mut [None, arg0, arg1, None]);
+
+    if let Some(user_arg) = callback.user_arg {
+        ra.asm
+            .mov(
+                abi::ABI_PARAMS[0].to_reg64(),
+                user_arg as usize as i64,
+            )
+            .unwrap();
+    }
+
+    SimpleCallback::new(callback.function as usize as u64)
+        .emit_call_simple(&mut *ra.asm)
+        .unwrap();
 }
 
 pub fn emit_a32_coproc_internal_operation(
-    _ctx: &EmitContext,
-    _ra: &mut RegAlloc,
-    _inst_ref: InstRef,
-    inst: &Inst,
-) {
-    // CDP: coprocessor data processing. For CP15, most operations are no-ops
-    // (memory barriers are handled by separate DMB/DSB/ISB instructions).
-    let info = inst.args[0].get_coproc_info();
-    let (coproc_no, _, _, crn, _, _) = unpack_coproc_info(info);
-
-    if coproc_no == 15 {
-        match crn {
-            7 => {
-                // CP15 C7: cache/barrier operations — no-op on x86 (strong memory model)
-            }
-            _ => {
-                // Other CDP to CP15 — no-op
-            }
-        }
-    }
-    // Non-CP15 CDP: silently ignore (better than crashing)
-}
-
-pub fn emit_a32_coproc_send_one_word(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
 ) {
-    // MCR: write CPU register to coprocessor register.
-    let info = inst.args[0].get_coproc_info();
-    let (coproc_no, two, opc1, crn, crm, opc2) = unpack_coproc_info(info);
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let opc1 = coproc_info[2] as u32;
+    let crd = CoprocReg::from_u8(coproc_info[3]);
+    let crn = CoprocReg::from_u8(coproc_info[4]);
+    let crm = CoprocReg::from_u8(coproc_info[5]);
+    let opc2 = coproc_info[6] as u32;
 
-    if coproc_no != 15 {
-        return;
-    }
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    let Some(action) = coproc.compile_internal_operation(two, opc1, crd, crn, crm, opc2) else {
+        emit_coprocessor_exception();
+    };
 
-    if two == 0 && opc1 == 0 && crn == 7 && crm == 5 && opc2 == 4 {
-        // CP15_FLUSH_PREFETCH_BUFFER: dummy write, ignore the source value.
-        return;
-    }
+    call_coproc_callback(ra, action, None, None, None);
+}
 
-    if two == 0 && opc1 == 0 && crn == 7 && crm == 10 {
-        match opc2 {
-            // CP15_DATA_SYNC_BARRIER
-            4 => {
-                ra.asm.mfence().unwrap();
-                ra.asm.lfence().unwrap();
-                return;
-            }
-            // CP15_DATA_MEMORY_BARRIER
-            5 => {
-                ra.asm.mfence().unwrap();
-                return;
-            }
-            _ => {}
+pub fn emit_a32_coproc_send_one_word(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let opc1 = coproc_info[2] as u32;
+    let crn = CoprocReg::from_u8(coproc_info[3]);
+    let crm = CoprocReg::from_u8(coproc_info[4]);
+    let opc2 = coproc_info[5] as u32;
+
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    match coproc.compile_send_one_word(two, opc1, crn, crm, opc2) {
+        CallbackOrAccessOneWord::CoprocessorException => emit_coprocessor_exception(),
+        CallbackOrAccessOneWord::Callback(callback) => {
+            call_coproc_callback(ra, callback, None, Some(&mut args[1]), None);
         }
-    }
-
-    if two == 0 && opc1 == 0 && crn == 13 && crm == 0 && opc2 == 2 {
-        // CP15_THREAD_UPRW
-        let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
-        let offset = A32JitState::offset_of_cp15_uprw();
-        if args[1].is_immediate() {
-            let imm = args[1].get_immediate_u32();
+        CallbackOrAccessOneWord::Memory(destination_ptr) => {
+            let word = ra.use_gpr(&mut args[1]);
+            let destination_addr = ra.scratch_gpr();
             ra.asm
-                .mov(dword_ptr(RegExp::from(R15) + offset as i32), imm as i32)
+                .mov(destination_addr, destination_ptr as usize as i64)
                 .unwrap();
-        } else {
-            let source = ra.use_gpr(&mut args[1]);
             ra.asm
                 .mov(
-                    dword_ptr(RegExp::from(R15) + offset as i32),
-                    source.cvt32().unwrap(),
+                    dword_ptr(RegExp::from(destination_addr)),
+                    word.cvt32().unwrap(),
                 )
                 .unwrap();
         }
@@ -2547,63 +2550,97 @@ pub fn emit_a32_coproc_send_one_word(
 }
 
 pub fn emit_a32_coproc_send_two_words(
-    _ctx: &EmitContext,
-    _ra: &mut RegAlloc,
-    _inst_ref: InstRef,
-    _inst: &Inst,
-) {
-    // MCRR: write two CPU registers to coprocessor — stub (no-op)
-}
-
-pub fn emit_a32_coproc_get_one_word(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    // MRC: read from coprocessor register into CPU register.
-    let info = inst.args[0].get_coproc_info();
-    let (coproc_no, _, _opc1, crn, crm, opc2) = unpack_coproc_info(info);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let opc = coproc_info[2] as u32;
+    let crm = CoprocReg::from_u8(coproc_info[3]);
 
-    let result = ra.scratch_gpr();
-
-    if coproc_no == 15 {
-        match (crn, crm, opc2) {
-            // MRC p15, 0, Rt, c13, c0, 2 — read TPIDR_UPRW
-            (13, 0, 2) => {
-                let offset = A32JitState::offset_of_cp15_uprw();
-                ra.asm
-                    .mov(
-                        result.cvt32().unwrap(),
-                        dword_ptr(RegExp::from(R15) + offset as i32),
-                    )
-                    .unwrap();
-            }
-            // MRC p15, 0, Rt, c13, c0, 3 — read TPIDR_URO
-            (13, 0, 3) => {
-                let offset = A32JitState::offset_of_cp15_uro();
-                ra.asm
-                    .mov(
-                        result.cvt32().unwrap(),
-                        dword_ptr(RegExp::from(R15) + offset as i32),
-                    )
-                    .unwrap();
-            }
-            _ => {
-                // Other MRC from CP15 — return 0
-                ra.asm
-                    .xor_(result.cvt32().unwrap(), result.cvt32().unwrap())
-                    .unwrap();
-            }
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    match coproc.compile_send_two_words(two, opc, crm) {
+        CallbackOrAccessTwoWords::CoprocessorException => emit_coprocessor_exception(),
+        CallbackOrAccessTwoWords::Callback(callback) => {
+            let (first, second) = args.split_at_mut(2);
+            call_coproc_callback(
+                ra,
+                callback,
+                None,
+                Some(&mut first[1]),
+                Some(&mut second[0]),
+            );
         }
-    } else {
-        // Non-CP15 MRC — return 0
-        ra.asm
-            .xor_(result.cvt32().unwrap(), result.cvt32().unwrap())
-            .unwrap();
+        CallbackOrAccessTwoWords::Memory(destination_ptrs) => {
+            let (first, second) = args.split_at_mut(2);
+            let word1 = ra.use_gpr(&mut first[1]);
+            let word2 = ra.use_gpr(&mut second[0]);
+            let destination_addr = ra.scratch_gpr();
+            ra.asm
+                .mov(destination_addr, destination_ptrs[0] as usize as i64)
+                .unwrap();
+            ra.asm
+                .mov(
+                    dword_ptr(RegExp::from(destination_addr)),
+                    word1.cvt32().unwrap(),
+                )
+                .unwrap();
+            ra.asm
+                .mov(destination_addr, destination_ptrs[1] as usize as i64)
+                .unwrap();
+            ra.asm
+                .mov(
+                    dword_ptr(RegExp::from(destination_addr)),
+                    word2.cvt32().unwrap(),
+                )
+                .unwrap();
+        }
     }
+}
 
-    ra.define_value(inst_ref, result);
+pub fn emit_a32_coproc_get_one_word(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let opc1 = coproc_info[2] as u32;
+    let crn = CoprocReg::from_u8(coproc_info[3]);
+    let crm = CoprocReg::from_u8(coproc_info[4]);
+    let opc2 = coproc_info[5] as u32;
+
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    match coproc.compile_get_one_word(two, opc1, crn, crm, opc2) {
+        CallbackOrAccessOneWord::CoprocessorException => emit_coprocessor_exception(),
+        CallbackOrAccessOneWord::Callback(callback) => {
+            call_coproc_callback(ra, callback, Some(inst_ref), None, None);
+        }
+        CallbackOrAccessOneWord::Memory(source_ptr) => {
+            let word = ra.scratch_gpr();
+            let source_addr = ra.scratch_gpr();
+            ra.asm
+                .mov(source_addr, source_ptr as usize as i64)
+                .unwrap();
+            ra.asm
+                .mov(
+                    word.cvt32().unwrap(),
+                    dword_ptr(RegExp::from(source_addr)),
+                )
+                .unwrap();
+            ra.define_value(inst_ref, word);
+        }
+    }
 }
 
 pub fn emit_a32_coproc_get_two_words(
@@ -2612,49 +2649,93 @@ pub fn emit_a32_coproc_get_two_words(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    // MRRC: read two words (64-bit value) from coprocessor.
-    let info = inst.args[0].get_coproc_info();
-    let (coproc_no, _, opc, _crn, crm, _opc2) = unpack_coproc_info(info);
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let opc = coproc_info[2] as u32;
+    let crm = CoprocReg::from_u8(coproc_info[3]);
 
-    if coproc_no == 15 && opc == 0 && crm == 14 {
-        // MRRC p15, 0, Rt, Rt2, c14 — CNTPCT (Physical Count Timer).
-        // Upstream (zuyu DynarmicCP15::CompileGetTwoWords) returns a Callback
-        // that invokes CoreTiming::GetClockTicks() at every call; matching that,
-        // we emit a host call to the get_cntpct callback which returns the live
-        // tick count. Reading a JitState field would return a stale value since
-        // the host only writes `cntpct` sporadically (not per-block).
-        ra.host_call(Some(inst_ref), &mut [None, None, None, None]);
-        ctx.config
-            .callbacks
-            .get_cntpct
-            .emit_call_simple(&mut *ra.asm)
-            .unwrap();
-    } else {
-        // Other MRRC — return 0.
-        let result = ra.scratch_gpr();
-        ra.asm
-            .xor_(result.cvt32().unwrap(), result.cvt32().unwrap())
-            .unwrap();
-        ra.define_value(inst_ref, result);
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    match coproc.compile_get_two_words(two, opc, crm) {
+        CallbackOrAccessTwoWords::CoprocessorException => emit_coprocessor_exception(),
+        CallbackOrAccessTwoWords::Callback(callback) => {
+            call_coproc_callback(ra, callback, Some(inst_ref), None, None);
+        }
+        CallbackOrAccessTwoWords::Memory(source_ptrs) => {
+            let result = ra.scratch_gpr();
+            let source_addr = ra.scratch_gpr();
+            let temporary = ra.scratch_gpr();
+            ra.asm
+                .mov(source_addr, source_ptrs[1] as usize as i64)
+                .unwrap();
+            ra.asm
+                .mov(
+                    result.cvt32().unwrap(),
+                    dword_ptr(RegExp::from(source_addr)),
+                )
+                .unwrap();
+            ra.asm.shl(result, 32).unwrap();
+            ra.asm
+                .mov(source_addr, source_ptrs[0] as usize as i64)
+                .unwrap();
+            ra.asm
+                .mov(
+                    temporary.cvt32().unwrap(),
+                    dword_ptr(RegExp::from(source_addr)),
+                )
+                .unwrap();
+            ra.asm.or_(result, temporary).unwrap();
+            ra.define_value(inst_ref, result);
+        }
     }
 }
 
 pub fn emit_a32_coproc_load_words(
-    _ctx: &EmitContext,
-    _ra: &mut RegAlloc,
-    _inst_ref: InstRef,
-    _inst: &Inst,
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
 ) {
-    // LDC: load to coprocessor from memory — stub (no-op)
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let long_transfer = coproc_info[2] != 0;
+    let crd = CoprocReg::from_u8(coproc_info[3]);
+    let option = (coproc_info[4] != 0).then_some(coproc_info[5]);
+
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    let Some(action) = coproc.compile_load_words(two, long_transfer, crd, option) else {
+        emit_coprocessor_exception();
+    };
+    call_coproc_callback(ra, action, None, Some(&mut args[1]), None);
 }
 
 pub fn emit_a32_coproc_store_words(
-    _ctx: &EmitContext,
-    _ra: &mut RegAlloc,
-    _inst_ref: InstRef,
-    _inst: &Inst,
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
 ) {
-    // STC: store from coprocessor to memory — stub (no-op)
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let coproc_info = inst.args[0].get_coproc_info().to_le_bytes();
+    let coproc_num = coproc_info[0] as usize;
+    let two = coproc_info[1] != 0;
+    let long_transfer = coproc_info[2] != 0;
+    let crd = CoprocReg::from_u8(coproc_info[3]);
+    let option = (coproc_info[4] != 0).then_some(coproc_info[5]);
+
+    let Some(coproc) = ctx.config.coprocessors[coproc_num].as_ref() else {
+        emit_coprocessor_exception();
+    };
+    let Some(action) = coproc.compile_store_words(two, long_transfer, crd, option) else {
+        emit_coprocessor_exception();
+    };
+    call_coproc_callback(ra, action, None, Some(&mut args[1]), None);
 }
 
 #[cfg(test)]
@@ -2676,6 +2757,13 @@ mod tests {
     use crate::ir::terminal::Terminal;
     use crate::ir::types::Type;
     use crate::ir::value::{InstRef, Value};
+    use crate::interface::a32::coprocessor::{
+        Callback as CoprocessorCallback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords,
+        Coprocessor,
+    };
+    use crate::interface::a32::coprocessor_util::CoprocReg;
+    use std::cell::UnsafeCell;
+    use std::sync::{Arc, Mutex};
 
     struct NoopCallback;
 
@@ -2707,6 +2795,7 @@ mod tests {
         }
 
         EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: EmitCallbacks {
                 memory_read_8: cb(),
                 memory_read_16: cb(),
@@ -2783,11 +2872,95 @@ mod tests {
             | ((opc1 as u64) << 16)
             | ((crn as u64) << 24)
             | ((crm as u64) << 32)
-            | ((opc2 as u64) << 48)
+            | ((opc2 as u64) << 40)
     }
 
-    fn emit_cp15_send_one_word(info: u64) -> Vec<u8> {
-        let config = dummy_emit_config();
+    struct RecordingCoprocessor {
+        destination: UnsafeCell<u32>,
+        send_one_word: Mutex<Option<(bool, u32, CoprocReg, CoprocReg, u32)>>,
+    }
+
+    unsafe impl Send for RecordingCoprocessor {}
+    unsafe impl Sync for RecordingCoprocessor {}
+
+    impl Coprocessor for RecordingCoprocessor {
+        fn compile_internal_operation(
+            &self,
+            _two: bool,
+            _opc1: u32,
+            _crd: CoprocReg,
+            _crn: CoprocReg,
+            _crm: CoprocReg,
+            _opc2: u32,
+        ) -> Option<CoprocessorCallback> {
+            None
+        }
+
+        fn compile_send_one_word(
+            &self,
+            two: bool,
+            opc1: u32,
+            crn: CoprocReg,
+            crm: CoprocReg,
+            opc2: u32,
+        ) -> CallbackOrAccessOneWord {
+            *self.send_one_word.lock().unwrap() = Some((two, opc1, crn, crm, opc2));
+            CallbackOrAccessOneWord::Memory(self.destination.get())
+        }
+
+        fn compile_send_two_words(
+            &self,
+            _two: bool,
+            _opc: u32,
+            _crm: CoprocReg,
+        ) -> CallbackOrAccessTwoWords {
+            CallbackOrAccessTwoWords::CoprocessorException
+        }
+
+        fn compile_get_one_word(
+            &self,
+            _two: bool,
+            _opc1: u32,
+            _crn: CoprocReg,
+            _crm: CoprocReg,
+            _opc2: u32,
+        ) -> CallbackOrAccessOneWord {
+            CallbackOrAccessOneWord::CoprocessorException
+        }
+
+        fn compile_get_two_words(
+            &self,
+            _two: bool,
+            _opc: u32,
+            _crm: CoprocReg,
+        ) -> CallbackOrAccessTwoWords {
+            CallbackOrAccessTwoWords::CoprocessorException
+        }
+
+        fn compile_load_words(
+            &self,
+            _two: bool,
+            _long_transfer: bool,
+            _crd: CoprocReg,
+            _option: Option<u8>,
+        ) -> Option<CoprocessorCallback> {
+            None
+        }
+
+        fn compile_store_words(
+            &self,
+            _two: bool,
+            _long_transfer: bool,
+            _crd: CoprocReg,
+            _option: Option<u8>,
+        ) -> Option<CoprocessorCallback> {
+            None
+        }
+    }
+
+    fn emit_send_one_word(info: u64, coprocessor: Arc<dyn Coprocessor>) -> Vec<u8> {
+        let mut config = dummy_emit_config();
+        config.coprocessors[15] = Some(coprocessor);
         let ctx = EmitContext::new(A32LocationDescriptor::at(0x1000).to_location(), &config);
         let inst = Inst::new(
             Opcode::A32CoprocSendOneWord,
@@ -2802,20 +2975,24 @@ mod tests {
     }
 
     #[test]
-    fn cp15_legacy_memory_barriers_match_host_fences() {
-        let dsb = emit_cp15_send_one_word(coproc_info(15, false, 0, 7, 10, 4));
-        let mut expected_dsb = rxbyak::CodeAssembler::new(4096).unwrap();
-        expected_dsb.mfence().unwrap();
-        expected_dsb.lfence().unwrap();
-        assert_eq!(dsb, expected_dsb.code());
+    fn configured_coprocessor_receives_exact_send_one_word_fields() {
+        let coprocessor = Arc::new(RecordingCoprocessor {
+            destination: UnsafeCell::new(0),
+            send_one_word: Mutex::new(None),
+        });
+        let destination = coprocessor.destination.get() as usize as u64;
+        let code = emit_send_one_word(
+            coproc_info(15, true, 6, 7, 10, 5),
+            coprocessor.clone(),
+        );
 
-        let dmb = emit_cp15_send_one_word(coproc_info(15, false, 0, 7, 10, 5));
-        let mut expected_dmb = rxbyak::CodeAssembler::new(4096).unwrap();
-        expected_dmb.mfence().unwrap();
-        assert_eq!(dmb, expected_dmb.code());
-
-        assert!(emit_cp15_send_one_word(coproc_info(15, true, 0, 7, 10, 4)).is_empty());
-        assert!(emit_cp15_send_one_word(coproc_info(15, false, 1, 7, 10, 5)).is_empty());
+        assert_eq!(
+            *coprocessor.send_one_word.lock().unwrap(),
+            Some((true, 6, CoprocReg::C7, CoprocReg::C10, 5))
+        );
+        assert!(code
+            .windows(8)
+            .any(|window| window == destination.to_le_bytes()));
     }
 
     #[test]

@@ -209,8 +209,9 @@ pub type EmitCheckMemoryAbort = for<'a> fn(
 /// Upstream owner: `backend/arm64/emit_arm64.h::EmitConfig`.
 /// This is intentionally backend-local; it should grow with the ARM64 emitter
 /// instead of reusing the x64 `EmitConfig` shape.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EmitConfig {
+    pub coprocessors: crate::interface::a32::config::Coprocessors,
     pub is_a32: bool,
     pub optimizations: OptimizationFlag,
     pub hook_isb: bool,
@@ -243,8 +244,6 @@ pub struct EmitConfig {
     pub state_nzcv_offset: usize,
     pub state_fpsr_offset: usize,
     pub state_exclusive_state_offset: usize,
-    pub a32_cp15_uprw: *mut u32,
-    pub a32_cp15_uro: *mut u32,
 }
 
 impl EmitConfig {
@@ -263,6 +262,7 @@ impl EmitConfig {
             config.fastmem_pointer.is_some() && config.global_monitor.is_some();
 
         Self {
+            coprocessors: config.coprocessors.clone(),
             is_a32: true,
             optimizations: effective_optimizations(config),
             hook_isb: config.memory.hook_isb,
@@ -296,8 +296,6 @@ impl EmitConfig {
             state_nzcv_offset: core::mem::offset_of!(A32JitState, cpsr_nzcv),
             state_fpsr_offset: core::mem::offset_of!(A32JitState, fpsr),
             state_exclusive_state_offset: core::mem::offset_of!(A32JitState, exclusive_state),
-            a32_cp15_uprw: core::ptr::null_mut(),
-            a32_cp15_uro: core::ptr::null_mut(),
         }
     }
 
@@ -306,6 +304,7 @@ impl EmitConfig {
         memory.processor_id = config.processor_id;
 
         Self {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             is_a32: false,
             optimizations: effective_optimizations(config),
             hook_isb: config.memory.hook_isb,
@@ -342,8 +341,6 @@ impl EmitConfig {
             state_nzcv_offset: core::mem::offset_of!(A64JitState, cpsr_nzcv),
             state_fpsr_offset: core::mem::offset_of!(A64JitState, fpsr),
             state_exclusive_state_offset: core::mem::offset_of!(A64JitState, exclusive_state),
-            a32_cp15_uprw: core::ptr::null_mut(),
-            a32_cp15_uro: core::ptr::null_mut(),
         }
     }
 }

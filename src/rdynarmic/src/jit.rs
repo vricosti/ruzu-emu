@@ -1594,6 +1594,7 @@ impl A64Jit {
         };
 
         let emit_config = EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: emit_callbacks,
             raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
                 write_8: Box::new(ArgCallback::new(
@@ -3087,6 +3088,7 @@ impl A32Jit {
         };
 
         let emit_config = EmitConfig {
+            coprocessors: config.coprocessors.clone(),
             callbacks: emit_callbacks,
             raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
                 write_8: Box::new(ArgCallback::new(
@@ -3430,50 +3432,6 @@ impl A32Jit {
         }
 
         self.inner.jit_state.ext_reg[index] = value;
-    }
-
-    /// Get CP15 TPIDR_UPRW (User Read/Write Thread Pointer).
-    /// Matching dynarmic's `DynarmicCP15::uprw`.
-    pub fn get_cp15_uprw(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.cp15_uprw();
-        }
-
-        self.inner.jit_state.cp15_uprw
-    }
-
-    /// Set CP15 TPIDR_UPRW (User Read/Write Thread Pointer).
-    pub fn set_cp15_uprw(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_cp15_uprw(value);
-            return;
-        }
-
-        self.inner.jit_state.cp15_uprw = value;
-    }
-
-    /// Get CP15 TPIDR_URO (User Read-Only Thread Pointer).
-    /// Matching dynarmic's `DynarmicCP15::uro`.
-    pub fn get_cp15_uro(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.cp15_uro();
-        }
-
-        self.inner.jit_state.cp15_uro
-    }
-
-    /// Set CP15 TPIDR_URO (User Read-Only Thread Pointer).
-    pub fn set_cp15_uro(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_cp15_uro(value);
-            return;
-        }
-
-        self.inner.jit_state.cp15_uro = value;
     }
 
     /// Get CNTPCT (Physical Count Timer) value.
@@ -4779,11 +4737,6 @@ mod tests {
 
         jit.set_ext_reg(7, 0xaabb_ccdd);
         assert_eq!(jit.get_ext_reg(7), 0xaabb_ccdd);
-
-        jit.set_cp15_uprw(0x1122_3344);
-        jit.set_cp15_uro(0x5566_7788);
-        assert_eq!(jit.get_cp15_uprw(), 0x1122_3344);
-        assert_eq!(jit.get_cp15_uro(), 0x5566_7788);
 
         jit.set_cntpct(0x1234_5678_9abc_def0);
         assert_eq!(jit.get_cntpct(), 0x1234_5678_9abc_def0);

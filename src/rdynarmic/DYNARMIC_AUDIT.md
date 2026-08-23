@@ -63,16 +63,20 @@ in its arm64 backend; rdynarmic now preserves that behavior explicitly.
 
 The opcode audit now compares exact return/argument signatures in addition to
 names, and rejects duplicate or missing Rust metadata entries. It exposed 126
-shared-signature mismatches. The vector/CRC metadata slice fixes 123 of them:
-all reviewed binary vector operations now take two `U128` operands, paired
-widening-add operations are unary, and CRC8/16 retain Eden's raw `U32` input.
-Three prerequisite-backed signature differences remain.
+shared-signature mismatches. The vector/CRC metadata slice fixed 123 of them,
+and the A32 coprocessor slice fixed two more: all reviewed binary vector
+operations now take two `U128` operands, paired widening-add operations are
+unary, CRC8/16 retain Eden's raw `U32` input, and coprocessor load/store use
+Eden's packed transfer metadata. One prerequisite-backed signature difference
+remains: `A64DataCacheOperationRaised`.
 
-Focused x64 emitter, IR-emitter, and opcode-metadata tests pass. Native Linux,
-Linux AArch64, and Windows x64 checks pass. The complete single-threaded unit
-suite progressed through its long JIT section but exceeded a 55-second audit
-limit; the broader `multiply` filter also exposes the pre-existing unrelated
-`scalar_lane_conversion_multiply_chain_matches_upstream` A32 oracle failure.
+Focused frontend, x64/arm64 emitter, CP15, IR-emitter, and opcode-metadata tests
+pass. Native Linux, Linux AArch64, and Windows x64 checks pass. The complete
+unit suite has a pre-existing x64 fastmem-test failure (`A32 fastmem path
+requires fallback table`) reproduced at the parent commit in an isolated
+worktree; differential oracle tests can also fail when the external Eden
+oracle does not complete. These are validation blockers, not evidence against
+the focused A32 coprocessor slice.
 
 ## Known behavioral gaps found during baseline
 
@@ -80,10 +84,7 @@ limit; the broader `multiply` filter also exposes the pre-existing unrelated
   `ExtractRegister32` and `ExtractRegister64` `unimplemented!()` paths.
 - `common/fp/process_exception.rs` logs floating-point exception raising as
   unimplemented rather than following Eden's exception-state behavior.
-- A32 non-VFP coprocessor translation/emission contains explicit no-op stubs.
 - The arm64 backend reports unimplemented vector-saturation opcodes.
-- `A32CoprocLoadWords` and `A32CoprocStoreWords` still carry an extra `U1`
-  argument, while their backend support is still incomplete.
 - `A64DataCacheOperationRaised` still omits Eden's location-descriptor
   argument, and the corresponding callback/lowering paths are incomplete.
 

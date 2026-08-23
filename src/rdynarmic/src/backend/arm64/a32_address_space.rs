@@ -32,8 +32,6 @@ pub struct A32AddressSpace {
     address_space: AddressSpace,
     conf: JitConfig,
     block_ranges: Vec<BlockRange32>,
-    cp15_uprw: Box<u32>,
-    cp15_uro: Box<u32>,
     dispatcher_entries: u64,
     dispatcher_cache_hits: u64,
     dispatcher_compiles: u64,
@@ -551,8 +549,6 @@ impl A32AddressSpace {
             address_space,
             conf,
             block_ranges: Vec::new(),
-            cp15_uprw: Box::new(0),
-            cp15_uro: Box::new(0),
             dispatcher_entries: 0,
             dispatcher_cache_hits: 0,
             dispatcher_compiles: 0,
@@ -755,26 +751,7 @@ impl A32AddressSpace {
     }
 
     pub fn get_emit_config(&self) -> EmitConfig {
-        let mut config = EmitConfig::from_a32_config(&self.conf);
-        config.a32_cp15_uprw = self.cp15_uprw.as_ref() as *const u32 as *mut u32;
-        config.a32_cp15_uro = self.cp15_uro.as_ref() as *const u32 as *mut u32;
-        config
-    }
-
-    pub fn cp15_uprw(&self) -> u32 {
-        *self.cp15_uprw
-    }
-
-    pub fn set_cp15_uprw(&mut self, value: u32) {
-        *self.cp15_uprw = value;
-    }
-
-    pub fn cp15_uro(&self) -> u32 {
-        *self.cp15_uro
-    }
-
-    pub fn set_cp15_uro(&mut self, value: u32) {
-        *self.cp15_uro = value;
+        EmitConfig::from_a32_config(&self.conf)
     }
 
     pub fn emit_normal_callback_trampolines(

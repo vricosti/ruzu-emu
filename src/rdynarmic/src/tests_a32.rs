@@ -3,8 +3,13 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::interface::a32::coprocessor::{
+        Callback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords, Coprocessor,
+    };
+    use crate::interface::a32::coprocessor_util::CoprocReg;
     use crate::jit::A32Jit;
     use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
+    use std::cell::UnsafeCell;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -128,9 +133,12 @@ mod tests {
         fn instruction_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
     }
 
-    fn make_jit(env: TestEnv) -> A32Jit {
+    fn make_jit_with_coprocessors(
+        env: TestEnv,
+        coprocessors: crate::interface::a32::config::Coprocessors,
+    ) -> A32Jit {
         let config = JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
+            coprocessors,
             callbacks: Box::new(env),
             enable_cycle_counting: true,
             code_cache_size: 4 * 1024 * 1024,
@@ -148,6 +156,100 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
         };
         A32Jit::new(config).expect("JIT creation should succeed")
+    }
+
+    fn make_jit(env: TestEnv) -> A32Jit {
+        make_jit_with_coprocessors(env, JitConfig::default_coprocessors())
+    }
+
+    struct ThreadPointerCoprocessor {
+        uro: UnsafeCell<u32>,
+    }
+
+    unsafe impl Send for ThreadPointerCoprocessor {}
+    unsafe impl Sync for ThreadPointerCoprocessor {}
+
+    impl Coprocessor for ThreadPointerCoprocessor {
+        fn compile_internal_operation(
+            &self,
+            _two: bool,
+            _opc1: u32,
+            _crd: CoprocReg,
+            _crn: CoprocReg,
+            _crm: CoprocReg,
+            _opc2: u32,
+        ) -> Option<Callback> {
+            None
+        }
+
+        fn compile_send_one_word(
+            &self,
+            _two: bool,
+            _opc1: u32,
+            _crn: CoprocReg,
+            _crm: CoprocReg,
+            _opc2: u32,
+        ) -> CallbackOrAccessOneWord {
+            CallbackOrAccessOneWord::CoprocessorException
+        }
+
+        fn compile_send_two_words(
+            &self,
+            _two: bool,
+            _opc: u32,
+            _crm: CoprocReg,
+        ) -> CallbackOrAccessTwoWords {
+            CallbackOrAccessTwoWords::CoprocessorException
+        }
+
+        fn compile_get_one_word(
+            &self,
+            two: bool,
+            opc1: u32,
+            crn: CoprocReg,
+            crm: CoprocReg,
+            opc2: u32,
+        ) -> CallbackOrAccessOneWord {
+            if !two
+                && opc1 == 0
+                && crn == CoprocReg::C13
+                && crm == CoprocReg::C0
+                && opc2 == 3
+            {
+                CallbackOrAccessOneWord::Memory(self.uro.get())
+            } else {
+                CallbackOrAccessOneWord::CoprocessorException
+            }
+        }
+
+        fn compile_get_two_words(
+            &self,
+            _two: bool,
+            _opc: u32,
+            _crm: CoprocReg,
+        ) -> CallbackOrAccessTwoWords {
+            CallbackOrAccessTwoWords::CoprocessorException
+        }
+
+        fn compile_load_words(
+            &self,
+            _two: bool,
+            _long_transfer: bool,
+            _crd: CoprocReg,
+            _option: Option<u8>,
+        ) -> Option<Callback> {
+            None
+        }
+
+        fn compile_store_words(
+            &self,
+            _two: bool,
+            _long_transfer: bool,
+            _crd: CoprocReg,
+            _option: Option<u8>,
+        ) -> Option<Callback> {
+            None
+        }
     }
 
     struct SharedEnv {
@@ -561,8 +663,11 @@ mod tests {
             0xee1d0f70, // mrc p15, 0, r0, c13, c0, 3
             0xeafffffe, // b +#0
         ]);
-        let mut jit = make_jit(env);
-        jit.set_cp15_uro(0xDEADBEEF);
+        let mut coprocessors = JitConfig::default_coprocessors();
+        coprocessors[15] = Some(Arc::new(ThreadPointerCoprocessor {
+            uro: UnsafeCell::new(0xDEADBEEF),
+        }));
+        let mut jit = make_jit_with_coprocessors(env, coprocessors);
         jit.set_cpsr(0x000001d0);
 
         jit.run();

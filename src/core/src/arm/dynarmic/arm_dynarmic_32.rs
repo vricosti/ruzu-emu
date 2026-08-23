@@ -19,6 +19,8 @@ use common::settings_enums::CpuAccuracy;
 
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
+use super::dynarmic_cp15::DynarmicCP15;
+
 static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Debug hook used to start the bounded A32 single-step tracer from a precise
@@ -2527,8 +2529,8 @@ pub struct ArmDynarmic32 {
     /// The rdynarmic A32 JIT instance
     jit: Option<rdynarmic::A32Jit>,
 
-    /// CP15 user-read-only register (TPIDRURO), upstream: m_cp15->uro
-    cp15_uro: u32,
+    /// Upstream: `std::shared_ptr<DynarmicCP15> m_cp15`.
+    cp15: Arc<DynarmicCP15>,
 
     /// Last exception address reported by dynarmic for the current halt.
     last_exception_address: Arc<AtomicU64>,
@@ -2608,6 +2610,7 @@ impl ArmDynarmic32 {
             base.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
         );
+        let cp15 = Arc::new(DynarmicCP15::new(parent_ptr.clone()));
 
         let settings = common::settings::values();
         let (optimizations, unsafe_optimizations) = if let Some(mask) =
@@ -2676,8 +2679,10 @@ impl ArmDynarmic32 {
             || (*settings.cpu_debug_mode.get_value()
                 && !*settings.cpuopt_ignore_memory_aborts.get_value());
 
+        let mut coprocessors = JitConfig::default_coprocessors();
+        coprocessors[15] = Some(cp15.clone());
         let config = JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
+            coprocessors,
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
             code_cache_size,
@@ -2801,7 +2806,7 @@ impl ArmDynarmic32 {
             halted_watchpoint,
             breakpoint_context: Arc::new(Mutex::new(ThreadContext::default())),
             jit,
-            cp15_uro: 0,
+            cp15,
             last_exception_address,
             trace_fastmem_ptr: fastmem_pointer.unwrap_or(std::ptr::null_mut()) as *const u8,
         };
@@ -2827,6 +2832,10 @@ impl ArmDynarmic32 {
     pub fn set_parent_ptr(&mut self) {
         let ptr: *mut ArmDynarmic32 = self;
         self.parent_ptr.store(ptr, Ordering::Release);
+    }
+
+    pub(super) fn clock_ticks(&self) -> u64 {
+        self.core_timing.get_clock_ticks()
     }
 
     /// Check if CPU is in Thumb mode.
@@ -3120,7 +3129,7 @@ impl ArmInterface for ArmDynarmic32 {
         let (fpsr, fpcr) = Self::fpscr_to_fpsr_fpcr(jit.get_fpscr());
         ctx.fpcr = fpcr;
         ctx.fpsr = fpsr;
-        ctx.tpidr = jit.get_cp15_uprw() as u64; // Upstream: ctx.tpidr = m_cp15->uprw
+        ctx.tpidr = self.cp15.uprw() as u64;
     }
 
     fn set_context(&mut self, ctx: &ThreadContext) {
@@ -3150,16 +3159,11 @@ impl ArmInterface for ArmDynarmic32 {
 
         let fpscr = Self::fpsr_fpcr_to_fpscr(ctx.fpsr as u64, ctx.fpcr as u64);
         jit.set_fpscr(fpscr);
-        // Upstream: m_cp15->uprw = static_cast<u32>(ctx.tpidr)
-        jit.set_cp15_uprw(ctx.tpidr as u32);
+        self.cp15.set_uprw(ctx.tpidr as u32);
     }
 
     fn set_tpidrro_el0(&mut self, value: u64) {
-        // Upstream: m_cp15->uro = static_cast<u32>(value)
-        self.cp15_uro = value as u32;
-        if let Some(jit) = self.jit.as_mut() {
-            jit.set_cp15_uro(value as u32);
-        }
+        self.cp15.set_uro(value as u32);
     }
 
     fn set_watchpoint_array(&mut self, watchpoints: *const WatchpointArray) {
@@ -3167,7 +3171,7 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn get_tpidrro_el0(&self) -> u64 {
-        self.cp15_uro as u64
+        self.cp15.uro() as u64
     }
 
     fn get_svc_arguments(&self, args: &mut [u64; 8]) {

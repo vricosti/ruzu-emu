@@ -6,36 +6,36 @@ Audit and align every shared IR opcode signature in
 `src/rdynarmic/src/ir/opcode.rs` with Eden
 `src/dynarmic/src/dynarmic/ir/opcodes.inc`.
 
-The name inventory is already at 725/725 shared names, with 22 Ruzu-only
-operations. The committed audit-tool work in this slice found 126 signature
-mismatches among the 725 shared names. The vector and CRC corrections reduce
-that inventory to three:
+The name inventory is at 725/725 shared names, with 22 Ruzu-only operations.
+The committed audit-tool work found 126 signature mismatches among the shared
+names. The vector, CRC, and A32 coprocessor corrections reduce that inventory
+to one:
 
-- `A32CoprocLoadWords` and `A32CoprocStoreWords` include an extra `U1`
-  argument;
 - `A64DataCacheOperationRaised` is missing Eden's third `U64` argument.
 
 ## Missing prerequisites
 
-Changing metadata alone is forbidden because the last seven differences may
-reflect divergent emitter, frontend, or backend contracts. Before resuming the
-global metadata slice:
+Changing metadata alone is forbidden because the remaining difference reflects
+divergent emitter, lowering, and callback contracts. Before resuming the global
+metadata slice:
 
-1. align A32 coprocessor load/store construction and dispatch;
-2. align A64 data-cache-operation construction, lowering and dispatch;
-3. verify and commit each prerequisite in its upstream-owned Rust files;
-4. rerun the exact-signature audit, update `DIFF.md`, and remove this state
+1. align A64 data-cache-operation construction, lowering, and dispatch;
+2. verify and commit the prerequisite in its upstream-owned Rust files;
+3. rerun the exact-signature audit, update `DIFF.md`, and remove this state
    file only after the shared mismatch count reaches zero.
 
 ## Completed prerequisites
 
-- The upstream-owned A32 coprocessor interface now exists under
-  `src/interface/a32/`: `CoprocReg` has moved out of the frontend, and the
-  callback/action/trait contracts match `coprocessor_util.h` and
-  `coprocessor.h`. `JitConfig` now also owns the exact 16-entry optional
-  registry from `config.h`; backend forwarding and action dispatch are the
-  next active prerequisite, and the old CP15-specific emitters are not yet
-  removed.
+- The upstream-owned A32 coprocessor interface exists under
+  `src/interface/a32/`: `CoprocReg`, callback/action contracts, and the exact
+  16-entry optional registry match Eden's interface owners.
+- ARM and Thumb decode/translation now cover Eden's seven generic coprocessor
+  forms. Metadata construction belongs to `A32IREmitter`, including CDP `CRd`,
+  exact field bytes, zeroed reserved bytes, and the exact load/store signature.
+- Both x64 and arm64 backends forward the registry and implement all compile-time
+  coprocessor actions instead of hard-coded CP15 subsets.
+- Core `DynarmicCP15` implements the interface directly; `ArmDynarmic32` owns it,
+  installs slot 15 before JIT creation, and uses it for UPRW/URO and CNTPCT.
 - CRC emitters and all A32/A64 frontend/backend call sites were re-read. They
   already pass and consume Eden's raw `U32` operand; the divergent metadata and
   arm64 routing test inputs are corrected.

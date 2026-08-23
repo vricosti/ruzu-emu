@@ -8335,3 +8335,79 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/decoder/{arm,thumb32,vfp}.in
 ### Binary layout verification
 - PASS: focused tests assert every byte of Eden's seven eight-byte coprocessor metadata layouts,
   including CDP `CRd`, one-word `opc2`, load/store option fields, and zeroed reserved bytes.
+
+## 2026-08-23 — rdynarmic A32 coprocessor backends vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/backend/x64/{a32_emit_a32,emit_context,jit_state}.rs`,
+`src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_a32_coprocessor,a32_address_space,a32_interface}.rs`,
+and `src/rdynarmic/src/jit.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp`,
+`src/dynarmic/src/dynarmic/backend/x64/emit_x64.h`,
+`src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp`,
+`src/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h`, and
+`src/dynarmic/src/dynarmic/interface/A32/a32.{h,cpp}`.
+
+### Intentional differences
+- Rust stores Eden's shared coprocessor objects as `Arc<dyn Coprocessor>` and forwards a cloned
+  16-entry array into backend configuration. This preserves shared lifetime and the exact slot
+  lookup while replacing C++ `shared_ptr` ownership.
+- Rust's x64 and arm64 callback helpers use the existing backend ABI/register-allocation APIs
+  rather than Eden's templated `ABI_CallFunction` helpers. They preserve the same optional user
+  argument, result destination, input ordering, and register-allocation accounting.
+- Missing coprocessors and compile-time exception actions use `unreachable!` at emission time,
+  corresponding to Eden's currently unreachable `EmitCoprocessorException` implementation.
+
+### Unintentional differences (to fix)
+- Both backends previously hard-coded a small CP15 subset and silently ignored several generic
+  actions. They now query the configured coprocessor and implement all seven upstream action
+  families: callback, direct one-word access, direct two-word access, and exception paths.
+- The registry previously stopped at `JitConfig`. It is now forwarded through x64 and arm64 emit
+  configuration, with empty registries used only for A64 emitters where Eden has no A32 coprocessor
+  configuration.
+- CP15 UPRW/URO storage previously lived in x64/arm64 JIT state and was exposed through bespoke
+  `A32Jit` accessors. Those non-upstream fields and accessors are removed; storage now belongs to
+  the configured core CP15 object, as it does in Eden.
+
+### Missing items
+- None in the reviewed x64/arm64 A32 coprocessor emission slice.
+
+### Binary layout verification
+- PASS for the reviewed state change: the two non-upstream CP15 words are removed from backend JIT
+  state, and every generated state access continues to use `offset_of!` rather than a persisted
+  numeric offset. Coprocessor pointers and callbacks are host-only and are not raw-copied into a
+  guest-visible structure.
+
+## 2026-08-23 — `core/arm/dynarmic/dynarmic_cp15.rs` vs Eden `dynarmic_cp15.{h,cpp}`
+
+Related Rust owner: `src/core/src/arm/dynarmic/arm_dynarmic_32.rs`; related Eden owner:
+`src/core/arm/dynarmic/arm_dynarmic_32.{h,cpp}`.
+
+### Intentional differences
+- Rust uses `UnsafeCell<u32>` for UPRW/URO and the ignored-write target so a coprocessor shared by
+  `Arc` can expose stable direct-access pointers through `&self`. Eden exposes pointers to mutable
+  members through a `shared_ptr`; both rely on the same single guest-execution-thread lifetime.
+- Eden's ignored-write target is process-global. Rust keeps one stable target in each CP15 object;
+  its address and stored value are unobservable, while avoiding mutable global state.
+- The CNTPCT callback reaches `ArmDynarmic32` through the existing post-placement atomic parent
+  pointer. This is the Rust counterpart of Eden's constructor-time parent reference and is needed
+  because the Rust CPU object moves into its final `Box` after JIT construction.
+- Rust uses `log::error!` where Eden uses `LOG_CRITICAL`, and portable sequentially-consistent
+  atomic fences on non-MSVC-x64 hosts where Eden selects compiler-specific barrier intrinsics.
+  The MSVC x64 DSB/DMB instruction distinction is preserved explicitly.
+
+### Unintentional differences (to fix)
+- CP15 previously returned local result enums that the JIT interpreted through hard-coded paths.
+  It now implements the upstream `Coprocessor` interface directly, including exact accepted
+  encodings, direct UPRW/URO accesses, barrier callbacks, CNTPCT callback, and rejection behavior.
+- `ArmDynarmic32` previously owned only a separate URO word and synchronized UPRW through bespoke
+  JIT state. It now owns one shared CP15 object, installs it in registry slot 15 before JIT
+  creation, and reads/writes thread context through that object in Eden's lifecycle order.
+
+### Missing items
+- None in the reviewed CP15 and `ArmDynarmic32` integration slice.
+
+### Binary layout verification
+- N/A: CP15 is a host-side polymorphic service object and is never serialized or raw-copied to
+  guest memory. Focused tests verify that the two thread-register actions expose distinct stable
+  words and that every accepted/rejected compile action matches Eden.

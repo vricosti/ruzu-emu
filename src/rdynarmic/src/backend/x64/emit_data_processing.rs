@@ -2211,6 +2211,7 @@ mod tests {
         }
 
         EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: EmitCallbacks {
                 memory_read_8: cb(),
                 memory_read_16: cb(),

@@ -189,22 +189,6 @@ impl A32Interface {
         self.current_state.exclusive_state = 0;
     }
 
-    pub fn cp15_uprw(&self) -> u32 {
-        self.current_address_space.cp15_uprw()
-    }
-
-    pub fn set_cp15_uprw(&mut self, value: u32) {
-        self.current_address_space.set_cp15_uprw(value);
-    }
-
-    pub fn cp15_uro(&self) -> u32 {
-        self.current_address_space.cp15_uro()
-    }
-
-    pub fn set_cp15_uro(&mut self, value: u32) {
-        self.current_address_space.set_cp15_uro(value);
-    }
-
     pub fn current_halt_reason(&self) -> HaltReason {
         HaltReason::from_bits_truncate(self.halt_reason.load(Ordering::SeqCst))
     }

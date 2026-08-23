@@ -1005,6 +1005,7 @@ mod tests {
     #[test]
     fn test_rsb_handler_generated() {
         let emit_config = crate::backend::x64::emit_context::EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: crate::backend::x64::emit_context::EmitCallbacks {
                 memory_read_8: Box::new(ArgCallback::new(0, 0)),
                 memory_read_16: Box::new(ArgCallback::new(0, 0)),
@@ -1075,6 +1076,7 @@ mod tests {
     #[test]
     fn test_fast_dispatch_table_allocated() {
         let emit_config = crate::backend::x64::emit_context::EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: crate::backend::x64::emit_context::EmitCallbacks {
                 memory_read_8: Box::new(ArgCallback::new(0, 0)),
                 memory_read_16: Box::new(ArgCallback::new(0, 0)),
@@ -1139,6 +1141,7 @@ mod tests {
     fn test_single_step_disables_rsb_and_fast_dispatch() {
         // When is_single_step is true, RSB and fast dispatch should be bypassed
         let emit_config = crate::backend::x64::emit_context::EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: crate::backend::x64::emit_context::EmitCallbacks {
                 memory_read_8: Box::new(ArgCallback::new(0, 0)),
                 memory_read_16: Box::new(ArgCallback::new(0, 0)),

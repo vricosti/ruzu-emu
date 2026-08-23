@@ -8,6 +8,7 @@ use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
 use crate::jit_config::OptimizationFlag;
+use crate::interface::a32::config::Coprocessors;
 
 pub use crate::backend::common::emit_context::MemoryEmitConfig;
 
@@ -265,6 +266,8 @@ pub struct RawExclusiveWriteCallbacks {
 
 /// Configuration for the A64 emitter.
 pub struct EmitConfig {
+    /// Configurable A32 coprocessors from `A32::UserConfig`.
+    pub coprocessors: Coprocessors,
     /// Callbacks for host-side operations.
     pub callbacks: EmitCallbacks,
     /// Direct user callbacks for faulting inline exclusive stores.

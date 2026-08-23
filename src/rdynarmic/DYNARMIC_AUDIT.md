@@ -136,5 +136,9 @@ validation blockers, not evidence against the focused slices.
   boundaries. The 14 newly restored dispatch paths reduce the remaining decoded A64 interpreter
   fallbacks to 57 identities. Its prerequisite also restored generic IR extension typing and the
   signed-to-unsigned saturated-shift U8 operand.
+- The A64 scalar three-same owner now contains all 37 visitors defined by Eden and the exact three
+  file-local helper boundaries. Thirteen restored dispatch paths reduce the remaining decoded A64
+  interpreter fallbacks to 44 identities; existing scalar-versus-vector operand shapes were also
+  corrected. Its prerequisite restored the five scalar saturated-arithmetic IR builders.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

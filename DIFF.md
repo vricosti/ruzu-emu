@@ -10014,3 +10014,57 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all 21
   decoder identities, the six saturation opcodes, rounding/accumulation operation counts, single
   scalar source extraction, and reserved-value handling without interpreter fallback.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (scalar saturated-arithmetic builders)
+
+### Intentional differences
+- Rust resolves instruction-backed operand types through the block arena because `Value::Inst`
+  does not carry Eden's `UAny::GetType()` inline. It asserts equal operand types before selecting
+  the same width-specific opcode.
+- Unsupported widths panic instead of returning Eden's empty `UAny` or reaching `UNREACHABLE`;
+  both are internal builder misuse and cannot be produced by a valid frontend visitor.
+
+### Unintentional differences (to fix)
+- Fixed: scalar signed/unsigned saturated add and subtract opcodes, plus signed saturating doubling
+  multiply-high, existed in the IR and backends without their upstream builder methods. All five
+  type-dispatching builders now live beside Eden's other saturated-arithmetic helpers.
+
+### Missing items
+- None for the reviewed scalar saturated-arithmetic builder family.
+
+### Binary layout verification
+- N/A: these builders construct SSA and define no raw-copied payload. A focused test verifies all
+  18 valid width/operation opcode selections in upstream order.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_three_same.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_three_same.cpp,impl.h}`
+
+### Intentional differences
+- Rust visitors extract typed operands from `DecodedInst`; the three file-local helper boundaries,
+  enums, validations, and visitor responsibilities otherwise mirror Eden.
+- Rust passes `fpcr_controlled=true` explicitly to FP vector comparison builders and false/true
+  carry inputs to non-flag-setting add/sub builders. These are required by Rust's lower-level IR
+  API and represent Eden's implicit builder behavior.
+- `SQRSHL_1` and `UQRSHL_1` remain header-only declarations in the reviewed Eden snapshot: they
+  have neither decoder identities nor C++ definitions, so Rust does not invent unreachable visitor
+  methods for them.
+
+### Unintentional differences (to fix)
+- Fixed: SQADD, SQSUB, SQDMULH, SQRDMULH, UQADD, UQSUB, SQSHL-register, SRSHL,
+  UQSHL-register, URSHL, FMULX, FACGE, and FACGT decoded but fell through to the non-upstream
+  interpreter terminal. All 13 now dispatch to their matching owner.
+- Fixed: ADD and SUB applied `VectorGetElement` twice to values already returned by `V_scalar`.
+  They now perform one scalar extraction per source as Eden does.
+- Fixed: scalar integer comparisons, CMTST, SSHL, USHL, and scalar FP comparisons used
+  `V_scalar` inputs where Eden uses vector `V(32/64)`. Their GetS/GetD/GetQ selection, vector
+  operation shape, scalar result extraction, and SetD/SetQ ordering now match upstream.
+- Fixed: the file used invented argument-decoding helpers and stored a register inside the
+  comparison-variant enum. The enums and three file-local helpers now have Eden's ownership and
+  responsibilities.
+
+### Missing items
+- None for the 37 visitors and three file-local helpers defined by the reviewed C++ source.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all 13
+  restored identities, scalar saturated opcode selection, corrected scalar/vector operand shapes,
+  and reserved rounding-shift sizes without interpreter fallback.

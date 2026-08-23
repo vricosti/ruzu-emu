@@ -664,6 +664,69 @@ impl<'a> IREmitter<'a> {
         ResultAndOverflow { result, overflow }
     }
 
+    pub fn signed_saturated_add(&mut self, a: Value, b: Value) -> Value {
+        let value_type = self.value_type(a);
+        assert_eq!(value_type, self.value_type(b));
+        let opcode = match value_type {
+            Type::U8 => Opcode::SignedSaturatedAdd8,
+            Type::U16 => Opcode::SignedSaturatedAdd16,
+            Type::U32 => Opcode::SignedSaturatedAdd32,
+            Type::U64 => Opcode::SignedSaturatedAdd64,
+            ty => panic!("Cannot perform signed saturated add on {ty:?}"),
+        };
+        self.emit(opcode, &[a, b])
+    }
+
+    pub fn signed_saturated_doubling_multiply_return_high(&mut self, a: Value, b: Value) -> Value {
+        let value_type = self.value_type(a);
+        assert_eq!(value_type, self.value_type(b));
+        let opcode = match value_type {
+            Type::U16 => Opcode::SignedSaturatedDoublingMultiplyReturnHigh16,
+            Type::U32 => Opcode::SignedSaturatedDoublingMultiplyReturnHigh32,
+            ty => panic!("Cannot perform saturated doubling multiply-high on {ty:?}"),
+        };
+        self.emit(opcode, &[a, b])
+    }
+
+    pub fn signed_saturated_sub(&mut self, a: Value, b: Value) -> Value {
+        let value_type = self.value_type(a);
+        assert_eq!(value_type, self.value_type(b));
+        let opcode = match value_type {
+            Type::U8 => Opcode::SignedSaturatedSub8,
+            Type::U16 => Opcode::SignedSaturatedSub16,
+            Type::U32 => Opcode::SignedSaturatedSub32,
+            Type::U64 => Opcode::SignedSaturatedSub64,
+            ty => panic!("Cannot perform signed saturated sub on {ty:?}"),
+        };
+        self.emit(opcode, &[a, b])
+    }
+
+    pub fn unsigned_saturated_add(&mut self, a: Value, b: Value) -> Value {
+        let value_type = self.value_type(a);
+        assert_eq!(value_type, self.value_type(b));
+        let opcode = match value_type {
+            Type::U8 => Opcode::UnsignedSaturatedAdd8,
+            Type::U16 => Opcode::UnsignedSaturatedAdd16,
+            Type::U32 => Opcode::UnsignedSaturatedAdd32,
+            Type::U64 => Opcode::UnsignedSaturatedAdd64,
+            ty => panic!("Cannot perform unsigned saturated add on {ty:?}"),
+        };
+        self.emit(opcode, &[a, b])
+    }
+
+    pub fn unsigned_saturated_sub(&mut self, a: Value, b: Value) -> Value {
+        let value_type = self.value_type(a);
+        assert_eq!(value_type, self.value_type(b));
+        let opcode = match value_type {
+            Type::U8 => Opcode::UnsignedSaturatedSub8,
+            Type::U16 => Opcode::UnsignedSaturatedSub16,
+            Type::U32 => Opcode::UnsignedSaturatedSub32,
+            Type::U64 => Opcode::UnsignedSaturatedSub64,
+            ty => panic!("Cannot perform unsigned saturated sub on {ty:?}"),
+        };
+        self.emit(opcode, &[a, b])
+    }
+
     // --- Flags ---
 
     pub fn get_carry_from_op(&mut self, value: Value) -> Value {
@@ -2819,6 +2882,52 @@ mod tests {
         );
         assert_eq!(inst.args[1], Value::ImmU8(7));
         assert_eq!(block.inst_count(), 2);
+    }
+
+    #[test]
+    fn scalar_saturated_builders_select_upstream_opcodes_from_operand_type() {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut e = IREmitter::new(&mut block);
+            for (a, b) in [
+                (Value::ImmU8(1), Value::ImmU8(2)),
+                (Value::ImmU16(1), Value::ImmU16(2)),
+                (Value::ImmU32(1), Value::ImmU32(2)),
+                (Value::ImmU64(1), Value::ImmU64(2)),
+            ] {
+                e.signed_saturated_add(a, b);
+                e.signed_saturated_sub(a, b);
+                e.unsigned_saturated_add(a, b);
+                e.unsigned_saturated_sub(a, b);
+            }
+            e.signed_saturated_doubling_multiply_return_high(Value::ImmU16(3), Value::ImmU16(4));
+            e.signed_saturated_doubling_multiply_return_high(Value::ImmU32(5), Value::ImmU32(6));
+        }
+
+        let opcodes: std::vec::Vec<_> = block.instructions.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                Opcode::SignedSaturatedAdd8,
+                Opcode::SignedSaturatedSub8,
+                Opcode::UnsignedSaturatedAdd8,
+                Opcode::UnsignedSaturatedSub8,
+                Opcode::SignedSaturatedAdd16,
+                Opcode::SignedSaturatedSub16,
+                Opcode::UnsignedSaturatedAdd16,
+                Opcode::UnsignedSaturatedSub16,
+                Opcode::SignedSaturatedAdd32,
+                Opcode::SignedSaturatedSub32,
+                Opcode::UnsignedSaturatedAdd32,
+                Opcode::UnsignedSaturatedSub32,
+                Opcode::SignedSaturatedAdd64,
+                Opcode::SignedSaturatedSub64,
+                Opcode::UnsignedSaturatedAdd64,
+                Opcode::UnsignedSaturatedSub64,
+                Opcode::SignedSaturatedDoublingMultiplyReturnHigh16,
+                Opcode::SignedSaturatedDoublingMultiplyReturnHigh32,
+            ]
+        );
     }
 
     #[test]

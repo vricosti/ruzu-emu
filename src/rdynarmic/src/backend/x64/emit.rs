@@ -15,7 +15,6 @@ use crate::backend::x64::emit_saturation as sat;
 use crate::backend::x64::emit_sha;
 use crate::backend::x64::emit_sm4;
 use crate::backend::x64::emit_terminal;
-use crate::backend::x64::emit_x64;
 use crate::backend::x64::emit_vector_arrangement as varr;
 use crate::backend::x64::emit_vector_basic as vbasic;
 use crate::backend::x64::emit_vector_compare as vcmp;
@@ -23,6 +22,7 @@ use crate::backend::x64::emit_vector_misc as vmisc;
 use crate::backend::x64::emit_vector_multiply as vmul;
 use crate::backend::x64::emit_vector_saturated as vsat;
 use crate::backend::x64::emit_vector_shift as vshift;
+use crate::backend::x64::emit_x64;
 use crate::backend::x64::emit_x64_vector;
 use crate::backend::x64::hostloc::HOST_RCX;
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
@@ -905,18 +905,10 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorEqual32 => vcmp::emit_vector_equal32(ctx, ra, inst_ref, inst),
             Opcode::VectorEqual64 => vcmp::emit_vector_equal64(ctx, ra, inst_ref, inst),
             Opcode::VectorEqual128 => vcmp::emit_vector_equal128(ctx, ra, inst_ref, inst),
-            Opcode::VectorGreaterS8 => {
-                vcmp::emit_vector_greater_signed8(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterS16 => {
-                vcmp::emit_vector_greater_signed16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterS32 => {
-                vcmp::emit_vector_greater_signed32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorGreaterS64 => {
-                vcmp::emit_vector_greater_signed64(ctx, ra, inst_ref, inst)
-            }
+            Opcode::VectorGreaterS8 => vcmp::emit_vector_greater_signed8(ctx, ra, inst_ref, inst),
+            Opcode::VectorGreaterS16 => vcmp::emit_vector_greater_signed16(ctx, ra, inst_ref, inst),
+            Opcode::VectorGreaterS32 => vcmp::emit_vector_greater_signed32(ctx, ra, inst_ref, inst),
+            Opcode::VectorGreaterS64 => vcmp::emit_vector_greater_signed64(ctx, ra, inst_ref, inst),
             Opcode::VectorGreaterEqualSigned8 => {
                 vcmp::emit_vector_greater_equal_signed8(ctx, ra, inst_ref, inst)
             }
@@ -966,25 +958,13 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorMaxS32 => vcmp::emit_vector_max_signed32(ctx, ra, inst_ref, inst),
             Opcode::VectorMaxS64 => vcmp::emit_vector_max_signed64(ctx, ra, inst_ref, inst),
             Opcode::VectorMinU8 => vcmp::emit_vector_min_unsigned8(ctx, ra, inst_ref, inst),
-            Opcode::VectorMinU16 => {
-                vcmp::emit_vector_min_unsigned16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorMinU32 => {
-                vcmp::emit_vector_min_unsigned32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorMinU64 => {
-                vcmp::emit_vector_min_unsigned64(ctx, ra, inst_ref, inst)
-            }
+            Opcode::VectorMinU16 => vcmp::emit_vector_min_unsigned16(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinU32 => vcmp::emit_vector_min_unsigned32(ctx, ra, inst_ref, inst),
+            Opcode::VectorMinU64 => vcmp::emit_vector_min_unsigned64(ctx, ra, inst_ref, inst),
             Opcode::VectorMaxU8 => vcmp::emit_vector_max_unsigned8(ctx, ra, inst_ref, inst),
-            Opcode::VectorMaxU16 => {
-                vcmp::emit_vector_max_unsigned16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorMaxU32 => {
-                vcmp::emit_vector_max_unsigned32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::VectorMaxU64 => {
-                vcmp::emit_vector_max_unsigned64(ctx, ra, inst_ref, inst)
-            }
+            Opcode::VectorMaxU16 => vcmp::emit_vector_max_unsigned16(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxU32 => vcmp::emit_vector_max_unsigned32(ctx, ra, inst_ref, inst),
+            Opcode::VectorMaxU64 => vcmp::emit_vector_max_unsigned64(ctx, ra, inst_ref, inst),
 
             // --- Vector shift ---
             Opcode::VectorLogicalShiftLeft8 => {
@@ -1095,17 +1075,17 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorMultiplyUnsignedWiden32 => {
                 vmul::emit_vector_multiply_unsigned_widen32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorSignedMultiplyLong16 => {
-                vmul::emit_vector_signed_multiply_long16(ctx, ra, inst_ref, inst)
+            Opcode::VectorSignedMultiply16 => {
+                emit_x64_vector::emit_vector_signed_multiply16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorSignedMultiplyLong32 => {
-                vmul::emit_vector_signed_multiply_long32(ctx, ra, inst_ref, inst)
+            Opcode::VectorSignedMultiply32 => {
+                emit_x64_vector::emit_vector_signed_multiply32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorUnsignedMultiplyLong16 => {
-                vmul::emit_vector_unsigned_multiply_long16(ctx, ra, inst_ref, inst)
+            Opcode::VectorUnsignedMultiply16 => {
+                emit_x64_vector::emit_vector_unsigned_multiply16(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorUnsignedMultiplyLong32 => {
-                vmul::emit_vector_unsigned_multiply_long32(ctx, ra, inst_ref, inst)
+            Opcode::VectorUnsignedMultiply32 => {
+                emit_x64_vector::emit_vector_unsigned_multiply32(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorPolynomialMultiply8 => {
                 vmul::emit_vector_polynomial_multiply8(ctx, ra, inst_ref, inst)

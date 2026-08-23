@@ -10,6 +10,12 @@ pub struct ResultAndOverflow {
     pub overflow: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UpperAndLower {
+    pub upper: Value,
+    pub lower: Value,
+}
+
 /// Base IR emitter — the builder API for constructing IR blocks.
 /// Wraps a Block and appends instructions to it.
 pub struct IREmitter<'a> {
@@ -696,6 +702,19 @@ impl<'a> IREmitter<'a> {
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, b])
+    }
+
+    pub fn vector_signed_multiply(&mut self, esize: usize, a: Value, b: Value) -> UpperAndLower {
+        let opcode = match esize {
+            16 => Opcode::VectorSignedMultiply16,
+            32 => Opcode::VectorSignedMultiply32,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        let multiply = self.emit(opcode, &[a, b]);
+        UpperAndLower {
+            upper: self.get_upper_from_op(multiply),
+            lower: self.get_lower_from_op(multiply),
+        }
     }
 
     pub fn vector_unsigned_absolute_difference(
@@ -2538,6 +2557,36 @@ mod tests {
         ];
         for (index, opcode) in expected.into_iter().enumerate() {
             assert_eq!(block.get(InstRef(index as u32 + 1)).opcode, opcode);
+        }
+    }
+
+    #[test]
+    fn vector_signed_multiply_builds_edens_upper_and_lower_results() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let (result16, result32);
+        {
+            let mut e = IREmitter::new(&mut block);
+            let a = e.zero_vector();
+            let b = e.zero_vector();
+            result16 = e.vector_signed_multiply(16, a, b);
+            result32 = e.vector_signed_multiply(32, a, b);
+        }
+        let multiply16 = block.get(result16.upper.inst_ref()).args[0].inst_ref();
+        let multiply32 = block.get(result32.upper.inst_ref()).args[0].inst_ref();
+
+        for (multiply, result, opcode) in [
+            (multiply16, result16, Opcode::VectorSignedMultiply16),
+            (multiply32, result32, Opcode::VectorSignedMultiply32),
+        ] {
+            assert_eq!(block.get(multiply).opcode, opcode);
+            assert_eq!(
+                block.get_associated_pseudo_operation(multiply, Opcode::GetUpperFromOp),
+                Some(result.upper.inst_ref())
+            );
+            assert_eq!(
+                block.get_associated_pseudo_operation(multiply, Opcode::GetLowerFromOp),
+                Some(result.lower.inst_ref())
+            );
         }
     }
 

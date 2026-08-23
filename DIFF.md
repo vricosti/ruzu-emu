@@ -8188,3 +8188,38 @@ Eden files: `src/dynarmic/src/dynarmic/ir/ir_emitter.h`,
 ### Binary layout verification
 - N/A: the change restores SSA pseudo-result ownership and register-allocation bookkeeping; it
   introduces no serialized payload or ABI-visible data structure.
+
+## 2026-08-23 — rdynarmic vector multi-result multiply IR/backends vs Eden Dynarmic
+
+Rust files: `src/rdynarmic/src/ir/{opcode,emitter}.rs`,
+`src/rdynarmic/src/backend/x64/{emit,emit_x64_vector}.rs`, and
+`src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_vector}.rs`.
+
+Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
+`src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`, and
+`src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`.
+
+### Intentional differences
+- Rust represents Eden's nullable associated pseudo-operation pointers as `Option<InstRef>` and
+  dispatches the same per-opcode emitters through explicit `match` arms. Producer ownership,
+  result-sensitive branches, host instruction ordering, and value-definition ordering are retained.
+- Rust reports an invalid element size with `panic!`; this is the direct counterpart of Eden's
+  `UNREACHABLE()` branch. Like Eden, the public emitter constructor exists only for signed
+  multiplication even though both signed and unsigned producer backends are present.
+
+### Unintentional differences (to fix)
+- Four dead `Vector{Signed,Unsigned}MultiplyLong{16,32}` operations had no Eden counterpart and
+  returned one widened vector instead of Eden's upper/lower multi-result contract. They and their
+  fallback implementations are removed; the exact four Eden producer operations replace them.
+- The pre-existing broad binary-vector metadata arm still assigns `U128(U128, U8)` to numerous
+  operations that Eden declares as `U128(U128, U128)`. The four newly reviewed multiply producers
+  are outside that arm and have their exact `Void(U128, U128)` metadata; the broader correction is
+  a separate audit slice.
+
+### Missing items
+- None for the four reviewed multiply producers. The opcode inventory has no missing Eden names,
+  while 22 Ruzu-only operations still require ownership and behavior review.
+
+### Binary layout verification
+- PASS: all four producer opcodes use Eden's exact `Void(U128, U128)` signature and both pseudo
+  results remain full `U128` values. No raw-memory payload or guest ABI structure is introduced.

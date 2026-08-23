@@ -25,18 +25,18 @@ Run:
 python3 tools/audit_dynarmic_opcodes.py /path/to/eden/src/dynarmic/src/dynarmic/ir/opcodes.inc
 ```
 
-After the opcode naming and vector broadcast-element slices:
+After the opcode naming, broadcast-element, reduction, and multi-result
+multiply slices:
 
 - Eden opcodes: 725
 - rdynarmic opcodes: 747
-- missing in rdynarmic: 4
-- extra in rdynarmic: 26
+- missing in rdynarmic: 0
+- extra in rdynarmic: 22
 
-The four missing opcodes are the `Vector{Signed,Unsigned}Multiply16/32` forms.
-The 26 extra opcodes include internal insertion-point and A32 execution-hook
-operations, comparison/shuffle operations that Eden builds from other IR, and
-four widening-multiply operations whose ownership differs from Eden's
-multi-result multiply opcodes.
+The 22 extra opcodes comprise internal insertion-point and A32 execution-hook
+operations plus comparison and shuffle operations that Eden builds from other
+IR. They remain audit items and are not counted as upstream parity merely
+because they compile.
 
 The first slice restored Eden's exact names for 73 already-equivalent opcodes,
 including `BitRotateRight*`, `PackedAbsDiffSumU8`, and the vector `S`/`U`
@@ -51,6 +51,22 @@ The third slice replaced ADDV's expanded per-lane loop with Eden's four
 dedicated `VectorReduceAdd*` opcodes. It ports the exact x64 SSSE3/SSE2 paths,
 arm64 scalar `ADDV`/`ADDP` paths, frontend validation and result write order.
 
+The fourth slice restored Eden's upper/lower pseudo-result ownership. The x64
+`GetUpperFromOp` and `GetLowerFromOp` emitters now register results defined by
+their producer instead of extracting unrelated 64-bit halves into GPRs.
+
+The fifth slice ports the four `Vector{Signed,Unsigned}Multiply16/32`
+multi-result producers and their exact x64 AVX/SSE instruction ordering. It
+also removes four dead `*MultiplyLong*` operations that had no Eden equivalent
+and had incompatible IR metadata. Eden marks the four producers unreachable
+in its arm64 backend; rdynarmic now preserves that behavior explicitly.
+
+Focused x64 emitter, IR-emitter, and opcode-metadata tests pass. Native Linux,
+Linux AArch64, and Windows x64 checks pass. The complete single-threaded unit
+suite progressed through its long JIT section but exceeded a 55-second audit
+limit; the broader `multiply` filter also exposes the pre-existing unrelated
+`scalar_lane_conversion_multiply_chain_matches_upstream` A32 oracle failure.
+
 ## Known behavioral gaps found during baseline
 
 - `backend/x64/emit_data_processing.rs` still contains dynamic
@@ -59,6 +75,10 @@ arm64 scalar `ADDV`/`ADDP` paths, frontend validation and result write order.
   unimplemented rather than following Eden's exception-state behavior.
 - A32 non-VFP coprocessor translation/emission contains explicit no-op stubs.
 - The arm64 backend reports unimplemented vector-saturation opcodes.
+- The broad binary-vector metadata arm in `ir/opcode.rs` still assigns
+  `U128(U128, U8)` to operations for which Eden declares `U128(U128, U128)`.
+  This affects many pre-existing opcodes and requires a separate metadata
+  audit rather than being folded into the multiply slice.
 
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

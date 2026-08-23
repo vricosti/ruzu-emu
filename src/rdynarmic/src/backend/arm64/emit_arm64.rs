@@ -1021,6 +1021,8 @@ fn emit_ir_instruction(
         | Opcode::VectorSignedAbsoluteDifference8
         | Opcode::VectorSignedAbsoluteDifference16
         | Opcode::VectorSignedAbsoluteDifference32
+        | Opcode::VectorSignedMultiply16
+        | Opcode::VectorSignedMultiply32
         | Opcode::VectorUnsignedAbsoluteDifference8
         | Opcode::VectorUnsignedAbsoluteDifference16
         | Opcode::VectorUnsignedAbsoluteDifference32
@@ -1067,6 +1069,8 @@ fn emit_ir_instruction(
         | Opcode::VectorTableLookup128
         | Opcode::VectorUnsignedRecipEstimate
         | Opcode::VectorUnsignedRecipSqrtEstimate
+        | Opcode::VectorUnsignedMultiply16
+        | Opcode::VectorUnsignedMultiply32
         | Opcode::VectorUnsignedSaturatedAccumulateSigned8
         | Opcode::VectorUnsignedSaturatedAccumulateSigned16
         | Opcode::VectorUnsignedSaturatedAccumulateSigned32

@@ -459,8 +459,8 @@ pub enum Opcode {
     VectorSignedAbsoluteDifference8,
     VectorSignedAbsoluteDifference16,
     VectorSignedAbsoluteDifference32,
-    VectorSignedMultiplyLong16,
-    VectorSignedMultiplyLong32,
+    VectorSignedMultiply16,
+    VectorSignedMultiply32,
     VectorSignedSaturatedAbs8,
     VectorSignedSaturatedAbs16,
     VectorSignedSaturatedAbs32,
@@ -515,8 +515,8 @@ pub enum Opcode {
     VectorUnsignedAbsoluteDifference8,
     VectorUnsignedAbsoluteDifference16,
     VectorUnsignedAbsoluteDifference32,
-    VectorUnsignedMultiplyLong16,
-    VectorUnsignedMultiplyLong32,
+    VectorUnsignedMultiply16,
+    VectorUnsignedMultiply32,
     VectorUnsignedRecipEstimate,
     VectorUnsignedRecipSqrtEstimate,
     VectorUnsignedSaturatedAccumulateSigned8,
@@ -1329,6 +1329,10 @@ impl Opcode {
 
             ZeroVector => OpcodeInfo { ret: U128, args: &[] },
 
+            VectorSignedMultiply16 | VectorSignedMultiply32 |
+            VectorUnsignedMultiply16 | VectorUnsignedMultiply32
+                => OpcodeInfo { ret: V, args: &[U128, U128] },
+
             // Binary vector -> vector ops
             VectorAdd8 | VectorAdd16 | VectorAdd32 | VectorAdd64 |
             VectorSub8 | VectorSub16 | VectorSub32 | VectorSub64 |
@@ -1368,9 +1372,7 @@ impl Opcode {
             VectorRoundingShiftLeftS8 | VectorRoundingShiftLeftS16 | VectorRoundingShiftLeftS32 | VectorRoundingShiftLeftS64 |
             VectorRoundingShiftLeftU8 | VectorRoundingShiftLeftU16 | VectorRoundingShiftLeftU32 | VectorRoundingShiftLeftU64 |
             VectorSignedAbsoluteDifference8 | VectorSignedAbsoluteDifference16 | VectorSignedAbsoluteDifference32 |
-            VectorSignedMultiplyLong16 | VectorSignedMultiplyLong32 |
             VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32 |
-            VectorUnsignedMultiplyLong16 | VectorUnsignedMultiplyLong32 |
             // Vector shifts: the non-V (scalar) forms take an immediate U8
             // shift amount. Upstream `opcodes.inc` signature:
             // `OPCODE(VectorLogicalShiftLeft32, U128, U128, U8)`.
@@ -1691,6 +1693,16 @@ mod tests {
 
         assert_eq!(Opcode::A64ReadMemory64.return_type(), Type::U64);
         assert_eq!(Opcode::A64ReadMemory64.num_args(), 3);
+
+        for opcode in [
+            Opcode::VectorSignedMultiply16,
+            Opcode::VectorSignedMultiply32,
+            Opcode::VectorUnsignedMultiply16,
+            Opcode::VectorUnsignedMultiply32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::Void);
+            assert_eq!(opcode.arg_types(), &[Type::U128, Type::U128]);
+        }
     }
 
     #[test]

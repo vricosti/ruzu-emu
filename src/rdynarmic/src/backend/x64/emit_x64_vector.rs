@@ -4,6 +4,7 @@ use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
+use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
 use rxbyak::{xmmword_ptr, XMM0};
 
@@ -246,12 +247,264 @@ pub fn emit_vector_reduce_add64(
     ra.define_value(inst_ref, data);
 }
 
+pub fn emit_vector_signed_multiply16(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let block = ctx.block.expect("IR block required for pseudo-operations");
+    let upper_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetUpperFromOp);
+    let lower_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetLowerFromOp);
+
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let x = ra.use_xmm(&mut args[0]);
+    let y = ra.use_xmm(&mut args[1]);
+
+    if let Some(upper_inst) = upper_inst {
+        let result = ra.scratch_xmm();
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpmulhw(result, x, y).unwrap();
+        } else {
+            ra.asm.movdqa(result, x).unwrap();
+            ra.asm.pmulhw(result, y).unwrap();
+        }
+        ra.define_value(upper_inst, result);
+    }
+
+    if let Some(lower_inst) = lower_inst {
+        let result = ra.scratch_xmm();
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpmullw(result, x, y).unwrap();
+        } else {
+            ra.asm.movdqa(result, x).unwrap();
+            ra.asm.pmullw(result, y).unwrap();
+        }
+        ra.define_value(lower_inst, result);
+    }
+}
+
+pub fn emit_vector_signed_multiply32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let block = ctx.block.expect("IR block required for pseudo-operations");
+    let upper_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetUpperFromOp);
+    let lower_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetLowerFromOp);
+
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+
+    if lower_inst.is_some() && upper_inst.is_none() && ctx.has_host_feature(HostFeature::AVX) {
+        let x = ra.use_xmm(&mut args[0]);
+        let y = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        ra.asm.vpmulld(result, x, y).unwrap();
+        ra.define_value(lower_inst.unwrap(), result);
+        return;
+    }
+
+    if ctx.has_host_feature(HostFeature::AVX) {
+        let x = ra.use_scratch_xmm(&mut args[0]);
+        let y = ra.use_scratch_xmm(&mut args[1]);
+
+        if let Some(lower_inst) = lower_inst {
+            let lower_result = ra.scratch_xmm();
+            ra.asm.vpmulld(lower_result, x, y).unwrap();
+            ra.define_value(lower_inst, lower_result);
+        }
+
+        let result = ra.scratch_xmm();
+        ra.asm.vpmuldq(result, x, y).unwrap();
+        ra.asm.vpsrlq_imm(x, x, 32).unwrap();
+        ra.asm.vpsrlq_imm(y, y, 32).unwrap();
+        ra.asm.vpmuldq(x, x, y).unwrap();
+        ra.asm.shufps(result, x, 0b1101_1101).unwrap();
+        ra.define_value(upper_inst.unwrap(), result);
+        return;
+    }
+
+    let x = ra.use_scratch_xmm(&mut args[0]);
+    let y = ra.use_scratch_xmm(&mut args[1]);
+    let tmp = ra.scratch_xmm();
+    let sign_correction = ra.scratch_xmm();
+    let upper_result = ra.scratch_xmm();
+    let lower_result = ra.scratch_xmm();
+
+    ra.asm.movdqa(tmp, x).unwrap();
+    ra.asm.movdqa(sign_correction, y).unwrap();
+    ra.asm.psrad_imm(tmp, 31).unwrap();
+    ra.asm.psrad_imm(sign_correction, 31).unwrap();
+    ra.asm.pand(tmp, y).unwrap();
+    ra.asm.pand(sign_correction, x).unwrap();
+    ra.asm.paddd(sign_correction, tmp).unwrap();
+    let sign_mask = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required")
+        .get_constant(0x7fff_ffff_7fff_ffff, 0x7fff_ffff_7fff_ffff);
+    ra.asm
+        .pand(sign_correction, xmmword_ptr(sign_mask))
+        .unwrap();
+
+    ra.asm.movdqa(tmp, x).unwrap();
+    ra.asm.pmuludq(tmp, y).unwrap();
+    ra.asm.psrlq_imm(x, 32).unwrap();
+    ra.asm.psrlq_imm(y, 32).unwrap();
+    ra.asm.pmuludq(x, y).unwrap();
+
+    ra.asm.pcmpeqw(upper_result, upper_result).unwrap();
+    ra.asm.pcmpeqw(lower_result, lower_result).unwrap();
+    ra.asm.psllq_imm(upper_result, 32).unwrap();
+    ra.asm.psrlq_imm(lower_result, 32).unwrap();
+    ra.asm.pand(upper_result, x).unwrap();
+    ra.asm.pand(lower_result, tmp).unwrap();
+    ra.asm.psrlq_imm(tmp, 32).unwrap();
+    ra.asm.psllq_imm(x, 32).unwrap();
+    ra.asm.por(upper_result, tmp).unwrap();
+    ra.asm.por(lower_result, x).unwrap();
+    ra.asm.psubd(upper_result, sign_correction).unwrap();
+
+    if let Some(upper_inst) = upper_inst {
+        ra.define_value(upper_inst, upper_result);
+    }
+    if let Some(lower_inst) = lower_inst {
+        ra.define_value(lower_inst, lower_result);
+    }
+}
+
+pub fn emit_vector_unsigned_multiply16(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let block = ctx.block.expect("IR block required for pseudo-operations");
+    let upper_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetUpperFromOp);
+    let lower_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetLowerFromOp);
+
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let x = ra.use_xmm(&mut args[0]);
+    let y = ra.use_xmm(&mut args[1]);
+
+    if let Some(upper_inst) = upper_inst {
+        let result = ra.scratch_xmm();
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpmulhuw(result, x, y).unwrap();
+        } else {
+            ra.asm.movdqa(result, x).unwrap();
+            ra.asm.pmulhuw(result, y).unwrap();
+        }
+        ra.define_value(upper_inst, result);
+    }
+
+    if let Some(lower_inst) = lower_inst {
+        let result = ra.scratch_xmm();
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpmullw(result, x, y).unwrap();
+        } else {
+            ra.asm.movdqa(result, x).unwrap();
+            ra.asm.pmullw(result, y).unwrap();
+        }
+        ra.define_value(lower_inst, result);
+    }
+}
+
+pub fn emit_vector_unsigned_multiply32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let block = ctx.block.expect("IR block required for pseudo-operations");
+    let upper_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetUpperFromOp);
+    let lower_inst = block.get_associated_pseudo_operation(inst_ref, Opcode::GetLowerFromOp);
+
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+
+    if lower_inst.is_some() && upper_inst.is_none() && ctx.has_host_feature(HostFeature::AVX) {
+        let x = ra.use_xmm(&mut args[0]);
+        let y = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        ra.asm.vpmulld(result, x, y).unwrap();
+        ra.define_value(lower_inst.unwrap(), result);
+    } else if ctx.has_host_feature(HostFeature::AVX) {
+        let x = ra.use_scratch_xmm(&mut args[0]);
+        let y = ra.use_scratch_xmm(&mut args[1]);
+
+        if let Some(lower_inst) = lower_inst {
+            let lower_result = ra.scratch_xmm();
+            ra.asm.vpmulld(lower_result, x, y).unwrap();
+            ra.define_value(lower_inst, lower_result);
+        }
+
+        let result = ra.scratch_xmm();
+        ra.asm.vpmuludq(result, x, y).unwrap();
+        ra.asm.vpsrlq_imm(x, x, 32).unwrap();
+        ra.asm.vpsrlq_imm(y, y, 32).unwrap();
+        ra.asm.vpmuludq(x, x, y).unwrap();
+        ra.asm.shufps(result, x, 0b1101_1101).unwrap();
+        ra.define_value(upper_inst.unwrap(), result);
+    } else {
+        let x = ra.use_scratch_xmm(&mut args[0]);
+        let y = ra.use_scratch_xmm(&mut args[1]);
+        let tmp = ra.scratch_xmm();
+        let upper_result = upper_inst.map(|_| ra.scratch_xmm());
+        let lower_result = lower_inst.map(|_| ra.scratch_xmm());
+
+        ra.asm.movdqa(tmp, x).unwrap();
+        ra.asm.pmuludq(tmp, y).unwrap();
+        ra.asm.psrlq_imm(x, 32).unwrap();
+        ra.asm.psrlq_imm(y, 32).unwrap();
+        ra.asm.pmuludq(x, y).unwrap();
+
+        if let Some(upper_result) = upper_result {
+            ra.asm.pcmpeqw(upper_result, upper_result).unwrap();
+        }
+        if let Some(lower_result) = lower_result {
+            ra.asm.pcmpeqw(lower_result, lower_result).unwrap();
+        }
+        if let Some(upper_result) = upper_result {
+            ra.asm.psllq_imm(upper_result, 32).unwrap();
+        }
+        if let Some(lower_result) = lower_result {
+            ra.asm.psrlq_imm(lower_result, 32).unwrap();
+        }
+        if let Some(upper_result) = upper_result {
+            ra.asm.pand(upper_result, x).unwrap();
+        }
+        if let Some(lower_result) = lower_result {
+            ra.asm.pand(lower_result, tmp).unwrap();
+        }
+        if upper_inst.is_some() {
+            ra.asm.psrlq_imm(tmp, 32).unwrap();
+        }
+        if lower_inst.is_some() {
+            ra.asm.psllq_imm(x, 32).unwrap();
+        }
+        if let Some(upper_result) = upper_result {
+            ra.asm.por(upper_result, tmp).unwrap();
+        }
+        if let Some(lower_result) = lower_result {
+            ra.asm.por(lower_result, x).unwrap();
+        }
+        if let (Some(upper_inst), Some(upper_result)) = (upper_inst, upper_result) {
+            ra.define_value(upper_inst, upper_result);
+        }
+        if let (Some(lower_inst), Some(lower_result)) = (lower_inst, lower_result) {
+            ra.define_value(lower_inst, lower_result);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::x64::callback::Callback;
     use crate::backend::x64::constant_pool::ConstantPool;
     use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig};
+    use crate::ir::block::Block;
     use crate::ir::location::LocationDescriptor;
     use crate::ir::opcode::Opcode;
     use crate::ir::value::Value;
@@ -379,8 +632,80 @@ mod tests {
         ra.asm.code().to_vec()
     }
 
+    fn emit_multiply_with_features(
+        opcode: Opcode,
+        upper: bool,
+        lower: bool,
+        features: HostFeature,
+    ) -> Vec<u8> {
+        let mut block = Block::new(LocationDescriptor::new(0));
+        let lhs = block.append(Opcode::ZeroVector, &[]);
+        let rhs = block.append(Opcode::ZeroVector, &[]);
+        let multiply = block.append(opcode, &[Value::Inst(lhs), Value::Inst(rhs)]);
+        if upper {
+            block.append(Opcode::GetUpperFromOp, &[Value::Inst(multiply)]);
+        }
+        if lower {
+            block.append(Opcode::GetLowerFromOp, &[Value::Inst(multiply)]);
+        }
+        block.rebuild_pseudo_op_links();
+
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let mut constant_pool = ConstantPool::new(1024);
+        constant_pool.set_pool_base(unsafe { asm.top().add(3072) as *mut u8 });
+        let mut inst_info = vec![(1, 128), (1, 128), ((upper as u32) + (lower as u32), 0)];
+        if upper {
+            inst_info.push((0, 128));
+        }
+        if lower {
+            inst_info.push((0, 128));
+        }
+        let mut ra = RegAlloc::new_default(&mut asm, inst_info);
+        ra.constant_pool = Some(&mut constant_pool);
+
+        let lhs_reg = ra.scratch_xmm();
+        ra.define_value(lhs, lhs_reg);
+        ra.end_of_alloc_scope();
+        let rhs_reg = ra.scratch_xmm();
+        ra.define_value(rhs, rhs_reg);
+        ra.end_of_alloc_scope();
+
+        let config = dummy_emit_config();
+        let mut ctx = EmitContext::new(LocationDescriptor::new(0), &config);
+        ctx.host_features = features;
+        ctx.block = Some(&block);
+        let inst = block.get(multiply);
+        match opcode {
+            Opcode::VectorSignedMultiply16 => {
+                emit_vector_signed_multiply16(&ctx, &mut ra, multiply, inst)
+            }
+            Opcode::VectorSignedMultiply32 => {
+                emit_vector_signed_multiply32(&ctx, &mut ra, multiply, inst)
+            }
+            Opcode::VectorUnsignedMultiply16 => {
+                emit_vector_unsigned_multiply16(&ctx, &mut ra, multiply, inst)
+            }
+            Opcode::VectorUnsignedMultiply32 => {
+                emit_vector_unsigned_multiply32(&ctx, &mut ra, multiply, inst)
+            }
+            _ => unreachable!("test helper only covers multi-result multiply opcodes"),
+        }
+        ra.end_of_alloc_scope();
+        ra.asm.code().to_vec()
+    }
+
+    fn has_legacy_opcode(code: &[u8], opcode: u8) -> bool {
+        code.windows(3).any(|bytes| bytes == [0x66, 0x0f, opcode])
+    }
+
+    fn has_vex_opcode(code: &[u8], opcode: u8) -> bool {
+        code.windows(4).any(|bytes| {
+            (bytes[0] == 0xc5 && bytes[2] == opcode) || (bytes[0] == 0xc4 && bytes[3] == opcode)
+        })
+    }
+
     #[test]
-    fn function_signatures_match_the_upstream_broadcast_and_reduce_emitters() {
+    fn function_signatures_match_the_upstream_vector_emitters() {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
             emit_vector_broadcast_element_lower8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
@@ -395,6 +720,85 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add16;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add32;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_reduce_add64;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_signed_multiply16;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_signed_multiply32;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_unsigned_multiply16;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_unsigned_multiply32;
+    }
+
+    #[test]
+    fn signed_multiply16_selects_edens_avx_and_sse_paths() {
+        let avx = emit_multiply_with_features(
+            Opcode::VectorSignedMultiply16,
+            true,
+            true,
+            HostFeature::AVX,
+        );
+        assert!(has_vex_opcode(&avx, 0xe5), "{avx:02x?}");
+        assert!(has_vex_opcode(&avx, 0xd5), "{avx:02x?}");
+
+        let sse = emit_multiply_with_features(
+            Opcode::VectorSignedMultiply16,
+            true,
+            true,
+            HostFeature::empty(),
+        );
+        assert!(has_legacy_opcode(&sse, 0xe5), "{sse:02x?}");
+        assert!(has_legacy_opcode(&sse, 0xd5), "{sse:02x?}");
+    }
+
+    #[test]
+    fn signed_multiply32_preserves_edens_result_sensitive_paths() {
+        let lower_only = emit_multiply_with_features(
+            Opcode::VectorSignedMultiply32,
+            false,
+            true,
+            HostFeature::AVX,
+        );
+        assert!(has_vex_opcode(&lower_only, 0x40), "{lower_only:02x?}");
+        assert!(!has_vex_opcode(&lower_only, 0x28), "{lower_only:02x?}");
+
+        let both = emit_multiply_with_features(
+            Opcode::VectorSignedMultiply32,
+            true,
+            true,
+            HostFeature::empty(),
+        );
+        assert!(has_legacy_opcode(&both, 0xf4), "{both:02x?}");
+        assert!(has_legacy_opcode(&both, 0xfa), "{both:02x?}");
+    }
+
+    #[test]
+    fn unsigned_multiply16_selects_edens_high_and_low_products() {
+        let sse = emit_multiply_with_features(
+            Opcode::VectorUnsignedMultiply16,
+            true,
+            true,
+            HostFeature::empty(),
+        );
+        assert!(has_legacy_opcode(&sse, 0xe4), "{sse:02x?}");
+        assert!(has_legacy_opcode(&sse, 0xd5), "{sse:02x?}");
+    }
+
+    #[test]
+    fn unsigned_multiply32_preserves_edens_result_sensitive_paths() {
+        let lower_only = emit_multiply_with_features(
+            Opcode::VectorUnsignedMultiply32,
+            false,
+            true,
+            HostFeature::AVX,
+        );
+        assert!(has_vex_opcode(&lower_only, 0x40), "{lower_only:02x?}");
+        assert!(!has_vex_opcode(&lower_only, 0xf4), "{lower_only:02x?}");
+
+        let both = emit_multiply_with_features(
+            Opcode::VectorUnsignedMultiply32,
+            true,
+            true,
+            HostFeature::empty(),
+        );
+        assert!(has_legacy_opcode(&both, 0xf4), "{both:02x?}");
+        assert!(!has_legacy_opcode(&both, 0xfa), "{both:02x?}");
     }
 
     #[test]

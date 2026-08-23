@@ -3354,15 +3354,18 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - None in `pack_2x16_to_1x32` or `most_significant_half`: masks, shift amounts, carry input, and
   operation ordering match Eden exactly.
+- Fixed: `ITBlockCheck` was absent. `it_block_check` now rejects exactly an active, nonfinal Thumb
+  IT position, using the same `IsInITBlock() && !IsLastInITBlock()` predicate as Eden.
 
 ### Missing items
 
-- None for the two common helpers required by the scalar saturation translator slice. Other
+- None for the three common helpers reviewed so far. Other
   pre-existing helpers in `common.h` were not re-audited or claimed by this prerequisite.
 
 ### Binary layout verification
 
-- N/A: these helpers construct internal SSA operations and serialize no guest-visible payload.
+- N/A: these helpers construct internal SSA operations or inspect translation state and serialize
+  no guest-visible payload. Focused tests cover inactive, final, and nonfinal IT positions.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/saturated.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{saturated.cpp,a32_translate_impl.h}`
 
@@ -8846,3 +8849,1047 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: this file defines no raw-copied payload. AArch64 tests run under QEMU route all 34 opcodes
   and compare parity-sensitive GE, scratch-register, saturation, absolute-difference, and select
   sequences against exact 32-bit instruction words from the independently verified encoders.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (unprivileged loads)
+
+### Intentional differences
+- Eden builds an ordered matcher from `thumb32.inc`; Ruzu retains its existing handwritten
+  decision tree. The Rust branch now makes the same `1110` low-control-nibble priority explicit
+  before the broader `1PUW` immediate forms.
+
+### Unintentional differences (to fix)
+- Fixed: `LDRT`, `LDRBT`, `LDRHT`, `LDRSBT`, and `LDRSHT` decoded as their generic imm8 families.
+  They now have distinct identifiers and win over `LDR/B/H/SB/SH_imm8` for the exact five Eden
+  patterns.
+- Fixed: negative-offset word/halfword/signed-byte literals with `Rn=PC` lost to the broader
+  register/imm8 groups, and Eden's four reserved signed-halfword `Rt=PC` patterns did not decode as
+  `NOP`. The handwritten decision tree now preserves those earlier table entries.
+- Fixed: translation preserves the existing effective-address behavior for the newly distinct
+  identifiers and applies Eden's PC-destination rejection before performing the load. Their final
+  method ownership now lives in the matching load-byte, load-halfword, and load-word files.
+
+### Missing items
+- None among the five reviewed unprivileged word/byte/halfword load patterns. Store families were
+  not part of this decoder prerequisite.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words and defines no raw-copied payload. Focused
+  tests cover all five exact `...1110...` encodings, adjacent `...1100...` imm8 encodings, the four
+  negative literal forms, and the four reserved signed-halfword `NOP` patterns.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_byte.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_byte.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes decoded fields as typed visitor parameters. Ruzu's matching
+  snake-case methods read those fields from `DecodedThumb32`; each method and helper remains in the
+  corresponding byte-load owner, while `thumb32.rs` only dispatches.
+- Rust uses a higher-ranked function pointer over `A32IREmitter` for Eden's
+  `ExtensionFunctionU8` member pointer and explicit `wrapping_add`/`wrapping_sub` for the same
+  unsigned `u32` literal-address arithmetic.
+
+### Unintentional differences (to fix)
+- Fixed: byte-load and preload behavior was split between broad `thumb32.rs` and unrelated
+  `thumb32_control.rs` owners. All 18 visitors plus `PLDHandler`, `PLIHandler`, `LoadByteLiteral`,
+  `LoadByteRegister`, and `LoadByteImmediate` now live in `thumb32_load_byte.rs`.
+- Fixed: generic byte loads omitted Eden's imm8 validation (`Rt=PC && W`, writeback aliasing, and
+  `!P && !W`) and the register form's `Rm=PC` rejection. Validation now precedes all register reads,
+  memory operations, and writeback.
+- Fixed: the former shared address helper performed writeback before the memory read and before
+  writing `Rt`. The immediate helper now preserves Eden's `read -> extend -> SetRegister(t) ->
+  optional SetRegister(n)` order.
+- Fixed: register byte loads skipped `LogicalShiftLeft` when `imm2` was zero. The helper now emits
+  Eden's operation unconditionally, preserving IR shape as well as the result.
+- Fixed: the distinct `LDRBT`/`LDRSBT` paths now apply their PC validation and then reuse the normal
+  positive, pre-indexed, non-writeback imm8 visitor exactly like Eden.
+
+### Missing items
+- None among the 18 declarations and implementations in the reviewed byte-load/memory-hint owner.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify literal
+  U-bit addressing, signed/unsigned extension selection, validation-before-side-effects, exact
+  destination/writeback order, register/preload PC checks, unprivileged access type, and absence of
+  unprivileged writeback.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_halfword.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_halfword.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes decoded fields to visitor methods. Ruzu's matching methods read
+  the fields from `DecodedThumb32`, use a higher-ranked Rust function pointer for
+  `ExtensionFunctionU16`, and state unsigned literal-address wraparound explicitly.
+
+### Unintentional differences (to fix)
+- Fixed: all halfword visitors and helpers lived in the broad `thumb32.rs`; the ten reviewed
+  methods plus `LoadHalfLiteral`, `LoadHalfRegister`, and `LoadHalfImmediate` now live in the
+  matching `thumb32_load_halfword.rs` owner.
+- Fixed: the generic implementation omitted Eden's imm8 validation and register `Rm=PC` rejection.
+  The exact `!P && !W` -> `Rt=PC && W` -> writeback-alias validation order now runs before any IR
+  side effect.
+- Fixed: register loads read `Rn` before `Rm` and elided a zero-bit shift. They now preserve Eden's
+  `GetRegister(m) -> GetRegister(n) -> LogicalShiftLeft` IR ordering.
+- Fixed: the shared address helper wrote the destination before the base for writeback forms. The
+  halfword helper now preserves Eden's distinct `read -> extend -> optional SetRegister(n) ->
+  SetRegister(t)` order.
+- Fixed: `LDRHT` and `LDRSHT` now apply their PC validation and reuse the normal positive,
+  pre-indexed, non-writeback imm8 visitors.
+
+### Missing items
+- None among the ten declarations and implementations in the reviewed halfword-load owner.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify
+  positive/negative literal addressing, signed/unsigned extension, register-read and zero-shift IR
+  order, validation-before-side-effects, halfword-specific writeback order, and unprivileged
+  no-writeback behavior.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_word.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_word.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed decoded fields to its visitor. The five snake-case Rust
+  visitors read the same fields from `DecodedThumb32`; the dispatcher remains routing-only.
+- Rust spells unsigned literal-address wraparound explicitly and represents Eden's terminal
+  variants with the existing `Terminal` enum.
+
+### Unintentional differences (to fix)
+- Fixed: the five word-load visitors lived in broad `thumb32.rs`; they now live in the matching
+  `thumb32_load_word.rs` owner, and the shared address helper no longer owns their behavior.
+- Fixed: word loads omitted Eden's undefined/writeback-alias, `Rm=PC`, and nonfinal-IT validation.
+  The exact validation order now runs before any register read or memory operation.
+- Fixed: register loads read `Rn` before `Rm` and elided `LogicalShiftLeft` for a zero shift. They
+  now preserve Eden's `GetRegister(m) -> GetRegister(n) -> LogicalShiftLeft` IR order.
+- Fixed: indexed loads previously performed writeback inside the shared address helper before the
+  memory read. The word visitor now preserves Eden's read-before-writeback order, followed by the
+  PC update and `PopRSBHint` only for post-indexed `SP` loads.
+- Fixed: the distinct `LDRT` visitor now rejects `Rt=PC` and reuses the positive, pre-indexed,
+  non-writeback imm8 path exactly like Eden.
+
+### Missing items
+- None among the five declarations and implementations in the reviewed word-load owner.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify
+  literal U-bit addressing, PC and IT behavior, validation-before-side-effects, register and
+  zero-shift order, writeback-before-PC order, pop terminal selection, and unprivileged behavior.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (store single data item)
+
+### Intentional differences
+- Eden builds a priority-ordered matcher from `thumb32.inc`; Ruzu retains its handwritten
+  decision tree while spelling the same control-nibble and register-form masks explicitly.
+
+### Unintentional differences (to fix)
+- Fixed: the fifteen Eden store-single entries were collapsed into nine ARM-manual-style IDs.
+  Ruzu now exposes the exact `_imm_1`, `_imm_2`, `_imm_3`, `*T`, and register identities used by
+  the upstream visitor boundary for word, byte, and halfword stores.
+- Fixed: every store with bit 11 clear was accepted as a register form, and every store with bit
+  11 set was accepted as an indexed immediate. The decoder now requires the exact register mask,
+  gives `1100` and `1110` their `_imm_2`/`*T` priority, accepts only `1PU1` as `_imm_1`, and rejects
+  reserved controls as `Unknown`.
+
+### Missing items
+- None among the fifteen store-single decoder entries reviewed from `thumb32.inc`.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words and defines no raw-copied payload. Focused
+  tests cover all fifteen identities plus reserved register/control patterns.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_store_single_data_item.rs` vs Eden `frontend/A32/translate/impl/{thumb32_store_single_data_item.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden passes typed matcher fields to the fifteen visitors; the snake-case Rust visitors read the
+  same fields from `DecodedThumb32`, while the dispatcher only routes exact decoded identities.
+- Rust function pointers stand in for Eden's immediate-store callbacks and register-store lambdas.
+  Separate byte, halfword, and word callbacks retain the same truncation and memory-operation
+  ownership inside the matching file.
+
+### Unintentional differences (to fix)
+- Fixed: all store-single behavior lived in broad `thumb32.rs` behind six combined methods and a
+  shared address helper. The fifteen visitors, `StoreRegister`, `StoreImmediate`, and width-specific
+  callbacks now live in the matching store-single owner.
+- Fixed: register stores omitted Eden's `Rn=PC` undefined path and `Rt/Rm=PC` unpredictable path,
+  read operands as `Rn -> Rm -> Rt`, and skipped a zero-bit shift. They now validate first and emit
+  `GetRegister(m) -> GetRegister(n) -> GetRegister(t) -> LogicalShiftLeft` exactly.
+- Fixed: immediate stores omitted per-encoding PC/alias validation and performed indexed writeback
+  while calculating the address, before reading `Rt` and before the store. They now preserve Eden's
+  `GetRegister(n) -> GetRegister(t) -> address -> store -> optional SetRegister(n)` order.
+- Fixed: `_imm_2`, `_imm_3`, and `*T` visitors now enforce their fixed subtract/add and no-writeback
+  modes instead of deriving all behavior from one broad decoded form.
+
+### Missing items
+- None among the fifteen declarations and implementations in the reviewed store-single owner.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify exact
+  register/shift ordering, byte/halfword truncation, validation-before-side-effects, store-before-
+  writeback ordering, fixed immediate modes, and unprivileged no-writeback behavior.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/a32_emitter.rs` vs Eden `frontend/A32/{a32_ir_emitter.h,a32_ir_emitter.cpp}` (memory access boundary)
+
+### Intentional differences
+- Rust's shared `Value` wrapper requires explicit byte/halfword coercion where Eden's C++ method
+  signatures carry `U8`/`U16` statically. The emitted operand types and operation order match.
+- `ExclusiveReadMemory64` returns a Rust tuple instead of `std::pair`; both expose separate low and
+  high words, and `ExclusiveWriteMemory64` accepts those words separately in the same order.
+
+### Unintentional differences (to fix)
+- Fixed: normal and exclusive 16/32-bit reads, normal 64-bit reads, and the corresponding writes
+  omitted Eden's `EFlag` byte reversal at the A32 emitter boundary.
+- Fixed: the 64-bit exclusive API returned/accepted one packed value. It now extracts low then high,
+  reverses each word without swapping in big-endian mode, and reverses then packs both write words
+  exactly like Eden. Existing ARM synchronization callers were updated to preserve that boundary.
+
+### Missing items
+- None among the reviewed normal/exclusive 8/16/32/64-bit memory methods.
+
+### Binary layout verification
+- N/A: these methods emit typed SSA operations rather than raw-copied structures. Focused tests
+  verify the exact reversal counts and the reverse-low -> reverse-high -> pack -> exclusive-write
+  sequence for the parity-sensitive 64-bit path.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (dual/exclusive/table branch)
+
+### Intentional differences
+- Eden generates its first-match decoder from pattern strings; Ruzu retains the handwritten
+  decoder and represents this family as an ordered mask table derived from the same strings.
+
+### Unintentional differences (to fix)
+- Fixed: six LDRD/STRD encodings were collapsed into three broad identities, which erased Eden's
+  fixed `P`/`W` visitor boundary and admitted reserved forms.
+- Fixed: `LDA`, `STL`, `TBB`, and `TBH` were absent. The decoder now exposes all eighteen exact
+  identities in upstream priority order, including the previously stubbed exclusive variants.
+
+### Missing items
+- None among the eighteen reviewed decoder entries from the dual/exclusive/table-branch group.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string parser
+  verifies all eighteen Rust mask/value pairs against `thumb32.inc`, and focused tests exercise
+  every identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_store_dual.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_store_dual.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed fields into visitor methods. The eighteen snake-case Rust
+  visitors read the same fields from `DecodedThumb32`; dispatch remains in `thumb32.rs` and all
+  behavior and helpers live in the matching owner.
+- Rust represents Eden's `U32`/`U64` SSA wrappers with `Value` and its terminal variants with the
+  existing `Terminal` enum.
+
+### Unintentional differences (to fix)
+- Fixed: dual-load/store and word-exclusive behavior lived in broad `thumb32.rs`, byte/half/dual
+  exclusives were stubs, and ordered access was incorrectly used for `LDREX`/`STREX`. The complete
+  family now lives in the upstream-owned file and uses exact atomic/ordered/normal access types.
+- Fixed: dual operations omitted Eden's validation and side-effect ordering. The helpers now
+  preserve validation-before-operands, endian word selection, atomic 64-bit access, and writeback.
+- Fixed: table branches and load-acquire/store-release were missing. Their IT checks, address and
+  branch IR order, location update, fast-dispatch terminal, and ordered accesses now match Eden.
+
+### Missing items
+- None among the four helpers and eighteen visitor declarations/implementations in the reviewed
+  owner.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify all
+  decoder identities, validation-before-side-effects, endian extraction and writeback order,
+  access types, exclusive widths, and table-branch read width/terminal behavior.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (load/store multiple)
+
+### Intentional differences
+- Eden generates its ordered decoder from pattern strings; Ruzu retains a handwritten decoder and
+  uses an ordered mask table derived from those same six strings.
+
+### Unintentional differences (to fix)
+- Fixed: `STMIA` and `LDMIA` were exposed as generic `STM` and `LDM` identities, obscuring the
+  exact upstream visitor boundary.
+- Fixed: the former decision tree did not enforce bit 15 as zero for `STMIA`, `STMDB`, and `PUSH`,
+  so reserved store-multiple encodings could reach translation. Exact upstream masks and priority
+  now reject those words and preserve the specialized `POP`/`PUSH` entries.
+
+### Missing items
+- None among the six reviewed load/store-multiple decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string comparison
+  verifies all six mask/value pairs, and focused tests cover every identity and reserved bit-15
+  store forms.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_store_multiple.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_store_multiple.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's matcher supplies typed `Imm<15>`/`Imm<16>` fields. Rust reads the same instruction fields
+  from `DecodedThumb32` and explicitly masks the store lists to retain the `Imm<15>` boundary.
+- Rust represents Eden's `IR::U32` wrappers with `Value` and uses `count_ones` for `std::popcount`.
+
+### Unintentional differences (to fix)
+- Fixed: the six visitors and both helpers lived in broad `thumb32.rs`; they now live in the
+  matching owner and the dispatcher only routes exact identities.
+- Fixed: loads omitted all Eden validation, while invalid stores returned `false` silently instead
+  of raising an unpredictable-instruction exception. PC/base/list/IT validation now runs in the
+  exact upstream order before any operand or memory access.
+- Fixed: generic decrement/increment implementations reconstructed addresses and writeback instead
+  of preserving Eden's shared start/writeback values. The helpers now retain exact atomic access,
+  register iteration, writeback, upper-location update, PC-load, and terminal ordering.
+
+### Missing items
+- None among `LDMHelper`, `STMHelper`, and the six reviewed visitor implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify
+  validation-before-side-effects, atomic access metadata, register/writeback order, shared
+  decrement-before start/writeback state, and POP's update-before-PC-read terminal path.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`PackedAbsDiffSumU8`)
+
+### Intentional differences
+- Rust uses snake case and the shared `Value` wrapper in place of Eden's typed `U32` wrapper.
+
+### Unintentional differences (to fix)
+- Fixed: the `PackedAbsDiffSumU8` opcode and both host backends existed, but the owning base-IR
+  emitter method was absent, preventing the Thumb32 `USAD8`/`USADA8` visitors from matching Eden's
+  call boundary.
+
+### Missing items
+- None for the reviewed `PackedAbsDiffSumU8` wrapper.
+
+### Binary layout verification
+- N/A: this is a typed SSA operation. A focused test verifies the exact opcode and `a, b` operand
+  order.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`MostSignificantWord`)
+
+### Intentional differences
+- Rust uses a concrete `ResultAndCarry` structure containing `Value` fields where Eden uses the
+  templated `ResultAndCarry<U32>` type.
+
+### Unintentional differences (to fix)
+- Fixed: `most_significant_word` returned only the primary value and callers created a carry
+  pseudo-operation only on rounding paths. It now eagerly creates and links `GetCarryFromOp` and
+  returns both values exactly at the base-IR ownership boundary; all A32 and A64 callers consume
+  `.result`, and rounding multiply callers consume the returned `.carry`.
+
+### Missing items
+- None for the reviewed `MostSignificantWord` result/carry contract and its existing Rust callers.
+
+### Binary layout verification
+- N/A: this is SSA metadata rather than a raw-copied structure. A focused test verifies producer,
+  pseudo-opcode, and associated-pseudo-operation linkage.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (multiply)
+
+### Intentional differences
+- Eden generates one global first-match table from pattern strings; Ruzu preserves its handwritten
+  outer decoder and uses an ordered mask table derived from the sixteen multiply strings.
+
+### Unintentional differences (to fix)
+- Fixed: ten multiply identities were absent and the existing manual decoder recognized only six
+  coarse forms. All sixteen exact identities now retain accumulator/non-accumulator and selector
+  field boundaries in upstream priority order.
+- Fixed: the `FB0…FB7` multiply range fell through to load-byte/halfword decoding, while unrelated
+  later prefixes were routed to the multiply helpers. Explicit `FB0…FB7` and `FB8…FBF` family
+  boundaries now route multiply and long-multiply words before the broad handwritten groups.
+
+### Missing items
+- None among the sixteen reviewed Thumb32 multiply decoder entries. The long-multiply visitor owner
+  remains a separate audit slice.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. Independent comparison against
+  `thumb32.inc` verifies all sixteen mask/value pairs; focused tests cover every identity and the
+  multiply/long-multiply/coprocessor prefix boundaries.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_multiply.rs` vs Eden `frontend/A32/translate/impl/{thumb32_multiply.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed registers and selector bits. The snake-case Rust visitors
+  read those exact fields from `DecodedThumb32`, and Rust variable swaps replace `std::swap`.
+- Rust uses `Value` for Eden's typed SSA wrappers and explicit `ImmU1(false/true)` carry inputs.
+
+### Unintentional differences (to fix)
+- Fixed: only six of sixteen visitors existed, aggregated in `thumb32.rs`; the complete owner now
+  implements MLA/MLS/MUL, all signed halfword/word multiply families, and USAD8/USADA8.
+- Fixed: the six former visitors omitted some or all PC validation and emitted register reads in a
+  different order. Every visitor now validates before side effects and preserves Eden's operand,
+  extension, product, accumulation, destination, and Q-flag order.
+- Fixed: packed absolute difference, halfword exchange/selection, overflow accumulation, and the
+  exact eager most-significant-word carry boundary were absent. They now use the matching IR
+  operations and upstream-owned base-emitter prerequisites.
+
+### Missing items
+- None among the sixteen declarations and implementations in the reviewed multiply owner.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests exercise all
+  sixteen decoded visitors, validation-before-register-read, accumulator operand order, both Q
+  updates around SMLAD accumulation, rounding carry use, and dedicated packed absolute difference.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (long multiply)
+
+### Intentional differences
+- Eden generates one global first-match table from pattern strings; Ruzu retains its handwritten
+  outer decoder and uses an ordered mask table derived from the same ten long-multiply strings.
+
+### Unintentional differences (to fix)
+- Fixed: four identities (`SMLALD`, `SMLALXY`, `SMLSLD`, and `UMAAL`) were absent, and the former
+  six-way decision accepted reserved selector bits for several existing families. The decoder now
+  uses all ten exact upstream masks in upstream priority order.
+
+### Missing items
+- None among the ten reviewed long-multiply, long-multiply-accumulate, and divide decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string parser
+  verifies all ten mask/value pairs against `thumb32.inc`, and focused tests exercise every
+  identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_long_multiply.rs` vs Eden `frontend/A32/translate/impl/{thumb32_long_multiply.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed registers and selector bits. The snake-case Rust visitors
+  read the same fields from `DecodedThumb32`, and Rust's `Value` represents Eden's typed SSA
+  wrappers.
+- Rust free-function pointers cannot name `IREmitter` methods with Eden's C++ member-function
+  pointer type, so two mechanical signed/unsigned wrappers feed the matching `DivideOperation`
+  helper boundary.
+
+### Unintentional differences (to fix)
+- Fixed: six partial implementations lived in broad `thumb32.rs`, omitted all PC/equal-destination
+  validation, and read accumulator registers in a different order. All ten visitors now live in
+  the matching owner and preserve validation-before-side-effects and exact operand order.
+- Fixed: `SMLALD`, `SMLALXY`, `SMLSLD`, and `UMAAL` were missing. Their halfword selection/swap,
+  signed extension, add/subtract nesting, accumulation, and low/high destination emission now
+  follow Eden literally, including the family-specific high-word extraction order.
+
+### Missing items
+- None among `DivideOperation` and the ten reviewed declarations/implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify all ten
+  visitors, validation before register reads, `SMLAL`/`UMAAL` operand order, and the direct
+  low-write-before-high-extraction ordering used by the dual-halfword accumulate families.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (branch)
+
+### Intentional differences
+- Eden generates one global first-match table from pattern strings; Ruzu retains its handwritten
+  outer family routing and uses the same ordered mask/value entries within the branch family.
+
+### Unintentional differences (to fix)
+- Fixed: generic `B_t3`, `B_t4`, and `BL` identities obscured the exact `B_cond`, `B`, and `BL_imm`
+  visitor boundaries. The four branch identities and masks now match `thumb32.inc` exactly.
+- Fixed: the former decision tree treated the reserved `F7E…` conditional-branch space as a
+  fabricated Thumb32 `SVC`; Eden has no such visitor and decodes it as `UDF`. All three upstream
+  Thumb32 `UDF` patterns now retain their priority around the branch entries.
+
+### Missing items
+- None among the four reviewed branch decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string parser
+  verifies the four branch masks, and focused tests cover all identities plus `UDF` priority.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_branch.rs` vs Eden `frontend/A32/translate/impl/{thumb32_branch.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed immediate fields. The snake-case Rust visitors consume the
+  same fields through `DecodedThumb32` offset helpers, and Rust terminal variants represent Eden's
+  `IR::Term` values.
+
+### Unintentional differences (to fix)
+- Fixed: all four implementations lived in broad `thumb32.rs` and omitted Eden's IT-block
+  validation. They now live in the matching owner and reject non-final IT positions, while
+  conditional branches reject every IT position before branch side effects.
+- Fixed: `BLX_imm` accepted an odd low immediate bit. It now validates `lo[0]` before pushing the
+  RSB or writing LR, then preserves Eden's aligned-PC, ARM-state, and IT-advance ordering.
+
+### Missing items
+- None among the four reviewed branch declarations/implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and terminals rather than raw-copied payloads. Focused tests
+  verify all four visitors, IT and low-bit validation before link side effects, RSB/LR order,
+  aligned BLX targeting, and conditional then/else locations.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/mod.rs` vs Eden `frontend/A32/translate/impl/a32_translate_impl.h` (`ThumbExpandImm_C`)
+
+### Intentional differences
+- Eden receives separate typed `i`, `imm3`, and `imm8` fields; Rust receives their already
+  concatenated twelve-bit value from `DecodedThumb32`.
+- Rust represents Eden's `IR::U1` carry with the shared `Value` SSA wrapper.
+
+### Unintentional differences (to fix)
+- Fixed: Thumb modified-immediate expansion lived in the decoder and accepted a host `bool` carry,
+  so non-rotated forms could not preserve Eden's runtime `GetCFlag` SSA value. The helper now lives
+  at the translator-implementation boundary, returns `ImmAndCarry`, and forwards dynamic carry
+  unchanged for all replication forms.
+- Fixed: the caller hard-coded carry-in to false. It now reads C before expansion; rotated forms
+  replace it with the immediate result's bit 31 exactly as Eden does.
+
+### Missing items
+- None for the reviewed `ThumbExpandImm_C` and `ThumbExpandImm` helper pair. The neighboring ARM
+  expansion helpers were not part of this prerequisite slice.
+
+### Binary layout verification
+- N/A: these helpers build immediate SSA values. Exhaustive tests verify all 4096 immediate values,
+  dynamic-carry identity for the 1024 replication forms, and immediate bit-31 carry for every
+  rotated form.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (modified immediate)
+
+### Intentional differences
+- Eden generates one global first-match decoder from pattern strings; Ruzu retains its handwritten
+  family routing and an ordered mask table derived from the same sixteen strings.
+
+### Unintentional differences (to fix)
+- Fixed: `ADD_imm` and `SUB_imm` hid the upstream `_1` visitor identities, and the former field
+  decision tree did not make every fixed/variable bit directly auditable. All sixteen identities,
+  masks, and priority positions now match `thumb32.inc` exactly.
+
+### Missing items
+- None among the sixteen reviewed modified-immediate decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
+  sixteen mask/value pairs, and focused decoder tests exercise every identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_modified_immediate.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_modified_immediate.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed immediate fields and registers; the snake-case Rust
+  visitors read those same fields from `DecodedThumb32` and use `Value` for typed SSA values.
+- Eden's soft `ASSERT` records an impossible decoder-contract violation and may continue; Rust
+  `assert!` stops on the same impossible direct-dispatch state. Valid decoded instructions cannot
+  reach those assertions.
+
+### Unintentional differences (to fix)
+- Fixed: all sixteen visitors were collapsed into a generic dispatcher in broad `thumb32.rs`,
+  omitted the per-visitor PC/decode validation, and read registers that MOV/MVN do not own. Each
+  visitor now lives in the matching file and validates before emitting carry or operand reads.
+- Fixed: the generic path emitted flag extraction/writes before the destination register. Logical
+  and arithmetic instructions now preserve Eden's result → destination → flag-extraction → flag
+  write order, while TST/TEQ/CMN/CMP never write a destination.
+- Fixed: BIC used `Not32` plus `And32`, and MVN/ORN emitted runtime `Not32`; the port now uses
+  `AndNot32` and compile-time complemented immediates exactly like Eden. Runtime C carry is also
+  retained through the verified translator-owned expansion helper.
+
+### Missing items
+- None among the sixteen reviewed declarations/implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
+  sixteen visitors, validation-before-inputs, dynamic carry/register order, exact logical opcodes,
+  destination-before-flags ordering, and the no-destination test forms.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (plain binary immediate)
+
+### Intentional differences
+- Eden generates one global first-match decoder from pattern strings; Ruzu retains its handwritten
+  family routing and an ordered mask table derived from the same fifteen entries.
+
+### Unintentional differences (to fix)
+- Fixed: the former field decision tree omitted both `SSAT16` and `USAT16`, hid five upstream
+  visitor identities behind `*_wide`/`ADR_add`/`ADR_sub` names, and made the reserved UDF priority
+  difficult to audit. The exact fifteen identities, masks, and source order now match
+  `thumb32.inc`.
+
+### Missing items
+- None among the fifteen reviewed decoder entries, including the reserved UDF encoding.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
+  fifteen mask/value pairs, and focused tests decode every identity and exercise every non-UDF
+  visitor.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_plain_binary_immediate.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_plain_binary_immediate.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden passes typed matcher fields to each visitor; the snake-case Rust visitors extract the same
+  fields from `DecodedThumb32`. A small Rust enum represents Eden's member-function pointer used by
+  the two saturation helpers.
+- Eden's two-argument shift IR methods do not expose a carry input; the shared Rust IR methods take
+  one, so shifts whose carry result is unused receive an immediate false value.
+
+### Unintentional differences (to fix)
+- Fixed: nine partial visitors lived in broad `thumb32.rs`, omitted PC and bit-range validation,
+  optimized away zero shifts, and used a different BFI mask/operation sequence. They now live in
+  the matching owner and preserve validation, register-read, shift, mask, and destination-write
+  ordering.
+- Fixed: `SSAT`, `SSAT16`, `USAT`, and `USAT16` were successful no-op stubs. Both upstream helper
+  boundaries and all four visitors are now ported, including the single source-register read for
+  halfword saturation and destination-before-Q-flag ordering.
+
+### Missing items
+- None among the fourteen reviewed declarations/implementations or their two private saturation
+  helpers.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
+  decoder entries and visitors, validation before register reads, exact BFI read/shift behavior,
+  both halfword saturation results and Q writes, bitfield shifts, and aligned architectural PC.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (shifted register)
+
+### Intentional differences
+- Eden generates one global first-match decoder from pattern strings; Ruzu retains its handwritten
+  family routing and an ordered mask table derived from the same seventeen entries.
+
+### Unintentional differences (to fix)
+- Fixed: a field-based decision tree obscured the exact fixed bits and specialized-entry priority.
+  The seventeen identities, masks, and source-order positions now match `thumb32.inc` directly.
+
+### Missing items
+- None among the seventeen reviewed shifted-register decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
+  seventeen mask/value pairs, and focused tests decode and translate every identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_shifted_register.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_shifted_register.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed fields; the snake-case Rust visitors extract the same
+  fields from `DecodedThumb32`. The private `shifted_register` helper is a mechanical expression of
+  Eden's repeated `EmitImmShift(GetRegister(m), ..., GetCFlag())` call.
+
+### Unintentional differences (to fix)
+- Fixed: all seventeen visitors were collapsed into a generic dispatcher in broad `thumb32.rs`.
+  That path skipped per-visitor decode/PC validation, read Rn for MOV/MVN, and wrote flags before
+  destination registers. The split visitors now preserve Eden's ownership, validation, operand,
+  destination, and flags ordering.
+- Fixed: BIC expanded NOT+AND rather than using `AndNot`, while PKH always selected the same half
+  ownership and register-read order. Both now emit Eden's exact operations for each `tb` form;
+  ADC/SBC also perform the second runtime carry read used by the arithmetic operation.
+
+### Missing items
+- None among the seventeen reviewed declarations/implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
+  visitors, validation before shift inputs, MOV input ownership, destination-before-flags order,
+  BIC opcode choice, ADC/SBC carry reads, and both PKH source-order branches.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`PackedAddU16`)
+
+### Intentional differences
+- Rust represents Eden's templated `ResultAndGE<U32>` with a concrete `ResultAndGE` containing two
+  shared SSA `Value` handles.
+
+### Unintentional differences (to fix)
+- Fixed: the `PackedAddU16` opcode and both backend emitters existed, but the Rust IR builder had no
+  corresponding producer method or `ResultAndGE` type. The method now emits the packed operation
+  followed by its associated `GetGEFromOp` pseudo-result exactly like Eden.
+
+### Missing items
+- None for the reviewed `PackedAddU16` builder prerequisite. The neighboring packed-operation
+  builders remain outside this prerequisite slice and will be audited with their owners.
+
+### Binary layout verification
+- N/A: this is an SSA builder API. A focused test verifies operand order, result opcode, GE opcode,
+  and the pseudo-operation link to its producer.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/helpers.rs` vs Eden `frontend/A32/translate/impl/common.h` (`Rotate`)
+
+### Intentional differences
+- Rust receives the two-bit `SignExtendRotation` field as its numeric decoded value and represents
+  Eden's typed IR values with the shared `Value` wrapper.
+
+### Unintentional differences (to fix)
+- Fixed: `Rotate` had no counterpart in the Rust `common.h` owner. Its former inline substitute in
+  broad `thumb32.rs` skipped the rotate instruction when the encoded rotation was zero; the owned
+  helper now always emits Eden's register read followed by ROR using `rotate * 8` and false carry.
+
+### Missing items
+- None for the reviewed `Rotate` prerequisite.
+
+### Binary layout verification
+- N/A: this helper constructs SSA. A focused test verifies the source-register read and exact
+  ROR-by-zero arguments that distinguish it from the previous substitute.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (register)
+
+### Intentional differences
+- Eden generates one global first-match decoder from pattern strings; Ruzu routes the `0xFA`
+  family to an ordered mask table derived from the same sixteen register entries.
+
+### Unintentional differences (to fix)
+- Fixed: none of the four register-shift entries or eight `*16`/accumulate variants had a decoded
+  Rust identity, and the other eight extension identities were unreachable through the Thumb32
+  family router. All sixteen identities, masks, and specialized-before-accumulate priorities now
+  match `thumb32.inc`.
+
+### Missing items
+- None among the sixteen reviewed data-processing-register decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
+  sixteen mask/value pairs, and focused tests decode and translate every identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_register.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_register.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden represents the four shift member-function pointers with a C++ function-pointer type; Rust
+  passes the matching `ShiftType` to one `shift_instruction` helper. Typed matcher fields are read
+  from `DecodedThumb32`.
+
+### Unintentional differences (to fix)
+- Fixed: eight extension visitors lived in broad `thumb32.rs`, omitted validation, optimized away
+  rotate-by-zero, and used masks in place of Eden's byte/halfword extension operations. They now
+  live in the matching owner and preserve exact validation, rotate, extraction, extension,
+  accumulation, and destination ordering.
+- Fixed: the four register shifts and four byte-pair extensions/accumulates were absent. The shift
+  helper preserves Eden's `s` read → low-byte → C read → `m` read → shift → optional flags →
+  destination order; `SXTAB16` and `UXTAB16` use the verified packed-add/GE prerequisite with the
+  correct asymmetric operand order.
+
+### Missing items
+- None among the sixteen reviewed declarations/implementations or the private `ShiftInstruction`
+  helper.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
+  visitors, validation before input reads, shift/flags/destination ordering, rotate-by-zero, and
+  both packed-accumulate operand orders plus GE pseudo-results.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`PackedSelect`)
+
+### Intentional differences
+- Rust represents Eden's typed `U32` operands and result through the shared SSA `Value` wrapper.
+
+### Unintentional differences (to fix)
+- Fixed: the `PackedSelect` opcode and backend emitters existed but the Rust IR builder exposed no
+  producer method. It now forwards GE, first data operand, and second data operand in Eden's order.
+
+### Missing items
+- None for the reviewed `PackedSelect` builder prerequisite.
+
+### Binary layout verification
+- N/A: this is an SSA builder API. A focused test verifies the exact opcode and three-operand
+  ordering.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (miscellaneous)
+
+### Intentional differences
+- Eden generates one global matcher; Ruzu checks the register table first within the `0xFA` family
+  and then an ordered table derived from the same ten miscellaneous patterns.
+
+### Unintentional differences (to fix)
+- Fixed: the ten miscellaneous identities had no Thumb32 decode path, and five were absent from the
+  Rust identity enum entirely. Every identity and exact mask now matches `thumb32.inc`.
+
+### Missing items
+- None among the ten reviewed miscellaneous decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
+  ten mask/value pairs, and focused tests decode and translate every identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_misc.rs` vs Eden `frontend/A32/translate/impl/{thumb32_misc.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden's generated matcher passes typed registers; the snake-case Rust visitors extract the same
+  registers from `DecodedThumb32` and use the shared SSA `Value` representation.
+
+### Unintentional differences (to fix)
+- Fixed: five partial visitors lived in broad `thumb32.rs` without validation; RBIT only reversed
+  bytes, and REV16/REVSH used different expanded sequences. All ten visitors now live in the
+  matching owner and preserve exact validation and IR operation ordering.
+- Fixed: the four saturating scalar operations and SEL were absent. Their runtime register order,
+  intermediate/final Q writes, destination ordering, GE read, and verified `PackedSelect` call now
+  match Eden.
+
+### Missing items
+- None among the ten reviewed declarations/implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all ten
+  visitors, duplicated-register validation before reads, QDADD lifecycle order, full RBIT shape,
+  and SEL register/GE/select ordering.
+
+## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (packed parallel builders)
+
+### Intentional differences
+- Rust uses concrete `Value` and `ResultAndGE` types where Eden's declarations use typed IR
+  templates. Each method remains explicit to retain one-to-one auditability.
+
+### Unintentional differences (to fix)
+- Fixed: 31 of the 32 packed builders required by `thumb32_parallel.cpp` were absent even though
+  their opcodes and backend emitters existed. The full add/sub/add-sub/sub-add, signed/unsigned,
+  8/16-bit, saturating, and halving surface is now exposed with Eden's exact opcode and operand
+  order; all twelve GE-producing operations emit and link `GetGEFromOp`.
+
+### Missing items
+- None among the 32 packed builders used by the reviewed Thumb32 parallel owner.
+
+### Binary layout verification
+- N/A: these methods construct SSA. A comprehensive focused test invokes every builder, checks all
+  opcodes and operand order, and verifies every GE pseudo-result link.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (parallel)
+
+### Intentional differences
+- Eden generates one global matcher; Ruzu routes the `0xFA` family through register, parallel, then
+  miscellaneous ordered mask tables matching those source sections.
+
+### Unintentional differences (to fix)
+- Fixed: all 36 parallel identities and decode paths were absent. The exact pattern-derived masks,
+  identities, and source ordering are now present between the register and miscellaneous families.
+
+### Missing items
+- None among the 36 reviewed parallel decoder entries.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
+  36 mask/value pairs, and focused tests decode and translate every identity.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_parallel.rs` vs Eden `frontend/A32/translate/impl/{thumb32_parallel.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Eden passes typed matcher registers; every explicit snake-case Rust visitor extracts the same
+  fields from `DecodedThumb32` and uses the shared SSA `Value` representation.
+
+### Unintentional differences (to fix)
+- Fixed: all 36 visitors were absent. Each now preserves Eden's validation, `m`-then-`n` reads,
+  packed opcode/operand order, destination write, and GE write where applicable.
+- Fixed: QASX/QSAX/UQASX/UQSAX now preserve the explicit half extraction and signed/unsigned
+  extension order, add/sub orientation, saturation pseudo-results, low/high packing, and final
+  destination write without hiding the four visitors behind a generic dispatcher.
+
+### Missing items
+- None among the 36 reviewed declarations/implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all 36
+  visitors, validation before reads, GE lifecycle ordering, and crossed-half saturation expansion.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb16.rs` vs Eden `frontend/A32/translate/impl/thumb16.cpp` (`thumb16_BX`)
+
+### Intentional differences
+- Rust exposes the snake-case visitor within the translation module so `thumb32_BXJ` can preserve
+  Eden's direct delegation without duplicating the branch lifecycle.
+
+### Unintentional differences (to fix)
+- Fixed: the Rust visitor previously extracted its register from a complete Thumb16 decode and
+  omitted Eden's non-final-IT-block rejection. It now owns the decoded `Reg` operand, validates IT
+  state before reading that register, then preserves descriptor update, `BXWritePC`, and terminal
+  selection order.
+
+### Missing items
+- None for the reviewed `thumb16_BX` prerequisite.
+
+### Binary layout verification
+- N/A: this visitor constructs SSA. A focused test verifies rejection before the source-register
+  read in a non-final IT instruction.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (control)
+
+### Intentional differences
+- Eden generates one global first-match decoder from pattern strings; Rust keeps the same ordered
+  control entries as explicit mask/value tuples in its branch-and-control decoder.
+
+### Unintentional differences (to fix)
+- Fixed: `BXJ` was absent, `CLREX` was unreachable, and a broad classifier accepted reserved
+  encodings as hints, barriers, `MSR`, or `MRS`. All thirteen control identities now use Eden's
+  exact ordered masks, and the `MRS_reg` identity retains its upstream name.
+
+### Missing items
+- None among the thirteen reviewed miscellaneous-control decoder entries; UDF and branch entries
+  remain in their following upstream order.
+
+### Binary layout verification
+- N/A: the decoder classifies 32-bit instruction words. Focused tests cover every exact pattern,
+  variable field, and reserved near-match rejection.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_control.rs` vs Eden `frontend/A32/translate/impl/{thumb32_control.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+- Typed matcher fields are extracted from `DecodedThumb32`; Rust represents terminal and SSA
+  values with its existing enums while preserving Eden's operation sequence.
+
+### Unintentional differences (to fix)
+- Fixed: `thumb32_BXJ` was missing. It now rejects `PC` before any register read and delegates to
+  the verified `thumb16_BX` owner exactly as Eden does.
+
+### Missing items
+- None among the fourteen reviewed control declarations and implementations.
+
+### Binary layout verification
+- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify both
+  the `PC` rejection and the delegated R14 `PopRSBHint` lifecycle.
+
+## 2026-08-23 — `src/rdynarmic/src/interface/optimization_flags.rs` vs Eden `interface/optimization_flags.h`
+
+### Intentional differences
+- Rust uses a transparent `u32` newtype with standard bitwise traits instead of a scoped C++ enum
+  plus free operator overloads. `contains` and `bits` expose the checks needed by existing Rust
+  consumers. `jit_config` temporarily re-exports the type while its shared configuration is split.
+
+### Unintentional differences (to fix)
+- Fixed: `OptimizationFlag` lived in the unrelated shared `jit_config.rs` owner and omitted Eden's
+  `CodeSpeed` and `DisableVerification` values. The complete flag inventory and constants now live
+  in the matching interface module with exact `u32` values.
+
+### Missing items
+- None for the reviewed flag values, constants, and bitwise operations.
+
+### Binary layout verification
+- PASS: `#[repr(transparent)]` preserves Eden's `std::uint32_t` underlying representation; focused
+  tests verify every value plus four-byte size and alignment.
+
+## 2026-08-23 — `src/rdynarmic/src/interface/a32/config.rs` vs Eden `interface/A32/config.h` (`Exception`)
+
+### Intentional differences
+- Rust exposes `as_u32` for the existing SSA immediate boundary. `frontend/a32/types.rs` retains a
+  compatibility re-export so translation owners can migrate independently of this ownership move.
+
+### Unintentional differences (to fix)
+- Fixed: `A32::Exception` lived in `frontend/a32/types.rs` despite Eden owning it in the public
+  configuration interface. The complete thirteen-value enum now lives beside the A32 configuration.
+
+### Missing items
+- None for the reviewed A32 exception inventory. `UserCallbacks` and `UserConfig` remain part of the
+  following configuration-ownership slice.
+
+### Binary layout verification
+- PASS: `repr(i32)` matches the default C++ scoped-enum underlying representation used by Eden;
+  focused tests verify every discriminant plus four-byte size and alignment.
+
+## 2026-08-23 — `src/rdynarmic/src/interface/a64/config.rs` vs Eden `interface/A64/config.h` (public enums)
+
+### Intentional differences
+- Rust applies normal PascalCase spelling to Eden's `VA` acronym in variant names.
+  `frontend/a64/types.rs` temporarily re-exports `Exception` for existing translation consumers.
+
+### Unintentional differences (to fix)
+- Fixed: `A64::Exception` lived in `frontend/a64/types.rs` and used an eight-byte representation.
+  It now lives in the public configuration owner with Eden's ten values and default four-byte
+  scoped-enum representation.
+- Fixed: the already-owned data- and instruction-cache enums used `repr(u8)` even though Eden uses
+  the default C++ scoped-enum representation. Both now use `repr(i32)`.
+
+### Missing items
+- None for the three reviewed A64 public enums. `UserCallbacks` and `UserConfig` remain part of the
+  following configuration-ownership slice.
+
+### Binary layout verification
+- PASS: focused tests verify all discriminants and four-byte size/alignment for `Exception`,
+  `DataCacheOperation`, and `InstructionCacheOperation`.
+
+## 2026-08-23 — `src/rdynarmic/src/jit_config.rs` vs Eden `interface/{A32,A64}/config.h` (`UserCallbacks` exclusive surface)
+
+### Intentional differences
+- Rust still exposes one temporary shared callback trait while the interrupted configuration split
+  is completed; the exact prerequisite and resume point are recorded in the project-local state
+  file, which is excluded from commits.
+- `set_halt_reason_ptr`, `set_pc_ptr`, and `set_upper_location_descriptor_ptr` are Rust ownership
+  adapters used after the boxed callback and JIT state acquire stable addresses. They do not add
+  guest-visible callback events.
+
+### Unintentional differences (to fix)
+- Fixed: the shared trait invented `exclusive_read_8/16/32/64/128` and `exclusive_clear` host
+  callbacks. Neither Eden callback interface declares them: exclusive loads use `MemoryRead*`, and
+  `Jit::ClearExclusiveState` only resets the backend-owned reservation state.
+- The remaining shared A32/A64 callback trait still exposes each architecture's members to the
+  other architecture. The active prerequisite slice will replace it with the two upstream-owned
+  traits before the `UserConfig` split resumes.
+
+### Missing items
+- Separate `interface/a32/config.rs::UserCallbacks` and
+  `interface/a64/config.rs::UserCallbacks` owners remain to be completed in the active prerequisite
+  slice.
+
+### Binary layout verification
+- N/A: Rust trait objects are not copied into guest or JIT binary payloads; this review verifies
+  method inventory and call ownership.
+
+## 2026-08-23 — `src/rdynarmic/src/{jit.rs,backend/common/a32_callbacks.rs}` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,a64_emit_x64_memory.cpp,a32_interface.cpp,a64_interface.cpp}`
+
+### Intentional differences
+- Rust trampolines make the callback target explicit and share mechanical reservation bookkeeping
+  with the in-progress arm64 backend. The generated-code callback table retains internal fields
+  named `exclusive_read_*`; those fields target the normal `memory_read_*` host methods just as
+  Eden's emitters instantiate exclusive-read helpers with `UserCallbacks::MemoryRead*`.
+
+### Unintentional differences (to fix)
+- Fixed: x64 exclusive-read trampolines previously dispatched through non-upstream exclusive-read
+  host methods, and clear dispatched an extra host event. They now read through `memory_read_*` and
+  clear only `jit_state.exclusive_state`, preserving Eden's exact callback and lifecycle behavior.
+
+### Missing items
+- None for the reviewed x64 exclusive-read and clear callback behavior.
+
+### Binary layout verification
+- PASS: no layout changed. Focused tests verify that reads record the expected value and that clear
+  resets only the reservation-state flag without modifying its stored values.
+
+## 2026-08-23 — `src/rdynarmic/src/backend/arm64/{a32_address_space.rs,a64_address_space.rs}` vs Eden `backend/arm64/{a32_address_space.cpp,a64_address_space.cpp}`
+
+### Intentional differences
+- Rust uses explicit callback-context trampolines instead of Eden's generated devirtualized call
+  trampolines; the target callback and monitor ordering remain the same.
+
+### Unintentional differences (to fix)
+- Fixed: arm64 exclusive-read trampolines called invented `exclusive_read_*` host methods. Both
+  architectures now route the monitor closure and local fallback through the ordinary
+  `memory_read_*` callbacks selected by Eden's `EmitExclusiveReadCallTrampoline` instantiations.
+
+### Missing items
+- None for the reviewed arm64 exclusive-read callback selection.
+
+### Binary layout verification
+- PASS: callback-context and JIT-state layouts are unchanged; this slice changes only the selected
+  trait method.
+
+## 2026-08-23 — `src/rdynarmic/src/{ir/a32_emitter.rs,frontend/a32/translate/{thumb16.rs,multiply.rs,thumb32_data_processing_modified_immediate.rs,thumb32_data_processing_shifted_register.rs,thumb32_data_processing_register.rs}}` vs Eden `frontend/A32/{a32_ir_emitter.{h,cpp},translate/impl/{thumb16.cpp,multiply.cpp,thumb32_data_processing_modified_immediate.cpp,thumb32_data_processing_shifted_register.cpp,thumb32_data_processing_register.cpp,a32_translate_impl.h}}`
+
+### Intentional differences
+- Rust exposes `nzcv_from` beside the A32 `nz_from` adapter because it cannot inherit Eden's
+  generic `IR::IREmitter::NZCVFrom`; both methods emit the exact upstream opcode and keep the
+  inherited C++ call surface visible to translation owners.
+
+### Unintentional differences (to fix)
+- Fixed: `A32IREmitter::nz_from` emitted `GetNZCVFromOp` instead of Eden's `GetNZFromOp`. Logical
+  Thumb32 instructions could therefore consume stale host flags because their result operations do
+  not own a `GetNZCVFromOp` pseudo-operation. Logical and shift visitors now use `GetNZFromOp`,
+  while all arithmetic `SetCpsrNZCV` sites explicitly use `GetNZCVFromOp`.
+- Fixed: the same pre-existing extractor mismatch affected Thumb16 logical/shift visitors and the
+  six flag-setting ARM multiply visitors. Their `SetCpsrNZ`/`SetCpsrNZC` paths now match Eden's
+  `NZFrom` calls.
+
+### Missing items
+- None for the reviewed A32 N/Z versus N/Z/C/V extraction surface and its affected visitors.
+
+### Binary layout verification
+- N/A: this slice changes SSA opcode selection only. Focused tests verify both helper opcodes,
+  logical-versus-arithmetic Thumb16 selection, flag-setting multiply selection, and the Thumb32
+  logical/arithmetic instruction streams. An x64 JIT regression executes Thumb32 `TST.W` followed
+  by `BEQ` and verifies that the branch observes N/Z from the logical result.
+
+## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/vfp.rs` vs Eden `frontend/A32/translate/impl/{vfp.cpp,a32_translate_impl.h}` (VFP memory transfers)
+
+### Intentional differences
+- Eden's decoder exposes separate A1/A2 VSTM and VLDM visitors. Rust currently decodes each family
+  to one identity and selects the single- or double-register path from `sz` in the same `vfp.rs`
+  owner; the source comment records this structural adaptation, while validation, ordering, and IR
+  operations follow the corresponding Eden path.
+- ARM condition handling remains in Rust's block-level conditional translator instead of being
+  repeated inside every VFP visitor; the memory-transfer bodies execute only after that guard.
+
+### Unintentional differences (to fix)
+- Fixed: VPUSH, VPOP, VLDR, VSTR, VSTM, and VLDM used `AccType::Normal`; every 32-bit transfer now
+  uses Eden's `AccType::ATOMIC`.
+- Fixed: double-register transfers omitted Eden's E-flag word swap. BE-8 loads now exchange the two
+  individually byte-reversed words before packing, and stores exchange low/high words before the
+  emitter performs each word's endian conversion.
+- Fixed: VPOP updated SP after its loads, and VSTM/VLDM updated Rn after their transfers. All three
+  now perform writeback before memory accesses in Eden's exact order.
+- Fixed: empty/out-of-range register lists returned success, VSTM/VLDM omitted addressing and PC
+  validation, and VSTR did not use the aligned architectural PC base. These checks and the aligned
+  base now match the corresponding Eden visitors.
+
+### Missing items
+- None for the reviewed VPUSH, VPOP, VLDR, VSTR, VSTM A1/A2, and VLDM A1/A2 behavior.
+
+### Binary layout verification
+- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify atomic
+  access tags, BE-8 double-word dependency order, pre-access writeback, and unpredictable empty
+  lists across all six memory-transfer families.

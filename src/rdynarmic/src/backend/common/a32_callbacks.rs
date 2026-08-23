@@ -114,9 +114,8 @@ pub fn get_cntpct(callbacks: &dyn UserCallbacks) -> u64 {
 }
 
 #[inline]
-pub fn exclusive_clear(state: &mut impl A32ExclusiveState, callbacks: &mut dyn UserCallbacks) {
+pub fn exclusive_clear(state: &mut impl A32ExclusiveState) {
     state.set_exclusive_state(0);
-    callbacks.exclusive_clear();
 }
 
 pub fn exclusive_read_8(
@@ -129,10 +128,10 @@ pub fn exclusive_read_8(
     state.set_exclusive_state(1);
     let value = if let Some(monitor) = global_monitor {
         unsafe {
-            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_8(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_8(vaddr))
         }
     } else {
-        callbacks.exclusive_read_8(vaddr)
+        callbacks.memory_read_8(vaddr)
     };
     state.set_exclusive_value(0, value as u64);
     value as u64
@@ -148,11 +147,10 @@ pub fn exclusive_read_16(
     state.set_exclusive_state(1);
     let value = if let Some(monitor) = global_monitor {
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_16(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_16(vaddr))
         }
     } else {
-        callbacks.exclusive_read_16(vaddr)
+        callbacks.memory_read_16(vaddr)
     };
     state.set_exclusive_value(0, value as u64);
     value as u64
@@ -168,11 +166,10 @@ pub fn exclusive_read_32(
     state.set_exclusive_state(1);
     let value = if let Some(monitor) = global_monitor {
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_32(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_32(vaddr))
         }
     } else {
-        callbacks.exclusive_read_32(vaddr)
+        callbacks.memory_read_32(vaddr)
     };
     state.set_exclusive_value(0, value as u64);
     value as u64
@@ -188,11 +185,10 @@ pub fn exclusive_read_64(
     state.set_exclusive_state(1);
     let value = if let Some(monitor) = global_monitor {
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_64(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_64(vaddr))
         }
     } else {
-        callbacks.exclusive_read_64(vaddr)
+        callbacks.memory_read_64(vaddr)
     };
     state.set_exclusive_value(0, value);
     value
@@ -210,13 +206,13 @@ pub fn exclusive_read_128(
     let (lo, hi) = if let Some(monitor) = global_monitor {
         let value: [u64; 2] = unsafe {
             (&mut *monitor).read_and_mark(processor_id, vaddr, || {
-                let (lo, hi) = callbacks.exclusive_read_128(vaddr);
+                let (lo, hi) = callbacks.memory_read_128(vaddr);
                 [lo, hi]
             })
         };
         (value[0], value[1])
     } else {
-        callbacks.exclusive_read_128(vaddr)
+        callbacks.memory_read_128(vaddr)
     };
     state.set_exclusive_value(0, lo);
     state.set_exclusive_value(1, hi);
@@ -462,26 +458,6 @@ mod tests {
             self.memory_write_64(vaddr + 8, value_hi);
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
-
         fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
             self.last_expected = expected as u64;
             self.memory_write_8(vaddr, value);
@@ -519,7 +495,6 @@ mod tests {
             true
         }
 
-        fn exclusive_clear(&mut self) {}
         fn call_supervisor(&mut self, _svc_num: u32) {}
         fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
 
@@ -555,6 +530,19 @@ mod tests {
         assert_eq!(value, 0xfeed_face);
         assert_eq!(state.exclusive_state, 1);
         assert_eq!(state.exclusive_value[0], 0xfeed_face);
+    }
+
+    #[test]
+    fn exclusive_clear_only_resets_jit_state() {
+        let mut state = TestState {
+            exclusive_state: 1,
+            exclusive_value: [0x1122_3344, 0x5566_7788],
+        };
+
+        exclusive_clear(&mut state);
+
+        assert_eq!(state.exclusive_state, 0);
+        assert_eq!(state.exclusive_value, [0x1122_3344, 0x5566_7788]);
     }
 
     #[test]

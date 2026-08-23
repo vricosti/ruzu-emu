@@ -291,35 +291,8 @@ impl SignExtendRotation {
     }
 }
 
+pub use crate::interface::a32::config::Exception;
 pub use crate::interface::a32::coprocessor_util::CoprocReg;
-
-/// A32 exception type, passed to the `exception_raised` callback.
-///
-/// Matches upstream `dynarmic::A32::Exception` enum in `interface/A32/config.h`.
-/// Values are the discriminant values (0-based).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum Exception {
-    UndefinedInstruction = 0,
-    UnpredictableInstruction = 1,
-    DecodeError = 2,
-    SendEvent = 3,
-    SendEventLocal = 4,
-    WaitForInterrupt = 5,
-    WaitForEvent = 6,
-    Yield = 7,
-    Breakpoint = 8,
-    PreloadData = 9,
-    PreloadDataWithIntentToWrite = 10,
-    PreloadInstruction = 11,
-    NoExecuteFault = 12,
-}
-
-impl Exception {
-    pub fn as_u32(self) -> u32 {
-        self as u32
-    }
-}
 
 #[cfg(test)]
 mod tests {

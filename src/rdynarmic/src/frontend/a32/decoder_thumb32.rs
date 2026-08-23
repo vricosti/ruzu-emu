@@ -21,21 +21,21 @@ pub enum Thumb32InstId {
     MVN_imm,
     EOR_imm,
     TEQ_imm,
-    ADD_imm,
+    ADD_imm_1,
     CMN_imm,
     ADC_imm,
     SBC_imm,
-    SUB_imm,
+    SUB_imm_1,
     CMP_imm,
     RSB_imm,
 
     // Data processing (plain binary immediate)
-    ADD_imm_wide,
-    ADR_sub,
-    MOV_imm_wide,
-    ADR_add,
+    ADR_t3,
+    ADD_imm_2,
+    MOVW_imm,
+    ADR_t2,
     MOVT,
-    SUB_imm_wide,
+    SUB_imm_2,
     SSAT,
     SSAT16,
     SBFX,
@@ -65,9 +65,9 @@ pub enum Thumb32InstId {
     RSB_reg,
 
     // Branch
-    B_t3,
-    B_t4,
-    BL,
+    B,
+    B_cond,
+    BL_imm,
     BLX_imm,
 
     // Load/Store single
@@ -75,36 +75,51 @@ pub enum Thumb32InstId {
     LDR_imm_t4,
     LDR_lit,
     LDR_reg,
+    LDRT,
     LDRB_imm_t2,
     LDRB_imm_t3,
     LDRB_lit,
     LDRB_reg,
+    LDRBT,
     LDRH_imm_t2,
     LDRH_imm_t3,
     LDRH_lit,
     LDRH_reg,
+    LDRHT,
     LDRSB_imm_t1,
     LDRSB_imm_t2,
     LDRSB_lit,
     LDRSB_reg,
+    LDRSBT,
     LDRSH_imm_t1,
     LDRSH_imm_t2,
     LDRSH_lit,
     LDRSH_reg,
-    STR_imm_t3,
-    STR_imm_t4,
+    LDRSHT,
+    STR_imm_1,
+    STR_imm_2,
+    STR_imm_3,
+    STRT,
     STR_reg,
-    STRB_imm_t2,
-    STRB_imm_t3,
+    STRB_imm_1,
+    STRB_imm_2,
+    STRB_imm_3,
+    STRBT,
     STRB_reg,
-    STRH_imm_t2,
-    STRH_imm_t3,
+    STRH_imm_1,
+    STRH_imm_2,
+    STRH_imm_3,
+    STRHT,
     STRH_reg,
 
     // Load/Store dual/exclusive
-    LDRD_imm,
-    LDRD_lit,
-    STRD_imm,
+    LDA,
+    LDRD_imm_1,
+    LDRD_imm_2,
+    LDRD_lit_1,
+    LDRD_lit_2,
+    STRD_imm_1,
+    STRD_imm_2,
     LDREX,
     LDREXB,
     LDREXH,
@@ -113,11 +128,14 @@ pub enum Thumb32InstId {
     STREXB,
     STREXH,
     STREXD,
+    STL,
+    TBB,
+    TBH,
 
     // Load/Store multiple
-    LDM,
+    LDMIA,
     LDMDB,
-    STM,
+    STMIA,
     STMDB,
     PUSH,
     POP,
@@ -126,13 +144,27 @@ pub enum Thumb32InstId {
     MUL,
     MLA,
     MLS,
+    SMLAD,
+    SMLAXY,
+    SMLAWY,
+    SMLSD,
     SMMUL,
     SMMLA,
     SMMLS,
+    SMUAD,
+    SMUSD,
+    SMULXY,
+    SMULWY,
+    USAD8,
+    USADA8,
     SMULL,
     UMULL,
     SMLAL,
+    SMLALD,
+    SMLALXY,
+    SMLSLD,
     UMLAL,
+    UMAAL,
     SDIV,
     UDIV,
 
@@ -146,6 +178,51 @@ pub enum Thumb32InstId {
     MRC,
 
     // Misc
+    LSL_reg,
+    LSR_reg,
+    ASR_reg,
+    ROR_reg,
+    QADD,
+    QDADD,
+    QSUB,
+    QDSUB,
+    SEL,
+    SADD8,
+    SADD16,
+    SASX,
+    SSAX,
+    SSUB8,
+    SSUB16,
+    UADD8,
+    UADD16,
+    UASX,
+    USAX,
+    USUB8,
+    USUB16,
+    QADD8,
+    QADD16,
+    QASX,
+    QSAX,
+    QSUB8,
+    QSUB16,
+    UQADD8,
+    UQADD16,
+    UQASX,
+    UQSAX,
+    UQSUB8,
+    UQSUB16,
+    SHADD8,
+    SHADD16,
+    SHASX,
+    SHSAX,
+    SHSUB8,
+    SHSUB16,
+    UHADD8,
+    UHADD16,
+    UHASX,
+    UHSAX,
+    UHSUB8,
+    UHSUB16,
     CLZ,
     RBIT,
     REV,
@@ -157,19 +234,23 @@ pub enum Thumb32InstId {
     UXTB,
     SXTAH,
     SXTAB,
+    SXTB16,
+    SXTAB16,
     UXTAH,
     UXTAB,
+    UXTB16,
+    UXTAB16,
 
     // Barriers
     DMB,
     DSB,
     ISB,
     CLREX,
+    BXJ,
 
     // System
-    MRS,
+    MRS_reg,
     MSR_reg,
-    SVC,
     UDF,
     BKPT,
     NOP,
@@ -246,16 +327,6 @@ impl DecodedThumb32 {
         let imm3 = ((self.hw2() >> 12) & 7) as u32;
         let imm8 = (self.hw2() & 0xFF) as u32;
         (i << 11) | (imm3 << 8) | imm8
-    }
-
-    /// Expand Thumb modified immediate to 32-bit value.
-    pub fn thumb_expand_imm(&self) -> u32 {
-        thumb_expand_imm(self.thumb_expand_imm_bits())
-    }
-
-    /// Expand Thumb modified immediate with carry output.
-    pub fn thumb_expand_imm_c(&self, carry_in: bool) -> (u32, bool) {
-        thumb_expand_imm_c(self.thumb_expand_imm_bits(), carry_in)
     }
 
     /// 12-bit unsigned immediate for plain binary: i:imm3:imm8.
@@ -393,48 +464,12 @@ impl DecodedThumb32 {
     }
 }
 
-/// Expand Thumb modified immediate (12-bit) to 32-bit value.
-pub fn thumb_expand_imm(imm12: u32) -> u32 {
-    let top2 = (imm12 >> 10) & 3;
-    if top2 == 0 {
-        let op = (imm12 >> 8) & 3;
-        let imm8 = imm12 & 0xFF;
-        match op {
-            0 => imm8,
-            1 => (imm8 << 16) | imm8,
-            2 => (imm8 << 24) | (imm8 << 8),
-            3 => (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8,
-            _ => unreachable!(),
-        }
-    } else {
-        let unrotated = 0x80 | (imm12 & 0x7F);
-        let rotation = (imm12 >> 7) & 0x1F;
-        unrotated.rotate_right(rotation)
-    }
-}
-
-/// Expand Thumb modified immediate with carry output.
-pub fn thumb_expand_imm_c(imm12: u32, carry_in: bool) -> (u32, bool) {
-    let top2 = (imm12 >> 10) & 3;
-    if top2 == 0 {
-        (thumb_expand_imm(imm12), carry_in)
-    } else {
-        let unrotated = 0x80 | (imm12 & 0x7F);
-        let rotation = (imm12 >> 7) & 0x1F;
-        let result = unrotated.rotate_right(rotation);
-        let carry = result & (1 << 31) != 0;
-        (result, carry)
-    }
-}
-
 /// Decode a 32-bit Thumb instruction from two halfwords.
 pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
     let raw = ((hw1 as u32) << 16) | (hw2 as u32);
     // Exact upstream thumb32.inc hint/preload encodings. These precede the
     // broader load-byte and branch groups in the generated decoder.
-    let id = if raw == 0xF3AF_8005 {
-        Thumb32InstId::SEVL
-    } else if matches_thumb32(raw, 0xFF7F_F000, 0xF81F_F000)
+    let id = if matches_thumb32(raw, 0xFF7F_F000, 0xF81F_F000)
         || matches_thumb32(raw, 0xFF7F_F000, 0xF83F_F000)
     {
         Thumb32InstId::PLD_lit
@@ -452,6 +487,12 @@ pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
         Thumb32InstId::PLI_imm8
     } else if matches_thumb32(raw, 0xFFF0_F000, 0xF990_F000) {
         Thumb32InstId::PLI_imm12
+    } else if matches_thumb32(raw, 0xFF7F_F000, 0xF93F_F000)
+        || matches_thumb32(raw, 0xFFF0_FFC0, 0xF930_F000)
+        || matches_thumb32(raw, 0xFFF0_FF00, 0xF930_FC00)
+        || matches_thumb32(raw, 0xFFF0_F000, 0xF9B0_F000)
+    {
+        Thumb32InstId::NOP
     } else if matches_thumb32(raw, 0xEFF0_0000, 0xEC40_0000) {
         Thumb32InstId::MCRR
     } else if matches_thumb32(raw, 0xEFF0_0000, 0xEC50_0000) {
@@ -466,12 +507,12 @@ pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
         Thumb32InstId::LDC
     } else if matches_thumb32(raw, 0xEE10_0000, 0xEC00_0000) {
         Thumb32InstId::STC
-    } else if matches_thumb32(raw, 0xFFF0_F0E0, 0xFB50_F000) {
-        Thumb32InstId::SMMUL
-    } else if matches_thumb32(raw, 0xFFF0_00E0, 0xFB50_0000) {
-        Thumb32InstId::SMMLA
-    } else if matches_thumb32(raw, 0xFFF0_00E0, 0xFB60_0000) {
-        Thumb32InstId::SMMLS
+    } else if raw >> 24 == 0xfa {
+        decode_thumb32_fa(raw)
+    } else if matches_thumb32(raw, 0xFF80_0000, 0xFB00_0000) {
+        decode_thumb32_multiply(raw)
+    } else if matches_thumb32(raw, 0xFF80_0000, 0xFB80_0000) {
+        decode_thumb32_long_multiply(raw)
     } else {
         let op1 = (hw1 >> 11) & 3;
         let op2 = ((hw1 >> 4) & 0x7F) as u32;
@@ -486,6 +527,113 @@ pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
     };
 
     DecodedThumb32 { raw, id }
+}
+
+fn decode_thumb32_fa(raw: u32) -> Thumb32InstId {
+    let register = decode_thumb32_dp_register(raw);
+    if register != Thumb32InstId::Unknown {
+        return register;
+    }
+    let parallel = decode_thumb32_parallel(raw);
+    if parallel != Thumb32InstId::Unknown {
+        return parallel;
+    }
+    decode_thumb32_misc(raw)
+}
+
+fn decode_thumb32_parallel(raw: u32) -> Thumb32InstId {
+    use Thumb32InstId::*;
+    for (mask, expected, id) in [
+        (0xfff0_f0f0, 0xfa90_f000, SADD16),
+        (0xfff0_f0f0, 0xfaa0_f000, SASX),
+        (0xfff0_f0f0, 0xfae0_f000, SSAX),
+        (0xfff0_f0f0, 0xfad0_f000, SSUB16),
+        (0xfff0_f0f0, 0xfa80_f000, SADD8),
+        (0xfff0_f0f0, 0xfac0_f000, SSUB8),
+        (0xfff0_f0f0, 0xfa90_f010, QADD16),
+        (0xfff0_f0f0, 0xfaa0_f010, QASX),
+        (0xfff0_f0f0, 0xfae0_f010, QSAX),
+        (0xfff0_f0f0, 0xfad0_f010, QSUB16),
+        (0xfff0_f0f0, 0xfa80_f010, QADD8),
+        (0xfff0_f0f0, 0xfac0_f010, QSUB8),
+        (0xfff0_f0f0, 0xfa90_f020, SHADD16),
+        (0xfff0_f0f0, 0xfaa0_f020, SHASX),
+        (0xfff0_f0f0, 0xfae0_f020, SHSAX),
+        (0xfff0_f0f0, 0xfad0_f020, SHSUB16),
+        (0xfff0_f0f0, 0xfa80_f020, SHADD8),
+        (0xfff0_f0f0, 0xfac0_f020, SHSUB8),
+        (0xfff0_f0f0, 0xfa90_f040, UADD16),
+        (0xfff0_f0f0, 0xfaa0_f040, UASX),
+        (0xfff0_f0f0, 0xfae0_f040, USAX),
+        (0xfff0_f0f0, 0xfad0_f040, USUB16),
+        (0xfff0_f0f0, 0xfa80_f040, UADD8),
+        (0xfff0_f0f0, 0xfac0_f040, USUB8),
+        (0xfff0_f0f0, 0xfa90_f050, UQADD16),
+        (0xfff0_f0f0, 0xfaa0_f050, UQASX),
+        (0xfff0_f0f0, 0xfae0_f050, UQSAX),
+        (0xfff0_f0f0, 0xfad0_f050, UQSUB16),
+        (0xfff0_f0f0, 0xfa80_f050, UQADD8),
+        (0xfff0_f0f0, 0xfac0_f050, UQSUB8),
+        (0xfff0_f0f0, 0xfa90_f060, UHADD16),
+        (0xfff0_f0f0, 0xfaa0_f060, UHASX),
+        (0xfff0_f0f0, 0xfae0_f060, UHSAX),
+        (0xfff0_f0f0, 0xfad0_f060, UHSUB16),
+        (0xfff0_f0f0, 0xfa80_f060, UHADD8),
+        (0xfff0_f0f0, 0xfac0_f060, UHSUB8),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
+    }
+    Unknown
+}
+
+fn decode_thumb32_dp_register(raw: u32) -> Thumb32InstId {
+    for (mask, expected, id) in [
+        (0xffe0_f0f0, 0xfa00_f000, Thumb32InstId::LSL_reg),
+        (0xffe0_f0f0, 0xfa20_f000, Thumb32InstId::LSR_reg),
+        (0xffe0_f0f0, 0xfa40_f000, Thumb32InstId::ASR_reg),
+        (0xffe0_f0f0, 0xfa60_f000, Thumb32InstId::ROR_reg),
+        (0xffff_f0c0, 0xfa0f_f080, Thumb32InstId::SXTH),
+        (0xfff0_f0c0, 0xfa00_f080, Thumb32InstId::SXTAH),
+        (0xffff_f0c0, 0xfa1f_f080, Thumb32InstId::UXTH),
+        (0xfff0_f0c0, 0xfa10_f080, Thumb32InstId::UXTAH),
+        (0xffff_f0c0, 0xfa2f_f080, Thumb32InstId::SXTB16),
+        (0xfff0_f0c0, 0xfa20_f080, Thumb32InstId::SXTAB16),
+        (0xffff_f0c0, 0xfa3f_f080, Thumb32InstId::UXTB16),
+        (0xfff0_f0c0, 0xfa30_f080, Thumb32InstId::UXTAB16),
+        (0xffff_f0c0, 0xfa4f_f080, Thumb32InstId::SXTB),
+        (0xfff0_f0c0, 0xfa40_f080, Thumb32InstId::SXTAB),
+        (0xffff_f0c0, 0xfa5f_f080, Thumb32InstId::UXTB),
+        (0xfff0_f0c0, 0xfa50_f080, Thumb32InstId::UXTAB),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
+    }
+
+    Thumb32InstId::Unknown
+}
+
+fn decode_thumb32_misc(raw: u32) -> Thumb32InstId {
+    for (mask, expected, id) in [
+        (0xfff0_f0f0, 0xfa80_f080, Thumb32InstId::QADD),
+        (0xfff0_f0f0, 0xfa80_f090, Thumb32InstId::QDADD),
+        (0xfff0_f0f0, 0xfa80_f0a0, Thumb32InstId::QSUB),
+        (0xfff0_f0f0, 0xfa80_f0b0, Thumb32InstId::QDSUB),
+        (0xfff0_f0f0, 0xfa90_f080, Thumb32InstId::REV),
+        (0xfff0_f0f0, 0xfa90_f090, Thumb32InstId::REV16),
+        (0xfff0_f0f0, 0xfa90_f0a0, Thumb32InstId::RBIT),
+        (0xfff0_f0f0, 0xfa90_f0b0, Thumb32InstId::REVSH),
+        (0xfff0_f0f0, 0xfaa0_f080, Thumb32InstId::SEL),
+        (0xfff0_f0f0, 0xfab0_f080, Thumb32InstId::CLZ),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
+    }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_01(raw: u32, _op2: u32, _op: u32) -> Thumb32InstId {
@@ -527,212 +675,170 @@ fn decode_thumb32_11(raw: u32, op2: u32) -> Thumb32InstId {
         0b0000..=0b0011 => decode_thumb32_ls_single(raw),
         // Load byte / Load halfword
         0b0100..=0b0111 => decode_thumb32_ls_single(raw),
-        // Multiply / long multiply / divide
-        0b1000..=0b1001 => decode_thumb32_multiply(raw),
-        0b1010..=0b1011 => decode_thumb32_long_multiply(raw),
         _ => Thumb32InstId::Unknown,
     }
 }
 
 fn decode_thumb32_ls_multiple(raw: u32) -> Thumb32InstId {
-    let op = (raw >> 23) & 3;
-    let l = (raw >> 20) & 1;
-    let w = (raw >> 21) & 1;
-    let rn = (raw >> 16) & 0xF;
-
-    match (l, op) {
-        (0, 0b01) => Thumb32InstId::STM,
-        (0, 0b10) => {
-            if rn == 13 && w == 1 {
-                Thumb32InstId::PUSH
-            } else {
-                Thumb32InstId::STMDB
-            }
+    for (mask, expected, id) in [
+        (0xffd0_8000, 0xe880_0000, Thumb32InstId::STMIA),
+        (0xffff_0000, 0xe8bd_0000, Thumb32InstId::POP),
+        (0xffd0_0000, 0xe890_0000, Thumb32InstId::LDMIA),
+        (0xffff_8000, 0xe92d_0000, Thumb32InstId::PUSH),
+        (0xffd0_8000, 0xe900_0000, Thumb32InstId::STMDB),
+        (0xffd0_0000, 0xe910_0000, Thumb32InstId::LDMDB),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
         }
-        (1, 0b01) => {
-            if rn == 13 && w == 1 {
-                Thumb32InstId::POP
-            } else {
-                Thumb32InstId::LDM
-            }
-        }
-        (1, 0b10) => Thumb32InstId::LDMDB,
-        _ => Thumb32InstId::Unknown,
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_ls_dual_excl(raw: u32) -> Thumb32InstId {
-    let op1 = (raw >> 23) & 3;
-    let op2 = (raw >> 20) & 3;
-    let op3 = (raw >> 4) & 0xF;
-
-    match (op1, op2) {
-        (0b00, 0b00) => Thumb32InstId::STREX,
-        (0b00, 0b01) => Thumb32InstId::LDREX,
-        (0b00, 0b10) | (0b01, 0b10) => Thumb32InstId::STRD_imm,
-        (0b00, 0b11) | (0b01, 0b11) => {
-            let rn = (raw >> 16) & 0xF;
-            if rn == 15 {
-                Thumb32InstId::LDRD_lit
-            } else {
-                Thumb32InstId::LDRD_imm
-            }
+    for (mask, expected, id) in [
+        (0xfff0_0000, 0xe840_0000, Thumb32InstId::STREX),
+        (0xfff0_0f00, 0xe850_0f00, Thumb32InstId::LDREX),
+        (0xff70_0000, 0xe860_0000, Thumb32InstId::STRD_imm_1),
+        (0xff50_0000, 0xe940_0000, Thumb32InstId::STRD_imm_2),
+        (0xff7f_0000, 0xe87f_0000, Thumb32InstId::LDRD_lit_1),
+        (0xff5f_0000, 0xe95f_0000, Thumb32InstId::LDRD_lit_2),
+        (0xff70_0000, 0xe870_0000, Thumb32InstId::LDRD_imm_1),
+        (0xff50_0000, 0xe950_0000, Thumb32InstId::LDRD_imm_2),
+        (0xfff0_0fff, 0xe8c0_0faf, Thumb32InstId::STL),
+        (0xfff0_0fff, 0xe8d0_0faf, Thumb32InstId::LDA),
+        (0xfff0_0ff0, 0xe8c0_0f40, Thumb32InstId::STREXB),
+        (0xfff0_0ff0, 0xe8c0_0f50, Thumb32InstId::STREXH),
+        (0xfff0_00f0, 0xe8c0_0070, Thumb32InstId::STREXD),
+        (0xfff0_fff0, 0xe8d0_f000, Thumb32InstId::TBB),
+        (0xfff0_fff0, 0xe8d0_f010, Thumb32InstId::TBH),
+        (0xfff0_0fff, 0xe8d0_0f4f, Thumb32InstId::LDREXB),
+        (0xfff0_0fff, 0xe8d0_0f5f, Thumb32InstId::LDREXH),
+        (0xfff0_00ff, 0xe8d0_007f, Thumb32InstId::LDREXD),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
         }
-        (0b01, 0b00) => match op3 {
-            0b0100 => Thumb32InstId::STREXB,
-            0b0101 => Thumb32InstId::STREXH,
-            0b0111 => Thumb32InstId::STREXD,
-            _ => Thumb32InstId::Unknown,
-        },
-        (0b01, 0b01) => match op3 {
-            0b0000 => Thumb32InstId::LDREXB,
-            0b0001 => Thumb32InstId::LDREXH,
-            0b0011 => Thumb32InstId::LDREXD,
-            _ => Thumb32InstId::Unknown,
-        },
-        (0b10, _) | (0b11, _) => {
-            if op2 & 1 == 0 {
-                Thumb32InstId::STRD_imm
-            } else {
-                let rn = (raw >> 16) & 0xF;
-                if rn == 15 {
-                    Thumb32InstId::LDRD_lit
-                } else {
-                    Thumb32InstId::LDRD_imm
-                }
-            }
-        }
-        _ => Thumb32InstId::Unknown,
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_dp_shifted_reg(raw: u32) -> Thumb32InstId {
-    let op = (raw >> 21) & 0xF;
-    let rn = (raw >> 16) & 0xF;
-    let rd = (raw >> 8) & 0xF;
-    let s = (raw >> 20) & 1;
-
-    match op {
-        0b0000 if rd == 15 && s == 1 => Thumb32InstId::TST_reg,
-        0b0000 => Thumb32InstId::AND_reg,
-        0b0001 => Thumb32InstId::BIC_reg,
-        0b0010 if rn == 15 => Thumb32InstId::MOV_reg,
-        0b0010 => Thumb32InstId::ORR_reg,
-        0b0011 if rn == 15 => Thumb32InstId::MVN_reg,
-        0b0011 => Thumb32InstId::ORN_reg,
-        0b0100 if rd == 15 && s == 1 => Thumb32InstId::TEQ_reg,
-        0b0100 => Thumb32InstId::EOR_reg,
-        0b0110 => Thumb32InstId::PKH,
-        0b1000 if rd == 15 && s == 1 => Thumb32InstId::CMN_reg,
-        0b1000 => Thumb32InstId::ADD_reg,
-        0b1010 => Thumb32InstId::ADC_reg,
-        0b1011 => Thumb32InstId::SBC_reg,
-        0b1101 if rd == 15 && s == 1 => Thumb32InstId::CMP_reg,
-        0b1101 => Thumb32InstId::SUB_reg,
-        0b1110 => Thumb32InstId::RSB_reg,
-        _ => Thumb32InstId::Unknown,
+    for (mask, expected, id) in [
+        (0xfff0_8f00, 0xea10_0f00, Thumb32InstId::TST_reg),
+        (0xffe0_8000, 0xea00_0000, Thumb32InstId::AND_reg),
+        (0xffe0_8000, 0xea20_0000, Thumb32InstId::BIC_reg),
+        (0xffef_8000, 0xea4f_0000, Thumb32InstId::MOV_reg),
+        (0xffe0_8000, 0xea40_0000, Thumb32InstId::ORR_reg),
+        (0xffef_8000, 0xea6f_0000, Thumb32InstId::MVN_reg),
+        (0xffe0_8000, 0xea60_0000, Thumb32InstId::ORN_reg),
+        (0xfff0_8f00, 0xea90_0f00, Thumb32InstId::TEQ_reg),
+        (0xffe0_8000, 0xea80_0000, Thumb32InstId::EOR_reg),
+        (0xfff0_8010, 0xeac0_0000, Thumb32InstId::PKH),
+        (0xfff0_8f00, 0xeb10_0f00, Thumb32InstId::CMN_reg),
+        (0xffe0_8000, 0xeb00_0000, Thumb32InstId::ADD_reg),
+        (0xffe0_8000, 0xeb40_0000, Thumb32InstId::ADC_reg),
+        (0xffe0_8000, 0xeb60_0000, Thumb32InstId::SBC_reg),
+        (0xfff0_8f00, 0xebb0_0f00, Thumb32InstId::CMP_reg),
+        (0xffe0_8000, 0xeba0_0000, Thumb32InstId::SUB_reg),
+        (0xffe0_8000, 0xebc0_0000, Thumb32InstId::RSB_reg),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_dp_mod_imm(raw: u32) -> Thumb32InstId {
-    let op = (raw >> 21) & 0xF;
-    let rn = (raw >> 16) & 0xF;
-    let rd = (raw >> 8) & 0xF;
-    let s = (raw >> 20) & 1;
-
-    match op {
-        0b0000 if rd == 15 && s == 1 => Thumb32InstId::TST_imm,
-        0b0000 => Thumb32InstId::AND_imm,
-        0b0001 => Thumb32InstId::BIC_imm,
-        0b0010 if rn == 15 => Thumb32InstId::MOV_imm,
-        0b0010 => Thumb32InstId::ORR_imm,
-        0b0011 if rn == 15 => Thumb32InstId::MVN_imm,
-        0b0011 => Thumb32InstId::ORN_imm,
-        0b0100 if rd == 15 && s == 1 => Thumb32InstId::TEQ_imm,
-        0b0100 => Thumb32InstId::EOR_imm,
-        0b1000 if rd == 15 && s == 1 => Thumb32InstId::CMN_imm,
-        0b1000 => Thumb32InstId::ADD_imm,
-        0b1010 => Thumb32InstId::ADC_imm,
-        0b1011 => Thumb32InstId::SBC_imm,
-        0b1101 if rd == 15 && s == 1 => Thumb32InstId::CMP_imm,
-        0b1101 => Thumb32InstId::SUB_imm,
-        0b1110 => Thumb32InstId::RSB_imm,
-        _ => Thumb32InstId::Unknown,
+    for (mask, expected, id) in [
+        (0xfbf0_8f00, 0xf010_0f00, Thumb32InstId::TST_imm),
+        (0xfbe0_8000, 0xf000_0000, Thumb32InstId::AND_imm),
+        (0xfbe0_8000, 0xf020_0000, Thumb32InstId::BIC_imm),
+        (0xfbef_8000, 0xf04f_0000, Thumb32InstId::MOV_imm),
+        (0xfbe0_8000, 0xf040_0000, Thumb32InstId::ORR_imm),
+        (0xfbef_8000, 0xf06f_0000, Thumb32InstId::MVN_imm),
+        (0xfbe0_8000, 0xf060_0000, Thumb32InstId::ORN_imm),
+        (0xfbf0_8f00, 0xf090_0f00, Thumb32InstId::TEQ_imm),
+        (0xfbe0_8000, 0xf080_0000, Thumb32InstId::EOR_imm),
+        (0xfbf0_8f00, 0xf110_0f00, Thumb32InstId::CMN_imm),
+        (0xfbe0_8000, 0xf100_0000, Thumb32InstId::ADD_imm_1),
+        (0xfbe0_8000, 0xf140_0000, Thumb32InstId::ADC_imm),
+        (0xfbe0_8000, 0xf160_0000, Thumb32InstId::SBC_imm),
+        (0xfbf0_8f00, 0xf1b0_0f00, Thumb32InstId::CMP_imm),
+        (0xfbe0_8000, 0xf1a0_0000, Thumb32InstId::SUB_imm_1),
+        (0xfbe0_8000, 0xf1c0_0000, Thumb32InstId::RSB_imm),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_dp_plain_imm(raw: u32) -> Thumb32InstId {
-    // Upstream thumb32.inc lists this "Invalid decoding" UDF entry immediately
-    // before SSAT/USAT. The Thumb32 matcher is first-match in source order
-    // (no specificity sort), so this reserved encoding (imm3=0, bits[7:4]=0b0001)
-    // wins over SSAT/USAT and raises UndefinedInstruction.
-    //   11110011-010----0000----0001----
-    if (raw & 0xFF70_F0F0) == 0xF320_0010 {
-        return Thumb32InstId::UDF;
+    // Keep the exact first-match ordering from upstream `thumb32.inc`.
+    for (mask, expected, id) in [
+        (0xfbff_8000, 0xf20f_0000, Thumb32InstId::ADR_t3),
+        (0xfbf0_8000, 0xf200_0000, Thumb32InstId::ADD_imm_2),
+        (0xfbf0_8000, 0xf240_0000, Thumb32InstId::MOVW_imm),
+        (0xfbff_8000, 0xf2af_0000, Thumb32InstId::ADR_t2),
+        (0xfbf0_8000, 0xf2a0_0000, Thumb32InstId::SUB_imm_2),
+        (0xfbf0_8000, 0xf2c0_0000, Thumb32InstId::MOVT),
+        (0xff70_f0f0, 0xf320_0010, Thumb32InstId::UDF),
+        (0xfff0_f0f0, 0xf320_0000, Thumb32InstId::SSAT16),
+        (0xfff0_f0f0, 0xf3a0_0000, Thumb32InstId::USAT16),
+        (0xffd0_8020, 0xf300_0000, Thumb32InstId::SSAT),
+        (0xffd0_8020, 0xf380_0000, Thumb32InstId::USAT),
+        (0xfff0_8020, 0xf340_0000, Thumb32InstId::SBFX),
+        (0xffff_8020, 0xf36f_0000, Thumb32InstId::BFC),
+        (0xfff0_8020, 0xf360_0000, Thumb32InstId::BFI),
+        (0xfff0_8020, 0xf3c0_0000, Thumb32InstId::UBFX),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
     }
 
-    let op = (raw >> 20) & 0x1F;
-    let rn = (raw >> 16) & 0xF;
-
-    match op {
-        0b00000 if rn == 15 => Thumb32InstId::ADR_add,
-        0b00000 => Thumb32InstId::ADD_imm_wide,
-        0b00100 => Thumb32InstId::MOV_imm_wide,
-        0b01010 if rn == 15 => Thumb32InstId::ADR_sub,
-        0b01010 => Thumb32InstId::SUB_imm_wide,
-        0b01100 => Thumb32InstId::MOVT,
-        0b10000 | 0b10010 => Thumb32InstId::SSAT,
-        0b10100 => Thumb32InstId::SBFX,
-        0b10110 if rn == 15 => Thumb32InstId::BFC,
-        0b10110 => Thumb32InstId::BFI,
-        0b11000 | 0b11010 => Thumb32InstId::USAT,
-        0b11100 => Thumb32InstId::UBFX,
-        _ => Thumb32InstId::Unknown,
-    }
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_branch(raw: u32) -> Thumb32InstId {
-    let op1 = (raw >> 20) & 0x7F;
-    let op2 = (raw >> 12) & 7;
-
-    match (op1 >> 3, op2) {
-        // MSR
-        (0b0001 | 0b0011, _) if op1 & 5 == 0 => Thumb32InstId::MSR_reg,
-        // Misc hints
-        (0b0001 | 0b0011, _) if op1 & 5 == 1 => decode_thumb32_hints(raw),
-        // MRS
-        (0b0001 | 0b0011, _) if op1 & 5 == 5 => Thumb32InstId::MRS,
-        // B (T3 conditional)
-        (_, 0b000 | 0b010) if op1 & 0x38 != 0x38 => Thumb32InstId::B_t3,
-        // UDF
-        (_, 0b000 | 0b010) if op1 == 0x7F => Thumb32InstId::UDF,
-        // SVC
-        (_, 0b000 | 0b010) if op1 == 0x7E => Thumb32InstId::SVC,
-        // B.W (T4 unconditional)
-        (_, 0b001 | 0b011) if op1 & 0x40 == 0 => Thumb32InstId::B_t4,
-        // BL
-        (_, 0b101 | 0b111) if op1 & 0x40 == 0 => Thumb32InstId::BL,
-        // BLX
-        (_, 0b100 | 0b110) if op1 & 0x40 == 0 => Thumb32InstId::BLX_imm,
-        _ => Thumb32InstId::Unknown,
+    if matches_thumb32(raw, 0xff70_f0f0, 0xf320_0010) {
+        return Thumb32InstId::UDF;
     }
-}
 
-fn decode_thumb32_hints(raw: u32) -> Thumb32InstId {
-    let op = (raw >> 4) & 0xF;
-    let hint = raw & 0xFF;
-    match hint {
-        0 => Thumb32InstId::NOP,
-        1 => Thumb32InstId::YIELD,
-        2 => Thumb32InstId::WFE,
-        3 => Thumb32InstId::WFI,
-        4 => Thumb32InstId::SEV,
-        5 => Thumb32InstId::SEVL,
-        _ if op == 4 => Thumb32InstId::DSB,
-        _ if op == 5 => Thumb32InstId::DMB,
-        _ if op == 6 => Thumb32InstId::ISB,
-        _ => Thumb32InstId::NOP,
+    for (mask, expected, id) in [
+        (0xffe0_f0ff, 0xf380_8000, Thumb32InstId::MSR_reg),
+        (0xffff_ffff, 0xf3af_8000, Thumb32InstId::NOP),
+        (0xffff_ffff, 0xf3af_8001, Thumb32InstId::YIELD),
+        (0xffff_ffff, 0xf3af_8002, Thumb32InstId::WFE),
+        (0xffff_ffff, 0xf3af_8003, Thumb32InstId::WFI),
+        (0xffff_ffff, 0xf3af_8004, Thumb32InstId::SEV),
+        (0xffff_ffff, 0xf3af_8005, Thumb32InstId::SEVL),
+        (0xffff_ffff, 0xf3bf_8f2f, Thumb32InstId::CLREX),
+        (0xffff_fff0, 0xf3bf_8f40, Thumb32InstId::DSB),
+        (0xffff_fff0, 0xf3bf_8f50, Thumb32InstId::DMB),
+        (0xffff_fff0, 0xf3bf_8f60, Thumb32InstId::ISB),
+        (0xfff0_ffff, 0xf3c0_8f00, Thumb32InstId::BXJ),
+        (0xffef_f0ff, 0xf3ef_8000, Thumb32InstId::MRS_reg),
+        (0xfff0_f000, 0xf7f0_a000, Thumb32InstId::UDF),
+        (0xf800_d000, 0xf000_d000, Thumb32InstId::BL_imm),
+        (0xf800_d000, 0xf000_c000, Thumb32InstId::BLX_imm),
+        (0xf800_d000, 0xf000_9000, Thumb32InstId::B),
+        (0xfb80_d000, 0xf380_8000, Thumb32InstId::UDF),
+        (0xf800_d000, 0xf000_8000, Thumb32InstId::B_cond),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_ls_single(raw: u32) -> Thumb32InstId {
@@ -742,19 +848,34 @@ fn decode_thumb32_ls_single(raw: u32) -> Thumb32InstId {
     let half = (raw >> 21) & 1 != 0;
     let word = (raw >> 22) & 1 != 0;
     let indexed_imm8 = raw & (1 << 11) != 0;
+    let unprivileged = (raw >> 8) & 0xf == 0b1110;
 
     match op1 {
         0b00 => {
             if load {
                 if word {
+                    if rn == 15 {
+                        return Thumb32InstId::LDR_lit;
+                    }
                     if indexed_imm8 {
-                        Thumb32InstId::LDR_imm_t4
+                        if unprivileged {
+                            Thumb32InstId::LDRT
+                        } else {
+                            Thumb32InstId::LDR_imm_t4
+                        }
                     } else {
                         Thumb32InstId::LDR_reg
                     }
                 } else if half {
+                    if rn == 15 {
+                        return Thumb32InstId::LDRH_lit;
+                    }
                     if indexed_imm8 {
-                        Thumb32InstId::LDRH_imm_t3
+                        if unprivileged {
+                            Thumb32InstId::LDRHT
+                        } else {
+                            Thumb32InstId::LDRH_imm_t3
+                        }
                     } else {
                         Thumb32InstId::LDRH_reg
                     }
@@ -763,29 +884,54 @@ fn decode_thumb32_ls_single(raw: u32) -> Thumb32InstId {
                         return Thumb32InstId::LDRB_lit;
                     }
                     if indexed_imm8 {
-                        Thumb32InstId::LDRB_imm_t3
+                        if unprivileged {
+                            Thumb32InstId::LDRBT
+                        } else {
+                            Thumb32InstId::LDRB_imm_t3
+                        }
                     } else {
                         Thumb32InstId::LDRB_reg
                     }
                 }
             } else {
                 if word {
-                    if indexed_imm8 {
-                        Thumb32InstId::STR_imm_t4
-                    } else {
+                    let control = (raw >> 8) & 0xf;
+                    if control == 0xc {
+                        Thumb32InstId::STR_imm_2
+                    } else if control == 0xe {
+                        Thumb32InstId::STRT
+                    } else if control & 0x9 == 0x9 {
+                        Thumb32InstId::STR_imm_1
+                    } else if raw & 0x0fc0 == 0 {
                         Thumb32InstId::STR_reg
+                    } else {
+                        Thumb32InstId::Unknown
                     }
                 } else if half {
-                    if indexed_imm8 {
-                        Thumb32InstId::STRH_imm_t3
-                    } else {
+                    let control = (raw >> 8) & 0xf;
+                    if control == 0xc {
+                        Thumb32InstId::STRH_imm_2
+                    } else if control == 0xe {
+                        Thumb32InstId::STRHT
+                    } else if control & 0x9 == 0x9 {
+                        Thumb32InstId::STRH_imm_1
+                    } else if raw & 0x0fc0 == 0 {
                         Thumb32InstId::STRH_reg
+                    } else {
+                        Thumb32InstId::Unknown
                     }
                 } else {
-                    if indexed_imm8 {
-                        Thumb32InstId::STRB_imm_t3
-                    } else {
+                    let control = (raw >> 8) & 0xf;
+                    if control == 0xc {
+                        Thumb32InstId::STRB_imm_2
+                    } else if control == 0xe {
+                        Thumb32InstId::STRBT
+                    } else if control & 0x9 == 0x9 {
+                        Thumb32InstId::STRB_imm_1
+                    } else if raw & 0x0fc0 == 0 {
                         Thumb32InstId::STRB_reg
+                    } else {
+                        Thumb32InstId::Unknown
                     }
                 }
             }
@@ -810,24 +956,39 @@ fn decode_thumb32_ls_single(raw: u32) -> Thumb32InstId {
                 }
             } else {
                 if word {
-                    Thumb32InstId::STR_imm_t3
+                    Thumb32InstId::STR_imm_3
                 } else if half {
-                    Thumb32InstId::STRH_imm_t2
+                    Thumb32InstId::STRH_imm_3
                 } else {
-                    Thumb32InstId::STRB_imm_t2
+                    Thumb32InstId::STRB_imm_3
                 }
             }
         }
         0b10 => {
             if load {
+                if rn == 15 {
+                    return if half {
+                        Thumb32InstId::LDRSH_lit
+                    } else {
+                        Thumb32InstId::LDRSB_lit
+                    };
+                }
                 if half {
                     if indexed_imm8 {
-                        Thumb32InstId::LDRSH_imm_t2
+                        if unprivileged {
+                            Thumb32InstId::LDRSHT
+                        } else {
+                            Thumb32InstId::LDRSH_imm_t2
+                        }
                     } else {
                         Thumb32InstId::LDRSH_reg
                     }
                 } else if indexed_imm8 {
-                    Thumb32InstId::LDRSB_imm_t2
+                    if unprivileged {
+                        Thumb32InstId::LDRSBT
+                    } else {
+                        Thumb32InstId::LDRSB_imm_t2
+                    }
                 } else {
                     Thumb32InstId::LDRSB_reg
                 }
@@ -857,62 +1018,51 @@ fn decode_thumb32_ls_single(raw: u32) -> Thumb32InstId {
 }
 
 fn decode_thumb32_multiply(raw: u32) -> Thumb32InstId {
-    let op1 = (raw >> 20) & 7;
-    let op2 = (raw >> 4) & 3;
-    let ra = (raw >> 12) & 0xF;
-
-    match op1 {
-        0b000 if ra == 15 => Thumb32InstId::MUL,
-        0b000 => Thumb32InstId::MLA,
-        0b001 => Thumb32InstId::MLS,
-        0b101 if ra == 15 && op2 == 0 => Thumb32InstId::SMMUL,
-        0b101 if op2 == 0 => Thumb32InstId::SMMLA,
-        0b110 if op2 == 0 => Thumb32InstId::SMMLS,
-        0b010 if op2 == 0 => {
-            let rn = (raw >> 16) & 0xF;
-            if rn == 15 {
-                Thumb32InstId::Unknown
-            } else {
-                Thumb32InstId::CLZ
-            }
-        }
-        _ => {
-            // Extensions / misc
-            let op = (raw >> 20) & 7;
-            let sub = (raw >> 4) & 3;
-            let rn = (raw >> 16) & 0xF;
-            match (op, sub) {
-                (0b100, 0b00) if rn == 15 => Thumb32InstId::SXTB,
-                (0b100, 0b00) => Thumb32InstId::SXTAB,
-                (0b000, 0b10) if rn == 15 => Thumb32InstId::SXTH,
-                (0b000, 0b10) => Thumb32InstId::SXTAH,
-                (0b100, 0b10) if rn == 15 => Thumb32InstId::UXTB,
-                (0b100, 0b10) => Thumb32InstId::UXTAB,
-                (0b000, 0b11) if rn == 15 => Thumb32InstId::UXTH,
-                (0b000, 0b11) => Thumb32InstId::UXTAH,
-                (0b001, 0b00) => Thumb32InstId::REV,
-                (0b001, 0b01) => Thumb32InstId::REV16,
-                (0b001, 0b10) => Thumb32InstId::RBIT,
-                (0b001, 0b11) => Thumb32InstId::REVSH,
-                _ => Thumb32InstId::Unknown,
-            }
+    for (mask, expected, id) in [
+        (0xfff0_f0f0, 0xfb00_f000, Thumb32InstId::MUL),
+        (0xfff0_00f0, 0xfb00_0000, Thumb32InstId::MLA),
+        (0xfff0_00f0, 0xfb00_0010, Thumb32InstId::MLS),
+        (0xfff0_f0c0, 0xfb10_f000, Thumb32InstId::SMULXY),
+        (0xfff0_00c0, 0xfb10_0000, Thumb32InstId::SMLAXY),
+        (0xfff0_f0e0, 0xfb20_f000, Thumb32InstId::SMUAD),
+        (0xfff0_00e0, 0xfb20_0000, Thumb32InstId::SMLAD),
+        (0xfff0_f0e0, 0xfb30_f000, Thumb32InstId::SMULWY),
+        (0xfff0_00e0, 0xfb30_0000, Thumb32InstId::SMLAWY),
+        (0xfff0_f0e0, 0xfb40_f000, Thumb32InstId::SMUSD),
+        (0xfff0_00e0, 0xfb40_0000, Thumb32InstId::SMLSD),
+        (0xfff0_f0e0, 0xfb50_f000, Thumb32InstId::SMMUL),
+        (0xfff0_00e0, 0xfb50_0000, Thumb32InstId::SMMLA),
+        (0xfff0_00e0, 0xfb60_0000, Thumb32InstId::SMMLS),
+        (0xfff0_f0f0, 0xfb70_f000, Thumb32InstId::USAD8),
+        (0xfff0_00f0, 0xfb70_0000, Thumb32InstId::USADA8),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
         }
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn decode_thumb32_long_multiply(raw: u32) -> Thumb32InstId {
-    let op1 = (raw >> 20) & 7;
-    let op2 = (raw >> 4) & 0xF;
-
-    match op1 {
-        0b000 => Thumb32InstId::SMULL,
-        0b001 if op2 == 0xF => Thumb32InstId::SDIV,
-        0b010 => Thumb32InstId::UMULL,
-        0b011 if op2 == 0xF => Thumb32InstId::UDIV,
-        0b100 => Thumb32InstId::SMLAL,
-        0b110 => Thumb32InstId::UMLAL,
-        _ => Thumb32InstId::Unknown,
+    for (mask, expected, id) in [
+        (0xfff0_00f0, 0xfb80_0000, Thumb32InstId::SMULL),
+        (0xfff0_f0f0, 0xfb90_f0f0, Thumb32InstId::SDIV),
+        (0xfff0_00f0, 0xfba0_0000, Thumb32InstId::UMULL),
+        (0xfff0_f0f0, 0xfbb0_f0f0, Thumb32InstId::UDIV),
+        (0xfff0_00f0, 0xfbc0_0000, Thumb32InstId::SMLAL),
+        (0xfff0_00c0, 0xfbc0_0080, Thumb32InstId::SMLALXY),
+        (0xfff0_00e0, 0xfbc0_00c0, Thumb32InstId::SMLALD),
+        (0xfff0_00e0, 0xfbd0_00c0, Thumb32InstId::SMLSLD),
+        (0xfff0_00f0, 0xfbe0_0000, Thumb32InstId::UMLAL),
+        (0xfff0_00f0, 0xfbe0_0060, Thumb32InstId::UMAAL),
+    ] {
+        if matches_thumb32(raw, mask, expected) {
+            return id;
+        }
     }
+
+    Thumb32InstId::Unknown
 }
 
 fn matches_thumb32(raw: u32, mask: u32, expected: u32) -> bool {
@@ -937,18 +1087,6 @@ mod tests {
     }
 
     #[test]
-    fn test_thumb_expand_imm() {
-        // Constant 0x42
-        assert_eq!(thumb_expand_imm(0x042), 0x42);
-        // Repeated pattern: 0x1AB => op=1 => (AB << 16) | AB = 0x00AB00AB
-        assert_eq!(thumb_expand_imm(0x1AB), 0x00AB00AB);
-        // Rotated: top2 != 0
-        let imm12 = 0x407; // top2=01, rotation=8, value=0x87
-        let result = thumb_expand_imm(imm12);
-        assert_eq!(result, 0x87u32.rotate_right(8));
-    }
-
-    #[test]
     fn test_decode_thumb32_bl() {
         // BL <offset> typical encoding
         // hw1: 1111 0 S imm10
@@ -956,7 +1094,88 @@ mod tests {
         let hw1: u16 = 0xF000; // S=0, imm10=0
         let hw2: u16 = 0xD000; // J1=0, J2=1, imm11=0
         let dec = decode_thumb32(hw1, hw2);
-        assert_eq!(dec.id, Thumb32InstId::BL);
+        assert_eq!(dec.id, Thumb32InstId::BL_imm);
+    }
+
+    #[test]
+    fn test_decode_thumb32_branch_matches_upstream_patterns_and_udf_priority() {
+        for (raw, expected) in [
+            (0xF000_D000u32, Thumb32InstId::BL_imm),
+            (0xF000_C000, Thumb32InstId::BLX_imm),
+            (0xF000_9000, Thumb32InstId::B),
+            (0xF000_8000, Thumb32InstId::B_cond),
+            (0xF7E0_A123, Thumb32InstId::UDF),
+            (0xF7F0_A123, Thumb32InstId::UDF),
+            (0xF320_0010, Thumb32InstId::UDF),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_thumb32_control_matches_upstream_patterns() {
+        let variable_bits = 0x001f_0f0fu32;
+        for (mask, expected, id) in [
+            (0xffe0_f0ff, 0xf380_8000, Thumb32InstId::MSR_reg),
+            (0xffff_ffff, 0xf3af_8000, Thumb32InstId::NOP),
+            (0xffff_ffff, 0xf3af_8001, Thumb32InstId::YIELD),
+            (0xffff_ffff, 0xf3af_8002, Thumb32InstId::WFE),
+            (0xffff_ffff, 0xf3af_8003, Thumb32InstId::WFI),
+            (0xffff_ffff, 0xf3af_8004, Thumb32InstId::SEV),
+            (0xffff_ffff, 0xf3af_8005, Thumb32InstId::SEVL),
+            (0xffff_ffff, 0xf3bf_8f2f, Thumb32InstId::CLREX),
+            (0xffff_fff0, 0xf3bf_8f40, Thumb32InstId::DSB),
+            (0xffff_fff0, 0xf3bf_8f50, Thumb32InstId::DMB),
+            (0xffff_fff0, 0xf3bf_8f60, Thumb32InstId::ISB),
+            (0xfff0_ffff, 0xf3c0_8f00, Thumb32InstId::BXJ),
+            (0xffef_f0ff, 0xf3ef_8000, Thumb32InstId::MRS_reg),
+        ] {
+            let raw = expected | (variable_bits & !mask);
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                id,
+                "raw={raw:08X}"
+            );
+        }
+
+        // Nearby reserved encodings must not be absorbed by the old broad
+        // control classifier.
+        assert_ne!(decode_thumb32(0xF3AF, 0x8010).id, Thumb32InstId::NOP);
+        assert_ne!(decode_thumb32(0xF3BF, 0x8F20).id, Thumb32InstId::CLREX);
+    }
+
+    #[test]
+    fn test_decode_thumb32_modified_immediate_matches_upstream_patterns() {
+        let variable_bits = 0x0401_2255u32;
+        for (mask, expected, id) in [
+            (0xfbf0_8f00, 0xf010_0f00, Thumb32InstId::TST_imm),
+            (0xfbe0_8000, 0xf000_0000, Thumb32InstId::AND_imm),
+            (0xfbe0_8000, 0xf020_0000, Thumb32InstId::BIC_imm),
+            (0xfbef_8000, 0xf04f_0000, Thumb32InstId::MOV_imm),
+            (0xfbe0_8000, 0xf040_0000, Thumb32InstId::ORR_imm),
+            (0xfbef_8000, 0xf06f_0000, Thumb32InstId::MVN_imm),
+            (0xfbe0_8000, 0xf060_0000, Thumb32InstId::ORN_imm),
+            (0xfbf0_8f00, 0xf090_0f00, Thumb32InstId::TEQ_imm),
+            (0xfbe0_8000, 0xf080_0000, Thumb32InstId::EOR_imm),
+            (0xfbf0_8f00, 0xf110_0f00, Thumb32InstId::CMN_imm),
+            (0xfbe0_8000, 0xf100_0000, Thumb32InstId::ADD_imm_1),
+            (0xfbe0_8000, 0xf140_0000, Thumb32InstId::ADC_imm),
+            (0xfbe0_8000, 0xf160_0000, Thumb32InstId::SBC_imm),
+            (0xfbf0_8f00, 0xf1b0_0f00, Thumb32InstId::CMP_imm),
+            (0xfbe0_8000, 0xf1a0_0000, Thumb32InstId::SUB_imm_1),
+            (0xfbe0_8000, 0xf1c0_0000, Thumb32InstId::RSB_imm),
+        ] {
+            let raw = expected | (variable_bits & !mask);
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                id,
+                "raw={raw:08X}"
+            );
+        }
     }
 
     #[test]
@@ -989,15 +1208,15 @@ mod tests {
         let hw1: u16 = 0xF240; // MOV_imm_wide
         let hw2: u16 = 0x0042; // Rd=R0, imm8=0x42
         let dec = decode_thumb32(hw1, hw2);
-        assert_eq!(dec.id, Thumb32InstId::MOV_imm_wide);
+        assert_eq!(dec.id, Thumb32InstId::MOVW_imm);
         assert_eq!(dec.rd(), Reg::R0);
         assert_eq!(dec.imm16(), 0x42);
     }
 
     #[test]
-    fn test_decode_thumb32_str_imm_t3_zero_offset_not_reg() {
+    fn test_decode_thumb32_str_imm_3_zero_offset_not_reg() {
         let dec = decode_thumb32(0xF8C0, 0x1000);
-        assert_eq!(dec.id, Thumb32InstId::STR_imm_t3);
+        assert_eq!(dec.id, Thumb32InstId::STR_imm_3);
     }
 
     #[test]
@@ -1019,9 +1238,9 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_thumb32_strb_imm_t2_zero_offset_not_reg() {
+    fn test_decode_thumb32_strb_imm_3_zero_offset_not_reg() {
         let dec = decode_thumb32(0xF880, 0x1000);
-        assert_eq!(dec.id, Thumb32InstId::STRB_imm_t2);
+        assert_eq!(dec.id, Thumb32InstId::STRB_imm_3);
     }
 
     #[test]
@@ -1031,15 +1250,102 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_thumb32_strh_imm_t2_zero_offset_not_reg() {
+    fn test_decode_thumb32_strh_imm_3_zero_offset_not_reg() {
         let dec = decode_thumb32(0xF8A0, 0x1000);
-        assert_eq!(dec.id, Thumb32InstId::STRH_imm_t2);
+        assert_eq!(dec.id, Thumb32InstId::STRH_imm_3);
+    }
+
+    #[test]
+    fn test_decode_thumb32_store_single_matches_upstream_patterns() {
+        for (raw, expected) in [
+            (0xF841_2B34u32, Thumb32InstId::STR_imm_1),
+            (0xF841_2C34, Thumb32InstId::STR_imm_2),
+            (0xF8C1_2234, Thumb32InstId::STR_imm_3),
+            (0xF841_2E34, Thumb32InstId::STRT),
+            (0xF841_2034, Thumb32InstId::STR_reg),
+            (0xF801_2B34, Thumb32InstId::STRB_imm_1),
+            (0xF801_2C34, Thumb32InstId::STRB_imm_2),
+            (0xF881_2234, Thumb32InstId::STRB_imm_3),
+            (0xF801_2E34, Thumb32InstId::STRBT),
+            (0xF801_2034, Thumb32InstId::STRB_reg),
+            (0xF821_2B34, Thumb32InstId::STRH_imm_1),
+            (0xF821_2C34, Thumb32InstId::STRH_imm_2),
+            (0xF8A1_2234, Thumb32InstId::STRH_imm_3),
+            (0xF821_2E34, Thumb32InstId::STRHT),
+            (0xF821_2034, Thumb32InstId::STRH_reg),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
+
+        for raw in [0xF841_2844u32, 0xF801_2A44, 0xF821_2444] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                Thumb32InstId::Unknown,
+                "reserved raw={raw:08X}"
+            );
+        }
     }
 
     #[test]
     fn test_decode_thumb32_ldrsb_imm_t1() {
         let dec = decode_thumb32(0xF990, 0x3000);
         assert_eq!(dec.id, Thumb32InstId::LDRSB_imm_t1);
+    }
+
+    #[test]
+    fn test_decode_thumb32_unprivileged_loads_precede_imm8_patterns() {
+        for (raw, expected) in [
+            (0xF851_2E34u32, Thumb32InstId::LDRT),
+            (0xF811_2E34u32, Thumb32InstId::LDRBT),
+            (0xF831_2E34, Thumb32InstId::LDRHT),
+            (0xF911_2E34, Thumb32InstId::LDRSBT),
+            (0xF931_2E34, Thumb32InstId::LDRSHT),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
+
+        for (raw, expected) in [
+            (0xF851_2C34u32, Thumb32InstId::LDR_imm_t4),
+            (0xF811_2C34u32, Thumb32InstId::LDRB_imm_t3),
+            (0xF831_2C34, Thumb32InstId::LDRH_imm_t3),
+            (0xF911_2C34, Thumb32InstId::LDRSB_imm_t2),
+            (0xF931_2C34, Thumb32InstId::LDRSH_imm_t2),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "adjacent imm8 raw={raw:08X}"
+            );
+        }
+
+        for (raw, expected) in [
+            (0xF85F_2E34u32, Thumb32InstId::LDR_lit),
+            (0xF83F_2E34, Thumb32InstId::LDRH_lit),
+            (0xF91F_2E34, Thumb32InstId::LDRSB_lit),
+            (0xF93F_2E34, Thumb32InstId::LDRSH_lit),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "negative literal raw={raw:08X}"
+            );
+        }
+
+        for raw in [0xF93F_F123u32, 0xF931_F000, 0xF931_FC00, 0xF9B1_F123] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                Thumb32InstId::NOP,
+                "reserved LDRSH raw={raw:08X}"
+            );
+        }
     }
 
     #[test]
@@ -1060,6 +1366,35 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_thumb32_load_store_multiple_matches_upstream_patterns() {
+        for (raw, expected) in [
+            (0xE8A1_0003u32, Thumb32InstId::STMIA),
+            (0xE8BD_8003, Thumb32InstId::POP),
+            (0xE8B1_0003, Thumb32InstId::LDMIA),
+            (0xE92D_4003, Thumb32InstId::PUSH),
+            (0xE921_0003, Thumb32InstId::STMDB),
+            (0xE931_0003, Thumb32InstId::LDMDB),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_thumb32_multiple_store_rejects_pc_list_bit() {
+        for raw in [0xE8A1_8003u32, 0xE921_8003, 0xE92D_8003] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                Thumb32InstId::Unknown,
+                "raw={raw:08X}"
+            );
+        }
+    }
+
+    #[test]
     fn test_decode_thumb32_eb00_is_data_processing_not_strd() {
         let hw1: u16 = 0xEB00;
         let hw2: u16 = 0x0000;
@@ -1072,15 +1407,45 @@ mod tests {
         let hw1: u16 = 0xE940;
         let hw2: u16 = 0x0000;
         let dec = decode_thumb32(hw1, hw2);
-        assert_eq!(dec.id, Thumb32InstId::STRD_imm);
+        assert_eq!(dec.id, Thumb32InstId::STRD_imm_2);
     }
 
     #[test]
-    fn test_decode_thumb32_e92d_is_push() {
+    fn test_decode_thumb32_load_store_dual_matches_upstream_patterns() {
+        for (raw, expected) in [
+            (0xE841_2304u32, Thumb32InstId::STREX),
+            (0xE851_2F04, Thumb32InstId::LDREX),
+            (0xE861_2304, Thumb32InstId::STRD_imm_1),
+            (0xE941_2304, Thumb32InstId::STRD_imm_2),
+            (0xE87F_2304, Thumb32InstId::LDRD_lit_1),
+            (0xE95F_2304, Thumb32InstId::LDRD_lit_2),
+            (0xE871_2304, Thumb32InstId::LDRD_imm_1),
+            (0xE951_2304, Thumb32InstId::LDRD_imm_2),
+            (0xE8C1_2FAF, Thumb32InstId::STL),
+            (0xE8D1_2FAF, Thumb32InstId::LDA),
+            (0xE8C1_2F43, Thumb32InstId::STREXB),
+            (0xE8C1_2F53, Thumb32InstId::STREXH),
+            (0xE8C1_2473, Thumb32InstId::STREXD),
+            (0xE8D1_F003, Thumb32InstId::TBB),
+            (0xE8D1_F013, Thumb32InstId::TBH),
+            (0xE8D1_2F4F, Thumb32InstId::LDREXB),
+            (0xE8D1_2F5F, Thumb32InstId::LDREXH),
+            (0xE8D1_247F, Thumb32InstId::LDREXD),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_thumb32_e92d_with_pc_list_bit_is_reserved() {
         let hw1: u16 = 0xE92D;
         let hw2: u16 = 0xB018;
         let dec = decode_thumb32(hw1, hw2);
-        assert_eq!(dec.id, Thumb32InstId::PUSH);
+        assert_eq!(dec.id, Thumb32InstId::Unknown);
     }
 
     #[test]
@@ -1104,6 +1469,62 @@ mod tests {
         let hw2: u16 = 0xF000;
         let dec = decode_thumb32(hw1, hw2);
         assert_eq!(dec.id, Thumb32InstId::SMMUL);
+    }
+
+    #[test]
+    fn test_decode_thumb32_multiply_matches_upstream_patterns() {
+        for (raw, expected) in [
+            (0xFB01_F203u32, Thumb32InstId::MUL),
+            (0xFB01_4203, Thumb32InstId::MLA),
+            (0xFB01_4213, Thumb32InstId::MLS),
+            (0xFB11_F233, Thumb32InstId::SMULXY),
+            (0xFB11_4233, Thumb32InstId::SMLAXY),
+            (0xFB21_F213, Thumb32InstId::SMUAD),
+            (0xFB21_4213, Thumb32InstId::SMLAD),
+            (0xFB31_F213, Thumb32InstId::SMULWY),
+            (0xFB31_4213, Thumb32InstId::SMLAWY),
+            (0xFB41_F213, Thumb32InstId::SMUSD),
+            (0xFB41_4213, Thumb32InstId::SMLSD),
+            (0xFB51_F213, Thumb32InstId::SMMUL),
+            (0xFB51_4213, Thumb32InstId::SMMLA),
+            (0xFB61_4213, Thumb32InstId::SMMLS),
+            (0xFB71_F203, Thumb32InstId::USAD8),
+            (0xFB71_4203, Thumb32InstId::USADA8),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_thumb32_multiply_family_prefix_boundaries() {
+        assert_eq!(decode_thumb32(0xFB81, 0x2303).id, Thumb32InstId::SMULL);
+        assert_eq!(decode_thumb32(0xFC01, 0xF203).id, Thumb32InstId::STC);
+    }
+
+    #[test]
+    fn test_decode_thumb32_long_multiply_matches_upstream_patterns() {
+        for (raw, expected) in [
+            (0xFB81_2303u32, Thumb32InstId::SMULL),
+            (0xFB91_F2F3, Thumb32InstId::SDIV),
+            (0xFBA1_2303, Thumb32InstId::UMULL),
+            (0xFBB1_F2F3, Thumb32InstId::UDIV),
+            (0xFBC1_2303, Thumb32InstId::SMLAL),
+            (0xFBC1_23B3, Thumb32InstId::SMLALXY),
+            (0xFBC1_23D3, Thumb32InstId::SMLALD),
+            (0xFBD1_23D3, Thumb32InstId::SMLSLD),
+            (0xFBE1_2303, Thumb32InstId::UMLAL),
+            (0xFBE1_2363, Thumb32InstId::UMAAL),
+        ] {
+            assert_eq!(
+                decode_thumb32((raw >> 16) as u16, raw as u16).id,
+                expected,
+                "raw={raw:08X}"
+            );
+        }
     }
 
     #[test]

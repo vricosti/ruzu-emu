@@ -78,21 +78,6 @@ impl UserCallbacks for BenchEnv {
     fn memory_write_32(&mut self, _: u64, _: u32) {}
     fn memory_write_64(&mut self, _: u64, _: u64) {}
     fn memory_write_128(&mut self, _: u64, _: u64, _: u64) {}
-    fn exclusive_read_8(&self, _: u64) -> u8 {
-        0
-    }
-    fn exclusive_read_16(&self, _: u64) -> u16 {
-        0
-    }
-    fn exclusive_read_32(&self, _: u64) -> u32 {
-        0
-    }
-    fn exclusive_read_64(&self, _: u64) -> u64 {
-        0
-    }
-    fn exclusive_read_128(&self, _: u64) -> (u64, u64) {
-        (0, 0)
-    }
     fn exclusive_write_8(&mut self, _: u64, _: u8, _: u8) -> bool {
         true
     }
@@ -108,7 +93,6 @@ impl UserCallbacks for BenchEnv {
     fn exclusive_write_128(&mut self, _: u64, _: u64, _: u64, _: u64, _: u64) -> bool {
         true
     }
-    fn exclusive_clear(&mut self) {}
     fn call_supervisor(&mut self, _: u32) {}
     fn exception_raised(&mut self, _: u64, _: u64) {}
     fn add_ticks(&mut self, ticks: u64) {

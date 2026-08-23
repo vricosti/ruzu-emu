@@ -1,6 +1,15 @@
-use crate::frontend::a32::types::ShiftType;
+use crate::frontend::a32::types::{Reg, ShiftType};
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::value::Value;
+
+/// Returns whether an instruction which writes `PC` is forbidden at the
+/// current position in a Thumb IT block.
+///
+/// Upstream owner: `frontend/A32/translate/impl/common.h::ITBlockCheck`.
+pub(crate) fn it_block_check(ir: &A32IREmitter<'_>) -> bool {
+    let it = ir.current_location.expect("current_location not set").it();
+    it.is_in_it_block() && !it.is_last_in_it_block()
+}
 
 /// Pack the low 16 bits of `lo` and `hi` into one 32-bit value.
 /// Upstream: `translate/impl/common.h::Pack2x16To1x32`.
@@ -19,6 +28,15 @@ pub fn most_significant_half(ir: &mut A32IREmitter, value: Value) -> Value {
         .ir()
         .logical_shift_right_32(value, Value::ImmU8(16), Value::ImmU1(false));
     ir.ir().least_significant_half(shifted)
+}
+
+/// Rotate the source register by the encoded sign-extension rotation.
+/// Upstream: `translate/impl/common.h::Rotate`.
+pub fn rotate(ir: &mut A32IREmitter<'_>, m: Reg, rotate: u32) -> Value {
+    let rotate_by = (rotate * 8) as u8;
+    let reg_m = ir.get_register(m);
+    ir.ir()
+        .rotate_right_32(reg_m, Value::ImmU8(rotate_by), Value::ImmU1(false))
 }
 
 /// Apply an immediate shift to a register value, returning (result, carry_out).
@@ -125,8 +143,11 @@ pub fn get_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frontend::a32::fpscr::FPSCR;
+    use crate::frontend::a32::it_state::ITState;
+    use crate::frontend::a32::psr::PSR;
     use crate::ir::block::Block;
-    use crate::ir::location::LocationDescriptor;
+    use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
     use crate::ir::opcode::Opcode;
 
     #[test]
@@ -158,5 +179,32 @@ mod tests {
             block.get(crate::ir::value::InstRef(3)).opcode,
             Opcode::LogicalShiftRight32
         );
+    }
+
+    #[test]
+    fn rotate_emits_ror_even_for_zero_rotation() {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut ir = A32IREmitter::new(&mut block);
+            let _ = rotate(&mut ir, Reg::R3, 0);
+        }
+
+        assert_eq!(block.instructions[0].opcode, Opcode::A32GetRegister);
+        assert_eq!(block.instructions[0].args[0], Value::ImmA32Reg(Reg::R3));
+        assert_eq!(block.instructions[1].opcode, Opcode::BitRotateRight32);
+        assert_eq!(block.instructions[1].args[1], Value::ImmU8(0));
+        assert_eq!(block.instructions[1].args[2], Value::ImmU1(false));
+    }
+
+    #[test]
+    fn it_block_check_only_rejects_nonfinal_it_positions() {
+        for (state, expected) in [(0x00, false), (0x08, false), (0x0c, true)] {
+            let location =
+                A32LocationDescriptor::new(0x1000, PSR::default(), FPSCR::default(), false)
+                    .set_it(ITState::new(state));
+            let mut block = Block::new(location.to_location());
+            let ir = A32IREmitter::with_location(&mut block, location);
+            assert_eq!(it_block_check(&ir), expected, "IT state {state:02x}");
+        }
     }
 }

@@ -118,7 +118,7 @@ pub fn arm_mrrc(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 
     // Split into low and high 32-bit halves
     let lo = ir.ir().least_significant_word(val64);
-    let hi = ir.ir().most_significant_word(val64);
+    let hi = ir.ir().most_significant_word(val64).result;
 
     ir.set_register(rt, lo);
     ir.set_register(rt2, hi);

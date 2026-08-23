@@ -82,21 +82,6 @@ mod tests {
             self.memory_write_64(vaddr + 8, hi);
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
         fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
             true
         }
@@ -119,8 +104,6 @@ mod tests {
         ) -> bool {
             true
         }
-        fn exclusive_clear(&mut self) {}
-
         fn call_supervisor(&mut self, _svc_num: u32) {}
         fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
         fn add_ticks(&mut self, ticks: u64) {
@@ -326,21 +309,6 @@ mod tests {
             self.memory_write_64(vaddr + 8, hi);
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
         fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
             true
         }
@@ -363,8 +331,6 @@ mod tests {
         ) -> bool {
             true
         }
-        fn exclusive_clear(&mut self) {}
-
         fn call_supervisor(&mut self, _svc_num: u32) {}
         fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
         fn add_ticks(&mut self, ticks: u64) {

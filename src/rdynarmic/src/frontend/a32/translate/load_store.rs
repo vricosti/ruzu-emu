@@ -565,14 +565,14 @@ pub fn arm_ldrd_lit(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         .expect("current_location not set")
         .e_flag();
     if e_flag {
-        let hi_word = ir.ir().most_significant_word(data);
+        let hi_word = ir.ir().most_significant_word(data).result;
         ir.set_register(rt, hi_word);
         let lo_word = ir.ir().least_significant_word(data);
         ir.set_register(rt2, lo_word);
     } else {
         let lo_word = ir.ir().least_significant_word(data);
         ir.set_register(rt, lo_word);
-        let hi_word = ir.ir().most_significant_word(data);
+        let hi_word = ir.ir().most_significant_word(data).result;
         ir.set_register(rt2, hi_word);
     }
     true
@@ -620,14 +620,14 @@ pub fn arm_ldrd_imm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         .expect("current_location not set")
         .e_flag();
     if e_flag {
-        let hi_word = ir.ir().most_significant_word(data);
+        let hi_word = ir.ir().most_significant_word(data).result;
         ir.set_register(rt, hi_word);
         let lo_word = ir.ir().least_significant_word(data);
         ir.set_register(rt2, lo_word);
     } else {
         let lo_word = ir.ir().least_significant_word(data);
         ir.set_register(rt, lo_word);
-        let hi_word = ir.ir().most_significant_word(data);
+        let hi_word = ir.ir().most_significant_word(data).result;
         ir.set_register(rt2, hi_word);
     }
     true
@@ -666,14 +666,14 @@ pub fn arm_ldrd_reg(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         .expect("current_location not set")
         .e_flag();
     if e_flag {
-        let hi_word = ir.ir().most_significant_word(data);
+        let hi_word = ir.ir().most_significant_word(data).result;
         ir.set_register(rt, hi_word);
         let lo_word = ir.ir().least_significant_word(data);
         ir.set_register(rt2, lo_word);
     } else {
         let lo_word = ir.ir().least_significant_word(data);
         ir.set_register(rt, lo_word);
-        let hi_word = ir.ir().most_significant_word(data);
+        let hi_word = ir.ir().most_significant_word(data).result;
         ir.set_register(rt2, hi_word);
     }
     true

@@ -65,17 +65,6 @@ pub trait UserCallbacks: Send {
     /// Write 128 bits to guest memory (low, high).
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64);
 
-    /// Exclusive read 8 bits (for LDXR/STXR exclusive access).
-    fn exclusive_read_8(&self, vaddr: u64) -> u8;
-    /// Exclusive read 16 bits.
-    fn exclusive_read_16(&self, vaddr: u64) -> u16;
-    /// Exclusive read 32 bits.
-    fn exclusive_read_32(&self, vaddr: u64) -> u32;
-    /// Exclusive read 64 bits.
-    fn exclusive_read_64(&self, vaddr: u64) -> u64;
-    /// Exclusive read 128 bits (low, high).
-    fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64);
-
     /// Exclusive write 8 bits. Returns true if the atomic CAS succeeded.
     /// `expected` is the value read during the preceding exclusive read (LDXR).
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool;
@@ -94,9 +83,6 @@ pub trait UserCallbacks: Send {
         expected_lo: u64,
         expected_hi: u64,
     ) -> bool;
-
-    /// Clear the exclusive monitor.
-    fn exclusive_clear(&mut self);
 
     /// Check if a virtual address points to read-only memory.
     ///
@@ -168,94 +154,9 @@ pub trait UserCallbacks: Send {
     fn set_upper_location_descriptor_ptr(&mut self, _ptr: *const u32) {}
 }
 
-/// Fine-grained optimization flags matching dynarmic's `OptimizationFlag`.
-///
-/// Safe optimizations occupy the low 16 bits; unsafe ones occupy the high bits.
-/// Use bitwise OR to combine flags.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OptimizationFlag(u32);
-
-impl OptimizationFlag {
-    // -- Safe optimizations ---------------------------------------------------
-
-    /// Direct jmp patching between compiled blocks.
-    pub const BLOCK_LINKING: Self = Self(0x0000_0001);
-    /// Return stack buffer prediction cache for returns.
-    pub const RETURN_STACK_BUFFER: Self = Self(0x0000_0002);
-    /// Hash-table MRU cache dispatch.
-    pub const FAST_DISPATCH: Self = Self(0x0000_0004);
-    /// GetSetElimination IR pass.
-    pub const GET_SET_ELIMINATION: Self = Self(0x0000_0008);
-    /// ConstantPropagation IR pass.
-    pub const CONST_PROP: Self = Self(0x0000_0010);
-    /// Miscellaneous IR optimizations (A64 merge-interpret-blocks).
-    pub const MISC_IR_OPT: Self = Self(0x0000_0020);
-
-    // -- Unsafe optimizations -------------------------------------------------
-
-    pub const UNSAFE_UNFUSE_FMA: Self = Self(0x0001_0000);
-    pub const UNSAFE_REDUCED_ERROR_FP: Self = Self(0x0002_0000);
-    pub const UNSAFE_INACCURATE_NAN: Self = Self(0x0004_0000);
-    pub const UNSAFE_IGNORE_STANDARD_FPCR_VALUE: Self = Self(0x0008_0000);
-    pub const UNSAFE_IGNORE_GLOBAL_MONITOR: Self = Self(0x0010_0000);
-
-    // -- Convenience constants ------------------------------------------------
-
-    /// No optimizations enabled.
-    pub const NO_OPTIMIZATIONS: Self = Self(0);
-    /// All safe optimizations enabled (low 16 bits).
-    pub const ALL_SAFE_OPTIMIZATIONS: Self = Self(0x0000_FFFF);
-
-    /// Returns true if `flag` is set within `self`.
-    #[inline]
-    pub fn contains(self, flag: Self) -> bool {
-        (self.0 & flag.0) == flag.0 && flag.0 != 0
-    }
-
-    /// Raw bits.
-    #[inline]
-    pub fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl std::ops::BitOr for OptimizationFlag {
-    type Output = Self;
-    #[inline]
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl std::ops::BitOrAssign for OptimizationFlag {
-    #[inline]
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl std::ops::BitAnd for OptimizationFlag {
-    type Output = Self;
-    #[inline]
-    fn bitand(self, rhs: Self) -> Self {
-        Self(self.0 & rhs.0)
-    }
-}
-
-impl std::ops::BitAndAssign for OptimizationFlag {
-    #[inline]
-    fn bitand_assign(&mut self, rhs: Self) {
-        self.0 &= rhs.0;
-    }
-}
-
-impl std::ops::Not for OptimizationFlag {
-    type Output = Self;
-    #[inline]
-    fn not(self) -> Self {
-        Self(!self.0)
-    }
-}
+// Compatibility re-export while the legacy shared `JitConfig` is split into
+// its upstream A32/A64 owners.
+pub use crate::interface::optimization_flags::OptimizationFlag;
 
 /// Configuration for creating an A64Jit / A32Jit instance.
 pub struct JitConfig {

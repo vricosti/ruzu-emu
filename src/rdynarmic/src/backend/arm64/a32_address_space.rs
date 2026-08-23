@@ -1205,26 +1205,6 @@ mod tests {
             self.memory_write_64(_vaddr + 8, _value_hi);
         }
 
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-            self.memory_read_8(_vaddr)
-        }
-
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-            self.memory_read_16(_vaddr)
-        }
-
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-            self.memory_read_32(_vaddr)
-        }
-
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-            self.memory_read_64(_vaddr)
-        }
-
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(_vaddr)
-        }
-
         fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
             self.memory_write_8(_vaddr, _value);
             true
@@ -1257,7 +1237,6 @@ mod tests {
             true
         }
 
-        fn exclusive_clear(&mut self) {}
         fn call_supervisor(&mut self, _svc_num: u32) {}
         fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
         fn add_ticks(&mut self, _ticks: u64) {}

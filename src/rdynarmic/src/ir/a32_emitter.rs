@@ -309,26 +309,53 @@ impl<'a> A32IREmitter<'a> {
 
     pub fn read_memory_16(&mut self, vaddr: Value, acc_type: AccType) -> Value {
         let upper = self.imm_current_location_descriptor();
-        self.emit(
+        let value = self.emit(
             Opcode::A32ReadMemory16,
             &[upper, vaddr, Value::ImmAccType(acc_type)],
-        )
+        );
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_half(value)
+        } else {
+            value
+        }
     }
 
     pub fn read_memory_32(&mut self, vaddr: Value, acc_type: AccType) -> Value {
         let upper = self.imm_current_location_descriptor();
-        self.emit(
+        let value = self.emit(
             Opcode::A32ReadMemory32,
             &[upper, vaddr, Value::ImmAccType(acc_type)],
-        )
+        );
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_word(value)
+        } else {
+            value
+        }
     }
 
     pub fn read_memory_64(&mut self, vaddr: Value, acc_type: AccType) -> Value {
         let upper = self.imm_current_location_descriptor();
-        self.emit(
+        let value = self.emit(
             Opcode::A32ReadMemory64,
             &[upper, vaddr, Value::ImmAccType(acc_type)],
-        )
+        );
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_dual(value)
+        } else {
+            value
+        }
     }
 
     pub fn exclusive_read_memory_8(&mut self, vaddr: Value, acc_type: AccType) -> Value {
@@ -341,26 +368,58 @@ impl<'a> A32IREmitter<'a> {
 
     pub fn exclusive_read_memory_16(&mut self, vaddr: Value, acc_type: AccType) -> Value {
         let upper = self.imm_current_location_descriptor();
-        self.emit(
+        let value = self.emit(
             Opcode::A32ExclusiveReadMemory16,
             &[upper, vaddr, Value::ImmAccType(acc_type)],
-        )
+        );
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_half(value)
+        } else {
+            value
+        }
     }
 
     pub fn exclusive_read_memory_32(&mut self, vaddr: Value, acc_type: AccType) -> Value {
         let upper = self.imm_current_location_descriptor();
-        self.emit(
+        let value = self.emit(
             Opcode::A32ExclusiveReadMemory32,
             &[upper, vaddr, Value::ImmAccType(acc_type)],
-        )
+        );
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_word(value)
+        } else {
+            value
+        }
     }
 
-    pub fn exclusive_read_memory_64(&mut self, vaddr: Value, acc_type: AccType) -> Value {
+    pub fn exclusive_read_memory_64(&mut self, vaddr: Value, acc_type: AccType) -> (Value, Value) {
         let upper = self.imm_current_location_descriptor();
-        self.emit(
+        let value = self.emit(
             Opcode::A32ExclusiveReadMemory64,
             &[upper, vaddr, Value::ImmAccType(acc_type)],
-        )
+        );
+        let lo = self.base.least_significant_word(value);
+        let hi = self.base.most_significant_word(value).result;
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            (
+                self.base.byte_reverse_word(lo),
+                self.base.byte_reverse_word(hi),
+            )
+        } else {
+            (lo, hi)
+        }
     }
 
     pub fn write_memory_8(&mut self, vaddr: Value, value: Value, acc_type: AccType) {
@@ -374,7 +433,14 @@ impl<'a> A32IREmitter<'a> {
 
     pub fn write_memory_16(&mut self, vaddr: Value, value: Value, acc_type: AccType) {
         let upper = self.imm_current_location_descriptor();
-        let value = self.coerce_to_u16(value);
+        let mut value = self.coerce_to_u16(value);
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            value = self.base.byte_reverse_half(value);
+        }
         self.emit_void(
             Opcode::A32WriteMemory16,
             &[upper, vaddr, value, Value::ImmAccType(acc_type)],
@@ -383,6 +449,15 @@ impl<'a> A32IREmitter<'a> {
 
     pub fn write_memory_32(&mut self, vaddr: Value, value: Value, acc_type: AccType) {
         let upper = self.imm_current_location_descriptor();
+        let value = if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_word(value)
+        } else {
+            value
+        };
         self.emit_void(
             Opcode::A32WriteMemory32,
             &[upper, vaddr, value, Value::ImmAccType(acc_type)],
@@ -391,6 +466,15 @@ impl<'a> A32IREmitter<'a> {
 
     pub fn write_memory_64(&mut self, vaddr: Value, value: Value, acc_type: AccType) {
         let upper = self.imm_current_location_descriptor();
+        let value = if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_dual(value)
+        } else {
+            value
+        };
         self.emit_void(
             Opcode::A32WriteMemory64,
             &[upper, vaddr, value, Value::ImmAccType(acc_type)],
@@ -418,7 +502,14 @@ impl<'a> A32IREmitter<'a> {
         acc_type: AccType,
     ) -> Value {
         let upper = self.imm_current_location_descriptor();
-        let value = self.coerce_to_u16(value);
+        let mut value = self.coerce_to_u16(value);
+        if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            value = self.base.byte_reverse_half(value);
+        }
         self.emit(
             Opcode::A32ExclusiveWriteMemory16,
             &[upper, vaddr, value, Value::ImmAccType(acc_type)],
@@ -432,6 +523,15 @@ impl<'a> A32IREmitter<'a> {
         acc_type: AccType,
     ) -> Value {
         let upper = self.imm_current_location_descriptor();
+        let value = if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            self.base.byte_reverse_word(value)
+        } else {
+            value
+        };
         self.emit(
             Opcode::A32ExclusiveWriteMemory32,
             &[upper, vaddr, value, Value::ImmAccType(acc_type)],
@@ -441,10 +541,24 @@ impl<'a> A32IREmitter<'a> {
     pub fn exclusive_write_memory_64(
         &mut self,
         vaddr: Value,
-        value: Value,
+        value_lo: Value,
+        value_hi: Value,
         acc_type: AccType,
     ) -> Value {
         let upper = self.imm_current_location_descriptor();
+        let (value_lo, value_hi) = if self
+            .current_location
+            .expect("current_location not set")
+            .e_flag()
+        {
+            (
+                self.base.byte_reverse_word(value_lo),
+                self.base.byte_reverse_word(value_hi),
+            )
+        } else {
+            (value_lo, value_hi)
+        };
+        let value = self.base.pack_2x32_to_1x64(value_lo, value_hi);
         self.emit(
             Opcode::A32ExclusiveWriteMemory64,
             &[upper, vaddr, value, Value::ImmAccType(acc_type)],
@@ -677,6 +791,10 @@ impl<'a> A32IREmitter<'a> {
     // --- Convenience flag helpers ---
 
     pub fn nz_from(&mut self, value: Value) -> Value {
+        self.base.get_nz_from_op(value)
+    }
+
+    pub fn nzcv_from(&mut self, value: Value) -> Value {
         self.base.get_nzcv_from_op(value)
     }
 
@@ -688,6 +806,8 @@ impl<'a> A32IREmitter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frontend::a32::fpscr::FPSCR;
+    use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::Reg;
     use crate::ir::block::Block;
     use crate::ir::value::InstRef;
@@ -760,6 +880,76 @@ mod tests {
     }
 
     #[test]
+    fn big_endian_memory_accesses_preserve_upstream_byte_reversal_boundary() {
+        let mut cpsr = PSR::default();
+        cpsr.set_e(true);
+        let loc = A32LocationDescriptor::new(0x2000, cpsr, FPSCR::default(), false);
+        let mut block = Block::new(loc.to_location());
+        {
+            let mut e = A32IREmitter::with_location(&mut block, loc);
+            let address = Value::ImmU32(0x3000);
+            let _ = e.read_memory_16(address, AccType::Normal);
+            let _ = e.read_memory_32(address, AccType::Normal);
+            let _ = e.read_memory_64(address, AccType::Normal);
+            let _ = e.exclusive_read_memory_16(address, AccType::Atomic);
+            let _ = e.exclusive_read_memory_32(address, AccType::Atomic);
+            let _ = e.exclusive_read_memory_64(address, AccType::Atomic);
+            e.write_memory_16(address, Value::ImmU16(1), AccType::Normal);
+            e.write_memory_32(address, Value::ImmU32(2), AccType::Normal);
+            e.write_memory_64(address, Value::ImmU64(3), AccType::Normal);
+            let _ = e.exclusive_write_memory_16(address, Value::ImmU16(4), AccType::Atomic);
+            let _ = e.exclusive_write_memory_32(address, Value::ImmU32(5), AccType::Atomic);
+            let _ = e.exclusive_write_memory_64(
+                address,
+                Value::ImmU32(6),
+                Value::ImmU32(7),
+                AccType::Atomic,
+            );
+        }
+
+        let opcodes = block
+            .instructions
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|&&opcode| opcode == Opcode::ByteReverseHalf)
+                .count(),
+            4
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|&&opcode| opcode == Opcode::ByteReverseWord)
+                .count(),
+            8
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|&&opcode| opcode == Opcode::ByteReverseDual)
+                .count(),
+            2
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|&&opcode| opcode == Opcode::Pack2x32To1x64)
+                .count(),
+            1
+        );
+        let exclusive_64 = opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::A32ExclusiveWriteMemory64)
+            .expect("exclusive 64-bit write");
+        assert_eq!(opcodes[exclusive_64 - 1], Opcode::Pack2x32To1x64);
+        assert_eq!(opcodes[exclusive_64 - 2], Opcode::ByteReverseWord);
+        assert_eq!(opcodes[exclusive_64 - 3], Opcode::ByteReverseWord);
+    }
+
+    #[test]
     fn test_a32_emitter_flags() {
         let loc = A32LocationDescriptor::at(0x3000);
         let mut block = Block::new(loc.to_location());
@@ -773,6 +963,21 @@ mod tests {
             e.set_cpsr_nzcv_raw(nzcv);
         }
         assert_eq!(block.inst_count(), 5);
+    }
+
+    #[test]
+    fn nz_and_nzcv_helpers_emit_the_distinct_upstream_operations() {
+        let loc = A32LocationDescriptor::at(0x3000);
+        let mut block = Block::new(loc.to_location());
+        {
+            let mut e = A32IREmitter::with_location(&mut block, loc);
+            let value = e.get_register(Reg::R0);
+            let _ = e.nz_from(value);
+            let _ = e.nzcv_from(value);
+        }
+
+        assert_eq!(block.get(InstRef(1)).opcode, Opcode::GetNZFromOp);
+        assert_eq!(block.get(InstRef(2)).opcode, Opcode::GetNZCVFromOp);
     }
 
     #[test]

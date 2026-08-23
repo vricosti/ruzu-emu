@@ -141,21 +141,6 @@ impl UserCallbacks for DiffEnv {
         self.memory_write_64(vaddr, lo);
         self.memory_write_64(vaddr + 8, hi);
     }
-    fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-        self.memory_read_8(vaddr)
-    }
-    fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-        self.memory_read_16(vaddr)
-    }
-    fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-        self.memory_read_32(vaddr)
-    }
-    fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-        self.memory_read_64(vaddr)
-    }
-    fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-        self.memory_read_128(vaddr)
-    }
     fn exclusive_write_8(&mut self, _: u64, _: u8, _: u8) -> bool {
         true
     }
@@ -171,7 +156,6 @@ impl UserCallbacks for DiffEnv {
     fn exclusive_write_128(&mut self, _: u64, _: u64, _: u64, _: u64, _: u64) -> bool {
         true
     }
-    fn exclusive_clear(&mut self) {}
     fn call_supervisor(&mut self, _svc: u32) {
         self.svc_hit = true;
     }

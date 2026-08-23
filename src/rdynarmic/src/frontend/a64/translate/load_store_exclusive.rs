@@ -146,7 +146,7 @@ impl<'a> TranslatorVisitor<'a> {
         } else {
             let data = self.ir.exclusive_read_memory_64(address, acctype);
             let lo = self.ir.ir().least_significant_word(data);
-            let hi = self.ir.ir().most_significant_word(data);
+            let hi = self.ir.ir().most_significant_word(data).result;
             self.set_x(32, rt, lo);
             self.set_x(32, rt2, hi);
         }

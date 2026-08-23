@@ -11,6 +11,18 @@ pub struct ResultAndOverflow {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResultAndCarry {
+    pub result: Value,
+    pub carry: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResultAndGE {
+    pub result: Value,
+    pub ge: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UpperAndLower {
     pub upper: Value,
     pub lower: Value,
@@ -75,8 +87,10 @@ impl<'a> IREmitter<'a> {
         self.emit(Opcode::LeastSignificantWord, &[value])
     }
 
-    pub fn most_significant_word(&mut self, value: Value) -> Value {
-        self.emit(Opcode::MostSignificantWord, &[value])
+    pub fn most_significant_word(&mut self, value: Value) -> ResultAndCarry {
+        let result = self.emit(Opcode::MostSignificantWord, &[value]);
+        let carry = self.get_carry_from_op(result);
+        ResultAndCarry { result, carry }
     }
 
     pub fn least_significant_half(&mut self, value: Value) -> Value {
@@ -233,6 +247,166 @@ impl<'a> IREmitter<'a> {
 
     pub fn mul_64(&mut self, a: Value, b: Value) -> Value {
         self.emit(Opcode::Mul64, &[a, b])
+    }
+
+    pub fn packed_abs_diff_sum_u8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedAbsDiffSumU8, &[a, b])
+    }
+
+    pub fn packed_add_u8(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedAddU8, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_add_s8(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedAddS8, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_add_u16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedAddU16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_add_s16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedAddS16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_sub_u8(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedSubU8, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_sub_s8(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedSubS8, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_sub_u16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedSubU16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_sub_s16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedSubS16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_add_sub_u16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedAddSubU16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_add_sub_s16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedAddSubS16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_sub_add_u16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedSubAddU16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_sub_add_s16(&mut self, a: Value, b: Value) -> ResultAndGE {
+        let result = self.emit(Opcode::PackedSubAddS16, &[a, b]);
+        let ge = self.get_ge_from_op(result);
+        ResultAndGE { result, ge }
+    }
+
+    pub fn packed_halving_add_u8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingAddU8, &[a, b])
+    }
+
+    pub fn packed_halving_add_s8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingAddS8, &[a, b])
+    }
+
+    pub fn packed_halving_add_u16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingAddU16, &[a, b])
+    }
+
+    pub fn packed_halving_add_s16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingAddS16, &[a, b])
+    }
+
+    pub fn packed_halving_sub_u8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingSubU8, &[a, b])
+    }
+
+    pub fn packed_halving_sub_s8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingSubS8, &[a, b])
+    }
+
+    pub fn packed_halving_sub_u16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingSubU16, &[a, b])
+    }
+
+    pub fn packed_halving_sub_s16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingSubS16, &[a, b])
+    }
+
+    pub fn packed_halving_add_sub_u16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingAddSubU16, &[a, b])
+    }
+
+    pub fn packed_halving_add_sub_s16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingAddSubS16, &[a, b])
+    }
+
+    pub fn packed_halving_sub_add_u16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingSubAddU16, &[a, b])
+    }
+
+    pub fn packed_halving_sub_add_s16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedHalvingSubAddS16, &[a, b])
+    }
+
+    pub fn packed_saturated_add_u8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedAddU8, &[a, b])
+    }
+
+    pub fn packed_saturated_add_s8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedAddS8, &[a, b])
+    }
+
+    pub fn packed_saturated_add_u16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedAddU16, &[a, b])
+    }
+
+    pub fn packed_saturated_add_s16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedAddS16, &[a, b])
+    }
+
+    pub fn packed_saturated_sub_u8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedSubU8, &[a, b])
+    }
+
+    pub fn packed_saturated_sub_s8(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedSubS8, &[a, b])
+    }
+
+    pub fn packed_saturated_sub_u16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedSubU16, &[a, b])
+    }
+
+    pub fn packed_saturated_sub_s16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSaturatedSubS16, &[a, b])
+    }
+
+    pub fn packed_select(&mut self, ge: Value, a: Value, b: Value) -> Value {
+        self.emit(Opcode::PackedSelect, &[ge, a, b])
     }
 
     pub fn signed_multiply_high_64(&mut self, a: Value, b: Value) -> Value {
@@ -437,6 +611,10 @@ impl<'a> IREmitter<'a> {
 
     pub fn get_overflow_from_op(&mut self, value: Value) -> Value {
         self.emit_pseudo_op(Opcode::GetOverflowFromOp, value)
+    }
+
+    pub fn get_ge_from_op(&mut self, value: Value) -> Value {
+        self.emit_pseudo_op(Opcode::GetGEFromOp, value)
     }
 
     pub fn get_nzcv_from_op(&mut self, value: Value) -> Value {
@@ -2729,6 +2907,184 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn packed_abs_diff_sum_u8_emits_upstream_opcode_and_operand_order() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let result;
+        {
+            let mut e = IREmitter::new(&mut block);
+            result =
+                e.packed_abs_diff_sum_u8(Value::ImmU32(0x0102_0304), Value::ImmU32(0x0506_0708));
+        }
+
+        let inst = block.get(result.inst_ref());
+        assert_eq!(inst.opcode, Opcode::PackedAbsDiffSumU8);
+        assert_eq!(inst.args[0], Value::ImmU32(0x0102_0304));
+        assert_eq!(inst.args[1], Value::ImmU32(0x0506_0708));
+    }
+
+    #[test]
+    fn packed_add_u16_returns_and_links_upstream_ge_pseudo_result() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let pair;
+        {
+            let mut e = IREmitter::new(&mut block);
+            pair = e.packed_add_u16(Value::ImmU32(0x0001_0002), Value::ImmU32(0x0003_0004));
+        }
+
+        let result = pair.result.inst_ref();
+        let ge = pair.ge.inst_ref();
+        assert_eq!(block.get(result).opcode, Opcode::PackedAddU16);
+        assert_eq!(block.get(result).args[0], Value::ImmU32(0x0001_0002));
+        assert_eq!(block.get(result).args[1], Value::ImmU32(0x0003_0004));
+        assert_eq!(block.get(ge).opcode, Opcode::GetGEFromOp);
+        assert_eq!(
+            block.get_associated_pseudo_operation(result, Opcode::GetGEFromOp),
+            Some(ge)
+        );
+    }
+
+    #[test]
+    fn packed_parallel_builder_surface_matches_upstream_opcodes_and_ge_results() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let (ge_pairs, plain_values);
+        {
+            let mut e = IREmitter::new(&mut block);
+            let a = Value::ImmU32(0x0102_0304);
+            let b = Value::ImmU32(0x0506_0708);
+            ge_pairs = vec![
+                (e.packed_add_u8(a, b), Opcode::PackedAddU8),
+                (e.packed_add_s8(a, b), Opcode::PackedAddS8),
+                (e.packed_add_u16(a, b), Opcode::PackedAddU16),
+                (e.packed_add_s16(a, b), Opcode::PackedAddS16),
+                (e.packed_sub_u8(a, b), Opcode::PackedSubU8),
+                (e.packed_sub_s8(a, b), Opcode::PackedSubS8),
+                (e.packed_sub_u16(a, b), Opcode::PackedSubU16),
+                (e.packed_sub_s16(a, b), Opcode::PackedSubS16),
+                (e.packed_add_sub_u16(a, b), Opcode::PackedAddSubU16),
+                (e.packed_add_sub_s16(a, b), Opcode::PackedAddSubS16),
+                (e.packed_sub_add_u16(a, b), Opcode::PackedSubAddU16),
+                (e.packed_sub_add_s16(a, b), Opcode::PackedSubAddS16),
+            ];
+            plain_values = vec![
+                (e.packed_halving_add_u8(a, b), Opcode::PackedHalvingAddU8),
+                (e.packed_halving_add_s8(a, b), Opcode::PackedHalvingAddS8),
+                (e.packed_halving_add_u16(a, b), Opcode::PackedHalvingAddU16),
+                (e.packed_halving_add_s16(a, b), Opcode::PackedHalvingAddS16),
+                (e.packed_halving_sub_u8(a, b), Opcode::PackedHalvingSubU8),
+                (e.packed_halving_sub_s8(a, b), Opcode::PackedHalvingSubS8),
+                (e.packed_halving_sub_u16(a, b), Opcode::PackedHalvingSubU16),
+                (e.packed_halving_sub_s16(a, b), Opcode::PackedHalvingSubS16),
+                (
+                    e.packed_halving_add_sub_u16(a, b),
+                    Opcode::PackedHalvingAddSubU16,
+                ),
+                (
+                    e.packed_halving_add_sub_s16(a, b),
+                    Opcode::PackedHalvingAddSubS16,
+                ),
+                (
+                    e.packed_halving_sub_add_u16(a, b),
+                    Opcode::PackedHalvingSubAddU16,
+                ),
+                (
+                    e.packed_halving_sub_add_s16(a, b),
+                    Opcode::PackedHalvingSubAddS16,
+                ),
+                (
+                    e.packed_saturated_add_u8(a, b),
+                    Opcode::PackedSaturatedAddU8,
+                ),
+                (
+                    e.packed_saturated_add_s8(a, b),
+                    Opcode::PackedSaturatedAddS8,
+                ),
+                (
+                    e.packed_saturated_add_u16(a, b),
+                    Opcode::PackedSaturatedAddU16,
+                ),
+                (
+                    e.packed_saturated_add_s16(a, b),
+                    Opcode::PackedSaturatedAddS16,
+                ),
+                (
+                    e.packed_saturated_sub_u8(a, b),
+                    Opcode::PackedSaturatedSubU8,
+                ),
+                (
+                    e.packed_saturated_sub_s8(a, b),
+                    Opcode::PackedSaturatedSubS8,
+                ),
+                (
+                    e.packed_saturated_sub_u16(a, b),
+                    Opcode::PackedSaturatedSubU16,
+                ),
+                (
+                    e.packed_saturated_sub_s16(a, b),
+                    Opcode::PackedSaturatedSubS16,
+                ),
+            ];
+        }
+
+        for (pair, opcode) in ge_pairs {
+            let producer = pair.result.inst_ref();
+            let ge = pair.ge.inst_ref();
+            assert_eq!(block.get(producer).opcode, opcode);
+            assert_eq!(block.get(producer).args[0], Value::ImmU32(0x0102_0304));
+            assert_eq!(block.get(producer).args[1], Value::ImmU32(0x0506_0708));
+            assert_eq!(block.get(ge).opcode, Opcode::GetGEFromOp);
+            assert_eq!(
+                block.get_associated_pseudo_operation(producer, Opcode::GetGEFromOp),
+                Some(ge)
+            );
+        }
+        for (value, opcode) in plain_values {
+            let inst = block.get(value.inst_ref());
+            assert_eq!(inst.opcode, opcode);
+            assert_eq!(inst.args[0], Value::ImmU32(0x0102_0304));
+            assert_eq!(inst.args[1], Value::ImmU32(0x0506_0708));
+        }
+    }
+
+    #[test]
+    fn packed_select_emits_upstream_operand_order() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let result;
+        {
+            let mut e = IREmitter::new(&mut block);
+            result = e.packed_select(
+                Value::ImmU32(0x00ff_00ff),
+                Value::ImmU32(0x1111_1111),
+                Value::ImmU32(0x2222_2222),
+            );
+        }
+
+        let inst = block.get(result.inst_ref());
+        assert_eq!(inst.opcode, Opcode::PackedSelect);
+        assert_eq!(inst.args[0], Value::ImmU32(0x00ff_00ff));
+        assert_eq!(inst.args[1], Value::ImmU32(0x1111_1111));
+        assert_eq!(inst.args[2], Value::ImmU32(0x2222_2222));
+    }
+
+    #[test]
+    fn most_significant_word_returns_and_links_upstream_carry_pseudo_result() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let pair;
+        {
+            let mut e = IREmitter::new(&mut block);
+            pair = e.most_significant_word(Value::ImmU64(0x1234_5678_9abc_def0));
+        }
+
+        let result = pair.result.inst_ref();
+        let carry = pair.carry.inst_ref();
+        assert_eq!(block.get(result).opcode, Opcode::MostSignificantWord);
+        assert_eq!(block.get(carry).opcode, Opcode::GetCarryFromOp);
+        assert_eq!(
+            block.get_associated_pseudo_operation(result, Opcode::GetCarryFromOp),
+            Some(carry)
+        );
     }
 
     #[test]

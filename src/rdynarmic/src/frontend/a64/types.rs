@@ -170,37 +170,4 @@ impl ShiftType {
     }
 }
 
-/// A64 exception types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u64)]
-pub enum Exception {
-    UnallocatedEncoding = 0,
-    ReservedValue = 1,
-    UnpredictableInstruction = 2,
-    WaitForInterrupt = 3,
-    WaitForEvent = 4,
-    SendEvent = 5,
-    SendEventLocal = 6,
-    Yield = 7,
-    Breakpoint = 8,
-    NoExecuteFault = 9,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Exception;
-
-    #[test]
-    fn exception_discriminants_match_upstream_a64_config() {
-        assert_eq!(Exception::UnallocatedEncoding as u64, 0);
-        assert_eq!(Exception::ReservedValue as u64, 1);
-        assert_eq!(Exception::UnpredictableInstruction as u64, 2);
-        assert_eq!(Exception::WaitForInterrupt as u64, 3);
-        assert_eq!(Exception::WaitForEvent as u64, 4);
-        assert_eq!(Exception::SendEvent as u64, 5);
-        assert_eq!(Exception::SendEventLocal as u64, 6);
-        assert_eq!(Exception::Yield as u64, 7);
-        assert_eq!(Exception::Breakpoint as u64, 8);
-        assert_eq!(Exception::NoExecuteFault as u64, 9);
-    }
-}
+pub use crate::interface::a64::config::Exception;

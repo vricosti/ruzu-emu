@@ -2167,56 +2167,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
-    fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-        self.check_memory_access(vaddr, 1, DebugWatchpointType::READ);
-        if !a32_callback_diagnostics_enabled() {
-            return self.mem().read_8(vaddr);
-        }
-        // memory_read_8 doesn't currently watch — add inline.
-        trace_unmapped_guest_read_regs(self, vaddr, 1);
-        let v = self.mem().read_8(vaddr);
-        watch_read(self, vaddr, 1, v as u128);
-        v
-    }
-
-    fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-        self.check_memory_access(vaddr, 2, DebugWatchpointType::READ);
-        if !a32_callback_diagnostics_enabled() {
-            return self.mem().read_16(vaddr);
-        }
-        // memory_read_16 already watches; just delegate.
-        self.memory_read_16(vaddr)
-    }
-
-    fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-        self.check_memory_access(vaddr, 4, DebugWatchpointType::READ);
-        if !a32_callback_diagnostics_enabled() {
-            return self.mem().read_32(vaddr);
-        }
-        let value = self.memory_read_32(vaddr);
-        maybe_trace_a32_exclusive(self, "read32", vaddr, value, None, None);
-        value
-    }
-
-    fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-        self.check_memory_access(vaddr, 8, DebugWatchpointType::READ);
-        if !a32_callback_diagnostics_enabled() {
-            return self.mem().read_64(vaddr);
-        }
-        self.memory_read_64(vaddr)
-    }
-
-    fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-        self.check_memory_access(vaddr, 16, DebugWatchpointType::READ);
-        if !a32_callback_diagnostics_enabled() {
-            let m = self.mem();
-            return (m.read_64(vaddr), m.read_64(vaddr + 8));
-        }
-        let (lo, hi) = self.memory_read_128(vaddr);
-        watch_read(self, vaddr, 16, ((hi as u128) << 64) | (lo as u128));
-        (lo, hi)
-    }
-
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
         if !self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE) {
             return false;
@@ -2313,18 +2263,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
         );
         self.mem()
             .write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
-    }
-
-    fn exclusive_clear(&mut self) {
-        // Upstream: m_parent.m_exclusive_monitor.ClearProcessor(m_parent.m_core_index)
-        let parent = self.parent();
-        if !parent.exclusive_monitor.is_null() {
-            unsafe {
-                (*parent.exclusive_monitor)
-                    .get_monitor()
-                    .clear_processor(parent.core_index)
-            };
-        }
     }
 
     fn is_read_only_memory(&self, vaddr: u32) -> bool {

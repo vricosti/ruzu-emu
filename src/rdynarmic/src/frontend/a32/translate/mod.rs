@@ -24,8 +24,23 @@ pub mod status_register;
 pub mod synchronization;
 pub mod thumb16;
 pub mod thumb32;
+pub mod thumb32_branch;
 pub mod thumb32_control;
 pub mod thumb32_coprocessor;
+pub mod thumb32_data_processing_modified_immediate;
+pub mod thumb32_data_processing_plain_binary_immediate;
+pub mod thumb32_data_processing_register;
+pub mod thumb32_data_processing_shifted_register;
+pub mod thumb32_load_byte;
+pub mod thumb32_load_halfword;
+pub mod thumb32_load_store_dual;
+pub mod thumb32_load_store_multiple;
+pub mod thumb32_load_word;
+pub mod thumb32_long_multiply;
+pub mod thumb32_misc;
+pub mod thumb32_multiply;
+pub mod thumb32_parallel;
+pub mod thumb32_store_single_data_item;
 mod translate_arm;
 pub mod translate_callbacks;
 mod translate_thumb;
@@ -38,6 +53,41 @@ use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
 pub use a32_translate::{translate, translate_single_instruction, TranslationOptions};
+
+/// Result of Eden's immediate-expansion helpers.
+pub(crate) struct ImmAndCarry {
+    pub imm32: u32,
+    pub carry: Value,
+}
+
+/// Matches `TranslatorVisitor::ThumbExpandImm_C` from `a32_translate_impl.h`.
+pub(crate) fn thumb_expand_imm_c(imm12: u32, carry_in: Value) -> ImmAndCarry {
+    if (imm12 >> 10) & 3 == 0 {
+        let imm8 = imm12 & 0xff;
+        let imm32 = match (imm12 >> 8) & 3 {
+            0b00 => imm8,
+            0b01 => (imm8 << 16) | imm8,
+            0b10 => (imm8 << 24) | (imm8 << 8),
+            0b11 => imm8 * 0x0101_0101,
+            _ => unreachable!(),
+        };
+        return ImmAndCarry {
+            imm32,
+            carry: carry_in,
+        };
+    }
+
+    let imm32 = (0x80 | (imm12 & 0x7f)).rotate_right((imm12 >> 7) & 0x1f);
+    ImmAndCarry {
+        imm32,
+        carry: Value::ImmU1(imm32 & (1 << 31) != 0),
+    }
+}
+
+/// Matches `TranslatorVisitor::ThumbExpandImm` from `a32_translate_impl.h`.
+pub(crate) fn thumb_expand_imm(imm12: u32) -> u32 {
+    thumb_expand_imm_c(imm12, Value::ImmU1(false)).imm32
+}
 
 /// Matches upstream `TranslatorVisitor::RaiseException`.
 pub(crate) fn raise_exception_with_instruction_size(
@@ -75,6 +125,51 @@ pub(crate) fn unpredictable_instruction(ir: &mut A32IREmitter) -> bool {
 /// Matches upstream `TranslatorVisitor::DecodeError` (ARM / Thumb32).
 pub(crate) fn decode_error(ir: &mut A32IREmitter) -> bool {
     raise_exception(ir, Exception::DecodeError)
+}
+
+#[cfg(test)]
+mod immediate_tests {
+    use super::{thumb_expand_imm, thumb_expand_imm_c};
+    use crate::ir::value::{InstRef, Value};
+
+    fn reference_thumb_expand_imm(imm12: u32) -> u32 {
+        if imm12 & 0xc00 == 0 {
+            let imm8 = imm12 & 0xff;
+            return match imm12 & 0x300 {
+                0x000 => imm8,
+                0x100 => (imm8 << 16) | imm8,
+                0x200 => (imm8 << 24) | (imm8 << 8),
+                0x300 => (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8,
+                _ => unreachable!(),
+            };
+        }
+        (0x80 | (imm12 & 0x7f)).rotate_right((imm12 >> 7) & 31)
+    }
+
+    #[test]
+    fn thumb_expand_imm_matches_all_twelve_bit_inputs() {
+        for imm12 in 0..=0xfff {
+            assert_eq!(thumb_expand_imm(imm12), reference_thumb_expand_imm(imm12));
+        }
+    }
+
+    #[test]
+    fn thumb_expand_imm_c_preserves_dynamic_carry_only_for_replication_forms() {
+        let dynamic_carry = Value::Inst(InstRef(42));
+        for imm12 in 0..=0x3ff {
+            let expanded = thumb_expand_imm_c(imm12, dynamic_carry);
+            assert_eq!(expanded.carry, dynamic_carry, "imm12={imm12:03X}");
+        }
+
+        for imm12 in 0x400..=0xfff {
+            let expanded = thumb_expand_imm_c(imm12, dynamic_carry);
+            assert_eq!(
+                expanded.carry,
+                Value::ImmU1(expanded.imm32 & (1 << 31) != 0),
+                "imm12={imm12:03X}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

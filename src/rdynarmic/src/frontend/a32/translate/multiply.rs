@@ -36,8 +36,8 @@ pub fn arm_mul(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().mul_32(rm_val, rs_val);
 
     if s {
-        let nzcv = ir.ir().get_nzcv_from_op(result);
-        ir.set_cpsr_nz(nzcv);
+        let nz = ir.nz_from(result);
+        ir.set_cpsr_nz(nz);
     }
 
     ir.set_register(rd, result);
@@ -59,8 +59,8 @@ pub fn arm_mla(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().add_32(product, rn_val, Value::ImmU1(false));
 
     if s {
-        let nzcv = ir.ir().get_nzcv_from_op(result);
-        ir.set_cpsr_nz(nzcv);
+        let nz = ir.nz_from(result);
+        ir.set_cpsr_nz(nz);
     }
 
     ir.set_register(rd, result);
@@ -101,11 +101,11 @@ pub fn arm_umull(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().mul_64(rm64, rs64);
 
     let lo = ir.ir().least_significant_word(result);
-    let hi = ir.ir().most_significant_word(result);
+    let hi = ir.ir().most_significant_word(result).result;
 
     if s {
-        let nzcv = ir.ir().get_nzcv_from_op(result);
-        ir.set_cpsr_nz(nzcv);
+        let nz = ir.nz_from(result);
+        ir.set_cpsr_nz(nz);
     }
 
     ir.set_register(rd_lo, lo);
@@ -134,11 +134,11 @@ pub fn arm_umlal(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().add_64(product, accum, Value::ImmU1(false));
 
     let lo = ir.ir().least_significant_word(result);
-    let hi = ir.ir().most_significant_word(result);
+    let hi = ir.ir().most_significant_word(result).result;
 
     if s {
-        let nzcv = ir.ir().get_nzcv_from_op(result);
-        ir.set_cpsr_nz(nzcv);
+        let nz = ir.nz_from(result);
+        ir.set_cpsr_nz(nz);
     }
 
     ir.set_register(rd_lo, lo);
@@ -162,11 +162,11 @@ pub fn arm_smull(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().mul_64(rm64, rs64);
 
     let lo = ir.ir().least_significant_word(result);
-    let hi = ir.ir().most_significant_word(result);
+    let hi = ir.ir().most_significant_word(result).result;
 
     if s {
-        let nzcv = ir.ir().get_nzcv_from_op(result);
-        ir.set_cpsr_nz(nzcv);
+        let nz = ir.nz_from(result);
+        ir.set_cpsr_nz(nz);
     }
 
     ir.set_register(rd_lo, lo);
@@ -195,11 +195,11 @@ pub fn arm_smlal(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().add_64(product, accum, Value::ImmU1(false));
 
     let lo = ir.ir().least_significant_word(result);
-    let hi = ir.ir().most_significant_word(result);
+    let hi = ir.ir().most_significant_word(result).result;
 
     if s {
-        let nzcv = ir.ir().get_nzcv_from_op(result);
-        ir.set_cpsr_nz(nzcv);
+        let nz = ir.nz_from(result);
+        ir.set_cpsr_nz(nz);
     }
 
     ir.set_register(rd_lo, lo);
@@ -229,7 +229,7 @@ pub fn arm_umaal(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let result = ir.ir().add_64(sum1, rdlo64, Value::ImmU1(false));
 
     let lo = ir.ir().least_significant_word(result);
-    let hi = ir.ir().most_significant_word(result);
+    let hi = ir.ir().most_significant_word(result).result;
 
     ir.set_register(rd_lo, lo);
     ir.set_register(rd_hi, hi);
@@ -254,7 +254,7 @@ pub fn arm_smlalxy(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let addend = ir.ir().pack_2x32_to_1x64(rd_lo_val, rd_hi_val);
     let result = ir.ir().add_64(product, addend, Value::ImmU1(false));
     let lo = ir.ir().least_significant_word(result);
-    let hi = ir.ir().most_significant_word(result);
+    let hi = ir.ir().most_significant_word(result).result;
 
     ir.set_register(rd_lo, lo);
     ir.set_register(rd_hi, hi);
@@ -377,10 +377,10 @@ pub fn arm_smmla(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let ra64 = ir.ir().pack_2x32_to_1x64(Value::ImmU32(0), ra32);
     let product = ir.ir().mul_64(rn64, rm64);
     let temp = ir.ir().add_64(ra64, product, Value::ImmU1(false));
-    let mut result = ir.ir().most_significant_word(temp);
+    let result_carry = ir.ir().most_significant_word(temp);
+    let mut result = result_carry.result;
     if round {
-        let carry = ir.ir().get_carry_from_op(result);
-        result = ir.ir().add_32(result, Value::ImmU32(0), carry);
+        result = ir.ir().add_32(result, Value::ImmU32(0), result_carry.carry);
     }
 
     ir.set_register(rd, result);
@@ -407,10 +407,10 @@ pub fn arm_smmls(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let ra64 = ir.ir().pack_2x32_to_1x64(Value::ImmU32(0), ra32);
     let product = ir.ir().mul_64(rn64, rm64);
     let temp = ir.ir().sub_64(ra64, product, Value::ImmU1(true));
-    let mut result = ir.ir().most_significant_word(temp);
+    let result_carry = ir.ir().most_significant_word(temp);
+    let mut result = result_carry.result;
     if round {
-        let carry = ir.ir().get_carry_from_op(result);
-        result = ir.ir().add_32(result, Value::ImmU32(0), carry);
+        result = ir.ir().add_32(result, Value::ImmU32(0), result_carry.carry);
     }
 
     ir.set_register(rd, result);
@@ -433,12 +433,44 @@ pub fn arm_smmul(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let rn64 = ir.ir().sign_extend_word_to_long(rn32);
     let rm64 = ir.ir().sign_extend_word_to_long(rm32);
     let product = ir.ir().mul_64(rn64, rm64);
-    let mut result = ir.ir().most_significant_word(product);
+    let result_carry = ir.ir().most_significant_word(product);
+    let mut result = result_carry.result;
     if round {
-        let carry = ir.ir().get_carry_from_op(result);
-        result = ir.ir().add_32(result, Value::ImmU32(0), carry);
+        result = ir.ir().add_32(result, Value::ImmU32(0), result_carry.carry);
     }
 
     ir.set_register(rd, result);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::a32::decoder::ArmInstId;
+    use crate::ir::block::Block;
+    use crate::ir::location::A32LocationDescriptor;
+    use crate::ir::opcode::Opcode;
+
+    #[test]
+    fn flag_setting_multiply_uses_nz_extractor() {
+        let loc = A32LocationDescriptor::at(0x4000);
+        let mut block = Block::new(loc.to_location());
+        let mut ir = A32IREmitter::with_location(&mut block, loc);
+        assert!(arm_mul(
+            &mut ir,
+            &DecodedArm {
+                raw: (1 << 20) | (2 << 16) | (1 << 8),
+                id: ArmInstId::MUL,
+            },
+        ));
+
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetNZFromOp));
+        assert!(!block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetNZCVFromOp));
+    }
 }

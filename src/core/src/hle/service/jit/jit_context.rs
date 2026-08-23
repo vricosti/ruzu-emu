@@ -299,21 +299,6 @@ impl UserCallbacks for DynarmicCallbacks64 {
         self.write_memory(address, &bytes);
     }
 
-    fn exclusive_read_8(&self, address: u64) -> u8 {
-        self.memory_read_8(address)
-    }
-    fn exclusive_read_16(&self, address: u64) -> u16 {
-        self.memory_read_16(address)
-    }
-    fn exclusive_read_32(&self, address: u64) -> u32 {
-        self.memory_read_32(address)
-    }
-    fn exclusive_read_64(&self, address: u64) -> u64 {
-        self.memory_read_64(address)
-    }
-    fn exclusive_read_128(&self, address: u64) -> (u64, u64) {
-        self.memory_read_128(address)
-    }
     fn exclusive_write_8(&mut self, address: u64, value: u8, _expected: u8) -> bool {
         self.write_value(address, value)
     }
@@ -337,8 +322,6 @@ impl UserCallbacks for DynarmicCallbacks64 {
         self.memory_write_128(address, value_lo, value_hi);
         true
     }
-    fn exclusive_clear(&mut self) {}
-
     fn call_supervisor(&mut self, swi: u32) {
         if swi != 0 {
             log::error!("JIT plugin issued unknown service call {swi}");

@@ -117,9 +117,7 @@ pub fn arm_ldaexd(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     }
 
     let address = ir.get_register(rn);
-    let value = ir.exclusive_read_memory_64(address, AccType::Ordered);
-    let lo = ir.ir().least_significant_word(value);
-    let hi = ir.ir().most_significant_word(value);
+    let (lo, hi) = ir.exclusive_read_memory_64(address, AccType::Ordered);
     ir.set_register(rt, lo);
     ir.set_register(rt2, hi);
     true
@@ -183,9 +181,7 @@ pub fn arm_ldrexd(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     }
 
     let address = ir.get_register(rn);
-    let value = ir.exclusive_read_memory_64(address, AccType::Atomic);
-    let lo = ir.ir().least_significant_word(value);
-    let hi = ir.ir().most_significant_word(value);
+    let (lo, hi) = ir.exclusive_read_memory_64(address, AccType::Atomic);
     ir.set_register(rt, lo);
     ir.set_register(rt2, hi);
     true
@@ -312,8 +308,7 @@ pub fn arm_stlexd(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let address = ir.get_register(rn);
     let lo = ir.get_register(rt);
     let hi = ir.get_register(rt2);
-    let value = ir.ir().pack_2x32_to_1x64(lo, hi);
-    let result = ir.exclusive_write_memory_64(address, value, AccType::Ordered);
+    let result = ir.exclusive_write_memory_64(address, lo, hi, AccType::Ordered);
     ir.set_register(rd, result);
     true
 }
@@ -398,8 +393,7 @@ pub fn arm_strexd(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let address = ir.get_register(rn);
     let lo = ir.get_register(rt);
     let hi = ir.get_register(rt2);
-    let value = ir.ir().pack_2x32_to_1x64(lo, hi);
-    let result = ir.exclusive_write_memory_64(address, value, AccType::Atomic);
+    let result = ir.exclusive_write_memory_64(address, lo, hi, AccType::Atomic);
     ir.set_register(rd, result);
     true
 }

@@ -9,6 +9,15 @@ use super::TranslationOptions;
 /// Rust counterpart of upstream dynarmic
 /// `frontend/A32/translate/impl/thumb32_control.cpp`.
 
+pub fn thumb32_bxj(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
+    let m = inst.rn();
+    if m == Reg::PC {
+        return super::unpredictable_instruction(ir);
+    }
+
+    super::thumb16::thumb16_bx(ir, m)
+}
+
 pub fn thumb32_clrex(ir: &mut A32IREmitter) -> bool {
     ir.clear_exclusive();
     true
@@ -59,19 +68,6 @@ pub fn thumb32_wfi(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
 
 pub fn thumb32_yield(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
     thumb32_hint(ir, options, Exception::Yield)
-}
-
-pub fn thumb32_pld(ir: &mut A32IREmitter, write_intent: bool, options: TranslationOptions) -> bool {
-    let exception = if write_intent {
-        Exception::PreloadDataWithIntentToWrite
-    } else {
-        Exception::PreloadData
-    };
-    thumb32_hint(ir, options, exception)
-}
-
-pub fn thumb32_pli(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
-    thumb32_hint(ir, options, Exception::PreloadInstruction)
 }
 
 fn thumb32_hint(ir: &mut A32IREmitter, options: TranslationOptions, exception: Exception) -> bool {
@@ -164,6 +160,44 @@ mod tests {
         let mut psr = PSR::default();
         psr.set_t(true);
         A32LocationDescriptor::new(pc, psr, FPSCR::default(), false)
+    }
+
+    #[test]
+    fn thumb32_bxj_matches_upstream_validation_and_thumb16_bx_lifecycle() {
+        let loc = thumb_loc(0x1000);
+
+        let mut invalid = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut invalid, loc);
+            let inst = DecodedThumb32 {
+                raw: 0xf3cf_8f00,
+                id: Thumb32InstId::BXJ,
+            };
+            assert!(!thumb32_bxj(&mut ir, &inst));
+        }
+        assert!(invalid
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32ExceptionRaised));
+        assert!(!invalid
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32GetRegister));
+
+        let mut valid = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut valid, loc);
+            let inst = DecodedThumb32 {
+                raw: 0xf3ce_8f00,
+                id: Thumb32InstId::BXJ,
+            };
+            assert!(!thumb32_bxj(&mut ir, &inst));
+        }
+        assert!(valid
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32BXWritePC));
+        assert!(matches!(valid.terminal, Terminal::PopRSBHint));
     }
 
     /// Assert `f(raw)` stops translation raising exactly `expected` with the

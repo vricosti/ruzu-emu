@@ -96,16 +96,35 @@ pass. The complete
 unit suite has a pre-existing x64 fastmem-test failure (`A32 fastmem path
 requires fallback table`) reproduced at the parent commit in an isolated
 worktree; differential oracle tests can also fail when the external Eden
-oracle does not complete. These are validation blockers, not evidence against
-the focused A32 coprocessor slice.
+oracle does not complete. A bounded single-threaded run with those known tests
+excluded progressed through all frontend and JIT tests relevant to the current
+Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
+With the external-oracle/fuzz module and the two known standalone blockers
+excluded, the remaining crate suite passes (1011 passed, 4 ignored). These are
+validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
 
+- `OptimizationFlag` now lives in its matching `interface/optimization_flags.rs` owner with all
+  Eden values. `jit_config` retains only a temporary compatibility re-export until the following
+  A32/A64 configuration split is complete.
+- A32/A64 exception types and A64 cache-operation types now live in their matching configuration
+  owners with Eden's four-byte enum representation. Frontend type modules retain temporary
+  compatibility re-exports until their consumers are migrated.
 - A32 and A64 still share one public `JitConfig` instead of matching Eden's
   separate `interface/A32/config.h` and `interface/A64/config.h` owners.
+- The temporary shared callback trait no longer invents separate exclusive-read or exclusive-clear
+  host events: all backends use `MemoryRead*`, and clear only resets backend reservation state as
+  Eden does. Splitting the remaining architecture-specific callback surface is the active
+  prerequisite for splitting `JitConfig`.
 - Several A32 instruction families remain aggregated in broad Rust modules;
-  notably the Thumb32 preload methods are not yet owned by a matching
-  `thumb32_load_byte.rs` counterpart.
+  the Thumb32 byte/preload, halfword-load, word-load, store-single,
+  dual/exclusive/table-branch, and load/store-multiple owners are now split.
+  The branch, modified-immediate, plain-immediate, register, shifted-register,
+  miscellaneous, parallel, control, multiply, and long-multiply owners are now split and
+  complete against their four, sixteen, fourteen, sixteen, seventeen, ten,
+  thirty-six, fourteen, sixteen, and ten Eden visitors. No broad Thumb32 implementation
+  owner remains in this inventory.
 - A32 condition-state setup is centralized before visitor dispatch, while Eden
   performs encoding validation inside each visitor before
   `ArmConditionPassed`; restoring that ordering requires a frontend-wide

@@ -277,10 +277,10 @@ extern "C" fn a64_arm64_exclusive_read_8(ctx: *mut A64CallbackContext, vaddr: u6
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_8(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_8(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_8(vaddr)
+        context.callbacks().memory_read_8(vaddr)
     };
     context.exclusive_value[0] = value as u64;
     value as u64
@@ -296,11 +296,10 @@ extern "C" fn a64_arm64_exclusive_read_16(ctx: *mut A64CallbackContext, vaddr: u
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_16(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_16(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_16(vaddr)
+        context.callbacks().memory_read_16(vaddr)
     };
     context.exclusive_value[0] = value as u64;
     value as u64
@@ -316,11 +315,10 @@ extern "C" fn a64_arm64_exclusive_read_32(ctx: *mut A64CallbackContext, vaddr: u
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_32(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_32(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_32(vaddr)
+        context.callbacks().memory_read_32(vaddr)
     };
     context.exclusive_value[0] = value as u64;
     if trace_a64_exclusive_enabled() {
@@ -342,11 +340,10 @@ extern "C" fn a64_arm64_exclusive_read_64(ctx: *mut A64CallbackContext, vaddr: u
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_64(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_64(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_64(vaddr)
+        context.callbacks().memory_read_64(vaddr)
     };
     context.exclusive_value[0] = value;
     value
@@ -363,12 +360,12 @@ extern "C" fn a64_arm64_exclusive_read_128(ctx: *mut A64CallbackContext, vaddr: 
         let callbacks = context.callbacks_mut();
         unsafe {
             (&mut *monitor).read_and_mark::<[u64; 2]>(processor_id, vaddr, || {
-                let (lo, hi) = callbacks.exclusive_read_128(vaddr);
+                let (lo, hi) = callbacks.memory_read_128(vaddr);
                 [lo, hi]
             })
         }
     } else {
-        let (lo, hi) = context.callbacks().exclusive_read_128(vaddr);
+        let (lo, hi) = context.callbacks().memory_read_128(vaddr);
         [lo, hi]
     };
     context.exclusive_value = value;
@@ -912,26 +909,6 @@ mod tests {
             self.write_le(vaddr + 8, value_hi.to_le_bytes());
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
-
         fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
             if self.memory_read_8(vaddr) == expected {
                 self.memory_write_8(vaddr, value);
@@ -983,8 +960,6 @@ mod tests {
                 false
             }
         }
-
-        fn exclusive_clear(&mut self) {}
 
         fn call_supervisor(&mut self, svc_num: u32) {
             self.svc_num = svc_num;

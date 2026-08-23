@@ -1902,26 +1902,6 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
         }
     }
 
-    fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-        self.memory_read_8(vaddr)
-    }
-
-    fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-        self.memory_read_16(vaddr)
-    }
-
-    fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-        self.memory_read_32(vaddr)
-    }
-
-    fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-        self.memory_read_64(vaddr)
-    }
-
-    fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-        self.memory_read_128(vaddr)
-    }
-
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
         self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
@@ -2083,16 +2063,6 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                 self.memory_write_128(vaddr, value_lo, value_hi);
                 true
             }
-    }
-
-    fn exclusive_clear(&mut self) {
-        if !self.exclusive_monitor.is_null() {
-            unsafe {
-                (*self.exclusive_monitor)
-                    .get_monitor()
-                    .clear_processor(self.core_index)
-            };
-        }
     }
 
     fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {

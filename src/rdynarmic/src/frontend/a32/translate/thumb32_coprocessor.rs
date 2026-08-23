@@ -30,7 +30,7 @@ pub fn thumb32_mrrc(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
         CoprocReg::from_u8(inst.coproc_crm() as u8),
     );
     let low = ir.ir().least_significant_word(two_words);
-    let high = ir.ir().most_significant_word(two_words);
+    let high = ir.ir().most_significant_word(two_words).result;
     ir.set_register(t, low);
     ir.set_register(t2, high);
     true

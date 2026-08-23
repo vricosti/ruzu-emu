@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn local_clock_callback_uses_updated_shared_clock_source_id() {
-        let mut manager = TimeManager::new(Box::new(|| 5_000_000_000));
+        let manager = TimeManager::new(Box::new(|| 5_000_000_000));
         let new_id = [0x5Au8; 16];
         *manager.steady_clock_source_id.lock().unwrap() = new_id;
 

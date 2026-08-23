@@ -5154,7 +5154,7 @@ mod tests {
 
     #[test]
     fn process_send_message_raw_data_from_user_source_uses_page_table_copy() {
-        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
+        let page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
 
@@ -6761,7 +6761,7 @@ mod tests {
                 1,
                 crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
             );
-            let mut offset = message.set_message_header(&header);
+            let offset = message.set_message_header(&header);
             let _ = message.set(offset, &[0xDEAD_BEEF]);
         }
         let valid_bytes: Vec<u8> = valid_words[..3]

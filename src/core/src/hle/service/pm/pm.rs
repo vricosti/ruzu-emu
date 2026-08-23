@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn test_boot_mode() {
-        let mut bm = BootMode::new();
+        let bm = BootMode::new();
         assert_eq!(bm.get_boot_mode(), SystemBootMode::Normal);
         bm.set_maintenance_boot();
         assert_eq!(bm.get_boot_mode(), SystemBootMode::Maintenance);

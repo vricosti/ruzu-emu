@@ -3323,7 +3323,7 @@ impl KScheduler {
         if self.exit_thread_if_termination_requested(process, current_thread_id) {
             self.request_schedule();
         }
-        let mut process = process.lock().unwrap();
+        let process = process.lock().unwrap();
 
         let mut best_thread_id = None;
         let mut best_priority = i32::MAX;

@@ -1481,7 +1481,7 @@ mod tests {
 
     #[test]
     fn controller_tag_transition_preserves_upstream_state_and_payload() {
-        let mut device = mounted_plain_device();
+        let device = mounted_plain_device();
         {
             let mut state = device.inner.lock();
             state.device_state = DeviceState::SearchingForTag;

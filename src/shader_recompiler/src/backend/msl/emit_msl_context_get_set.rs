@@ -108,6 +108,16 @@ pub fn emit_resolution_down_factor(
     )
 }
 
+/// Emit Eden's `EmitYDirection` from the static pipeline Y-negate state.
+pub fn emit_y_direction(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
+    context.define(
+        inst_ref,
+        ir::Type::F32,
+        context.y_direction_expression().to_owned(),
+        false,
+    )
+}
+
 /// Emit Eden's `EmitIsHelperInvocation` while demote remains unsupported.
 pub fn emit_is_helper_invocation(
     context: &mut MslEmitContext,

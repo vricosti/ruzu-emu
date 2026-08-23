@@ -64,6 +64,7 @@ pub struct MslEmitContext {
     has_broken_robust: bool,
     support_vertex_instance_id: bool,
     convert_depth_mode: bool,
+    y_negate: bool,
     emits_frag_depth: bool,
     emits_point_size: bool,
     clip_distance_count: u32,
@@ -642,6 +643,7 @@ impl MslEmitContext {
             has_broken_robust: profile.has_broken_robust,
             support_vertex_instance_id: profile.support_vertex_instance_id,
             convert_depth_mode: runtime_info.convert_depth_mode && !profile.support_native_ndc,
+            y_negate: runtime_info.y_negate,
             emits_frag_depth,
             emits_point_size,
             clip_distance_count,
@@ -1073,6 +1075,14 @@ impl MslEmitContext {
 
     pub(super) fn resolution_down_factor_expression(&self) -> &'static str {
         "rescaling_push_constants.down_factor"
+    }
+
+    pub(super) fn y_direction_expression(&self) -> &'static str {
+        if self.y_negate {
+            "-1.0f"
+        } else {
+            "1.0f"
+        }
     }
 
     pub(super) fn render_area_expression(&self) -> &'static str {

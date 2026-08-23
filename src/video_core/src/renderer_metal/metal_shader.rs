@@ -2877,6 +2877,7 @@ mod tests {
                 Value::ImmU32(0x5678),
             ],
         );
+        block.append_new_inst(Opcode::YDirection, vec![]);
 
         let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
             &program,

@@ -683,6 +683,7 @@ fn emit_inst(
         Opcode::ResolutionDownFactor => {
             emit_msl_context_get_set::emit_resolution_down_factor(context, inst_ref)
         }
+        Opcode::YDirection => emit_msl_context_get_set::emit_y_direction(context, inst_ref),
         Opcode::IsTextureScaled => emit_msl_image::emit_is_texture_scaled(context, inst_ref, inst),
         Opcode::IsImageScaled => emit_msl_image::emit_is_image_scaled(context, inst_ref, inst),
         Opcode::RenderArea => emit_msl_context_get_set::emit_render_area(context, inst_ref),
@@ -3064,6 +3065,26 @@ mod tests {
         assert!(modern.source.source.contains(
             "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);"
         ));
+    }
+
+    #[test]
+    fn y_direction_matches_runtime_info() {
+        let mut program = empty_program(Stage::VertexB);
+        program.blocks[0].append_new_inst(Opcode::YDirection, vec![]);
+
+        let positive = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(positive.source.source.contains("float v_0_0 = 1.0f;"));
+
+        let negative = emit_msl(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo {
+                y_negate: true,
+                ..RuntimeInfo::default()
+            },
+        )
+        .unwrap();
+        assert!(negative.source.source.contains("float v_0_0 = -1.0f;"));
     }
 
     #[test]

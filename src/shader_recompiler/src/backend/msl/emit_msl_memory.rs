@@ -135,3 +135,37 @@ pub fn emit_write_storage(
     }
     Ok(())
 }
+
+pub fn emit_load_global(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let (function, result_type) = match inst.opcode {
+        Opcode::LoadGlobal32 => ("spvLoadGlobal32", ir::Type::U32),
+        Opcode::LoadGlobal64 => ("spvLoadGlobal64", ir::Type::U32x2),
+        Opcode::LoadGlobal128 => ("spvLoadGlobal128", ir::Type::U32x4),
+        _ => unreachable!("non-global load opcode {:?}", inst.opcode),
+    };
+    let address = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let expression = context.global_memory_call(function, &address, None);
+    context.define(inst_ref, result_type, expression, false)
+}
+
+pub fn emit_write_global(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let function = match inst.opcode {
+        Opcode::WriteGlobal32 => "spvWriteGlobal32",
+        Opcode::WriteGlobal64 => "spvWriteGlobal64",
+        Opcode::WriteGlobal128 => "spvWriteGlobal128",
+        _ => unreachable!("non-global write opcode {:?}", inst.opcode),
+    };
+    let address = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let call = context.global_memory_call(function, &address, Some(&value));
+    context.emit_statement(&format!("{call};"));
+    Ok(())
+}

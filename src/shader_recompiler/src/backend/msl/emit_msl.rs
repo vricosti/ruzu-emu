@@ -144,9 +144,10 @@ fn first_unsupported_program_feature(
     if info.uses_patches.iter().any(|used| *used) {
         return Some("tessellation patches");
     }
-    if info.stores_global_memory
-        || info.uses_global_memory
-        || info.uses_global_increment
+    if info.uses_global_memory && !profile.support_int64 {
+        return Some("global memory without 64-bit integers");
+    }
+    if info.uses_global_increment
         || info.uses_global_decrement
         || info.uses_atomic_f32_add
         || info.uses_atomic_f16x2_add
@@ -705,6 +706,9 @@ fn emit_inst(
         | Opcode::LoadStorage32
         | Opcode::LoadStorage64
         | Opcode::LoadStorage128 => emit_msl_memory::emit_load_storage(context, inst_ref, inst),
+        Opcode::LoadGlobal32 | Opcode::LoadGlobal64 | Opcode::LoadGlobal128 => {
+            emit_msl_memory::emit_load_global(context, inst_ref, inst)
+        }
         Opcode::WriteStorageU8
         | Opcode::WriteStorageS8
         | Opcode::WriteStorageU16
@@ -712,6 +716,9 @@ fn emit_inst(
         | Opcode::WriteStorage32
         | Opcode::WriteStorage64
         | Opcode::WriteStorage128 => emit_msl_memory::emit_write_storage(context, inst_ref, inst),
+        Opcode::WriteGlobal32 | Opcode::WriteGlobal64 | Opcode::WriteGlobal128 => {
+            emit_msl_memory::emit_write_global(context, inst_ref, inst)
+        }
         Opcode::LoadSharedU8
         | Opcode::LoadSharedS8
         | Opcode::LoadSharedU16
@@ -1047,8 +1054,8 @@ mod tests {
     use crate::profile::Profile;
     use crate::runtime_info::RuntimeInfo;
     use crate::shader_info::{
-        ImageBufferDescriptor, ImageDescriptor, ImageFormat, TextureBufferDescriptor,
-        TextureDescriptor, TextureType,
+        ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
+        StorageBufferDescriptor, TextureBufferDescriptor, TextureDescriptor, TextureType,
     };
     use crate::stage::Stage;
 
@@ -2885,6 +2892,83 @@ mod tests {
         );
         assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
         assert_eq!(artifact.bindings.resources[0].count, None);
+    }
+
+    #[test]
+    fn emits_global_memory_helpers_over_nvn_storage_buffers() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.uses_global_memory = true;
+        program.info.stores_global_memory = true;
+        program.info.uses_int64 = true;
+        program.info.nvn_buffer_used = 1;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 1 });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x110,
+                count: 1,
+                is_written: true,
+            });
+        let block = &mut program.blocks[0];
+        let load32 = block.append_new_inst(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]);
+        let load64 = block.append_new_inst(Opcode::LoadGlobal64, vec![Value::ImmU64(0x1008)]);
+        let load128 = block.append_new_inst(Opcode::LoadGlobal128, vec![Value::ImmU64(0x1010)]);
+        block.append_new_inst(
+            Opcode::WriteGlobal32,
+            vec![
+                Value::ImmU64(0x1020),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load32,
+                }),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::WriteGlobal64,
+            vec![
+                Value::ImmU64(0x1028),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load64,
+                }),
+            ],
+        );
+        block.append_new_inst(
+            Opcode::WriteGlobal128,
+            vec![
+                Value::ImmU64(0x1030),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load128,
+                }),
+            ],
+        );
+
+        let profile = Profile {
+            support_int64: true,
+            unified_descriptor_binding: true,
+            min_ssbo_alignment: 16,
+            ..Profile::default()
+        };
+        let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
+        let source = &artifact.source.source;
+        assert!(source.contains(
+            "inline uint spvLoadGlobal32(ulong address, constant uint4* global_cbuf0, device uint* global_ssbo0)"
+        ));
+        assert!(source.contains(
+            "as_type<ulong>(uint2(global_cbuf0[17u].x, global_cbuf0[17u].y)) & 0xFFFFFFFFFFFFFFF0ul"
+        ));
+        assert!(source.contains("ulong(global_cbuf0[17u].z)"));
+        assert!(source.contains("const uint element = uint(address - ssbo_address) >> 4u;"));
+        assert!(source.contains("uint v_0_0 = spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0);"));
+        assert!(source.contains("spvWriteGlobal128(0x0000000000001030ul, v_0_2, c0, ssbo0);"));
+        assert_eq!(artifact.bindings.buffer_count, 2);
+        assert_eq!(artifact.bindings.resources.len(), 2);
     }
 
     #[test]

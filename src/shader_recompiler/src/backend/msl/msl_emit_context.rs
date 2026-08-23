@@ -32,6 +32,9 @@ pub struct MslEmitContext {
     definitions: HashMap<InstRef, String>,
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
+    global_memory_resources: Vec<MslGlobalMemoryResource>,
+    uses_global_memory: bool,
+    min_ssbo_alignment: u64,
     texture_buffers: Vec<MslTextureBufferDefinition>,
     image_buffers: Vec<MslImageBufferDefinition>,
     textures: Vec<MslTextureDefinition>,
@@ -105,6 +108,13 @@ struct MslImageDefinition {
     texture_type: TextureType,
     count: u32,
     is_integer: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MslGlobalMemoryResource {
+    cbuf_name: String,
+    storage_name: String,
+    cbuf_offset: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +276,33 @@ impl MslEmitContext {
             }
             storage_index += descriptor.count;
         }
+        let global_memory_resources = if program.info.uses_global_memory {
+            program
+                .info
+                .storage_buffers_descriptors
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    *index < u16::BITS as usize
+                        && program.info.nvn_buffer_used & (1u16 << index) != 0
+                })
+                .map(|(index, descriptor)| {
+                    Ok(MslGlobalMemoryResource {
+                        cbuf_name: constant_buffers
+                            .get(&descriptor.cbuf_index)
+                            .cloned()
+                            .ok_or(MslError::MissingConstantBuffer(descriptor.cbuf_index))?,
+                        storage_name: storage_buffers
+                            .get(&(index as u32))
+                            .cloned()
+                            .ok_or(MslError::MissingStorageBuffer(index as u32))?,
+                        cbuf_offset: descriptor.cbuf_offset,
+                    })
+                })
+                .collect::<Result<Vec<_>, MslError>>()?
+        } else {
+            Vec::new()
+        };
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
         } else {
@@ -607,6 +644,9 @@ impl MslEmitContext {
             definitions: HashMap::new(),
             constant_buffers,
             storage_buffers,
+            global_memory_resources,
+            uses_global_memory: program.info.uses_global_memory,
+            min_ssbo_alignment: profile.min_ssbo_alignment.max(1),
             texture_buffers,
             image_buffers,
             textures,
@@ -1348,6 +1388,138 @@ impl MslEmitContext {
         Ok(format!("{name}[{index}]"))
     }
 
+    pub fn global_memory_call(&self, function: &str, address: &str, value: Option<&str>) -> String {
+        let mut arguments = vec![address.to_owned()];
+        if let Some(value) = value {
+            arguments.push(value.to_owned());
+        }
+        for resource in &self.global_memory_resources {
+            arguments.push(resource.cbuf_name.clone());
+            arguments.push(resource.storage_name.clone());
+        }
+        format!("{function}({})", arguments.join(", "))
+    }
+
+    fn global_cbuf_word(name: &str, offset: u32) -> String {
+        const COMPONENTS: [&str; 4] = ["x", "y", "z", "w"];
+        format!(
+            "{name}[{}u].{}",
+            offset / 16,
+            COMPONENTS[((offset / 4) % 4) as usize]
+        )
+    }
+
+    fn define_global_memory_function(
+        source: &mut String,
+        resources: &[MslGlobalMemoryResource],
+        alignment: u64,
+        name: &str,
+        value_type: &str,
+        words: u32,
+        write: bool,
+    ) {
+        let mut parameters = if write {
+            vec!["ulong address".to_owned(), format!("{value_type} data")]
+        } else {
+            vec!["ulong address".to_owned()]
+        };
+        for index in 0..resources.len() {
+            parameters.push(format!("constant uint4* global_cbuf{index}"));
+            parameters.push(format!("device uint* global_ssbo{index}"));
+        }
+        let return_type = if write { "void" } else { value_type };
+        source.push_str(&format!(
+            "inline {return_type} {name}({}) {{\n",
+            parameters.join(", ")
+        ));
+        let alignment_mask = !alignment.wrapping_sub(1);
+        let shift = (words * 4).trailing_zeros();
+        for (index, resource) in resources.iter().enumerate() {
+            let low = Self::global_cbuf_word(&format!("global_cbuf{index}"), resource.cbuf_offset);
+            let high =
+                Self::global_cbuf_word(&format!("global_cbuf{index}"), resource.cbuf_offset + 4);
+            let size =
+                Self::global_cbuf_word(&format!("global_cbuf{index}"), resource.cbuf_offset + 8);
+            source.push_str("    {\n");
+            source.push_str(&format!(
+                "        const ulong ssbo_address = as_type<ulong>(uint2({low}, {high})) & 0x{alignment_mask:016X}ul;\n"
+            ));
+            source.push_str(&format!(
+                "        const ulong ssbo_end = ssbo_address + ulong({size});\n"
+            ));
+            source.push_str("        if (address >= ssbo_address && address < ssbo_end) {\n");
+            source.push_str(&format!(
+                "            const uint element = uint(address - ssbo_address) >> {shift}u;\n"
+            ));
+            let base_word = if words == 1 {
+                "element".to_owned()
+            } else {
+                format!("element * {words}u")
+            };
+            if write {
+                const COMPONENTS: [&str; 4] = ["x", "y", "z", "w"];
+                for word in 0..words {
+                    let value = if words == 1 {
+                        "data".to_owned()
+                    } else {
+                        format!("data.{}", COMPONENTS[word as usize])
+                    };
+                    let index_expression = if word == 0 {
+                        base_word.clone()
+                    } else {
+                        format!("{base_word} + {word}u")
+                    };
+                    source.push_str(&format!(
+                        "            global_ssbo{index}[{index_expression}] = {value};\n"
+                    ));
+                }
+                source.push_str("            return;\n");
+            } else if words == 1 {
+                source.push_str(&format!(
+                    "            return global_ssbo{index}[{base_word}];\n"
+                ));
+            } else {
+                let elements = (0..words)
+                    .map(|word| {
+                        if word == 0 {
+                            format!("global_ssbo{index}[{base_word}]")
+                        } else {
+                            format!("global_ssbo{index}[{base_word} + {word}u]")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                source.push_str(&format!("            return {value_type}({elements});\n"));
+            }
+            source.push_str("        }\n");
+            source.push_str("    }\n");
+        }
+        if write {
+            source.push_str("}\n\n");
+        } else {
+            source.push_str(&format!("    return {value_type}(0u);\n}}\n\n"));
+        }
+    }
+
+    fn define_global_memory_functions(
+        source: &mut String,
+        resources: &[MslGlobalMemoryResource],
+        alignment: u64,
+    ) {
+        for (name, value_type, words, write) in [
+            ("spvLoadGlobal32", "uint", 1, false),
+            ("spvWriteGlobal32", "uint", 1, true),
+            ("spvLoadGlobal64", "uint2", 2, false),
+            ("spvWriteGlobal64", "uint2", 2, true),
+            ("spvLoadGlobal128", "uint4", 4, false),
+            ("spvWriteGlobal128", "uint4", 4, true),
+        ] {
+            Self::define_global_memory_function(
+                source, resources, alignment, name, value_type, words, write,
+            );
+        }
+    }
+
     pub fn emit_statement(&mut self, statement: &str) {
         self.source.push_str("    ");
         self.source.push_str(statement);
@@ -1677,6 +1849,13 @@ impl MslEmitContext {
         }
         self.source.push_str("}\n");
         let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
+        if self.uses_global_memory {
+            Self::define_global_memory_functions(
+                &mut source,
+                &self.global_memory_resources,
+                self.min_ssbo_alignment,
+            );
+        }
         if self.uses_cbuf_indirect {
             Self::define_constant_buffer_indirect_functions(&mut source);
         }

@@ -107,6 +107,37 @@ fn append_fetch_coordinates(
     Ok(())
 }
 
+fn append_storage_coordinates(
+    arguments: &mut Vec<String>,
+    texture_type: TextureType,
+    coords: String,
+) -> Result<(), MslError> {
+    match texture_type {
+        TextureType::Color1D => arguments.push(coords),
+        TextureType::ColorArray1D => {
+            arguments.push(format!("({coords}).x"));
+            arguments.push(format!("({coords}).y"));
+        }
+        TextureType::Color2D => arguments.push(coords),
+        TextureType::ColorArray2D => {
+            arguments.push(format!("({coords}).xy"));
+            arguments.push(format!("({coords}).z"));
+        }
+        TextureType::Color3D => arguments.push(coords),
+        TextureType::Buffer => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "image buffer in storage image operation",
+            ));
+        }
+        TextureType::ColorCube | TextureType::ColorArrayCube | TextureType::Color2DRect => {
+            return Err(MslError::UnsupportedProgramFeature(
+                "invalid storage image texture type",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn query_lod_coordinates(texture_type: TextureType, coords: String) -> Result<String, MslError> {
     match texture_type {
         TextureType::Color1D | TextureType::ColorArray1D => Err(
@@ -825,4 +856,61 @@ pub fn emit_image_gradient(
         sample
     };
     context.define(inst_ref, Type::F32x4, expression, false)
+}
+
+/// Native-MSL counterpart of upstream `EmitImageRead`.
+pub fn emit_image_read(
+    context: &mut MslEmitContext,
+    _program: &Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    if crate::shader_info::ImageFormat::from_u8(info.image_format)
+        == crate::shader_info::ImageFormat::Typeless
+        && !context.supports_typeless_image_loads()
+    {
+        log::warn!("MSL: typeless image read not supported by host");
+        return context.define(inst_ref, Type::U32x4, "uint4(0u)".to_owned(), false);
+    }
+    if inst
+        .get_associated_pseudo(Opcode::GetSparseFromOp)
+        .is_some()
+    {
+        return Err(MslError::UnsupportedProgramFeature(
+            "sparse storage image read",
+        ));
+    }
+    let image = context.image_expressions(info, inst.arg(0), inst_ref)?;
+    let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let mut arguments = Vec::new();
+    append_storage_coordinates(&mut arguments, image.texture_type, coords)?;
+    let read = format!("{}.read({})", image.image, arguments.join(", "));
+    let expression = if image.is_integer {
+        read
+    } else {
+        format!("as_type<uint4>({read})")
+    };
+    context.define(inst_ref, Type::U32x4, expression, false)
+}
+
+/// Native-MSL counterpart of upstream `EmitImageWrite`.
+pub fn emit_image_write(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let image = context.image_expressions(info, inst.arg(0), inst_ref)?;
+    let coords = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let color = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let color = if image.is_integer {
+        color
+    } else {
+        format!("as_type<float4>({color})")
+    };
+    let mut arguments = vec![color];
+    append_storage_coordinates(&mut arguments, image.texture_type, coords)?;
+    context.push_statement(format!("{}.write({});", image.image, arguments.join(", ")));
+    Ok(())
 }

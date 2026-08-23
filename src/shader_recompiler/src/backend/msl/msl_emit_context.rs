@@ -14,7 +14,7 @@ use crate::ir::instruction::Inst;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 use crate::profile::Profile;
-use crate::shader_info::{TextureDescriptor, TextureType};
+use crate::shader_info::{ImageDescriptor, TextureDescriptor, TextureType};
 use crate::stage::Stage;
 
 use super::{
@@ -29,6 +29,7 @@ pub struct MslEmitContext {
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
     textures: Vec<MslTextureDefinition>,
+    images: Vec<MslImageDefinition>,
     bindings: MslBindingLayout,
     returns_output: bool,
     uses_no_contraction_add: bool,
@@ -37,6 +38,7 @@ pub struct MslEmitContext {
     uses_storage_subword_cas: bool,
     language_version: MslVersion,
     supports_query_texture_lod: bool,
+    supports_typeless_image_loads: bool,
     need_gather_subpixel_offset: bool,
     execution: MslExecutionInfo,
     has_broken_robust: bool,
@@ -53,6 +55,14 @@ struct MslTextureDefinition {
     is_multisample: bool,
 }
 
+#[derive(Debug, Clone)]
+struct MslImageDefinition {
+    image_name: String,
+    texture_type: TextureType,
+    count: u32,
+    is_integer: bool,
+}
+
 pub(super) struct MslTextureExpressions {
     pub texture: String,
     pub sampler: String,
@@ -60,6 +70,12 @@ pub(super) struct MslTextureExpressions {
     pub is_depth: bool,
     pub is_integer: bool,
     pub is_multisample: bool,
+}
+
+pub(super) struct MslImageExpressions {
+    pub image: String,
+    pub texture_type: TextureType,
+    pub is_integer: bool,
 }
 
 impl MslEmitContext {
@@ -82,6 +98,7 @@ impl MslEmitContext {
         let mut constant_buffers = HashMap::new();
         let mut storage_buffers = HashMap::new();
         let mut textures = Vec::new();
+        let mut images = Vec::new();
         let mut parameters = Vec::new();
         let binding_counter = if profile.unified_descriptor_binding {
             &mut binding_counters.unified
@@ -154,6 +171,23 @@ impl MslEmitContext {
             textures.push(definition);
             *binding_counter += 1;
         }
+        let binding_counter = if profile.unified_descriptor_binding {
+            &mut binding_counters.unified
+        } else {
+            &mut binding_counters.image
+        };
+        for (descriptor_index, descriptor) in program.info.image_descriptors.iter().enumerate() {
+            let definition = Self::define_image(
+                descriptor_index as u32,
+                descriptor,
+                *binding_counter,
+                options.supports_read_write_textures,
+                &mut bindings,
+                &mut parameters,
+            )?;
+            images.push(definition);
+            *binding_counter += 1;
+        }
         let parameters = parameters.join(", ");
         let mut source = String::new();
         let returns_output = match stage {
@@ -201,6 +235,7 @@ impl MslEmitContext {
             constant_buffers,
             storage_buffers,
             textures,
+            images,
             bindings,
             returns_output,
             uses_no_contraction_add: false,
@@ -209,6 +244,7 @@ impl MslEmitContext {
             uses_storage_subword_cas: false,
             language_version: options.language_version,
             supports_query_texture_lod: options.supports_query_texture_lod,
+            supports_typeless_image_loads: profile.support_typeless_image_loads,
             need_gather_subpixel_offset: profile.need_gather_subpixel_offset,
             execution: MslExecutionInfo {
                 workgroup_size: (stage == Stage::Compute).then_some(program.workgroup_size),
@@ -354,6 +390,89 @@ impl MslEmitContext {
         })
     }
 
+    fn define_image(
+        descriptor_index: u32,
+        descriptor: &ImageDescriptor,
+        descriptor_binding: u32,
+        supports_read_write_textures: bool,
+        bindings: &mut MslBindingLayout,
+        parameters: &mut Vec<String>,
+    ) -> Result<MslImageDefinition, MslError> {
+        if descriptor.count == 0 {
+            return Err(MslError::UnsupportedProgramFeature(
+                "zero-sized storage image descriptor array",
+            ));
+        }
+        let access = match (descriptor.is_read, descriptor.is_written) {
+            (true, false) => "read",
+            (false, true) => "write",
+            (true, true) if supports_read_write_textures => "read_write",
+            (true, true) => {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "read/write storage image on this Metal device",
+                ));
+            }
+            (false, false) => {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "storage image with no declared access",
+                ));
+            }
+        };
+        let texture_class = match descriptor.texture_type {
+            TextureType::Color1D => "texture1d",
+            TextureType::ColorArray1D => "texture1d_array",
+            TextureType::Color2D => "texture2d",
+            TextureType::ColorArray2D => "texture2d_array",
+            TextureType::Color3D => "texture3d",
+            TextureType::Buffer => {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "image buffer in storage image descriptors",
+                ));
+            }
+            TextureType::ColorCube | TextureType::ColorArrayCube | TextureType::Color2DRect => {
+                return Err(MslError::UnsupportedProgramFeature(
+                    "invalid storage image texture type",
+                ));
+            }
+        };
+        let component = if descriptor.is_integer {
+            "uint"
+        } else {
+            "float"
+        };
+        let image_type = format!("{texture_class}<{component}, access::{access}>");
+        let texture_index = bindings.texture_count;
+        bindings.texture_count += descriptor.count;
+        bindings.resources.push(MslResourceBinding {
+            descriptor_set: 0,
+            binding: descriptor_binding,
+            kind: MslResourceKind::StorageImage,
+            buffer_index: 0,
+            texture_index,
+            sampler_index: 0,
+            count: (descriptor.count > 1)
+                .then(|| std::num::NonZeroU32::new(descriptor.count).unwrap()),
+        });
+
+        let image_name = format!("img{descriptor_index}");
+        if descriptor.count > 1 {
+            parameters.push(format!(
+                "array<{image_type}, {}> {image_name} [[texture({texture_index})]]",
+                descriptor.count
+            ));
+        } else {
+            parameters.push(format!(
+                "{image_type} {image_name} [[texture({texture_index})]]"
+            ));
+        }
+        Ok(MslImageDefinition {
+            image_name,
+            texture_type: descriptor.texture_type,
+            count: descriptor.count,
+            is_integer: descriptor.is_integer,
+        })
+    }
+
     pub fn stage(&self) -> Stage {
         self.stage
     }
@@ -364,6 +483,10 @@ impl MslEmitContext {
 
     pub fn need_gather_subpixel_offset(&self) -> bool {
         self.need_gather_subpixel_offset
+    }
+
+    pub fn supports_typeless_image_loads(&self) -> bool {
+        self.supports_typeless_image_loads
     }
 
     pub fn validate_texture(
@@ -414,6 +537,35 @@ impl MslEmitContext {
             is_depth: definition.is_depth,
             is_integer: definition.is_integer,
             is_multisample: definition.is_multisample,
+        })
+    }
+
+    pub(super) fn image_expressions(
+        &self,
+        info: crate::ir::types::TextureInstInfo,
+        index: &Value,
+        inst_ref: InstRef,
+    ) -> Result<MslImageExpressions, MslError> {
+        let definition = self
+            .images
+            .get(info.descriptor_index as usize)
+            .ok_or(MslError::MissingImage(info.descriptor_index.into()))?;
+        let instruction_type = TextureType::from_u8(info.texture_type);
+        if definition.texture_type != instruction_type {
+            return Err(MslError::UnsupportedProgramFeature(
+                "storage image instruction/descriptor type mismatch",
+            ));
+        }
+        let image = if definition.count == 1 {
+            definition.image_name.clone()
+        } else {
+            let index = self.value_expression(index, inst_ref, 0)?;
+            format!("{}[{index}]", definition.image_name)
+        };
+        Ok(MslImageExpressions {
+            image,
+            texture_type: definition.texture_type,
+            is_integer: definition.is_integer,
         })
     }
 
@@ -564,6 +716,12 @@ impl MslEmitContext {
         ));
         self.definitions.insert(inst_ref, name);
         Ok(())
+    }
+
+    pub fn push_statement(&mut self, statement: String) {
+        self.source.push_str("    ");
+        self.source.push_str(&statement);
+        self.source.push('\n');
     }
 
     pub fn emit_binary(

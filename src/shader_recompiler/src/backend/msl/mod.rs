@@ -48,6 +48,10 @@ pub struct MslOptions {
     /// Whether the selected Metal device supports the texture LOD query
     /// methods. This is a device capability, independent of the MSL version.
     pub supports_query_texture_lod: bool,
+    /// Whether the selected Metal device supports textures declared with
+    /// `access::read_write`. This is negotiated from the device's read/write
+    /// texture tier rather than inferred from the MSL language version.
+    pub supports_read_write_textures: bool,
 }
 
 impl Default for MslOptions {
@@ -55,6 +59,7 @@ impl Default for MslOptions {
         Self {
             language_version: MslVersion::V2_3,
             supports_query_texture_lod: false,
+            supports_read_write_textures: false,
         }
     }
 }
@@ -147,6 +152,8 @@ pub enum MslError {
     MissingStorageBuffer(u32),
     #[error("MSL emission references undeclared sampled texture {0}")]
     MissingTexture(u32),
+    #[error("MSL emission references undeclared storage image {0}")]
+    MissingImage(u32),
     #[error("MSL emission does not implement {opcode} at block {block} instruction {inst}")]
     UnsupportedOpcode {
         block: u32,

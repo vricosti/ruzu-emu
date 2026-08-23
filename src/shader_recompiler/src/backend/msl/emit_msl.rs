@@ -79,10 +79,7 @@ fn first_unsupported_program_feature(
     if !info.storage_buffers_descriptors.is_empty() && profile.support_descriptor_aliasing {
         return Some("descriptor-aliasing storage buffers");
     }
-    if !info.texture_buffer_descriptors.is_empty()
-        || !info.image_buffer_descriptors.is_empty()
-        || !info.image_descriptors.is_empty()
-    {
+    if !info.texture_buffer_descriptors.is_empty() || !info.image_buffer_descriptors.is_empty() {
         return Some("resource bindings");
     }
     if !info.constant_buffer_descriptors.is_empty() && profile.support_descriptor_aliasing {
@@ -570,6 +567,8 @@ fn emit_inst(
         Opcode::ImageGradient => {
             emit_msl_image::emit_image_gradient(context, program, inst_ref, inst)
         }
+        Opcode::ImageRead => emit_msl_image::emit_image_read(context, program, inst_ref, inst),
+        Opcode::ImageWrite => emit_msl_image::emit_image_write(context, inst_ref, inst),
         Opcode::SetAttribute => {
             let Value::Attribute(attribute) = inst.arg(0) else {
                 return Err(MslError::ExpectedImmediate {
@@ -709,7 +708,7 @@ mod tests {
     use crate::ir::value::Value;
     use crate::profile::Profile;
     use crate::runtime_info::RuntimeInfo;
-    use crate::shader_info::{TextureDescriptor, TextureType};
+    use crate::shader_info::{ImageDescriptor, ImageFormat, TextureDescriptor, TextureType};
     use crate::stage::Stage;
 
     use super::*;
@@ -764,6 +763,91 @@ mod tests {
             ..Default::default()
         }
         .to_u32();
+        program
+    }
+
+    fn storage_coordinates(program: &mut ir::Program, texture_type: TextureType) -> Value {
+        let (opcode, values) = match texture_type {
+            TextureType::Color1D => return Value::ImmU32(4),
+            TextureType::ColorArray1D | TextureType::Color2D => (
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(4), Value::ImmU32(2)],
+            ),
+            TextureType::ColorArray2D | TextureType::Color3D => (
+                Opcode::CompositeConstructU32x3,
+                vec![Value::ImmU32(4), Value::ImmU32(2), Value::ImmU32(1)],
+            ),
+            _ => unreachable!("invalid storage image test dimension"),
+        };
+        let coords = program.blocks[0].append_new_inst(opcode, values);
+        Value::Inst(InstRef {
+            block: 0,
+            inst: coords,
+        })
+    }
+
+    fn storage_image_program(
+        texture_type: TextureType,
+        count: u32,
+        is_integer: bool,
+        is_read: bool,
+        is_written: bool,
+    ) -> ir::Program {
+        let mut program = empty_program(Stage::Compute);
+        let format = if is_integer {
+            ImageFormat::R32Uint
+        } else {
+            ImageFormat::Typeless
+        };
+        program.info.image_descriptors.push(ImageDescriptor {
+            texture_type,
+            format,
+            is_written,
+            is_read,
+            is_integer,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count,
+            size_shift: 0,
+        });
+        let coords = storage_coordinates(&mut program, texture_type);
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: texture_type as u8,
+            image_format: format as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        if is_read {
+            let read = program.blocks[0].append_new_inst(
+                Opcode::ImageRead,
+                vec![Value::ImmU32(count.saturating_sub(1)), coords],
+            );
+            program.blocks[0].inst_mut(read).flags = flags;
+        }
+        if is_written {
+            let color = program.blocks[0].append_new_inst(
+                Opcode::CompositeConstructU32x4,
+                vec![
+                    Value::ImmU32(1),
+                    Value::ImmU32(2),
+                    Value::ImmU32(3),
+                    Value::ImmU32(4),
+                ],
+            );
+            let write = program.blocks[0].append_new_inst(
+                Opcode::ImageWrite,
+                vec![
+                    Value::ImmU32(count.saturating_sub(1)),
+                    coords,
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: color,
+                    }),
+                ],
+            );
+            program.blocks[0].inst_mut(write).flags = flags;
+        }
         program
     }
 
@@ -1949,5 +2033,80 @@ mod tests {
             .source
             .source
             .contains("output.color0.z = as_type<float>(0x3F000000u);"));
+    }
+
+    #[test]
+    fn emits_storage_image_access_and_binding_abi() {
+        let mut profile = Profile::default();
+        profile.support_typeless_image_loads = true;
+        let options = MslOptions {
+            supports_read_write_textures: true,
+            ..MslOptions::default()
+        };
+
+        let integer = storage_image_program(TextureType::ColorArray2D, 3, true, true, true);
+        let artifact =
+            emit_msl_with_options(&integer, &profile, &RuntimeInfo::default(), &options).unwrap();
+        assert_eq!(artifact.bindings.texture_count, 3);
+        assert_eq!(artifact.bindings.resources.len(), 1);
+        assert_eq!(
+            artifact.bindings.resources[0].kind,
+            MslResourceKind::StorageImage
+        );
+        assert_eq!(artifact.bindings.resources[0].binding, 0);
+        assert_eq!(artifact.bindings.resources[0].texture_index, 0);
+        assert_eq!(artifact.bindings.resources[0].count.unwrap().get(), 3);
+        assert!(artifact
+            .source
+            .source
+            .contains("array<texture2d_array<uint, access::read_write>, 3> img0 [[texture(0)]]"));
+        assert!(artifact.source.source.contains("img0[0x00000002u].read("));
+        assert!(artifact.source.source.contains("img0[0x00000002u].write("));
+
+        let float = storage_image_program(TextureType::Color3D, 1, false, true, true);
+        let artifact =
+            emit_msl_with_options(&float, &profile, &RuntimeInfo::default(), &options).unwrap();
+        assert!(artifact
+            .source
+            .source
+            .contains("texture3d<float, access::read_write> img0 [[texture(0)]]"));
+        assert!(artifact.source.source.contains("as_type<uint4>(img0.read("));
+        assert!(artifact
+            .source
+            .source
+            .contains("img0.write(as_type<float4>("));
+    }
+
+    #[test]
+    fn storage_image_access_qualifiers_follow_descriptor_usage() {
+        let read = storage_image_program(TextureType::Color2D, 1, true, true, false);
+        let read = emit_msl(&read, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(read
+            .source
+            .source
+            .contains("texture2d<uint, access::read> img0"));
+
+        let write = storage_image_program(TextureType::Color2D, 1, true, false, true);
+        let write = emit_msl(&write, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(write
+            .source
+            .source
+            .contains("texture2d<uint, access::write> img0"));
+
+        let read_write = storage_image_program(TextureType::Color2D, 1, true, true, true);
+        assert_eq!(
+            emit_msl(&read_write, &Profile::default(), &RuntimeInfo::default()),
+            Err(MslError::UnsupportedProgramFeature(
+                "read/write storage image on this Metal device"
+            ))
+        );
+    }
+
+    #[test]
+    fn unsupported_typeless_image_read_matches_upstream_zero() {
+        let program = storage_image_program(TextureType::Color2D, 1, false, true, false);
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        assert!(artifact.source.source.contains("= uint4(0u);"));
+        assert!(!artifact.source.source.contains(".read("));
     }
 }

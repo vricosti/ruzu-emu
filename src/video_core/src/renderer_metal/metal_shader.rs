@@ -13,6 +13,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLFunction, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+    MTLReadWriteTextureTier,
 };
 use spirv_cross2::compile::msl::{
     BindTarget, CompilerOptions, MetalPlatform, MslVersion as SpirvCrossMslVersion, ResourceBinding,
@@ -711,6 +712,8 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
         &shader_recompiler::backend::msl::MslOptions {
             language_version: active.language_version(),
             supports_query_texture_lod: device.supportsQueryTextureLOD(),
+            supports_read_write_textures: device.readWriteTextureSupport()
+                != MTLReadWriteTextureTier::TierNone,
         },
         bindings,
     )?;
@@ -741,7 +744,8 @@ mod tests {
     use shader_recompiler::profile::Profile;
     use shader_recompiler::runtime_info::RuntimeInfo;
     use shader_recompiler::shader_info::{
-        ConstantBufferDescriptor, StorageBufferDescriptor, TextureDescriptor, TextureType,
+        ConstantBufferDescriptor, ImageDescriptor, ImageFormat, StorageBufferDescriptor,
+        TextureDescriptor, TextureType,
     };
     use shader_recompiler::stage::Stage;
 
@@ -966,6 +970,103 @@ mod tests {
         })
     }
 
+    fn storage_coordinates(program: &mut Program, texture_type: TextureType) -> Value {
+        let (opcode, values) = match texture_type {
+            TextureType::Color1D => return Value::ImmU32(4),
+            TextureType::ColorArray1D | TextureType::Color2D => (
+                Opcode::CompositeConstructU32x2,
+                vec![Value::ImmU32(4), Value::ImmU32(2)],
+            ),
+            TextureType::ColorArray2D | TextureType::Color3D => (
+                Opcode::CompositeConstructU32x3,
+                vec![Value::ImmU32(4), Value::ImmU32(2), Value::ImmU32(1)],
+            ),
+            _ => unreachable!("invalid storage image test dimension"),
+        };
+        let coords = program.blocks[0].append_new_inst(opcode, values);
+        Value::Inst(InstRef {
+            block: 0,
+            inst: coords,
+        })
+    }
+
+    fn storage_image_program(
+        texture_type: TextureType,
+        count: u32,
+        is_integer: bool,
+        is_read: bool,
+        is_written: bool,
+    ) -> Program {
+        let mut program = Program::new(Stage::Fragment);
+        program.blocks.push(Block::new());
+        let format = if is_integer {
+            ImageFormat::R32Uint
+        } else {
+            ImageFormat::Typeless
+        };
+        program.info.image_descriptors.push(ImageDescriptor {
+            texture_type,
+            format,
+            is_written,
+            is_read,
+            is_integer,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count,
+            size_shift: 0,
+        });
+        let coords = storage_coordinates(&mut program, texture_type);
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: texture_type as u8,
+            image_format: format as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        let read = if is_read {
+            let read = program.blocks[0].append_new_inst(
+                Opcode::ImageRead,
+                vec![Value::ImmU32(count.saturating_sub(1)), coords],
+            );
+            program.blocks[0].inst_mut(read).flags = flags;
+            store_query_result(&mut program, read);
+            Some(read)
+        } else {
+            None
+        };
+        if is_written {
+            let color = read.map_or_else(
+                || {
+                    let color = program.blocks[0].append_new_inst(
+                        Opcode::CompositeConstructU32x4,
+                        vec![
+                            Value::ImmU32(1),
+                            Value::ImmU32(2),
+                            Value::ImmU32(3),
+                            Value::ImmU32(4),
+                        ],
+                    );
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: color,
+                    })
+                },
+                |read| {
+                    Value::Inst(InstRef {
+                        block: 0,
+                        inst: read,
+                    })
+                },
+            );
+            let write = program.blocks[0].append_new_inst(
+                Opcode::ImageWrite,
+                vec![Value::ImmU32(count.saturating_sub(1)), coords, color],
+            );
+            program.blocks[0].inst_mut(write).flags = flags;
+        }
+        program
+    }
+
     fn store_query_result(program: &mut Program, query: u32) {
         program.info.stores_frag_color[0] = true;
         for component in 0..4 {
@@ -980,7 +1081,7 @@ mod tests {
                 ],
             );
             let value = program.blocks[0].append_new_inst(
-                Opcode::BitCastU32F32,
+                Opcode::BitCastF32U32,
                 vec![Value::Inst(InstRef {
                     block: 0,
                     inst: extracted,
@@ -1422,6 +1523,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .expect("minimal compute IR must lower directly to MSL");
@@ -1466,6 +1568,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .expect("supported vertex IR must lower directly to MSL");
@@ -1577,6 +1680,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .expect("scalar IR must lower directly to MSL");
@@ -1693,6 +1797,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .expect("native half/int64 IR must lower directly to MSL when supported");
@@ -2067,6 +2172,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .expect("PTP gather must lower directly to MSL");
@@ -2074,6 +2180,88 @@ mod tests {
         assert_eq!(artifact.source.source.matches(").w").count(), 4);
         compile_native_msl_artifact(device.device(), artifact)
             .expect("direct PTP gather MSL must compile natively");
+    }
+
+    #[test]
+    fn compiles_direct_storage_images_with_active_abi() {
+        let Ok(device) = MetalDevice::new() else {
+            return;
+        };
+        let mut profile = make_shader_profile(device.profile());
+        // Exercise the float load conversion as well as the integer path.
+        // Runtime Metal profiles keep typeless loads disabled and therefore
+        // follow upstream's explicit zero-result path.
+        profile.support_typeless_image_loads = true;
+        let runtime_info = RuntimeInfo::default();
+        let mut programs = Vec::new();
+        for texture_type in [
+            TextureType::Color1D,
+            TextureType::ColorArray1D,
+            TextureType::Color2D,
+            TextureType::ColorArray2D,
+            TextureType::Color3D,
+        ] {
+            programs.push(storage_image_program(texture_type, 1, true, true, false));
+            programs.push(storage_image_program(texture_type, 1, false, false, true));
+        }
+        if device.profile().supports_read_write_textures() {
+            programs.push(storage_image_program(
+                TextureType::Color2D,
+                1,
+                true,
+                true,
+                true,
+            ));
+        }
+
+        for program in programs {
+            let spirv = emit_spirv(&program, &profile, &runtime_info);
+            let active = compile_native_shader(
+                device.device(),
+                device.profile(),
+                &spirv,
+                &MetalShaderCompileOptions::for_device(device.profile()),
+            )
+            .expect("active storage-image SPIR-V/MSL must compile");
+            let direct = validate_direct_msl_against_active_module(
+                device.device(),
+                &program,
+                &profile,
+                &runtime_info,
+                &active,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "direct storage-image MSL must compile: {error}\nactive MSL:\n{}",
+                    active.source().source,
+                )
+            });
+            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(
+                direct.bindings().resources[0].kind,
+                MetalResourceKind::StorageImage
+            );
+        }
+
+        // Eden's current SPIR-V storage-image declaration does not preserve
+        // descriptor-array count in reflection. Validate the direct ABI and
+        // native MSL independently so the native backend does not inherit
+        // that limitation.
+        let array = storage_image_program(TextureType::Color2D, 2, true, true, false);
+        let artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+            &array,
+            &profile,
+            &runtime_info,
+            &shader_recompiler::backend::msl::MslOptions {
+                language_version: device.profile().msl_language_version,
+                supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
+            },
+        )
+        .expect("direct storage-image descriptor array must lower");
+        assert_eq!(artifact.bindings.resources[0].count.unwrap().get(), 2);
+        compile_native_msl_artifact(device.device(), artifact)
+            .expect("direct storage-image descriptor array must compile natively");
     }
 
     #[test]
@@ -2249,6 +2437,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: shader_recompiler::backend::msl::MslVersion::V2_3,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .expect("multisample fetch must lower at the MSL 2.3 baseline");
@@ -2483,6 +2672,7 @@ mod tests {
             &shader_recompiler::backend::msl::MslOptions {
                 language_version: device.profile().msl_language_version,
                 supports_query_texture_lod: device.profile().supports_query_texture_lod,
+                supports_read_write_textures: device.profile().supports_read_write_textures(),
             },
         )
         .unwrap();

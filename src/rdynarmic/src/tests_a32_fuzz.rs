@@ -678,9 +678,13 @@ mod tests {
         code_with_loop.push(0xEAFFFFFE); // infinite loop
 
         let env = FuzzEnv::new(code_with_loop);
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
         let mut config = A32UserConfig::new(Box::new(env));
         config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = optimizations;
+        config.global_monitor = Some(&mut *monitor as *mut _);
         let mut jit = A32Jit::new(config).expect("JIT creation failed");
 
         for i in 0..15 {

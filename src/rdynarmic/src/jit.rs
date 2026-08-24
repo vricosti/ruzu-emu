@@ -2537,6 +2537,65 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_a32_non_inline_exclusive_sequence_uses_global_monitor() {
+        let code: &[u32] = &[
+            0xE191_0F9F, // LDREX R0, [R1]
+            0xE181_2F93, // STREX R2, R3, [R1]
+            0xE181_4F95, // STREX R4, R5, [R1] (reservation already consumed)
+            0xEF00_0000, // SVC #0
+        ];
+        let old_value = 0x1122_3344u32;
+        let new_value = 0x5566_7788u32;
+        let rejected_value = 0xAABB_CCDDu32;
+        let mut contents = vec![0u8; 0x2000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x100..0x104].copy_from_slice(&old_value.to_le_bytes());
+        let memory = Arc::new(Mutex::new(contents));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
+
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = Some(&mut *monitor as *mut _);
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
+        config.fastmem_exclusive_access = false;
+
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_register(3, new_value);
+        jit.set_register(5, rejected_value);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), old_value);
+        assert_eq!(jit.get_register(2), 0);
+        assert_eq!(jit.get_register(4), 1);
+        assert_eq!(
+            u32::from_le_bytes(memory.lock().unwrap()[0x100..0x104].try_into().unwrap()),
+            new_value
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_a32_jit_preserves_disabled_exclusive_fastmem_policy() {
         let mut memory = vec![0; 0x2000];
         memory[0x1000..0x1004].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // svc #0

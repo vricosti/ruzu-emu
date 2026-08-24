@@ -4,8 +4,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::backend::common::a32_callbacks::{self, A32ExclusiveState};
+use crate::backend::common::a32_callbacks;
 use crate::backend::x64::a32_emit_x64::A32EmitX64;
+use crate::backend::x64::a32_emit_x64_memory;
 use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn, DEFAULT_CODE_SIZE};
@@ -91,7 +92,6 @@ pub(crate) struct A32Jit {
 
 pub(crate) struct A32JitInner {
     pub(crate) jit_state: A32JitState,
-    exclusive_value: [u64; 2],
     pub(crate) emitter: Option<A32EmitX64>,
     pub(crate) callbacks: Box<dyn A32UserCallbacks>,
     pub(crate) run_code_fn: Option<RunCodeFn>,
@@ -100,29 +100,6 @@ pub(crate) struct A32JitInner {
     invalidate_entire_cache: bool,
     invalid_cache_ranges: Vec<(u32, u32)>,
     invalidation_mutex: std::sync::Mutex<()>,
-}
-
-struct A32ExclusiveStateView<'a> {
-    jit_state: &'a mut A32JitState,
-    exclusive_value: &'a mut [u64; 2],
-}
-
-impl A32ExclusiveState for A32ExclusiveStateView<'_> {
-    fn exclusive_state(&self) -> u32 {
-        self.jit_state.exclusive_state
-    }
-
-    fn set_exclusive_state(&mut self, value: u32) {
-        self.jit_state.exclusive_state = value;
-    }
-
-    fn exclusive_value(&self, index: usize) -> u64 {
-        self.exclusive_value[index]
-    }
-
-    fn set_exclusive_value(&mut self, index: usize, value: u64) {
-        self.exclusive_value[index] = value;
-    }
 }
 
 impl A32JitInner {
@@ -221,7 +198,6 @@ impl A32Jit {
 
         let mut inner = Box::new(A32JitInner {
             jit_state: A32JitState::new(),
-            exclusive_value: [0; 2],
             emitter: None,
             callbacks: config.callbacks,
             run_code_fn: None,
@@ -590,7 +566,6 @@ impl A32Jit {
     pub fn reset(&mut self, is_executing: bool) {
         assert!(!is_executing, "Cannot reset while the JIT is executing");
         self.inner.jit_state = A32JitState::new();
-        self.inner.exclusive_value = [0; 2];
     }
 
     // ---- Register accessors (R0-R15, u32) ----
@@ -1037,78 +1012,64 @@ extern "C" fn a32_unreachable_get_cntpct_trampoline(_inner_ptr: u64) -> u64 {
 
 extern "C" fn a32_exclusive_clear_trampoline(inner_ptr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_clear(&mut state);
+    inner.jit_state.exclusive_state = 0;
 }
 extern "C" fn a32_exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_read_8(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_8(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_read_16(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_16(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_read_32(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_32(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_read_64(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_64(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_write_8(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_8(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,
@@ -1116,14 +1077,12 @@ extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value
 }
 extern "C" fn a32_exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_write_16(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_16(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,
@@ -1132,14 +1091,12 @@ extern "C" fn a32_exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, valu
 extern "C" fn a32_exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     maybe_log_a32_watch_write(inner, vaddr, 4, value, 0);
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_write_32(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_32(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,
@@ -1147,14 +1104,12 @@ extern "C" fn a32_exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, valu
 }
 extern "C" fn a32_exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let mut state = A32ExclusiveStateView {
-        jit_state: &mut inner.jit_state,
-        exclusive_value: &mut inner.exclusive_value,
-    };
-    a32_callbacks::exclusive_write_64(
-        &mut state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_64(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,

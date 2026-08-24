@@ -11729,11 +11729,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   of Eden's deferred fallback handler calling `EmitCheckMemoryAbort` before joining `end`.
 
 ### Unintentional differences (to fix)
-- Non-inline exclusive monitor coordination is still performed inside
-  `backend/common/a32_callbacks.rs`, whereas Eden emits the exclusive-state test/clear and calls
-  the global-monitor operation from `EmitExclusiveReadMemory`/`EmitExclusiveWriteMemory`. The
-  resulting behavior matches, but this remains a large method-ownership difference requiring a
-  separate callback-boundary refactor.
 - Fixed: all A32 memory emitters and the per-instruction fallback stub were owned by
   `a32_emit_a32.rs`/`a32_emit_x64.rs`; they now live in the counterpart memory module.
 - Fixed: `EmitCheckMemoryAbort` was absent. Callback, page-table fallback, direct-fastmem fallback,
@@ -11757,13 +11752,41 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   now use the byte-sized field semantics emitted by Eden.
 
 ### Missing items
-- The non-inline exclusive callback-boundary ownership refactor noted above remains to be ported as
-  a separate prerequisite.
 
 ### Binary layout verification
 - PASS: no `A32JitState` field or offset changed. Memory-abort tests verify the embedded A32 resume
   PC, upper descriptor, halt-reason offset, and disabled no-op path; the fallback inventory test
   verifies exactly `2 * 14 * 14 * 4` entries per scalar table and rejects 128-bit A32 entries.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{a32_emit_x64_memory,a32_interface}.rs` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}`
+
+### Intentional differences
+- Rust host trampolines recover `A32JitInner` in `a32_interface.rs`; the exclusive-monitor
+  operations corresponding to Eden's generated lambdas live beside the generated-code owner in
+  `a32_emit_x64_memory.rs`.
+- The shared callback container retains an unused clear-exclusive slot for the existing Rust FFI
+  boundary, while A32 generated code clears `A32JitState::exclusive_state` directly like Eden.
+
+### Unintentional differences (to fix)
+- Fixed: non-inline exclusive callbacks previously owned the generated-code reservation lifecycle
+  and maintained a private `exclusive_value`. The emitter now sets, tests, atomically consumes, and
+  clears `exclusive_state` in Eden's exact order, while the global monitor alone owns the expected
+  value.
+- Fixed: non-inline exclusive operations could run without a global monitor. Their emitters now
+  enforce Eden's `ASSERT(conf.global_monitor != nullptr)` precondition.
+- Fixed: scalar exclusive reads did not explicitly zero-extend the callback result after the host
+  call. They now apply Eden's per-width zero extension before the memory-abort check.
+- Fixed: the A32 differential-test harness could generate LDREX/STREX without configuring Eden's
+  required global monitor. Its one-CPU test configuration now owns a monitor for the complete JIT
+  lifetime.
+
+### Missing items
+- No missing item remains in the reviewed A32 scalar non-inline exclusive path.
+
+### Binary layout verification
+- PASS: the host-only private `exclusive_value` was removed from `A32JitInner`; the generated-code
+  `A32JitState` layout is unchanged. An executing LDREX/STREX/STREX regression verifies the global
+  monitor value, first-store success, reservation consumption, and second-store failure.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.rs` vs Eden `backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.{h,cpp}` (prelude lifecycle)
 

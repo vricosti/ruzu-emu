@@ -24,6 +24,8 @@ use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
 use crate::backend::x64::perf_map;
 use crate::backend::x64::reg_alloc::RegAlloc;
+use crate::interface::a32::config::UserCallbacks as A32UserCallbacks;
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
 use crate::interface::halt_reason::HaltReason;
 use crate::ir::inst::Inst;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
@@ -1131,6 +1133,130 @@ pub fn emit_a32_write_memory_64(
 // Exclusive memory operations
 // ---------------------------------------------------------------------------
 
+pub(crate) fn exclusive_read_8(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+) -> u64 {
+    unsafe {
+        (&mut *monitor).read_and_mark(processor_id, vaddr, || {
+            callbacks.memory_read_8(vaddr as u32)
+        }) as u64
+    }
+}
+
+pub(crate) fn exclusive_read_16(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+) -> u64 {
+    unsafe {
+        (&mut *monitor).read_and_mark(processor_id, vaddr, || {
+            callbacks.memory_read_16(vaddr as u32)
+        }) as u64
+    }
+}
+
+pub(crate) fn exclusive_read_32(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+) -> u64 {
+    unsafe {
+        (&mut *monitor).read_and_mark(processor_id, vaddr, || {
+            callbacks.memory_read_32(vaddr as u32)
+        }) as u64
+    }
+}
+
+pub(crate) fn exclusive_read_64(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+) -> u64 {
+    unsafe {
+        (&mut *monitor).read_and_mark(processor_id, vaddr, || {
+            callbacks.memory_read_64(vaddr as u32)
+        })
+    }
+}
+
+pub(crate) fn exclusive_write_8(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+    value: u64,
+) -> u64 {
+    if unsafe {
+        (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u8| {
+            callbacks.memory_write_exclusive_8(vaddr as u32, value as u8, expected)
+        })
+    } {
+        0
+    } else {
+        1
+    }
+}
+
+pub(crate) fn exclusive_write_16(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+    value: u64,
+) -> u64 {
+    if unsafe {
+        (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u16| {
+            callbacks.memory_write_exclusive_16(vaddr as u32, value as u16, expected)
+        })
+    } {
+        0
+    } else {
+        1
+    }
+}
+
+pub(crate) fn exclusive_write_32(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+    value: u64,
+) -> u64 {
+    if unsafe {
+        (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u32| {
+            callbacks.memory_write_exclusive_32(vaddr as u32, value as u32, expected)
+        })
+    } {
+        0
+    } else {
+        1
+    }
+}
+
+pub(crate) fn exclusive_write_64(
+    callbacks: &mut dyn A32UserCallbacks,
+    monitor: *mut ExclusiveMonitor,
+    processor_id: usize,
+    vaddr: u64,
+    value: u64,
+) -> u64 {
+    if unsafe {
+        (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u64| {
+            callbacks.memory_write_exclusive_64(vaddr as u32, value, expected)
+        })
+    } {
+        0
+    } else {
+        1
+    }
+}
+
 fn emit_a32_exclusive_read(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -1138,6 +1264,11 @@ fn emit_a32_exclusive_read(
     inst: &Inst,
     bitsize: usize,
 ) {
+    assert!(
+        ctx.config.global_monitor.is_some(),
+        "A32 exclusive read requires a global monitor"
+    );
+
     // Inline fast path: monitor + fastmem both configured. Mirrors upstream
     // `EmitExclusiveReadMemoryInline` (emit_x64_memory.cpp.inc:334-408).
     // Without this, every LDREX/LDAEX takes the trampoline path which costs
@@ -1152,18 +1283,17 @@ fn emit_a32_exclusive_read(
         return;
     }
 
-    // Set exclusive_state = 1
-    let excl_offset = A32JitState::offset_of_exclusive_state();
-    ra.asm
-        .mov(byte_ptr(RegExp::from(R15) + excl_offset as i32), 1i32)
-        .unwrap();
-
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     // args[2] is the AccType immediate. LDAEX uses Ordered.
     let ordered = is_ordered(args[2].value.get_acc_type());
     // args[0] = location descriptor (upper), args[1] = vaddr, args[2] = acc_type
     // ArgCallback: position 0 = None (context), position 1 = vaddr
     ra.host_call(Some(inst_ref), &mut [None, Some(&mut args[1]), None, None]);
+
+    let excl_offset = A32JitState::offset_of_exclusive_state();
+    ra.asm
+        .mov(byte_ptr(RegExp::from(R15) + excl_offset as i32), 1i32)
+        .unwrap();
     if ordered {
         // Drain pending stores before the exclusive load. Mirrors upstream
         // `EmitExclusiveReadMemory<bitsize>` ordered path in
@@ -1179,6 +1309,7 @@ fn emit_a32_exclusive_read(
         _ => unreachable!(),
     };
     callback.emit_call_simple(&mut *ra.asm).unwrap();
+    emit_zero_extend(ra.asm, bitsize, RAX);
     emit_check_memory_abort(ra.asm, memory_abort_info(ctx, inst), None);
 }
 
@@ -1286,6 +1417,11 @@ fn emit_a32_exclusive_write(
     inst: &Inst,
     bitsize: usize,
 ) {
+    assert!(
+        ctx.config.global_monitor.is_some(),
+        "A32 exclusive write requires a global monitor"
+    );
+
     // Inline fast path — see `emit_a32_exclusive_write_inline` doc comment.
     if ctx.config.memory.fastmem_exclusive_access
         && ctx.fastmem_available
@@ -1307,6 +1443,31 @@ fn emit_a32_exclusive_write(
         &mut [None, Some(&mut first[1]), Some(&mut rest[0]), None],
     );
 
+    let tmp = ra.scratch_gpr();
+    let end = ra.asm.create_label();
+    let excl_offset = A32JitState::offset_of_exclusive_state();
+
+    ra.asm.mov(RAX, 1i32).unwrap();
+    ra.asm
+        .movzx(
+            tmp.cvt32().unwrap(),
+            byte_ptr(RegExp::from(R15) + excl_offset as i32),
+        )
+        .unwrap();
+    ra.asm
+        .test(tmp.cvt8().unwrap(), tmp.cvt8().unwrap())
+        .unwrap();
+    ra.asm.je(&end, JmpType::Near).unwrap();
+    ra.asm
+        .xor_(tmp.cvt32().unwrap(), tmp.cvt32().unwrap())
+        .unwrap();
+    ra.asm
+        .xchg(
+            tmp.cvt8().unwrap(),
+            byte_ptr(RegExp::from(R15) + excl_offset as i32),
+        )
+        .unwrap();
+
     let callback = match bitsize {
         8 => &ctx.config.callbacks.exclusive_write_8,
         16 => &ctx.config.callbacks.exclusive_write_16,
@@ -1321,12 +1482,7 @@ fn emit_a32_exclusive_write(
         // `emit_x64_memory.cpp.inc:307-309`.
         ra.asm.mfence().unwrap();
     }
-
-    // Clear exclusive_state
-    let excl_offset = A32JitState::offset_of_exclusive_state();
-    ra.asm
-        .mov(byte_ptr(RegExp::from(R15) + excl_offset as i32), 0i32)
-        .unwrap();
+    ra.asm.bind(&end).unwrap();
     emit_check_memory_abort(ra.asm, memory_abort_info(ctx, inst), None);
 }
 

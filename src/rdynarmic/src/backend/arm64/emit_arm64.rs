@@ -1,4 +1,4 @@
-use crate::backend::arm64::abi::{XFASTMEM, XSTATE};
+use crate::backend::arm64::abi::XSTATE;
 use crate::backend::arm64::abi::{XSCRATCH0, XSCRATCH1, XSCRATCH2, XTICKS};
 use crate::backend::arm64::emit_arm64_a32::{
     emit_a32_bx_write_pc, emit_a32_call_supervisor, emit_a32_check_memory_abort, emit_a32_cond,
@@ -114,8 +114,6 @@ use crate::ir::cond::Cond;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
-#[cfg(test)]
-use crate::jit_config::JitConfig;
 
 pub type CodePtr = *const u8;
 
@@ -1981,16 +1979,20 @@ fn emitted_block_offset(
 mod tests {
     use super::*;
     use crate::frontend::a64::types::{Reg as A64Reg, Vec as A64Vec};
+    use crate::interface::a32::config::{
+        Exception as A32Exception, UserCallbacks as A32UserCallbacks,
+    };
+    use crate::interface::a64::config::{
+        Exception as A64Exception, UserCallbacks as A64UserCallbacks,
+    };
     use crate::ir::acc_type::AccType;
     use crate::ir::inst::Inst;
     use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
-    use crate::jit_config::UserCallbacks;
-    use std::collections::HashMap;
 
-    struct DummyCallbacks;
+    struct A64DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
+    impl A64UserCallbacks for A64DummyCallbacks {
         fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
             None
         }
@@ -2011,45 +2013,57 @@ mod tests {
             0
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_128(&self, _vaddr: u64) -> [u64; 2] {
+            [0, 0]
         }
 
         fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
         fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
         fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
+        fn memory_write_128(&mut self, _vaddr: u64, _value: [u64; 2]) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
+        fn add_ticks(&mut self, _ticks: u64) {}
 
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
+        fn get_ticks_remaining(&self) -> u64 {
+            0
         }
 
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
+        fn get_cntpct(&self) -> u64 {
+            0
+        }
+    }
+
+    struct A32DummyCallbacks;
+
+    impl A32UserCallbacks for A32DummyCallbacks {
+        fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
+            None
         }
 
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
+        fn memory_read_8(&self, _vaddr: u32) -> u8 {
+            0
         }
 
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
+        fn memory_read_16(&self, _vaddr: u32) -> u16 {
+            0
         }
 
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
+        fn memory_read_32(&self, _vaddr: u32) -> u32 {
+            0
         }
 
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn memory_read_64(&self, _vaddr: u32) -> u64 {
+            0
+        }
+
+        fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
+        fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
+        fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
+        fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
@@ -2057,36 +2071,30 @@ mod tests {
         }
     }
 
-    fn config(unsafe_optimizations: bool) -> JitConfig {
-        JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting: true,
-            code_cache_size: 0,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
-                | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR,
-            unsafe_optimizations,
-            global_monitor: None,
-            fastmem_pointer: Some(0x1000 as *mut u8),
-            page_table_pointer: Some(0x2000 as *const u8),
-            define_unpredictable_behaviour: false,
-            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: 3,
-            wall_clock_cntpct: true,
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn a64_config(unsafe_optimizations: bool) -> A64UserConfig {
+        let mut config = A64UserConfig::new(Box::new(A64DummyCallbacks));
+        config.fastmem_pointer = Some(0x1000 as *mut u8);
+        config.page_table = Some(0x2000 as *mut *mut std::ffi::c_void);
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        config.code_cache_size = 0;
+        config.processor_id = 3;
+        config.unsafe_optimizations = unsafe_optimizations;
+        config.wall_clock_cntpct = true;
+        config
     }
 
-    fn a64_config(unsafe_optimizations: bool) -> A64UserConfig {
-        config(unsafe_optimizations).into_a64_user_config()
+    fn a32_config(unsafe_optimizations: bool) -> A32UserConfig {
+        let mut config = A32UserConfig::new(Box::new(A32DummyCallbacks));
+        config.page_table = Some(0x2000 as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        config.fastmem_pointer = Some(0x1000 as *mut u8);
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        config.code_cache_size = 0;
+        config.processor_id = 3;
+        config.unsafe_optimizations = unsafe_optimizations;
+        config.wall_clock_cntpct = true;
+        config
     }
 
     fn empty_block_info(code: &BlockOfCode) -> EmittedBlockInfo {
@@ -2420,7 +2428,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a32_config(&config(false).into_a32_user_config()),
+            EmitConfig::from_a32_config(&a32_config(false)),
         )
         .expect("PushRSB block should emit");
 
@@ -2471,7 +2479,7 @@ mod tests {
 
     #[test]
     fn a32_emit_config_forces_32_bit_mirrored_memory_spaces() {
-        let mut a32_config = config(false).into_a32_user_config();
+        let mut a32_config = a32_config(false);
         a32_config.always_little_endian = true;
         a32_config.fastmem_exclusive_access = true;
         a32_config.recompile_on_exclusive_fastmem_failure = false;
@@ -3161,16 +3169,11 @@ mod tests {
             ],
         );
         let mut code = BlockOfCode::with_size(4096).unwrap();
-        let mut jit_config = config(false);
-        jit_config.fastmem_pointer = None;
-        jit_config.page_table_pointer = None;
+        let mut config = a32_config(false);
+        config.fastmem_pointer = None;
+        config.page_table = None;
 
-        let info = emit_arm64(
-            &mut code,
-            block,
-            EmitConfig::from_a32_config(&jit_config.into_a32_user_config()),
-        )
-        .unwrap();
+        let info = emit_arm64(&mut code, block, EmitConfig::from_a32_config(&config)).unwrap();
 
         assert_eq!(info.size, 20);
         assert_eq!(

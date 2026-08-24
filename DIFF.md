@@ -11025,3 +11025,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: the AArch64 test build enforces the A32 `u32` callback-address boundary; the existing
   emitter tests continue to verify generated instruction words and this slice serializes no guest
   payload.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_a32}.rs` vs Eden `backend/arm64/emit_arm64.{h,cpp}`, `backend/arm64/emit_arm64_a32.cpp`, and `interface/{A32,A64}/config.h` (dispatcher test ownership)
+
+### Intentional differences
+- Rust retains native instruction-word and relocation tests beside the corresponding shared and
+  A32 dispatcher implementations; their fallible code-buffer API does not change the upstream
+  emission ordering under test.
+
+### Unintentional differences (to fix)
+- Fixed: the shared dispatcher tests used one merged callback/configuration type for both guest
+  architectures. They now use separate A32 and A64 fixtures with their respective address widths,
+  vector representation, exception type, system callbacks, and configuration defaults.
+- Fixed: the A32 dispatcher tests converted a merged configuration at every context boundary.
+  Their helpers now own A32 `UserConfig` directly, including optimization, cycle-counting, and
+  memory-abort fields.
+- Fixed: `emit_arm64_a32.rs` imported `OptimizationFlag` through the compatibility module, and the
+  shared dispatcher retained an unused `XFASTMEM` import. The flag now comes from its interface
+  owner and the stale import is removed.
+
+### Missing items
+- The mixed-architecture test environment in `jit.rs` remains the final legacy merged-configuration
+  consumer before the compatibility layer can be removed.
+
+### Binary layout verification
+- PASS: the AArch64 test build enforces A32 `u32` addresses and A64 `[u64; 2]` vectors at the
+  dispatcher fixtures; existing tests continue to assert generated instruction words, JIT-state
+  offsets, relocation ordering, and A32's fixed 32-bit memory spaces.

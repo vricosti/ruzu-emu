@@ -45,25 +45,25 @@ pub fn arm_trace_after_watch() {
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
 /// Same mapping as in arm_dynarmic_64.rs.
-fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
+fn translate_halt_reason(hr: rdynarmic::HaltReason) -> HaltReason {
     let mut result = HaltReason::empty();
 
-    if hr.contains(rdynarmic::halt_reason::HaltReason::STEP) {
+    if hr.contains(rdynarmic::HaltReason::STEP) {
         result |= HaltReason::STEP_THREAD;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::MEMORY_ABORT) {
+    if hr.contains(rdynarmic::HaltReason::MEMORY_ABORT) {
         result |= HaltReason::DATA_ABORT;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::SVC) {
+    if hr.contains(rdynarmic::HaltReason::SVC) {
         result |= HaltReason::SUPERVISOR_CALL;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::BREAKPOINT) {
+    if hr.contains(rdynarmic::HaltReason::BREAKPOINT) {
         result |= HaltReason::INSTRUCTION_BREAKPOINT;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED) {
+    if hr.contains(rdynarmic::HaltReason::EXCEPTION_RAISED) {
         result |= HaltReason::PREFETCH_ABORT;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT) {
+    if hr.contains(rdynarmic::HaltReason::EXTERNAL_HALT) {
         result |= HaltReason::BREAK_LOOP;
     }
 
@@ -526,7 +526,7 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
                     "[A32TRACE] armed after watch write vaddr=0x{:08X} size={} value=0x{:X}",
                     vaddr as u32, size, value
                 );
-                cb.halt_execution(rdynarmic::halt_reason::HaltReason::USER_DEFINED2);
+                cb.halt_execution(rdynarmic::HaltReason::USER_DEFINED2);
             }
         }
     }
@@ -1997,14 +1997,14 @@ impl DynarmicCallbacks32 {
 
     /// Halt the jit execution with the given reason.
     /// This is the Rust equivalent of upstream's `m_parent.m_jit->HaltExecution(hr)`.
-    fn halt_execution(&self, reason: rdynarmic::halt_reason::HaltReason) {
+    fn halt_execution(&self, reason: rdynarmic::HaltReason) {
         if let Some(jit) = self.parent().jit.as_ref() {
             jit.halt_execution(reason);
         }
     }
 
     /// Matches upstream `DynarmicCallbacks32::ReturnException`.
-    fn return_exception(&self, pc: u32, reason: rdynarmic::halt_reason::HaltReason) {
+    fn return_exception(&self, pc: u32, reason: rdynarmic::HaltReason) {
         let parent = self.parent();
         let mut ctx = ThreadContext::default();
         parent.get_context(&mut ctx);
@@ -2054,7 +2054,7 @@ impl DynarmicCallbacks32 {
         };
         if !valid {
             log::error!("Stopping execution due to unmapped memory access at {addr:#x}");
-            self.halt_execution(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT);
+            self.halt_execution(rdynarmic::HaltReason::PREFETCH_ABORT);
             return false;
         }
 
@@ -2064,7 +2064,7 @@ impl DynarmicCallbacks32 {
 
         if let Some(watchpoint) = matching_watchpoint(&self.watchpoints, addr, size, access_type) {
             *self.halted_watchpoint.lock().unwrap() = Some(watchpoint);
-            self.halt_execution(rdynarmic::halt_reason::HaltReason::MEMORY_ABORT);
+            self.halt_execution(rdynarmic::HaltReason::MEMORY_ABORT);
             return false;
         }
 
@@ -2248,7 +2248,7 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
         // run literal/MOV pair scans once after the first SVC entry, so the
         // main module is loaded but boot is still early.
         maybe_run_one_shot_scans(self);
-        self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
+        self.halt_execution(rdynarmic::HaltReason::SVC);
     }
 
     fn exception_raised(&mut self, pc: u32, exception: A32Exception) {
@@ -2267,11 +2267,11 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
                 self.parent()
                     .last_exception_address
                     .store(pc as u64, Ordering::Relaxed);
-                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
+                self.halt_execution(rdynarmic::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
                 if self.debugger_enabled {
-                    self.return_exception(pc, rdynarmic::halt_reason::HaltReason::BREAKPOINT);
+                    self.return_exception(pc, rdynarmic::HaltReason::BREAKPOINT);
                     return;
                 }
 
@@ -2761,7 +2761,7 @@ impl ArmInterface for ArmDynarmic32 {
             if trace_limit > 0
                 && (current_pc >= start && current_pc < end || trace_search_limit > 0)
             {
-                let mut last_hr = rdynarmic::halt_reason::HaltReason::empty();
+                let mut last_hr = rdynarmic::HaltReason::empty();
                 let mut entered_range = current_pc >= start && current_pc < end;
                 let mut logged_steps = 0u32;
                 let total_limit = if entered_range {
@@ -2798,7 +2798,7 @@ impl ArmInterface for ArmDynarmic32 {
                         } else {
                             last_hr = jit.step();
                             if !last_hr.is_empty()
-                                && last_hr != rdynarmic::halt_reason::HaltReason::STEP
+                                && last_hr != rdynarmic::HaltReason::STEP
                             {
                                 if !quiet_search {
                                     log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
@@ -2852,11 +2852,11 @@ impl ArmInterface for ArmDynarmic32 {
                     logged_steps += 1;
                     last_hr = jit.step();
                     if std::env::var_os("RUZU_A32_TRACE_HALT_AFTER_WATCH").is_some()
-                        && last_hr.contains(rdynarmic::halt_reason::HaltReason::USER_DEFINED2)
+                        && last_hr.contains(rdynarmic::HaltReason::USER_DEFINED2)
                     {
-                        last_hr = rdynarmic::halt_reason::HaltReason::STEP;
+                        last_hr = rdynarmic::HaltReason::STEP;
                     }
-                    if !last_hr.is_empty() && last_hr != rdynarmic::halt_reason::HaltReason::STEP {
+                    if !last_hr.is_empty() && last_hr != rdynarmic::HaltReason::STEP {
                         log::info!("[A32TRACE] halt={:?}", last_hr);
                         break;
                     }
@@ -3040,7 +3040,7 @@ impl ArmInterface for ArmDynarmic32 {
 
     fn signal_interrupt(&mut self, _thread: &mut KThread) {
         if let Some(jit) = self.jit.as_ref() {
-            jit.halt_execution(rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT);
+            jit.halt_execution(rdynarmic::HaltReason::EXTERNAL_HALT);
         }
     }
 
@@ -3097,7 +3097,7 @@ mod tests {
     #[test]
     fn translate_halt_reason_includes_memory_abort() {
         assert_eq!(
-            translate_halt_reason(rdynarmic::halt_reason::HaltReason::MEMORY_ABORT),
+            translate_halt_reason(rdynarmic::HaltReason::MEMORY_ABORT),
             HaltReason::DATA_ABORT
         );
     }

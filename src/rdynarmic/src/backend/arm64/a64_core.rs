@@ -1,5 +1,5 @@
-use crate::halt_reason::HaltReason;
 use crate::interface::a64::config::UserConfig;
+use crate::interface::halt_reason::HaltReason;
 use crate::ir::location::A64LocationDescriptor;
 
 use super::a64_address_space::A64AddressSpace;

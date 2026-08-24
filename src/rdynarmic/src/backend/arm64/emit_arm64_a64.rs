@@ -12,7 +12,7 @@ use crate::backend::arm64::inst;
 use crate::backend::arm64::jit_state::A64JitState;
 use crate::backend::arm64::label::Label;
 use crate::backend::arm64::stack_layout::{RSBEntry, StackLayout, RSB_INDEX_MASK};
-use crate::halt_reason::HaltReason;
+use crate::interface::halt_reason::HaltReason;
 use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};

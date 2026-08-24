@@ -281,7 +281,7 @@ pub struct EmitConfig {
     /// reservation address, and the per-processor saved value — matching
     /// upstream's `GetExclusiveMonitorLockPointer` /
     /// `GetExclusiveMonitorAddressPointer` / `GetExclusiveMonitorValuePointer`.
-    pub global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+    pub global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
     /// Counter-timer frequency returned for `MRS CNTFRQ_EL0`.
     /// Upstream `A64::UserConfig::cntfrq_el0`; forwarded from the architecture-owned config.
     pub cntfrq_el0: u32,

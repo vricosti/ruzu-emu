@@ -11113,3 +11113,112 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   and cache operations, direct TLS/page-table pointer types, and A32 `u32` callback addresses.
   Focused A64 fastmem-fault, physical-counter, and exclusive-fallback execution tests pass; no
   serialized guest payload changed.
+
+## 2026-08-24 — `src/rdynarmic/src/common/spin_lock.rs` vs Eden `common/spin_lock.h` and `common/spin_lock_{x64,arm64}.cpp`
+
+### Intentional differences
+- Rust uses a four-byte `AtomicU32` rather than lazily generating host routines for ordinary
+  `SpinLock::lock` and `unlock`; acquire/release behavior and the x64 `xchg`/`mfence` strength are
+  retained without allocating an executable helper page.
+
+### Unintentional differences (to fix)
+- Fixed: `SpinLock` lived inside the root exclusive-monitor module instead of its upstream
+  `common/spin_lock` owner.
+- Fixed: the x64 ordinary unlock used only a release store; it now performs the upstream-equivalent
+  sequentially consistent exchange and fence.
+
+### Missing items
+- The AArch64 JIT-emitted `EmitSpinLockLock` and `EmitSpinLockUnlock` helpers remain part of the
+  broader arm64 exclusive-fastmem backend parity work.
+
+### Binary layout verification
+- PASS: a focused test verifies that `SpinLock` has the four-byte size and alignment required by
+  both upstream host emitters and Ruzu's generated x64 accesses.
+
+## 2026-08-24 — `src/rdynarmic/src/common/spin_lock_x64.rs` vs Eden `common/spin_lock_x64.{h,cpp}`
+
+### Intentional differences
+- Rust emits through `rxbyak::CodeAssembler` and uses its native `umonitor` encoder instead of
+  Eden's hand-written workaround for the historical Xbyak encoding bug.
+
+### Unintentional differences (to fix)
+- Fixed: the file lived under `backend/x64` even though upstream owns both declarations and
+  implementation under `common`.
+- Fixed: the acquire helper ignored WAITPKG and added a redundant explicit `lock` prefix to the
+  implicitly locked memory `xchg`; both paths now follow Eden's emitted sequence.
+
+### Missing items
+- None for the two reviewed x64 emission helpers.
+
+### Binary layout verification
+- N/A: this owner emits host instructions rather than a raw-copied payload. Focused byte-level
+  tests verify the PAUSE path, implicit-lock encoding, and UMONITOR/UMWAIT path.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/code_page.rs` vs Eden `interface/code_page.h`
+
+### Intentional differences
+- Rust expresses the public instruction array length with a constant expression over its native
+  `u32` size.
+
+### Unintentional differences (to fix)
+- Fixed: Ruzu had no counterpart for Eden's public `CodePage` declaration and constant.
+
+### Missing items
+- None for this declaration.
+
+### Binary layout verification
+- PASS: `CodePage` is `repr(C)` and tests verify a 4096-byte size with `u32` alignment.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/halt_reason.rs` vs Eden `interface/halt_reason.h`
+
+### Intentional differences
+- Rust uses `bitflags` for Eden's operators and retains named aliases mapping Ruzu core events onto
+  the corresponding upstream `UserDefined` bits.
+
+### Unintentional differences (to fix)
+- Fixed: the declaration lived at the crate root instead of its upstream `interface` owner; all
+  internal and external consumers now use the owned type or its top-level public re-export.
+
+### Missing items
+- None for the upstream flag inventory and bitwise operations.
+
+### Binary layout verification
+- PASS: focused tests verify the four-byte representation and upstream bit values.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/exclusive_monitor.rs` vs Eden `interface/exclusive_monitor.h` and host `exclusive_monitor.cpp` implementations
+
+### Intentional differences
+- Rust stores the fixed-at-construction address/value sequences in non-resizing `Vec`s rather than
+  Boost `static_vector`; the four-entry capacity is enforced and the host pointers remain stable.
+- `Copy` is Rust's bound for the trivially-copyable template payload, and `MaybeUninit` represents
+  Eden's uninitialized local before the exact-size `memcpy`.
+
+### Unintentional differences (to fix)
+- Fixed: the monitor lived at the crate root and also owned the unrelated `SpinLock` implementation.
+- Fixed: construction accepted more than Eden's four-core static capacity, and `read_and_mark`
+  cleared all sixteen reserved-value bytes before copying a smaller payload. It now enforces the
+  upstream capacity and copies only `size_of::<T>()` bytes.
+
+### Missing items
+- None for the reviewed public methods, constants, state, and host-independent lifecycle.
+
+### Binary layout verification
+- N/A: Eden's monitor is a host-only C++ class containing Boost storage and is not raw-copied.
+  Focused tests cover all supported widths, invalidation, clearing, and the capacity invariant.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/exclusive_monitor_friend.rs` vs Eden `backend/x64/exclusive_monitor_friend.h`
+
+### Intentional differences
+- Rust exposes the four friend operations as `unsafe` crate-local functions because raw-pointer
+  validity, index bounds, and stable monitor ownership are caller contracts.
+
+### Unintentional differences (to fix)
+- Fixed: the four friend operations were extra public methods on `ExclusiveMonitor`, obscuring the
+  upstream x64 owner. The emitter now calls the matching file-owned functions.
+
+### Missing items
+- None for the four friend accessors.
+
+### Binary layout verification
+- PASS: focused tests verify that the accessors address the monitor's four-byte lock storage,
+  processor count, reservation-address slots, and 128-bit value slots.

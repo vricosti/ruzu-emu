@@ -402,5 +402,5 @@ mod tests {
 }
 use std::ffi::c_void;
 
-use crate::exclusive_monitor::ExclusiveMonitor;
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
 use crate::interface::optimization_flags::OptimizationFlag;

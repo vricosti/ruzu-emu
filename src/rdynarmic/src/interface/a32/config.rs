@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::arch_version::ArchVersion;
 use super::coprocessor::Coprocessor;
-use crate::exclusive_monitor::ExclusiveMonitor;
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
 use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::a32_emitter::A32IREmitter;
 

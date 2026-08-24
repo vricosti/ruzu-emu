@@ -522,7 +522,7 @@ fn main() {
         }
 
         // Check for SVC (both sides should no-op it)
-        if rd_hr.contains(rdynarmic::halt_reason::HaltReason::SVC) {
+        if rd_hr.contains(rdynarmic::HaltReason::SVC) {
             eprintln!("  step {}: SVC hit, skipping", step);
             // Both sides no-op SVCs, so just continue
         }

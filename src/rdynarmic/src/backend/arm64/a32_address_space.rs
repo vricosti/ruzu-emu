@@ -4,12 +4,12 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use crate::backend::common::a32_callbacks::{self, A32ExclusiveState};
-use crate::exclusive_monitor::ExclusiveMonitor;
 use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
 use crate::frontend::a32::translate::{translate, TranslationOptions};
 use crate::interface::a32::config::{
     UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
 };
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
 use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};

@@ -3,10 +3,10 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use crate::halt_reason::HaltReason;
 use crate::interface::a32::config::{
     UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
 };
+use crate::interface::halt_reason::HaltReason;
 
 use super::a32_address_space::{A32AddressSpace, A32CallbackContext};
 use super::a32_core::A32Core;

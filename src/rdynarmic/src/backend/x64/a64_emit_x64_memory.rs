@@ -37,7 +37,7 @@ use crate::backend::x64::hostloc::HostLoc;
 use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::value_classify::{ir_value_is_vector_backed, ir_value_resolves_to_xmm};
-use crate::halt_reason::HaltReason;
+use crate::interface::halt_reason::HaltReason;
 use crate::ir::inst::Inst;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::value::InstRef;

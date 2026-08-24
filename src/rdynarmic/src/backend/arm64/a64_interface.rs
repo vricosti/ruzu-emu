@@ -3,8 +3,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use crate::halt_reason::HaltReason;
 use crate::interface::a64::config::{UserCallbacks, UserConfig};
+use crate::interface::halt_reason::HaltReason;
 
 use super::a64_address_space::{A64AddressSpace, A64CallbackContext};
 use super::a64_core::A64Core;

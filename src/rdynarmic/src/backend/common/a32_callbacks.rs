@@ -1,5 +1,5 @@
-use crate::exclusive_monitor::ExclusiveMonitor;
 use crate::interface::a32::config::{Exception, UserCallbacks};
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
 
 /// Minimal A32 exclusive-monitor state needed by host callback thunks.
 ///

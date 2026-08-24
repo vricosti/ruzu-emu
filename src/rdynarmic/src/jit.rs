@@ -12,7 +12,6 @@ use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
 use crate::frontend::a32::translate::TranslationOptions as A32TranslationOptions;
 use crate::frontend::a64::translate::TranslationOptions;
-use crate::halt_reason::HaltReason;
 use crate::interface::a32::config::{
     UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
 };
@@ -21,6 +20,7 @@ use crate::interface::a64::config::{
     InstructionCacheOperation as A64InstructionCacheOperation, UserCallbacks as A64UserCallbacks,
     UserConfig as A64UserConfig,
 };
+use crate::interface::halt_reason::HaltReason;
 #[cfg(test)]
 use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::location::LocationDescriptor;
@@ -42,7 +42,7 @@ struct JitInner {
     callbacks: Box<dyn A64UserCallbacks>,
     run_code_fn: Option<RunCodeFn>,
     is_executing: bool,
-    global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+    global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
     processor_id: usize,
 }
 
@@ -2828,7 +2828,7 @@ struct A32JitInner {
     callbacks: Box<dyn A32UserCallbacks>,
     run_code_fn: Option<RunCodeFn>,
     is_executing: bool,
-    global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+    global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
     processor_id: usize,
 }
 
@@ -4981,7 +4981,7 @@ mod tests {
 
     fn test_a64_inner(
         callbacks: MockCallbacks,
-        global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+        global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
         processor_id: usize,
     ) -> Box<JitInner> {
         Box::new(JitInner {
@@ -4997,7 +4997,7 @@ mod tests {
 
     #[test]
     fn test_a64_exclusive_trampolines_use_global_monitor_cross_core() {
-        let mut monitor = crate::exclusive_monitor::ExclusiveMonitor::new(2);
+        let mut monitor = crate::interface::exclusive_monitor::ExclusiveMonitor::new(2);
         let monitor_ptr = &mut monitor as *mut _;
         let mut core0 = test_a64_inner(
             MockCallbacks::from_memory(0x1000, vec![0; 0x100]),
@@ -5024,7 +5024,7 @@ mod tests {
 
     #[test]
     fn test_a64_exclusive_write_without_reservation_fails() {
-        let mut monitor = crate::exclusive_monitor::ExclusiveMonitor::new(1);
+        let mut monitor = crate::interface::exclusive_monitor::ExclusiveMonitor::new(1);
         let mut inner = test_a64_inner(
             MockCallbacks::from_memory(0x1000, vec![0; 0x100]),
             Some(&mut monitor as *mut _),
@@ -5532,7 +5532,9 @@ mod tests {
         memory[0x2018..0x2020].copy_from_slice(&old_hi.to_le_bytes());
         let fastmem_pointer = memory.as_mut_ptr();
         let memory = Arc::new(Mutex::new(memory));
-        let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
         let monitor_ptr = Some(&mut *monitor as *mut _);
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
@@ -5605,7 +5607,9 @@ mod tests {
         memory[0x1000..0x1004].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // svc #0
         let fastmem_pointer = memory.as_mut_ptr();
         let memory = Arc::new(Mutex::new(memory));
-        let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(0, memory)));
         config.enable_cycle_counting = false;
         config.code_cache_size = 4 * 1024 * 1024;
@@ -5652,7 +5656,9 @@ mod tests {
         memory[0x2018..0x2020].copy_from_slice(&old_hi.to_le_bytes());
         let memory = Arc::new(Mutex::new(memory));
         let fastmem = TestFastmemMapping::new(0x1_0000);
-        let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
             0,

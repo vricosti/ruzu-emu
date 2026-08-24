@@ -1,3 +1,5 @@
+//! Public JIT halt reasons from upstream `interface/halt_reason.h`.
+
 use bitflags::bitflags;
 
 bitflags! {
@@ -67,6 +69,7 @@ mod tests {
 
     #[test]
     fn test_halt_reason_values_match_upstream_dynarmic() {
+        assert_eq!(std::mem::size_of::<HaltReason>(), 4);
         assert_eq!(HaltReason::STEP.bits(), 0x0000_0001);
         assert_eq!(HaltReason::CACHE_INVALIDATION.bits(), 0x0000_0002);
         assert_eq!(HaltReason::MEMORY_ABORT.bits(), 0x0000_0004);

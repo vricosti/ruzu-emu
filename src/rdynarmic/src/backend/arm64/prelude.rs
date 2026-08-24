@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use crate::halt_reason::HaltReason;
+use crate::interface::halt_reason::HaltReason;
 use crate::ir::cond::Cond;
 
 use super::abi::{

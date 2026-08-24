@@ -1,5 +1,5 @@
-use crate::halt_reason::HaltReason;
 use crate::interface::a32::config::UserConfig as A32UserConfig;
+use crate::interface::halt_reason::HaltReason;
 use crate::ir::location::A32LocationDescriptor;
 
 use super::a32_address_space::A32AddressSpace;

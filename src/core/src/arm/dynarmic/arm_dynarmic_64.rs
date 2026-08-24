@@ -663,25 +663,25 @@ fn trace_unmapped_write_64(cb: &DynarmicCallbacks64, vaddr: u64, size: u64, valu
 ///   CACHE_INVALIDATION=16, EXTERNAL_HALT=32
 ///
 /// Corresponds to upstream `Core::TranslateHaltReason`.
-fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
+fn translate_halt_reason(hr: rdynarmic::HaltReason) -> HaltReason {
     let mut result = HaltReason::empty();
 
-    if hr.contains(rdynarmic::halt_reason::HaltReason::STEP) {
+    if hr.contains(rdynarmic::HaltReason::STEP) {
         result |= HaltReason::STEP_THREAD;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::MEMORY_ABORT) {
+    if hr.contains(rdynarmic::HaltReason::MEMORY_ABORT) {
         result |= HaltReason::DATA_ABORT;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::SVC) {
+    if hr.contains(rdynarmic::HaltReason::SVC) {
         result |= HaltReason::SUPERVISOR_CALL;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::BREAKPOINT) {
+    if hr.contains(rdynarmic::HaltReason::BREAKPOINT) {
         result |= HaltReason::INSTRUCTION_BREAKPOINT;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT) {
+    if hr.contains(rdynarmic::HaltReason::PREFETCH_ABORT) {
         result |= HaltReason::PREFETCH_ABORT;
     }
-    if hr.contains(rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT) {
+    if hr.contains(rdynarmic::HaltReason::EXTERNAL_HALT) {
         result |= HaltReason::BREAK_LOOP;
     }
 
@@ -819,7 +819,7 @@ impl DynarmicCallbacks64 {
     }
 
     /// Rust equivalent of upstream `m_parent.m_jit->HaltExecution(hr)`.
-    fn halt_execution(&self, reason: rdynarmic::halt_reason::HaltReason) {
+    fn halt_execution(&self, reason: rdynarmic::HaltReason) {
         if let Some(ptr) = self.halt_reason_ptr {
             unsafe { (&*ptr).fetch_or(reason.bits(), Ordering::SeqCst) };
         }
@@ -905,7 +905,7 @@ impl DynarmicCallbacks64 {
         };
         if !valid {
             log::error!("Stopping execution due to unmapped memory access at {addr:#x}");
-            self.halt_execution(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT);
+            self.halt_execution(rdynarmic::HaltReason::PREFETCH_ABORT);
             return false;
         }
 
@@ -915,7 +915,7 @@ impl DynarmicCallbacks64 {
 
         if let Some(watchpoint) = matching_watchpoint(&self.watchpoints, addr, size, access_type) {
             *self.halted_watchpoint.lock().unwrap() = Some(watchpoint);
-            self.halt_execution(rdynarmic::halt_reason::HaltReason::MEMORY_ABORT);
+            self.halt_execution(rdynarmic::HaltReason::MEMORY_ABORT);
             return false;
         }
 
@@ -2062,7 +2062,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
 
     fn call_svc(&mut self, svc_num: u32) {
         self.svc.store(svc_num, Ordering::Relaxed);
-        self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
+        self.halt_execution(rdynarmic::HaltReason::SVC);
     }
 
     fn exception_raised(&mut self, pc: u64, exception: A64Exception) {
@@ -2081,13 +2081,13 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                     "Cannot execute instruction at unmapped address {:#016x}",
                     pc
                 );
-                self.halt_execution(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT);
+                self.halt_execution(rdynarmic::HaltReason::PREFETCH_ABORT);
                 return;
             }
             A64Exception::Breakpoint => {
                 self.last_exception_address.store(pc, Ordering::Relaxed);
                 self.snapshot_context(pc);
-                self.halt_execution(rdynarmic::halt_reason::HaltReason::BREAKPOINT);
+                self.halt_execution(rdynarmic::HaltReason::BREAKPOINT);
                 return;
             }
             _ => {}
@@ -2506,7 +2506,7 @@ impl ArmInterface for ArmDynarmic64 {
         jit.clear_exclusive_state();
         let rdynarmic_hr = jit.run();
         if trace_a64_svc_regs_enabled()
-            && rdynarmic_hr.contains(rdynarmic::halt_reason::HaltReason::SVC)
+            && rdynarmic_hr.contains(rdynarmic::HaltReason::SVC)
         {
             eprintln!(
                 "[A64_SVC_HALT] svc=0x{:x} pc=0x{:016x} lr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x2=0x{:016x} x3=0x{:016x} x4=0x{:016x} x5=0x{:016x} x6=0x{:016x} x7=0x{:016x} x21=0x{:016x} x22=0x{:016x} x24=0x{:016x} x25=0x{:016x}",
@@ -2544,7 +2544,7 @@ impl ArmInterface for ArmDynarmic64 {
         jit.clear_exclusive_state();
         let rdynarmic_hr = jit.step();
         if trace_a64_svc_regs_enabled()
-            && rdynarmic_hr.contains(rdynarmic::halt_reason::HaltReason::SVC)
+            && rdynarmic_hr.contains(rdynarmic::HaltReason::SVC)
         {
             eprintln!(
                 "[A64_SVC_STEP] svc=0x{:x} pc=0x{:016x} lr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x2=0x{:016x} x3=0x{:016x} x4=0x{:016x} x5=0x{:016x} x6=0x{:016x} x7=0x{:016x} x21=0x{:016x} x22=0x{:016x} x24=0x{:016x} x25=0x{:016x}",
@@ -2734,7 +2734,7 @@ impl ArmInterface for ArmDynarmic64 {
     fn signal_interrupt(&mut self, _thread: &mut KThread) {
         // Upstream: m_jit->HaltExecution(BreakLoop)
         if let Some(jit) = self.jit.as_ref() {
-            jit.halt_execution(rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT);
+            jit.halt_execution(rdynarmic::HaltReason::EXTERNAL_HALT);
         }
     }
 
@@ -2885,12 +2885,12 @@ mod tests {
 
     #[test]
     fn translate_halt_reason_uses_upstream_a64_bits() {
-        let hr = rdynarmic::halt_reason::HaltReason::STEP
-            | rdynarmic::halt_reason::HaltReason::MEMORY_ABORT
-            | rdynarmic::halt_reason::HaltReason::SVC
-            | rdynarmic::halt_reason::HaltReason::BREAKPOINT
-            | rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT
-            | rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT;
+        let hr = rdynarmic::HaltReason::STEP
+            | rdynarmic::HaltReason::MEMORY_ABORT
+            | rdynarmic::HaltReason::SVC
+            | rdynarmic::HaltReason::BREAKPOINT
+            | rdynarmic::HaltReason::PREFETCH_ABORT
+            | rdynarmic::HaltReason::EXTERNAL_HALT;
         let translated = translate_halt_reason(hr);
         assert!(translated.contains(HaltReason::STEP_THREAD));
         assert!(translated.contains(HaltReason::DATA_ABORT));
@@ -2903,7 +2903,7 @@ mod tests {
     #[test]
     fn translate_halt_reason_ignores_legacy_exception_raised_bit() {
         let translated =
-            translate_halt_reason(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
+            translate_halt_reason(rdynarmic::HaltReason::EXCEPTION_RAISED);
         assert!(translated.is_empty());
     }
 
@@ -2950,7 +2950,7 @@ mod tests {
         );
         assert_ne!(
             halt_reason.load(Ordering::SeqCst)
-                & rdynarmic::halt_reason::HaltReason::MEMORY_ABORT.bits(),
+                & rdynarmic::HaltReason::MEMORY_ABORT.bits(),
             0
         );
     }

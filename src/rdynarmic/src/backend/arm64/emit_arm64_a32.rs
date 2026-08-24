@@ -14,7 +14,7 @@ use crate::backend::arm64::label::Label;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::backend::arm64::stack_layout::{RSBEntry, StackLayout, RSB_INDEX_MASK};
 use crate::frontend::a32::types::{ExtReg, Reg};
-use crate::halt_reason::HaltReason;
+use crate::interface::halt_reason::HaltReason;
 use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};

@@ -3,11 +3,11 @@ use std::ffi::c_void;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
-use crate::exclusive_monitor::ExclusiveMonitor;
 use crate::frontend::a64::translate::{translate, TranslationOptions};
 use crate::interface::a64::config::{
     DataCacheOperation, Exception, InstructionCacheOperation, UserCallbacks, UserConfig,
 };
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
 use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};

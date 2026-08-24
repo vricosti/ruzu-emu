@@ -6966,6 +6966,76 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn a64_cache_invalidation_matches_a_block_overlapping_in_its_middle() {
+        let code = [
+            0xd280_0020_u32, // movz x0, #1
+            0xd280_0040_u32, // movz x0, #2
+            0xd400_0001_u32, // svc #0
+        ];
+        let mut memory = vec![0_u8; 0x10000];
+        for (index, instruction) in code.into_iter().enumerate() {
+            memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let memory = Arc::new(Mutex::new(memory));
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            Arc::clone(&memory),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        let mut jit = A64Jit::new(config).unwrap();
+
+        jit.set_pc(0x1000);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 2);
+
+        memory.lock().unwrap()[4..8].copy_from_slice(&0xd280_0060_u32.to_le_bytes());
+        jit.invalidate_cache_range(0x1004, 4);
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1000);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 3);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a32_cache_invalidation_matches_a_block_overlapping_in_its_middle() {
+        let code = [
+            0xe3a0_0001_u32, // mov r0, #1
+            0xe3a0_0002_u32, // mov r0, #2
+            0xef00_0000_u32, // svc #0
+        ];
+        let mut memory = vec![0_u8; 0x10000];
+        for (index, instruction) in code.into_iter().enumerate() {
+            memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let memory = Arc::new(Mutex::new(memory));
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            Arc::clone(&memory),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        let mut jit = A32Jit::new(config).unwrap();
+
+        jit.set_pc(0x1000);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 2);
+
+        memory.lock().unwrap()[4..8].copy_from_slice(&0xe3a0_0003_u32.to_le_bytes());
+        jit.invalidate_cache_range(0x1004, 4);
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1000);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 3);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_jit_register_accessors() {
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
         config.enable_cycle_counting = false;

@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, EAX, EBP, EBX, ECX, R12, R15, RAX, RBP, RBX, RCX};
 
+use crate::backend::block_range_information::BlockRangeInformation;
 use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
 use crate::backend::x64::abi;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
@@ -71,6 +72,7 @@ pub struct A32EmitX64 {
     exception_handler: ExceptionHandler,
     pub code: BlockOfCode,
     pub cache: BlockCache,
+    block_ranges: BlockRangeInformation<u32>,
     pub dispatcher_labels: DispatcherLabels,
     pub emit_config: EmitConfig,
     pub run_code_callbacks: RunCodeCallbacks,
@@ -142,6 +144,7 @@ impl A32EmitX64 {
             exception_handler,
             code,
             cache: BlockCache::new(),
+            block_ranges: BlockRangeInformation::default(),
             dispatcher_labels,
             emit_config,
             run_code_callbacks: run_callbacks,
@@ -438,6 +441,9 @@ impl A32EmitX64 {
             }
         }
 
+        let end_location = A32LocationDescriptor::from_location(block.end_location());
+        self.block_ranges
+            .add_range(a32_loc.pc()..=end_location.pc().wrapping_sub(1), location);
         self.cache.insert(
             location,
             CachedBlock {
@@ -966,35 +972,16 @@ impl A32EmitX64 {
         self.clear_fast_dispatch_table();
         self.fastmem_patches.clear();
         self.cache.clear();
+        self.block_ranges.clear_cache();
         crate::backend::x64::perf_map::clear();
         self.code.clear_cache();
     }
 
     pub fn invalidate_range(&mut self, start: u64, length: u64) {
-        let end = start.wrapping_add(length);
-
-        let to_remove: Vec<LocationDescriptor> = self
-            .cache
-            .keys()
-            .filter(|loc| {
-                // A32 PC is in the lower 32 bits of the location descriptor
-                let pc = loc.value() & 0xFFFF_FFFF;
-                pc >= start && pc < end
-            })
-            .copied()
-            .collect();
-
-        for &loc in &to_remove {
-            self.unpatch(loc);
-            self.patch_table.remove(&loc);
-            self.invalidate_fast_dispatch_entry(loc);
-        }
-
-        let had_blocks = !self.cache.is_empty();
-        self.cache.invalidate_range(start, length);
-        if had_blocks && self.cache.is_empty() {
-            self.patch_table.clear();
-            self.code.clear_cache();
+        let start = start as u32;
+        let end = start.wrapping_add(length as u32).wrapping_sub(1);
+        for location in self.block_ranges.invalidate_ranges(&[start..=end]) {
+            self.invalidate_basic_block(location);
         }
     }
 }

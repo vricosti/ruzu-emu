@@ -254,21 +254,17 @@ fn emit_add(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
             ra.asm.adc(result_sized, op_arg).unwrap();
         }
     } else {
-        let op2 = ra.use_gpr(&mut args[1]);
-        let op2_sized = if bitsize == 32 {
-            op2.cvt32().unwrap()
-        } else {
-            op2
-        };
+        let mut op2 = ra.use_op_arg(&mut args[1]);
+        op2.set_bit(bitsize as u16);
         if carry_in_is_zero {
-            ra.asm.add(result_sized, op2_sized).unwrap();
+            ra.asm.add(result_sized, op2).unwrap();
         } else if args[2].is_immediate() && args[2].get_immediate_u1() {
             ra.asm.stc().unwrap();
-            ra.asm.adc(result_sized, op2_sized).unwrap();
+            ra.asm.adc(result_sized, op2).unwrap();
         } else {
             let carry = ra.use_gpr(&mut args[2]);
             ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
-            ra.asm.adc(result_sized, op2_sized).unwrap();
+            ra.asm.adc(result_sized, op2).unwrap();
         }
     }
 
@@ -382,13 +378,9 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
                 .cmp(result_sized, args[1].get_immediate_u32())
                 .unwrap();
         } else {
-            let op2 = ra.use_gpr(&mut args[1]);
-            let op2_sized = if bitsize == 32 {
-                op2.cvt32().unwrap()
-            } else {
-                op2
-            };
-            ra.asm.cmp(result_sized, op2_sized).unwrap();
+            let mut op2 = ra.use_op_arg(&mut args[1]);
+            op2.set_bit(bitsize as u16);
+            ra.asm.cmp(result_sized, op2).unwrap();
         }
     } else if args[1].is_immediate() && args[1].get_type() == Type::U32 {
         let op_arg = args[1].get_immediate_u32();
@@ -409,24 +401,20 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
             invert_output_carry = false;
         }
     } else {
-        let op2 = ra.use_gpr(&mut args[1]);
-        let op2_sized = if bitsize == 32 {
-            op2.cvt32().unwrap()
-        } else {
-            op2
-        };
+        let mut op2 = ra.use_op_arg(&mut args[1]);
+        op2.set_bit(bitsize as u16);
         if carry_in_is_one {
-            ra.asm.sub(result_sized, op2_sized).unwrap();
+            ra.asm.sub(result_sized, op2).unwrap();
         } else if args[2].is_immediate() {
             // carry_in=0: a + NOT(b) + 0 — use STC;SBB
             ra.asm.stc().unwrap();
-            ra.asm.sbb(result_sized, op2_sized).unwrap();
+            ra.asm.sbb(result_sized, op2).unwrap();
         } else {
             // Dynamic carry: bt carry, 0; cmc; sbb result, op2
             let carry = ra.use_gpr(&mut args[2]);
             ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
             ra.asm.cmc().unwrap();
-            ra.asm.sbb(result_sized, op2_sized).unwrap();
+            ra.asm.sbb(result_sized, op2).unwrap();
         }
     }
 
@@ -477,10 +465,9 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
 pub fn emit_mul32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_gpr(&mut args[0]);
-    let op2 = ra.use_gpr(&mut args[1]);
-    ra.asm
-        .imul(result.cvt32().unwrap(), op2.cvt32().unwrap())
-        .unwrap();
+    let mut op2 = ra.use_op_arg(&mut args[1]);
+    op2.set_bit(32);
+    ra.asm.imul(result.cvt32().unwrap(), op2).unwrap();
     ra.define_value(inst_ref, result);
 }
 
@@ -488,7 +475,7 @@ pub fn emit_mul32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst
 pub fn emit_mul64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_gpr(&mut args[0]);
-    let op2 = ra.use_gpr(&mut args[1]);
+    let op2 = ra.use_op_arg(&mut args[1]);
     ra.asm.imul(result, op2).unwrap();
     ra.define_value(inst_ref, result);
 }
@@ -517,7 +504,7 @@ pub fn emit_signed_multiply_high_64(
 
     let rdx = ra.scratch_gpr_at(HOST_RDX);
     ra.use_scratch(&mut args[0], HOST_RAX);
-    let op2 = ra.use_gpr(&mut args[1]);
+    let op2 = ra.use_op_arg(&mut args[1]);
 
     // Single-operand signed multiply: RDX:RAX = RAX * op2
     ra.asm.imul_1op(op2).unwrap();
@@ -538,7 +525,7 @@ pub fn emit_unsigned_multiply_high_64(
 
     let rdx = ra.scratch_gpr_at(HOST_RDX);
     ra.use_scratch(&mut args[0], HOST_RAX);
-    let op2 = ra.use_gpr(&mut args[1]);
+    let op2 = ra.use_op_arg(&mut args[1]);
 
     // Single-operand mul
     ra.asm.mul(op2).unwrap();
@@ -699,16 +686,12 @@ fn emit_binop(ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bitsize: usize,
             BinOp::Eor => ra.asm.xor_(result_sized, imm).unwrap(),
         }
     } else {
-        let op2 = ra.use_gpr(&mut args[1]);
-        let op2_sized = if bitsize == 32 {
-            op2.cvt32().unwrap()
-        } else {
-            op2
-        };
+        let mut op2 = ra.use_op_arg(&mut args[1]);
+        op2.set_bit(bitsize as u16);
         match op {
-            BinOp::And => ra.asm.and_(result_sized, op2_sized).unwrap(),
-            BinOp::Or => ra.asm.or_(result_sized, op2_sized).unwrap(),
-            BinOp::Eor => ra.asm.xor_(result_sized, op2_sized).unwrap(),
+            BinOp::And => ra.asm.and_(result_sized, op2).unwrap(),
+            BinOp::Or => ra.asm.or_(result_sized, op2).unwrap(),
+            BinOp::Eor => ra.asm.xor_(result_sized, op2).unwrap(),
         }
     }
     ra.define_value(inst_ref, result);
@@ -743,13 +726,28 @@ pub fn emit_and_not32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, i
         return;
     }
 
-    let op2 = ra.use_scratch_gpr(&mut args[1]);
-    ra.asm.not_(op2.cvt32().unwrap()).unwrap();
-    let op1 = ra.use_gpr(&mut args[0]);
-    ra.asm
-        .and_(op2.cvt32().unwrap(), op1.cvt32().unwrap())
-        .unwrap();
-    ra.define_value(inst_ref, op2);
+    let result = if args[1].is_immediate() {
+        let result = ra.scratch_gpr();
+        ra.asm
+            .mov(result.cvt32().unwrap(), !args[1].get_immediate_u32())
+            .unwrap();
+        result
+    } else {
+        let result = ra.use_scratch_gpr(&mut args[1]);
+        ra.asm.not_(result.cvt32().unwrap()).unwrap();
+        result
+    };
+
+    if args[0].is_immediate() {
+        ra.asm
+            .and_(result.cvt32().unwrap(), args[0].get_immediate_u32())
+            .unwrap();
+    } else {
+        let mut op_arg = ra.use_op_arg(&mut args[0]);
+        op_arg.set_bit(32);
+        ra.asm.and_(result.cvt32().unwrap(), op_arg).unwrap();
+    }
+    ra.define_value(inst_ref, result);
 }
 
 /// AndNot64: result = a & ~b
@@ -765,11 +763,28 @@ pub fn emit_and_not64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, i
         return;
     }
 
-    let op2 = ra.use_scratch_gpr(&mut args[1]);
-    ra.asm.not_(op2).unwrap();
-    let op1 = ra.use_gpr(&mut args[0]);
-    ra.asm.and_(op2, op1).unwrap();
-    ra.define_value(inst_ref, op2);
+    let result = if args[1].is_immediate() {
+        let result = ra.scratch_gpr();
+        ra.asm
+            .mov(result, !args[1].get_immediate_u64() as i64)
+            .unwrap();
+        result
+    } else {
+        let result = ra.use_scratch_gpr(&mut args[1]);
+        ra.asm.not_(result).unwrap();
+        result
+    };
+
+    if args[0].fits_in_immediate_s32() {
+        ra.asm
+            .and_(result, args[0].get_immediate_s32() as u32)
+            .unwrap();
+    } else {
+        let mut op_arg = ra.use_op_arg(&mut args[0]);
+        op_arg.set_bit(64);
+        ra.asm.and_(result, op_arg).unwrap();
+    }
+    ra.define_value(inst_ref, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -2388,6 +2403,46 @@ mod tests {
         ra.end_of_alloc_scope();
 
         assert!(ra.asm.size() > start, "Should have emitted code for add32");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn and_not_immediate_paths_match_upstream_results() {
+        fn execute(opcode: Opcode, lhs: Value, rhs: Value) -> u64 {
+            let mut asm = CodeAssembler::new(4096).unwrap();
+            let mut ra = RegAlloc::new_default(&mut asm, make_inst_info(1));
+            let inst = Inst::new(opcode, &[lhs, rhs]);
+            let config = dummy_emit_config();
+            let ctx = EmitContext::new(LocationDescriptor::new(0), &config);
+
+            match opcode {
+                Opcode::AndNot32 => emit_and_not32(&ctx, &mut ra, InstRef(0), &inst),
+                Opcode::AndNot64 => emit_and_not64(&ctx, &mut ra, InstRef(0), &inst),
+                _ => unreachable!(),
+            }
+            ra.asm.ret().unwrap();
+            ra.asm.ready().unwrap();
+
+            let function: extern "C" fn() -> u64 = unsafe { ra.asm.get_code() };
+            function()
+        }
+
+        let lhs32 = 0xF0FF_0FF0u32;
+        let rhs32 = 0x00F0_F00Fu32;
+        assert_eq!(
+            execute(Opcode::AndNot32, Value::ImmU32(lhs32), Value::ImmU32(rhs32),),
+            (lhs32 & !rhs32) as u64,
+        );
+
+        let lhs64_small = 0x7FFF_00FFu64;
+        let lhs64_large = 0xF0FF_0FF0_FFFF_00FFu64;
+        let rhs64 = 0x00F0_F00F_0000_F0F0u64;
+        for lhs64 in [lhs64_small, lhs64_large] {
+            assert_eq!(
+                execute(Opcode::AndNot64, Value::ImmU64(lhs64), Value::ImmU64(rhs64),),
+                lhs64 & !rhs64,
+            );
+        }
     }
 
     #[test]

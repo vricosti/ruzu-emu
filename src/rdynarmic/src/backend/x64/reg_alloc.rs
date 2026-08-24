@@ -6,6 +6,7 @@ use crate::backend::x64::constant_pool::ConstantPool;
 use crate::backend::x64::abi;
 use crate::backend::x64::block_of_code::STACK_LAYOUT_RSP_OFFSET;
 use crate::backend::x64::hostloc::*;
+use crate::backend::x64::oparg::OpArg;
 use crate::backend::x64::stack_layout::{StackLayout, SPILL_COUNT};
 use crate::ir::cond::Cond;
 use crate::ir::inst::MAX_ARGS;
@@ -480,6 +481,10 @@ impl<'a> RegAlloc<'a> {
         arg.allocated = true;
         let loc = self.use_impl(arg.value, &self.gpr_order.clone());
         loc.to_reg64()
+    }
+
+    pub fn use_op_arg(&mut self, arg: &mut Argument) -> OpArg {
+        OpArg::from(self.use_gpr(arg))
     }
 
     /// Use a value in an XMM register (read-only). Returns the XMM register.

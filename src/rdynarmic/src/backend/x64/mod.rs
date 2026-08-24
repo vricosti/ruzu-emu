@@ -46,6 +46,7 @@ pub mod host_feature;
 pub mod hostloc;
 pub mod jitstate_info;
 pub mod nzcv_util;
+pub mod oparg;
 #[cfg(feature = "profile_opcodes")]
 pub mod opcode_profile;
 pub mod patch_info;

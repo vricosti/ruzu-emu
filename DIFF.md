@@ -11811,6 +11811,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: `FpFixup`, `FpRangeSelect`, and `FpRangeSign` use `repr(u8)` and exhaustive tests verify all
   discriminants, bitmasks, LUT bit placement, aliases, and rounding immediates.
 
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/oparg.rs` vs Eden `backend/x64/oparg.h`
+
+### Intentional differences
+- Rust stores the register-or-address alternatives in `RegMem` rather than a manually tagged C++
+  union. The default/uninitialized C++ `Operand` state is represented by `None` and rejected when
+  consumed; every upstream `UseOpArg` consumer initializes the wrapper before use.
+- Rust passes the copyable wrapper through rxbyak's `Into<RegMem>` boundary rather than exposing
+  C++ dereference operators. `set_bit` retains the same register conversion and address-size
+  behavior.
+- `EmitMul32` materializes an immediate second operand before the two-operand `imul`, because the
+  Rust rxbyak surface does not expose Xbyak's three-operand immediate overload. The resulting
+  lower 32-bit value is identical; only the emitted instruction sequence differs.
+
+### Unintentional differences (to fix)
+- Fixed: the matching owner and `RegAlloc::UseOpArg` boundary were absent. Add/sub, multiply,
+  multiply-high, AND/OR/EOR, and AND-NOT consumers now use the wrapper at all 15 upstream sites
+  instead of duplicating register-width conversion locally.
+- Fixed: both AND-NOT emitters materialized immediate operands through the generic register path.
+  They now preserve Eden's immediate `MOV`/`AND` branches and their exact signed-32-bit selection
+  rule for the 64-bit operation.
+
+### Missing items
+- None in the reviewed `OpArg` owner or its current `emit_x64_data_processing.cpp` consumers.
+
+### Binary layout verification
+- N/A: `OpArg` is an emission-time tagged operand and is never serialized or copied into guest/JIT
+  state. Focused tests cover the default state, all four upstream GPR widths, address-size changes
+  without altering the address expression, and executing immediate AND-NOT paths.
+
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.rs` vs Eden `backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.{h,cpp}` (prelude lifecycle)
 
 ### Intentional differences

@@ -30,8 +30,8 @@ use crate::backend::x64::emit_context::{
 };
 use crate::backend::x64::emit_terminal::emit_jmp_to_offset;
 use crate::backend::x64::emit_x64_memory::{
-    emit_fastmem_vaddr_a64, emit_read_memory_mov, emit_vaddr_lookup_a64, emit_write_memory_mov,
-    is_ordered,
+    emit_call_to_offset, emit_fastmem_vaddr_a64, emit_read_memory_mov, emit_vaddr_lookup_a64,
+    emit_write_memory_mov, is_ordered,
 };
 use crate::backend::x64::exception_handler::{DoNotFastmemMarker, FastmemPatchInfo};
 use crate::backend::x64::hostloc::HostLoc;
@@ -604,19 +604,6 @@ fn emit_zero_extend(asm: &mut CodeAssembler, bitsize: usize, reg: Reg) {
 // exclusive inline accesses use this module's 128-bit fallback entries from
 // `emit_exclusive_memory.rs`.
 // ---------------------------------------------------------------------------
-
-/// Emit a `call rel32` to a target byte offset within the same code
-/// buffer. Used by deferred-emit closures to jump to the pre-generated
-/// fallback stubs.
-///
-/// Encoding: `0xE8 rel32` where `rel32 = target - (current + 5)`.
-pub(crate) fn emit_call_to_offset(asm: &mut CodeAssembler, target_offset: usize) {
-    let current = asm.size();
-    let rel32 = (target_offset as i64) - (current as i64 + 5);
-    asm.db(0xE8).unwrap();
-    let rel32_le = (rel32 as i32) as u32;
-    asm.dd(rel32_le).unwrap();
-}
 
 /// Matches upstream `A64EmitX64::ShouldFastmem`.
 pub(crate) fn should_fastmem(ctx: &EmitContext, inst_ref: InstRef) -> Option<DoNotFastmemMarker> {

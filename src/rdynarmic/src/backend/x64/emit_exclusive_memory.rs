@@ -1,8 +1,10 @@
 use crate::backend::x64::a64_emit_x64_memory::{
-    emit_a64_check_memory_abort, emit_call_to_offset, should_fastmem, FastmemFallbacksTable,
+    emit_a64_check_memory_abort, should_fastmem, FastmemFallbacksTable,
 };
 use crate::backend::x64::emit_context::EmitContext;
-use crate::backend::x64::emit_x64_memory::{emit_fastmem_vaddr_a64, emit_read_memory_mov};
+use crate::backend::x64::emit_x64_memory::{
+    emit_call_to_offset, emit_fastmem_vaddr_a64, emit_read_memory_mov,
+};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::common::spin_lock_x64::{emit_spin_lock_lock, emit_spin_lock_unlock};
 use crate::ir::inst::Inst;

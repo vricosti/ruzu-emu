@@ -1,14 +1,7 @@
-//! Shared memory-emit helpers for the A64 (and potentially A32) fastmem
-//! / page-table paths.
+//! Shared memory-emit helpers for the A32 and A64 fastmem / page-table paths.
 //!
 //! Port of upstream `dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h`
 //! (anonymous-namespace inline templates instantiated by both A32 and A64).
-//!
-//! The current rdynarmic A32 fastmem path is per-emission and lives in
-//! `a32_emit_a32.rs`; it does NOT use these helpers. Per the porting
-//! decision (option A, A64-only initially), only the A64-specialised
-//! variants are implemented here. The A32 specialisations are left as
-//! `unimplemented!()` stubs for future migration.
 //!
 //! ## Layout
 //!
@@ -42,6 +35,16 @@ use crate::ir::acc_type::AccType;
 pub const PAGE_BITS: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_BITS;
 pub const PAGE_MASK: usize = PAGE_SIZE - 1;
+
+/// Mechanical equivalent of an intra-buffer call emitted through Xbyak.
+/// Rust stores generated fallback addresses as byte offsets, so both
+/// architecture owners use this encoding helper when binding deferred paths.
+pub fn emit_call_to_offset(asm: &mut CodeAssembler, target_offset: usize) {
+    let current = asm.size();
+    let rel32 = target_offset as i64 - (current as i64 + 5);
+    asm.db(0xE8).unwrap();
+    asm.dd(rel32 as i32 as u32).unwrap();
+}
 
 /// Whether the access type makes a memory access "ordered" (requires
 /// fence semantics).

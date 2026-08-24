@@ -39,39 +39,6 @@ pub struct DeferredEmitCtx<'a> {
 /// One deferred-emit closure. Drained after the main block is emitted.
 pub type DeferredEmit = Box<dyn FnOnce(&mut DeferredEmitCtx<'_>)>;
 
-/// Info about a fastmem instruction recorded during emission.
-#[derive(Clone, Debug)]
-pub struct FastmemEntry {
-    /// Code offset of the fastmem mov instruction (relative to code base).
-    pub inst_offset: usize,
-    /// Code offset right after the fastmem instruction (resume point).
-    pub resume_offset: usize,
-    /// Bit size of the memory access (8, 16, 32, 64).
-    pub bitsize: usize,
-    /// Whether this is a write (true) or read (false).
-    pub is_write: bool,
-    /// Whether the access belongs to an inline exclusive sequence. Faulting
-    /// exclusive writes must call the raw compare-and-store callback because
-    /// the generated code already holds the monitor lock.
-    pub is_exclusive: bool,
-    /// Whether this access is `AccType::Ordered` (LDA / STL / LDAEX / STLEX).
-    /// When true, the slow-path stub emits `mfence` around the callback
-    /// (before for reads, after for writes), matching upstream
-    /// `GenFastmemFallbacks` in `a32_emit_x64_memory.cpp:60-96`.
-    pub ordered: bool,
-    /// Register index holding the virtual address (0=RAX, 1=RCX, etc.).
-    pub vaddr_reg: u8,
-    /// Register index for the value (result for reads, source for writes).
-    pub value_reg: u8,
-    /// Identifies this memory microinstruction within its source block.
-    ///
-    /// Matches upstream `DoNotFastmemMarker` and is used to disable only this
-    /// access when its direct fastmem instruction faults.
-    pub marker: crate::backend::x64::exception_handler::DoNotFastmemMarker,
-    /// Fault policy selected for this ordinary or exclusive access.
-    pub recompile: bool,
-}
-
 /// Architecture-specific configuration for terminal emission.
 ///
 /// Provides the correct JitState field offsets and location descriptor
@@ -348,13 +315,6 @@ pub struct EmitContext<'a> {
     pub do_not_fastmem: Option<
         &'a std::collections::HashSet<crate::backend::x64::exception_handler::DoNotFastmemMarker>,
     >,
-    /// Fastmem instruction info collected during emission.
-    /// Converted to absolute RIPs and fallback stubs after block emission.
-    ///
-    /// Used by the existing per-emission A32 fastmem path; the upstream-
-    /// faithful A64 path does not populate this and uses `deferred_emits`
-    /// instead to record patches.
-    pub fastmem_entries: RefCell<Vec<FastmemEntry>>,
     /// Closures to run after the main block has been emitted, to emit
     /// abort/fallback handlers for fastmem and page-table memory accesses.
     ///
@@ -407,7 +367,6 @@ impl<'a> EmitContext<'a> {
             has_bx_write_pc: false,
             fastmem_available: false,
             do_not_fastmem: None,
-            fastmem_entries: RefCell::new(Vec::new()),
             deferred_emits: RefCell::new(Vec::new()),
             fastmem_fallbacks: None,
             prologue_counter_addr: std::cell::Cell::new(None),
@@ -446,7 +405,6 @@ impl<'a> EmitContext<'a> {
             has_bx_write_pc: false,
             fastmem_available: false,
             do_not_fastmem: None,
-            fastmem_entries: RefCell::new(Vec::new()),
             deferred_emits: RefCell::new(Vec::new()),
             fastmem_fallbacks: None,
             prologue_counter_addr: std::cell::Cell::new(None),

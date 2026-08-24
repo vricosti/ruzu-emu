@@ -11715,3 +11715,52 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: no state layout changed; the executing A32 scalar-saturation regression confirms `cpsr_q`
   remains exactly zero or one after SSAT/USAT/QADD-family flag updates.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_x64_memory.rs` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}` and `a32_emit_x64.h`
+
+### Intentional differences
+- Rust expresses Eden's member methods as architecture-owned free functions. The A32 fallback-table
+  loop, scalar stub primitives, and three fallback maps all live in this file; only the mechanical
+  intra-buffer relative-call encoder is shared with A64.
+- Opt-in `RUZU_*` diagnostic traps and tracing remain in the A32 memory owner. They emit no code
+  unless explicitly selected through the environment and preserve the normal upstream path.
+- Faulting direct-fastmem instructions resume at an inline memory-abort check when that check is
+  enabled; normal fastmem execution jumps over it. This is the Rust exception-handler counterpart
+  of Eden's deferred fallback handler calling `EmitCheckMemoryAbort` before joining `end`.
+
+### Unintentional differences (to fix)
+- Non-inline exclusive monitor coordination is still performed inside
+  `backend/common/a32_callbacks.rs`, whereas Eden emits the exclusive-state test/clear and calls
+  the global-monitor operation from `EmitExclusiveReadMemory`/`EmitExclusiveWriteMemory`. The
+  resulting behavior matches, but this remains a large method-ownership difference requiring a
+  separate callback-boundary refactor.
+- Fixed: all A32 memory emitters and the per-instruction fallback stub were owned by
+  `a32_emit_a32.rs`/`a32_emit_x64.rs`; they now live in the counterpart memory module.
+- Fixed: `EmitCheckMemoryAbort` was absent. Callback, page-table fallback, direct-fastmem fallback,
+  and exclusive paths now test `MemoryAbort`, restore the exact A32 PC/upper descriptor, and force
+  a dispatcher return in Eden's ordering.
+- Fixed: exclusive inline selection ignored `fastmem_exclusive_access`; disabled configurations
+  now use the callback path as upstream requires.
+- Fixed: inline exclusive reads used an unordered MOV and unordered fallback. They now use Eden's
+  always-ordered `lock xadd` sequence and ordered callback stub for every scalar width.
+- Fixed: a `do_not_fastmem` marker selected the entire non-inline exclusive path. The inline owner
+  now retains Eden's monitor lock/address/value lifecycle and calls the pre-generated fallback
+  under that lock when only the individual fastmem instruction has been disabled.
+- Fixed: A32 reused the A64 fallback generator and emitted unused 128-bit tables. Its owner now
+  generates exactly the upstream 8/16/32/64 inventory and registers Eden's exact per-width perf
+  symbol names.
+- Fixed: exclusive fastmem faults generated a second per-instruction callback stub, and exclusive
+  writes resumed directly after `cmpxchg`, where callback-modified host flags could produce a
+  wrong status. All A32 accesses now use the architecture-owned pre-generated tables; exclusive
+  write faults resume in Eden's explicit `AL`-to-status continuation before unlocking.
+- Fixed: generated accesses to `exclusive_state` used dword operations. Clear/set/test operations
+  now use the byte-sized field semantics emitted by Eden.
+
+### Missing items
+- The non-inline exclusive callback-boundary ownership refactor noted above remains to be ported as
+  a separate prerequisite.
+
+### Binary layout verification
+- PASS: no `A32JitState` field or offset changed. Memory-abort tests verify the embedded A32 resume
+  PC, upper descriptor, halt-reason offset, and disabled no-op path; the fallback inventory test
+  verifies exactly `2 * 14 * 14 * 4` entries per scalar table and rejects 128-bit A32 entries.

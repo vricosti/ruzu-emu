@@ -11052,3 +11052,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: the AArch64 test build enforces A32 `u32` addresses and A64 `[u64; 2]` vectors at the
   dispatcher fixtures; existing tests continue to assert generated instruction words, JIT-state
   offsets, relocation ordering, and A32's fixed 32-bit memory spaces.
+
+## 2026-08-24 — `src/rdynarmic/src/jit.rs` vs Eden `interface/A32/{a32,config}.h` and `backend/{x64,arm64}/a32_interface.cpp` (A32 test configuration ownership)
+
+### Intentional differences
+- Rust keeps its cross-backend native regression tests in the public JIT wrapper while Eden's
+  backend interfaces are separate translation units. The fixtures now expose the A32-owned
+  configuration and callback boundary directly despite that existing harness placement.
+- The Rust JIT constructors remain fallible because executable-memory allocation and code
+  generation report errors instead of relying on C++ assertions.
+
+### Unintentional differences (to fix)
+- Fixed: 42 A32 JIT fixtures constructed the obsolete architecture-merged `JitConfig`, including
+  A64-only timer, cache-register, cache-hook, TLS, and 128-bit callback fields. They now construct
+  A32 `UserConfig` directly with `u32` guest addresses and the A32-owned memory-policy fields.
+- Fixed: the page-table fixtures reached A32 through a typeless compatibility pointer. They now
+  expose the upstream 1,048,576-entry A32 page-table pointer type and preserve the configured
+  entry stride, pointer mask, misalignment, absolute-offset, fastmem fallback, and halt policies.
+
+### Missing items
+- The A64 fixtures in the same Rust-native test module still construct the merged compatibility
+  configuration. The common mock behavior still delegates through its legacy callback
+  implementation until those A64 fixtures are migrated and both architecture traits can call
+  architecture-neutral test-memory helpers directly.
+
+### Binary layout verification
+- PASS: native and AArch64 test builds enforce the A32 `u32` callback boundary and upstream-sized
+  page-table pointer type. Existing focused fastmem, sixteen-byte page-table stride, and Thumb
+  logical-flags regressions pass; this test-only migration serializes no guest payload.

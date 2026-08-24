@@ -10880,3 +10880,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   exception, vector, and cache-operation layouts are verified in the two interface configuration
   modules; core compile-time regression tests require each callback owner to implement its exact
   architecture trait.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{a32,a64}_interface.rs` vs Eden `backend/arm64/{a32,a64}_interface.cpp` and `interface/{A32,A64}/config.h` (test configuration ownership)
+
+### Intentional differences
+- Rust test callbacks retain optional shared pointer-observation state so lifecycle tests can
+  assert that generated-code callback pointers target the final boxed interface state. Eden's
+  production interfaces do not contain these Rust regression fixtures.
+
+### Unintentional differences (to fix)
+- Fixed: both ARM64 interface test modules built the obsolete architecture-merged `JitConfig` and
+  reached the backend through its conversion adapter. They now construct the interface-owned A32
+  and A64 configurations directly and override only the three test-specific settings.
+- Fixed: the A32 fixture exposed 64-bit addresses and A64-only 128-bit callbacks. It now implements
+  the A32 callback contract with 32-bit addresses, typed exceptions, and the upstream default
+  exclusive-write behavior.
+- Fixed: the A64 fixture used tuple-shaped 128-bit values, raw exception integers, and the legacy
+  supervisor-call name. It now uses the upstream-shaped vector, typed exception, `call_svc`, and
+  required physical-counter callback.
+
+### Missing items
+- The remaining legacy test-configuration users in other ARM64 backend files are outside this
+  interface-owned slice and still need conversion before the merged compatibility layer can be
+  removed.
+
+### Binary layout verification
+- PASS: compile-time trait checking on AArch64 now enforces A32 `u32` guest addresses and A64
+  `[u64; 2]` vectors at these test/backend boundaries; this slice serializes no guest payload.

@@ -86,7 +86,7 @@ fn emit_fp_estimate_call(
     ra.asm
         .lea(
             fpsr_param,
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
@@ -118,7 +118,7 @@ fn emit_fp_step_fused_call(
     ra.asm
         .lea(
             fpsr_param,
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
@@ -151,7 +151,7 @@ fn emit_fp_convert_call(
     ra.asm
         .lea(
             fpsr_param,
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
@@ -412,7 +412,7 @@ fn emit_fp_min_max(
     ra.asm
         .lea(
             fpsr_param,
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm.mov(rxbyak::RAX, fallback as i64).unwrap();
@@ -751,7 +751,7 @@ fn emit_fp_round_int(
     ra.asm
         .lea(
             fpsr_param,
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm
@@ -886,7 +886,7 @@ fn emit_fp_mul_add(
         ra.asm.bind(&end).unwrap();
 
         let fpcr_value = fpcr.value();
-        let fpsr_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let fpsr_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         let function = match (fsize, negate_product) {
             (32, false) => fp_helpers::fp_mul_add32 as usize,
             (32, true) => fp_helpers::fp_mul_sub32 as usize,
@@ -1020,7 +1020,7 @@ fn emit_fp_mul_add(
         ra.asm
             .lea(
                 rxbyak::RAX,
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         ra.asm
@@ -1046,7 +1046,7 @@ fn emit_fp_mul_add(
         ra.asm
             .lea(
                 abi::ABI_PARAMS[4].to_reg64(),
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         let function = match (fsize, negate_product) {
@@ -1285,7 +1285,7 @@ fn emit_fp_to_fixed_s32(
         ra.asm
             .lea(
                 abi::ABI_PARAMS[3].to_reg64(),
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         ra.asm.mov(rxbyak::RAX, helper as i64).unwrap();
@@ -1394,7 +1394,7 @@ fn emit_fp_to_fixed_s64(
         ra.asm
             .lea(
                 abi::ABI_PARAMS[3].to_reg64(),
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         ra.asm.mov(rxbyak::RAX, helper as i64).unwrap();
@@ -1616,7 +1616,7 @@ fn emit_fp_to_fixed_unsigned(
     ra.asm
         .lea(
             abi::ABI_PARAMS[3].to_reg64(),
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm.mov(rxbyak::RAX, helper as i64).unwrap();
@@ -1978,7 +1978,7 @@ fn emit_fp_recip_step_fused(
         ra.asm.bind(&end).unwrap();
 
         let fpcr_value = ctx.fpcr(true).value();
-        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let fpsr_exc_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         ctx.deferred_emits
             .borrow_mut()
             .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
@@ -2260,7 +2260,7 @@ fn emit_fp_rsqrt_step_fused(
         ra.asm.bind(&end).unwrap();
 
         let fpcr_value = ctx.fpcr(true).value();
-        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let fpsr_exc_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         ctx.deferred_emits
             .borrow_mut()
             .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {

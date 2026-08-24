@@ -1,34 +1,38 @@
-use rxbyak::JmpType;
-use rxbyak::RegExp;
-use rxbyak::R15;
-use rxbyak::{byte_ptr, dword_ptr};
+use rxbyak::{byte_ptr, Reg, RegExp, R15};
 
-use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::emit_context::EmitContext;
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
 
 // ---------------------------------------------------------------------------
-// Helper: OR the QC flag in jit_state
+// Shared saturation helpers
 // ---------------------------------------------------------------------------
 
-/// `or [r15 + fpsr_qc], 1` — sets the QC (saturation) sticky flag.
-fn set_qc_flag(ra: &mut RegAlloc) {
-    let offset = A64JitState::offset_of_fpsr_qc();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaturationOp {
+    Add,
+    Sub,
+}
+
+fn emit_or_qc(ra: &mut RegAlloc, jit_state_info: JitStateInfo, overflow: Reg) {
+    let offset = jit_state_info.offsetof_fpsr_qc;
     ra.asm
-        .or_(dword_ptr(RegExp::from(R15) + offset as i32), 1)
+        .or_(
+            byte_ptr(RegExp::from(R15) + offset as i32),
+            overflow.cvt8().unwrap(),
+        )
         .unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// Signed saturated add: result = clamp(a + b, MIN, MAX), set QC on overflow
-// ---------------------------------------------------------------------------
-
-fn emit_signed_saturated_add(
+fn emit_signed_saturated_op(
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
+    op: SaturationOp,
     bitsize: usize,
     has_overflow_inst: bool,
     overflow_inst: Option<InstRef>,
@@ -56,20 +60,33 @@ fn emit_signed_saturated_add(
         ra.asm.adc(sat_val, 0i32).unwrap();
     }
 
-    match bitsize {
-        8 => ra
+    match (op, bitsize) {
+        (SaturationOp::Add, 8) => ra
             .asm
             .add(result.cvt8().unwrap(), op2.cvt8().unwrap())
             .unwrap(),
-        16 => ra
+        (SaturationOp::Add, 16) => ra
             .asm
             .add(result.cvt16().unwrap(), op2.cvt16().unwrap())
             .unwrap(),
-        32 => ra
+        (SaturationOp::Add, 32) => ra
             .asm
             .add(result.cvt32().unwrap(), op2.cvt32().unwrap())
             .unwrap(),
-        64 => ra.asm.add(result, op2).unwrap(),
+        (SaturationOp::Add, 64) => ra.asm.add(result, op2).unwrap(),
+        (SaturationOp::Sub, 8) => ra
+            .asm
+            .sub(result.cvt8().unwrap(), op2.cvt8().unwrap())
+            .unwrap(),
+        (SaturationOp::Sub, 16) => ra
+            .asm
+            .sub(result.cvt16().unwrap(), op2.cvt16().unwrap())
+            .unwrap(),
+        (SaturationOp::Sub, 32) => ra
+            .asm
+            .sub(result.cvt32().unwrap(), op2.cvt32().unwrap())
+            .unwrap(),
+        (SaturationOp::Sub, 64) => ra.asm.sub(result, op2).unwrap(),
         _ => unreachable!(),
     }
 
@@ -104,13 +121,7 @@ fn emit_signed_saturated_add(
             ra.release(sat_val);
         }
     } else {
-        let offset = A64JitState::offset_of_fpsr_qc();
-        ra.asm
-            .or_(
-                byte_ptr(RegExp::from(R15) + offset as i32),
-                sat_val.cvt8().unwrap(),
-            )
-            .unwrap();
+        emit_or_qc(ra, ctx.jit_state_info, sat_val);
         ra.release(sat_val);
     }
 
@@ -127,134 +138,54 @@ pub fn emit_signed_saturated_add_with_flag32(
         block
             .get_associated_pseudo_operation(inst_ref, crate::ir::opcode::Opcode::GetOverflowFromOp)
     });
-    emit_signed_saturated_add(ra, inst_ref, inst, 32, true, overflow_inst);
+    emit_signed_saturated_op(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        SaturationOp::Add,
+        32,
+        true,
+        overflow_inst,
+    );
 }
 
 pub fn emit_signed_saturated_add8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 8, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 8, false, None);
 }
 pub fn emit_signed_saturated_add16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 16, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 16, false, None);
 }
 pub fn emit_signed_saturated_add32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 32, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 32, false, None);
 }
 pub fn emit_signed_saturated_add64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 64, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 64, false, None);
 }
 
 // ---------------------------------------------------------------------------
 // Signed saturated sub: result = clamp(a - b, MIN, MAX), set QC on overflow
 // ---------------------------------------------------------------------------
-
-fn emit_signed_saturated_sub(
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-    bitsize: usize,
-    has_overflow_inst: bool,
-    overflow_inst: Option<InstRef>,
-) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_gpr(&mut args[0]);
-    let op2 = ra.use_gpr(&mut args[1]);
-
-    let sat_val = ra.scratch_gpr();
-    if bitsize < 64 {
-        let int_max = (1u64 << (bitsize - 1)) - 1;
-        ra.asm
-            .xor_(sat_val.cvt32().unwrap(), sat_val.cvt32().unwrap())
-            .unwrap();
-        ra.asm
-            .bt_imm(result.cvt32().unwrap(), (bitsize - 1) as u8)
-            .unwrap();
-        ra.asm
-            .adc(sat_val.cvt32().unwrap(), int_max as i32)
-            .unwrap();
-    } else {
-        ra.asm.mov(sat_val, i64::MAX).unwrap();
-        ra.asm.bt_imm(result, 63).unwrap();
-        ra.asm.adc(sat_val, 0i32).unwrap();
-    }
-
-    match bitsize {
-        8 => ra
-            .asm
-            .sub(result.cvt8().unwrap(), op2.cvt8().unwrap())
-            .unwrap(),
-        16 => ra
-            .asm
-            .sub(result.cvt16().unwrap(), op2.cvt16().unwrap())
-            .unwrap(),
-        32 => ra
-            .asm
-            .sub(result.cvt32().unwrap(), op2.cvt32().unwrap())
-            .unwrap(),
-        64 => ra.asm.sub(result, op2).unwrap(),
-        _ => unreachable!(),
-    }
-
-    if bitsize == 8 {
-        ra.asm
-            .cmovo(result.cvt32().unwrap(), sat_val.cvt32().unwrap())
-            .unwrap();
-    } else {
-        let result = match bitsize {
-            16 => result.cvt16().unwrap(),
-            32 => result.cvt32().unwrap(),
-            64 => result,
-            _ => unreachable!(),
-        };
-        let sat_val_width = match bitsize {
-            16 => sat_val.cvt16().unwrap(),
-            32 => sat_val.cvt32().unwrap(),
-            64 => sat_val,
-            _ => unreachable!(),
-        };
-        ra.asm.cmovo(result, sat_val_width).unwrap();
-    }
-
-    ra.asm.seto(sat_val.cvt8().unwrap()).unwrap();
-
-    if has_overflow_inst {
-        if let Some(overflow_inst) = overflow_inst {
-            ra.define_value(overflow_inst, sat_val);
-        } else {
-            ra.release(sat_val);
-        }
-    } else {
-        let offset = A64JitState::offset_of_fpsr_qc();
-        ra.asm
-            .or_(
-                byte_ptr(RegExp::from(R15) + offset as i32),
-                sat_val.cvt8().unwrap(),
-            )
-            .unwrap();
-        ra.release(sat_val);
-    }
-
-    ra.define_value(inst_ref, result);
-}
 
 pub fn emit_signed_saturated_sub_with_flag32(
     ctx: &EmitContext,
@@ -266,203 +197,218 @@ pub fn emit_signed_saturated_sub_with_flag32(
         block
             .get_associated_pseudo_operation(inst_ref, crate::ir::opcode::Opcode::GetOverflowFromOp)
     });
-    emit_signed_saturated_sub(ra, inst_ref, inst, 32, true, overflow_inst);
+    emit_signed_saturated_op(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        SaturationOp::Sub,
+        32,
+        true,
+        overflow_inst,
+    );
 }
 
 pub fn emit_signed_saturated_sub8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 8, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 8, false, None);
 }
 pub fn emit_signed_saturated_sub16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 16, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 16, false, None);
 }
 pub fn emit_signed_saturated_sub32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 32, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 32, false, None);
 }
 pub fn emit_signed_saturated_sub64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 64, false, None);
+    emit_signed_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 64, false, None);
 }
 
 // ---------------------------------------------------------------------------
 // Unsigned saturated add: result = min(a + b, MAX), set QC on carry
 // ---------------------------------------------------------------------------
 
-fn emit_unsigned_saturated_add(ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bitsize: usize) {
+fn emit_unsigned_saturated_op(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    op: SaturationOp,
+    bitsize: usize,
+) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_gpr(&mut args[0]);
-    let op2 = ra.use_gpr(&mut args[1]);
+    let op_result = ra.use_scratch_gpr(&mut args[0]);
+    let addend = ra.use_scratch_gpr(&mut args[1]);
 
-    match bitsize {
-        8 => {
+    match (op, bitsize) {
+        (SaturationOp::Add, 8) => {
             ra.asm
-                .add(result.cvt8().unwrap(), op2.cvt8().unwrap())
+                .add(op_result.cvt8().unwrap(), addend.cvt8().unwrap())
                 .unwrap();
         }
-        16 => {
+        (SaturationOp::Add, 16) => {
             ra.asm
-                .add(result.cvt16().unwrap(), op2.cvt16().unwrap())
+                .add(op_result.cvt16().unwrap(), addend.cvt16().unwrap())
                 .unwrap();
         }
-        32 => {
+        (SaturationOp::Add, 32) => {
             ra.asm
-                .add(result.cvt32().unwrap(), op2.cvt32().unwrap())
+                .add(op_result.cvt32().unwrap(), addend.cvt32().unwrap())
                 .unwrap();
         }
-        64 => {
-            ra.asm.add(result, op2).unwrap();
+        (SaturationOp::Add, 64) => {
+            ra.asm.add(op_result, addend).unwrap();
         }
+        (SaturationOp::Sub, 8) => {
+            ra.asm
+                .sub(op_result.cvt8().unwrap(), addend.cvt8().unwrap())
+                .unwrap();
+        }
+        (SaturationOp::Sub, 16) => {
+            ra.asm
+                .sub(op_result.cvt16().unwrap(), addend.cvt16().unwrap())
+                .unwrap();
+        }
+        (SaturationOp::Sub, 32) => {
+            ra.asm
+                .sub(op_result.cvt32().unwrap(), addend.cvt32().unwrap())
+                .unwrap();
+        }
+        (SaturationOp::Sub, 64) => ra.asm.sub(op_result, addend).unwrap(),
         _ => unreachable!(),
     }
 
-    // On carry (CF=1), set result to all-ones (MAX)
-    let sat_val = ra.scratch_gpr();
-    ra.asm.mov(sat_val.cvt32().unwrap(), -1i32).unwrap();
-    if bitsize == 64 {
-        ra.asm.mov(sat_val, -1i64).unwrap();
+    let boundary = match op {
+        SaturationOp::Add if bitsize == 64 => u64::MAX,
+        SaturationOp::Add => (1u64 << bitsize) - 1,
+        SaturationOp::Sub => 0,
+    };
+    match bitsize {
+        8 => ra.asm.mov(addend.cvt8().unwrap(), boundary as i32).unwrap(),
+        16 => ra
+            .asm
+            .mov(addend.cvt16().unwrap(), boundary as i32)
+            .unwrap(),
+        32 => ra
+            .asm
+            .mov(addend.cvt32().unwrap(), boundary as i32)
+            .unwrap(),
+        64 => ra.asm.mov(addend, boundary as i64).unwrap(),
+        _ => unreachable!(),
     }
-    ra.asm.cmovb(result, sat_val).unwrap();
+    if bitsize == 8 {
+        ra.asm
+            .cmovae(addend.cvt32().unwrap(), op_result.cvt32().unwrap())
+            .unwrap();
+    } else {
+        let addend_width = match bitsize {
+            16 => addend.cvt16().unwrap(),
+            32 => addend.cvt32().unwrap(),
+            64 => addend,
+            _ => unreachable!(),
+        };
+        let result_width = match bitsize {
+            16 => op_result.cvt16().unwrap(),
+            32 => op_result.cvt32().unwrap(),
+            64 => op_result,
+            _ => unreachable!(),
+        };
+        ra.asm.cmovae(addend_width, result_width).unwrap();
+    }
 
-    // Set QC if carry
-    let label_no_carry = ra.asm.create_label();
-    ra.asm.jae(&label_no_carry, JmpType::Near).unwrap();
-    set_qc_flag(ra);
-    ra.asm.bind(&label_no_carry).unwrap();
-
-    ra.release(sat_val);
-    ra.define_value(inst_ref, result);
+    let overflow = ra.scratch_gpr();
+    ra.asm.setb(overflow.cvt8().unwrap()).unwrap();
+    emit_or_qc(ra, ctx.jit_state_info, overflow);
+    ra.release(overflow);
+    ra.define_value(inst_ref, addend);
 }
 
 pub fn emit_unsigned_saturated_add8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_add(ra, inst_ref, inst, 8);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 8);
 }
 pub fn emit_unsigned_saturated_add16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_add(ra, inst_ref, inst, 16);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 16);
 }
 pub fn emit_unsigned_saturated_add32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_add(ra, inst_ref, inst, 32);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 32);
 }
 pub fn emit_unsigned_saturated_add64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_add(ra, inst_ref, inst, 64);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Add, 64);
 }
 
 // ---------------------------------------------------------------------------
 // Unsigned saturated sub: result = max(a - b, 0), set QC on borrow
 // ---------------------------------------------------------------------------
 
-fn emit_unsigned_saturated_sub(ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bitsize: usize) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_gpr(&mut args[0]);
-    let op2 = ra.use_gpr(&mut args[1]);
-
-    match bitsize {
-        8 => {
-            ra.asm
-                .sub(result.cvt8().unwrap(), op2.cvt8().unwrap())
-                .unwrap();
-        }
-        16 => {
-            ra.asm
-                .sub(result.cvt16().unwrap(), op2.cvt16().unwrap())
-                .unwrap();
-        }
-        32 => {
-            ra.asm
-                .sub(result.cvt32().unwrap(), op2.cvt32().unwrap())
-                .unwrap();
-        }
-        64 => {
-            ra.asm.sub(result, op2).unwrap();
-        }
-        _ => unreachable!(),
-    }
-
-    // On borrow (CF=1), set result to 0
-    let zero = ra.scratch_gpr();
-    ra.asm
-        .xor_(zero.cvt32().unwrap(), zero.cvt32().unwrap())
-        .unwrap();
-    ra.asm.cmovb(result, zero).unwrap();
-
-    // Set QC if borrow
-    let label_no_borrow = ra.asm.create_label();
-    ra.asm.jae(&label_no_borrow, JmpType::Near).unwrap();
-    set_qc_flag(ra);
-    ra.asm.bind(&label_no_borrow).unwrap();
-
-    ra.release(zero);
-    ra.define_value(inst_ref, result);
-}
-
 pub fn emit_unsigned_saturated_sub8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_sub(ra, inst_ref, inst, 8);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 8);
 }
 pub fn emit_unsigned_saturated_sub16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_sub(ra, inst_ref, inst, 16);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 16);
 }
 pub fn emit_unsigned_saturated_sub32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_sub(ra, inst_ref, inst, 32);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 32);
 }
 pub fn emit_unsigned_saturated_sub64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_unsigned_saturated_sub(ra, inst_ref, inst, 64);
+    emit_unsigned_saturated_op(ctx, ra, inst_ref, inst, SaturationOp::Sub, 64);
 }
 
 // ---------------------------------------------------------------------------
@@ -587,24 +533,25 @@ pub fn emit_unsigned_saturation(
 // ---------------------------------------------------------------------------
 
 pub fn emit_signed_saturated_doubling_multiply_return_high16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_doubling_multiply_return_high(ra, inst_ref, inst, 16);
+    emit_signed_saturated_doubling_multiply_return_high(ctx, ra, inst_ref, inst, 16);
 }
 
 pub fn emit_signed_saturated_doubling_multiply_return_high32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_doubling_multiply_return_high(ra, inst_ref, inst, 32);
+    emit_signed_saturated_doubling_multiply_return_high(ctx, ra, inst_ref, inst, 32);
 }
 
 fn emit_signed_saturated_doubling_multiply_return_high(
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
@@ -614,60 +561,59 @@ fn emit_signed_saturated_doubling_multiply_return_high(
 
     match bitsize {
         16 => {
-            // Sign-extend both to 32-bit, multiply, shift >> 15 (double >> 16 = >> 15)
-            let a = ra.use_scratch_gpr(&mut args[0]);
-            let b = ra.use_gpr(&mut args[1]);
+            let x = ra.use_scratch_gpr(&mut args[0]);
+            let y = ra.use_scratch_gpr(&mut args[1]);
+            let tmp = ra.scratch_gpr();
 
-            // Sign-extend 16→32
             ra.asm
-                .movsx(a.cvt32().unwrap(), a.cvt16().unwrap())
+                .movsx(x.cvt32().unwrap(), x.cvt16().unwrap())
                 .unwrap();
-            let b_ext = ra.scratch_gpr();
             ra.asm
-                .movsx(b_ext.cvt32().unwrap(), b.cvt16().unwrap())
+                .movsx(y.cvt32().unwrap(), y.cvt16().unwrap())
                 .unwrap();
-
-            // imul
+            ra.asm.imul(x.cvt32().unwrap(), y.cvt32().unwrap()).unwrap();
             ra.asm
-                .imul(a.cvt32().unwrap(), b_ext.cvt32().unwrap())
+                .lea(
+                    y.cvt32().unwrap(),
+                    rxbyak::ptr(RegExp::from(x) + RegExp::from(x)),
+                )
                 .unwrap();
-            // Double and take high half: (a*b*2) >> 16 = (a*b) >> 15
-            ra.asm.sar(a.cvt32().unwrap(), 15u8).unwrap();
-
-            // Check for INT16_MIN * INT16_MIN overflow (result should be INT16_MAX)
-            ra.asm.cmp(a.cvt32().unwrap(), 0x8000i32).unwrap();
-            let label_no_overflow = ra.asm.create_label();
-            ra.asm.jne(&label_no_overflow, JmpType::Near).unwrap();
-            ra.asm.mov(a.cvt32().unwrap(), 0x7FFFi32).unwrap();
-            set_qc_flag(ra);
-            ra.asm.bind(&label_no_overflow).unwrap();
-
-            ra.release(b_ext);
-            ra.define_value(inst_ref, a);
+            ra.asm
+                .mov(tmp.cvt32().unwrap(), x.cvt32().unwrap())
+                .unwrap();
+            ra.asm.shr(tmp.cvt32().unwrap(), 15u8).unwrap();
+            ra.asm.xor_(y.cvt32().unwrap(), x.cvt32().unwrap()).unwrap();
+            ra.asm.mov(y.cvt32().unwrap(), 0x7FFF).unwrap();
+            ra.asm
+                .cmovns(y.cvt32().unwrap(), tmp.cvt32().unwrap())
+                .unwrap();
+            ra.asm.sets(tmp.cvt8().unwrap()).unwrap();
+            emit_or_qc(ra, ctx.jit_state_info, tmp);
+            ra.release(tmp);
+            ra.define_value(inst_ref, y);
         }
         32 => {
-            // Sign-extend both to 64-bit, multiply, shift >> 31
-            let a = ra.use_scratch_gpr(&mut args[0]);
-            let b = ra.use_gpr(&mut args[1]);
+            let x = ra.use_scratch_gpr(&mut args[0]);
+            let y = ra.use_scratch_gpr(&mut args[1]);
+            let tmp = ra.scratch_gpr();
 
-            ra.asm.movsxd(a, a.cvt32().unwrap()).unwrap();
-            let b_ext = ra.scratch_gpr();
-            ra.asm.movsxd(b_ext, b.cvt32().unwrap()).unwrap();
-
-            ra.asm.imul(a, b_ext).unwrap();
-            ra.asm.sar(a, 31u8).unwrap();
-
-            // Check for INT32_MIN * INT32_MIN overflow
-            ra.asm.mov(b_ext, 0x8000_0000i64).unwrap();
-            ra.asm.cmp(a, b_ext).unwrap();
-            let label_no_overflow = ra.asm.create_label();
-            ra.asm.jne(&label_no_overflow, JmpType::Near).unwrap();
-            ra.asm.mov(a.cvt32().unwrap(), 0x7FFF_FFFFi32).unwrap();
-            set_qc_flag(ra);
-            ra.asm.bind(&label_no_overflow).unwrap();
-
-            ra.release(b_ext);
-            ra.define_value(inst_ref, a);
+            ra.asm.movsxd(x, x.cvt32().unwrap()).unwrap();
+            ra.asm.movsxd(y, y.cvt32().unwrap()).unwrap();
+            ra.asm.imul(x, y).unwrap();
+            ra.asm
+                .lea(y, rxbyak::ptr(RegExp::from(x) + RegExp::from(x)))
+                .unwrap();
+            ra.asm.mov(tmp, x).unwrap();
+            ra.asm.shr(tmp, 31u8).unwrap();
+            ra.asm.xor_(y, x).unwrap();
+            ra.asm.mov(y.cvt32().unwrap(), 0x7FFF_FFFF).unwrap();
+            ra.asm
+                .cmovns(y.cvt32().unwrap(), tmp.cvt32().unwrap())
+                .unwrap();
+            ra.asm.sets(tmp.cvt8().unwrap()).unwrap();
+            emit_or_qc(ra, ctx.jit_state_info, tmp);
+            ra.release(tmp);
+            ra.define_value(inst_ref, y);
         }
         _ => unreachable!(),
     }
@@ -676,6 +622,31 @@ fn emit_signed_saturated_doubling_multiply_return_high(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qc_write_uses_the_selected_jit_state_layout() {
+        let mut asm = rxbyak::CodeAssembler::new(4096).unwrap();
+        {
+            let mut ra = RegAlloc::new_default(&mut asm, vec![]);
+            let overflow = ra.scratch_gpr();
+            emit_or_qc(&mut ra, JitStateInfo::from_a32(), overflow);
+        }
+
+        let code = asm.code();
+        let a32_displacement = (JitStateInfo::from_a32().offsetof_fpsr_qc as u32).to_le_bytes();
+        let a64_displacement = (JitStateInfo::from_a64().offsetof_fpsr_qc as u32).to_le_bytes();
+        assert!(
+            code.windows(a32_displacement.len())
+                .any(|window| window == a32_displacement),
+            "QC write must address the A32 fpsr_qc field"
+        );
+        assert!(
+            !code
+                .windows(a64_displacement.len())
+                .any(|window| window == a64_displacement),
+            "QC write must not retain the former A64-only displacement"
+        );
+    }
 
     #[test]
     fn test_saturation_fn_signatures() {

@@ -221,7 +221,7 @@ pub fn emit_cond_prelude(ctx: &EmitContext, ra: &mut RegAlloc, block: &crate::ir
     // Step 1: Load NZCV from jit_state into EAX using raw assembly.
     // This is the same as load_nzcv_into_flags but without going through
     // the register allocator's scratch_gpr_at method.
-    let nzcv_offset = ctx.arch.cpsr_nzcv_offset();
+    let nzcv_offset = ctx.jit_state_info.offsetof_cpsr_nzcv;
     ra.asm
         .mov(
             rxbyak::EAX,
@@ -858,13 +858,21 @@ pub fn emit_a32_get_c_flag(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Inst
 pub fn emit_a32_or_q_flag(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let offset = A32JitState::offset_of_cpsr_q();
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
-    let value = ra.use_gpr(&mut args[0]);
-    ra.asm
-        .or_(
-            dword_ptr(RegExp::from(R15) + offset as i32),
-            value.cvt32().unwrap(),
-        )
-        .unwrap();
+    if args[0].is_immediate() {
+        if args[0].get_immediate_u1() {
+            ra.asm
+                .mov(dword_ptr(RegExp::from(R15) + offset as i32), 1)
+                .unwrap();
+        }
+    } else {
+        let value = ra.use_gpr(&mut args[0]);
+        ra.asm
+            .or_(
+                byte_ptr(RegExp::from(R15) + offset as i32),
+                value.cvt8().unwrap(),
+            )
+            .unwrap();
+    }
 }
 
 /// A32SetCheckBit: stack_layout.check_bit = value & 1
@@ -2815,7 +2823,7 @@ mod tests {
         let location = A32LocationDescriptor::new(0x1000, cpsr, fpscr, false).to_location();
         let end_location = A32LocationDescriptor::new(0x1004, cpsr, fpscr, true).to_location();
         let mut ctx = EmitContext::new(location, &config);
-        ctx.arch = ArchConfig::A32;
+        ctx.set_arch(ArchConfig::A32);
         ctx.end_location = Some(end_location);
 
         let upper = a32_bx_upper_without_t(&ctx);
@@ -3011,7 +3019,7 @@ mod tests {
         let mut ra = RegAlloc::new(&mut asm, gpr_order, ANY_XMM.to_vec(), inst_info);
 
         let mut ctx = EmitContext::new(location, &config);
-        ctx.arch = ArchConfig::A32;
+        ctx.set_arch(ArchConfig::A32);
         ctx.fastmem_available = true;
         ctx.block = Some(&block);
         ctx.end_location = Some(block.end_location());
@@ -3054,7 +3062,7 @@ mod tests {
         let mut ra = RegAlloc::new(&mut asm, gpr_order, ANY_XMM.to_vec(), inst_info);
 
         let mut ctx = EmitContext::new(location, &config);
-        ctx.arch = ArchConfig::A32;
+        ctx.set_arch(ArchConfig::A32);
         ctx.block = Some(&block);
         ctx.end_location = Some(block.end_location());
 

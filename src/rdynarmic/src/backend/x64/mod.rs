@@ -43,6 +43,7 @@ pub mod exclusive_monitor_friend;
 pub mod fp_helpers;
 pub mod host_feature;
 pub mod hostloc;
+pub mod jitstate_info;
 pub mod nzcv_util;
 #[cfg(feature = "profile_opcodes")]
 pub mod opcode_profile;

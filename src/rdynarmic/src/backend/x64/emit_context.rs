@@ -5,6 +5,7 @@ use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::exception_handler::FastmemPatchTable;
 use crate::backend::x64::host_feature::HostFeature;
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
 use crate::interface::a32::config::Coprocessors;
@@ -101,11 +102,11 @@ impl ArchConfig {
         }
     }
 
-    /// Offset of `halt_reason` in the JitState struct.
-    pub fn halt_reason_offset(self) -> usize {
+    /// Shared x64 JIT-state layout selected by the concrete architecture.
+    pub const fn jit_state_info(self) -> JitStateInfo {
         match self {
-            Self::A64 => A64JitState::offset_of_halt_reason(),
-            Self::A32 => A32JitState::offset_of_halt_reason(),
+            Self::A64 => JitStateInfo::from_a64(),
+            Self::A32 => JitStateInfo::from_a32(),
         }
     }
 
@@ -141,42 +142,6 @@ impl ArchConfig {
         match self {
             Self::A64 => 0,
             Self::A32 => A32LocationDescriptor::from_location(loc).upper_location_descriptor(),
-        }
-    }
-
-    /// Offset of `cpsr_nzcv` in the JitState struct.
-    pub fn cpsr_nzcv_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_cpsr_nzcv(),
-            Self::A32 => A32JitState::offset_of_cpsr_nzcv(),
-        }
-    }
-
-    pub fn fpsr_exc_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_fpsr_exc(),
-            Self::A32 => A32JitState::offset_of_fpsr_exc(),
-        }
-    }
-
-    pub fn fpsr_qc_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_fpsr_qc(),
-            Self::A32 => A32JitState::offset_of_fpsr_qc(),
-        }
-    }
-
-    pub fn guest_mxcsr_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_guest_mxcsr(),
-            Self::A32 => A32JitState::offset_of_guest_mxcsr(),
-        }
-    }
-
-    pub fn asimd_mxcsr_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_asimd_mxcsr(),
-            Self::A32 => A32JitState::offset_of_asimd_mxcsr(),
         }
     }
 
@@ -330,6 +295,12 @@ pub struct EmitContext<'a> {
     /// Architecture-specific configuration (A32 vs A64).
     /// Controls PC offset, halt_reason offset, location descriptor parsing.
     pub arch: ArchConfig,
+    /// Copy of the immutable JIT-state layout owned by `BlockOfCode`.
+    ///
+    /// Eden emitters query `BlockOfCode::GetJitStateInfo()` directly. Rust's
+    /// split mutable assembler borrow prevents retaining that owner here, so
+    /// the exact value is copied into the per-block context.
+    pub jit_state_info: JitStateInfo,
     /// Dispatcher return_from_run_code offsets (4 entries).
     ///
     /// When `Some`, terminals emit `jmp rel32` to these absolute code buffer
@@ -420,6 +391,7 @@ impl<'a> EmitContext<'a> {
             host_features: crate::backend::x64::block_of_code::get_host_features(),
             optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
             arch: ArchConfig::A64,
+            jit_state_info: JitStateInfo::from_a64(),
             dispatcher_offsets: None,
             code_base_ptr: std::ptr::null(),
             is_single_step: false,
@@ -446,6 +418,7 @@ impl<'a> EmitContext<'a> {
         location: LocationDescriptor,
         config: &'a EmitConfig,
         arch: ArchConfig,
+        jit_state_info: JitStateInfo,
         host_features: HostFeature,
         optimizations: OptimizationFlag,
         dispatcher_offsets: [usize; 4],
@@ -457,6 +430,7 @@ impl<'a> EmitContext<'a> {
             host_features,
             optimizations,
             arch,
+            jit_state_info,
             dispatcher_offsets: Some(dispatcher_offsets),
             code_base_ptr,
             is_single_step: arch.extract_single_stepping(location),
@@ -490,6 +464,11 @@ impl<'a> EmitContext<'a> {
 
     pub fn has_optimization(&self, flag: OptimizationFlag) -> bool {
         self.optimizations.contains(flag)
+    }
+
+    pub fn set_arch(&mut self, arch: ArchConfig) {
+        self.arch = arch;
+        self.jit_state_info = arch.jit_state_info();
     }
 
     pub fn fpcr(&self, fpcr_controlled: bool) -> Fpcr {
@@ -526,16 +505,16 @@ mod tests {
     #[test]
     fn architecture_selects_its_own_saturation_flag_offset() {
         assert_eq!(
-            ArchConfig::A64.fpsr_qc_offset(),
+            ArchConfig::A64.jit_state_info().offsetof_fpsr_qc,
             A64JitState::offset_of_fpsr_qc()
         );
         assert_eq!(
-            ArchConfig::A32.fpsr_qc_offset(),
+            ArchConfig::A32.jit_state_info().offsetof_fpsr_qc,
             A32JitState::offset_of_fpsr_qc()
         );
         assert_ne!(
-            ArchConfig::A64.fpsr_qc_offset(),
-            ArchConfig::A32.fpsr_qc_offset()
+            ArchConfig::A64.jit_state_info().offsetof_fpsr_qc,
+            ArchConfig::A32.jit_state_info().offsetof_fpsr_qc
         );
     }
 }

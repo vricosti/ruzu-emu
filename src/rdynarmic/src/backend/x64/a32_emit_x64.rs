@@ -15,7 +15,7 @@ use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFal
 use crate::backend::x64::abi;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn,
 };
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
@@ -24,6 +24,7 @@ use crate::backend::x64::exception_handler::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::patch_info::{
     PatchTable, PatchType, A32_PATCH_JG_SIZE, A32_PATCH_JMP_SIZE, A32_PATCH_JZ_SIZE,
 };
@@ -123,15 +124,9 @@ impl A32EmitX64 {
         translation_options: TranslationOptions,
         cache_size: usize,
     ) -> Result<Self, String> {
-        let mut code = BlockOfCode::with_size_and_offsets(
-            cache_size,
-            JitStateOffsets {
-                halt_reason: A32JitState::offset_of_halt_reason(),
-                guest_mxcsr: A32JitState::offset_of_guest_mxcsr(),
-                asimd_mxcsr: A32JitState::offset_of_asimd_mxcsr(),
-            },
-        )
-        .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
+        let mut code =
+            BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a32())
+                .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code
             .gen_run_code(&run_callbacks)
@@ -329,6 +324,7 @@ impl A32EmitX64 {
                 location,
                 &self.emit_config,
                 ArchConfig::A32,
+                self.code.jit_state_info(),
                 host_features,
                 self.optimizations,
                 self.dispatcher_labels.return_from_run_code,

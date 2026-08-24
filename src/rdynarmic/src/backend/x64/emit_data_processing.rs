@@ -2020,7 +2020,7 @@ fn emit_conditional_select(
     };
 
     // Load NZCV from jit_state into x86 flags
-    load_nzcv_into_flags_with_rax(ra, rax, cond, ctx.arch.cpsr_nzcv_offset());
+    load_nzcv_into_flags_with_rax(ra, rax, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
 
     // cmovcc: if condition true, replace else_ with then_
     emit_cmovcc(ra.asm, cond, else_sized, then_sized);
@@ -2045,7 +2045,7 @@ pub fn emit_conditional_select_nzcv(
     let then32 = then_.cvt32().unwrap();
     let else32 = else_.cvt32().unwrap();
 
-    load_nzcv_into_flags_with_rax(ra, rax, cond, ctx.arch.cpsr_nzcv_offset());
+    load_nzcv_into_flags_with_rax(ra, rax, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
     emit_cmovcc(ra.asm, cond, else32, then32);
 
     ra.define_value(inst_ref, else_);

@@ -60,23 +60,23 @@ fn maybe_standard_fpscr_value(
     if switch_mxcsr && !ctx.has_optimization(OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE) {
         ra.asm
             .stmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.guest_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_guest_mxcsr as i32,
             ))
             .unwrap();
         ra.asm
             .ldmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.asimd_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_asimd_mxcsr as i32,
             ))
             .unwrap();
         emit(ra);
         ra.asm
             .stmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.asimd_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_asimd_mxcsr as i32,
             ))
             .unwrap();
         ra.asm
             .ldmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.guest_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_guest_mxcsr as i32,
             ))
             .unwrap();
     } else {
@@ -363,7 +363,7 @@ fn emit_fp_vector_muladd(
         }
 
         let fpcr_value = fpcr.value();
-        let fpsr_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let fpsr_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         let correction_function = match (fsize, inaccurate_nan) {
             (32, false) => fallback_fp_muladd_correction32 as usize,
             (32, true) => fallback_fp_muladd_correction32_inaccurate_nan as usize,
@@ -711,7 +711,7 @@ fn emit_fp_vector_recip_step_fused(
         });
 
         let fpcr_value = ctx.fpcr(fpcr_controlled).value();
-        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let fpsr_exc_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         ctx.deferred_emits
             .borrow_mut()
             .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
@@ -1067,7 +1067,7 @@ fn emit_fp_vector_rsqrt_step_fused(
         });
 
         let fpcr_value = ctx.fpcr(fpcr_controlled).value();
-        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let fpsr_exc_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         ctx.deferred_emits
             .borrow_mut()
             .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
@@ -1551,12 +1551,12 @@ fn emit_fp_vector_to_fixed_native(
     if switch_mxcsr {
         ra.asm
             .stmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.guest_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_guest_mxcsr as i32,
             ))
             .unwrap();
         ra.asm
             .ldmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.asimd_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_asimd_mxcsr as i32,
             ))
             .unwrap();
     }
@@ -1676,12 +1676,12 @@ fn emit_fp_vector_to_fixed_native(
     if switch_mxcsr {
         ra.asm
             .stmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.asimd_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_asimd_mxcsr as i32,
             ))
             .unwrap();
         ra.asm
             .ldmxcsr(dword_ptr(
-                RegExp::from(R15) + ctx.arch.guest_mxcsr_offset() as i32,
+                RegExp::from(R15) + ctx.jit_state_info.offsetof_guest_mxcsr as i32,
             ))
             .unwrap();
     }

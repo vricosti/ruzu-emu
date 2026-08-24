@@ -8,7 +8,7 @@ use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFal
 use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn,
 };
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
@@ -17,6 +17,7 @@ use crate::backend::x64::exception_handler::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::frontend::a64::translate::{translate, MemoryReadCodeFn, TranslationOptions};
@@ -132,15 +133,9 @@ impl A64EmitX64 {
         optimizations: OptimizationFlag,
         cache_size: usize,
     ) -> Result<Self, String> {
-        let mut code = BlockOfCode::with_size_and_offsets(
-            cache_size,
-            JitStateOffsets {
-                halt_reason: A64JitState::offset_of_halt_reason(),
-                guest_mxcsr: A64JitState::offset_of_guest_mxcsr(),
-                asimd_mxcsr: A64JitState::offset_of_asimd_mxcsr(),
-            },
-        )
-        .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
+        let mut code =
+            BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a64())
+                .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code
             .gen_run_code(&run_callbacks)
@@ -379,6 +374,7 @@ impl A64EmitX64 {
                 location,
                 &self.emit_config,
                 ArchConfig::A64,
+                self.code.jit_state_info(),
                 host_features,
                 self.optimizations,
                 self.dispatcher_labels.return_from_run_code,
@@ -1195,6 +1191,7 @@ mod tests {
             loc,
             &emit_config,
             ArchConfig::A64,
+            JitStateInfo::from_a64(),
             crate::backend::x64::block_of_code::get_host_features(),
             OptimizationFlag::NO_OPTIMIZATIONS,
             [100, 200, 300, 400],

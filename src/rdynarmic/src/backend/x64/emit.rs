@@ -1,5 +1,4 @@
 use crate::backend::x64::a32_emit_a32 as a32;
-use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::a64_emit_x64_memory;
 use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::emit_a64;
@@ -50,19 +49,12 @@ fn profile_opcodes_enabled() -> bool {
 }
 
 fn rsb_offsets(ctx: &EmitContext) -> (usize, usize, usize) {
-    if ctx.arch.is_a32() {
-        (
-            A32JitState::offset_of_rsb_ptr(),
-            A32JitState::offset_of_rsb_location_descriptors(),
-            A32JitState::offset_of_rsb_codeptrs(),
-        )
-    } else {
-        (
-            A64JitState::offset_of_rsb_ptr(),
-            A64JitState::offset_of_rsb_location_descriptors(),
-            A64JitState::offset_of_rsb_codeptrs(),
-        )
-    }
+    let info = ctx.jit_state_info;
+    (
+        info.offsetof_rsb_ptr,
+        info.offsetof_rsb_location_descriptors,
+        info.offsetof_rsb_codeptrs,
+    )
 }
 
 fn emit_patch_mov_rcx(ctx: &EmitContext, target_loc: LocationDescriptor) -> u64 {
@@ -119,13 +111,11 @@ pub fn emit_push_rsb_location(
         .unwrap();
 
     ra.asm.add(index_reg.cvt32().unwrap(), 1).unwrap();
-    let rsb_ptr_mask = if ctx.arch.is_a32() {
-        A32JitState::RSB_PTR_MASK
-    } else {
-        A64JitState::RSB_PTR_MASK
-    };
     ra.asm
-        .and_(index_reg.cvt32().unwrap(), rsb_ptr_mask as i32)
+        .and_(
+            index_reg.cvt32().unwrap(),
+            ctx.jit_state_info.rsb_ptr_mask as i32,
+        )
         .unwrap();
     ra.asm
         .mov(

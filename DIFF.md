@@ -11649,3 +11649,69 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: removing the extra values from raw state is covered by the exact A32/A64 layout assertions;
   the host interface fallback storage has no generated-code or serialized ABI.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/jitstate_info.rs` vs Eden `backend/x64/jitstate_info.h`
+
+### Intentional differences
+- Rust uses explicit `from_a32` and `from_a64` constant constructors because it cannot express
+  Eden's templated constructor over arbitrary standard-layout JIT-state types.
+- `EmitContext` carries a value copy supplied by `BlockOfCode` because Rust emission temporarily
+  borrows the assembler separately from its owner. The copied ten-field inventory is immutable for
+  the block and is the counterpart of calling Eden's `BlockOfCode::GetJitStateInfo()`.
+
+### Unintentional differences (to fix)
+- Fixed: the upstream file owner was missing and `block_of_code.rs` held only three offsets, while
+  RSB, CPSR, and FPSR consumers independently selected A32 or A64 layouts.
+- Fixed: the shared saturation emitter hard-coded `A64JitState::fpsr_qc`; A32 saturation now writes
+  its own QC field through the `JitStateInfo` supplied by its `BlockOfCode`.
+
+### Missing items
+- None in the reviewed ten-field `JitStateInfo` inventory.
+
+### Binary layout verification
+- N/A: `JitStateInfo` describes host-side byte offsets and is neither copied to guest memory nor
+  serialized. Focused tests verify all ten values against both exact JIT-state layouts.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/emit_saturation.rs` vs Eden `backend/x64/emit_x64_saturation.cpp`
+
+### Intentional differences
+- Runtime `SaturationOp` and bit-width matches replace Eden's template instantiations while keeping
+  the same shared signed/unsigned helper boundaries and emitted operation ordering.
+- The mechanical `emit_or_qc` helper centralizes Eden's repeated byte-sized QC update without
+  moving its ownership outside this file.
+- For the signed-saturation `N == 32` pseudo-result, Rust emits a zero value because its emission
+  context holds an immutable IR block; Eden replaces uses with an immediate false during emission.
+  Both paths expose the same value to generated code.
+
+### Unintentional differences (to fix)
+- Fixed: every QC update used the A64 offset, including A32 instructions.
+- Fixed: unsigned saturated add/sub used branchful saturation and QC paths; they now preserve
+  Eden's scratch-operand ownership, boundary move, `cmovae`, `setb`, and byte-sized sticky-QC OR.
+- Fixed: signed doubling multiply used a compare/branch special case; both widths now reproduce
+  Eden's doubled-product, sign test, conditional move, and sticky-QC sequence.
+
+### Missing items
+- None in the reviewed saturation opcode/helper inventory.
+
+### Binary layout verification
+- PASS: the focused A32 regression inspects emitted addressing and verifies that the QC write uses
+  offset 508 rather than A64 offset 940; both offsets are covered by the exact JIT-state layouts.
+  The executing scalar-saturation regression also verifies results and the architectural Q flag.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_a32.rs` vs Eden `backend/x64/a32_emit_x64.cpp` (`EmitA32OrQFlag`)
+
+### Intentional differences
+- Rust uses `ArgumentInfo` and rxbyak's Rust register conversions, preserving Eden's immediate and
+  register branches without changing method ownership.
+
+### Unintentional differences (to fix)
+- Fixed: the register path ORed a full dirty 32-bit temporary into the one-bit `cpsr_q` field.
+  It now ORs only `value.cvt8()`, while immediate one stores a dword one and immediate zero emits
+  nothing, exactly as Eden does.
+
+### Missing items
+- None in the reviewed `EmitA32OrQFlag` method.
+
+### Binary layout verification
+- PASS: no state layout changed; the executing A32 scalar-saturation regression confirms `cpsr_q`
+  remains exactly zero or one after SSAT/USAT/QADD-family flag updates.

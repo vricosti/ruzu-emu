@@ -285,73 +285,48 @@ mod tests {
     use crate::backend::arm64::fastmem::FastmemManager;
     use crate::backend::arm64::fpsr_manager::FpsrManager;
     use crate::backend::arm64::reg_alloc::RegAlloc;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::Reg;
+    use crate::interface::a32::config::{
+        Exception as A32Exception, UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+    };
     use crate::interface::a32::coprocessor::Coprocessor;
+    use crate::interface::optimization_flags::OptimizationFlag;
     use crate::ir::block::Block;
     use crate::ir::inst::Inst;
     use crate::ir::location::A32LocationDescriptor;
     use crate::ir::opcode::Opcode;
     use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
-    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
     use std::cell::UnsafeCell;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     struct DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
-        fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for DummyCallbacks {
+        fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
             None
         }
 
-        fn memory_read_8(&self, _vaddr: u64) -> u8 {
+        fn memory_read_8(&self, _vaddr: u32) -> u8 {
             0
         }
-        fn memory_read_16(&self, _vaddr: u64) -> u16 {
+        fn memory_read_16(&self, _vaddr: u32) -> u16 {
             0
         }
-        fn memory_read_32(&self, _vaddr: u64) -> u32 {
+        fn memory_read_32(&self, _vaddr: u32) -> u32 {
             0
         }
-        fn memory_read_64(&self, _vaddr: u64) -> u64 {
+        fn memory_read_64(&self, _vaddr: u32) -> u64 {
             0
         }
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-        fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
-        fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
-        fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
-        fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
+        fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
+        fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
+        fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
         fn get_ticks_remaining(&self) -> u64 {
             0
@@ -460,35 +435,14 @@ mod tests {
     }
 
     fn config() -> EmitConfig {
-        let mut coprocessors = JitConfig::default_coprocessors();
-        coprocessors[15] = Some(Arc::new(TestCoprocessor {
+        let mut config = A32UserConfig::new(Box::new(DummyCallbacks));
+        config.coprocessors[15] = Some(Arc::new(TestCoprocessor {
             value: UnsafeCell::new(0),
         }));
-        let jit_config = JitConfig {
-            coprocessors,
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 0,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        };
-        EmitConfig::from_a32_config(&jit_config.into_a32_user_config())
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 0;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        EmitConfig::from_a32_config(&config)
     }
 
     fn empty_block_info(code: &BlockOfCode) -> EmittedBlockInfo {

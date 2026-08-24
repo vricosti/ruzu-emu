@@ -11000,3 +11000,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: the AArch64 test build enforces the A64 `[u64; 2]` callback vector layout; the existing
   memory-emission tests continue to assert instruction words for 8/16/32/64/128-bit paths.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/emit_arm64_a32_{memory,coprocessor}.rs` vs Eden `backend/arm64/emit_arm64_a32_{memory,coprocessor}.cpp` and `interface/A32/config.h` (A32 emitter test ownership)
+
+### Intentional differences
+- Rust keeps native unit-test harnesses next to these file-owned emitters and constructs the
+  fallible instruction writer explicitly; the production emission sequences remain unchanged.
+
+### Unintentional differences (to fix)
+- Fixed: both A32 emitter fixtures built the architecture-merged `JitConfig` and callback adapter.
+  They now construct A32 `UserConfig` directly and implement only A32 `UserCallbacks`.
+- Fixed: the fixtures exposed A64-only 128-bit callbacks, `u64` guest addresses, and raw exception
+  values. Their boundary now uses A32 `u32` addresses, typed exceptions and SVC naming, while
+  retaining upstream's default exclusive-write behavior.
+- Fixed: the memory fixture now sets `check_halt_on_memory_access` directly on its A32 owner, and
+  the coprocessor fixture installs CP15 directly in the A32 coprocessor table.
+
+### Missing items
+- The shared ARM64 dispatcher and A32 dispatcher test fixtures in `emit_arm64.rs` and
+  `emit_arm64_a32.rs` still use the merged compatibility layer and require separate owner-aligned
+  conversion.
+
+### Binary layout verification
+- PASS: the AArch64 test build enforces the A32 `u32` callback-address boundary; the existing
+  emitter tests continue to verify generated instruction words and this slice serializes no guest
+  payload.

@@ -20,6 +20,7 @@ use crate::backend::x64::emit_x64_memory::{
     emit_call_to_offset, emit_read_memory_mov, emit_vaddr_lookup_a32, emit_write_memory_mov,
     is_ordered,
 };
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
 use crate::backend::x64::perf_map;
 use crate::backend::x64::reg_alloc::RegAlloc;
@@ -350,12 +351,13 @@ fn emit_bitsize_read_mov(
     value_idx: u8,
     addr: RegExp,
     ordered: bool,
+    host_features: HostFeature,
 ) -> usize {
     match bitsize {
-        8 => emit_read_memory_mov::<8>(ra.asm, value_idx, addr, ordered),
-        16 => emit_read_memory_mov::<16>(ra.asm, value_idx, addr, ordered),
-        32 => emit_read_memory_mov::<32>(ra.asm, value_idx, addr, ordered),
-        64 => emit_read_memory_mov::<64>(ra.asm, value_idx, addr, ordered),
+        8 => emit_read_memory_mov::<8>(ra.asm, value_idx, addr, ordered, host_features),
+        16 => emit_read_memory_mov::<16>(ra.asm, value_idx, addr, ordered, host_features),
+        32 => emit_read_memory_mov::<32>(ra.asm, value_idx, addr, ordered, host_features),
+        64 => emit_read_memory_mov::<64>(ra.asm, value_idx, addr, ordered, host_features),
         _ => unreachable!(),
     }
 }
@@ -366,12 +368,13 @@ fn emit_bitsize_write_mov(
     addr: RegExp,
     value_idx: u8,
     ordered: bool,
+    host_features: HostFeature,
 ) -> usize {
     match bitsize {
-        8 => emit_write_memory_mov::<8>(ra.asm, addr, value_idx, ordered),
-        16 => emit_write_memory_mov::<16>(ra.asm, addr, value_idx, ordered),
-        32 => emit_write_memory_mov::<32>(ra.asm, addr, value_idx, ordered),
-        64 => emit_write_memory_mov::<64>(ra.asm, addr, value_idx, ordered),
+        8 => emit_write_memory_mov::<8>(ra.asm, addr, value_idx, ordered, host_features),
+        16 => emit_write_memory_mov::<16>(ra.asm, addr, value_idx, ordered, host_features),
+        32 => emit_write_memory_mov::<32>(ra.asm, addr, value_idx, ordered, host_features),
+        64 => emit_write_memory_mov::<64>(ra.asm, addr, value_idx, ordered, host_features),
         _ => unreachable!(),
     }
 }
@@ -675,7 +678,7 @@ fn emit_a32_memory_read(
         let end = ra.asm.create_label();
         let abort_info = memory_abort_info(ctx, inst);
         let addr = emit_vaddr_lookup_a32(ra, ctx, bitsize, abort, vaddr);
-        emit_bitsize_read_mov(ra, bitsize, result_idx, addr, ordered);
+        emit_bitsize_read_mov(ra, bitsize, result_idx, addr, ordered, ctx.host_features);
 
         ctx.deferred_emits.borrow_mut().push(Box::new(move |dctx| {
             let asm = &mut *dctx.asm;
@@ -1022,7 +1025,7 @@ fn emit_a32_memory_write(
         let end = ra.asm.create_label();
         let abort_info = memory_abort_info(ctx, inst);
         let addr = emit_vaddr_lookup_a32(ra, ctx, bitsize, abort, vaddr);
-        emit_bitsize_write_mov(ra, bitsize, addr, value_idx, ordered);
+        emit_bitsize_write_mov(ra, bitsize, addr, value_idx, ordered, ctx.host_features);
 
         ctx.deferred_emits.borrow_mut().push(Box::new(move |dctx| {
             let asm = &mut *dctx.asm;
@@ -1243,7 +1246,7 @@ fn emit_a32_exclusive_read_inline(
         // independently of the IR access-type operand.
         let addr_expr = RegExp::from(rxbyak::R13) + vaddr;
         let inst_offset = ra.asm.size();
-        emit_bitsize_read_mov(ra, bitsize, result_idx, addr_expr, true);
+        emit_bitsize_read_mov(ra, bitsize, result_idx, addr_expr, true, ctx.host_features);
         let resume_offset = ra.asm.size();
         let marker = (ctx.location, inst_ref.0);
         let recompile = ctx.config.memory.recompile_on_exclusive_fastmem_failure;

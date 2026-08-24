@@ -195,9 +195,10 @@ pub struct RawExclusiveWriteCallbacks {
     pub write_16: Box<dyn Callback>,
     pub write_32: Box<dyn Callback>,
     pub write_64: Box<dyn Callback>,
-    /// The 128-bit callback receives `(vaddr, value_ptr, expected_ptr)` after
-    /// the fixed JIT context parameter. The pointer adaptation keeps both
-    /// System V and Windows within their four-register ABI limit.
+    /// System V receives `(vaddr, value_lo, value_hi, expected_lo,
+    /// expected_hi)` after the fixed JIT context parameter. Win64 receives
+    /// `(vaddr, value_ptr, expected_ptr)`, matching the ABI adaptation in
+    /// Eden's generated 128-bit accessor.
     pub write_128: Box<dyn Callback>,
 }
 
@@ -335,6 +336,10 @@ pub struct EmitContext<'a> {
     /// (the table outlives the context — it's owned by `A64EmitX64`).
     /// Cast back to `&FastmemFallbacksTable` at use time.
     pub fastmem_fallbacks: Option<*const ()>,
+    /// A64's permanent generated 128-bit read/write/exclusive-write
+    /// accessors. The matching owner is `a64_emit_x64_memory.rs`; this raw
+    /// pointer follows the fallback-table lifetime pattern above.
+    pub memory_128_accessors: Option<*const ()>,
     /// `RUZU_BLOCK_PROLOGUE_COUNT_PC` per-core counter address. When `Some`,
     /// `emit_block` emits `lock inc qword [counter_addr]` immediately after
     /// the entrypoint offset is captured, so the increment runs on every
@@ -369,6 +374,7 @@ impl<'a> EmitContext<'a> {
             do_not_fastmem: None,
             deferred_emits: RefCell::new(Vec::new()),
             fastmem_fallbacks: None,
+            memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
         }
     }
@@ -407,6 +413,7 @@ impl<'a> EmitContext<'a> {
             do_not_fastmem: None,
             deferred_emits: RefCell::new(Vec::new()),
             fastmem_fallbacks: None,
+            memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
         }
     }

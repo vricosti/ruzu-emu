@@ -1715,6 +1715,24 @@ extern "C" fn raw_exclusive_write_64_trampoline(
         .memory_write_exclusive_64(vaddr, value, expected) as u64
 }
 
+#[cfg(not(target_os = "windows"))]
+extern "C" fn raw_exclusive_write_128_trampoline(
+    inner_ptr: u64,
+    vaddr: u64,
+    value_lo: u64,
+    value_hi: u64,
+    expected_lo: u64,
+    expected_hi: u64,
+) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
+    inner.callbacks.memory_write_exclusive_128(
+        vaddr,
+        [value_lo, value_hi],
+        [expected_lo, expected_hi],
+    ) as u64
+}
+
+#[cfg(target_os = "windows")]
 extern "C" fn raw_exclusive_write_128_trampoline(
     inner_ptr: u64,
     vaddr: u64,

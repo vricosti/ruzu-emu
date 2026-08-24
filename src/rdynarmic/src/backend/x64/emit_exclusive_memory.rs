@@ -501,11 +501,11 @@ fn emit_a64_exclusive_read_inline(
         let mut require_abort = false;
         let src = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
         let mov_off = match bitsize {
-            8 => emit_read_memory_mov::<8>(ra.asm, value_idx, src, true),
-            16 => emit_read_memory_mov::<16>(ra.asm, value_idx, src, true),
-            32 => emit_read_memory_mov::<32>(ra.asm, value_idx, src, true),
-            64 => emit_read_memory_mov::<64>(ra.asm, value_idx, src, true),
-            128 => emit_read_memory_mov::<128>(ra.asm, value_idx, src, true),
+            8 => emit_read_memory_mov::<8>(ra.asm, value_idx, src, true, ctx.host_features),
+            16 => emit_read_memory_mov::<16>(ra.asm, value_idx, src, true, ctx.host_features),
+            32 => emit_read_memory_mov::<32>(ra.asm, value_idx, src, true, ctx.host_features),
+            64 => emit_read_memory_mov::<64>(ra.asm, value_idx, src, true, ctx.host_features),
+            128 => emit_read_memory_mov::<128>(ra.asm, value_idx, src, true, ctx.host_features),
             _ => unreachable!(),
         };
         let resume_off = ra.asm.size();

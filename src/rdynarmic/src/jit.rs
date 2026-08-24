@@ -2807,6 +2807,133 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_a64_fastmem_ldr_str_q_use_128_bit_path() {
+        let code: &[u32] = &[
+            0x3DC0_0020, // LDR Q0, [X1]
+            0x3D80_0040, // STR Q0, [X2]
+            0xD400_0001, // SVC #0
+        ];
+        let lo = 0x0123_4567_89AB_CDEFu64;
+        let hi = 0xFEDC_BA98_7654_3210u64;
+        let mut contents = vec![0u8; 0x3000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[0x1000 + index * 4..0x1000 + index * 4 + 4]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x1100..0x1108].copy_from_slice(&lo.to_le_bytes());
+        contents[0x1108..0x1110].copy_from_slice(&hi.to_le_bytes());
+        let fastmem_pointer = contents.as_mut_ptr();
+        let memory = Arc::new(Mutex::new(contents));
+
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(fastmem_pointer);
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 16;
+        config.silently_mirror_fastmem = true;
+
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_register(2, 0x1200);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_vector_parts(0), (lo, hi));
+        let memory = memory.lock().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1200..0x1208].try_into().unwrap()),
+            lo
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1208..0x1210].try_into().unwrap()),
+            hi
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn test_a64_fastmem_fault_ldr_str_q_use_128_bit_fallbacks() {
+        let code: &[u32] = &[
+            0x3DC0_0020, // LDR Q0, [X1]
+            0x3D80_0040, // STR Q0, [X2]
+            0xD400_0001, // SVC #0
+        ];
+        let lo = 0x0123_4567_89AB_CDEFu64;
+        let hi = 0xFEDC_BA98_7654_3210u64;
+        let mut contents = vec![0u8; 0x3000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[0x1000 + index * 4..0x1000 + index * 4 + 4]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x1100..0x1108].copy_from_slice(&lo.to_le_bytes());
+        contents[0x1108..0x1110].copy_from_slice(&hi.to_le_bytes());
+        let memory = Arc::new(Mutex::new(contents));
+        let fastmem = TestFastmemMapping::new(0x1_0000);
+
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(fastmem.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 16;
+        config.silently_mirror_fastmem = true;
+        config.recompile_on_fastmem_failure = true;
+        config.check_halt_on_memory_access = false;
+
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_register(2, 0x1200);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_vector_parts(0), (lo, hi));
+        let memory = memory.lock().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1200..0x1208].try_into().unwrap()),
+            lo
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1208..0x1210].try_into().unwrap()),
+            hi
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_a64_stxp_uses_host_128_bit_argument_abi() {
         let code: &[u32] = &[
             0xC87F_14C4, // LDXP X4, X5, [X6]

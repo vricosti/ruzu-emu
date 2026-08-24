@@ -11790,10 +11790,42 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   causing perpetual clear/recompile dispatch. Test configurations now use 16 MiB.
 
 ### Missing items
-- A64's upstream `GenMemory128Accessors` permanent-prelude owner remains absent; it is recorded in
-  the active rdynarmic port state for a separate structural slice.
+- Resolved by the 2026-08-24 A64 memory-prelude follow-up below.
 
 ### Binary layout verification
 - N/A: this changes generated-code lifecycle and test cache capacity, not either architecture's
   JIT-state layout. The executing x64 back-edge regression verifies bounded linked and unlinked
   dispatch after the corrected prelude boundary.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{a64_emit_x64_memory,a64_emit_x64,a64_interface,emit_context,emit_x64_memory}.rs` vs Eden `backend/x64/{a64_emit_x64_memory.cpp,a64_emit_x64.{h,cpp},emit_x64_memory.{h,cpp.inc},callback.cpp}`
+
+### Intentional differences
+- Rust stores generated-code byte offsets in `Memory128Accessors` and resolves them relative to the
+  owning code buffer; Eden stores native function pointers. The accessors remain below
+  `code_begin` and survive cache clears under the same lifetime.
+- Rust `ArgCallback` objects call explicit `extern "C"` trampolines instead of devirtualizing C++
+  member functions. System V passes 128-bit values as scalar lanes and Windows uses 16-byte stack
+  payloads after shadow space, preserving the platform ABI selected by Eden's `_WIN32` branches.
+- Existing opt-in `RUZU_*` diagnostic traps remain in the A64 memory owner. They emit no guest path
+  changes unless explicitly enabled through the environment.
+
+### Unintentional differences (to fix)
+- Fixed: A64 omitted `GenMemory128Accessors`, generated no ordinary 128-bit write fallbacks, and
+  routed ordinary `ReadMemory128`/`WriteMemory128` through a separate callback-only owner. The
+  generated accessors, all 6,048 fallback entries, dispatcher ownership, and permanent-prelude
+  ordering now match Eden.
+- Fixed: ordered 128-bit packing and extraction unconditionally emitted SSE4.1 instructions. The
+  SSE2 `movq`/`punpck*qdq` alternatives now follow `emit_x64_memory.h`.
+- Fixed: direct callback and deferred fastmem/page-table fallbacks skipped Eden's post-access
+  `EmitCheckMemoryAbort`; all scalar and 128-bit paths now restore the exact A64 resume PC and force
+  a dispatcher return when `MemoryAbort` is set.
+- Fixed: the raw 128-bit exclusive-write trampoline used pointer payloads on System V. The generated
+  accessor now fills `ABI_PARAM3` through `ABI_PARAM6` and calls a scalar-lane trampoline there,
+  while Windows retains Eden's two pointer payloads and compiler-specific hidden-return ordering.
+
+### Missing items
+
+### Binary layout verification
+- PASS: Windows generated accessors use exact 16-byte value/expected payloads after the 32-byte
+  shadow space; System V transfers two 64-bit lanes per value. Linux execution covers direct and
+  faulting fastmem `LDR/STR Q`, while Windows and AArch64 cross-target test builds pass.

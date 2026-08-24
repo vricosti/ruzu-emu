@@ -4,7 +4,9 @@ use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, R12, R15, RAX, RBP, RBX};
 
 use crate::backend::block_range_information::BlockRangeInformation;
-use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
+use crate::backend::x64::a64_emit_x64_memory::{
+    gen_fastmem_fallbacks, gen_memory_128_accessors, FastmemFallbacksTable, Memory128Accessors,
+};
 use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
@@ -93,6 +95,9 @@ pub struct A64EmitX64 {
     /// Mirrors upstream's `read_fallbacks` / `write_fallbacks` /
     /// `exclusive_write_fallbacks` maps in `a64_emit_x64.h:74-76`.
     pub fastmem_fallbacks: FastmemFallbacksTable,
+    /// Permanent generated ABI adapters used by every A64 128-bit memory
+    /// callback and its fallback stubs.
+    pub memory_128_accessors: Memory128Accessors,
     /// Per-instruction fastmem patch info. Looked up by the SIGSEGV
     /// handler at fault time to redirect the faulting RIP to the
     /// fallback stub. Mirrors upstream `fastmem_patch_info`.
@@ -157,6 +162,7 @@ impl A64EmitX64 {
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
             fastmem_fallbacks: FastmemFallbacksTable::new(),
+            memory_128_accessors: Memory128Accessors::default(),
             fastmem_patches: Box::new(FastmemPatchTable::new()),
             do_not_fastmem: HashSet::new(),
             fastmem_enabled,
@@ -164,13 +170,28 @@ impl A64EmitX64 {
             processor_id: 0,
         };
 
-        // Pre-generate the fastmem fallback-stub table. Mirrors
-        // upstream `A64EmitX64::GenFastmemFallbacks` invocation in the
-        // `A64EmitX64` constructor.
+        let host_features = emitter.code.host_features();
+        let raw_exclusive_write_callbacks = emitter
+            .emit_config
+            .raw_exclusive_write_callbacks
+            .as_ref()
+            .ok_or_else(|| "A64 x64 emission requires raw exclusive-write callbacks".to_string())?;
+
+        // Match the exact upstream permanent-prelude ordering: generated
+        // 128-bit callback accessors, fastmem fallbacks, terminal handlers,
+        // then `PreludeComplete`.
+        emitter.memory_128_accessors = gen_memory_128_accessors(
+            &mut emitter.code.asm,
+            &emitter.emit_config.callbacks,
+            raw_exclusive_write_callbacks,
+            host_features,
+        );
         emitter.fastmem_fallbacks = gen_fastmem_fallbacks(
             &mut emitter.code.asm,
             &emitter.emit_config.callbacks,
-            emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
+            raw_exclusive_write_callbacks,
+            emitter.memory_128_accessors,
+            host_features,
         );
 
         // Match upstream constructor ordering: permanent fallback tables and
@@ -389,6 +410,8 @@ impl A64EmitX64 {
             ctx.do_not_fastmem = Some(&self.do_not_fastmem);
             ctx.fastmem_fallbacks =
                 Some(&self.fastmem_fallbacks as *const FastmemFallbacksTable as *const ());
+            ctx.memory_128_accessors =
+                Some(&self.memory_128_accessors as *const Memory128Accessors as *const ());
             ctx.block = Some(&block);
 
             // Set up block lookup closure for checking if targets are already compiled
@@ -947,6 +970,20 @@ mod tests {
         }
     }
 
+    fn make_raw_exclusive_write_callbacks(
+    ) -> crate::backend::x64::emit_context::RawExclusiveWriteCallbacks {
+        let callback = || -> Box<dyn crate::backend::x64::callback::Callback> {
+            Box::new(ArgCallback::new(0, 0))
+        };
+        crate::backend::x64::emit_context::RawExclusiveWriteCallbacks {
+            write_8: callback(),
+            write_16: callback(),
+            write_32: callback(),
+            write_64: callback(),
+            write_128: callback(),
+        }
+    }
+
     #[test]
     fn test_type_bit_width() {
         assert_eq!(type_bit_width(Type::Void), 0);
@@ -999,7 +1036,7 @@ mod tests {
                 exclusive_write_64: Box::new(ArgCallback::new(0, 0)),
                 exclusive_write_128: Box::new(ArgCallback::new(0, 0)),
             },
-            raw_exclusive_write_callbacks: None,
+            raw_exclusive_write_callbacks: Some(make_raw_exclusive_write_callbacks()),
             enable_cycle_counting: true,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
@@ -1040,12 +1077,16 @@ mod tests {
         );
 
         let prelude_end = emitter.code.code_size();
+        let accessors = emitter.memory_128_accessors;
         let fallback_offset = *emitter
             .fastmem_fallbacks
             .read
             .values()
             .next()
             .expect("A64 prelude should contain read fallbacks");
+        assert!(accessors.read < accessors.write);
+        assert!(accessors.write < accessors.exclusive_write);
+        assert!(accessors.exclusive_write < fallback_offset);
         assert!(fallback_offset < rsb_off);
         assert!(fd_off < prelude_end);
 
@@ -1057,6 +1098,7 @@ mod tests {
             emitter.fastmem_fallbacks.read.values().next().copied(),
             Some(fallback_offset)
         );
+        assert_eq!(emitter.memory_128_accessors, accessors);
         assert_eq!(emitter.terminal_handler_pop_rsb_hint, Some(rsb_off));
         assert_eq!(emitter.terminal_handler_fast_dispatch_hint, Some(fd_off));
     }
@@ -1096,7 +1138,7 @@ mod tests {
                 exclusive_write_64: Box::new(ArgCallback::new(0, 0)),
                 exclusive_write_128: Box::new(ArgCallback::new(0, 0)),
             },
-            raw_exclusive_write_callbacks: None,
+            raw_exclusive_write_callbacks: Some(make_raw_exclusive_write_callbacks()),
             enable_cycle_counting: true,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,

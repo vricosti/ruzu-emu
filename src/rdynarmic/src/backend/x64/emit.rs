@@ -11,7 +11,6 @@ use crate::backend::x64::emit_exclusive_memory as excl_mem;
 use crate::backend::x64::emit_floating_point as fp;
 use crate::backend::x64::emit_fp_vector as fpv;
 use crate::backend::x64::emit_fp_vector_convert as fpvc;
-use crate::backend::x64::emit_memory;
 use crate::backend::x64::emit_packed as packed;
 use crate::backend::x64::emit_saturation as sat;
 use crate::backend::x64::emit_sha;
@@ -496,13 +495,8 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::MinUnsigned64 => dp::emit_min_unsigned64(ctx, ra, inst_ref, inst),
 
             // --- Memory access ---
-            // 8/16/32/64-bit reads + writes use the upstream-faithful
-            // dispatcher in `a64_emit_x64_memory.rs` which selects the
-            // fastmem / page-table / callback path based on
-            // `ctx.fastmem_available` and `ctx.config.memory.page_table_present`.
-            // 128-bit reads/writes stay on the existing callback path
-            // in `emit_memory.rs` per decision 2 (deferred fastmem path
-            // requires `cmpxchg16b` and 128-bit ABI shims).
+            // A64 memory access ownership and callback/fastmem/page-table
+            // selection match `a64_emit_x64_memory.cpp` for every width.
             Opcode::A64ReadMemory8 => {
                 a64_emit_x64_memory::emit_a64_read_memory_8(ctx, ra, inst_ref, inst)
             }
@@ -516,7 +510,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 a64_emit_x64_memory::emit_a64_read_memory_64(ctx, ra, inst_ref, inst)
             }
             Opcode::A64ReadMemory128 => {
-                emit_memory::emit_a64_read_memory_128(ctx, ra, inst_ref, inst)
+                a64_emit_x64_memory::emit_a64_read_memory_128(ctx, ra, inst_ref, inst)
             }
             Opcode::A64WriteMemory8 => {
                 a64_emit_x64_memory::emit_a64_write_memory_8(ctx, ra, inst_ref, inst)
@@ -531,7 +525,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 a64_emit_x64_memory::emit_a64_write_memory_64(ctx, ra, inst_ref, inst)
             }
             Opcode::A64WriteMemory128 => {
-                emit_memory::emit_a64_write_memory_128(ctx, ra, inst_ref, inst)
+                a64_emit_x64_memory::emit_a64_write_memory_128(ctx, ra, inst_ref, inst)
             }
 
             // --- Exclusive memory access ---

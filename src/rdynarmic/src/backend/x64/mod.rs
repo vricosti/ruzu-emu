@@ -22,7 +22,6 @@ pub mod emit_exclusive_memory;
 pub mod emit_floating_point;
 pub mod emit_fp_vector;
 pub mod emit_fp_vector_convert;
-pub mod emit_memory;
 pub mod emit_packed;
 pub mod emit_saturation;
 pub mod emit_sha;

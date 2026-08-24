@@ -7,6 +7,11 @@
 //! Most commands are stubbed; the implemented ones delegate to other NS interfaces.
 
 use super::ns_types::*;
+use crate::core::SystemRef;
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
 
 /// IPC command table for IApplicationManagerInterface.
 /// Entries with `true` are implemented upstream; `false` means nullptr/stub.
@@ -329,6 +334,52 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (3050, false, "ListAssignELicenseTaskResult"),
     (9999, false, "GetApplicationCertificate"),
 ];
+
+/// Port of upstream `IApplicationManagerInterface` ownership and command table.
+pub struct IApplicationManagerInterface {
+    #[allow(dead_code)]
+    system: SystemRef,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IApplicationManagerInterface {
+    pub fn new(system: SystemRef) -> Self {
+        let functions = IAPPLICATION_MANAGER_INTERFACE_COMMANDS
+            .iter()
+            .map(|&(command_id, _, name)| (command_id, None, name))
+            .collect::<Vec<_>>();
+        Self {
+            system,
+            handlers: build_handler_map(&functions),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IApplicationManagerInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IApplicationManagerInterface"
+    }
+}
+
+impl ServiceFramework for IApplicationManagerInterface {
+    fn get_service_name(&self) -> &str {
+        "IApplicationManagerInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Stub: ResumeAll does nothing upstream.
 pub fn resume_all() {

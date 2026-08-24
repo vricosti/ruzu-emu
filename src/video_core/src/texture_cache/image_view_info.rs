@@ -89,7 +89,18 @@ impl ImageViewInfo {
             ..Self::default()
         };
 
-        match TextureType::from_raw(config.texture_type()).expect("Invalid TIC texture_type") {
+        let mut texture_type =
+            TextureType::from_raw(config.texture_type()).expect("Invalid TIC texture_type");
+        if config.depth() > 1 || base_layer != 0 {
+            texture_type = match texture_type {
+                TextureType::Texture1D => TextureType::Texture1DArray,
+                TextureType::Texture2D => TextureType::Texture2DArray,
+                TextureType::TextureCubemap => TextureType::TextureCubeArray,
+                other => other,
+            };
+        }
+
+        match texture_type {
             TextureType::Texture1D => {
                 assert_eq!(config.height(), 1);
                 assert_eq!(config.depth(), 1);
@@ -217,12 +228,12 @@ mod tests {
     #[test]
     fn tic_2d_normalized_maps_to_2d_view() {
         let tic = tic_entry(TextureType::Texture2D, true, 1, 2, 4);
-        let info = ImageViewInfo::from_tic_entry(&tic, 7);
+        let info = ImageViewInfo::from_tic_entry(&tic, 0);
 
         assert_eq!(info.view_type, ImageViewType::E2D);
         assert_eq!(info.format, PixelFormat::A8B8G8R8Unorm);
         assert_eq!(info.range.base.level, 2);
-        assert_eq!(info.range.base.layer, 7);
+        assert_eq!(info.range.base.layer, 0);
         assert_eq!(info.range.extent.levels, 3);
         assert_eq!(info.range.extent.layers, 1);
         assert_eq!(
@@ -234,6 +245,25 @@ mod tests {
                 SwizzleSource::A as u8,
             ]
         );
+    }
+
+    #[test]
+    fn layered_2d_tic_maps_to_2d_array_view() {
+        let tic = tic_entry(TextureType::Texture2D, true, 6, 0, 0);
+        let info = ImageViewInfo::from_tic_entry(&tic, 0);
+
+        assert_eq!(info.view_type, ImageViewType::E2DArray);
+        assert_eq!(info.range.extent.layers, 6);
+    }
+
+    #[test]
+    fn nonzero_base_layer_promotes_2d_tic_to_array_view() {
+        let tic = tic_entry(TextureType::Texture2D, true, 1, 0, 0);
+        let info = ImageViewInfo::from_tic_entry(&tic, 3);
+
+        assert_eq!(info.view_type, ImageViewType::E2DArray);
+        assert_eq!(info.range.base.layer, 3);
+        assert_eq!(info.range.extent.layers, 1);
     }
 
     #[test]

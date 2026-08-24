@@ -30,7 +30,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service(
                 name,
                 Box::new(move || -> SessionRequestHandlerPtr {
-                    Arc::new(super::service_creator::IServiceCreator::new(&n))
+                    Arc::new(super::service_creator::IServiceCreator::new(system, &n))
                 }),
                 64,
             );

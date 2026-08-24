@@ -11367,3 +11367,21 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: this change affects host code-cache metadata only. A full-JIT regression test mutates the
   middle instruction of an A64 block and proves that invalidating four bytes recompiles it.
+
+## 2026-08-24 — `src/rdynarmic/src/common/mod.rs` vs Eden `common/spin_lock_x64.{h,cpp}`
+
+### Intentional differences
+- Eden only builds its x64 backend on x64 hosts. Rust currently compiles the x64 code-generator
+  modules on ARM64 as well, so the architecture-independent `rxbyak` emission helper must remain
+  visible there even though the generated instructions are x64 instructions.
+
+### Unintentional differences (to fix)
+- Fixed: `spin_lock_x64` was hidden behind a host-architecture `cfg`, while the unconditionally
+  compiled x64 exclusive-memory emitter imported it. Clean Apple Silicon builds consequently
+  failed with an unresolved import.
+
+### Missing items
+- None in the module-ownership fix.
+
+### Binary layout verification
+- N/A: this only changes Rust module visibility for a host-code emission helper.

@@ -63,14 +63,15 @@ impl EmitContext<'_> {
 mod tests {
     use super::*;
     use crate::backend::arm64::emit_arm64::{CodePtr, EmittedBlockInfo};
-    use crate::backend::common::emit_context::MemoryEmitConfig;
+    use crate::interface::a64::config::{
+        Exception as A64Exception, UserCallbacks as A64UserCallbacks, UserConfig as A64UserConfig,
+        Vector as A64Vector,
+    };
     use crate::ir::location::A64LocationDescriptor;
-    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
-    use std::collections::HashMap;
 
     struct DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
+    impl A64UserCallbacks for DummyCallbacks {
         fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
             None
         }
@@ -91,77 +92,34 @@ mod tests {
             0
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_128(&self, _vaddr: u64) -> A64Vector {
+            [0, 0]
         }
 
         fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
         fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
         fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
+        fn memory_write_128(&mut self, _vaddr: u64, _value: A64Vector) {}
 
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
             0
         }
+
+        fn get_cntpct(&self) -> u64 {
+            0
+        }
     }
 
-    fn config() -> JitConfig {
-        JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 0,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn config() -> A64UserConfig {
+        let mut config = A64UserConfig::new(Box::new(DummyCallbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 0;
+        config
     }
 
     fn empty_block_info() -> EmittedBlockInfo {
@@ -195,9 +153,7 @@ mod tests {
         let mut emitted_block_info = empty_block_info();
         let mut fpsr = FpsrManager::default();
         let mut fastmem = FastmemManager::default();
-        let conf = crate::backend::arm64::emit_arm64::EmitConfig::from_a64_config(
-            &config().into_a64_user_config(),
-        );
+        let conf = crate::backend::arm64::emit_arm64::EmitConfig::from_a64_config(&config());
 
         let ctx = EmitContext {
             block: &mut block,

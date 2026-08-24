@@ -10907,3 +10907,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: compile-time trait checking on AArch64 now enforces A32 `u32` guest addresses and A64
   `[u64; 2]` vectors at these test/backend boundaries; this slice serializes no guest payload.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{emit_context,emit_arm64_a64}.rs` vs Eden `backend/arm64/{emit_context.h,emit_arm64_a64.cpp}` and `interface/A64/config.h` (A64 emitter test ownership)
+
+### Intentional differences
+- Rust emission helpers return `Result` because instruction-buffer writes are fallible; the test
+  fixtures exercise the same emitted instruction and relocation sequences as Eden through this
+  error-aware API.
+
+### Unintentional differences (to fix)
+- Fixed: A64 emission-context and terminal-emitter tests constructed the obsolete merged
+  configuration and converted it before building `EmitConfig`. Both now consume A64 `UserConfig`
+  directly, including its direct `check_halt_on_memory_access` owner.
+- Fixed: their callback fixtures exposed the legacy tuple/raw-integer API. They now implement the
+  A64 callback contract with typed vectors, exceptions, SVC naming, physical counter, and upstream
+  default exclusive-write behavior.
+- Fixed: `emit_arm64_a64.rs` imported the optimization flags through the compatibility module even
+  in production code. It now imports their upstream-equivalent interface owner directly.
+
+### Missing items
+- Other ARM64 A64 address-space and shared-memory emitter test fixtures still depend on the merged
+  compatibility layer and remain separate ownership slices.
+
+### Binary layout verification
+- PASS: the AArch64 test build checks the `[u64; 2]` callback vector boundary; this test-only
+  configuration migration does not alter emitted instruction encodings or guest data layouts.

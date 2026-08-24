@@ -231,6 +231,7 @@ pub struct EmitConfig {
     pub page_table_pointer: u64,
     pub page_table_address_space_bits: usize,
     pub page_table_pointer_mask_bits: u32,
+    pub page_table_log2_stride: usize,
     pub silently_mirror_page_table: bool,
     pub absolute_offset_page_table: bool,
     pub detect_misaligned_access_via_page_table: u32,
@@ -257,9 +258,7 @@ impl EmitConfig {
         let memory = MemoryEmitConfig {
             fastmem_address_space_bits: 32,
             silently_mirror_fastmem: true,
-            fastmem_exclusive_access: config.fastmem_exclusive_access
-                && config.fastmem_pointer.is_some()
-                && config.global_monitor.is_some(),
+            fastmem_exclusive_access: config.fastmem_exclusive_access,
             recompile_on_exclusive_fastmem_failure: config.recompile_on_exclusive_fastmem_failure,
             recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
             page_table_present: config.page_table.is_some(),
@@ -267,6 +266,7 @@ impl EmitConfig {
             silently_mirror_page_table: true,
             absolute_offset_page_table: config.absolute_offset_page_table,
             page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+            page_table_log2_stride: config.page_table_log2_stride,
             detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
                 as u32,
             only_detect_misalignment_via_page_table_on_page_boundary: config
@@ -293,6 +293,7 @@ impl EmitConfig {
             page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: 32,
             page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
+            page_table_log2_stride: config.page_table_log2_stride,
             silently_mirror_page_table: true,
             absolute_offset_page_table: memory.absolute_offset_page_table,
             detect_misaligned_access_via_page_table: memory.detect_misaligned_access_via_page_table,
@@ -338,6 +339,7 @@ impl EmitConfig {
             page_table_pointer: config.page_table_pointer.map_or(0, |p| p as u64),
             page_table_address_space_bits: memory.page_table_address_space_bits,
             page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
+            page_table_log2_stride: config.page_table_log2_stride,
             silently_mirror_page_table: memory.silently_mirror_page_table,
             absolute_offset_page_table: memory.absolute_offset_page_table,
             detect_misaligned_access_via_page_table: memory.detect_misaligned_access_via_page_table,
@@ -2462,7 +2464,7 @@ mod tests {
         assert_eq!(cfg.memory.page_table_address_space_bits, 32);
         assert!(cfg.memory.silently_mirror_fastmem);
         assert!(cfg.memory.silently_mirror_page_table);
-        assert!(!cfg.memory.fastmem_exclusive_access);
+        assert!(cfg.memory.fastmem_exclusive_access);
         assert!(!cfg.memory.recompile_on_exclusive_fastmem_failure);
         assert_eq!(cfg.fastmem_address_space_bits, 32);
         assert_eq!(cfg.page_table_address_space_bits, 32);

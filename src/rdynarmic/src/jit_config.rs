@@ -557,7 +557,7 @@ impl JitConfig {
                 .page_table_pointer_mask_bits
                 .try_into()
                 .expect("A32 page-table pointer mask must fit i32"),
-            page_table_log2_stride: 3,
+            page_table_log2_stride: memory.page_table_log2_stride,
             arch_version: self.arch_version,
             processor_id: self
                 .processor_id

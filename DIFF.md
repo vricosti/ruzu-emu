@@ -10652,3 +10652,33 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the changed configuration objects and callback tables are host-side Rust structures and
   are not raw-copied guest payloads. A32 exception values retain their verified four-byte layout;
   focused callback/configuration tests and all four cross-target test builds pass.
+## 2026-08-24 — `src/rdynarmic/src/backend/{common/emit_context.rs,x64/emit_x64_memory.rs,arm64/{emit_arm64.rs,emit_arm64_memory.rs}}` vs Eden `backend/{x64/emit_x64_memory.h,arm64/{emit_arm64.h,emit_arm64_memory.cpp}}` (`page_table_log2_stride`)
+
+### Intentional differences
+- Rust's existing `MemoryEmitConfig` is shared by the two host emitters, whereas Eden stores the
+  field in each architecture `UserConfig` and copies it into the arm64 `EmitConfig`. Both A32 and
+  A64 construction paths now forward the architecture-owned value into that mechanical backend
+  container.
+- The temporary public `JitConfig` compatibility bridge exposes the stride through its nested
+  memory configuration until remaining callers migrate to architecture-owned configurations.
+
+### Unintentional differences (to fix)
+- Fixed: both x64 page-table lookups multiplied every index by eight. They now shift the index by
+  the configured log2 stride before the unscaled pointer load, exactly like Eden, so both supported
+  eight- and sixteen-byte entries address the correct pointer field.
+- Fixed: arm64 used the scaled `LDR` form and therefore also hard-coded eight-byte entries. It now
+  emits Eden's explicit `LSL` followed by an unscaled indexed `LDR`.
+- Fixed: the A32 and A64 configuration adapters discarded the supplied stride and always selected
+  three; they now preserve the value end-to-end.
+- Fixed: A32 emitter construction conditioned `fastmem_exclusive_access` on two unrelated pointer
+  presences. Eden forwards the configuration flag literally; both host construction paths now do
+  the same.
+
+### Missing items
+- Removing the temporary merged `JitConfig` remains part of the architecture-configuration
+  migration; no page-table stride behavior remains missing in the reviewed x64 or arm64 lookup.
+
+### Binary layout verification
+- N/A: the configuration is host-side. A native x64 execution test uses sixteen-byte entries with
+  a poisoned second word and verifies that the JIT loads the first-word pointer; arm64 emission
+  tests verify the configured `LSL #4` and unscaled indexed `LDR` sequence.

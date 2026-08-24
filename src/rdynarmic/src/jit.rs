@@ -3126,9 +3126,7 @@ impl A32Jit {
             memory: crate::backend::common::emit_context::MemoryEmitConfig {
                 fastmem_address_space_bits: 32,
                 silently_mirror_fastmem: true,
-                fastmem_exclusive_access: config.fastmem_exclusive_access
-                    && config.fastmem_pointer.is_some()
-                    && config.global_monitor.is_some(),
+                fastmem_exclusive_access: config.fastmem_exclusive_access,
                 recompile_on_exclusive_fastmem_failure: config
                     .recompile_on_exclusive_fastmem_failure,
                 recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
@@ -3137,6 +3135,7 @@ impl A32Jit {
                 silently_mirror_page_table: true,
                 absolute_offset_page_table: config.absolute_offset_page_table,
                 page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+                page_table_log2_stride: config.page_table_log2_stride,
                 detect_misaligned_access_via_page_table: config
                     .detect_misaligned_access_via_page_table
                     as u32,
@@ -4570,6 +4569,78 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[test]
+    fn a32_page_table_honors_sixteen_byte_entry_stride() {
+        #[repr(C)]
+        struct PageTableEntry {
+            pointer: usize,
+            reserved: usize,
+        }
+
+        let code: [u32; 2] = [
+            0xE590_1000, // ldr r1, [r0]
+            0xEF00_0000, // svc #0
+        ];
+        let mut callback_memory = vec![0u8; 0x10_000];
+        for (index, instruction) in code.iter().enumerate() {
+            callback_memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        callback_memory[0x3000..0x3004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mut page_memory = vec![0u8; 0x1000];
+        page_memory[0..4].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let mut page_table: Vec<PageTableEntry> = (0..1 << (16 - 12))
+            .map(|_| PageTableEntry {
+                pointer: 0,
+                reserved: usize::MAX,
+            })
+            .collect();
+        page_table[3].pointer = (page_memory.as_ptr() as usize).wrapping_sub(0x3000);
+
+        let config = JitConfig {
+            coprocessors: JitConfig::default_coprocessors(),
+            callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: None,
+            page_table_pointer: Some(page_table.as_ptr().cast()),
+            define_unpredictable_behaviour: false,
+            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
+            hook_hint_instructions: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                page_table_present: true,
+                page_table_address_space_bits: 16,
+                page_table_log2_stride: 4,
+                silently_mirror_page_table: true,
+                absolute_offset_page_table: true,
+                ..Default::default()
+            },
+        };
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x3000);
+        jit.set_register(15, 0);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xCAFE_BABE);
+
+        drop(jit);
+        drop(page_table);
+        drop(page_memory);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
     fn a32_fastmem_fault_recompiles_to_page_table() {
         let code: [u32; 2] = [
             0xE590_1000, // ldr r1, [r0]
@@ -5412,6 +5483,7 @@ mod tests {
                 silently_mirror_page_table: true,
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: 0,
+                page_table_log2_stride: 3,
                 detect_misaligned_access_via_page_table: 0,
                 only_detect_misalignment_via_page_table_on_page_boundary: false,
                 check_halt_on_memory_access: false,
@@ -5547,6 +5619,7 @@ mod tests {
                 silently_mirror_page_table: true,
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: 0,
+                page_table_log2_stride: 3,
                 detect_misaligned_access_via_page_table: 0,
                 only_detect_misalignment_via_page_table_on_page_boundary: false,
                 check_halt_on_memory_access: false,
@@ -7178,6 +7251,7 @@ mod tests {
                 silently_mirror_page_table: false,
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: 0,
+                page_table_log2_stride: 3,
                 detect_misaligned_access_via_page_table: 0,
                 only_detect_misalignment_via_page_table_on_page_boundary: false,
                 check_halt_on_memory_access: false,

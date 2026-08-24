@@ -34,6 +34,8 @@ pub struct MemoryEmitConfig {
     pub absolute_offset_page_table: bool,
     /// Number of low bits in page-table entries that are attribute flags.
     pub page_table_pointer_mask_bits: u32,
+    /// Log2 byte stride between page-table entries; upstream permits 3 or 4.
+    pub page_table_log2_stride: usize,
     /// Bitmask of access widths to detect misalignment for via the page-table
     /// path. `16 | 32 | 64 | 128` matches upstream zuyu.
     pub detect_misaligned_access_via_page_table: u32,
@@ -60,6 +62,7 @@ impl Default for MemoryEmitConfig {
             silently_mirror_page_table: true,
             absolute_offset_page_table: false,
             page_table_pointer_mask_bits: 0,
+            page_table_log2_stride: 3,
             detect_misaligned_access_via_page_table: 0,
             only_detect_misalignment_via_page_table_on_page_boundary: false,
             check_halt_on_memory_access: false,

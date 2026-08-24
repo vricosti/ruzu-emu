@@ -14,8 +14,11 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+use rdynarmic::interface::a32::config::{
+    Exception as A32Exception, UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+};
+use rdynarmic::interface::optimization_flags::OptimizationFlag;
 use rdynarmic::jit::A32Jit;
-use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 const ORACLE: &str = "/home/vricosti/Dev/emulators/zuyu/build/a32_oracle";
 
@@ -90,9 +93,9 @@ impl DiffEnv {
     }
 }
 
-impl UserCallbacks for DiffEnv {
-    fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        let a = vaddr & !3;
+impl A32UserCallbacks for DiffEnv {
+    fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
+        let a = u64::from(vaddr & !3);
         if let Some((i, off)) = self.find_segment(a) {
             let d = &self.segments[i].1;
             if off + 4 <= d.len() {
@@ -107,59 +110,51 @@ impl UserCallbacks for DiffEnv {
         // Fall back: 0xEAFFFFFE is ARM "b ." (infinite self-loop) — matches old behavior.
         Some(0xEAFFFFFE)
     }
-    fn memory_read_8(&self, vaddr: u64) -> u8 {
-        self.read_byte(vaddr)
+    fn memory_read_8(&self, vaddr: u32) -> u8 {
+        self.read_byte(vaddr.into())
     }
-    fn memory_read_16(&self, vaddr: u64) -> u16 {
-        self.memory_read_8(vaddr) as u16 | (self.memory_read_8(vaddr + 1) as u16) << 8
+    fn memory_read_16(&self, vaddr: u32) -> u16 {
+        self.memory_read_8(vaddr) as u16 | (self.memory_read_8(vaddr.wrapping_add(1)) as u16) << 8
     }
-    fn memory_read_32(&self, vaddr: u64) -> u32 {
-        self.memory_read_16(vaddr) as u32 | (self.memory_read_16(vaddr + 2) as u32) << 16
+    fn memory_read_32(&self, vaddr: u32) -> u32 {
+        self.memory_read_16(vaddr) as u32
+            | (self.memory_read_16(vaddr.wrapping_add(2)) as u32) << 16
     }
-    fn memory_read_64(&self, vaddr: u64) -> u64 {
-        self.memory_read_32(vaddr) as u64 | (self.memory_read_32(vaddr + 4) as u64) << 32
+    fn memory_read_64(&self, vaddr: u32) -> u64 {
+        self.memory_read_32(vaddr) as u64
+            | (self.memory_read_32(vaddr.wrapping_add(4)) as u64) << 32
     }
-    fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-        (self.memory_read_64(vaddr), self.memory_read_64(vaddr + 8))
+    fn memory_write_8(&mut self, vaddr: u32, value: u8) {
+        self.write_byte(vaddr.into(), value);
     }
-    fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        self.write_byte(vaddr, value);
-    }
-    fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+    fn memory_write_16(&mut self, vaddr: u32, value: u16) {
         self.memory_write_8(vaddr, value as u8);
-        self.memory_write_8(vaddr + 1, (value >> 8) as u8);
+        self.memory_write_8(vaddr.wrapping_add(1), (value >> 8) as u8);
     }
-    fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+    fn memory_write_32(&mut self, vaddr: u32, value: u32) {
         self.memory_write_16(vaddr, value as u16);
-        self.memory_write_16(vaddr + 2, (value >> 16) as u16);
+        self.memory_write_16(vaddr.wrapping_add(2), (value >> 16) as u16);
     }
-    fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+    fn memory_write_64(&mut self, vaddr: u32, value: u64) {
         self.memory_write_32(vaddr, value as u32);
-        self.memory_write_32(vaddr + 4, (value >> 32) as u32);
+        self.memory_write_32(vaddr.wrapping_add(4), (value >> 32) as u32);
     }
-    fn memory_write_128(&mut self, vaddr: u64, lo: u64, hi: u64) {
-        self.memory_write_64(vaddr, lo);
-        self.memory_write_64(vaddr + 8, hi);
-    }
-    fn exclusive_write_8(&mut self, _: u64, _: u8, _: u8) -> bool {
+    fn memory_write_exclusive_8(&mut self, _: u32, _: u8, _: u8) -> bool {
         true
     }
-    fn exclusive_write_16(&mut self, _: u64, _: u16, _: u16) -> bool {
+    fn memory_write_exclusive_16(&mut self, _: u32, _: u16, _: u16) -> bool {
         true
     }
-    fn exclusive_write_32(&mut self, _: u64, _: u32, _: u32) -> bool {
+    fn memory_write_exclusive_32(&mut self, _: u32, _: u32, _: u32) -> bool {
         true
     }
-    fn exclusive_write_64(&mut self, _: u64, _: u64, _: u64) -> bool {
+    fn memory_write_exclusive_64(&mut self, _: u32, _: u64, _: u64) -> bool {
         true
     }
-    fn exclusive_write_128(&mut self, _: u64, _: u64, _: u64, _: u64, _: u64) -> bool {
-        true
-    }
-    fn call_supervisor(&mut self, _svc: u32) {
+    fn call_svc(&mut self, _svc: u32) {
         self.svc_hit = true;
     }
-    fn exception_raised(&mut self, _pc: u64, _exc: u64) {}
+    fn exception_raised(&mut self, _pc: u32, _exc: A32Exception) {}
     fn add_ticks(&mut self, ticks: u64) {
         self.ticks_left = self.ticks_left.saturating_sub(ticks);
     }
@@ -375,30 +370,10 @@ fn main() {
         env.load_code(*load_addr, code_data);
     }
 
-    let config = JitConfig {
-        coprocessors: JitConfig::default_coprocessors(),
-        callbacks: Box::new(env),
-        enable_cycle_counting: false,
-        code_cache_size: 64 * 1024 * 1024,
-        optimizations: optimization_flags_from_mask(optimization_mask),
-        unsafe_optimizations: false,
-        global_monitor: None,
-        fastmem_pointer: None,
-        page_table_pointer: None,
-        define_unpredictable_behaviour: false,
-        arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
-        hook_hint_instructions: false,
-        processor_id: 0,
-        wall_clock_cntpct: false,
-        cntfrq_el0: 600_000_000,
-        ctr_el0: 0x8444_c004,
-        dczid_el0: 4,
-        hook_data_cache_operations: false,
-        hook_isb: false,
-        tpidrro_el0: None,
-        tpidr_el0: None,
-        memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default(),
-    };
+    let mut config = A32UserConfig::new(Box::new(env));
+    config.enable_cycle_counting = false;
+    config.code_cache_size = 64 * 1024 * 1024;
+    config.optimizations = optimization_flags_from_mask(optimization_mask);
 
     let mut jit = A32Jit::new(config).expect("Failed to create rdynarmic A32Jit");
 
@@ -562,4 +537,16 @@ fn main() {
     }
 
     eprintln!("Completed {} steps with no divergence!", max_steps);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differential_environment_implements_a32_callbacks_directly() {
+        fn assert_a32_callbacks<T: A32UserCallbacks>() {}
+
+        assert_a32_callbacks::<DiffEnv>();
+    }
 }

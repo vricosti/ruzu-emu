@@ -3951,6 +3951,33 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: only local diagnostics and test builders changed.
 
+## 2026-08-24 — `src/rdynarmic/src/bin/{a32_diff.rs,compile_bench.rs}` vs Eden `src/dynarmic/src/dynarmic/interface/A32/config.h` and `tests/A32/testenv.h`
+
+### Intentional differences
+
+- Both executables are Ruzu developer tools without direct Eden executable counterparts. Their
+  sparse differential address space and deterministic compilation workloads remain tool-local;
+  callback ownership and configuration follow Eden's A32 interface.
+- Rust owns callbacks in `A32UserConfig` instead of storing Eden's non-owning `UserCallbacks*`.
+
+### Unintentional differences (to fix)
+
+- Fixed: both tools implemented the architecture-merged legacy callbacks, including A64-only
+  128-bit accesses and `u64` guest addresses. They now implement the A32 callback interface
+  directly with `u32` addresses, typed A32 exceptions, and A32-exclusive callback names.
+- Fixed: both tools built the merged legacy configuration and supplied irrelevant A64 register and
+  address-space options. They now construct `A32UserConfig` and override only cycle counting, code
+  cache size, and the optimization mask used by each workload.
+
+### Missing items
+
+- None in the callback/configuration ownership of these two developer tools.
+
+### Binary layout verification
+
+- N/A: the tools exchange no raw callback or configuration payload. Focused compile-time tests
+  require both environments to implement the architecture-owned A32 callback trait.
+
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/{decoder.rs,decoder_thumb32.rs,translate/thumb32.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/{decoder,translate/impl}`
 
 ### Intentional differences

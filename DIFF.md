@@ -4007,6 +4007,32 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   memory and coprocessor paths; a focused local fuzz-environment regression constructs and runs an
   A32 JIT without relying on the external oracle.
 
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{a32_core.rs,a64_core.rs}` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/{a32_core.h,a64_core.h}` and architecture config headers
+
+### Intentional differences
+
+- Rust returns address-space emission errors from `run` and `step`; Eden's `GetOrEmit` path relies
+  on assertions/allocation invariants and returns its entry point directly.
+- The architecture-specific test callbacks are boxed by their Rust `UserConfig`; Eden stores a
+  non-owning callback pointer.
+
+### Unintentional differences (to fix)
+
+- Fixed: both core test modules built the merged legacy configuration. Their callback inventories,
+  address widths, vector values, and exception types now come directly from their matching A32 or
+  A64 interface, and their builders return the architecture-owned configuration without adapters.
+- Fixed: the A64 page-table test now assigns the page table and its address-space width through the
+  A64-owned fields instead of mutating a shared memory carrier and converting it afterward.
+
+### Missing items
+
+- None in the `A32Core`/`A64Core` run and step surface or this test-configuration slice.
+
+### Binary layout verification
+
+- N/A: these core wrappers and test configurations serialize no guest payload. The complete
+  `rdynarmic` test target compiles for `aarch64-unknown-linux-gnu` with both callback traits checked.
+
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/{decoder.rs,decoder_thumb32.rs,translate/thumb32.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/{decoder,translate/impl}`
 
 ### Intentional differences

@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::backend::common::a32_callbacks;
 use crate::backend::x64::a32_emit_x64::A32EmitX64;
+use crate::backend::x64::a32_emit_x64_memory;
+use crate::backend::x64::a32_jitstate::A32JitState;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn, DEFAULT_CODE_SIZE};
 use crate::backend::x64::callback::ArgCallback;
 use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig, RawExclusiveWriteCallbacks};
-use crate::backend::x64::jit_state::{A32JitState, A64JitState, RSB_PTR_MASK};
 use crate::common::llvm_disassemble::disassemble_x64;
 use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
 use crate::frontend::a32::translate::TranslationOptions as A32TranslationOptions;
@@ -405,6 +407,8 @@ impl A32Jit {
                 processor_id: config.processor_id as usize,
             },
             global_monitor: config.global_monitor,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             // Unused by A32 (CNTFRQ is a CP15 read there), but the shared
             // EmitConfig carries it; forward the configured value anyway.
             cntfrq_el0: 600_000_000,
@@ -451,7 +455,8 @@ impl A32Jit {
         // RunCode() just calls the stored function pointer — no mprotect ever.
         let unique_hash = self.inner.jit_state.get_unique_hash();
         let location = LocationDescriptor::new(unique_hash);
-        let new_rsb_ptr = self.inner.jit_state.rsb_ptr.wrapping_sub(1) as usize & RSB_PTR_MASK;
+        let new_rsb_ptr =
+            self.inner.jit_state.rsb_ptr.wrapping_sub(1) as usize & A32JitState::RSB_PTR_MASK;
         let rsb_code_ptr =
             if self.inner.jit_state.rsb_location_descriptors[new_rsb_ptr] == unique_hash {
                 self.inner.jit_state.rsb_ptr = new_rsb_ptr as u32;
@@ -631,18 +636,6 @@ impl A32Jit {
         assert!(index < 64, "A32 ext_reg index out of range (0-63)");
 
         self.inner.jit_state.ext_reg[index] = value;
-    }
-
-    /// Get CNTPCT (Physical Count Timer) value.
-    pub fn get_cntpct(&self) -> u64 {
-        self.inner.jit_state.cntpct
-    }
-
-    /// Set CNTPCT (Physical Count Timer) value.
-    /// Should be set before `run()` to provide the current tick count.
-    /// Read by MRRC p15, 0, Rt, Rt2, c14.
-    pub fn set_cntpct(&mut self, value: u64) {
-        self.inner.jit_state.cntpct = value;
     }
 
     /// Clear exclusive monitor state.
@@ -1019,54 +1012,64 @@ extern "C" fn a32_unreachable_get_cntpct_trampoline(_inner_ptr: u64) -> u64 {
 
 extern "C" fn a32_exclusive_clear_trampoline(inner_ptr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_clear(&mut inner.jit_state);
+    inner.jit_state.exclusive_state = 0;
 }
 extern "C" fn a32_exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_8(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_8(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_16(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_16(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_32(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_32(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_64(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive read requires a global monitor");
+    a32_emit_x64_memory::exclusive_read_64(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
     )
 }
 extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_8(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_8(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,
@@ -1074,10 +1077,12 @@ extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value
 }
 extern "C" fn a32_exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_16(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_16(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,
@@ -1086,10 +1091,12 @@ extern "C" fn a32_exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, valu
 extern "C" fn a32_exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     maybe_log_a32_watch_write(inner, vaddr, 4, value, 0);
-    a32_callbacks::exclusive_write_32(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_32(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,
@@ -1097,10 +1104,12 @@ extern "C" fn a32_exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, valu
 }
 extern "C" fn a32_exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_64(
-        &mut inner.jit_state,
+    let monitor = inner
+        .global_monitor
+        .expect("A32 exclusive write requires a global monitor");
+    a32_emit_x64_memory::exclusive_write_64(
         inner.callbacks.as_mut(),
-        inner.global_monitor,
+        monitor,
         inner.processor_id,
         vaddr,
         value,

@@ -1,9 +1,11 @@
 use std::cell::RefCell;
 
+use crate::backend::x64::a32_jitstate::A32JitState;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::exception_handler::FastmemPatchTable;
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::jit_state::{A32JitState, A64JitState};
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
 use crate::interface::a32::config::Coprocessors;
@@ -37,39 +39,6 @@ pub struct DeferredEmitCtx<'a> {
 /// One deferred-emit closure. Drained after the main block is emitted.
 pub type DeferredEmit = Box<dyn FnOnce(&mut DeferredEmitCtx<'_>)>;
 
-/// Info about a fastmem instruction recorded during emission.
-#[derive(Clone, Debug)]
-pub struct FastmemEntry {
-    /// Code offset of the fastmem mov instruction (relative to code base).
-    pub inst_offset: usize,
-    /// Code offset right after the fastmem instruction (resume point).
-    pub resume_offset: usize,
-    /// Bit size of the memory access (8, 16, 32, 64).
-    pub bitsize: usize,
-    /// Whether this is a write (true) or read (false).
-    pub is_write: bool,
-    /// Whether the access belongs to an inline exclusive sequence. Faulting
-    /// exclusive writes must call the raw compare-and-store callback because
-    /// the generated code already holds the monitor lock.
-    pub is_exclusive: bool,
-    /// Whether this access is `AccType::Ordered` (LDA / STL / LDAEX / STLEX).
-    /// When true, the slow-path stub emits `mfence` around the callback
-    /// (before for reads, after for writes), matching upstream
-    /// `GenFastmemFallbacks` in `a32_emit_x64_memory.cpp:60-96`.
-    pub ordered: bool,
-    /// Register index holding the virtual address (0=RAX, 1=RCX, etc.).
-    pub vaddr_reg: u8,
-    /// Register index for the value (result for reads, source for writes).
-    pub value_reg: u8,
-    /// Identifies this memory microinstruction within its source block.
-    ///
-    /// Matches upstream `DoNotFastmemMarker` and is used to disable only this
-    /// access when its direct fastmem instruction faults.
-    pub marker: crate::backend::x64::exception_handler::DoNotFastmemMarker,
-    /// Fault policy selected for this ordinary or exclusive access.
-    pub recompile: bool,
-}
-
 /// Architecture-specific configuration for terminal emission.
 ///
 /// Provides the correct JitState field offsets and location descriptor
@@ -100,11 +69,11 @@ impl ArchConfig {
         }
     }
 
-    /// Offset of `halt_reason` in the JitState struct.
-    pub fn halt_reason_offset(self) -> usize {
+    /// Shared x64 JIT-state layout selected by the concrete architecture.
+    pub const fn jit_state_info(self) -> JitStateInfo {
         match self {
-            Self::A64 => A64JitState::offset_of_halt_reason(),
-            Self::A32 => A32JitState::offset_of_halt_reason(),
+            Self::A64 => JitStateInfo::from_a64(),
+            Self::A32 => JitStateInfo::from_a32(),
         }
     }
 
@@ -140,42 +109,6 @@ impl ArchConfig {
         match self {
             Self::A64 => 0,
             Self::A32 => A32LocationDescriptor::from_location(loc).upper_location_descriptor(),
-        }
-    }
-
-    /// Offset of `cpsr_nzcv` in the JitState struct.
-    pub fn cpsr_nzcv_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_cpsr_nzcv(),
-            Self::A32 => A32JitState::offset_of_cpsr_nzcv(),
-        }
-    }
-
-    pub fn fpsr_exc_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_fpsr_exc(),
-            Self::A32 => A32JitState::offset_of_fpsr_exc(),
-        }
-    }
-
-    pub fn fpsr_qc_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_fpsr_qc(),
-            Self::A32 => A32JitState::offset_of_fpsr_qc(),
-        }
-    }
-
-    pub fn guest_mxcsr_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_guest_mxcsr(),
-            Self::A32 => A32JitState::offset_of_guest_mxcsr(),
-        }
-    }
-
-    pub fn asimd_mxcsr_offset(self) -> usize {
-        match self {
-            Self::A64 => A64JitState::offset_of_asimd_mxcsr(),
-            Self::A32 => A32JitState::offset_of_asimd_mxcsr(),
         }
     }
 
@@ -262,9 +195,10 @@ pub struct RawExclusiveWriteCallbacks {
     pub write_16: Box<dyn Callback>,
     pub write_32: Box<dyn Callback>,
     pub write_64: Box<dyn Callback>,
-    /// The 128-bit callback receives `(vaddr, value_ptr, expected_ptr)` after
-    /// the fixed JIT context parameter. The pointer adaptation keeps both
-    /// System V and Windows within their four-register ABI limit.
+    /// System V receives `(vaddr, value_lo, value_hi, expected_lo,
+    /// expected_hi)` after the fixed JIT context parameter. Win64 receives
+    /// `(vaddr, value_ptr, expected_ptr)`, matching the ABI adaptation in
+    /// Eden's generated 128-bit accessor.
     pub write_128: Box<dyn Callback>,
 }
 
@@ -289,6 +223,11 @@ pub struct EmitConfig {
     /// upstream's `GetExclusiveMonitorLockPointer` /
     /// `GetExclusiveMonitorAddressPointer` / `GetExclusiveMonitorValuePointer`.
     pub global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
+    /// Stable backing pointers embedded in A64 TPIDR instructions.
+    ///
+    /// Upstream owner: `A64::UserConfig::{tpidr_el0,tpidrro_el0}`.
+    pub tpidrro_el0: Option<*const u64>,
+    pub tpidr_el0: Option<*mut u64>,
     /// Counter-timer frequency returned for `MRS CNTFRQ_EL0`.
     /// Upstream `A64::UserConfig::cntfrq_el0`; forwarded from the architecture-owned config.
     pub cntfrq_el0: u32,
@@ -324,6 +263,12 @@ pub struct EmitContext<'a> {
     /// Architecture-specific configuration (A32 vs A64).
     /// Controls PC offset, halt_reason offset, location descriptor parsing.
     pub arch: ArchConfig,
+    /// Copy of the immutable JIT-state layout owned by `BlockOfCode`.
+    ///
+    /// Eden emitters query `BlockOfCode::GetJitStateInfo()` directly. Rust's
+    /// split mutable assembler borrow prevents retaining that owner here, so
+    /// the exact value is copied into the per-block context.
+    pub jit_state_info: JitStateInfo,
     /// Dispatcher return_from_run_code offsets (4 entries).
     ///
     /// When `Some`, terminals emit `jmp rel32` to these absolute code buffer
@@ -371,13 +316,6 @@ pub struct EmitContext<'a> {
     pub do_not_fastmem: Option<
         &'a std::collections::HashSet<crate::backend::x64::exception_handler::DoNotFastmemMarker>,
     >,
-    /// Fastmem instruction info collected during emission.
-    /// Converted to absolute RIPs and fallback stubs after block emission.
-    ///
-    /// Used by the existing per-emission A32 fastmem path; the upstream-
-    /// faithful A64 path does not populate this and uses `deferred_emits`
-    /// instead to record patches.
-    pub fastmem_entries: RefCell<Vec<FastmemEntry>>,
     /// Closures to run after the main block has been emitted, to emit
     /// abort/fallback handlers for fastmem and page-table memory accesses.
     ///
@@ -398,6 +336,10 @@ pub struct EmitContext<'a> {
     /// (the table outlives the context — it's owned by `A64EmitX64`).
     /// Cast back to `&FastmemFallbacksTable` at use time.
     pub fastmem_fallbacks: Option<*const ()>,
+    /// A64's permanent generated 128-bit read/write/exclusive-write
+    /// accessors. The matching owner is `a64_emit_x64_memory.rs`; this raw
+    /// pointer follows the fallback-table lifetime pattern above.
+    pub memory_128_accessors: Option<*const ()>,
     /// `RUZU_BLOCK_PROLOGUE_COUNT_PC` per-core counter address. When `Some`,
     /// `emit_block` emits `lock inc qword [counter_addr]` immediately after
     /// the entrypoint offset is captured, so the increment runs on every
@@ -414,6 +356,7 @@ impl<'a> EmitContext<'a> {
             host_features: crate::backend::x64::block_of_code::get_host_features(),
             optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
             arch: ArchConfig::A64,
+            jit_state_info: JitStateInfo::from_a64(),
             dispatcher_offsets: None,
             code_base_ptr: std::ptr::null(),
             is_single_step: false,
@@ -429,9 +372,9 @@ impl<'a> EmitContext<'a> {
             has_bx_write_pc: false,
             fastmem_available: false,
             do_not_fastmem: None,
-            fastmem_entries: RefCell::new(Vec::new()),
             deferred_emits: RefCell::new(Vec::new()),
             fastmem_fallbacks: None,
+            memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
         }
     }
@@ -440,6 +383,7 @@ impl<'a> EmitContext<'a> {
         location: LocationDescriptor,
         config: &'a EmitConfig,
         arch: ArchConfig,
+        jit_state_info: JitStateInfo,
         host_features: HostFeature,
         optimizations: OptimizationFlag,
         dispatcher_offsets: [usize; 4],
@@ -451,6 +395,7 @@ impl<'a> EmitContext<'a> {
             host_features,
             optimizations,
             arch,
+            jit_state_info,
             dispatcher_offsets: Some(dispatcher_offsets),
             code_base_ptr,
             is_single_step: arch.extract_single_stepping(location),
@@ -466,9 +411,9 @@ impl<'a> EmitContext<'a> {
             has_bx_write_pc: false,
             fastmem_available: false,
             do_not_fastmem: None,
-            fastmem_entries: RefCell::new(Vec::new()),
             deferred_emits: RefCell::new(Vec::new()),
             fastmem_fallbacks: None,
+            memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
         }
     }
@@ -484,6 +429,11 @@ impl<'a> EmitContext<'a> {
 
     pub fn has_optimization(&self, flag: OptimizationFlag) -> bool {
         self.optimizations.contains(flag)
+    }
+
+    pub fn set_arch(&mut self, arch: ArchConfig) {
+        self.arch = arch;
+        self.jit_state_info = arch.jit_state_info();
     }
 
     pub fn fpcr(&self, fpcr_controlled: bool) -> Fpcr {
@@ -520,16 +470,16 @@ mod tests {
     #[test]
     fn architecture_selects_its_own_saturation_flag_offset() {
         assert_eq!(
-            ArchConfig::A64.fpsr_qc_offset(),
+            ArchConfig::A64.jit_state_info().offsetof_fpsr_qc,
             A64JitState::offset_of_fpsr_qc()
         );
         assert_eq!(
-            ArchConfig::A32.fpsr_qc_offset(),
+            ArchConfig::A32.jit_state_info().offsetof_fpsr_qc,
             A32JitState::offset_of_fpsr_qc()
         );
         assert_ne!(
-            ArchConfig::A64.fpsr_qc_offset(),
-            ArchConfig::A32.fpsr_qc_offset()
+            ArchConfig::A64.jit_state_info().offsetof_fpsr_qc,
+            ArchConfig::A32.jit_state_info().offsetof_fpsr_qc
         );
     }
 }

@@ -5,11 +5,12 @@ use rxbyak::xmmword_ptr;
 use rxbyak::{CodeAssembler, JmpType, Reg, RegExp};
 use rxbyak::{R14, R15, RAX, RBX, RSP};
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::constant_pool::ConstantPool;
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::jit_state::A64JitState;
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::stack_layout::StackLayout;
 
 pub(crate) fn get_host_features() -> HostFeature {
@@ -61,26 +62,6 @@ pub(crate) fn get_host_features() -> HostFeature {
     }
 
     features
-}
-
-/// Field offsets into the JitState struct (A32 or A64).
-/// Passed at construction time to make BlockOfCode architecture-agnostic.
-#[derive(Clone, Copy, Debug)]
-pub struct JitStateOffsets {
-    pub halt_reason: usize,
-    pub guest_mxcsr: usize,
-    pub asimd_mxcsr: usize,
-}
-
-impl JitStateOffsets {
-    /// Default offsets for A64JitState (backward compatibility).
-    pub fn a64_defaults() -> Self {
-        Self {
-            halt_reason: A64JitState::offset_of_halt_reason(),
-            guest_mxcsr: A64JitState::offset_of_guest_mxcsr(),
-            asimd_mxcsr: A64JitState::offset_of_asimd_mxcsr(),
-        }
-    }
 }
 
 /// Default code cache size (128 MB).
@@ -204,8 +185,8 @@ pub struct BlockOfCode {
     prelude_complete: bool,
     /// Code pointer where user-emitted blocks begin (after prelude).
     pub(crate) code_begin_offset: usize,
-    /// JitState field offsets (architecture-specific: A32 vs A64).
-    pub jit_state_offsets: JitStateOffsets,
+    /// Architecture-specific JIT-state layout used by shared x64 emission.
+    jit_state_info: JitStateInfo,
     /// Immutable host-capability mask selected once when the code cache is built.
     host_features: HostFeature,
 }
@@ -216,15 +197,15 @@ impl BlockOfCode {
         Self::with_size(DEFAULT_CODE_SIZE)
     }
 
-    /// Create a new BlockOfCode with a custom code cache size (A64 offsets).
+    /// Create a new BlockOfCode with a custom code cache size (A64 JIT state).
     pub fn with_size(total_size: usize) -> rxbyak::Result<Self> {
-        Self::with_size_and_offsets(total_size, JitStateOffsets::a64_defaults())
+        Self::with_size_and_jit_state_info(total_size, JitStateInfo::from_a64())
     }
 
-    /// Create a new BlockOfCode with a custom code cache size and architecture-specific offsets.
-    pub fn with_size_and_offsets(
+    /// Create a code cache for the supplied architecture-specific JIT state.
+    pub fn with_size_and_jit_state_info(
         total_size: usize,
-        offsets: JitStateOffsets,
+        jit_state_info: JitStateInfo,
     ) -> rxbyak::Result<Self> {
         let mut asm = CodeAssembler::new(total_size)?;
         #[cfg(not(feature = "no_execute_support"))]
@@ -234,9 +215,13 @@ impl BlockOfCode {
             constant_pool: ConstantPool::new(CONSTANT_POOL_SIZE),
             prelude_complete: false,
             code_begin_offset: 0,
-            jit_state_offsets: offsets,
+            jit_state_info,
             host_features: get_host_features(),
         })
+    }
+
+    pub const fn jit_state_info(&self) -> JitStateInfo {
+        self.jit_state_info
     }
 
     pub fn has_host_feature(&self, feature: HostFeature) -> bool {
@@ -424,22 +409,22 @@ impl BlockOfCode {
     ///
     /// Saves host MXCSR to StackLayout, loads guest MXCSR from JitState.
     pub fn emit_switch_mxcsr_on_entry(&mut self) -> rxbyak::Result<()> {
-        emit_switch_mxcsr_on_entry(&mut self.asm, self.jit_state_offsets.guest_mxcsr)
+        emit_switch_mxcsr_on_entry(&mut self.asm, self.jit_state_info.offsetof_guest_mxcsr)
     }
 
     /// Emit: Switch MXCSR back to host mode on JIT exit.
     ///
     /// Saves guest MXCSR to JitState, loads host MXCSR from StackLayout.
     pub fn emit_switch_mxcsr_on_exit(&mut self) -> rxbyak::Result<()> {
-        emit_switch_mxcsr_on_exit(&mut self.asm, self.jit_state_offsets.guest_mxcsr)
+        emit_switch_mxcsr_on_exit(&mut self.asm, self.jit_state_info.offsetof_guest_mxcsr)
     }
 
     /// Emit: Enter standard ASIMD MXCSR mode.
     ///
     /// Saves guest MXCSR, loads ASIMD MXCSR.
     pub fn emit_enter_standard_asimd(&mut self) -> rxbyak::Result<()> {
-        let guest_offset = self.jit_state_offsets.guest_mxcsr;
-        let asimd_offset = self.jit_state_offsets.asimd_mxcsr;
+        let guest_offset = self.jit_state_info.offsetof_guest_mxcsr;
+        let asimd_offset = self.jit_state_info.offsetof_asimd_mxcsr;
 
         self.asm
             .stmxcsr(dword_ptr(RegExp::from(R15) + guest_offset as i32))?;
@@ -452,8 +437,8 @@ impl BlockOfCode {
     ///
     /// Saves ASIMD MXCSR, loads guest MXCSR.
     pub fn emit_leave_standard_asimd(&mut self) -> rxbyak::Result<()> {
-        let guest_offset = self.jit_state_offsets.guest_mxcsr;
-        let asimd_offset = self.jit_state_offsets.asimd_mxcsr;
+        let guest_offset = self.jit_state_info.offsetof_guest_mxcsr;
+        let asimd_offset = self.jit_state_info.offsetof_asimd_mxcsr;
 
         self.asm
             .stmxcsr(dword_ptr(RegExp::from(R15) + asimd_offset as i32))?;
@@ -532,8 +517,10 @@ impl BlockOfCode {
     /// Generate the dispatcher prelude: run_code entry point and
     /// return_from_run_code exit stubs.
     ///
-    /// This must be called before any user blocks are emitted.
-    /// After this, `prelude_complete()` is called automatically.
+    /// This must be called before the architecture emitter generates its
+    /// fallback tables and terminal handlers. The emitter calls
+    /// `prelude_complete()` only after all of those permanent stubs have been
+    /// emitted, matching the upstream constructor ordering.
     ///
     /// Calling convention:
     ///   System V (Linux/macOS): RDI = *mut A64JitState, RSI = *const u8
@@ -546,7 +533,7 @@ impl BlockOfCode {
         );
 
         let frame_size = core::mem::size_of::<StackLayout>();
-        let halt_offset = self.jit_state_offsets.halt_reason;
+        let halt_offset = self.jit_state_info.offsetof_halt_reason;
         // StackLayout is at RSP+STACK_LAYOUT_RSP_OFFSET.
         let sl = STACK_LAYOUT_RSP_OFFSET;
         let cycles_remaining_off = sl + StackLayout::cycles_remaining_offset();
@@ -781,9 +768,6 @@ impl BlockOfCode {
             step_code_offset,
         };
 
-        // Mark prelude as complete
-        self.prelude_complete();
-
         Ok(labels)
     }
 }
@@ -803,6 +787,14 @@ impl Drop for BlockOfCode {
 mod tests {
     use super::*;
     use crate::backend::x64::callback::ArgCallback;
+    use crate::backend::x64::jitstate_info::JitStateInfo;
+
+    #[test]
+    fn preserves_supplied_jit_state_info() {
+        let info = JitStateInfo::from_a32();
+        let boc = BlockOfCode::with_size_and_jit_state_info(4096, info).unwrap();
+        assert_eq!(boc.jit_state_info(), info);
+    }
 
     #[test]
     fn test_block_of_code_creation() {
@@ -871,6 +863,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         assert!(boc.prelude_complete);
         assert!(boc.code_begin_offset > 0);
         assert!(labels.run_code_offset == 0);
@@ -892,6 +885,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         assert!(boc.prelude_complete);
         // With cycle counting, the prelude should be larger
         assert!(boc.code_begin_offset > 50);
@@ -937,6 +931,7 @@ mod tests {
             page_table_pointer: None,
         };
         boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         let prelude_size = boc.code_begin_offset;
 
         // Emit some dummy code after prelude
@@ -962,6 +957,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         let code = unsafe { std::slice::from_raw_parts(boc.code_base_ptr(), boc.code_size()) };
         // Search for xchg opcode (0x87) in the return path
         // It should appear after the return_from_run_code[FORCE_RETURN|MXCSR] offset
@@ -1011,6 +1007,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         assert_ne!(
             labels.step_code_offset, labels.run_code_offset,
             "step_code should have its own entry point"
@@ -1034,6 +1031,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         let code = unsafe { std::slice::from_raw_parts(boc.code_base_ptr(), boc.code_size()) };
         // Search for LOCK prefix (0xF0) in the step_code region
         let step_region = &code[labels.step_code_offset..];

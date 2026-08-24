@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::backend::x64::a64_emit_x64::A64EmitX64;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn};
 use crate::backend::x64::callback::ArgCallback;
 use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig, RawExclusiveWriteCallbacks};
-use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
 use crate::common::llvm_disassemble::disassemble_x64;
 use crate::frontend::a64::translate::TranslationOptions;
 use crate::interface::a64::config::{
@@ -38,6 +38,7 @@ pub(crate) struct A64Jit {
 /// Internal JIT state. Box'd for stable heap pointer used by callback trampolines.
 pub(crate) struct JitInner {
     pub(crate) jit_state: A64JitState,
+    pub(crate) exclusive_value: [u64; 2],
     pub(crate) emitter: Option<A64EmitX64>,
     pub(crate) callbacks: Box<dyn A64UserCallbacks>,
     pub(crate) run_code_fn: Option<RunCodeFn>,
@@ -577,6 +578,7 @@ impl A64Jit {
         let mut inner = Box::new(JitInner {
             jit_state: A64JitState::new(),
             emitter: None,
+            exclusive_value: [0; 2],
             callbacks: config.callbacks,
             run_code_fn: None,
             is_executing: false,
@@ -790,6 +792,8 @@ impl A64Jit {
                 }
             },
             global_monitor: config.global_monitor,
+            tpidrro_el0: config.tpidrro_el0,
+            tpidr_el0: config.tpidr_el0,
             cntfrq_el0: config.cntfrq_el0,
             ctr_el0: config.ctr_el0,
             dczid_el0: config.dczid_el0,
@@ -844,7 +848,8 @@ impl A64Jit {
 
         let unique_hash = self.inner.jit_state.get_unique_hash();
         let location = LocationDescriptor::new(unique_hash);
-        let new_rsb_ptr = self.inner.jit_state.rsb_ptr.wrapping_sub(1) as usize & RSB_PTR_MASK;
+        let new_rsb_ptr =
+            self.inner.jit_state.rsb_ptr.wrapping_sub(1) as usize & A64JitState::RSB_PTR_MASK;
         let rsb_code_ptr =
             if self.inner.jit_state.rsb_location_descriptors[new_rsb_ptr] == unique_hash {
                 self.inner.jit_state.rsb_ptr = new_rsb_ptr as u32;
@@ -963,6 +968,7 @@ impl A64Jit {
             "Cannot reset while the JIT is executing"
         );
         self.inner.jit_state = A64JitState::new();
+        self.inner.exclusive_value = [0; 2];
     }
 
     // ---- Register accessors ----
@@ -1064,22 +1070,6 @@ impl A64Jit {
 
     pub fn set_fpsr(&mut self, value: u32) {
         self.inner.jit_state.set_fpsr(value);
-    }
-
-    pub fn get_tpidr_el0(&self) -> u64 {
-        self.inner.jit_state.tpidr_el0
-    }
-
-    pub fn set_tpidr_el0(&mut self, value: u64) {
-        self.inner.jit_state.tpidr_el0 = value;
-    }
-
-    pub fn get_tpidrro_el0(&self) -> u64 {
-        self.inner.jit_state.tpidrro_el0
-    }
-
-    pub fn set_tpidrro_el0(&mut self, value: u64) {
-        self.inner.jit_state.tpidrro_el0 = value;
     }
 
     /// Clear exclusive monitor state.
@@ -1418,7 +1408,7 @@ extern "C" fn exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     } else {
         inner.callbacks.memory_read_8(vaddr)
     };
-    inner.jit_state.exclusive_value[0] = value as u64;
+    inner.exclusive_value[0] = value as u64;
     value as u64
 }
 
@@ -1435,7 +1425,7 @@ extern "C" fn exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     } else {
         inner.callbacks.memory_read_16(vaddr)
     };
-    inner.jit_state.exclusive_value[0] = value as u64;
+    inner.exclusive_value[0] = value as u64;
     value as u64
 }
 
@@ -1452,7 +1442,7 @@ pub(crate) extern "C" fn exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64
     } else {
         inner.callbacks.memory_read_32(vaddr)
     };
-    inner.jit_state.exclusive_value[0] = value as u64;
+    inner.exclusive_value[0] = value as u64;
     value as u64
 }
 
@@ -1469,7 +1459,7 @@ extern "C" fn exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     } else {
         inner.callbacks.memory_read_64(vaddr)
     };
-    inner.jit_state.exclusive_value[0] = value;
+    inner.exclusive_value[0] = value;
     value
 }
 
@@ -1487,8 +1477,8 @@ fn exclusive_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     } else {
         inner.callbacks.memory_read_128(vaddr)
     };
-    inner.jit_state.exclusive_value[0] = lo;
-    inner.jit_state.exclusive_value[1] = hi;
+    inner.exclusive_value[0] = lo;
+    inner.exclusive_value[1] = hi;
     Pair128 { lo, hi }
 }
 
@@ -1520,7 +1510,7 @@ extern "C" fn exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u6
             1
         };
     }
-    let expected = inner.jit_state.exclusive_value[0] as u8;
+    let expected = inner.exclusive_value[0] as u8;
     if inner
         .callbacks
         .memory_write_exclusive_8(vaddr, value as u8, expected)
@@ -1549,7 +1539,7 @@ extern "C" fn exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u
             1
         };
     }
-    let expected = inner.jit_state.exclusive_value[0] as u16;
+    let expected = inner.exclusive_value[0] as u16;
     if inner
         .callbacks
         .memory_write_exclusive_16(vaddr, value as u16, expected)
@@ -1582,7 +1572,7 @@ pub(crate) extern "C" fn exclusive_write_32_trampoline(
             1
         };
     }
-    let expected = inner.jit_state.exclusive_value[0] as u32;
+    let expected = inner.exclusive_value[0] as u32;
     if inner
         .callbacks
         .memory_write_exclusive_32(vaddr, value as u32, expected)
@@ -1611,7 +1601,7 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
             1
         };
     }
-    let expected = inner.jit_state.exclusive_value[0];
+    let expected = inner.exclusive_value[0];
     if inner
         .callbacks
         .memory_write_exclusive_64(vaddr, value, expected)
@@ -1644,8 +1634,8 @@ fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi:
             1
         };
     }
-    let expected_lo = inner.jit_state.exclusive_value[0];
-    let expected_hi = inner.jit_state.exclusive_value[1];
+    let expected_lo = inner.exclusive_value[0];
+    let expected_hi = inner.exclusive_value[1];
     if inner.callbacks.memory_write_exclusive_128(
         vaddr,
         [value_lo, value_hi],
@@ -1725,6 +1715,24 @@ extern "C" fn raw_exclusive_write_64_trampoline(
         .memory_write_exclusive_64(vaddr, value, expected) as u64
 }
 
+#[cfg(not(target_os = "windows"))]
+extern "C" fn raw_exclusive_write_128_trampoline(
+    inner_ptr: u64,
+    vaddr: u64,
+    value_lo: u64,
+    value_hi: u64,
+    expected_lo: u64,
+    expected_hi: u64,
+) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
+    inner.callbacks.memory_write_exclusive_128(
+        vaddr,
+        [value_lo, value_hi],
+        [expected_lo, expected_hi],
+    ) as u64
+}
+
+#[cfg(target_os = "windows")]
 extern "C" fn raw_exclusive_write_128_trampoline(
     inner_ptr: u64,
     vaddr: u64,

@@ -2,11 +2,11 @@ use rxbyak::RegExp;
 use rxbyak::{byte_ptr, dword_ptr, qword_ptr, xmmword_ptr};
 use rxbyak::{JmpType, R15, RAX};
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_of_code::STACK_LAYOUT_RSP_OFFSET;
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::*;
-use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::nzcv_util;
 use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
 use crate::backend::x64::stack_layout::StackLayout;
@@ -705,38 +705,40 @@ pub fn emit_a64_set_fpsr(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstR
 // System registers
 // ---------------------------------------------------------------------------
 
-/// A64GetTPIDR: result = jit_state.tpidr_el0 (stored as fixed u64 field)
-pub fn emit_a64_get_tpidr(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
-    let offset = A64JitState::offset_of_tpidr_el0();
+/// A64GetTPIDR: load through the stable pointer embedded from `UserConfig`.
+pub fn emit_a64_get_tpidr(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
     let result = ra.scratch_gpr();
-    ra.asm
-        .mov(result, qword_ptr(RegExp::from(R15) + offset as i32))
-        .unwrap();
+    if let Some(pointer) = ctx.config.tpidr_el0 {
+        ra.asm.mov(result, pointer as u64 as i64).unwrap();
+        ra.asm.mov(result, qword_ptr(result.into())).unwrap();
+    } else {
+        let result32 = result.cvt32().unwrap();
+        ra.asm.xor_(result32, result32).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
 
-/// A64SetTPIDR: jit_state.tpidr_el0 = value
-pub fn emit_a64_set_tpidr(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+/// A64SetTPIDR: store through the stable pointer embedded from `UserConfig`.
+pub fn emit_a64_set_tpidr(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
     let value = ra.use_gpr(&mut args[0]);
-    let offset = A64JitState::offset_of_tpidr_el0();
-    ra.asm
-        .mov(qword_ptr(RegExp::from(R15) + offset as i32), value)
-        .unwrap();
+    let address = ra.scratch_gpr();
+    if let Some(pointer) = ctx.config.tpidr_el0 {
+        ra.asm.mov(address, pointer as u64 as i64).unwrap();
+        ra.asm.mov(qword_ptr(address.into()), value).unwrap();
+    }
 }
 
-/// A64GetTPIDRRO: result = jit_state.tpidrro_el0
-pub fn emit_a64_get_tpidrro(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    _inst: &Inst,
-) {
-    let offset = A64JitState::offset_of_tpidrro_el0();
+/// A64GetTPIDRRO: load through the stable pointer embedded from `UserConfig`.
+pub fn emit_a64_get_tpidrro(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
     let result = ra.scratch_gpr();
-    ra.asm
-        .mov(result, qword_ptr(RegExp::from(R15) + offset as i32))
-        .unwrap();
+    if let Some(pointer) = ctx.config.tpidrro_el0 {
+        ra.asm.mov(result, pointer as u64 as i64).unwrap();
+        ra.asm.mov(result, qword_ptr(result.into())).unwrap();
+    } else {
+        let result32 = result.cvt32().unwrap();
+        ra.asm.xor_(result32, result32).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
 

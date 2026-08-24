@@ -1,14 +1,7 @@
-//! Shared memory-emit helpers for the A64 (and potentially A32) fastmem
-//! / page-table paths.
+//! Shared memory-emit helpers for the A32 and A64 fastmem / page-table paths.
 //!
 //! Port of upstream `dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h`
 //! (anonymous-namespace inline templates instantiated by both A32 and A64).
-//!
-//! The current rdynarmic A32 fastmem path is per-emission and lives in
-//! `a32_emit_a32.rs`; it does NOT use these helpers. Per the porting
-//! decision (option A, A64-only initially), only the A64-specialised
-//! variants are implemented here. The A32 specialisations are left as
-//! `unimplemented!()` stubs for future migration.
 //!
 //! ## Layout
 //!
@@ -42,6 +35,16 @@ use crate::ir::acc_type::AccType;
 pub const PAGE_BITS: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_BITS;
 pub const PAGE_MASK: usize = PAGE_SIZE - 1;
+
+/// Mechanical equivalent of an intra-buffer call emitted through Xbyak.
+/// Rust stores generated fallback addresses as byte offsets, so both
+/// architecture owners use this encoding helper when binding deferred paths.
+pub fn emit_call_to_offset(asm: &mut CodeAssembler, target_offset: usize) {
+    let current = asm.size();
+    let rel32 = target_offset as i64 - (current as i64 + 5);
+    asm.db(0xE8).unwrap();
+    asm.dd(rel32 as i32 as u32).unwrap();
+}
 
 /// Whether the access type makes a memory access "ordered" (requires
 /// fence semantics).
@@ -98,6 +101,7 @@ pub fn emit_read_memory_mov<const BITSIZE: usize>(
     value_idx: u8,
     addr: RegExp,
     ordered: bool,
+    host_features: HostFeature,
 ) -> usize {
     if ordered {
         // Pre-zero the destination so the lock-xadd accumulates correctly.
@@ -141,7 +145,12 @@ pub fn emit_read_memory_mov<const BITSIZE: usize>(
                 asm.lock().unwrap();
                 asm.cmpxchg16b(xmmword_ptr(addr)).unwrap();
                 asm.movq(Reg::xmm(value_idx), rxbyak::RAX).unwrap();
-                asm.pinsrq(Reg::xmm(value_idx), rxbyak::RDX, 1).unwrap();
+                if host_features.contains(HostFeature::SSE41) {
+                    asm.pinsrq(Reg::xmm(value_idx), rxbyak::RDX, 1).unwrap();
+                } else {
+                    asm.movq(Reg::xmm(0), rxbyak::RDX).unwrap();
+                    asm.punpcklqdq(Reg::xmm(value_idx), Reg::xmm(0)).unwrap();
+                }
             }
             _ => unreachable!("invalid bitsize: {}", BITSIZE),
         }
@@ -180,6 +189,7 @@ pub fn emit_write_memory_mov<const BITSIZE: usize>(
     addr: RegExp,
     value_idx: u8,
     ordered: bool,
+    host_features: HostFeature,
 ) -> usize {
     if ordered {
         if BITSIZE == 128 {
@@ -191,8 +201,15 @@ pub fn emit_write_memory_mov<const BITSIZE: usize>(
             // `emit_x64_memory.h:276-311`.
             asm.xor_(rxbyak::EAX, rxbyak::EAX).unwrap();
             asm.xor_(rxbyak::EDX, rxbyak::EDX).unwrap();
-            asm.movq(rxbyak::RBX, Reg::xmm(value_idx)).unwrap();
-            asm.pextrq(rxbyak::RCX, Reg::xmm(value_idx), 1).unwrap();
+            if host_features.contains(HostFeature::SSE41) {
+                asm.movq(rxbyak::RBX, Reg::xmm(value_idx)).unwrap();
+                asm.pextrq(rxbyak::RCX, Reg::xmm(value_idx), 1).unwrap();
+            } else {
+                asm.movaps(Reg::xmm(0), Reg::xmm(value_idx)).unwrap();
+                asm.movq(rxbyak::RBX, Reg::xmm(0)).unwrap();
+                asm.punpckhqdq(Reg::xmm(0), Reg::xmm(0)).unwrap();
+                asm.movq(rxbyak::RCX, Reg::xmm(0)).unwrap();
+            }
         }
 
         let fastmem_location = asm.size();
@@ -551,7 +568,13 @@ mod tests {
     fn test_emit_read_memory_mov_32_unordered() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let addr = RegExp::from(R13) + RAX;
-        let off = emit_read_memory_mov::<32>(&mut asm, 0 /*=eax*/, addr, false);
+        let off = emit_read_memory_mov::<32>(
+            &mut asm,
+            0, /*=eax*/
+            addr,
+            false,
+            HostFeature::empty(),
+        );
         assert_eq!(off, 0, "should be at start of buffer");
         let bytes = asm.code();
         assert_eq!(
@@ -566,7 +589,13 @@ mod tests {
     fn test_emit_write_memory_mov_32_unordered() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let addr = RegExp::from(R13) + RAX;
-        let off = emit_write_memory_mov::<32>(&mut asm, addr, 0 /*=eax*/, false);
+        let off = emit_write_memory_mov::<32>(
+            &mut asm,
+            addr,
+            0, /*=eax*/
+            false,
+            HostFeature::empty(),
+        );
         assert_eq!(off, 0);
         let bytes = asm.code();
         assert_eq!(
@@ -579,7 +608,8 @@ mod tests {
     #[test]
     fn test_emit_write_memory_mov_8_uses_low_byte_register() {
         let mut asm = CodeAssembler::new(4096).unwrap();
-        let off = emit_write_memory_mov::<8>(&mut asm, RegExp::from(RAX), 6, false);
+        let off =
+            emit_write_memory_mov::<8>(&mut asm, RegExp::from(RAX), 6, false, HostFeature::empty());
         assert_eq!(off, 0);
         assert_eq!(
             asm.code(),
@@ -591,7 +621,8 @@ mod tests {
     #[test]
     fn test_emit_write_memory_mov_8_ordered_uses_low_byte_register() {
         let mut asm = CodeAssembler::new(4096).unwrap();
-        let off = emit_write_memory_mov::<8>(&mut asm, RegExp::from(RAX), 6, true);
+        let off =
+            emit_write_memory_mov::<8>(&mut asm, RegExp::from(RAX), 6, true, HostFeature::empty());
         assert_eq!(off, 0);
         assert_eq!(
             asm.code(),
@@ -603,7 +634,8 @@ mod tests {
     #[test]
     fn test_emit_read_memory_mov_8_ordered_uses_low_byte_register() {
         let mut asm = CodeAssembler::new(4096).unwrap();
-        let off = emit_read_memory_mov::<8>(&mut asm, 6, RegExp::from(RAX), true);
+        let off =
+            emit_read_memory_mov::<8>(&mut asm, 6, RegExp::from(RAX), true, HostFeature::empty());
         assert_eq!(
             &asm.code()[off..],
             &[0xF0, 0x40, 0x0F, 0xC0, 0x30],
@@ -623,7 +655,7 @@ mod tests {
     fn test_emit_read_memory_mov_32_ordered() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let addr = RegExp::from(R13) + RAX;
-        let off = emit_read_memory_mov::<32>(&mut asm, 0, addr, true);
+        let off = emit_read_memory_mov::<32>(&mut asm, 0, addr, true, HostFeature::empty());
         let bytes = asm.code();
         // Bytes from `off` onward must be the LOCK XADD encoding.
         assert_eq!(
@@ -647,7 +679,7 @@ mod tests {
     fn test_emit_write_memory_mov_32_ordered() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let addr = RegExp::from(R13) + RAX;
-        let off = emit_write_memory_mov::<32>(&mut asm, addr, 0, true);
+        let off = emit_write_memory_mov::<32>(&mut asm, addr, 0, true, HostFeature::empty());
         assert_eq!(off, 0);
         let bytes = asm.code();
         assert_eq!(
@@ -665,7 +697,7 @@ mod tests {
     fn test_emit_read_memory_mov_128_ordered() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let addr = RegExp::from(R13) + RAX;
-        let off = emit_read_memory_mov::<128>(&mut asm, 0, addr, true);
+        let off = emit_read_memory_mov::<128>(&mut asm, 0, addr, true, HostFeature::SSE41);
         let bytes = asm.code();
         // Preamble (4 xor reg32, reg32) is 4*2 = 8 bytes minimum (the
         // shorter encoding `33 c0`/`31 c0` style is fine — both 2 bytes).
@@ -682,6 +714,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_emit_read_memory_mov_128_ordered_sse2_fallback() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let addr = RegExp::from(R13) + RAX;
+        emit_read_memory_mov::<128>(&mut asm, 1, addr, true, HostFeature::empty());
+        let bytes = asm.code();
+
+        assert!(bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x6C]));
+        assert!(!bytes.windows(3).any(|w| w == [0x0F, 0x3A, 0x22]));
+    }
+
     /// Ordered 128-bit write: pre-loop setup (`xor eax,eax; xor edx,edx;
     /// movq rbx, xmm0; pextrq rcx, xmm0, 1`) followed by the
     /// `loop: lock cmpxchg16b [addr]; jnz loop;` loop. The
@@ -691,7 +734,7 @@ mod tests {
     fn test_emit_write_memory_mov_128_ordered() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let addr = RegExp::from(R13) + RAX;
-        let off = emit_write_memory_mov::<128>(&mut asm, addr, 0, true);
+        let off = emit_write_memory_mov::<128>(&mut asm, addr, 0, true, HostFeature::SSE41);
         let bytes = asm.code();
         assert!(off > 0, "preamble must come before fastmem_location");
         assert!(!bytes[..off].contains(&0xF0));
@@ -712,5 +755,16 @@ mod tests {
         let disp_off = (cmpx_end - 1) + pos + 2;
         let disp = i32::from_le_bytes(bytes[disp_off..disp_off + 4].try_into().unwrap());
         assert!(disp < 0, "jnz must branch backward to the loop label");
+    }
+
+    #[test]
+    fn test_emit_write_memory_mov_128_ordered_sse2_fallback() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let addr = RegExp::from(R13) + RAX;
+        emit_write_memory_mov::<128>(&mut asm, addr, 1, true, HostFeature::empty());
+        let bytes = asm.code();
+
+        assert!(bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x6D]));
+        assert!(!bytes.windows(3).any(|w| w == [0x0F, 0x3A, 0x16]));
     }
 }

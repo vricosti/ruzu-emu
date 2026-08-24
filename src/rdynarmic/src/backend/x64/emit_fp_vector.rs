@@ -4,6 +4,7 @@
     unnecessary_transmutes
 )]
 
+use crate::backend::x64::constants::cmp;
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_floating_point::fp_min_max;
 use crate::backend::x64::emit_vector_helpers::*;
@@ -22,8 +23,8 @@ pub(crate) fn force_to_default_nan_vector(ra: &mut RegAlloc, result: rxbyak::Reg
     let nan_mask = ra.scratch_xmm();
     ra.asm.movaps(nan_mask, result).unwrap();
     match esize {
-        32 => ra.asm.cmpps(nan_mask, nan_mask, 7).unwrap(),
-        64 => ra.asm.cmppd(nan_mask, nan_mask, 7).unwrap(),
+        32 => ra.asm.cmpps(nan_mask, nan_mask, cmp::ORDERED_Q).unwrap(),
+        64 => ra.asm.cmppd(nan_mask, nan_mask, cmp::ORDERED_Q).unwrap(),
         _ => unreachable!(),
     }
     ra.asm.andps(result, nan_mask).unwrap();

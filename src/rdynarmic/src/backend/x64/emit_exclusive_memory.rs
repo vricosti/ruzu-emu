@@ -1,8 +1,10 @@
 use crate::backend::x64::a64_emit_x64_memory::{
-    emit_a64_check_memory_abort, emit_call_to_offset, should_fastmem, FastmemFallbacksTable,
+    emit_a64_check_memory_abort, should_fastmem, FastmemFallbacksTable,
 };
 use crate::backend::x64::emit_context::EmitContext;
-use crate::backend::x64::emit_x64_memory::{emit_fastmem_vaddr_a64, emit_read_memory_mov};
+use crate::backend::x64::emit_x64_memory::{
+    emit_call_to_offset, emit_fastmem_vaddr_a64, emit_read_memory_mov,
+};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::common::spin_lock_x64::{emit_spin_lock_lock, emit_spin_lock_unlock};
 use crate::ir::inst::Inst;
@@ -14,6 +16,7 @@ use rxbyak::{
     R15, RAX, RBX, RCX, RDX, XMM0,
 };
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::DeferredEmitCtx;
 use crate::backend::x64::exception_handler::{supports_fastmem, FastmemPatchInfo};
@@ -23,7 +26,6 @@ use crate::backend::x64::exclusive_monitor_friend::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
-use crate::backend::x64::jit_state::A64JitState;
 
 // ---------------------------------------------------------------------------
 // EmitExclusiveLock / EmitExclusiveUnlock — inline acquire/release of the
@@ -499,11 +501,11 @@ fn emit_a64_exclusive_read_inline(
         let mut require_abort = false;
         let src = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
         let mov_off = match bitsize {
-            8 => emit_read_memory_mov::<8>(ra.asm, value_idx, src, true),
-            16 => emit_read_memory_mov::<16>(ra.asm, value_idx, src, true),
-            32 => emit_read_memory_mov::<32>(ra.asm, value_idx, src, true),
-            64 => emit_read_memory_mov::<64>(ra.asm, value_idx, src, true),
-            128 => emit_read_memory_mov::<128>(ra.asm, value_idx, src, true),
+            8 => emit_read_memory_mov::<8>(ra.asm, value_idx, src, true, ctx.host_features),
+            16 => emit_read_memory_mov::<16>(ra.asm, value_idx, src, true, ctx.host_features),
+            32 => emit_read_memory_mov::<32>(ra.asm, value_idx, src, true, ctx.host_features),
+            64 => emit_read_memory_mov::<64>(ra.asm, value_idx, src, true, ctx.host_features),
+            128 => emit_read_memory_mov::<128>(ra.asm, value_idx, src, true, ctx.host_features),
             _ => unreachable!(),
         };
         let resume_off = ra.asm.size();

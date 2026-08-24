@@ -4,6 +4,7 @@
     unnecessary_transmutes
 )]
 
+use crate::backend::x64::constants::cmp_int;
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_vector_helpers::*;
 use crate::backend::x64::host_feature::HostFeature;
@@ -286,7 +287,9 @@ pub fn emit_vector_logical_vshift8(
             .get_constant(0x0103_070f_1f3f_7fff, 0);
 
         ra.asm.pxor(tmp, tmp).unwrap();
-        ra.asm.vpcmpb(rxbyak::K1, left_shift, tmp, 1).unwrap();
+        ra.asm
+            .vpcmpb(rxbyak::K1, left_shift, tmp, cmp_int::LESS_THAN)
+            .unwrap();
 
         ra.asm
             .vmovaps(rxbyak::XMM0, rxbyak::xmmword_ptr(matrix))

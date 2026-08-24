@@ -27,7 +27,7 @@ use crate::backend::x64::a64_interface::{
     exclusive_read_32_trampoline, exclusive_write_32_trampoline, JitInner,
 };
 #[cfg(all(test, target_arch = "x86_64"))]
-use crate::backend::x64::jit_state::A64JitState;
+use crate::backend::x64::a64_jitstate::A64JitState;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use crate::backend::x64::a64_interface::a64_block_entry_trace_hook;
@@ -636,7 +636,8 @@ pub(crate) extern "C" fn a32_pc_trace_hook(jit_state_ptr: u64, fastmem_base: u64
     let state =
         unsafe { &*(jit_state_ptr as *const crate::backend::arm64::jit_state::A32JitState) };
     #[cfg(not(target_arch = "aarch64"))]
-    let state = unsafe { &*(jit_state_ptr as *const crate::backend::x64::jit_state::A32JitState) };
+    let state =
+        unsafe { &*(jit_state_ptr as *const crate::backend::x64::a32_jitstate::A32JitState) };
     #[cfg(target_arch = "aarch64")]
     let regs = &state.regs;
     #[cfg(not(target_arch = "aarch64"))]
@@ -1555,7 +1556,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1619,7 +1620,7 @@ mod tests {
         let mut config =
             A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1679,7 +1680,7 @@ mod tests {
         let mut config =
             A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1728,7 +1729,7 @@ mod tests {
         let mut config =
             A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1780,7 +1781,7 @@ mod tests {
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1834,7 +1835,7 @@ mod tests {
     fn a32_public_jit_uses_arm64_interface_on_aarch64() {
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xe1a0_0000])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1864,9 +1865,6 @@ mod tests {
         jit.set_ext_reg(7, 0xaabb_ccdd);
         assert_eq!(jit.get_ext_reg(7), 0xaabb_ccdd);
 
-        jit.set_cntpct(0x1234_5678_9abc_def0);
-        assert_eq!(jit.get_cntpct(), 0x1234_5678_9abc_def0);
-
         jit.halt_execution(HaltReason::USER_DEFINED2);
         assert_ne!(jit.read_halt_reason() & HaltReason::USER_DEFINED2.bits(), 0);
         jit.clear_halt(HaltReason::USER_DEFINED2);
@@ -1884,6 +1882,7 @@ mod tests {
     ) -> Box<JitInner> {
         Box::new(JitInner {
             jit_state: A64JitState::new(),
+            exclusive_value: [0; 2],
             emitter: None,
             callbacks: Box::new(callbacks),
             run_code_fn: None,
@@ -1951,7 +1950,7 @@ mod tests {
             0x1234_5678_9ABC_DEF0,
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -1986,7 +1985,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2025,7 +2024,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2060,7 +2059,7 @@ mod tests {
         let code: [u32; 2] = [0x2F00_E41C, 0xD400_0001];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2108,7 +2107,7 @@ mod tests {
         let code: [u32; 3] = [sbfm_w(1, 0, 4, 11), sbfm_x(2, 0, 4, 11), 0xD400_0001];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2145,7 +2144,7 @@ mod tests {
             Arc::clone(&isb_count),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2180,7 +2179,7 @@ mod tests {
             Arc::clone(&isb_count),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2221,7 +2220,7 @@ mod tests {
             Arc::clone(&instruction_cache),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2274,7 +2273,7 @@ mod tests {
         let code: [u32; 3] = [0xD53B_0020, 0xD53B_00E1, 0xD400_0001];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2305,6 +2304,41 @@ mod tests {
     }
 
     #[test]
+    fn test_a64_tpidr_system_registers_use_user_config_pointers() {
+        // MRS X0, TPIDR_EL0; MRS X1, TPIDRRO_EL0;
+        // MSR TPIDR_EL0, X2; MRS X3, TPIDR_EL0; SVC #0.
+        let code: [u32; 5] = [
+            0xD53B_D040,
+            0xD53B_D061,
+            0xD51B_D042,
+            0xD53B_D043,
+            0xD400_0001,
+        ];
+        let mut tpidr_el0 = Box::new(0x1111_2222_3333_4444u64);
+        let tpidrro_el0 = Box::new(0xAAAA_BBBB_CCCC_DDDDu64);
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.tpidr_el0 = Some((&mut *tpidr_el0) as *mut u64);
+        config.tpidrro_el0 = Some((&*tpidrro_el0) as *const u64);
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_register(2, 0x5555_6666_7777_8888);
+        jit.set_pc(0x1000);
+
+        let mut halt = jit.run();
+        if halt.is_empty() {
+            halt = jit.run();
+        }
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 0x1111_2222_3333_4444);
+        assert_eq!(jit.get_register(1), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(jit.get_register(3), 0x5555_6666_7777_8888);
+        assert_eq!(*tpidr_el0, 0x5555_6666_7777_8888);
+    }
+
+    #[test]
     fn test_a64_unhooked_dc_zva_uses_configured_block_size() {
         // DC ZVA, X0; SVC #0.
         let code: [u32; 2] = [0xD50B_7420, 0xD400_0001];
@@ -2320,7 +2354,7 @@ mod tests {
             Arc::clone(&memory),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2377,7 +2411,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2443,7 +2477,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = monitor_ptr;
@@ -2503,6 +2537,65 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_a32_non_inline_exclusive_sequence_uses_global_monitor() {
+        let code: &[u32] = &[
+            0xE191_0F9F, // LDREX R0, [R1]
+            0xE181_2F93, // STREX R2, R3, [R1]
+            0xE181_4F95, // STREX R4, R5, [R1] (reservation already consumed)
+            0xEF00_0000, // SVC #0
+        ];
+        let old_value = 0x1122_3344u32;
+        let new_value = 0x5566_7788u32;
+        let rejected_value = 0xAABB_CCDDu32;
+        let mut contents = vec![0u8; 0x2000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x100..0x104].copy_from_slice(&old_value.to_le_bytes());
+        let memory = Arc::new(Mutex::new(contents));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
+
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = Some(&mut *monitor as *mut _);
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
+        config.fastmem_exclusive_access = false;
+
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_register(3, new_value);
+        jit.set_register(5, rejected_value);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), old_value);
+        assert_eq!(jit.get_register(2), 0);
+        assert_eq!(jit.get_register(4), 1);
+        assert_eq!(
+            u32::from_le_bytes(memory.lock().unwrap()[0x100..0x104].try_into().unwrap()),
+            new_value
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_a32_jit_preserves_disabled_exclusive_fastmem_policy() {
         let mut memory = vec![0; 0x2000];
         memory[0x1000..0x1004].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // svc #0
@@ -2513,7 +2606,7 @@ mod tests {
         ));
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(0, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = Some(&mut *monitor as *mut _);
@@ -2566,7 +2659,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = Some(&mut *monitor as *mut _);
@@ -2646,7 +2739,7 @@ mod tests {
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2690,7 +2783,7 @@ mod tests {
         memory[0x108..0x110].copy_from_slice(&hi.to_le_bytes());
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2735,7 +2828,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2773,6 +2866,133 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_a64_fastmem_ldr_str_q_use_128_bit_path() {
+        let code: &[u32] = &[
+            0x3DC0_0020, // LDR Q0, [X1]
+            0x3D80_0040, // STR Q0, [X2]
+            0xD400_0001, // SVC #0
+        ];
+        let lo = 0x0123_4567_89AB_CDEFu64;
+        let hi = 0xFEDC_BA98_7654_3210u64;
+        let mut contents = vec![0u8; 0x3000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[0x1000 + index * 4..0x1000 + index * 4 + 4]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x1100..0x1108].copy_from_slice(&lo.to_le_bytes());
+        contents[0x1108..0x1110].copy_from_slice(&hi.to_le_bytes());
+        let fastmem_pointer = contents.as_mut_ptr();
+        let memory = Arc::new(Mutex::new(contents));
+
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(fastmem_pointer);
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 16;
+        config.silently_mirror_fastmem = true;
+
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_register(2, 0x1200);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_vector_parts(0), (lo, hi));
+        let memory = memory.lock().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1200..0x1208].try_into().unwrap()),
+            lo
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1208..0x1210].try_into().unwrap()),
+            hi
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn test_a64_fastmem_fault_ldr_str_q_use_128_bit_fallbacks() {
+        let code: &[u32] = &[
+            0x3DC0_0020, // LDR Q0, [X1]
+            0x3D80_0040, // STR Q0, [X2]
+            0xD400_0001, // SVC #0
+        ];
+        let lo = 0x0123_4567_89AB_CDEFu64;
+        let hi = 0xFEDC_BA98_7654_3210u64;
+        let mut contents = vec![0u8; 0x3000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[0x1000 + index * 4..0x1000 + index * 4 + 4]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x1100..0x1108].copy_from_slice(&lo.to_le_bytes());
+        contents[0x1108..0x1110].copy_from_slice(&hi.to_le_bytes());
+        let memory = Arc::new(Mutex::new(contents));
+        let fastmem = TestFastmemMapping::new(0x1_0000);
+
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(fastmem.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 16;
+        config.silently_mirror_fastmem = true;
+        config.recompile_on_fastmem_failure = true;
+        config.check_halt_on_memory_access = false;
+
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_register(2, 0x1200);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_vector_parts(0), (lo, hi));
+        let memory = memory.lock().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1200..0x1208].try_into().unwrap()),
+            lo
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory[0x1208..0x1210].try_into().unwrap()),
+            hi
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_a64_stxp_uses_host_128_bit_argument_abi() {
         let code: &[u32] = &[
             0xC87F_14C4, // LDXP X4, X5, [X6]
@@ -2795,7 +3015,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -2846,7 +3066,7 @@ mod tests {
     ) -> A64Jit {
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = optimizations;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -3266,7 +3486,7 @@ mod tests {
             Arc::clone(&shared_memory),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::BLOCK_LINKING
             | OptimizationFlag::RETURN_STACK_BUFFER
             | OptimizationFlag::FAST_DISPATCH;
@@ -3568,7 +3788,7 @@ mod tests {
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -3752,7 +3972,7 @@ mod tests {
         let mut jit = {
             let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
             config.enable_cycle_counting = false;
-            config.code_cache_size = 4 * 1024 * 1024;
+            config.code_cache_size = 16 * 1024 * 1024;
             config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
             config.unsafe_optimizations = false;
             config.global_monitor = None;
@@ -3850,7 +4070,7 @@ mod tests {
     fn test_jit_creation() {
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xD4000001])));
         config.enable_cycle_counting = true;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -3889,7 +4109,7 @@ mod tests {
             Arc::clone(&memory),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         let mut jit = A64Jit::new(config).unwrap();
 
@@ -3989,7 +4209,7 @@ mod tests {
             Arc::clone(&memory),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         let mut jit = A32Jit::new(config).unwrap();
 
@@ -4080,7 +4300,7 @@ mod tests {
         }
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         let mut jit = A64Jit::new(config).unwrap();
 
@@ -4158,7 +4378,7 @@ mod tests {
         }
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         let mut jit = A32Jit::new(config).unwrap();
 
@@ -4232,7 +4452,7 @@ mod tests {
     fn a32_public_state_surface_matches_upstream() {
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         let mut jit = A32Jit::new(config).unwrap();
 
@@ -4255,7 +4475,7 @@ mod tests {
     fn test_jit_register_accessors() {
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4304,9 +4524,6 @@ mod tests {
         assert!(!jit.is_executing());
         assert!(jit.disassemble().contains("generated x86_64 code"));
 
-        jit.set_tpidr_el0(0xABCD);
-        assert_eq!(jit.get_tpidr_el0(), 0xABCD);
-
         jit.reset();
         assert_eq!(jit.get_registers(), [0; 31]);
         assert_eq!(jit.get_vectors(), [[0; 2]; 32]);
@@ -4318,7 +4535,7 @@ mod tests {
     fn test_halt_execution() {
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4368,7 +4585,7 @@ mod tests {
                 MockCallbacks::with_memory_read_64_count(0x1000, &code, runner_count),
             ));
             config.enable_cycle_counting = false;
-            config.code_cache_size = 4 * 1024 * 1024;
+            config.code_cache_size = 16 * 1024 * 1024;
             config.optimizations = OptimizationFlag::BLOCK_LINKING;
             config.unsafe_optimizations = false;
             config.global_monitor = None;
@@ -4430,7 +4647,7 @@ mod tests {
             svc_sink.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4475,7 +4692,7 @@ mod tests {
         callbacks.svc_sink = Some(svc_sink.clone());
         let mut config = A64UserConfig::new(Box::new(callbacks));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4533,7 +4750,7 @@ mod tests {
         callbacks.svc_sink = Some(svc_sink.clone());
         let mut config = A64UserConfig::new(Box::new(callbacks));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4608,7 +4825,7 @@ mod tests {
         callbacks.svc_sink = Some(svc_sink.clone());
         let mut config = A64UserConfig::new(Box::new(callbacks));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4671,7 +4888,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4706,7 +4923,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4747,7 +4964,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4792,7 +5009,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4817,7 +5034,7 @@ mod tests {
 
         let mut config2 = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config2.enable_cycle_counting = false;
-        config2.code_cache_size = 4 * 1024 * 1024;
+        config2.code_cache_size = 16 * 1024 * 1024;
         config2.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config2.unsafe_optimizations = false;
         config2.global_monitor = None;
@@ -4871,7 +5088,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4897,7 +5114,7 @@ mod tests {
 
         let mut config2 = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config2.enable_cycle_counting = false;
-        config2.code_cache_size = 4 * 1024 * 1024;
+        config2.code_cache_size = 16 * 1024 * 1024;
         config2.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config2.unsafe_optimizations = false;
         config2.global_monitor = None;
@@ -4934,7 +5151,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -4974,7 +5191,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5044,7 +5261,7 @@ mod tests {
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5077,7 +5294,7 @@ mod tests {
         let mut jit2 = {
             let mut config2 = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
             config2.enable_cycle_counting = false;
-            config2.code_cache_size = 4 * 1024 * 1024;
+            config2.code_cache_size = 16 * 1024 * 1024;
             config2.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
             config2.unsafe_optimizations = false;
             config2.global_monitor = None;
@@ -5144,7 +5361,7 @@ mod tests {
                    expected_result: u64| {
             let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
             config.enable_cycle_counting = false;
-            config.code_cache_size = 4 * 1024 * 1024;
+            config.code_cache_size = 16 * 1024 * 1024;
             config.optimizations = optimizations;
             config.unsafe_optimizations = false;
             config.global_monitor = None;
@@ -5198,7 +5415,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5241,7 +5458,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5276,7 +5493,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xE7DF_0E1F])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5307,7 +5524,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xF57F_F01F])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5359,7 +5576,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xE7E3_52D1])));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5402,7 +5619,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5445,7 +5662,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5490,7 +5707,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5535,7 +5752,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations =
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS & !OptimizationFlag::GET_SET_ELIMINATION;
         config.unsafe_optimizations = false;
@@ -5581,7 +5798,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5619,7 +5836,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5650,7 +5867,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5710,7 +5927,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = true;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5751,7 +5968,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5809,7 +6026,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5853,7 +6070,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5901,7 +6118,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(base, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -5948,7 +6165,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(base, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6007,7 +6224,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(base, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6062,7 +6279,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6112,7 +6329,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6164,7 +6381,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = optimizations;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6229,7 +6446,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6276,7 +6493,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6332,7 +6549,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6388,7 +6605,7 @@ mod tests {
 
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6450,7 +6667,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6501,7 +6718,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6562,7 +6779,7 @@ mod tests {
         let memory = callbacks.memory.clone();
         let mut config = A32UserConfig::new(Box::new(callbacks));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6655,7 +6872,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6739,7 +6956,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6826,7 +7043,7 @@ mod tests {
             memory.clone(),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = optimizations;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6945,7 +7162,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -6983,7 +7200,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7018,7 +7235,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::CONST_PROP;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7049,7 +7266,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::BLOCK_LINKING;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7116,7 +7333,7 @@ mod tests {
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7221,7 +7438,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7267,7 +7484,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7322,7 +7539,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7378,7 +7595,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7434,7 +7651,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7714,7 +7931,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -7772,7 +7989,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -8537,7 +8754,7 @@ mod tests {
         ];
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(PC, &code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -8575,7 +8792,7 @@ mod tests {
             MockCallbacks::new(PC, &code).with_memory_read_address_sink(Arc::clone(&read_address)),
         ));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -8796,7 +9013,7 @@ mod tests {
 
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0, memory)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -8880,7 +9097,7 @@ mod tests {
             Arc::clone(&memory),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -9005,7 +9222,7 @@ mod tests {
             Arc::clone(&memory),
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -9056,7 +9273,7 @@ mod tests {
             ],
         )));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -9090,7 +9307,7 @@ mod tests {
             svc_sink.clone(),
         )));
         config.enable_cycle_counting = true;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;
@@ -9154,7 +9371,7 @@ mod tests {
         mapping.map_u32(0x2000, 0);
         let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
         config.unsafe_optimizations = false;
         config.global_monitor = None;

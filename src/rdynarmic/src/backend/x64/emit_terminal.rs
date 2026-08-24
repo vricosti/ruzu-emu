@@ -47,7 +47,7 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
             // Check halt_reason before entering the RSB hot path.
             // Upstream wraps these terminals in CheckHalt at the IR level;
             // we enforce it at the emitter level as a safety net.
-            let halt_offset = ctx.arch.halt_reason_offset();
+            let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
             ra.asm
                 .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
                 .unwrap();
@@ -63,7 +63,7 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
         }
 
         Terminal::FastDispatchHint => {
-            let halt_offset = ctx.arch.halt_reason_offset();
+            let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
             ra.asm
                 .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
                 .unwrap();
@@ -266,7 +266,7 @@ fn emit_terminal_link_block(
                 let target_ptr = ctx.block_lookup.as_ref().and_then(|lookup| lookup(next));
                 emit_patch_jg_a32(ra.asm, next, target_ptr, offsets, ctx.code_base_ptr, ctx);
             } else {
-                let halt_offset = ctx.arch.halt_reason_offset();
+                let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
                 ra.asm
                     .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
                     .unwrap();
@@ -323,7 +323,7 @@ fn emit_terminal_link_block(
             emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
         } else {
             // No cycle counting: check halt_reason
-            let halt_offset = ctx.arch.halt_reason_offset();
+            let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
             ra.asm
                 .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
                 .unwrap();
@@ -370,7 +370,7 @@ fn emit_terminal_link_block(
             emit_add_ticks(ctx, ra);
             ra.asm.ret().unwrap();
         } else {
-            let halt_offset = ctx.arch.halt_reason_offset();
+            let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
             let halt_label = ra.asm.create_label();
             ra.asm
                 .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
@@ -407,7 +407,7 @@ fn emit_terminal_link_block_fast(
             // the preemption timer, causing the JIT to spin forever and starve other
             // threads on the same core.
             if !ctx.config.enable_cycle_counting {
-                let halt_offset = ctx.arch.halt_reason_offset();
+                let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
                 ra.asm
                     .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
                     .unwrap();
@@ -440,7 +440,7 @@ fn emit_terminal_link_block_fast(
 
         // A64: same halt_reason check for non-cycle-counting mode.
         if !ctx.config.enable_cycle_counting {
-            let halt_offset = ctx.arch.halt_reason_offset();
+            let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
             ra.asm
                 .cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
                 .unwrap();
@@ -494,7 +494,7 @@ fn emit_terminal_if(
         _ => {}
     }
 
-    load_nzcv_into_flags(ra, cond, ctx.arch.cpsr_nzcv_offset());
+    load_nzcv_into_flags(ra, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
 
     let pass_label = ra.asm.create_label();
     emit_jcc(ra.asm, cond, &pass_label);
@@ -536,7 +536,7 @@ fn emit_terminal_check_bit(
 
 /// Emit: if halt_reason != 0, force return to host; otherwise emit else_.
 fn emit_terminal_check_halt(ctx: &EmitContext, ra: &mut RegAlloc, else_: &Terminal) {
-    let halt_offset = ctx.arch.halt_reason_offset();
+    let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
     let halt_label = ra.asm.create_label();
 
     ra.asm
@@ -816,19 +816,10 @@ fn emit_push_rsb_terminal(
     asm: &mut CodeAssembler,
     target_loc: crate::ir::location::LocationDescriptor,
 ) {
-    let (rsb_ptr_offset, rsb_loc_offset, rsb_code_offset) = if ctx.arch.is_a32() {
-        (
-            crate::backend::x64::jit_state::A32JitState::offset_of_rsb_ptr(),
-            crate::backend::x64::jit_state::A32JitState::offset_of_rsb_location_descriptors(),
-            crate::backend::x64::jit_state::A32JitState::offset_of_rsb_codeptrs(),
-        )
-    } else {
-        (
-            crate::backend::x64::jit_state::A64JitState::offset_of_rsb_ptr(),
-            crate::backend::x64::jit_state::A64JitState::offset_of_rsb_location_descriptors(),
-            crate::backend::x64::jit_state::A64JitState::offset_of_rsb_codeptrs(),
-        )
-    };
+    let info = ctx.jit_state_info;
+    let rsb_ptr_offset = info.offsetof_rsb_ptr;
+    let rsb_loc_offset = info.offsetof_rsb_location_descriptors;
+    let rsb_code_offset = info.offsetof_rsb_codeptrs;
 
     asm.mov(
         RBX.cvt32().unwrap(),
@@ -865,11 +856,8 @@ fn emit_push_rsb_terminal(
     )
     .unwrap();
     asm.add(RBX.cvt32().unwrap(), 1).unwrap();
-    asm.and_(
-        RBX.cvt32().unwrap(),
-        crate::backend::x64::jit_state::RSB_PTR_MASK as i32,
-    )
-    .unwrap();
+    asm.and_(RBX.cvt32().unwrap(), info.rsb_ptr_mask as i32)
+        .unwrap();
     asm.mov(
         dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32),
         RBX.cvt32().unwrap(),

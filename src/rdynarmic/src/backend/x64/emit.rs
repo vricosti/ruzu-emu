@@ -1,5 +1,7 @@
 use crate::backend::x64::a32_emit_a32 as a32;
+use crate::backend::x64::a32_emit_x64_memory as a32_memory;
 use crate::backend::x64::a64_emit_x64_memory;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::emit_a64;
 use crate::backend::x64::emit_aes;
 use crate::backend::x64::emit_context::{BlockDescriptor, EmitContext};
@@ -9,7 +11,6 @@ use crate::backend::x64::emit_exclusive_memory as excl_mem;
 use crate::backend::x64::emit_floating_point as fp;
 use crate::backend::x64::emit_fp_vector as fpv;
 use crate::backend::x64::emit_fp_vector_convert as fpvc;
-use crate::backend::x64::emit_memory;
 use crate::backend::x64::emit_packed as packed;
 use crate::backend::x64::emit_saturation as sat;
 use crate::backend::x64::emit_sha;
@@ -25,7 +26,6 @@ use crate::backend::x64::emit_vector_shift as vshift;
 use crate::backend::x64::emit_x64;
 use crate::backend::x64::emit_x64_vector;
 use crate::backend::x64::hostloc::HOST_RCX;
-use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::{PatchEntry, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::block::Block;
@@ -49,19 +49,12 @@ fn profile_opcodes_enabled() -> bool {
 }
 
 fn rsb_offsets(ctx: &EmitContext) -> (usize, usize, usize) {
-    if ctx.arch.is_a32() {
-        (
-            A32JitState::offset_of_rsb_ptr(),
-            A32JitState::offset_of_rsb_location_descriptors(),
-            A32JitState::offset_of_rsb_codeptrs(),
-        )
-    } else {
-        (
-            A64JitState::offset_of_rsb_ptr(),
-            A64JitState::offset_of_rsb_location_descriptors(),
-            A64JitState::offset_of_rsb_codeptrs(),
-        )
-    }
+    let info = ctx.jit_state_info;
+    (
+        info.offsetof_rsb_ptr,
+        info.offsetof_rsb_location_descriptors,
+        info.offsetof_rsb_codeptrs,
+    )
 }
 
 fn emit_patch_mov_rcx(ctx: &EmitContext, target_loc: LocationDescriptor) -> u64 {
@@ -121,7 +114,7 @@ pub fn emit_push_rsb_location(
     ra.asm
         .and_(
             index_reg.cvt32().unwrap(),
-            crate::backend::x64::jit_state::RSB_PTR_MASK as i32,
+            ctx.jit_state_info.rsb_ptr_mask as i32,
         )
         .unwrap();
     ra.asm
@@ -502,13 +495,8 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::MinUnsigned64 => dp::emit_min_unsigned64(ctx, ra, inst_ref, inst),
 
             // --- Memory access ---
-            // 8/16/32/64-bit reads + writes use the upstream-faithful
-            // dispatcher in `a64_emit_x64_memory.rs` which selects the
-            // fastmem / page-table / callback path based on
-            // `ctx.fastmem_available` and `ctx.config.memory.page_table_present`.
-            // 128-bit reads/writes stay on the existing callback path
-            // in `emit_memory.rs` per decision 2 (deferred fastmem path
-            // requires `cmpxchg16b` and 128-bit ABI shims).
+            // A64 memory access ownership and callback/fastmem/page-table
+            // selection match `a64_emit_x64_memory.cpp` for every width.
             Opcode::A64ReadMemory8 => {
                 a64_emit_x64_memory::emit_a64_read_memory_8(ctx, ra, inst_ref, inst)
             }
@@ -522,7 +510,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 a64_emit_x64_memory::emit_a64_read_memory_64(ctx, ra, inst_ref, inst)
             }
             Opcode::A64ReadMemory128 => {
-                emit_memory::emit_a64_read_memory_128(ctx, ra, inst_ref, inst)
+                a64_emit_x64_memory::emit_a64_read_memory_128(ctx, ra, inst_ref, inst)
             }
             Opcode::A64WriteMemory8 => {
                 a64_emit_x64_memory::emit_a64_write_memory_8(ctx, ra, inst_ref, inst)
@@ -537,7 +525,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 a64_emit_x64_memory::emit_a64_write_memory_64(ctx, ra, inst_ref, inst)
             }
             Opcode::A64WriteMemory128 => {
-                emit_memory::emit_a64_write_memory_128(ctx, ra, inst_ref, inst)
+                a64_emit_x64_memory::emit_a64_write_memory_128(ctx, ra, inst_ref, inst)
             }
 
             // --- Exclusive memory access ---
@@ -1756,38 +1744,56 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::A32SetFpscrNZCV => a32::emit_a32_set_fpscr_nzcv(ctx, ra, inst_ref, inst),
 
             // --- A32 Memory ---
-            Opcode::A32ClearExclusive => a32::emit_a32_clear_exclusive(ctx, ra, inst_ref, inst),
-            Opcode::A32ReadMemory8 => a32::emit_a32_read_memory_8(ctx, ra, inst_ref, inst),
-            Opcode::A32ReadMemory16 => a32::emit_a32_read_memory_16(ctx, ra, inst_ref, inst),
-            Opcode::A32ReadMemory32 => a32::emit_a32_read_memory_32(ctx, ra, inst_ref, inst),
-            Opcode::A32ReadMemory64 => a32::emit_a32_read_memory_64(ctx, ra, inst_ref, inst),
+            Opcode::A32ClearExclusive => {
+                a32_memory::emit_a32_clear_exclusive(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32ReadMemory8 => {
+                a32_memory::emit_a32_read_memory_8(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32ReadMemory16 => {
+                a32_memory::emit_a32_read_memory_16(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32ReadMemory32 => {
+                a32_memory::emit_a32_read_memory_32(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32ReadMemory64 => {
+                a32_memory::emit_a32_read_memory_64(ctx, ra, inst_ref, inst)
+            }
             Opcode::A32ExclusiveReadMemory8 => {
-                a32::emit_a32_exclusive_read_memory_8(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_read_memory_8(ctx, ra, inst_ref, inst)
             }
             Opcode::A32ExclusiveReadMemory16 => {
-                a32::emit_a32_exclusive_read_memory_16(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_read_memory_16(ctx, ra, inst_ref, inst)
             }
             Opcode::A32ExclusiveReadMemory32 => {
-                a32::emit_a32_exclusive_read_memory_32(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_read_memory_32(ctx, ra, inst_ref, inst)
             }
             Opcode::A32ExclusiveReadMemory64 => {
-                a32::emit_a32_exclusive_read_memory_64(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_read_memory_64(ctx, ra, inst_ref, inst)
             }
-            Opcode::A32WriteMemory8 => a32::emit_a32_write_memory_8(ctx, ra, inst_ref, inst),
-            Opcode::A32WriteMemory16 => a32::emit_a32_write_memory_16(ctx, ra, inst_ref, inst),
-            Opcode::A32WriteMemory32 => a32::emit_a32_write_memory_32(ctx, ra, inst_ref, inst),
-            Opcode::A32WriteMemory64 => a32::emit_a32_write_memory_64(ctx, ra, inst_ref, inst),
+            Opcode::A32WriteMemory8 => {
+                a32_memory::emit_a32_write_memory_8(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32WriteMemory16 => {
+                a32_memory::emit_a32_write_memory_16(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32WriteMemory32 => {
+                a32_memory::emit_a32_write_memory_32(ctx, ra, inst_ref, inst)
+            }
+            Opcode::A32WriteMemory64 => {
+                a32_memory::emit_a32_write_memory_64(ctx, ra, inst_ref, inst)
+            }
             Opcode::A32ExclusiveWriteMemory8 => {
-                a32::emit_a32_exclusive_write_memory_8(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_write_memory_8(ctx, ra, inst_ref, inst)
             }
             Opcode::A32ExclusiveWriteMemory16 => {
-                a32::emit_a32_exclusive_write_memory_16(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_write_memory_16(ctx, ra, inst_ref, inst)
             }
             Opcode::A32ExclusiveWriteMemory32 => {
-                a32::emit_a32_exclusive_write_memory_32(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_write_memory_32(ctx, ra, inst_ref, inst)
             }
             Opcode::A32ExclusiveWriteMemory64 => {
-                a32::emit_a32_exclusive_write_memory_64(ctx, ra, inst_ref, inst)
+                a32_memory::emit_a32_exclusive_write_memory_64(ctx, ra, inst_ref, inst)
             }
 
             // --- A32 Coprocessor (stubs) ---

@@ -10,20 +10,20 @@ use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, EAX, EBP, EBX, ECX, R12, R15, RAX, RBP, RBX, RCX};
 
 use crate::backend::block_range_information::BlockRangeInformation;
-use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
-use crate::backend::x64::abi;
+use crate::backend::x64::a32_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
+use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn,
 };
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
 use crate::backend::x64::exception_handler::{
-    DoNotFastmemMarker, ExceptionHandler, FastmemPatchInfo, FastmemPatchTable,
+    DoNotFastmemMarker, ExceptionHandler, FastmemPatchTable,
 };
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
-use crate::backend::x64::jit_state::{A32JitState, RSB_PTR_MASK};
+use crate::backend::x64::hostloc::{ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::patch_info::{
     PatchTable, PatchType, A32_PATCH_JG_SIZE, A32_PATCH_JMP_SIZE, A32_PATCH_JZ_SIZE,
 };
@@ -35,9 +35,6 @@ use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::opt;
 use crate::ir::types::Type;
-
-/// Minimum space remaining in the code buffer before triggering a cache clear.
-const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
 
 /// Fast dispatch table entry (same layout as A64).
 #[repr(C)]
@@ -123,15 +120,9 @@ impl A32EmitX64 {
         translation_options: TranslationOptions,
         cache_size: usize,
     ) -> Result<Self, String> {
-        let mut code = BlockOfCode::with_size_and_offsets(
-            cache_size,
-            JitStateOffsets {
-                halt_reason: A32JitState::offset_of_halt_reason(),
-                guest_mxcsr: A32JitState::offset_of_guest_mxcsr(),
-                asimd_mxcsr: A32JitState::offset_of_asimd_mxcsr(),
-            },
-        )
-        .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
+        let mut code =
+            BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a32())
+                .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code
             .gen_run_code(&run_callbacks)
@@ -167,6 +158,7 @@ impl A32EmitX64 {
             emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
         );
         emitter.gen_terminal_handlers()?;
+        emitter.code.prelude_complete();
 
         // Publish the callback whenever fastmem was configured. Eden does this
         // independently of whether platform-handler installation succeeded.
@@ -252,11 +244,6 @@ impl A32EmitX64 {
             return cached.entrypoint;
         }
 
-        // Check space remaining
-        if self.code.space_remaining() < MIN_SPACE_REMAINING {
-            self.clear_cache();
-        }
-
         // Translate: ARM32/Thumb → IR (A32 frontend)
         let a32_loc = A32LocationDescriptor::from_location(location);
         let pc = a32_loc.pc();
@@ -323,12 +310,13 @@ impl A32EmitX64 {
             .collect();
 
         // Emit
-        let (desc, patch_entries, fastmem_entries) = {
+        let (desc, patch_entries) = {
             let host_features = self.code.host_features();
             let mut ctx = EmitContext::with_dispatcher(
                 location,
                 &self.emit_config,
                 ArchConfig::A32,
+                self.code.jit_state_info(),
                 host_features,
                 self.optimizations,
                 self.dispatcher_labels.return_from_run_code,
@@ -394,8 +382,7 @@ impl A32EmitX64 {
             }
 
             let patch_entries = ctx.take_patch_entries();
-            let fastmem_entries = ctx.fastmem_entries.borrow().clone();
-            (desc, patch_entries, fastmem_entries)
+            (desc, patch_entries)
         };
 
         let entrypoint = unsafe { self.code.code_base_ptr().add(desc.entrypoint_offset) };
@@ -411,26 +398,6 @@ impl A32EmitX64 {
                 a32_loc.fpscr().value()
             ),
         );
-        let code_base = self.code.code_base_ptr() as u64;
-
-        // Generate inline fallback stubs for each fastmem instruction.
-        // Each stub: save caller-saves, call callback, restore, ret.
-        // The SIGSEGV handler FakeCall(callback, resume) redirects to the stub.
-        for entry in &fastmem_entries {
-            let inst_rip = code_base + entry.inst_offset as u64;
-            let resume_rip = code_base + entry.resume_offset as u64;
-
-            // Emit the fallback stub at the current code position
-            let stub_offset = self.code.asm.size();
-            self.emit_fastmem_fallback_stub(entry);
-            let stub_rip = code_base + stub_offset as u64;
-
-            self.fastmem_patches.add(
-                inst_rip,
-                FastmemPatchInfo::new(resume_rip, stub_rip, Some(entry.marker), entry.recompile),
-            );
-        }
-
         for entry in &patch_entries {
             let info = self.patch_table.entry(entry.target).or_default();
             match entry.patch_type {
@@ -690,7 +657,7 @@ impl A32EmitX64 {
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.sub(EAX, 1i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
-        asm.and_(EAX, RSB_PTR_MASK as i32)
+        asm.and_(EAX, A32JitState::RSB_PTR_MASK as i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.mov(dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32), EAX)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
@@ -781,119 +748,6 @@ impl A32EmitX64 {
         self.code.code_begin_offset = self.code.asm.size();
 
         Ok(())
-    }
-
-    /// Emit an inline fallback stub for a fastmem instruction.
-    ///
-    /// The stub is called via FakeCall when the fastmem mov faults.
-    /// It saves caller-save registers, calls the memory callback,
-    /// moves the result to the correct register, restores, and rets.
-    ///
-    /// Matches upstream GenFastmemFallbacks per-register stub pattern.
-    fn emit_fastmem_fallback_stub(
-        &mut self,
-        entry: &crate::backend::x64::emit_context::FastmemEntry,
-    ) {
-        use rxbyak::RAX;
-
-        if entry.is_write && entry.is_exclusive {
-            let callbacks = self
-                .emit_config
-                .raw_exclusive_write_callbacks
-                .as_ref()
-                .expect("exclusive fastmem requires raw write callbacks");
-            crate::backend::x64::a64_emit_x64_memory::emit_exclusive_write_fallback(
-                &mut self.code.asm,
-                callbacks,
-                entry.bitsize,
-                entry.vaddr_reg,
-                entry.value_reg,
-            );
-            return;
-        }
-
-        let vaddr_reg = rxbyak::Reg::gpr64(entry.vaddr_reg);
-        let value_reg = rxbyak::Reg::gpr64(entry.value_reg);
-        let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
-        let value_param = abi::ABI_PARAMS[2].to_reg64();
-        let vaddr_param_idx = vaddr_param.get_idx();
-        let value_param_idx = value_param.get_idx();
-
-        if entry.is_write {
-            let frame =
-                abi::push_caller_save_registers_and_adjust_stack(&mut self.code.asm).unwrap();
-
-            // Write: callback(context, vaddr, value). ArgCallback owns ABI_PARAM1.
-            if entry.vaddr_reg == value_param_idx && entry.value_reg == vaddr_param_idx {
-                self.code.asm.xchg(vaddr_param, value_param).unwrap();
-            } else if entry.vaddr_reg == value_param_idx {
-                self.code.asm.mov(vaddr_param, vaddr_reg).unwrap();
-                if entry.value_reg != value_param_idx {
-                    self.code.asm.mov(value_param, value_reg).unwrap();
-                }
-            } else {
-                if entry.value_reg != value_param_idx {
-                    self.code.asm.mov(value_param, value_reg).unwrap();
-                }
-                if entry.vaddr_reg != vaddr_param_idx {
-                    self.code.asm.mov(vaddr_param, vaddr_reg).unwrap();
-                }
-            }
-            self.code
-                .emit_zero_extend_from(entry.bitsize, value_param)
-                .unwrap();
-            let callback = match entry.bitsize {
-                8 => &self.emit_config.callbacks.memory_write_8,
-                16 => &self.emit_config.callbacks.memory_write_16,
-                32 => &self.emit_config.callbacks.memory_write_32,
-                64 => &self.emit_config.callbacks.memory_write_64,
-                _ => unreachable!(),
-            };
-            callback.emit_call_simple(&mut self.code.asm).unwrap();
-            // Ordered store: drain the store buffer AFTER the callback,
-            // matching upstream `GenFastmemFallbacks` write path in
-            // `a32_emit_x64_memory.cpp:94-96`.
-            if entry.ordered {
-                self.code.asm.mfence().unwrap();
-            }
-            abi::pop_caller_save_registers_and_adjust_stack(&mut self.code.asm, &frame).unwrap();
-        } else {
-            let frame = abi::push_caller_save_registers_and_adjust_stack_except(
-                &mut self.code.asm,
-                Some(HostLoc::Gpr(entry.value_reg)),
-            )
-            .unwrap();
-
-            // Read: callback(context, vaddr). ArgCallback owns ABI_PARAM1.
-            if entry.vaddr_reg != vaddr_param_idx {
-                self.code.asm.mov(vaddr_param, vaddr_reg).unwrap();
-            }
-            // Ordered load: drain pending stores BEFORE the callback,
-            // matching upstream `GenFastmemFallbacks` read path in
-            // `a32_emit_x64_memory.cpp:60-62`.
-            if entry.ordered {
-                self.code.asm.mfence().unwrap();
-            }
-            let callback = match entry.bitsize {
-                8 => &self.emit_config.callbacks.memory_read_8,
-                16 => &self.emit_config.callbacks.memory_read_16,
-                32 => &self.emit_config.callbacks.memory_read_32,
-                64 => &self.emit_config.callbacks.memory_read_64,
-                _ => unreachable!(),
-            };
-            callback.emit_call_simple(&mut self.code.asm).unwrap();
-            // Move result from RAX to value_reg
-            if value_reg.get_idx() != RAX.get_idx() {
-                self.code.asm.mov(value_reg, RAX).unwrap();
-            }
-            abi::pop_caller_save_registers_and_adjust_stack(&mut self.code.asm, &frame).unwrap();
-            self.code
-                .emit_zero_extend_from(entry.bitsize, value_reg)
-                .unwrap();
-        }
-
-        // Return to resume_rip (pushed by the SIGSEGV handler's FakeCall)
-        self.code.asm.ret().unwrap();
     }
 
     pub fn clear_fast_dispatch_table(&mut self) {

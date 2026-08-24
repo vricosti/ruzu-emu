@@ -4,10 +4,13 @@ use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, R12, R15, RAX, RBP, RBX};
 
 use crate::backend::block_range_information::BlockRangeInformation;
-use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
+use crate::backend::x64::a64_emit_x64_memory::{
+    gen_fastmem_fallbacks, gen_memory_128_accessors, FastmemFallbacksTable, Memory128Accessors,
+};
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn,
 };
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
@@ -16,7 +19,7 @@ use crate::backend::x64::exception_handler::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
-use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
+use crate::backend::x64::jitstate_info::JitStateInfo;
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::frontend::a64::translate::{translate, MemoryReadCodeFn, TranslationOptions};
@@ -25,9 +28,6 @@ use crate::ir::block::Block;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::types::Type;
-
-/// Minimum space remaining in the code buffer before triggering a cache clear.
-const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
 
 fn allocation_gpr_order(page_table_present: bool, fastmem_enabled: bool) -> Vec<HostLoc> {
     let mut gprs = ANY_GPR.to_vec();
@@ -95,6 +95,9 @@ pub struct A64EmitX64 {
     /// Mirrors upstream's `read_fallbacks` / `write_fallbacks` /
     /// `exclusive_write_fallbacks` maps in `a64_emit_x64.h:74-76`.
     pub fastmem_fallbacks: FastmemFallbacksTable,
+    /// Permanent generated ABI adapters used by every A64 128-bit memory
+    /// callback and its fallback stubs.
+    pub memory_128_accessors: Memory128Accessors,
     /// Per-instruction fastmem patch info. Looked up by the SIGSEGV
     /// handler at fault time to redirect the faulting RIP to the
     /// fallback stub. Mirrors upstream `fastmem_patch_info`.
@@ -132,15 +135,9 @@ impl A64EmitX64 {
         optimizations: OptimizationFlag,
         cache_size: usize,
     ) -> Result<Self, String> {
-        let mut code = BlockOfCode::with_size_and_offsets(
-            cache_size,
-            JitStateOffsets {
-                halt_reason: A64JitState::offset_of_halt_reason(),
-                guest_mxcsr: A64JitState::offset_of_guest_mxcsr(),
-                asimd_mxcsr: A64JitState::offset_of_asimd_mxcsr(),
-            },
-        )
-        .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
+        let mut code =
+            BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a64())
+                .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code
             .gen_run_code(&run_callbacks)
@@ -165,6 +162,7 @@ impl A64EmitX64 {
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
             fastmem_fallbacks: FastmemFallbacksTable::new(),
+            memory_128_accessors: Memory128Accessors::default(),
             fastmem_patches: Box::new(FastmemPatchTable::new()),
             do_not_fastmem: HashSet::new(),
             fastmem_enabled,
@@ -172,17 +170,34 @@ impl A64EmitX64 {
             processor_id: 0,
         };
 
-        // Generate prelude handlers for RSB and fast dispatch.
-        emitter.gen_terminal_handlers()?;
+        let host_features = emitter.code.host_features();
+        let raw_exclusive_write_callbacks = emitter
+            .emit_config
+            .raw_exclusive_write_callbacks
+            .as_ref()
+            .ok_or_else(|| "A64 x64 emission requires raw exclusive-write callbacks".to_string())?;
 
-        // Pre-generate the fastmem fallback-stub table. Mirrors
-        // upstream `A64EmitX64::GenFastmemFallbacks` invocation in the
-        // `A64EmitX64` constructor.
+        // Match the exact upstream permanent-prelude ordering: generated
+        // 128-bit callback accessors, fastmem fallbacks, terminal handlers,
+        // then `PreludeComplete`.
+        emitter.memory_128_accessors = gen_memory_128_accessors(
+            &mut emitter.code.asm,
+            &emitter.emit_config.callbacks,
+            raw_exclusive_write_callbacks,
+            host_features,
+        );
         emitter.fastmem_fallbacks = gen_fastmem_fallbacks(
             &mut emitter.code.asm,
             &emitter.emit_config.callbacks,
-            emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
+            raw_exclusive_write_callbacks,
+            emitter.memory_128_accessors,
+            host_features,
         );
+
+        // Match upstream constructor ordering: permanent fallback tables and
+        // terminal handlers are part of the prelude retained by ClearCache.
+        emitter.gen_terminal_handlers()?;
+        emitter.code.prelude_complete();
 
         // Publish the fastmem callback whenever a fastmem pointer was supplied,
         // matching upstream even when handler installation disabled fastmem.
@@ -256,11 +271,6 @@ impl A64EmitX64 {
         // Check cache first
         if let Some(cached) = self.cache.get(&location) {
             return cached.entrypoint;
-        }
-
-        // Check space remaining — clear cache if low
-        if self.code.space_remaining() < MIN_SPACE_REMAINING {
-            self.clear_cache();
         }
 
         // Translate: ARM64 → IR
@@ -379,6 +389,7 @@ impl A64EmitX64 {
                 location,
                 &self.emit_config,
                 ArchConfig::A64,
+                self.code.jit_state_info(),
                 host_features,
                 self.optimizations,
                 self.dispatcher_labels.return_from_run_code,
@@ -399,6 +410,8 @@ impl A64EmitX64 {
             ctx.do_not_fastmem = Some(&self.do_not_fastmem);
             ctx.fastmem_fallbacks =
                 Some(&self.fastmem_fallbacks as *const FastmemFallbacksTable as *const ());
+            ctx.memory_128_accessors =
+                Some(&self.memory_128_accessors as *const Memory128Accessors as *const ());
             ctx.block = Some(&block);
 
             // Set up block lookup closure for checking if targets are already compiled
@@ -665,7 +678,7 @@ impl A64EmitX64 {
         .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.sub(rxbyak::Reg::gpr32(0), 1i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
-        asm.and_(rxbyak::Reg::gpr32(0), RSB_PTR_MASK as i32)
+        asm.and_(rxbyak::Reg::gpr32(0), A64JitState::RSB_PTR_MASK as i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         // Store updated pointer
         asm.mov(
@@ -879,14 +892,8 @@ impl A64EmitX64 {
         Ok(marker_count)
     }
 
-    /// Clear all cached blocks and reset the code buffer.
-    ///
-    /// `BlockOfCode::clear_cache` resets the assembler cursor to
-    /// `code_begin_offset` (right after the dispatcher prelude). That
-    /// wipes the terminal handlers AND the fastmem fallback stubs that
-    /// were generated post-prelude. Re-emit them from scratch and
-    /// invalidate the stale fastmem patch table — old RIPs no longer
-    /// point at valid stubs.
+    /// Clear all cached blocks and reset the code buffer after the permanent
+    /// prelude, preserving the fallback tables and terminal handlers.
     pub fn clear_cache(&mut self) {
         self.patch_table.clear();
         self.clear_fast_dispatch_table();
@@ -895,19 +902,6 @@ impl A64EmitX64 {
         self.fastmem_patches.clear();
         crate::backend::x64::perf_map::clear();
         self.code.clear_cache();
-        // Re-emit terminal handlers and fastmem fallbacks. Their
-        // offsets in the code buffer change, but the SIGSEGV-handler
-        // registration's `code_begin..code_end` range is the WHOLE
-        // buffer so it stays valid.
-        self.terminal_handler_pop_rsb_hint = None;
-        self.terminal_handler_fast_dispatch_hint = None;
-        self.gen_terminal_handlers()
-            .expect("re-generating terminal handlers after clear_cache failed");
-        self.fastmem_fallbacks = gen_fastmem_fallbacks(
-            &mut self.code.asm,
-            &self.emit_config.callbacks,
-            self.emit_config.raw_exclusive_write_callbacks.as_ref(),
-        );
     }
 
     /// Invalidate cached blocks whose PC falls within a memory range.
@@ -976,6 +970,20 @@ mod tests {
         }
     }
 
+    fn make_raw_exclusive_write_callbacks(
+    ) -> crate::backend::x64::emit_context::RawExclusiveWriteCallbacks {
+        let callback = || -> Box<dyn crate::backend::x64::callback::Callback> {
+            Box::new(ArgCallback::new(0, 0))
+        };
+        crate::backend::x64::emit_context::RawExclusiveWriteCallbacks {
+            write_8: callback(),
+            write_16: callback(),
+            write_32: callback(),
+            write_64: callback(),
+            write_128: callback(),
+        }
+    }
+
     #[test]
     fn test_type_bit_width() {
         assert_eq!(type_bit_width(Type::Void), 0);
@@ -1028,10 +1036,12 @@ mod tests {
                 exclusive_write_64: Box::new(ArgCallback::new(0, 0)),
                 exclusive_write_128: Box::new(ArgCallback::new(0, 0)),
             },
-            raw_exclusive_write_callbacks: None,
+            raw_exclusive_write_callbacks: Some(make_raw_exclusive_write_callbacks()),
             enable_cycle_counting: true,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
@@ -1040,12 +1050,12 @@ mod tests {
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
-        let emitter = A64EmitX64::new(
+        let mut emitter = A64EmitX64::new(
             emit_config,
             run_callbacks,
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            4 * 1024 * 1024,
+            16 * 1024 * 1024,
         )
         .unwrap();
 
@@ -1065,6 +1075,32 @@ mod tests {
             fd_off > rsb_off,
             "Fast dispatch handler should come after RSB"
         );
+
+        let prelude_end = emitter.code.code_size();
+        let accessors = emitter.memory_128_accessors;
+        let fallback_offset = *emitter
+            .fastmem_fallbacks
+            .read
+            .values()
+            .next()
+            .expect("A64 prelude should contain read fallbacks");
+        assert!(accessors.read < accessors.write);
+        assert!(accessors.write < accessors.exclusive_write);
+        assert!(accessors.exclusive_write < fallback_offset);
+        assert!(fallback_offset < rsb_off);
+        assert!(fd_off < prelude_end);
+
+        emitter.code.asm.ret().unwrap();
+        assert!(emitter.code.code_size() > prelude_end);
+        emitter.clear_cache();
+        assert_eq!(emitter.code.code_size(), prelude_end);
+        assert_eq!(
+            emitter.fastmem_fallbacks.read.values().next().copied(),
+            Some(fallback_offset)
+        );
+        assert_eq!(emitter.memory_128_accessors, accessors);
+        assert_eq!(emitter.terminal_handler_pop_rsb_hint, Some(rsb_off));
+        assert_eq!(emitter.terminal_handler_fast_dispatch_hint, Some(fd_off));
     }
 
     #[test]
@@ -1102,10 +1138,12 @@ mod tests {
                 exclusive_write_64: Box::new(ArgCallback::new(0, 0)),
                 exclusive_write_128: Box::new(ArgCallback::new(0, 0)),
             },
-            raw_exclusive_write_callbacks: None,
+            raw_exclusive_write_callbacks: Some(make_raw_exclusive_write_callbacks()),
             enable_cycle_counting: true,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
@@ -1119,7 +1157,7 @@ mod tests {
             run_callbacks,
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            4 * 1024 * 1024,
+            16 * 1024 * 1024,
         )
         .unwrap();
 
@@ -1174,6 +1212,8 @@ mod tests {
             enable_cycle_counting: false,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
@@ -1189,6 +1229,7 @@ mod tests {
             loc,
             &emit_config,
             ArchConfig::A64,
+            JitStateInfo::from_a64(),
             crate::backend::x64::block_of_code::get_host_features(),
             OptimizationFlag::NO_OPTIMIZATIONS,
             [100, 200, 300, 400],

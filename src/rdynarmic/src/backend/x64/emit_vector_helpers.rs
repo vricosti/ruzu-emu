@@ -184,7 +184,7 @@ pub fn emit_two_op_fallback_with_fpcr_arg(
     ra.asm
         .lea(
             fpsr_param,
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
@@ -351,7 +351,7 @@ pub fn emit_three_op_fallback(
         ra.asm
             .lea(
                 rxbyak::RAX,
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         ra.asm
@@ -365,7 +365,7 @@ pub fn emit_three_op_fallback(
     ra.asm
         .lea(
             abi::ABI_PARAMS[4].to_reg64(),
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
 
@@ -449,7 +449,7 @@ pub fn emit_fp_one_arg_fallback_with_params(
         ra.asm
             .lea(
                 rxbyak::RAX,
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         ra.asm
@@ -463,7 +463,7 @@ pub fn emit_fp_one_arg_fallback_with_params(
     ra.asm
         .lea(
             abi::ABI_PARAMS[4].to_reg64(),
-            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
         )
         .unwrap();
 
@@ -802,7 +802,7 @@ pub fn emit_four_op_fallback(
         ra.asm
             .lea(
                 rxbyak::RAX,
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
         ra.asm
@@ -823,7 +823,7 @@ pub fn emit_four_op_fallback(
         ra.asm
             .lea(
                 abi::ABI_PARAMS[5].to_reg64(),
-                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.jit_state_info.offsetof_fpsr_exc as i32),
             )
             .unwrap();
     }
@@ -968,7 +968,7 @@ pub fn emit_two_arg_fallback_saturated(
     ra.asm.call_reg(rxbyak::RAX).unwrap();
 
     // OR QC flag: fpsr_qc |= RAX
-    let qc_offset = ctx.arch.fpsr_qc_offset() as i32;
+    let qc_offset = ctx.jit_state_info.offsetof_fpsr_qc as i32;
     ra.asm
         .or_(
             byte_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
@@ -1040,7 +1040,7 @@ pub fn emit_two_arg_fallback_with_saturation_and_immediate(
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
     ra.asm.call_reg(rxbyak::RAX).unwrap();
 
-    let qc_offset = ctx.arch.fpsr_qc_offset() as i32;
+    let qc_offset = ctx.jit_state_info.offsetof_fpsr_qc as i32;
     ra.asm
         .or_(
             byte_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
@@ -1108,7 +1108,7 @@ pub fn emit_one_arg_fallback_saturated(
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
     ra.asm.call_reg(rxbyak::RAX).unwrap();
 
-    let qc_offset = ctx.arch.fpsr_qc_offset() as i32;
+    let qc_offset = ctx.jit_state_info.offsetof_fpsr_qc as i32;
     ra.asm
         .or_(
             byte_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),

@@ -11460,8 +11460,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `start + length - 1` expression.
 - Fixed: `GetRegisters`, `SetRegisters`, `GetVector`, `SetVector`, `GetVectors`, `SetVectors`, and
   the empty ARM64 `Disassemble` result were absent from this owner.
-- TPIDR and diagnostic raw-pointer accessors remain Ruzu extensions in this upstream-owned file;
-  a dedicated follow-up must move them behind an explicit extension boundary.
+- Fixed in the x64 JIT-state ownership slice: TPIDR accessors that only mirrored Core-owned
+  backing storage were removed from this upstream owner.
 
 ### Missing items
 - None in the reviewed public A64 method inventory or deferred-invalidation behavior.
@@ -11475,7 +11475,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Intentional differences
 - Rust selects the x64 or ARM64 implementation with target `cfg` blocks instead of a link-selected
   C++ `Impl`, but the public `Jit` remains the owner of the backend object and `is_executing`.
-- `read_halt_reason`, raw state-pointer access, individual register helpers, CNTPCT access,
+- `read_halt_reason`, raw state-pointer access, individual register helpers,
   compile-only, and block-map dumping are Ruzu diagnostic/tool extensions beyond Eden's public
   interface. They delegate to host backends and do not replace an upstream method.
 
@@ -11511,7 +11511,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   interface owner's field at Eden's exact lifecycle points.
 
 ### Missing items
-- Diagnostic state-pointer, CNTPCT, compile-only, trace, and block-map facilities remain mixed into
+- Diagnostic state-pointer, compile-only, trace, and block-map facilities remain mixed into
   this upstream-owned backend file pending an explicit Ruzu extension boundary.
 
 ### Binary layout verification
@@ -11539,8 +11539,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the RSB first, and process every queued closed range before Run/Step report non-execution.
 
 ### Missing items
-- TPIDR and diagnostic raw-pointer/trace facilities remain mixed into this upstream-owned backend
-  file pending an explicit Ruzu extension boundary.
+- Fixed in the x64 JIT-state ownership slice: TPIDR values are no longer mirrored through backend
+  accessors or raw-state fields. Diagnostic raw-pointer/trace facilities remain mixed into this
+  upstream-owned backend file pending an explicit Ruzu extension boundary.
 
 ### Binary layout verification
 - PASS: no A64 JIT-state or callback payload layout changed. The focused capacity test covers the
@@ -11551,7 +11552,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Intentional differences
 - Target-specific Rust `Jit` definitions replace the C++ pImpl selected by the build, while retaining
   the same public method owner and complete register/vector surface.
-- Raw state/halt pointers, halt inspection, tuple vector compatibility, and TPIDR access are Ruzu
+- Raw state/halt pointers, halt inspection, and tuple vector compatibility are Ruzu
   integration extensions delegated to the selected backend.
 
 ### Unintentional differences (to fix)
@@ -11566,3 +11567,340 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: public `Vector` remains `[u64; 2]`; aggregate access tests verify 31 GPRs and 32 vectors,
   including low/high lane order.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_jitstate.rs` vs Eden `backend/x64/a32_jitstate.{h,cpp}`
+
+### Intentional differences
+- Rust spells the fields and methods with Rust naming conventions and uses explicit zeroed padding
+  before `ext_reg`; the padding reproduces Eden's implicit `alignas(16)` gap and makes reserved
+  bytes deterministic.
+- Compile-time `offset_of!` helpers expose the same offsets to the Rust x64 emitter that C++ obtains
+  with `offsetof`.
+
+### Unintentional differences (to fix)
+- Fixed: A32 state was combined with A64 in `jit_state.rs`; it now has the matching upstream owner.
+- Fixed: the raw state had appended `exclusive_value` and `cntpct` fields absent from Eden. The safe
+  no-global-monitor fallback value now belongs to `A32JitInner`; the unused A32 CNTPCT extension was
+  removed.
+- Fixed: `TransferJitState` was missing. The port copies Eden's exact architectural/MXCSR/FPSR
+  fields, preserves `halt_reason`, clears `exclusive_state`, and conditionally copies or resets RSB.
+
+### Missing items
+- None in the state fields, constants, or method inventory of the reviewed header/source pair.
+
+### Binary layout verification
+- PASS: a program compiled against Eden's header and the Rust layout test both report alignment 16,
+  size 528, and identical offsets for every field from `reg` at 0 through `fpsr_nzcv` at 512.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_jitstate.rs` vs Eden `backend/x64/a64_jitstate.{h,cpp}`
+
+### Intentional differences
+- Rust uses explicit zeroed padding after `exclusive_state` to reproduce the C++ compiler's padding
+  before `rsb_ptr`, and compile-time offset helpers stand in for C++ `offsetof` calls.
+
+### Unintentional differences (to fix)
+- Fixed: A64 state was combined with A32 in `jit_state.rs`; it now has the matching upstream owner.
+- Fixed: `exclusive_value`, `tpidr_el0`, and `tpidrro_el0` incorrectly extended the generated-code
+  state. The fallback exclusive value now belongs to `JitInner`, while TPIDR uses the configured
+  stable pointers exactly like Eden.
+
+### Missing items
+- None in the state fields, constants, or method inventory of the reviewed header/source pair.
+
+### Binary layout verification
+- PASS: a program compiled against Eden's header and the Rust layout test both report alignment 16,
+  size 960, and identical offsets for every field from `reg` at 0 through `fpcr` at 944.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/emit_a64.rs` vs Eden `backend/x64/a64_emit_x64.cpp` (TPIDR)
+
+### Intentional differences
+- Rust represents nullable TPIDR pointers as `Option<*mut u64>`/`Option<*const u64>` and materializes
+  their addresses through rxbyak's Rust API; the emitted load/store sequence is otherwise the same.
+
+### Unintentional differences (to fix)
+- Fixed: TPIDR instructions read and wrote private fields appended to `A64JitState`. `MRS/MSR
+  TPIDR_EL0` and `MRS TPIDRRO_EL0` now load/store through the pointers embedded from `UserConfig`;
+  null reads return zero and null writes do nothing.
+
+### Missing items
+- None in the three reviewed TPIDR emitter methods.
+
+### Binary layout verification
+- N/A: TPIDR backing storage is host-owned and outside raw JIT state. An executing five-instruction
+  regression verifies both configured reads and the configured write.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/{a32/a32,a64/a64}.rs` and host interfaces vs Eden `interface/{A32/a32,A64/a64}.h` and `backend/{x64,arm64}/*_interface.cpp`
+
+### Intentional differences
+- When no global monitor is configured, Ruzu's safe callback fallback retains expected exclusive
+  values in the host interface owner. These values are not visible to generated code and are reset
+  with the architectural state.
+
+### Unintentional differences (to fix)
+- Fixed: public A32 CNTPCT accessors stored an inert value that no A32 instruction consumed.
+- Fixed: public A64 TPIDR accessors duplicated Core's configured backing storage; the read-only
+  setter also cast Eden's `const` TPIDRRO pointer to mutable. Core now reads/writes its stable
+  backing allocations directly, as Eden's `ArmDynarmic64` does.
+
+### Missing items
+- Ruzu diagnostic state pointers, halt inspection, compile-only, trace, and block-map helpers still
+  require a separate extension boundary to make the public/upstream interface owners exact.
+
+### Binary layout verification
+- PASS: removing the extra values from raw state is covered by the exact A32/A64 layout assertions;
+  the host interface fallback storage has no generated-code or serialized ABI.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/jitstate_info.rs` vs Eden `backend/x64/jitstate_info.h`
+
+### Intentional differences
+- Rust uses explicit `from_a32` and `from_a64` constant constructors because it cannot express
+  Eden's templated constructor over arbitrary standard-layout JIT-state types.
+- `EmitContext` carries a value copy supplied by `BlockOfCode` because Rust emission temporarily
+  borrows the assembler separately from its owner. The copied ten-field inventory is immutable for
+  the block and is the counterpart of calling Eden's `BlockOfCode::GetJitStateInfo()`.
+
+### Unintentional differences (to fix)
+- Fixed: the upstream file owner was missing and `block_of_code.rs` held only three offsets, while
+  RSB, CPSR, and FPSR consumers independently selected A32 or A64 layouts.
+- Fixed: the shared saturation emitter hard-coded `A64JitState::fpsr_qc`; A32 saturation now writes
+  its own QC field through the `JitStateInfo` supplied by its `BlockOfCode`.
+
+### Missing items
+- None in the reviewed ten-field `JitStateInfo` inventory.
+
+### Binary layout verification
+- N/A: `JitStateInfo` describes host-side byte offsets and is neither copied to guest memory nor
+  serialized. Focused tests verify all ten values against both exact JIT-state layouts.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/emit_saturation.rs` vs Eden `backend/x64/emit_x64_saturation.cpp`
+
+### Intentional differences
+- Runtime `SaturationOp` and bit-width matches replace Eden's template instantiations while keeping
+  the same shared signed/unsigned helper boundaries and emitted operation ordering.
+- The mechanical `emit_or_qc` helper centralizes Eden's repeated byte-sized QC update without
+  moving its ownership outside this file.
+- For the signed-saturation `N == 32` pseudo-result, Rust emits a zero value because its emission
+  context holds an immutable IR block; Eden replaces uses with an immediate false during emission.
+  Both paths expose the same value to generated code.
+
+### Unintentional differences (to fix)
+- Fixed: every QC update used the A64 offset, including A32 instructions.
+- Fixed: unsigned saturated add/sub used branchful saturation and QC paths; they now preserve
+  Eden's scratch-operand ownership, boundary move, `cmovae`, `setb`, and byte-sized sticky-QC OR.
+- Fixed: signed doubling multiply used a compare/branch special case; both widths now reproduce
+  Eden's doubled-product, sign test, conditional move, and sticky-QC sequence.
+
+### Missing items
+- None in the reviewed saturation opcode/helper inventory.
+
+### Binary layout verification
+- PASS: the focused A32 regression inspects emitted addressing and verifies that the QC write uses
+  offset 508 rather than A64 offset 940; both offsets are covered by the exact JIT-state layouts.
+  The executing scalar-saturation regression also verifies results and the architectural Q flag.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_a32.rs` vs Eden `backend/x64/a32_emit_x64.cpp` (`EmitA32OrQFlag`)
+
+### Intentional differences
+- Rust uses `ArgumentInfo` and rxbyak's Rust register conversions, preserving Eden's immediate and
+  register branches without changing method ownership.
+
+### Unintentional differences (to fix)
+- Fixed: the register path ORed a full dirty 32-bit temporary into the one-bit `cpsr_q` field.
+  It now ORs only `value.cvt8()`, while immediate one stores a dword one and immediate zero emits
+  nothing, exactly as Eden does.
+
+### Missing items
+- None in the reviewed `EmitA32OrQFlag` method.
+
+### Binary layout verification
+- PASS: no state layout changed; the executing A32 scalar-saturation regression confirms `cpsr_q`
+  remains exactly zero or one after SSAT/USAT/QADD-family flag updates.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_x64_memory.rs` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}` and `a32_emit_x64.h`
+
+### Intentional differences
+- Rust expresses Eden's member methods as architecture-owned free functions. The A32 fallback-table
+  loop, scalar stub primitives, and three fallback maps all live in this file; only the mechanical
+  intra-buffer relative-call encoder is shared with A64.
+- Opt-in `RUZU_*` diagnostic traps and tracing remain in the A32 memory owner. They emit no code
+  unless explicitly selected through the environment and preserve the normal upstream path.
+- Faulting direct-fastmem instructions resume at an inline memory-abort check when that check is
+  enabled; normal fastmem execution jumps over it. This is the Rust exception-handler counterpart
+  of Eden's deferred fallback handler calling `EmitCheckMemoryAbort` before joining `end`.
+
+### Unintentional differences (to fix)
+- Fixed: all A32 memory emitters and the per-instruction fallback stub were owned by
+  `a32_emit_a32.rs`/`a32_emit_x64.rs`; they now live in the counterpart memory module.
+- Fixed: `EmitCheckMemoryAbort` was absent. Callback, page-table fallback, direct-fastmem fallback,
+  and exclusive paths now test `MemoryAbort`, restore the exact A32 PC/upper descriptor, and force
+  a dispatcher return in Eden's ordering.
+- Fixed: exclusive inline selection ignored `fastmem_exclusive_access`; disabled configurations
+  now use the callback path as upstream requires.
+- Fixed: inline exclusive reads used an unordered MOV and unordered fallback. They now use Eden's
+  always-ordered `lock xadd` sequence and ordered callback stub for every scalar width.
+- Fixed: a `do_not_fastmem` marker selected the entire non-inline exclusive path. The inline owner
+  now retains Eden's monitor lock/address/value lifecycle and calls the pre-generated fallback
+  under that lock when only the individual fastmem instruction has been disabled.
+- Fixed: A32 reused the A64 fallback generator and emitted unused 128-bit tables. Its owner now
+  generates exactly the upstream 8/16/32/64 inventory and registers Eden's exact per-width perf
+  symbol names.
+- Fixed: exclusive fastmem faults generated a second per-instruction callback stub, and exclusive
+  writes resumed directly after `cmpxchg`, where callback-modified host flags could produce a
+  wrong status. All A32 accesses now use the architecture-owned pre-generated tables; exclusive
+  write faults resume in Eden's explicit `AL`-to-status continuation before unlocking.
+- Fixed: generated accesses to `exclusive_state` used dword operations. Clear/set/test operations
+  now use the byte-sized field semantics emitted by Eden.
+
+### Missing items
+
+### Binary layout verification
+- PASS: no `A32JitState` field or offset changed. Memory-abort tests verify the embedded A32 resume
+  PC, upper descriptor, halt-reason offset, and disabled no-op path; the fallback inventory test
+  verifies exactly `2 * 14 * 14 * 4` entries per scalar table and rejects 128-bit A32 entries.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{a32_emit_x64_memory,a32_interface}.rs` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}`
+
+### Intentional differences
+- Rust host trampolines recover `A32JitInner` in `a32_interface.rs`; the exclusive-monitor
+  operations corresponding to Eden's generated lambdas live beside the generated-code owner in
+  `a32_emit_x64_memory.rs`.
+- The shared callback container retains an unused clear-exclusive slot for the existing Rust FFI
+  boundary, while A32 generated code clears `A32JitState::exclusive_state` directly like Eden.
+
+### Unintentional differences (to fix)
+- Fixed: non-inline exclusive callbacks previously owned the generated-code reservation lifecycle
+  and maintained a private `exclusive_value`. The emitter now sets, tests, atomically consumes, and
+  clears `exclusive_state` in Eden's exact order, while the global monitor alone owns the expected
+  value.
+- Fixed: non-inline exclusive operations could run without a global monitor. Their emitters now
+  enforce Eden's `ASSERT(conf.global_monitor != nullptr)` precondition.
+- Fixed: scalar exclusive reads did not explicitly zero-extend the callback result after the host
+  call. They now apply Eden's per-width zero extension before the memory-abort check.
+- Fixed: the A32 differential-test harness could generate LDREX/STREX without configuring Eden's
+  required global monitor. Its one-CPU test configuration now owns a monitor for the complete JIT
+  lifetime.
+
+### Missing items
+- No missing item remains in the reviewed A32 scalar non-inline exclusive path.
+
+### Binary layout verification
+- PASS: the host-only private `exclusive_value` was removed from `A32JitInner`; the generated-code
+  `A32JitState` layout is unchanged. An executing LDREX/STREX/STREX regression verifies the global
+  monitor value, first-store success, reservation consumption, and second-store failure.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/constants.rs` vs Eden `backend/x64/constants.h`
+
+### Intentional differences
+- Eden's `Cmp`, `CmpInt`, `Tern`, and `FpClass` namespaces are Rust modules, with constant and enum
+  spellings changed only to Rust naming conventions.
+- Rust has no default function arguments, so `fixup_lut` requires all eight `FpFixup` operands;
+  callers that omit trailing operands upstream pass `FpFixup::Dest` explicitly.
+- `convert_rounding_mode_to_x64_immediate` retains Eden's `Option<i32>` result. Consumers cast the
+  proven two-bit value to `u8` only at rxbyak's more strongly typed instruction boundary.
+
+### Unintentional differences (to fix)
+- Fixed: the complete constants owner was absent and consumers embedded raw compare predicates and
+  duplicated rounding-mode maps. The full predicate, ternary, floating-point class, fixup, range,
+  and rounding inventories now live in the matching module.
+
+### Missing items
+- No item is missing from the reviewed constants owner; AVX-512 consumers that use some currently
+  unreferenced constants remain part of their respective emitter-file audits.
+
+### Binary layout verification
+- PASS: `FpFixup`, `FpRangeSelect`, and `FpRangeSign` use `repr(u8)` and exhaustive tests verify all
+  discriminants, bitmasks, LUT bit placement, aliases, and rounding immediates.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/oparg.rs` vs Eden `backend/x64/oparg.h`
+
+### Intentional differences
+- Rust stores the register-or-address alternatives in `RegMem` rather than a manually tagged C++
+  union. The default/uninitialized C++ `Operand` state is represented by `None` and rejected when
+  consumed; every upstream `UseOpArg` consumer initializes the wrapper before use.
+- Rust passes the copyable wrapper through rxbyak's `Into<RegMem>` boundary rather than exposing
+  C++ dereference operators. `set_bit` retains the same register conversion and address-size
+  behavior.
+- `EmitMul32` materializes an immediate second operand before the two-operand `imul`, because the
+  Rust rxbyak surface does not expose Xbyak's three-operand immediate overload. The resulting
+  lower 32-bit value is identical; only the emitted instruction sequence differs.
+
+### Unintentional differences (to fix)
+- Fixed: the matching owner and `RegAlloc::UseOpArg` boundary were absent. Add/sub, multiply,
+  multiply-high, AND/OR/EOR, and AND-NOT consumers now use the wrapper at all 15 upstream sites
+  instead of duplicating register-width conversion locally.
+- Fixed: both AND-NOT emitters materialized immediate operands through the generic register path.
+  They now preserve Eden's immediate `MOV`/`AND` branches and their exact signed-32-bit selection
+  rule for the 64-bit operation.
+
+### Missing items
+- None in the reviewed `OpArg` owner or its current `emit_x64_data_processing.cpp` consumers.
+
+### Binary layout verification
+- N/A: `OpArg` is an emission-time tagged operand and is never serialized or copied into guest/JIT
+  state. Focused tests cover the default state, all four upstream GPR widths, address-size changes
+  without altering the address expression, and executing immediate AND-NOT paths.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.rs` vs Eden `backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.{h,cpp}` (prelude lifecycle)
+
+### Intentional differences
+- Rust's `gen_run_code` returns byte-offset dispatcher labels to the owning emitter, whereas Eden's
+  `BlockOfCode` stores native function pointers. Both now leave the prelude open until the
+  architecture emitter explicitly completes it.
+- `rxbyak` reserves the complete executable buffer up front, so there is no Linux operation
+  corresponding to Eden's Windows-only incremental `EnsureMemoryCommitted` implementation.
+
+### Unintentional differences (to fix)
+- Fixed: `gen_run_code` completed the prelude before architecture fallback tables and terminal
+  handlers were emitted. Cache clearing therefore rewound into permanent code and could overwrite
+  it. A32 now emits fallbacks, terminal handlers, then completes the prelude exactly in Eden's
+  constructor order; A64 does the same for its currently ported permanent stubs.
+- Fixed: A64 generated terminal handlers before fallback tables and regenerated both after every
+  cache clear. Permanent stubs now remain below `code_begin` and `clear_cache` only rewinds dynamic
+  blocks, as Eden's `EmitX64::ClearCache` does.
+- Fixed: both architecture emitters performed their own low-space cache clear in addition to the
+  interface-owned capacity check. Capacity invalidation remains solely in the matching A32/A64
+  interface owner.
+- Fixed: x64 execution tests configured 4 MiB caches despite Eden documenting an approximately
+  8 MiB minimum. The complete A32 prelude left less than the mandatory 1 MiB compilation reserve,
+  causing perpetual clear/recompile dispatch. Test configurations now use 16 MiB.
+
+### Missing items
+- Resolved by the 2026-08-24 A64 memory-prelude follow-up below.
+
+### Binary layout verification
+- N/A: this changes generated-code lifecycle and test cache capacity, not either architecture's
+  JIT-state layout. The executing x64 back-edge regression verifies bounded linked and unlinked
+  dispatch after the corrected prelude boundary.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{a64_emit_x64_memory,a64_emit_x64,a64_interface,emit_context,emit_x64_memory}.rs` vs Eden `backend/x64/{a64_emit_x64_memory.cpp,a64_emit_x64.{h,cpp},emit_x64_memory.{h,cpp.inc},callback.cpp}`
+
+### Intentional differences
+- Rust stores generated-code byte offsets in `Memory128Accessors` and resolves them relative to the
+  owning code buffer; Eden stores native function pointers. The accessors remain below
+  `code_begin` and survive cache clears under the same lifetime.
+- Rust `ArgCallback` objects call explicit `extern "C"` trampolines instead of devirtualizing C++
+  member functions. System V passes 128-bit values as scalar lanes and Windows uses 16-byte stack
+  payloads after shadow space, preserving the platform ABI selected by Eden's `_WIN32` branches.
+- Existing opt-in `RUZU_*` diagnostic traps remain in the A64 memory owner. They emit no guest path
+  changes unless explicitly enabled through the environment.
+
+### Unintentional differences (to fix)
+- Fixed: A64 omitted `GenMemory128Accessors`, generated no ordinary 128-bit write fallbacks, and
+  routed ordinary `ReadMemory128`/`WriteMemory128` through a separate callback-only owner. The
+  generated accessors, all 6,048 fallback entries, dispatcher ownership, and permanent-prelude
+  ordering now match Eden.
+- Fixed: ordered 128-bit packing and extraction unconditionally emitted SSE4.1 instructions. The
+  SSE2 `movq`/`punpck*qdq` alternatives now follow `emit_x64_memory.h`.
+- Fixed: direct callback and deferred fastmem/page-table fallbacks skipped Eden's post-access
+  `EmitCheckMemoryAbort`; all scalar and 128-bit paths now restore the exact A64 resume PC and force
+  a dispatcher return when `MemoryAbort` is set.
+- Fixed: the raw 128-bit exclusive-write trampoline used pointer payloads on System V. The generated
+  accessor now fills `ABI_PARAM3` through `ABI_PARAM6` and calls a scalar-lane trampoline there,
+  while Windows retains Eden's two pointer payloads and compiler-specific hidden-return ordering.
+
+### Missing items
+
+### Binary layout verification
+- PASS: Windows generated accessors use exact 16-byte value/expected payloads after the 32-byte
+  shadow space; System V transfers two 64-bit lanes per value. Linux execution covers direct and
+  faulting fastmem `LDR/STR Q`, while Windows and AArch64 cross-target test builds pass.

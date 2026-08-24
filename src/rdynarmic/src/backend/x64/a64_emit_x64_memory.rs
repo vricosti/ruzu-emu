@@ -2,15 +2,9 @@
 //! (the A64-specific glue around the shared memory-emit templates in
 //! `emit_x64_memory.cpp.inc`).
 //!
-//! Currently scoped to:
-//!
-//! - `gen_fastmem_fallbacks`: pre-generate the per-(ordered, bitsize,
-//!   vaddr_idx, value_idx) fallback stubs that the SIGSEGV handler
-//!   redirects to when a fastmem mov faults. Mirrors upstream
-//!   `A64EmitX64::GenFastmemFallbacks` (a64_emit_x64_memory.cpp:113-280).
-//!
-//! The fallback table includes scalar and 128-bit exclusive paths. The
-//! architecture-specific exclusive emitters remain in
+//! Owns Eden's generated 128-bit callback accessors, complete scalar/128-bit
+//! fallback tables, memory-abort checks, and ordinary A64 memory emitters.
+//! Architecture-specific exclusive instruction bodies remain in
 //! `emit_exclusive_memory.rs`.
 
 use std::collections::HashMap;
@@ -22,6 +16,7 @@ use rxbyak::{
     RDX, RSP,
 };
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::block_of_code::FORCE_RETURN;
 use crate::backend::x64::emit_context::{
@@ -29,18 +24,68 @@ use crate::backend::x64::emit_context::{
 };
 use crate::backend::x64::emit_terminal::emit_jmp_to_offset;
 use crate::backend::x64::emit_x64_memory::{
-    emit_fastmem_vaddr_a64, emit_read_memory_mov, emit_vaddr_lookup_a64, emit_write_memory_mov,
-    is_ordered,
+    emit_call_to_offset, emit_fastmem_vaddr_a64, emit_read_memory_mov, emit_vaddr_lookup_a64,
+    emit_write_memory_mov, is_ordered,
 };
 use crate::backend::x64::exception_handler::{DoNotFastmemMarker, FastmemPatchInfo};
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
-use crate::backend::x64::jit_state::A64JitState;
+use crate::backend::x64::perf_map;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::value_classify::{ir_value_is_vector_backed, ir_value_resolves_to_xmm};
 use crate::interface::halt_reason::HaltReason;
 use crate::ir::inst::Inst;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::value::InstRef;
+
+#[derive(Clone, Copy)]
+struct A64MemoryAbortInfo {
+    enabled: bool,
+    current_pc: u64,
+    dispatcher_offsets: Option<[usize; 4]>,
+    code_base_ptr: *const u8,
+}
+
+fn memory_abort_info(ctx: &EmitContext, inst: &Inst) -> A64MemoryAbortInfo {
+    A64MemoryAbortInfo {
+        enabled: ctx.config.memory.check_halt_on_memory_access,
+        current_pc: A64LocationDescriptor::from_location(LocationDescriptor::new(
+            inst.args[0].get_imm_as_u64(),
+        ))
+        .pc(),
+        dispatcher_offsets: ctx.dispatcher_offsets,
+        code_base_ptr: ctx.code_base_ptr,
+    }
+}
+
+fn emit_memory_abort_check(asm: &mut CodeAssembler, info: A64MemoryAbortInfo, end: Option<&Label>) {
+    if !info.enabled {
+        return;
+    }
+
+    let skip = asm.create_label();
+    let skip_target = end.unwrap_or(&skip);
+    asm.test(
+        dword_ptr(RegExp::from(R15) + A64JitState::offset_of_halt_reason() as i32),
+        HaltReason::MEMORY_ABORT.bits() as i32,
+    )
+    .unwrap();
+    asm.jz(skip_target, JmpType::Near).unwrap();
+    asm.mov(RAX, info.current_pc as i64).unwrap();
+    asm.mov(
+        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_pc() as i32),
+        RAX,
+    )
+    .unwrap();
+    if let Some(offsets) = info.dispatcher_offsets {
+        emit_jmp_to_offset(asm, offsets[FORCE_RETURN], info.code_base_ptr);
+    } else {
+        asm.ret().unwrap();
+    }
+    if end.is_none() {
+        asm.bind(&skip).unwrap();
+    }
+}
 
 /// Emit upstream `A64EmitX64::EmitCheckMemoryAbort` after a memory access.
 pub(crate) fn emit_a64_check_memory_abort(
@@ -49,37 +94,7 @@ pub(crate) fn emit_a64_check_memory_abort(
     inst: &Inst,
     end: Option<&Label>,
 ) {
-    if !ctx.config.memory.check_halt_on_memory_access {
-        return;
-    }
-
-    let skip = ra.asm.create_label();
-    let skip_target = end.unwrap_or(&skip);
-    let current_location = A64LocationDescriptor::from_location(LocationDescriptor::new(
-        inst.args[0].get_imm_as_u64(),
-    ));
-    ra.asm
-        .test(
-            dword_ptr(RegExp::from(R15) + A64JitState::offset_of_halt_reason() as i32),
-            HaltReason::MEMORY_ABORT.bits() as i32,
-        )
-        .unwrap();
-    ra.asm.jz(skip_target, JmpType::Near).unwrap();
-    ra.asm.mov(RAX, current_location.pc() as i64).unwrap();
-    ra.asm
-        .mov(
-            qword_ptr(RegExp::from(R15) + A64JitState::offset_of_pc() as i32),
-            RAX,
-        )
-        .unwrap();
-    if let Some(offsets) = ctx.dispatcher_offsets {
-        emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
-    } else {
-        ra.asm.ret().unwrap();
-    }
-    if end.is_none() {
-        ra.asm.bind(&skip).unwrap();
-    }
+    emit_memory_abort_check(ra.asm, memory_abort_info(ctx, inst), end);
 }
 
 /// Pre-generated fallback-stub address table.
@@ -166,20 +181,200 @@ impl FastmemFallbacksTable {
 /// `a64_emit_x64_memory.cpp:114-138`).
 const VALID_GPR_IDXES: [u8; 14] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
+/// Permanent generated A64 128-bit callback accessors.
+///
+/// The offsets are relative to the owning `BlockOfCode` base and remain valid
+/// across `clear_cache`, because they are emitted before `prelude_complete`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory128Accessors {
+    pub read: usize,
+    pub write: usize,
+    pub exclusive_write: usize,
+}
+
+fn register_generated(asm: &CodeAssembler, start_offset: usize, name: &str) {
+    let start = unsafe { asm.top().add(start_offset) };
+    let end = unsafe { asm.top().add(asm.size()) };
+    perf_map::register(start, end, name);
+}
+
+/// Generate Eden's three permanent A64 128-bit callback ABI adapters.
+///
+/// JIT code passes the guest address in ABI parameter 2, the value in XMM1,
+/// and (for exclusive writes) the expected value in XMM2. These accessors
+/// adapt that stable generated-code convention to the host C ABI.
+pub fn gen_memory_128_accessors(
+    asm: &mut CodeAssembler,
+    callbacks: &EmitCallbacks,
+    raw_exclusive_write_callbacks: &RawExclusiveWriteCallbacks,
+    host_features: HostFeature,
+) -> Memory128Accessors {
+    #[cfg(target_os = "windows")]
+    let _ = host_features;
+
+    asm.align(16).unwrap();
+    let read = asm.size();
+
+    #[cfg(target_os = "windows")]
+    {
+        const FRAME_SIZE: usize = 8 + 16 + abi::ABI_SHADOW_SPACE;
+        asm.sub(RSP, FRAME_SIZE as i32).unwrap();
+        callbacks
+            .memory_read_128
+            .emit_call_with_return_pointer(asm, &|code, return_value_ptr, params| {
+                // The hidden return pointer occupies ABI parameter 2, so move
+                // the incoming vaddr to ABI parameter 3 first.
+                code.mov(params[0], abi::ABI_PARAMS[1].to_reg64())?;
+                code.lea(
+                    return_value_ptr,
+                    qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                )
+            })
+            .unwrap();
+        asm.movups(
+            Reg::xmm(1),
+            xmmword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+        )
+        .unwrap();
+        asm.add(RSP, FRAME_SIZE as i32).unwrap();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        asm.sub(RSP, 8i32).unwrap();
+        callbacks.memory_read_128.emit_call_simple(asm).unwrap();
+        asm.movq(Reg::xmm(1), abi::ABI_RETURN.to_reg64()).unwrap();
+        if host_features.contains(HostFeature::SSE41) {
+            asm.pinsrq(Reg::xmm(1), abi::ABI_RETURN2.to_reg64(), 1)
+                .unwrap();
+        } else {
+            asm.movq(Reg::xmm(2), abi::ABI_RETURN2.to_reg64()).unwrap();
+            asm.punpcklqdq(Reg::xmm(1), Reg::xmm(2)).unwrap();
+        }
+        asm.add(RSP, 8i32).unwrap();
+    }
+    asm.ret().unwrap();
+    register_generated(asm, read, "a64_memory_read_128");
+
+    asm.align(16).unwrap();
+    let write = asm.size();
+
+    #[cfg(target_os = "windows")]
+    {
+        const FRAME_SIZE: usize = 8 + 16 + abi::ABI_SHADOW_SPACE;
+        asm.sub(RSP, FRAME_SIZE as i32).unwrap();
+        callbacks
+            .memory_write_128
+            .emit_call(asm, &|code, params| {
+                code.lea(
+                    params[1],
+                    qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                )?;
+                code.movaps(xmmword_ptr(params[1].into()), Reg::xmm(1))
+            })
+            .unwrap();
+        asm.add(RSP, FRAME_SIZE as i32).unwrap();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        asm.sub(RSP, 8i32).unwrap();
+        callbacks
+            .memory_write_128
+            .emit_call(asm, &|code, params| {
+                code.movq(params[1], Reg::xmm(1))?;
+                if host_features.contains(HostFeature::SSE41) {
+                    code.pextrq(params[2], Reg::xmm(1), 1)
+                } else {
+                    code.punpckhqdq(Reg::xmm(1), Reg::xmm(1))?;
+                    code.movq(params[2], Reg::xmm(1))
+                }
+            })
+            .unwrap();
+        asm.add(RSP, 8i32).unwrap();
+    }
+    asm.ret().unwrap();
+    register_generated(asm, write, "a64_memory_write_128");
+
+    asm.align(16).unwrap();
+    let exclusive_write = asm.size();
+
+    #[cfg(target_os = "windows")]
+    {
+        const FRAME_SIZE: usize = 8 + 32 + abi::ABI_SHADOW_SPACE;
+        asm.sub(RSP, FRAME_SIZE as i32).unwrap();
+        raw_exclusive_write_callbacks
+            .write_128
+            .emit_call(asm, &|code, params| {
+                code.lea(
+                    params[1],
+                    qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                )?;
+                code.lea(
+                    params[2],
+                    qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32 + 16),
+                )?;
+                code.movaps(xmmword_ptr(params[1].into()), Reg::xmm(1))?;
+                code.movaps(xmmword_ptr(params[2].into()), Reg::xmm(2))
+            })
+            .unwrap();
+        asm.add(RSP, FRAME_SIZE as i32).unwrap();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        asm.sub(RSP, 8i32).unwrap();
+        if host_features.contains(HostFeature::SSE41) {
+            asm.movq(abi::ABI_PARAMS[2].to_reg64(), Reg::xmm(1))
+                .unwrap();
+            asm.pextrq(abi::ABI_PARAMS[3].to_reg64(), Reg::xmm(1), 1)
+                .unwrap();
+            asm.movq(abi::ABI_PARAMS[4].to_reg64(), Reg::xmm(2))
+                .unwrap();
+            asm.pextrq(abi::ABI_PARAMS[5].to_reg64(), Reg::xmm(2), 1)
+                .unwrap();
+        } else {
+            asm.movq(abi::ABI_PARAMS[2].to_reg64(), Reg::xmm(1))
+                .unwrap();
+            asm.punpckhqdq(Reg::xmm(1), Reg::xmm(1)).unwrap();
+            asm.movq(abi::ABI_PARAMS[3].to_reg64(), Reg::xmm(1))
+                .unwrap();
+            asm.movq(abi::ABI_PARAMS[4].to_reg64(), Reg::xmm(2))
+                .unwrap();
+            asm.punpckhqdq(Reg::xmm(2), Reg::xmm(2)).unwrap();
+            asm.movq(abi::ABI_PARAMS[5].to_reg64(), Reg::xmm(2))
+                .unwrap();
+        }
+        raw_exclusive_write_callbacks
+            .write_128
+            .emit_call_simple(asm)
+            .unwrap();
+        asm.add(RSP, 8i32).unwrap();
+    }
+    asm.ret().unwrap();
+    register_generated(asm, exclusive_write, "a64_memory_exclusive_write_128");
+
+    Memory128Accessors {
+        read,
+        write,
+        exclusive_write,
+    }
+}
+
 /// Pre-generate the full table of fastmem fallback stubs into `asm`'s
 /// code buffer and record the byte offsets in the returned table.
 ///
-/// Generates `2 (ordered) × 14 (vaddr) × 14 (value) × 4 (bitsize) × 2
-/// (read+write) = 3136` stubs. At ~30-50 bytes each, the table costs
-/// roughly 100-150 KB of code-buffer space — comparable to upstream's
-/// fallback table size.
+/// Generates 1,568 scalar plus 448 128-bit entries for each of read, write,
+/// and exclusive-write: 6,048 stubs in Eden's exact nesting order.
 ///
 /// Mirrors upstream `A64EmitX64::GenFastmemFallbacks` in
 /// `a64_emit_x64_memory.cpp:113-280`.
 pub fn gen_fastmem_fallbacks(
     asm: &mut CodeAssembler,
     callbacks: &EmitCallbacks,
-    raw_exclusive_write_callbacks: Option<&RawExclusiveWriteCallbacks>,
+    raw_exclusive_write_callbacks: &RawExclusiveWriteCallbacks,
+    accessors: Memory128Accessors,
+    host_features: HostFeature,
 ) -> FastmemFallbacksTable {
     let mut table = FastmemFallbacksTable::new();
 
@@ -188,19 +383,33 @@ pub fn gen_fastmem_fallbacks(
             for value_idx in 0u8..16 {
                 asm.align(16).unwrap();
                 let read_off = asm.size();
-                emit_read_fallback_128(asm, callbacks, ordered, vaddr_idx, value_idx);
+                emit_read_fallback_128(asm, accessors.read, ordered, vaddr_idx, value_idx);
                 table
                     .read
                     .insert((ordered, 128, vaddr_idx, value_idx), read_off);
+                register_generated(asm, read_off, "a64_read_fallback_128");
 
-                if let Some(raw_callbacks) = raw_exclusive_write_callbacks {
-                    asm.align(16).unwrap();
-                    let exclusive_write_off = asm.size();
-                    emit_exclusive_write_fallback_128(asm, raw_callbacks, vaddr_idx, value_idx);
-                    table
-                        .exclusive_write
-                        .insert((ordered, 128, vaddr_idx, value_idx), exclusive_write_off);
-                }
+                asm.align(16).unwrap();
+                let write_off = asm.size();
+                emit_write_fallback_128(asm, accessors.write, ordered, vaddr_idx, value_idx);
+                table
+                    .write
+                    .insert((ordered, 128, vaddr_idx, value_idx), write_off);
+                register_generated(asm, write_off, "a64_write_fallback_128");
+
+                asm.align(16).unwrap();
+                let exclusive_write_off = asm.size();
+                emit_exclusive_write_fallback_128(
+                    asm,
+                    accessors.exclusive_write,
+                    host_features,
+                    vaddr_idx,
+                    value_idx,
+                );
+                table
+                    .exclusive_write
+                    .insert((ordered, 128, vaddr_idx, value_idx), exclusive_write_off);
+                register_generated(asm, exclusive_write_off, "a64_exclusive_write_fallback_128");
             }
 
             for &value_idx in &VALID_GPR_IDXES {
@@ -211,6 +420,7 @@ pub fn gen_fastmem_fallbacks(
                     table
                         .read
                         .insert((ordered, bitsize, vaddr_idx, value_idx), read_off);
+                    register_generated(asm, read_off, &format!("a64_read_fallback_{bitsize}"));
 
                     asm.align(16).unwrap();
                     let write_off = asm.size();
@@ -218,22 +428,26 @@ pub fn gen_fastmem_fallbacks(
                     table
                         .write
                         .insert((ordered, bitsize, vaddr_idx, value_idx), write_off);
+                    register_generated(asm, write_off, &format!("a64_write_fallback_{bitsize}"));
 
-                    if let Some(raw_callbacks) = raw_exclusive_write_callbacks {
-                        asm.align(16).unwrap();
-                        let exclusive_write_off = asm.size();
-                        emit_exclusive_write_fallback(
-                            asm,
-                            raw_callbacks,
-                            bitsize,
-                            vaddr_idx,
-                            value_idx,
-                        );
-                        table.exclusive_write.insert(
-                            (ordered, bitsize, vaddr_idx, value_idx),
-                            exclusive_write_off,
-                        );
-                    }
+                    asm.align(16).unwrap();
+                    let exclusive_write_off = asm.size();
+                    emit_exclusive_write_fallback(
+                        asm,
+                        raw_exclusive_write_callbacks,
+                        bitsize,
+                        vaddr_idx,
+                        value_idx,
+                    );
+                    table.exclusive_write.insert(
+                        (ordered, bitsize, vaddr_idx, value_idx),
+                        exclusive_write_off,
+                    );
+                    register_generated(
+                        asm,
+                        exclusive_write_off,
+                        &format!("a64_exclusive_write_fallback_{bitsize}"),
+                    );
                 }
             }
         }
@@ -244,57 +458,48 @@ pub fn gen_fastmem_fallbacks(
 
 fn emit_read_fallback_128(
     asm: &mut CodeAssembler,
-    callbacks: &EmitCallbacks,
+    accessor_offset: usize,
     ordered: bool,
     vaddr_idx: u8,
     value_idx: u8,
 ) {
-    #[cfg(target_os = "windows")]
-    let (saved, local) = abi::push_caller_save_registers_and_adjust_stack_except_with_local(
-        asm,
-        Some(HostLoc::Xmm(value_idx)),
-        16,
-    )
-    .unwrap();
-    #[cfg(not(target_os = "windows"))]
     let saved =
         abi::push_caller_save_registers_and_adjust_stack_except(asm, Some(HostLoc::Xmm(value_idx)))
             .unwrap();
+    let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
+    if vaddr_idx != vaddr_param.get_idx() {
+        asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
+    }
     if ordered {
         asm.mfence().unwrap();
     }
-
-    #[cfg(target_os = "windows")]
-    callbacks
-        .memory_read_128
-        .emit_call(asm, &|code, params| {
-            code.mov(params[0], Reg::gpr64(vaddr_idx))?;
-            code.lea(params[1], qword_ptr(RegExp::from(RSP) + local as i32))?;
-            Ok(())
-        })
-        .unwrap();
-
-    #[cfg(not(target_os = "windows"))]
-    callbacks
-        .memory_read_128
-        .emit_call(asm, &|code, params| {
-            code.mov(params[0], Reg::gpr64(vaddr_idx))?;
-            Ok(())
-        })
-        .unwrap();
-
-    #[cfg(target_os = "windows")]
-    asm.movups(
-        Reg::xmm(value_idx),
-        xmmword_ptr(RegExp::from(RSP) + local as i32),
-    )
-    .unwrap();
-    #[cfg(not(target_os = "windows"))]
-    {
-        asm.movq(Reg::xmm(value_idx), RAX).unwrap();
-        asm.pinsrq(Reg::xmm(value_idx), RDX, 1).unwrap();
+    emit_call_to_offset(asm, accessor_offset);
+    if value_idx != 1 {
+        asm.movaps(Reg::xmm(value_idx), Reg::xmm(1)).unwrap();
     }
+    abi::pop_caller_save_registers_and_adjust_stack(asm, &saved).unwrap();
+    asm.ret().unwrap();
+}
 
+fn emit_write_fallback_128(
+    asm: &mut CodeAssembler,
+    accessor_offset: usize,
+    ordered: bool,
+    vaddr_idx: u8,
+    value_idx: u8,
+) {
+    let saved = abi::push_caller_save_registers_and_adjust_stack(asm).unwrap();
+    let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
+    if vaddr_idx != vaddr_param.get_idx() {
+        asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
+    }
+    if value_idx != 1 {
+        asm.movaps(Reg::xmm(1), Reg::xmm(value_idx)).unwrap();
+    }
+    emit_call_to_offset(asm, accessor_offset);
+    if ordered {
+        asm.mfence().unwrap();
+    }
     abi::pop_caller_save_registers_and_adjust_stack(asm, &saved).unwrap();
     asm.ret().unwrap();
 }
@@ -509,40 +714,31 @@ pub(crate) fn emit_exclusive_write_fallback(
 
 fn emit_exclusive_write_fallback_128(
     asm: &mut CodeAssembler,
-    callbacks: &RawExclusiveWriteCallbacks,
+    accessor_offset: usize,
+    host_features: HostFeature,
     vaddr_idx: u8,
-    _value_idx: u8,
+    value_idx: u8,
 ) {
-    let (saved, local) = abi::push_caller_save_registers_and_adjust_stack_except_with_local(
+    let saved = abi::push_caller_save_registers_and_adjust_stack_except(
         asm,
         Some(HostLoc::Gpr(RAX.get_idx())),
-        48,
     )
     .unwrap();
-    asm.mov(qword_ptr(RegExp::from(RSP) + local as i32), RBX)
-        .unwrap();
-    asm.mov(qword_ptr(RegExp::from(RSP) + local as i32 + 8), RCX)
-        .unwrap();
-    asm.mov(qword_ptr(RegExp::from(RSP) + local as i32 + 16), RAX)
-        .unwrap();
-    asm.mov(qword_ptr(RegExp::from(RSP) + local as i32 + 24), RDX)
-        .unwrap();
-    asm.mov(
-        qword_ptr(RegExp::from(RSP) + local as i32 + 32),
-        Reg::gpr64(vaddr_idx),
-    )
-    .unwrap();
-
-    callbacks
-        .write_128
-        .emit_call(asm, &|code, params| {
-            code.mov(params[0], qword_ptr(RegExp::from(RSP) + local as i32 + 32))?;
-            code.lea(params[1], qword_ptr(RegExp::from(RSP) + local as i32))?;
-            code.lea(params[2], qword_ptr(RegExp::from(RSP) + local as i32 + 16))?;
-            Ok(())
-        })
-        .unwrap();
-
+    if value_idx != 1 {
+        asm.movaps(Reg::xmm(1), Reg::xmm(value_idx)).unwrap();
+    }
+    asm.movq(Reg::xmm(2), RAX).unwrap();
+    if host_features.contains(HostFeature::SSE41) {
+        asm.pinsrq(Reg::xmm(2), RDX, 1).unwrap();
+    } else {
+        asm.movq(Reg::xmm(0), RDX).unwrap();
+        asm.punpcklqdq(Reg::xmm(2), Reg::xmm(0)).unwrap();
+    }
+    let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
+    if vaddr_idx != vaddr_param.get_idx() {
+        asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
+    }
+    emit_call_to_offset(asm, accessor_offset);
     abi::pop_caller_save_registers_and_adjust_stack(asm, &saved).unwrap();
     asm.ret().unwrap();
 }
@@ -600,23 +796,10 @@ fn emit_zero_extend(asm: &mut CodeAssembler, bitsize: usize, reg: Reg) {
 // 3. Page table (no fastmem, `page_table_present` set): same shape as
 //    fastmem but uses `EmitVAddrLookup` and does NOT record patch info.
 //
-// Ordinary 128-bit accesses remain on the callback path in `emit_memory.rs`;
-// exclusive inline accesses use this module's 128-bit fallback entries from
-// `emit_exclusive_memory.rs`.
+// The same owner handles 128-bit callback, fastmem, and page-table accesses;
+// exclusive inline accesses consume this module's 128-bit fallback entries
+// from `emit_exclusive_memory.rs`.
 // ---------------------------------------------------------------------------
-
-/// Emit a `call rel32` to a target byte offset within the same code
-/// buffer. Used by deferred-emit closures to jump to the pre-generated
-/// fallback stubs.
-///
-/// Encoding: `0xE8 rel32` where `rel32 = target - (current + 5)`.
-pub(crate) fn emit_call_to_offset(asm: &mut CodeAssembler, target_offset: usize) {
-    let current = asm.size();
-    let rel32 = (target_offset as i64) - (current as i64 + 5);
-    asm.db(0xE8).unwrap();
-    let rel32_le = (rel32 as i32) as u32;
-    asm.dd(rel32_le).unwrap();
-}
 
 /// Matches upstream `A64EmitX64::ShouldFastmem`.
 pub(crate) fn should_fastmem(ctx: &EmitContext, inst_ref: InstRef) -> Option<DoNotFastmemMarker> {
@@ -630,8 +813,16 @@ pub(crate) fn should_fastmem(ctx: &EmitContext, inst_ref: InstRef) -> Option<DoN
         .unwrap_or(Some(marker))
 }
 
-/// A64 IR memory read dispatcher. `BITSIZE` ∈ {8, 16, 32, 64}.
-/// 128-bit reads stay on the existing callback path in `emit_memory.rs`.
+fn memory_128_accessors(ctx: &EmitContext) -> Memory128Accessors {
+    unsafe {
+        *(ctx
+            .memory_128_accessors
+            .expect("A64 128-bit memory emission requires generated accessors")
+            as *const Memory128Accessors)
+    }
+}
+
+/// A64 IR memory read dispatcher. `BITSIZE` ∈ {8, 16, 32, 64, 128}.
 ///
 /// Mirrors upstream `A64EmitX64::EmitMemoryRead<BITSIZE, callback>` in
 /// `emit_x64_memory.cpp.inc:54-139` (instantiated for A64).
@@ -641,7 +832,7 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    debug_assert!(matches!(BITSIZE, 8 | 16 | 32 | 64));
+    debug_assert!(matches!(BITSIZE, 8 | 16 | 32 | 64 | 128));
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     // args[2] is the access-type immediate (Value::ImmAccType).
     let ordered = is_ordered(args[2].value.get_acc_type());
@@ -657,6 +848,17 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
 
     // Path 1: pure callback when neither fastmem nor page table apply.
     if !mem_conf.page_table_present && fastmem_marker.is_none() {
+        if BITSIZE == 128 {
+            let result = ra.scratch_xmm_at(HostLoc::Xmm(1));
+            ra.host_call(None, &mut [None, Some(&mut args[1]), None, None]);
+            if ordered {
+                ra.asm.mfence().unwrap();
+            }
+            emit_call_to_offset(ra.asm, memory_128_accessors(ctx).read);
+            ra.define_value(inst_ref, result);
+            emit_memory_abort_check(ra.asm, memory_abort_info(ctx, inst), None);
+            return;
+        }
         ra.host_call(Some(inst_ref), &mut [None, Some(&mut args[1]), None, None]);
         if ordered {
             ra.asm.mfence().unwrap();
@@ -671,12 +873,24 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
         cb.emit_call_simple(&mut *ra.asm).unwrap();
         // host_call already defined the result in RAX → inst_ref.
         // Zero-extension below 64-bit is performed by callback ABI.
+        emit_memory_abort_check(ra.asm, memory_abort_info(ctx, inst), None);
         return;
+    }
+
+    if ordered && BITSIZE == 128 {
+        ra.scratch_gpr_at(HostLoc::Gpr(RAX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RBX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RCX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RDX.get_idx()));
     }
 
     // Allocate vaddr (use) + value (scratch).
     let vaddr = ra.use_gpr(&mut args[1]);
-    let value = ra.scratch_gpr();
+    let value = if BITSIZE == 128 {
+        ra.scratch_xmm()
+    } else {
+        ra.scratch_gpr()
+    };
     let vaddr_idx = vaddr.get_idx();
     let value_idx = value.get_idx();
 
@@ -752,12 +966,14 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
 
     let abort = ra.asm.create_label();
     let end = ra.asm.create_label();
+    let abort_info = memory_abort_info(ctx, inst);
 
     if let Some(marker) = fastmem_marker {
         // Path 2: fastmem.
         let mut require_abort = false;
         let src_ptr = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
-        let mov_off = emit_read_memory_mov::<BITSIZE>(ra.asm, value_idx, src_ptr, ordered);
+        let mov_off =
+            emit_read_memory_mov::<BITSIZE>(ra.asm, value_idx, src_ptr, ordered, ctx.host_features);
 
         // RUZU_TRAP_FASTMEM_R64_VALUE_PATTERN=1 — after a 64-bit
         // fastmem-direct load, trap if the loaded value matches STK's
@@ -833,18 +1049,15 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
                     FastmemPatchInfo::new(resume_rip, stub_rip, Some(marker), recompile),
                 );
 
-                // EmitCheckMemoryAbort is deferred — only relevant when
-                // `check_halt_on_memory_access` is set, which ruzu does
-                // not currently enable. Stay parity-faithful by still
-                // recording the patch entry but skip the inline check.
-
+                emit_memory_abort_check(asm, abort_info, Some(&end));
                 asm.jmp(&end, JmpType::Near).unwrap();
             }));
     } else {
         // Path 3: page table (debug_assert page_table_present).
         debug_assert!(mem_conf.page_table_present);
         let src_ptr = emit_vaddr_lookup_a64(ra, ctx, BITSIZE, abort, vaddr);
-        let _mov_off = emit_read_memory_mov::<BITSIZE>(ra.asm, value_idx, src_ptr, ordered);
+        let _mov_off =
+            emit_read_memory_mov::<BITSIZE>(ra.asm, value_idx, src_ptr, ordered, ctx.host_features);
 
         ctx.deferred_emits
             .borrow_mut()
@@ -852,6 +1065,7 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
                 let asm = &mut *dctx.asm;
                 asm.bind(&abort).unwrap();
                 emit_call_to_offset(asm, wrapped_fn_off);
+                emit_memory_abort_check(asm, abort_info, Some(&end));
                 asm.jmp(&end, JmpType::Near).unwrap();
             }));
     }
@@ -860,7 +1074,7 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     ra.define_value(inst_ref, value);
 }
 
-/// A64 IR memory write dispatcher. `BITSIZE` ∈ {8, 16, 32, 64}.
+/// A64 IR memory write dispatcher. `BITSIZE` ∈ {8, 16, 32, 64, 128}.
 ///
 /// Mirrors upstream `A64EmitX64::EmitMemoryWrite<BITSIZE, callback>` in
 /// `emit_x64_memory.cpp.inc:141-220` (instantiated for A64).
@@ -870,7 +1084,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    debug_assert!(matches!(BITSIZE, 8 | 16 | 32 | 64));
+    debug_assert!(matches!(BITSIZE, 8 | 16 | 32 | 64 | 128));
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     // args[3] is the access-type immediate (Value::ImmAccType).
     let ordered = is_ordered(args[3].value.get_acc_type());
@@ -900,6 +1114,19 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
 
     // Path 1: pure callback.
     if !mem_conf.page_table_present && fastmem_marker.is_none() {
+        if BITSIZE == 128 {
+            let (first, rest) = args.split_at_mut(2);
+            ra.use_loc(&mut first[1], abi::ABI_PARAMS[1]);
+            ra.use_loc(&mut rest[0], HostLoc::Xmm(1));
+            ra.end_of_alloc_scope();
+            ra.host_call(None, &mut [None, None, None, None]);
+            emit_call_to_offset(ra.asm, memory_128_accessors(ctx).write);
+            if ordered {
+                ra.asm.mfence().unwrap();
+            }
+            emit_memory_abort_check(ra.asm, memory_abort_info(ctx, inst), None);
+            return;
+        }
         if matches!(BITSIZE, 32 | 64) && (value_resolves_to_xmm || value_is_vector_backed) {
             let (first, rest) = args.split_at_mut(2);
             ra.use_loc(&mut first[1], abi::ABI_PARAMS[1]);
@@ -920,6 +1147,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
             if ordered {
                 ra.asm.mfence().unwrap();
             }
+            emit_memory_abort_check(ra.asm, memory_abort_info(ctx, inst), None);
             return;
         }
         let (first, rest) = args.split_at_mut(2);
@@ -938,12 +1166,22 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         if ordered {
             ra.asm.mfence().unwrap();
         }
+        emit_memory_abort_check(ra.asm, memory_abort_info(ctx, inst), None);
         return;
+    }
+
+    if ordered && BITSIZE == 128 {
+        ra.scratch_gpr_at(HostLoc::Gpr(RAX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RBX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RCX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RDX.get_idx()));
     }
 
     // Allocate vaddr (use) + value (use).
     let vaddr = ra.use_gpr(&mut args[1]);
-    let value = if matches!(BITSIZE, 32 | 64) && (value_resolves_to_xmm || value_is_vector_backed) {
+    let value = if BITSIZE == 128 {
+        ra.use_xmm(&mut args[2])
+    } else if matches!(BITSIZE, 32 | 64) && (value_resolves_to_xmm || value_is_vector_backed) {
         // `A64GetS`/`A64GetD` are typed as U128 upstream but physically hold
         // their scalar payload in the low 32/64 bits of XMM. For scalar
         // memory writes, upstream stores that low lane; avoid routing through
@@ -977,12 +1215,19 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
 
     let abort = ra.asm.create_label();
     let end = ra.asm.create_label();
+    let abort_info = memory_abort_info(ctx, inst);
 
     if let Some(marker) = fastmem_marker {
         // Path 2: fastmem.
         let mut require_abort = false;
         let dest_ptr = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
-        let mov_off = emit_write_memory_mov::<BITSIZE>(ra.asm, dest_ptr, value_idx, ordered);
+        let mov_off = emit_write_memory_mov::<BITSIZE>(
+            ra.asm,
+            dest_ptr,
+            value_idx,
+            ordered,
+            ctx.host_features,
+        );
 
         // RUZU_TRAP_FASTMEM_W64_CORRUPT=1 — for 64-bit fastmem-direct writes,
         // emit inline check: if value's byte 5 = 0x21, byte 4 = 0x01, bytes
@@ -1367,13 +1612,20 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
                     FastmemPatchInfo::new(resume_rip, stub_rip, Some(marker), recompile),
                 );
 
+                emit_memory_abort_check(asm, abort_info, Some(&end));
                 asm.jmp(&end, JmpType::Near).unwrap();
             }));
     } else {
         // Path 3: page table.
         debug_assert!(mem_conf.page_table_present);
         let dest_ptr = emit_vaddr_lookup_a64(ra, ctx, BITSIZE, abort, vaddr);
-        let _mov_off = emit_write_memory_mov::<BITSIZE>(ra.asm, dest_ptr, value_idx, ordered);
+        let _mov_off = emit_write_memory_mov::<BITSIZE>(
+            ra.asm,
+            dest_ptr,
+            value_idx,
+            ordered,
+            ctx.host_features,
+        );
 
         ctx.deferred_emits
             .borrow_mut()
@@ -1381,6 +1633,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
                 let asm = &mut *dctx.asm;
                 asm.bind(&abort).unwrap();
                 emit_call_to_offset(asm, wrapped_fn_off);
+                emit_memory_abort_check(asm, abort_info, Some(&end));
                 asm.jmp(&end, JmpType::Near).unwrap();
             }));
     }
@@ -1426,6 +1679,14 @@ pub fn emit_a64_read_memory_64(
 ) {
     emit_a64_memory_read::<64>(ctx, ra, inst_ref, inst);
 }
+pub fn emit_a64_read_memory_128(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    emit_a64_memory_read::<128>(ctx, ra, inst_ref, inst);
+}
 
 pub fn emit_a64_write_memory_8(
     ctx: &EmitContext,
@@ -1459,6 +1720,14 @@ pub fn emit_a64_write_memory_64(
 ) {
     emit_a64_memory_write::<64>(ctx, ra, inst_ref, inst);
 }
+pub fn emit_a64_write_memory_128(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    emit_a64_memory_write::<128>(ctx, ra, inst_ref, inst);
+}
 
 // `JmpType` is referenced by the deferred-emit closures above.
 #[allow(dead_code)]
@@ -1482,6 +1751,18 @@ mod tests {
     extern "C" fn dummy_raw_write(_ctx: u64, _vaddr: u64, _value: u64, _expected: u64) -> u64 {
         1
     }
+    #[cfg(not(target_os = "windows"))]
+    extern "C" fn dummy_raw_write_128(
+        _ctx: u64,
+        _vaddr: u64,
+        _value_lo: u64,
+        _value_hi: u64,
+        _expected_lo: u64,
+        _expected_hi: u64,
+    ) -> u64 {
+        1
+    }
+    #[cfg(target_os = "windows")]
     extern "C" fn dummy_raw_write_128(
         _ctx: u64,
         _vaddr: u64,
@@ -1552,6 +1833,17 @@ mod tests {
         }
     }
 
+    fn generate_fallbacks(
+        asm: &mut CodeAssembler,
+        callbacks: &EmitCallbacks,
+        raw_callbacks: &RawExclusiveWriteCallbacks,
+    ) -> (Memory128Accessors, FastmemFallbacksTable) {
+        let host_features = crate::backend::x64::block_of_code::get_host_features();
+        let accessors = gen_memory_128_accessors(asm, callbacks, raw_callbacks, host_features);
+        let table = gen_fastmem_fallbacks(asm, callbacks, raw_callbacks, accessors, host_features);
+        (accessors, table)
+    }
+
     /// Verify the table is fully populated: every (ordered, bitsize,
     /// vaddr_idx, value_idx) combination in the valid space has both a
     /// read and a write entry.
@@ -1560,7 +1852,8 @@ mod tests {
         // Need a large code buffer — 3136 stubs × ~50 bytes ≈ 150 KB.
         let mut asm = CodeAssembler::new(2 * 1024 * 1024).unwrap();
         let callbacks = dummy_callbacks();
-        let table = gen_fastmem_fallbacks(&mut asm, &callbacks, None);
+        let raw_callbacks = dummy_raw_callbacks();
+        let (_, table) = generate_fallbacks(&mut asm, &callbacks, &raw_callbacks);
 
         let mut expected = 0;
         for &_o in &[false, true] {
@@ -1574,7 +1867,8 @@ mod tests {
         }
         let expected_128 = 2 * VALID_GPR_IDXES.len() * 16;
         assert_eq!(table.read.len(), expected + expected_128);
-        assert_eq!(table.write.len(), expected);
+        assert_eq!(table.write.len(), expected + expected_128);
+        assert_eq!(table.exclusive_write.len(), expected + expected_128);
     }
 
     /// Verify offsets are unique and strictly monotonic — the stubs
@@ -1583,12 +1877,14 @@ mod tests {
     fn test_gen_fastmem_fallbacks_unique_offsets() {
         let mut asm = CodeAssembler::new(2 * 1024 * 1024).unwrap();
         let callbacks = dummy_callbacks();
-        let table = gen_fastmem_fallbacks(&mut asm, &callbacks, None);
+        let raw_callbacks = dummy_raw_callbacks();
+        let (_, table) = generate_fallbacks(&mut asm, &callbacks, &raw_callbacks);
 
         let mut all_offsets: Vec<usize> = table
             .read
             .values()
             .chain(table.write.values())
+            .chain(table.exclusive_write.values())
             .copied()
             .collect();
         all_offsets.sort();
@@ -1616,7 +1912,8 @@ mod tests {
     fn test_gen_fastmem_fallbacks_stubs_nonempty() {
         let mut asm = CodeAssembler::new(2 * 1024 * 1024).unwrap();
         let callbacks = dummy_callbacks();
-        let table = gen_fastmem_fallbacks(&mut asm, &callbacks, None);
+        let raw_callbacks = dummy_raw_callbacks();
+        let (_, table) = generate_fallbacks(&mut asm, &callbacks, &raw_callbacks);
 
         // Pick one specific stub and check it has reasonable size.
         let off_a = table.read_stub(false, 32, 0, 0);
@@ -1644,7 +1941,8 @@ mod tests {
             probe_write as *const () as usize as u64,
             PROBE_CONTEXT,
         ));
-        let table = gen_fastmem_fallbacks(&mut asm, &callbacks, None);
+        let raw_callbacks = dummy_raw_callbacks();
+        let (_, table) = generate_fallbacks(&mut asm, &callbacks, &raw_callbacks);
 
         let vaddr_idx = abi::ABI_PARAMS[1].to_reg64().get_idx();
         let value_idx = abi::ABI_PARAMS[2].to_reg64().get_idx();
@@ -1673,7 +1971,7 @@ mod tests {
         let mut asm = CodeAssembler::new(4 * 1024 * 1024).unwrap();
         let callbacks = dummy_callbacks();
         let raw_callbacks = dummy_raw_callbacks();
-        let table = gen_fastmem_fallbacks(&mut asm, &callbacks, Some(&raw_callbacks));
+        let (_, table) = generate_fallbacks(&mut asm, &callbacks, &raw_callbacks);
 
         let expected_scalar = 2 * VALID_GPR_IDXES.len() * VALID_GPR_IDXES.len() * 4;
         let expected_128 = 2 * VALID_GPR_IDXES.len() * 16;
@@ -1688,5 +1986,46 @@ mod tests {
                 bitsize
             );
         }
+    }
+
+    #[test]
+    fn disabled_memory_abort_check_emits_nothing() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        emit_memory_abort_check(
+            &mut asm,
+            A64MemoryAbortInfo {
+                enabled: false,
+                current_pc: 0x0123_4567_89AB_CDEF,
+                dispatcher_offsets: None,
+                code_base_ptr: core::ptr::null(),
+            },
+            None,
+        );
+        assert_eq!(asm.size(), 0);
+    }
+
+    #[test]
+    fn enabled_memory_abort_check_embeds_exact_a64_resume_pc() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let current_pc = 0x0123_4567_89AB_CDEFu64;
+        emit_memory_abort_check(
+            &mut asm,
+            A64MemoryAbortInfo {
+                enabled: true,
+                current_pc,
+                dispatcher_offsets: None,
+                code_base_ptr: core::ptr::null(),
+            },
+            None,
+        );
+
+        let code = asm.code();
+        assert!(code
+            .windows(8)
+            .any(|bytes| bytes == current_pc.to_le_bytes()));
+        assert!(code
+            .windows(4)
+            .any(|bytes| { bytes == (A64JitState::offset_of_halt_reason() as u32).to_le_bytes() }));
+        assert!(code.contains(&(A64JitState::offset_of_pc() as u8)));
     }
 }

@@ -149,22 +149,6 @@ impl Jit {
     pub fn disassemble(&self) -> String {
         self.inner.disassemble()
     }
-
-    pub fn get_tpidr_el0(&self) -> u64 {
-        self.inner.get_tpidr_el0()
-    }
-
-    pub fn set_tpidr_el0(&mut self, value: u64) {
-        self.inner.set_tpidr_el0(value);
-    }
-
-    pub fn get_tpidrro_el0(&self) -> u64 {
-        self.inner.get_tpidrro_el0()
-    }
-
-    pub fn set_tpidrro_el0(&mut self, value: u64) {
-        self.inner.set_tpidrro_el0(value);
-    }
 }
 
 /// Public A64 JIT interface for the native AArch64 backend.
@@ -315,21 +299,5 @@ impl Jit {
 
     pub fn disassemble(&self) -> String {
         self.inner.disassemble()
-    }
-
-    pub fn get_tpidr_el0(&self) -> u64 {
-        self.inner.tpidr_el0()
-    }
-
-    pub fn set_tpidr_el0(&mut self, value: u64) {
-        self.inner.set_tpidr_el0(value);
-    }
-
-    pub fn get_tpidrro_el0(&self) -> u64 {
-        self.inner.tpidrro_el0()
-    }
-
-    pub fn set_tpidrro_el0(&mut self, value: u64) {
-        self.inner.set_tpidrro_el0(value);
     }
 }

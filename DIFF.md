@@ -10977,3 +10977,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 - N/A: this change affects host-side scheduling and diagnostic snapshots only.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/emit_arm64_memory.rs` vs Eden `backend/arm64/emit_arm64_memory.cpp` and `interface/A64/config.h` (memory-emitter test ownership)
+
+### Intentional differences
+- Rust memory-emission tests construct an `EmitConfig` explicitly around the fallible instruction
+  writer; their expected ARM64 words and relocation records remain the behavioral oracle for the
+  same helpers owned by Eden's file.
+
+### Unintentional differences (to fix)
+- Fixed: the shared memory-emitter fixture built the architecture-merged `JitConfig`, mutated its
+  nested memory policy, then converted it to A64. It now constructs A64 `UserConfig` directly and
+  sets `check_halt_on_memory_access` on its upstream-equivalent owner.
+- Fixed: its callbacks used legacy raw exception values and tuple-shaped 128-bit memory values.
+  They now implement the typed A64 callback boundary, including `get_cntpct` and upstream default
+  exclusive-write behavior.
+
+### Missing items
+- The A32-specific ARM64 memory and coprocessor emitter fixtures remain on the compatibility layer
+  and require their own A32-owned conversion.
+
+### Binary layout verification
+- PASS: the AArch64 test build enforces the A64 `[u64; 2]` callback vector layout; the existing
+  memory-emission tests continue to assert instruction words for 8/16/32/64/128-bit paths.

@@ -15,9 +15,11 @@ use common::elf::{
     elf64_rel_type, Elf64Dyn, Elf64Rela, Elf64Relr, ELF_AARCH64_RELATIVE, ELF_DT_NULL, ELF_DT_RELA,
     ELF_DT_RELASZ, ELF_DT_RELR, ELF_DT_RELRSZ,
 };
-use rdynarmic::backend::common::emit_context::MemoryEmitConfig;
 use rdynarmic::halt_reason::HaltReason;
-use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
+use rdynarmic::interface::a64::config::{
+    Exception as A64Exception, UserCallbacks as A64UserCallbacks, UserConfig as A64UserConfig,
+    Vector as A64Vector,
+};
 use rdynarmic::A64Jit;
 
 use crate::memory::memory::Memory;
@@ -243,7 +245,7 @@ impl DynarmicCallbacks64 {
     }
 }
 
-impl UserCallbacks for DynarmicCallbacks64 {
+impl A64UserCallbacks for DynarmicCallbacks64 {
     fn memory_read_code(&self, address: u64) -> Option<u32> {
         let aligned_address = address & !(CODE_PAGE_SIZE as u64 - 1);
         let mut code_page = self.code_page.lock().unwrap();
@@ -271,13 +273,13 @@ impl UserCallbacks for DynarmicCallbacks64 {
     fn memory_read_64(&self, address: u64) -> u64 {
         self.read_value(address)
     }
-    fn memory_read_128(&self, address: u64) -> (u64, u64) {
+    fn memory_read_128(&self, address: u64) -> A64Vector {
         let mut bytes = [0; 16];
         self.read_memory(address, &mut bytes);
-        (
+        [
             u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-        )
+        ]
     }
 
     fn memory_write_8(&mut self, address: u64, value: u8) {
@@ -292,37 +294,35 @@ impl UserCallbacks for DynarmicCallbacks64 {
     fn memory_write_64(&mut self, address: u64, value: u64) {
         self.write_value(address, value);
     }
-    fn memory_write_128(&mut self, address: u64, value_lo: u64, value_hi: u64) {
+    fn memory_write_128(&mut self, address: u64, value: A64Vector) {
         let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&value_lo.to_le_bytes());
-        bytes[8..].copy_from_slice(&value_hi.to_le_bytes());
+        bytes[..8].copy_from_slice(&value[0].to_le_bytes());
+        bytes[8..].copy_from_slice(&value[1].to_le_bytes());
         self.write_memory(address, &bytes);
     }
 
-    fn exclusive_write_8(&mut self, address: u64, value: u8, _expected: u8) -> bool {
+    fn memory_write_exclusive_8(&mut self, address: u64, value: u8, _expected: u8) -> bool {
         self.write_value(address, value)
     }
-    fn exclusive_write_16(&mut self, address: u64, value: u16, _expected: u16) -> bool {
+    fn memory_write_exclusive_16(&mut self, address: u64, value: u16, _expected: u16) -> bool {
         self.write_value(address, value)
     }
-    fn exclusive_write_32(&mut self, address: u64, value: u32, _expected: u32) -> bool {
+    fn memory_write_exclusive_32(&mut self, address: u64, value: u32, _expected: u32) -> bool {
         self.write_value(address, value)
     }
-    fn exclusive_write_64(&mut self, address: u64, value: u64, _expected: u64) -> bool {
+    fn memory_write_exclusive_64(&mut self, address: u64, value: u64, _expected: u64) -> bool {
         self.write_value(address, value)
     }
-    fn exclusive_write_128(
+    fn memory_write_exclusive_128(
         &mut self,
         address: u64,
-        value_lo: u64,
-        value_hi: u64,
-        _expected_lo: u64,
-        _expected_hi: u64,
+        value: A64Vector,
+        _expected: A64Vector,
     ) -> bool {
-        self.memory_write_128(address, value_lo, value_hi);
+        self.memory_write_128(address, value);
         true
     }
-    fn call_supervisor(&mut self, swi: u32) {
+    fn call_svc(&mut self, swi: u32) {
         if swi != 0 {
             log::error!("JIT plugin issued unknown service call {swi}");
             self.halt();
@@ -376,9 +376,9 @@ impl UserCallbacks for DynarmicCallbacks64 {
         }
     }
 
-    fn exception_raised(&mut self, pc: u64, exception: u64) {
+    fn exception_raised(&mut self, pc: u64, exception: A64Exception) {
         let instruction = self.memory_read_32(pc);
-        log::error!("JIT plugin exception {exception} at {pc:08x}, data={instruction:08x}");
+        log::error!("JIT plugin exception {exception:?} at {pc:08x}, data={instruction:08x}");
         self.halt();
     }
 
@@ -429,30 +429,7 @@ impl JitContext {
     fn new_impl(memory: Option<Arc<Mutex<Memory>>>) -> Result<Self, String> {
         let state = Arc::new(Mutex::new(ContextState::new()));
         let callbacks = DynarmicCallbacks64::new(memory, Arc::clone(&state));
-        let jit = A64Jit::new(JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
-            callbacks: Box::new(callbacks),
-            enable_cycle_counting: false,
-            code_cache_size: JitConfig::DEFAULT_CODE_CACHE_SIZE,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        })?;
+        let jit = A64Jit::new(A64UserConfig::new(Box::new(callbacks)))?;
         Ok(Self { jit, state })
     }
 
@@ -682,6 +659,13 @@ impl JitContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callbacks_implement_the_architecture_owned_a64_interface() {
+        fn assert_a64_callbacks<T: A64UserCallbacks>() {}
+
+        assert_a64_callbacks::<DynarmicCallbacks64>();
+    }
 
     fn minimal_nro(code_offset: usize, code: &[u32]) -> Vec<u8> {
         let mut data = vec![0; (code_offset + code.len() * 4).max(0x38)];

@@ -7595,7 +7595,14 @@ vs Eden `display_list.h` and `layer_list.h`
   serializes every JIT call through one mutex.
 
 ### Unintentional differences (to fix)
-- None.
+- Fixed: the Rust service constructed the architecture-merged `JitConfig` and reached A64 through
+  `LegacyA64Callbacks`. It now implements the A64-owned callback trait with typed vectors and
+  exceptions and constructs `A64UserConfig` directly.
+- Fixed: the legacy literal disabled cycle counting and supplied its shared memory carrier's
+  64-bit address-space defaults. Eden only assigns `callbacks` on a default A64 configuration,
+  leaving cycle counting enabled and both unused address-space widths at 36; Rust now uses those
+  exact A64 defaults. The callback's no-op `AddTicks` and maximum tick budget preserve Eden's
+  effective unlimited plugin execution.
 
 ### Missing items
 - None for the public `JITContext` interface or the private behavior in `JITContextImpl` and
@@ -7612,9 +7619,8 @@ vs Eden `display_list.h` and `layer_list.h`
 - The Rust backend exposes `instruction_synchronization_barrier_raised` as a default no-op trait
   method and wires it for every JIT configuration. This avoids a JIT-service-only backend type while
   leaving existing callback implementations behaviorally unchanged.
-- The flag corresponding to Dynarmic's top-level `UserConfig::hook_isb` lives in the shared Rust
-  `MemoryEmitConfig`, which is already the frontend-to-backend option carrier used by both host
-  emitters. Its default remains false.
+- The flag corresponding to Dynarmic's top-level `UserConfig::hook_isb` lives in the matching
+  architecture-owned Rust `A64UserConfig`; its default remains false.
 
 ### Unintentional differences (to fix)
 - None.

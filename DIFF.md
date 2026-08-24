@@ -11904,3 +11904,117 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: Windows generated accessors use exact 16-byte value/expected payloads after the 32-byte
   shadow space; System V transfers two 64-bit lanes per value. Linux execution covers direct and
   faulting fastmem `LDR/STR Q`, while Windows and AArch64 cross-target test builds pass.
+
+## 2026-08-24 — `src/rdynarmic/src/tests_a32_fuzz.rs` and `tools/a32_oracle.cpp` vs Eden A32 JIT differential-test behavior
+
+### Intentional differences
+- Test-only runners retain one Rust JIT and one Eden oracle process per test thread. Between cases
+  they reset CPU state, clear the complete code cache, replace code memory, clear data memory,
+  restore the 200-tick budget, and use the same optimization configuration as the former
+  one-process/one-JIT-per-case path; the first case starts from the equivalent fresh state.
+- The local oracle adds a `BATCH` protocol around Eden's public A32 JIT interface. This is tooling
+  only; the one-shot and existing `INIT` protocols remain compatible.
+
+### Unintentional differences (to fix)
+- Fixed: the differential harness rebuilt both JITs and spawned an Eden process for every case,
+  making the full-coverage fuzz tests appear blocked for minutes. Persistent runners now preserve
+  case isolation while removing initialization overhead.
+- Fixed during verification: calling `ClearCache` before `Reset` lost Eden's pending
+  `CacheInvalidation` halt bit because `Reset` zeroes the JIT state. Both runners now perform
+  `Reset` before `ClearCache`, so the following `Run` consumes the invalidation exactly as Eden's
+  A32 interface requires.
+- Fixed: the Eden oracle left `UserConfig::global_monitor` null even though the generated Thumb32
+  corpus includes exclusive loads and stores. Those cases terminated the oracle with SIGSEGV and
+  were silently skipped; all oracle modes now own a one-core `ExclusiveMonitor`, matching the Rust
+  runner and restoring the missing comparisons.
+
+### Missing items
+- None for the reviewed differential-test lifecycle. An older externally configured oracle falls
+  back to the original one-shot protocol, and a failed batch session also falls back safely.
+
+### Binary layout verification
+- PASS: the text protocol still transfers exactly 15 input GPRs, an instruction count, the code
+  words, 16 output GPRs, and CPSR. No production or guest-visible binary structure changed.
+
+## 2026-08-24 — `src/core/src/hle/service/bcat/{bcat,service_creator}.rs` vs Eden `src/core/hle/service/bcat/{bcat,service_creator}.{h,cpp}`
+
+### Intentional differences
+- Rust uses explicit `ServiceFramework` callbacks and `CmifResponse` in place of Eden's compile-time
+  `D<&IServiceCreator::...>` CMIF wrappers. Commands 0 and 1 read the same out-of-band client process
+  ID, while command 2 reads the same raw application ID; all return one IPC interface.
+- Rust shares the null BCAT backend through `Arc<Mutex<dyn BcatBackend + Send>>`; Eden owns the
+  backend with `unique_ptr` and lends a reference to each `IBcatService`.
+- Rust retains `SystemRef` and an `Arc<Mutex<FileSystemController>>` instead of C++ references. The
+  controller and runtime program ID remain owned by `System`, and their lookup ordering matches
+  Eden.
+
+### Unintentional differences (to fix)
+- None in commands 0, 1, or 2.
+
+### Missing items
+- None in the three commands implemented by Eden. Commands 3 and 4 remain null entries on both
+  sides.
+
+### Binary layout verification
+- N/A: `ClientProcessId` is supplied by the HIPC handle descriptor rather than serialized in the
+  raw CMIF payload. Command 2 carries one aligned `u64`; every response contains only a result code
+  plus one IPC interface.
+
+## 2026-08-24 — `src/core/src/hle/service/bcat/delivery_cache_storage_service.rs` vs Eden `src/core/hle/service/bcat/delivery_cache_storage_service.{h,cpp}` (`EnumerateDeliveryCacheDirectory`)
+
+### Intentional differences
+- Rust protects `entries` and `next_read_index` with mutexes because service callbacks receive a
+  shared reference. Both values remain owned together by `IDeliveryCacheStorageService`, and the
+  lock scope preserves Eden's count, copy, then index-advance ordering.
+
+### Unintentional differences (to fix)
+- None in the three storage-service commands implemented by Eden.
+
+### Missing items
+- None. Commands 0 and 1 return their corresponding child interfaces; command 10 uses Eden's HIPC
+  map-alias output buffer and signed 32-bit count.
+
+### Binary layout verification
+- PASS: `DirectoryName` retains its fixed upstream payload layout; the handler copies complete
+  entries and serializes the count as `s32`.
+
+## 2026-08-24 — `src/video_core/src/texture_cache/image_view_info.rs` vs Eden `src/video_core/texture_cache/image_view_info.{h,cpp}`
+
+### Intentional differences
+- Rust expresses Eden's mutable local `TextureType` switch as an enum match. The promotion rules and
+  subsequent view-type switch remain in the same file and order.
+
+### Unintentional differences (to fix)
+- Fixed: Ruzu previously skipped Eden's promotion of 1D, 2D, and cube TIC types to their array forms
+  when `Depth() > 1` or `base_layer != 0`. A layered 2D TIC consequently reached the scalar 2D
+  assertion and aborted the GPU thread.
+
+### Missing items
+- None in the TIC view-type selection path.
+
+### Binary layout verification
+- PASS: `ImageViewInfo` fields and `repr(C)` layout are unchanged; this correction only restores the
+  constructor's type-selection control flow. Focused tests cover depth-driven and base-layer-driven
+  2D-array promotion.
+
+## 2026-08-24 — `src/core/src/hle/service/ns/{service_getter_interface,application_manager_interface}.rs` vs Eden `src/core/hle/service/ns/{service_getter_interface,application_manager_interface}.{h,cpp}`
+
+### Intentional differences
+- Rust returns the child service with an explicit `ResponseBuilder` IPC interface instead of Eden's
+  `Out<SharedPointer<IApplicationManagerInterface>>` serialization wrapper. `SystemRef` preserves
+  the same non-owning system lifetime.
+
+### Unintentional differences (to fix)
+- The application-manager child now exists and owns its command table, but most Eden-implemented
+  application-manager callbacks and its service-context events are not yet ported.
+- Several other `IServiceGetterInterface` child getters remain disconnected despite being wired in
+  Eden; the application-manager getter required by the observed launch path is now connected.
+
+### Missing items
+- Full `IApplicationManagerInterface` method/event parity and the remaining service-getter child
+  callbacks.
+
+### Binary layout verification
+- N/A: this slice creates and transfers IPC service objects; it does not introduce a raw-memory
+  payload. The focused test verifies that command 7996 returns the application-manager owner with
+  its current command table.

@@ -5,12 +5,14 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "dynarmic/interface/A32/a32.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 
 namespace {
 
@@ -22,6 +24,13 @@ public:
     }
 
     OracleEnvironment() = default;
+
+    void Reset(std::vector<std::uint32_t> instructions) {
+        code.clear();
+        data.clear();
+        ticks_left = 200;
+        LoadCode(0, instructions);
+    }
 
     void LoadCode(std::uint32_t address, const std::vector<std::uint32_t>& instructions) {
         for (std::size_t index = 0; index < instructions.size(); ++index) {
@@ -118,6 +127,78 @@ void PrintState(const Dynarmic::A32::Jit& jit) {
     std::cout << std::setw(8) << jit.Cpsr() << '\n' << std::flush;
 }
 
+struct OracleInput {
+    std::array<std::uint32_t, 15> regs;
+    std::vector<std::uint32_t> code;
+};
+
+std::optional<OracleInput> ReadOracleInput() {
+    OracleInput input{};
+    for (auto& reg : input.regs) {
+        if (!(std::cin >> std::hex >> reg)) {
+            return std::nullopt;
+        }
+    }
+
+    std::size_t instruction_count;
+    if (!(std::cin >> std::hex >> instruction_count)) {
+        return std::nullopt;
+    }
+    input.code.resize(instruction_count);
+    for (auto& instruction : input.code) {
+        if (!(std::cin >> std::hex >> instruction)) {
+            return std::nullopt;
+        }
+    }
+    input.code.push_back(0xEAFFFFFE); // b .
+    return input;
+}
+
+void RunOracleCase(Dynarmic::A32::Jit& jit, const std::array<std::uint32_t, 15>& input_regs,
+                   std::uint32_t cpsr) {
+    for (std::size_t index = 0; index < input_regs.size(); ++index) {
+        jit.Regs()[index] = input_regs[index];
+    }
+    jit.SetCpsr(cpsr);
+    jit.Run();
+
+    PrintState(jit);
+}
+
+int RunBatchOracle() {
+    OracleEnvironment environment;
+    Dynarmic::ExclusiveMonitor monitor{1};
+    std::unique_ptr<Dynarmic::A32::Jit> jit;
+
+    std::cout << "OK\n" << std::flush;
+
+    std::string cpsr_token;
+    while (std::cin >> cpsr_token) {
+        if (cpsr_token == "QUIT") {
+            return 0;
+        }
+        const auto cpsr = static_cast<std::uint32_t>(std::stoul(cpsr_token, nullptr, 16));
+        auto input = ReadOracleInput();
+        if (!input) {
+            return 1;
+        }
+
+        environment.Reset(std::move(input->code));
+        if (!jit) {
+            Dynarmic::A32::UserConfig config{};
+            config.callbacks = &environment;
+            config.global_monitor = &monitor;
+            config.optimizations = Dynarmic::no_optimizations;
+            jit = std::make_unique<Dynarmic::A32::Jit>(config);
+        } else {
+            jit->Reset();
+            jit->ClearCache();
+        }
+        RunOracleCase(*jit, input->regs, cpsr);
+    }
+    return 0;
+}
+
 int RunPersistentOracle() {
     std::uint32_t cpsr;
     std::array<std::uint32_t, 15> input_regs{};
@@ -131,8 +212,10 @@ int RunPersistentOracle() {
     }
 
     OracleEnvironment environment;
+    Dynarmic::ExclusiveMonitor monitor{1};
     Dynarmic::A32::UserConfig config{};
     config.callbacks = &environment;
+    config.global_monitor = &monitor;
     config.optimizations = Dynarmic::no_optimizations;
     config.enable_cycle_counting = false;
     Dynarmic::A32::Jit jit{config};
@@ -188,41 +271,20 @@ int RunPersistentOracle() {
 
 int RunOneShotOracle(const std::string& cpsr_token) {
     const auto cpsr = static_cast<std::uint32_t>(std::stoul(cpsr_token, nullptr, 16));
-
-    while (true) {
-        std::array<std::uint32_t, 15> input_regs{};
-        for (auto& reg : input_regs) {
-            if (!(std::cin >> std::hex >> reg)) {
-                return 1;
-            }
-        }
-
-        std::size_t instruction_count;
-        if (!(std::cin >> std::hex >> instruction_count)) {
-            return 1;
-        }
-        std::vector<std::uint32_t> code(instruction_count);
-        for (auto& instruction : code) {
-            if (!(std::cin >> std::hex >> instruction)) {
-                return 1;
-            }
-        }
-        code.push_back(0xEAFFFFFE); // b .
-
-        OracleEnvironment environment{std::move(code)};
-        Dynarmic::A32::UserConfig config{};
-        config.callbacks = &environment;
-        config.optimizations = Dynarmic::no_optimizations;
-        Dynarmic::A32::Jit jit{config};
-        for (std::size_t index = 0; index < input_regs.size(); ++index) {
-            jit.Regs()[index] = input_regs[index];
-        }
-        jit.SetCpsr(cpsr);
-        jit.Run();
-
-        PrintState(jit);
-        return 0;
+    auto input = ReadOracleInput();
+    if (!input) {
+        return 1;
     }
+
+    OracleEnvironment environment{std::move(input->code)};
+    Dynarmic::ExclusiveMonitor monitor{1};
+    Dynarmic::A32::UserConfig config{};
+    config.callbacks = &environment;
+    config.global_monitor = &monitor;
+    config.optimizations = Dynarmic::no_optimizations;
+    Dynarmic::A32::Jit jit{config};
+    RunOracleCase(jit, input->regs, cpsr);
+    return 0;
 }
 
 int main() {
@@ -234,6 +296,9 @@ int main() {
     }
     if (first_token == "INIT") {
         return RunPersistentOracle();
+    }
+    if (first_token == "BATCH") {
+        return RunBatchOracle();
     }
     return RunOneShotOracle(first_token);
 }

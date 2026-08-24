@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::application_manager_interface::IApplicationManagerInterface;
 use super::content_management_interface::IContentManagementInterface;
 use super::ecommerce_interface::IECommerceInterface;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -84,7 +85,7 @@ impl IServiceGetterInterface {
             ),
             (
                 commands::GET_APPLICATION_MANAGER_INTERFACE,
-                None,
+                Some(Self::get_application_manager_interface_handler),
                 "GetApplicationManagerInterface",
             ),
             (
@@ -162,8 +163,21 @@ impl IServiceGetterInterface {
     }
 
     /// GetApplicationManagerInterface (cmd 7996).
-    pub fn get_application_manager_interface(&self) {
+    pub fn get_application_manager_interface(&self) -> IApplicationManagerInterface {
         log::debug!("IServiceGetterInterface::get_application_manager_interface called");
+        IApplicationManagerInterface::new(self.system)
+    }
+
+    fn get_application_manager_interface_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IServiceGetterInterface) };
+        let interface = Arc::new(service.get_application_manager_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
     }
 
     /// GetDownloadTaskInterface (cmd 7997).
@@ -218,6 +232,20 @@ mod tests {
             .and_then(|info| info.handler_callback)
             .is_some());
         assert_eq!(service.get_ecommerce_interface().handlers().len(), 7);
+    }
+
+    #[test]
+    fn application_manager_getter_returns_the_upstream_child_interface() {
+        let service = IServiceGetterInterface::new(crate::core::SystemRef::null(), "ns:am2");
+        assert!(
+            service.handlers[&commands::GET_APPLICATION_MANAGER_INTERFACE]
+                .handler_callback
+                .is_some()
+        );
+        assert_eq!(
+            service.get_application_manager_interface().handlers().len(),
+            crate::hle::service::ns::application_manager_interface::IAPPLICATION_MANAGER_INTERFACE_COMMANDS.len()
+        );
     }
 }
 

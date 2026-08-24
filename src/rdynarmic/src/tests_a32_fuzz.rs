@@ -10,11 +10,18 @@ mod tests {
     };
     use crate::interface::optimization_flags::OptimizationFlag;
     use crate::jit::A32Jit;
+    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::{Arc, Mutex};
 
+    #[derive(Clone)]
     struct FuzzEnv {
+        state: Arc<Mutex<FuzzState>>,
+    }
+
+    struct FuzzState {
         code_mem: Vec<u32>,
         data_mem: HashMap<u32, u8>,
         ticks_left: u64,
@@ -23,24 +30,40 @@ mod tests {
     impl FuzzEnv {
         fn new(code: Vec<u32>) -> Self {
             Self {
-                code_mem: code,
-                data_mem: HashMap::new(),
-                ticks_left: 200,
+                state: Arc::new(Mutex::new(FuzzState {
+                    code_mem: code,
+                    data_mem: HashMap::new(),
+                    ticks_left: 200,
+                })),
             }
+        }
+
+        fn reset(&self, code: Vec<u32>) {
+            let mut state = self.state.lock().unwrap();
+            state.code_mem = code;
+            state.data_mem.clear();
+            state.ticks_left = 200;
         }
     }
 
     impl A32UserCallbacks for FuzzEnv {
         fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
             let idx = (vaddr as usize) / 4;
-            if idx < self.code_mem.len() {
-                Some(self.code_mem[idx])
+            let state = self.state.lock().unwrap();
+            if idx < state.code_mem.len() {
+                Some(state.code_mem[idx])
             } else {
                 Some(0xEAFFFFFE)
             }
         }
         fn memory_read_8(&self, vaddr: u32) -> u8 {
-            *self.data_mem.get(&vaddr).unwrap_or(&0)
+            *self
+                .state
+                .lock()
+                .unwrap()
+                .data_mem
+                .get(&vaddr)
+                .unwrap_or(&0)
         }
         fn memory_read_16(&self, vaddr: u32) -> u16 {
             self.memory_read_8(vaddr) as u16
@@ -55,7 +78,7 @@ mod tests {
                 | (self.memory_read_32(vaddr.wrapping_add(4)) as u64) << 32
         }
         fn memory_write_8(&mut self, vaddr: u32, value: u8) {
-            self.data_mem.insert(vaddr, value);
+            self.state.lock().unwrap().data_mem.insert(vaddr, value);
         }
         fn memory_write_16(&mut self, vaddr: u32, value: u16) {
             self.memory_write_8(vaddr, value as u8);
@@ -84,10 +107,11 @@ mod tests {
         fn call_svc(&mut self, _: u32) {}
         fn exception_raised(&mut self, _: u32, _: A32Exception) {}
         fn add_ticks(&mut self, ticks: u64) {
-            self.ticks_left = self.ticks_left.saturating_sub(ticks);
+            let mut state = self.state.lock().unwrap();
+            state.ticks_left = state.ticks_left.saturating_sub(ticks);
         }
         fn get_ticks_remaining(&self) -> u64 {
-            self.ticks_left
+            self.state.lock().unwrap().ticks_left
         }
     }
 
@@ -668,7 +692,69 @@ mod tests {
         }
     }
 
+    struct RdynarmicRunner {
+        jit: A32Jit,
+        env: FuzzEnv,
+        _monitor: Box<crate::interface::exclusive_monitor::ExclusiveMonitor>,
+    }
+
+    impl RdynarmicRunner {
+        fn new(optimizations: OptimizationFlag) -> Self {
+            let env = FuzzEnv::new(Vec::new());
+            let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+                1,
+            ));
+            let mut config = A32UserConfig::new(Box::new(env.clone()));
+            config.code_cache_size = 16 * 1024 * 1024;
+            config.optimizations = optimizations;
+            config.global_monitor = Some(&mut *monitor as *mut _);
+            let jit = A32Jit::new(config).expect("JIT creation failed");
+            Self {
+                jit,
+                env,
+                _monitor: monitor,
+            }
+        }
+
+        fn run(&mut self, code: &[u32], regs: &[u32; 15], cpsr: u32) -> ([u32; 16], u32) {
+            let mut code_with_loop = code.to_vec();
+            code_with_loop.push(0xEAFFFFFE); // infinite loop
+            self.env.reset(code_with_loop);
+            self.jit.reset();
+            self.jit.clear_cache();
+
+            for (index, value) in regs.iter().copied().enumerate() {
+                self.jit.set_register(index, value);
+            }
+            self.jit.set_cpsr(cpsr);
+            self.jit.run();
+
+            let mut out = [0u32; 16];
+            out.copy_from_slice(self.jit.regs());
+            (out, self.jit.get_cpsr())
+        }
+    }
+
+    thread_local! {
+        static RDYNARMIC_RUNNERS: RefCell<HashMap<u32, RdynarmicRunner>> = RefCell::new(HashMap::new());
+    }
+
     fn run_rdynarmic_with_optimizations(
+        code: &[u32],
+        regs: &[u32; 15],
+        cpsr: u32,
+        optimizations: OptimizationFlag,
+    ) -> ([u32; 16], u32) {
+        RDYNARMIC_RUNNERS.with(|runners| {
+            runners
+                .borrow_mut()
+                .entry(optimizations.bits())
+                .or_insert_with(|| RdynarmicRunner::new(optimizations))
+                .run(code, regs, cpsr)
+        })
+    }
+
+    fn run_rdynarmic_one_shot(
         code: &[u32],
         regs: &[u32; 15],
         cpsr: u32,
@@ -676,7 +762,6 @@ mod tests {
     ) -> ([u32; 16], u32) {
         let mut code_with_loop = code.to_vec();
         code_with_loop.push(0xEAFFFFFE); // infinite loop
-
         let env = FuzzEnv::new(code_with_loop);
         let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
             1,
@@ -687,17 +772,15 @@ mod tests {
         config.global_monitor = Some(&mut *monitor as *mut _);
         let mut jit = A32Jit::new(config).expect("JIT creation failed");
 
-        for i in 0..15 {
-            jit.set_register(i, regs[i]);
+        for (index, value) in regs.iter().copied().enumerate() {
+            jit.set_register(index, value);
         }
         jit.set_cpsr(cpsr);
 
         jit.run();
 
         let mut out = [0u32; 16];
-        for i in 0..16 {
-            out[i] = jit.get_register(i);
-        }
+        out.copy_from_slice(jit.regs());
         (out, jit.get_cpsr())
     }
 
@@ -717,7 +800,36 @@ mod tests {
         assert_eq!(result[0], 12);
     }
 
-    fn run_oracle(code: &[u32], regs: &[u32; 15], cpsr: u32) -> Option<([u32; 16], u32)> {
+    #[test]
+    fn persistent_rdynarmic_matches_one_shot_and_isolates_memory() {
+        let cpsr = 0x0000_01D0;
+        let optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+
+        let mut store_regs = [0u32; 15];
+        store_regs[0] = 0x1000;
+        store_regs[1] = 0xDEAD_BEEF;
+        store_regs[13] = 0x8000;
+        let store_code = [0xE580_1000]; // STR r1, [r0]
+        assert_eq!(
+            run_rdynarmic_with_optimizations(&store_code, &store_regs, cpsr, optimizations),
+            run_rdynarmic_one_shot(&store_code, &store_regs, cpsr, optimizations)
+        );
+
+        let mut load_regs = [0u32; 15];
+        load_regs[0] = 0x1000;
+        load_regs[2] = u32::MAX;
+        load_regs[13] = 0x8000;
+        let load_code = [0xE590_2000]; // LDR r2, [r0]
+        let persistent =
+            run_rdynarmic_with_optimizations(&load_code, &load_regs, cpsr, optimizations);
+        assert_eq!(
+            persistent,
+            run_rdynarmic_one_shot(&load_code, &load_regs, cpsr, optimizations)
+        );
+        assert_eq!(persistent.0[2], 0, "persistent cases leaked data memory");
+    }
+
+    fn oracle_input(code: &[u32], regs: &[u32; 15], cpsr: u32) -> String {
         let mut input = format!("{:08x}", cpsr);
         for r in regs {
             input += &format!(" {:08x}", r);
@@ -727,6 +839,123 @@ mod tests {
             input += &format!(" {:08x}", insn);
         }
         input += "\n";
+        input
+    }
+
+    fn parse_oracle_state(line: &str) -> Option<([u32; 16], u32)> {
+        let tokens: Vec<u32> = line
+            .split_whitespace()
+            .map(|token| u32::from_str_radix(token, 16))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        if tokens.len() != 17 {
+            return None;
+        }
+
+        let mut out = [0u32; 16];
+        out.copy_from_slice(&tokens[..16]);
+        Some((out, tokens[16]))
+    }
+
+    struct BatchOracle {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl BatchOracle {
+        fn spawn() -> Option<Self> {
+            let mut child = Command::new(oracle_path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            let mut stdin = child.stdin.take()?;
+            let stdout = child.stdout.take()?;
+            stdin.write_all(b"BATCH\n").ok()?;
+            stdin.flush().ok()?;
+
+            let mut stdout = BufReader::new(stdout);
+            let mut response = String::new();
+            stdout.read_line(&mut response).ok()?;
+            if response.trim() != "OK" {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+
+            Some(Self {
+                child,
+                stdin,
+                stdout,
+            })
+        }
+
+        fn run(&mut self, code: &[u32], regs: &[u32; 15], cpsr: u32) -> Option<([u32; 16], u32)> {
+            self.stdin
+                .write_all(oracle_input(code, regs, cpsr).as_bytes())
+                .ok()?;
+            self.stdin.flush().ok()?;
+
+            let mut response = String::new();
+            self.stdout.read_line(&mut response).ok()?;
+            parse_oracle_state(&response)
+        }
+    }
+
+    impl Drop for BatchOracle {
+        fn drop(&mut self) {
+            let _ = self.stdin.write_all(b"QUIT\n");
+            let _ = self.stdin.flush();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    enum OracleRunner {
+        Batch(BatchOracle),
+        OneShot,
+        RestartBatch,
+        Unavailable,
+    }
+
+    impl OracleRunner {
+        fn spawn() -> Self {
+            if !oracle_path().is_file() {
+                return Self::Unavailable;
+            }
+            BatchOracle::spawn().map_or(Self::OneShot, Self::Batch)
+        }
+
+        fn run(&mut self, code: &[u32], regs: &[u32; 15], cpsr: u32) -> Option<([u32; 16], u32)> {
+            if matches!(self, Self::RestartBatch) {
+                *self = Self::spawn();
+            }
+            let batch_result = match self {
+                Self::Batch(oracle) => oracle.run(code, regs, cpsr),
+                Self::OneShot => return run_oracle_one_shot(code, regs, cpsr),
+                Self::Unavailable => return None,
+                Self::RestartBatch => unreachable!(),
+            };
+            if batch_result.is_some() {
+                return batch_result;
+            }
+
+            // A guest sequence can terminate the Eden oracle itself. Preserve
+            // the old one-shot result for this case, then start a fresh batch
+            // for the following case instead of disabling batching forever.
+            *self = Self::RestartBatch;
+            run_oracle_one_shot(code, regs, cpsr)
+        }
+    }
+
+    thread_local! {
+        static ORACLE: RefCell<Option<OracleRunner>> = const { RefCell::new(None) };
+    }
+
+    fn run_oracle_one_shot(code: &[u32], regs: &[u32; 15], cpsr: u32) -> Option<([u32; 16], u32)> {
+        let input = oracle_input(code, regs, cpsr);
 
         let mut child = Command::new(oracle_path())
             .stdin(Stdio::piped())
@@ -739,22 +968,52 @@ mod tests {
         drop(child.stdin.take());
 
         let output = child.wait_with_output().ok()?;
-        let line = String::from_utf8_lossy(&output.stdout);
-        let tokens: Vec<u32> = line
-            .trim()
-            .split_whitespace()
-            .filter_map(|s| u32::from_str_radix(s, 16).ok())
-            .collect();
+        parse_oracle_state(&String::from_utf8_lossy(&output.stdout))
+    }
 
-        if tokens.len() < 17 {
-            return None;
-        }
+    fn run_oracle(code: &[u32], regs: &[u32; 15], cpsr: u32) -> Option<([u32; 16], u32)> {
+        ORACLE.with(|oracle| {
+            let mut oracle = oracle.borrow_mut();
+            oracle
+                .get_or_insert_with(OracleRunner::spawn)
+                .run(code, regs, cpsr)
+        })
+    }
 
-        let mut out = [0u32; 16];
-        for i in 0..16 {
-            out[i] = tokens[i];
+    #[test]
+    fn batch_oracle_matches_one_shot_and_isolates_memory() {
+        if skip_when_oracle_is_unavailable() {
+            return;
         }
-        Some((out, tokens[16]))
+        let Some(mut batch) = BatchOracle::spawn() else {
+            eprintln!("skipping batch protocol test: the configured oracle predates BATCH support");
+            return;
+        };
+        let cpsr = 0x0000_01D0;
+
+        let mut store_regs = [0u32; 15];
+        store_regs[0] = 0x1000;
+        store_regs[1] = 0xDEAD_BEEF;
+        store_regs[13] = 0x8000;
+        let store_code = [0xE580_1000]; // STR r1, [r0]
+        assert_eq!(
+            batch.run(&store_code, &store_regs, cpsr),
+            run_oracle_one_shot(&store_code, &store_regs, cpsr)
+        );
+
+        let mut load_regs = [0u32; 15];
+        load_regs[0] = 0x1000;
+        load_regs[2] = u32::MAX;
+        load_regs[13] = 0x8000;
+        let load_code = [0xE590_2000]; // LDR r2, [r0]
+        let batch_result = batch
+            .run(&load_code, &load_regs, cpsr)
+            .expect("batch oracle failed after the first case");
+        assert_eq!(
+            Some(batch_result),
+            run_oracle_one_shot(&load_code, &load_regs, cpsr)
+        );
+        assert_eq!(batch_result.0[2], 0, "batch cases leaked data memory");
     }
 
     #[test]

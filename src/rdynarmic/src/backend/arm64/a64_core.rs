@@ -1,6 +1,6 @@
 use crate::halt_reason::HaltReason;
+use crate::interface::a64::config::UserConfig;
 use crate::ir::location::A64LocationDescriptor;
-use crate::jit_config::JitConfig;
 
 use super::a64_address_space::A64AddressSpace;
 use super::jit_state::A64JitState;
@@ -11,7 +11,7 @@ use super::jit_state::A64JitState;
 pub struct A64Core;
 
 impl A64Core {
-    pub fn new(_config: &JitConfig) -> Self {
+    pub fn new(_config: &UserConfig) -> Self {
         Self
     }
 
@@ -62,7 +62,7 @@ mod tests {
     use crate::backend::arm64::emit_arm64::EmittedBlockInfo;
     use crate::backend::common::emit_context::MemoryEmitConfig;
     use crate::ir::location::LocationDescriptor;
-    use crate::jit_config::{OptimizationFlag, UserCallbacks};
+    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
     use std::collections::HashMap;
 
     struct TestCallbacks {
@@ -136,7 +136,78 @@ mod tests {
         }
     }
 
-    fn config() -> JitConfig {
+    impl crate::interface::a64::config::UserCallbacks for TestCallbacks {
+        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+            UserCallbacks::memory_read_code(self, vaddr)
+        }
+
+        fn memory_read_8(&self, vaddr: u64) -> u8 {
+            UserCallbacks::memory_read_8(self, vaddr)
+        }
+
+        fn memory_read_16(&self, vaddr: u64) -> u16 {
+            UserCallbacks::memory_read_16(self, vaddr)
+        }
+
+        fn memory_read_32(&self, vaddr: u64) -> u32 {
+            UserCallbacks::memory_read_32(self, vaddr)
+        }
+
+        fn memory_read_64(&self, vaddr: u64) -> u64 {
+            UserCallbacks::memory_read_64(self, vaddr)
+        }
+
+        fn memory_read_128(&self, vaddr: u64) -> [u64; 2] {
+            let (lo, hi) = UserCallbacks::memory_read_128(self, vaddr);
+            [lo, hi]
+        }
+
+        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+            UserCallbacks::memory_write_8(self, vaddr, value);
+        }
+
+        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+            UserCallbacks::memory_write_16(self, vaddr, value);
+        }
+
+        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+            UserCallbacks::memory_write_32(self, vaddr, value);
+        }
+
+        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+            UserCallbacks::memory_write_64(self, vaddr, value);
+        }
+
+        fn memory_write_128(&mut self, vaddr: u64, value: [u64; 2]) {
+            UserCallbacks::memory_write_128(self, vaddr, value[0], value[1]);
+        }
+
+        fn call_svc(&mut self, swi: u32) {
+            UserCallbacks::call_supervisor(self, swi);
+        }
+
+        fn exception_raised(
+            &mut self,
+            pc: u64,
+            exception: crate::interface::a64::config::Exception,
+        ) {
+            UserCallbacks::exception_raised(self, pc, exception as u32 as u64);
+        }
+
+        fn add_ticks(&mut self, ticks: u64) {
+            UserCallbacks::add_ticks(self, ticks);
+        }
+
+        fn get_ticks_remaining(&self) -> u64 {
+            UserCallbacks::get_ticks_remaining(self)
+        }
+
+        fn get_cntpct(&self) -> u64 {
+            UserCallbacks::get_cntpct(self)
+        }
+    }
+
+    fn legacy_config() -> JitConfig {
         JitConfig {
             coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(TestCallbacks {
@@ -163,6 +234,10 @@ mod tests {
             tpidr_el0: None,
             memory: MemoryEmitConfig::default(),
         }
+    }
+
+    fn config() -> UserConfig {
+        legacy_config().into_a64_user_config()
     }
 
     #[test]
@@ -232,15 +307,16 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn get_set_elimination_preserves_value_live_across_memory_callback() {
-        let mut conf = config();
-        conf.callbacks = Box::new(TestCallbacks {
+        let mut legacy_conf = legacy_config();
+        legacy_conf.callbacks = Box::new(TestCallbacks {
             code: HashMap::from([
                 (0x1000, 0xf940_0261), // ldr x1, [x19]
                 (0x1004, 0xaa13_03e0), // mov x0, x19
                 (0x1008, 0xd61f_0040), // br x2
             ]),
         });
-        conf.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        legacy_conf.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        let conf = legacy_conf.into_a64_user_config();
 
         let mut core = A64Core::new(&conf);
         let mut process = A64AddressSpace::new(conf).unwrap();
@@ -251,8 +327,9 @@ mod tests {
         let mut runtime_callbacks = TestCallbacks {
             code: HashMap::new(),
         };
-        let callbacks_ptr =
-            &mut runtime_callbacks as &mut dyn UserCallbacks as *mut dyn UserCallbacks;
+        let a64_callbacks: &mut dyn crate::interface::a64::config::UserCallbacks =
+            &mut runtime_callbacks;
+        let callbacks_ptr = a64_callbacks as *mut dyn crate::interface::a64::config::UserCallbacks;
         let mut callback_context = A64CallbackContext::new(&mut state, callbacks_ptr, None, 0);
         process
             .emit_callback_trampolines(
@@ -288,15 +365,16 @@ mod tests {
         }
         code.insert(pc, 0xd61f_0040); // br x2
 
-        let mut conf = config();
-        conf.callbacks = Box::new(TestCallbacks { code });
-        conf.code_cache_size = 64 * 1024;
-        conf.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        let mut legacy_conf = legacy_config();
+        legacy_conf.callbacks = Box::new(TestCallbacks { code });
+        legacy_conf.code_cache_size = 64 * 1024;
+        legacy_conf.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
         let page_table = vec![0u64; 16];
-        conf.page_table_pointer = Some(page_table.as_ptr().cast());
-        conf.memory.page_table_present = true;
-        conf.memory.page_table_address_space_bits = 16;
-        conf.memory.silently_mirror_page_table = true;
+        legacy_conf.page_table_pointer = Some(page_table.as_ptr().cast());
+        legacy_conf.memory.page_table_present = true;
+        legacy_conf.memory.page_table_address_space_bits = 16;
+        legacy_conf.memory.silently_mirror_page_table = true;
+        let conf = legacy_conf.into_a64_user_config();
 
         let mut core = A64Core::new(&conf);
         let mut process = A64AddressSpace::new(conf).unwrap();
@@ -309,8 +387,9 @@ mod tests {
         let mut runtime_callbacks = TestCallbacks {
             code: HashMap::new(),
         };
-        let callbacks_ptr =
-            &mut runtime_callbacks as &mut dyn UserCallbacks as *mut dyn UserCallbacks;
+        let a64_callbacks: &mut dyn crate::interface::a64::config::UserCallbacks =
+            &mut runtime_callbacks;
+        let callbacks_ptr = a64_callbacks as *mut dyn crate::interface::a64::config::UserCallbacks;
         let mut callback_context = A64CallbackContext::new(&mut state, callbacks_ptr, None, 0);
         process
             .emit_callback_trampolines(

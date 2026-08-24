@@ -533,6 +533,7 @@ mod tests {
         config: JitConfig,
         f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
+        let config = config.into_a64_user_config();
         let conf = EmitConfig::from_a64_config(&config);
         let mut reg_alloc = RegAlloc::default();
         let mut info = EmittedBlockInfo {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::halt_reason::HaltReason;
-use crate::jit_config::JitConfig;
+use crate::interface::a64::config::{UserCallbacks, UserConfig};
 
 use super::a64_address_space::{A64AddressSpace, A64CallbackContext};
 use super::a64_core::A64Core;
@@ -48,7 +48,8 @@ struct A64Invalidation {
 }
 
 impl A64Interface {
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: impl Into<UserConfig>) -> Result<Self, String> {
+        let config = config.into();
         let current_address_space = A64AddressSpace::new(config)?;
         let core = A64Core::new(current_address_space.config());
         let mut interface = Self {
@@ -285,13 +286,13 @@ impl A64Interface {
         let processor_id = inner.current_address_space.config().processor_id;
         let callbacks = {
             let callbacks = &mut inner.current_address_space.config_mut().callbacks;
-            callbacks.as_mut() as *mut dyn crate::jit_config::UserCallbacks
+            callbacks.as_mut() as *mut dyn UserCallbacks
         };
         inner.callback_context = Some(A64CallbackContext::new(
             &mut inner.current_state,
             callbacks,
             global_monitor,
-            processor_id,
+            processor_id as usize,
         ));
         let callback_context_ptr = inner
             .callback_context
@@ -309,7 +310,7 @@ impl A64Interface {
 mod tests {
     use super::*;
     use crate::backend::common::emit_context::MemoryEmitConfig;
-    use crate::jit_config::{OptimizationFlag, UserCallbacks};
+    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -401,7 +402,7 @@ mod tests {
         }
     }
 
-    fn config_with_pointers(pointers: Option<Arc<Mutex<PointerState>>>) -> JitConfig {
+    fn config_with_pointers(pointers: Option<Arc<Mutex<PointerState>>>) -> UserConfig {
         JitConfig {
             coprocessors: JitConfig::default_coprocessors(),
             callbacks: Box::new(TestCallbacks { pointers }),
@@ -426,9 +427,10 @@ mod tests {
             tpidr_el0: None,
             memory: MemoryEmitConfig::default(),
         }
+        .into_a64_user_config()
     }
 
-    fn config() -> JitConfig {
+    fn config() -> UserConfig {
         config_with_pointers(None)
     }
 

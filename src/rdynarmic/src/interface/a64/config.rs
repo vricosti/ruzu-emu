@@ -16,6 +16,24 @@ pub enum Exception {
     NoExecuteFault = 9,
 }
 
+impl Exception {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::UnallocatedEncoding,
+            1 => Self::ReservedValue,
+            2 => Self::UnpredictableInstruction,
+            3 => Self::WaitForInterrupt,
+            4 => Self::WaitForEvent,
+            5 => Self::SendEvent,
+            6 => Self::SendEventLocal,
+            7 => Self::Yield,
+            8 => Self::Breakpoint,
+            9 => Self::NoExecuteFault,
+            _ => unreachable!("invalid A64 exception value {value}"),
+        }
+    }
+}
+
 /// Data-cache maintenance operation reported by A64 IR.
 ///
 /// Upstream owner: `interface/A64/config.h::DataCacheOperation`.
@@ -33,6 +51,23 @@ pub enum DataCacheOperation {
     ZeroByVa,
 }
 
+impl DataCacheOperation {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::CleanAndInvalidateBySetWay,
+            1 => Self::CleanAndInvalidateByVaToPoC,
+            2 => Self::CleanBySetWay,
+            3 => Self::CleanByVaToPoC,
+            4 => Self::CleanByVaToPoU,
+            5 => Self::CleanByVaToPoP,
+            6 => Self::InvalidateBySetWay,
+            7 => Self::InvalidateByVaToPoC,
+            8 => Self::ZeroByVa,
+            _ => unreachable!("invalid A64 data-cache operation value {value}"),
+        }
+    }
+}
+
 /// Instruction-cache maintenance operation reported by A64 IR.
 ///
 /// Upstream owner: `interface/A64/config.h::InstructionCacheOperation`.
@@ -42,6 +77,17 @@ pub enum InstructionCacheOperation {
     InvalidateByVaToPoU,
     InvalidateAllToPoU,
     InvalidateAllToPoUInnerSharable,
+}
+
+impl InstructionCacheOperation {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::InvalidateByVaToPoU,
+            1 => Self::InvalidateAllToPoU,
+            2 => Self::InvalidateAllToPoUInnerSharable,
+            _ => unreachable!("invalid A64 instruction-cache operation value {value}"),
+        }
+    }
 }
 
 /// The 128-bit vector value exchanged by A64 memory callbacks.
@@ -105,6 +151,12 @@ pub trait UserCallbacks: Send {
     fn add_ticks(&mut self, ticks: u64);
     fn get_ticks_remaining(&self) -> u64;
     fn get_cntpct(&self) -> u64;
+
+    /// Rust lifecycle adapter: called once the owning JIT state has a stable address.
+    fn set_halt_reason_ptr(&mut self, _ptr: *const u32) {}
+
+    /// Rust lifecycle adapter: called once the owning JIT state has a stable address.
+    fn set_pc_ptr(&mut self, _ptr: *const u32) {}
 }
 
 /// Configuration for an A64 JIT instance.
@@ -193,6 +245,14 @@ impl UserConfig {
         }
         (flag & self.optimizations) != OptimizationFlag::NO_OPTIMIZATIONS
     }
+
+    pub fn effective_optimizations(&self) -> OptimizationFlag {
+        if self.unsafe_optimizations {
+            self.optimizations
+        } else {
+            self.optimizations & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +278,7 @@ mod tests {
         ];
         for (expected, exception) in values.into_iter().enumerate() {
             assert_eq!(exception as i32, expected as i32);
+            assert_eq!(Exception::from_u32(expected as u32), exception);
         }
         assert_eq!(std::mem::size_of::<Exception>(), 4);
         assert_eq!(std::mem::align_of::<Exception>(), 4);
@@ -238,6 +299,7 @@ mod tests {
         ];
         for (expected, operation) in data.into_iter().enumerate() {
             assert_eq!(operation as usize, expected);
+            assert_eq!(DataCacheOperation::from_u32(expected as u32), operation);
         }
         assert_eq!(std::mem::size_of::<DataCacheOperation>(), 4);
         assert_eq!(std::mem::align_of::<DataCacheOperation>(), 4);
@@ -250,6 +312,18 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<InstructionCacheOperation>(), 4);
         assert_eq!(std::mem::align_of::<InstructionCacheOperation>(), 4);
+        assert_eq!(
+            InstructionCacheOperation::from_u32(0),
+            InstructionCacheOperation::InvalidateByVaToPoU
+        );
+        assert_eq!(
+            InstructionCacheOperation::from_u32(1),
+            InstructionCacheOperation::InvalidateAllToPoU
+        );
+        assert_eq!(
+            InstructionCacheOperation::from_u32(2),
+            InstructionCacheOperation::InvalidateAllToPoUInnerSharable
+        );
     }
 
     struct DefaultCallbacks;

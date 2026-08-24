@@ -16,10 +16,14 @@ use crate::halt_reason::HaltReason;
 use crate::interface::a32::config::{
     UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
 };
+use crate::interface::a64::config::{
+    DataCacheOperation as A64DataCacheOperation, Exception as A64Exception,
+    InstructionCacheOperation as A64InstructionCacheOperation, UserCallbacks as A64UserCallbacks,
+    UserConfig as A64UserConfig,
+};
 use crate::ir::location::LocationDescriptor;
 #[cfg(test)]
-use crate::jit_config::OptimizationFlag;
-use crate::jit_config::{JitConfig, UserCallbacks};
+use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 /// Public ARM64 JIT compiler.
 ///
@@ -35,11 +39,54 @@ pub struct A64Jit {
 struct JitInner {
     jit_state: A64JitState,
     emitter: Option<A64EmitX64>,
-    callbacks: Box<dyn UserCallbacks>,
+    callbacks: Box<dyn A64UserCallbacks>,
     run_code_fn: Option<RunCodeFn>,
     is_executing: bool,
     global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
     processor_id: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct A64DummyCallbacks;
+
+#[cfg(target_arch = "aarch64")]
+impl A64UserCallbacks for A64DummyCallbacks {
+    fn memory_read_8(&self, _vaddr: u64) -> u8 {
+        0
+    }
+
+    fn memory_read_16(&self, _vaddr: u64) -> u16 {
+        0
+    }
+
+    fn memory_read_32(&self, _vaddr: u64) -> u32 {
+        0
+    }
+
+    fn memory_read_64(&self, _vaddr: u64) -> u64 {
+        0
+    }
+
+    fn memory_read_128(&self, _vaddr: u64) -> [u64; 2] {
+        [0; 2]
+    }
+
+    fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
+    fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
+    fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
+    fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
+    fn memory_write_128(&mut self, _vaddr: u64, _value: [u64; 2]) {}
+    fn call_svc(&mut self, _svc_num: u32) {}
+    fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
+    fn add_ticks(&mut self, _ticks: u64) {}
+
+    fn get_ticks_remaining(&self) -> u64 {
+        0
+    }
+
+    fn get_cntpct(&self) -> u64 {
+        0
+    }
 }
 
 fn a64_trace_registry() -> &'static Mutex<HashMap<usize, usize>> {
@@ -1384,14 +1431,15 @@ impl A64Jit {
     ///
     /// This allocates the code buffer, generates the dispatcher prelude,
     /// and wires up all callback trampolines.
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: impl Into<A64UserConfig>) -> Result<Self, String> {
+        let config = config.into();
         #[cfg(target_arch = "aarch64")]
         {
             let arm64 = crate::backend::arm64::a64_interface::A64Interface::new(config)?;
             let inner = Box::new(JitInner {
                 jit_state: A64JitState::new(),
                 emitter: None,
-                callbacks: Box::new(A32DummyCallbacks),
+                callbacks: Box::new(A64DummyCallbacks),
                 run_code_fn: None,
                 is_executing: false,
                 global_monitor: None,
@@ -1410,11 +1458,7 @@ impl A64Jit {
             ));
         }
 
-        let cache_size = if config.code_cache_size > 0 {
-            config.code_cache_size
-        } else {
-            DEFAULT_CODE_SIZE
-        };
+        let cache_size = config.code_cache_size as usize;
         let effective_optimizations = config.effective_optimizations();
 
         // Phase 1: Create boxed JitInner with stable heap address
@@ -1425,7 +1469,7 @@ impl A64Jit {
             run_code_fn: None,
             is_executing: false,
             global_monitor: config.global_monitor,
-            processor_id: config.processor_id,
+            processor_id: config.processor_id as usize,
         });
         let halt_ptr = &inner.jit_state.halt_reason as *const u32;
         inner.callbacks.set_halt_reason_ptr(halt_ptr);
@@ -1456,7 +1500,9 @@ impl A64Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
-            page_table_pointer: config.page_table_pointer,
+            page_table_pointer: config
+                .page_table
+                .map(|pointer| pointer.cast::<u8>() as *const u8),
         };
 
         // Build EmitCallbacks (block-level callbacks for memory/system ops)
@@ -1606,12 +1652,27 @@ impl A64Jit {
             }),
             enable_cycle_counting: config.enable_cycle_counting,
             memory: {
-                let mut m = config.memory.clone();
-                // `processor_id` lives at the top level of JitConfig but
-                // mirror it into MemoryEmitConfig so the helpers can read
-                // it via `ctx.config.memory.processor_id`.
-                m.processor_id = config.processor_id;
-                m
+                crate::backend::common::emit_context::MemoryEmitConfig {
+                    fastmem_address_space_bits: config.fastmem_address_space_bits as usize,
+                    silently_mirror_fastmem: config.silently_mirror_fastmem,
+                    fastmem_exclusive_access: config.fastmem_exclusive_access,
+                    recompile_on_exclusive_fastmem_failure: config
+                        .recompile_on_exclusive_fastmem_failure,
+                    recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+                    page_table_present: config.page_table.is_some(),
+                    page_table_address_space_bits: config.page_table_address_space_bits as usize,
+                    silently_mirror_page_table: config.silently_mirror_page_table,
+                    absolute_offset_page_table: config.absolute_offset_page_table,
+                    page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+                    page_table_log2_stride: config.page_table_log2_stride,
+                    detect_misaligned_access_via_page_table: config
+                        .detect_misaligned_access_via_page_table
+                        as u32,
+                    only_detect_misalignment_via_page_table_on_page_boundary: config
+                        .only_detect_misalignment_via_page_table_on_page_boundary,
+                    check_halt_on_memory_access: config.check_halt_on_memory_access,
+                    processor_id: config.processor_id as usize,
+                }
             },
             global_monitor: config.global_monitor,
             cntfrq_el0: config.cntfrq_el0,
@@ -1638,7 +1699,7 @@ impl A64Jit {
         // Forward the per-emulator-core index so JIT-emit-time diagnostics
         // (e.g. RUZU_BLOCK_PROLOGUE_COUNT_PC) can address the correct slot
         // in their per-core counter array.
-        emitter.processor_id = config.processor_id;
+        emitter.processor_id = config.processor_id as usize;
 
         // Extract run_code function pointer
         let run_code_fn = unsafe { emitter.get_run_code_fn()? };
@@ -2168,7 +2229,7 @@ extern "C" fn memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
 
 fn memory_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    let (lo, hi) = inner.callbacks.memory_read_128(vaddr);
+    let [lo, hi] = inner.callbacks.memory_read_128(vaddr);
     Pair128 { lo, hi }
 }
 
@@ -2351,7 +2412,9 @@ extern "C" fn memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64)
 fn memory_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     maybe_log_watch_write(inner, vaddr, 16, value_lo, value_hi);
-    inner.callbacks.memory_write_128(vaddr, value_lo, value_hi);
+    inner
+        .callbacks
+        .memory_write_128(vaddr, [value_lo, value_hi]);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2373,22 +2436,29 @@ extern "C" fn memory_write_128_trampoline(inner_ptr: u64, vaddr: u64, value: *co
 // System trampolines
 extern "C" fn call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.call_supervisor(svc_num as u32);
+    inner.callbacks.call_svc(svc_num as u32);
 }
 
 extern "C" fn exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.exception_raised(pc, exception);
+    inner
+        .callbacks
+        .exception_raised(pc, A64Exception::from_u32(exception as u32));
 }
 
 extern "C" fn data_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.data_cache_operation(op, vaddr);
+    inner
+        .callbacks
+        .data_cache_operation_raised(A64DataCacheOperation::from_u32(op as u32), vaddr);
 }
 
 extern "C" fn instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.instruction_cache_operation(op, vaddr);
+    inner.callbacks.instruction_cache_operation_raised(
+        A64InstructionCacheOperation::from_u32(op as u32),
+        vaddr,
+    );
 }
 
 extern "C" fn instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
@@ -2477,15 +2547,14 @@ extern "C" fn exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
 fn exclusive_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner.jit_state.exclusive_state = 1;
-    let (lo, hi) = if let Some(monitor) = inner.global_monitor {
+    let [lo, hi] = if let Some(monitor) = inner.global_monitor {
         let callbacks = &mut inner.callbacks;
         let value: [u64; 2] = unsafe {
             (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                let (lo, hi) = callbacks.memory_read_128(vaddr);
-                [lo, hi]
+                callbacks.memory_read_128(vaddr)
             })
         };
-        (value[0], value[1])
+        value
     } else {
         inner.callbacks.memory_read_128(vaddr)
     };
@@ -2514,7 +2583,7 @@ extern "C" fn exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u6
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u8| {
-                callbacks.exclusive_write_8(vaddr, value as u8, expected)
+                callbacks.memory_write_exclusive_8(vaddr, value as u8, expected)
             })
         } {
             0
@@ -2525,7 +2594,7 @@ extern "C" fn exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u6
     let expected = inner.jit_state.exclusive_value[0] as u8;
     if inner
         .callbacks
-        .exclusive_write_8(vaddr, value as u8, expected)
+        .memory_write_exclusive_8(vaddr, value as u8, expected)
     {
         0
     } else {
@@ -2543,7 +2612,7 @@ extern "C" fn exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u16| {
-                callbacks.exclusive_write_16(vaddr, value as u16, expected)
+                callbacks.memory_write_exclusive_16(vaddr, value as u16, expected)
             })
         } {
             0
@@ -2554,7 +2623,7 @@ extern "C" fn exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u
     let expected = inner.jit_state.exclusive_value[0] as u16;
     if inner
         .callbacks
-        .exclusive_write_16(vaddr, value as u16, expected)
+        .memory_write_exclusive_16(vaddr, value as u16, expected)
     {
         0
     } else {
@@ -2572,7 +2641,7 @@ extern "C" fn exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u32| {
-                callbacks.exclusive_write_32(vaddr, value as u32, expected)
+                callbacks.memory_write_exclusive_32(vaddr, value as u32, expected)
             })
         } {
             0
@@ -2583,7 +2652,7 @@ extern "C" fn exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u
     let expected = inner.jit_state.exclusive_value[0] as u32;
     if inner
         .callbacks
-        .exclusive_write_32(vaddr, value as u32, expected)
+        .memory_write_exclusive_32(vaddr, value as u32, expected)
     {
         0
     } else {
@@ -2601,7 +2670,7 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u64| {
-                callbacks.exclusive_write_64(vaddr, value, expected)
+                callbacks.memory_write_exclusive_64(vaddr, value, expected)
             })
         } {
             0
@@ -2610,7 +2679,10 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
         };
     }
     let expected = inner.jit_state.exclusive_value[0];
-    if inner.callbacks.exclusive_write_64(vaddr, value, expected) {
+    if inner
+        .callbacks
+        .memory_write_exclusive_64(vaddr, value, expected)
+    {
         0
     } else {
         1
@@ -2630,13 +2702,7 @@ fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi:
                 inner.processor_id,
                 vaddr,
                 |expected: [u64; 2]| {
-                    callbacks.exclusive_write_128(
-                        vaddr,
-                        value_lo,
-                        value_hi,
-                        expected[0],
-                        expected[1],
-                    )
+                    callbacks.memory_write_exclusive_128(vaddr, [value_lo, value_hi], expected)
                 },
             )
         } {
@@ -2647,10 +2713,11 @@ fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi:
     }
     let expected_lo = inner.jit_state.exclusive_value[0];
     let expected_hi = inner.jit_state.exclusive_value[1];
-    if inner
-        .callbacks
-        .exclusive_write_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
-    {
+    if inner.callbacks.memory_write_exclusive_128(
+        vaddr,
+        [value_lo, value_hi],
+        [expected_lo, expected_hi],
+    ) {
         0
     } else {
         1
@@ -2686,7 +2753,7 @@ extern "C" fn raw_exclusive_write_8_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner
         .callbacks
-        .exclusive_write_8(vaddr, value as u8, expected as u8) as u64
+        .memory_write_exclusive_8(vaddr, value as u8, expected as u8) as u64
 }
 
 extern "C" fn raw_exclusive_write_16_trampoline(
@@ -2698,7 +2765,7 @@ extern "C" fn raw_exclusive_write_16_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner
         .callbacks
-        .exclusive_write_16(vaddr, value as u16, expected as u16) as u64
+        .memory_write_exclusive_16(vaddr, value as u16, expected as u16) as u64
 }
 
 extern "C" fn raw_exclusive_write_32_trampoline(
@@ -2710,7 +2777,7 @@ extern "C" fn raw_exclusive_write_32_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner
         .callbacks
-        .exclusive_write_32(vaddr, value as u32, expected as u32) as u64
+        .memory_write_exclusive_32(vaddr, value as u32, expected as u32) as u64
 }
 
 extern "C" fn raw_exclusive_write_64_trampoline(
@@ -2720,7 +2787,9 @@ extern "C" fn raw_exclusive_write_64_trampoline(
     expected: u64,
 ) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.exclusive_write_64(vaddr, value, expected) as u64
+    inner
+        .callbacks
+        .memory_write_exclusive_64(vaddr, value, expected) as u64
 }
 
 extern "C" fn raw_exclusive_write_128_trampoline(
@@ -2734,7 +2803,7 @@ extern "C" fn raw_exclusive_write_128_trampoline(
     let expected = unsafe { *expected };
     inner
         .callbacks
-        .exclusive_write_128(vaddr, value[0], value[1], expected[0], expected[1]) as u64
+        .memory_write_exclusive_128(vaddr, value, expected) as u64
 }
 
 // ===========================================================================
@@ -2820,67 +2889,6 @@ impl A32UserCallbacks for A32DummyCallbacks {
 
     fn add_ticks(&mut self, _ticks: u64) {}
 
-    fn get_ticks_remaining(&self) -> u64 {
-        0
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-impl UserCallbacks for A32DummyCallbacks {
-    fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
-        None
-    }
-
-    fn memory_read_8(&self, _vaddr: u64) -> u8 {
-        0
-    }
-
-    fn memory_read_16(&self, _vaddr: u64) -> u16 {
-        0
-    }
-
-    fn memory_read_32(&self, _vaddr: u64) -> u32 {
-        0
-    }
-
-    fn memory_read_64(&self, _vaddr: u64) -> u64 {
-        0
-    }
-
-    fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-        (0, 0)
-    }
-
-    fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
-    fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
-    fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
-    fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-    fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-    fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-        false
-    }
-    fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-        false
-    }
-    fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-        false
-    }
-    fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-        false
-    }
-    fn exclusive_write_128(
-        &mut self,
-        _vaddr: u64,
-        _value_lo: u64,
-        _value_hi: u64,
-        _expected_lo: u64,
-        _expected_hi: u64,
-    ) -> bool {
-        false
-    }
-    fn call_supervisor(&mut self, _svc_num: u32) {}
-    fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
-    fn add_ticks(&mut self, _ticks: u64) {}
     fn get_ticks_remaining(&self) -> u64 {
         0
     }
@@ -4312,7 +4320,10 @@ mod tests {
             }
         }
         fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-            (self.memory_read_64(vaddr), self.memory_read_64(vaddr + 8))
+            (
+                UserCallbacks::memory_read_64(self, vaddr),
+                UserCallbacks::memory_read_64(self, vaddr + 8),
+            )
         }
 
         fn memory_write_8(&mut self, vaddr: u64, value: u8) {
@@ -4344,24 +4355,24 @@ mod tests {
             }
         }
         fn memory_write_128(&mut self, vaddr: u64, lo: u64, hi: u64) {
-            self.memory_write_64(vaddr, lo);
-            self.memory_write_64(vaddr + 8, hi);
+            UserCallbacks::memory_write_64(self, vaddr, lo);
+            UserCallbacks::memory_write_64(self, vaddr + 8, hi);
         }
 
         fn exclusive_write_8(&mut self, vaddr: u64, value: u8, _expected: u8) -> bool {
-            self.memory_write_8(vaddr, value);
+            UserCallbacks::memory_write_8(self, vaddr, value);
             true
         }
         fn exclusive_write_16(&mut self, vaddr: u64, value: u16, _expected: u16) -> bool {
-            self.memory_write_16(vaddr, value);
+            UserCallbacks::memory_write_16(self, vaddr, value);
             true
         }
         fn exclusive_write_32(&mut self, vaddr: u64, value: u32, _expected: u32) -> bool {
-            self.memory_write_32(vaddr, value);
+            UserCallbacks::memory_write_32(self, vaddr, value);
             true
         }
         fn exclusive_write_64(&mut self, vaddr: u64, value: u64, _expected: u64) -> bool {
-            self.memory_write_64(vaddr, value);
+            UserCallbacks::memory_write_64(self, vaddr, value);
             true
         }
         fn exclusive_write_128(
@@ -4372,7 +4383,7 @@ mod tests {
             _expected_lo: u64,
             _expected_hi: u64,
         ) -> bool {
-            self.memory_write_128(vaddr, lo, hi);
+            UserCallbacks::memory_write_128(self, vaddr, lo, hi);
             true
         }
         fn call_supervisor(&mut self, svc_num: u32) {
@@ -4424,6 +4435,129 @@ mod tests {
 
         fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
             self.halt_reason_ptr = Some(ptr as usize);
+        }
+    }
+
+    impl A64UserCallbacks for MockCallbacks {
+        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+            UserCallbacks::memory_read_code(self, vaddr)
+        }
+
+        fn memory_read_8(&self, vaddr: u64) -> u8 {
+            UserCallbacks::memory_read_8(self, vaddr)
+        }
+
+        fn memory_read_16(&self, vaddr: u64) -> u16 {
+            UserCallbacks::memory_read_16(self, vaddr)
+        }
+
+        fn memory_read_32(&self, vaddr: u64) -> u32 {
+            UserCallbacks::memory_read_32(self, vaddr)
+        }
+
+        fn memory_read_64(&self, vaddr: u64) -> u64 {
+            UserCallbacks::memory_read_64(self, vaddr)
+        }
+
+        fn memory_read_128(&self, vaddr: u64) -> [u64; 2] {
+            let (lo, hi) = UserCallbacks::memory_read_128(self, vaddr);
+            [lo, hi]
+        }
+
+        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+            UserCallbacks::memory_write_8(self, vaddr, value);
+        }
+
+        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+            UserCallbacks::memory_write_16(self, vaddr, value);
+        }
+
+        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+            UserCallbacks::memory_write_32(self, vaddr, value);
+        }
+
+        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+            UserCallbacks::memory_write_64(self, vaddr, value);
+        }
+
+        fn memory_write_128(&mut self, vaddr: u64, value: [u64; 2]) {
+            UserCallbacks::memory_write_128(self, vaddr, value[0], value[1]);
+        }
+
+        fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+            UserCallbacks::exclusive_write_8(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+            UserCallbacks::exclusive_write_16(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+            UserCallbacks::exclusive_write_32(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+            UserCallbacks::exclusive_write_64(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_128(
+            &mut self,
+            vaddr: u64,
+            value: [u64; 2],
+            expected: [u64; 2],
+        ) -> bool {
+            UserCallbacks::exclusive_write_128(
+                self,
+                vaddr,
+                value[0],
+                value[1],
+                expected[0],
+                expected[1],
+            )
+        }
+
+        fn is_read_only_memory(&self, vaddr: u64) -> bool {
+            UserCallbacks::is_read_only_memory(self, vaddr as u32)
+        }
+
+        fn call_svc(&mut self, swi: u32) {
+            UserCallbacks::call_supervisor(self, swi);
+        }
+
+        fn exception_raised(&mut self, pc: u64, exception: A64Exception) {
+            UserCallbacks::exception_raised(self, pc, exception as u64);
+        }
+
+        fn data_cache_operation_raised(&mut self, op: A64DataCacheOperation, value: u64) {
+            UserCallbacks::data_cache_operation(self, op as u64, value);
+        }
+
+        fn instruction_cache_operation_raised(
+            &mut self,
+            op: A64InstructionCacheOperation,
+            value: u64,
+        ) {
+            UserCallbacks::instruction_cache_operation(self, op as u64, value);
+        }
+
+        fn instruction_synchronization_barrier_raised(&mut self) {
+            UserCallbacks::instruction_synchronization_barrier_raised(self);
+        }
+
+        fn add_ticks(&mut self, ticks: u64) {
+            UserCallbacks::add_ticks(self, ticks);
+        }
+
+        fn get_ticks_remaining(&self) -> u64 {
+            UserCallbacks::get_ticks_remaining(self)
+        }
+
+        fn get_cntpct(&self) -> u64 {
+            UserCallbacks::get_cntpct(self)
+        }
+
+        fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
+            UserCallbacks::set_halt_reason_ptr(self, ptr);
         }
     }
 

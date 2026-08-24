@@ -107,12 +107,15 @@ use crate::backend::arm64::{
 };
 use crate::backend::common::emit_context::MemoryEmitConfig;
 use crate::interface::a32::config::UserConfig as A32UserConfig;
+use crate::interface::a64::config::UserConfig as A64UserConfig;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
-use crate::jit_config::{JitConfig, OptimizationFlag};
+#[cfg(test)]
+use crate::jit_config::JitConfig;
 
 pub type CodePtr = *const u8;
 
@@ -314,14 +317,31 @@ impl EmitConfig {
         }
     }
 
-    pub fn from_a64_config(config: &JitConfig) -> Self {
-        let mut memory = config.memory.clone();
-        memory.processor_id = config.processor_id;
+    pub fn from_a64_config(config: &A64UserConfig) -> Self {
+        let memory = MemoryEmitConfig {
+            fastmem_address_space_bits: config.fastmem_address_space_bits as usize,
+            silently_mirror_fastmem: config.silently_mirror_fastmem,
+            fastmem_exclusive_access: config.fastmem_exclusive_access,
+            recompile_on_exclusive_fastmem_failure: config.recompile_on_exclusive_fastmem_failure,
+            recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+            page_table_present: config.page_table.is_some(),
+            page_table_address_space_bits: config.page_table_address_space_bits as usize,
+            silently_mirror_page_table: config.silently_mirror_page_table,
+            absolute_offset_page_table: config.absolute_offset_page_table,
+            page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+            page_table_log2_stride: config.page_table_log2_stride,
+            detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
+                as u32,
+            only_detect_misalignment_via_page_table_on_page_boundary: config
+                .only_detect_misalignment_via_page_table_on_page_boundary,
+            check_halt_on_memory_access: config.check_halt_on_memory_access,
+            processor_id: config.processor_id as usize,
+        };
 
         Self {
             coprocessors: crate::interface::a32::config::empty_coprocessors(),
             is_a32: false,
-            optimizations: effective_optimizations(config),
+            optimizations: config.effective_optimizations(),
             hook_isb: config.hook_isb,
             // Upstream A64::UserConfig::cntfrq_el0 — forwarded from the
             // emulator (yuzu sets the Switch's 19'200'000 Hz; the dynarmic
@@ -336,7 +356,7 @@ impl EmitConfig {
             recompile_on_fastmem_failure: memory.recompile_on_fastmem_failure,
             fastmem_address_space_bits: memory.fastmem_address_space_bits,
             silently_mirror_fastmem: memory.silently_mirror_fastmem,
-            page_table_pointer: config.page_table_pointer.map_or(0, |p| p as u64),
+            page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: memory.page_table_address_space_bits,
             page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
             page_table_log2_stride: config.page_table_log2_stride,
@@ -358,14 +378,6 @@ impl EmitConfig {
             state_fpsr_offset: core::mem::offset_of!(A64JitState, fpsr),
             state_exclusive_state_offset: core::mem::offset_of!(A64JitState, exclusive_state),
         }
-    }
-}
-
-fn effective_optimizations(config: &JitConfig) -> OptimizationFlag {
-    if config.unsafe_optimizations {
-        config.optimizations
-    } else {
-        config.optimizations & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
     }
 }
 
@@ -2073,6 +2085,10 @@ mod tests {
         }
     }
 
+    fn a64_config(unsafe_optimizations: bool) -> A64UserConfig {
+        config(unsafe_optimizations).into_a64_user_config()
+    }
+
     fn empty_block_info(code: &BlockOfCode) -> EmittedBlockInfo {
         EmittedBlockInfo {
             entry_point: code.code_base_ptr(),
@@ -2127,7 +2143,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2155,7 +2171,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2210,7 +2226,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap_or_else(|error| panic!("{opcode:?} failed ARM64 emission: {error}"));
         }
@@ -2228,7 +2244,7 @@ mod tests {
         emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .expect("PackedSelect must be routed to the packed emitter");
     }
@@ -2255,7 +2271,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
         let words = (0..info.size)
@@ -2295,7 +2311,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
         let words = (0..info.size)
@@ -2323,10 +2339,10 @@ mod tests {
 
     #[test]
     fn masks_unsafe_optimizations_unless_enabled() {
-        let safe = EmitConfig::from_a64_config(&config(false));
+        let safe = EmitConfig::from_a64_config(&a64_config(false));
         assert!(!safe.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
 
-        let unsafe_enabled = EmitConfig::from_a64_config(&config(true));
+        let unsafe_enabled = EmitConfig::from_a64_config(&a64_config(true));
         assert!(unsafe_enabled.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
     }
 
@@ -2505,20 +2521,19 @@ mod tests {
 
     #[test]
     fn a64_emit_config_preserves_memory_and_system_defaults() {
-        let mut config = config(false);
+        let mut config = a64_config(false);
         config.cntfrq_el0 = 19_200_000;
-        config.memory.fastmem_address_space_bits = 39;
-        config.memory.silently_mirror_fastmem = false;
-        config.memory.recompile_on_fastmem_failure = true;
-        config.memory.page_table_address_space_bits = 40;
-        config.memory.page_table_pointer_mask_bits = 3;
-        config.memory.silently_mirror_page_table = false;
-        config.memory.absolute_offset_page_table = true;
-        config.memory.detect_misaligned_access_via_page_table = 16 | 32 | 64;
-        config
-            .memory
-            .only_detect_misalignment_via_page_table_on_page_boundary = true;
-        config.memory.check_halt_on_memory_access = true;
+        config.fastmem_address_space_bits = 39;
+        config.silently_mirror_fastmem = false;
+        config.recompile_on_fastmem_failure = true;
+        config.page_table_address_space_bits = 40;
+        config.page_table_pointer_mask_bits = 3;
+        config.page_table_log2_stride = 4;
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = true;
+        config.detect_misaligned_access_via_page_table = 16 | 32 | 64;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = true;
+        config.check_halt_on_memory_access = true;
 
         let cfg = EmitConfig::from_a64_config(&config);
 
@@ -2530,6 +2545,7 @@ mod tests {
         assert!(cfg.recompile_on_fastmem_failure);
         assert_eq!(cfg.page_table_address_space_bits, 40);
         assert_eq!(cfg.page_table_pointer_mask_bits, 3);
+        assert_eq!(cfg.page_table_log2_stride, 4);
         assert!(!cfg.silently_mirror_page_table);
         assert!(cfg.absolute_offset_page_table);
         assert_eq!(cfg.detect_misaligned_access_via_page_table, 16 | 32 | 64);
@@ -2563,7 +2579,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             return_to_dispatch_block(),
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2590,7 +2606,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2619,7 +2635,7 @@ mod tests {
         emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2659,7 +2675,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2681,7 +2697,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2710,7 +2726,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2744,7 +2760,7 @@ mod tests {
         emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
     }
@@ -2809,7 +2825,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2836,7 +2852,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2859,7 +2875,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2883,7 +2899,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2903,7 +2919,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2920,7 +2936,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2936,7 +2952,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2957,7 +2973,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2979,7 +2995,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2999,7 +3015,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -3015,7 +3031,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -3030,7 +3046,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -3060,7 +3076,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -3080,7 +3096,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -3101,7 +3117,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 

@@ -188,5 +188,11 @@ validation blockers, not evidence against the focused slices.
   FCADD, and the file-local dot-product helper. Restoring those final four dispatch paths leaves no
   decoded A64 identity routed through the temporary interpreter fallback; signed/unsigned byte
   extension, accumulation, complex rotations, fused operations, and size validation follow Eden.
+- Both A32 and A64 runtime/backend construction paths now consume their architecture-owned
+  `UserConfig` and typed `UserCallbacks` interfaces. The old merged types remain only as consuming
+  caller adapters; the shared x64 callback tables are the next ownership split.
+- Page-table entry stride is now propagated end-to-end and applied by both x64 lookup
+  specializations and the arm64 lookup. Eight- and sixteen-byte entry layouts therefore follow the
+  same explicit shift plus unscaled pointer-load contract as Eden.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

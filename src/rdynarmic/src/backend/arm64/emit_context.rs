@@ -195,7 +195,9 @@ mod tests {
         let mut emitted_block_info = empty_block_info();
         let mut fpsr = FpsrManager::default();
         let mut fastmem = FastmemManager::default();
-        let conf = crate::backend::arm64::emit_arm64::EmitConfig::from_a64_config(&config());
+        let conf = crate::backend::arm64::emit_arm64::EmitConfig::from_a64_config(
+            &config().into_a64_user_config(),
+        );
 
         let ctx = EmitContext {
             block: &mut block,

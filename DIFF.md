@@ -10652,6 +10652,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the changed configuration objects and callback tables are host-side Rust structures and
   are not raw-copied guest payloads. A32 exception values retain their verified four-byte layout;
   focused callback/configuration tests and all four cross-target test builds pass.
+
 ## 2026-08-24 — `src/rdynarmic/src/backend/{common/emit_context.rs,x64/emit_x64_memory.rs,arm64/{emit_arm64.rs,emit_arm64_memory.rs}}` vs Eden `backend/{x64/emit_x64_memory.h,arm64/{emit_arm64.h,emit_arm64_memory.cpp}}` (`page_table_log2_stride`)
 
 ### Intentional differences
@@ -10682,3 +10683,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the configuration is host-side. A native x64 execution test uses sixteen-byte entries with
   a poisoned second word and verifies that the JIT loads the first-word pointer; arm64 emission
   tests verify the configured `LSL #4` and unscaled indexed `LDR` sequence.
+
+## 2026-08-24 — `src/rdynarmic/src/{interface/a64/config.rs,jit.rs,jit_config.rs,backend/arm64/a64_{address_space,core,interface}.rs,backend/arm64/emit_arm64.rs}` vs Eden `interface/A64/config.h` and `backend/{x64,arm64}/a64_{interface,address_space}.*`
+
+### Intentional differences
+- Rust owns the callback object with `Box<dyn UserCallbacks>` and installs stable JIT-state
+  pointers through two lifecycle hooks. Eden receives a non-owning callback pointer whose owner
+  already knows the public JIT object; callback arguments and installation order are preserved.
+- `jit_config.rs` retains a consuming adapter for existing ruzu callers of the former merged
+  public configuration. Production A64 JIT/backend state immediately converts at this boundary
+  and stores only the A64-owned configuration and typed callback interface.
+- The Rust arm64 backend stores an explicit callback context and function-address table where Eden
+  devirtualizes C++ member functions into generated trampolines.
+
+### Unintentional differences (to fix)
+- Fixed: A64 runtime and arm64 backend owners consumed the merged configuration and raw-integer
+  callback surface. They now consume `interface/a64/config.rs::{UserConfig,UserCallbacks}` and
+  preserve A64 vector values, typed exceptions, cache operations, address widths, system-register
+  values, memory policy, processor ID, and optimization masking.
+- Fixed: the A64 x64 and arm64 callback trampolines exposed legacy method names and tuple-shaped
+  128-bit values. Their calls now match the A64-owned interface, including exclusive writes and
+  SVC/cache-event ownership.
+- Fixed: both A64 host constructors treated an explicit zero code-cache size as a request for the
+  default. Eden forwards the configured value literally; Rust now preserves it as well.
+
+### Missing items
+- The legacy shared `jit_config::{JitConfig,UserCallbacks}` remains as a caller compatibility
+  boundary and still narrows its old read-only-memory query to 32 bits. It must be removed after
+  all external construction sites use the separate A32/A64 owners.
+- The x64 `EmitCallbacks` and `RawExclusiveWriteCallbacks` containers are still shared between
+  A32 and A64; splitting those backend tables remains a separate ownership slice.
+
+### Binary layout verification
+- PASS: A64 exception and cache-operation enums remain four-byte values with upstream ordinal
+  order, and `Vector = [u64; 2]` remains 16 bytes. Round-trip enum tests and typed callback tests
+  cover the values crossing generated-code trampolines.

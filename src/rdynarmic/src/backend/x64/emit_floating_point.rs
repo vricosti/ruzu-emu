@@ -13,9 +13,9 @@ use crate::common::fp::op::fp_round_int::fp_round_int;
 use crate::common::fp::process_nan::process_nan;
 use crate::common::fp::rounding_mode::RoundingMode;
 use crate::common::fp::unpacked::{fp_unpack, FpType};
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
-use crate::jit_config::OptimizationFlag;
 
 // ---------------------------------------------------------------------------
 // Helper: emit a host_call to a Rust function with N args, returning result in RAX

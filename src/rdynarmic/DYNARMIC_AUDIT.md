@@ -107,18 +107,15 @@ validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
 
-- `OptimizationFlag` now lives in its matching `interface/optimization_flags.rs` owner with all
-  Eden values. `jit_config` retains only a temporary compatibility re-export until the following
-  A32/A64 configuration split is complete.
+- `OptimizationFlag` lives in its matching `interface/optimization_flags.rs` owner with all Eden
+  values; the former merged configuration compatibility module has been removed.
 - A32/A64 exception types and A64 cache-operation types now live in their matching configuration
   owners with Eden's four-byte enum representation. Frontend type modules retain temporary
   compatibility re-exports until their consumers are migrated.
-- A32 and A64 now own callback traits and `UserConfig` structures with Eden's exact
-  architecture-specific inventories, types, constants, and defaults. The A32 JIT and both A32
-  host backends now consume the A32-owned types directly, including its 32-bit callback addresses,
-  typed exceptions, endianness setting, and reduced callback inventory. A legacy conversion
-  remains at the public boundary while A64 consumers still use the temporary shared
-  `jit_config::{UserCallbacks,JitConfig}` bridge.
+- A32 and A64 own callback traits and `UserConfig` structures with Eden's exact
+  architecture-specific inventories, types, constants, and defaults. Both public JIT wrappers,
+  host backends, production consumers, tools, and tests consume their architecture-owned types
+  directly; the former shared callback/configuration bridge has been removed.
 - Several A32 instruction families remain aggregated in broad Rust modules;
   the Thumb32 byte/preload, halfword-load, word-load, store-single,
   dual/exclusive/table-branch, and load/store-multiple owners are now split.

@@ -19,11 +19,11 @@ use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::frontend::a64::translate::{translate, MemoryReadCodeFn, TranslationOptions};
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::types::Type;
-use crate::jit_config::OptimizationFlag;
 
 /// Minimum space remaining in the code buffer before triggering a cache clear.
 const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB

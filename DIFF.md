@@ -11080,3 +11080,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: native and AArch64 test builds enforce the A32 `u32` callback boundary and upstream-sized
   page-table pointer type. Existing focused fastmem, sixteen-byte page-table stride, and Thumb
   logical-flags regressions pass; this test-only migration serializes no guest payload.
+
+## 2026-08-24 — `src/rdynarmic/src/{jit.rs,lib.rs}` and removed `jit_config.rs` vs Eden `interface/{A32,A64}/{a32,a64,config}.h` and `backend/{x64,arm64}/{a32,a64}_interface.cpp`
+
+### Intentional differences
+- Rust exposes fallible JIT constructors and boxes callback traits to represent C++ virtual
+  callback ownership. The constructors now otherwise take the matching architecture `UserConfig`
+  by value, as Eden does.
+- Rust-native A32 and A64 integration regressions share memory-storage helper methods inside the
+  test module; the two public callback implementations retain their distinct upstream signatures.
+
+### Unintentional differences (to fix)
+- Fixed: all 58 remaining A64 fixtures constructed an architecture-merged configuration containing
+  A32 coprocessor/version fields. They now construct A64 `UserConfig` directly and use Eden's
+  36-bit address-space defaults unless a test explicitly selects another width.
+- Fixed: the shared test callback implementation and conversion adapters erased A32/A64 address,
+  vector, exception, cache-operation, and default-exclusive-write differences. The fixtures now
+  implement the two architecture callback traits directly over test-only storage helpers.
+- Fixed: the non-upstream public `jit_config.rs` compatibility owner and its generic constructor
+  conversions remained after every consumer had migrated. The module, re-export, adapters, and
+  stale backend imports have been removed; optimization flags are imported from their interface
+  owner.
+
+### Missing items
+- `jit.rs` remains a combined Rust wrapper for both guest architectures rather than mirroring
+  Eden's backend-specific A32/A64 interface translation units. Splitting that established wrapper
+  is a separate structural ownership slice because it also owns host callback trampolines and
+  cache lifecycle.
+
+### Binary layout verification
+- PASS: native and AArch64 test builds enforce A64 `[u64; 2]` vectors, typed four-byte exceptions
+  and cache operations, direct TLS/page-table pointer types, and A32 `u32` callback addresses.
+  Focused A64 fastmem-fault, physical-counter, and exclusive-fallback execution tests pass; no
+  serialized guest payload changed.

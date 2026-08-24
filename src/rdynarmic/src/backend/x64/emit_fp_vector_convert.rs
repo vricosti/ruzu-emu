@@ -23,9 +23,9 @@ use crate::common::fp::op::fp_round_int::fp_round_int;
 use crate::common::fp::op::fp_rsqrt_step_fused::fp_rsqrt_step_fused;
 use crate::common::fp::op::fp_to_fixed::fp_to_fixed;
 use crate::common::fp::rounding_mode::RoundingMode;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
-use crate::jit_config::OptimizationFlag;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn host_supports_fma_avx() -> bool {

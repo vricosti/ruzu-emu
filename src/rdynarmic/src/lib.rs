@@ -3,10 +3,9 @@ pub mod common;
 pub mod exclusive_monitor;
 pub mod frontend;
 pub mod halt_reason;
-pub mod ir;
 pub mod interface;
+pub mod ir;
 pub mod jit;
-pub mod jit_config;
 
 pub use exclusive_monitor::ExclusiveMonitor;
 pub use interface::optimization_flags::OptimizationFlag;

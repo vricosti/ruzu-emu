@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, R12, R15, RAX, RBP, RBX};
 
+use crate::backend::block_range_information::BlockRangeInformation;
 use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
@@ -74,6 +75,7 @@ pub struct A64EmitX64 {
     exception_handler: ExceptionHandler,
     pub code: BlockOfCode,
     pub cache: BlockCache,
+    block_ranges: BlockRangeInformation<u64>,
     pub dispatcher_labels: DispatcherLabels,
     pub emit_config: EmitConfig,
     pub translation_options: TranslationOptions,
@@ -153,6 +155,7 @@ impl A64EmitX64 {
             exception_handler,
             code,
             cache: BlockCache::new(),
+            block_ranges: BlockRangeInformation::default(),
             dispatcher_labels,
             emit_config,
             translation_options,
@@ -518,6 +521,9 @@ impl A64EmitX64 {
         }
 
         // Cache the compiled block
+        let end_location = A64LocationDescriptor::from_location(block.end_location());
+        self.block_ranges
+            .add_range(a64_loc.pc()..=end_location.pc().wrapping_sub(1), location);
         self.cache.insert(
             location,
             CachedBlock {
@@ -885,6 +891,7 @@ impl A64EmitX64 {
         self.patch_table.clear();
         self.clear_fast_dispatch_table();
         self.cache.clear();
+        self.block_ranges.clear_cache();
         self.fastmem_patches.clear();
         crate::backend::x64::perf_map::clear();
         self.code.clear_cache();
@@ -905,32 +912,9 @@ impl A64EmitX64 {
 
     /// Invalidate cached blocks whose PC falls within a memory range.
     pub fn invalidate_range(&mut self, start: u64, length: u64) {
-        let end = start.wrapping_add(length);
-
-        // Collect locations to invalidate
-        let to_remove: Vec<LocationDescriptor> = self
-            .cache
-            .keys()
-            .filter(|loc| {
-                let pc = loc.value() & 0x00FF_FFFF_FFFF_FFFF;
-                pc >= start && pc < end
-            })
-            .copied()
-            .collect();
-
-        // Unpatch all slots targeting the removed blocks
-        for &loc in &to_remove {
-            self.unpatch(loc);
-            self.patch_table.remove(&loc);
-            self.invalidate_fast_dispatch_entry(loc);
-        }
-
-        let had_blocks = !self.cache.is_empty();
-        self.cache.invalidate_range(start, length);
-        // If all blocks were invalidated, clear code buffer to reclaim space.
-        if had_blocks && self.cache.is_empty() {
-            self.patch_table.clear();
-            self.code.clear_cache();
+        let end = start.wrapping_add(length).wrapping_sub(1);
+        for location in self.block_ranges.invalidate_ranges(&[start..=end]) {
+            self.invalidate_basic_block(location);
         }
     }
 }

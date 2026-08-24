@@ -191,5 +191,9 @@ validation blockers, not evidence against the focused slices.
 - Page-table entry stride is now propagated end-to-end and applied by both x64 lookup
   specializations and the arm64 lookup. Eight- and sixteen-byte entry layouts therefore follow the
   same explicit shift plus unscaled pointer-load contract as Eden.
+- The shared `backend/block_range_information.rs` owner now serves all four A32/A64 x64 and ARM64
+  consumers. Emitted blocks register their complete closed guest-PC interval, so invalidating a
+  write into the middle of a block removes every overlapping descriptor rather than filtering on
+  entry PC; cache clears and the non-erasing range-map lifecycle match Eden.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

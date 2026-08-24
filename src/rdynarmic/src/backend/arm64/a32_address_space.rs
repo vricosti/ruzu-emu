@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
+use crate::backend::block_range_information::BlockRangeInformation;
 use crate::backend::common::a32_callbacks::{self, A32ExclusiveState};
 use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
 use crate::frontend::a32::translate::{translate, TranslationOptions};
@@ -22,20 +22,13 @@ use super::fast_hash::arm64_code_cache_profile_enabled;
 use super::jit_state::A32JitState;
 use super::prelude::{DispatcherCallback, PreludeIsa, PreludeOptions, TickCallbacks};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockRange32 {
-    pub start: u32,
-    pub end: u32,
-    pub descriptor: LocationDescriptor,
-}
-
 /// A32-specific ARM64 address-space owner.
 ///
 /// Upstream owner: `backend/arm64/a32_address_space.h/.cpp`.
 pub struct A32AddressSpace {
     address_space: AddressSpace,
     conf: A32UserConfig,
-    block_ranges: Vec<BlockRange32>,
+    block_ranges: BlockRangeInformation<u32>,
     dispatcher_entries: u64,
     dispatcher_cache_hits: u64,
     dispatcher_compiles: u64,
@@ -545,7 +538,7 @@ impl A32AddressSpace {
         Ok(Self {
             address_space,
             conf,
-            block_ranges: Vec::new(),
+            block_ranges: BlockRangeInformation::default(),
             dispatcher_entries: 0,
             dispatcher_cache_hits: 0,
             dispatcher_compiles: 0,
@@ -956,29 +949,20 @@ impl A32AddressSpace {
     pub fn register_new_basic_block(&mut self, block: &Block) {
         let descriptor = A32LocationDescriptor::from_location(block.location);
         let end_location = A32LocationDescriptor::from_location(block.end_location());
-        self.block_ranges.push(BlockRange32 {
-            start: descriptor.pc(),
-            end: end_location.pc().wrapping_sub(1),
-            descriptor: block.location,
-        });
+        self.block_ranges.add_range(
+            descriptor.pc()..=end_location.pc().wrapping_sub(1),
+            block.location,
+        );
     }
 
     pub fn invalidate_cache_ranges(&mut self, ranges: &[RangeInclusive<u32>]) {
-        let mut descriptors = HashSet::new();
-        self.block_ranges.retain(|block_range| {
-            let overlaps = ranges
-                .iter()
-                .any(|range| ranges_overlap_u32(block_range.start, block_range.end, range));
-            if overlaps {
-                descriptors.insert(block_range.descriptor);
-            }
-            !overlaps
-        });
+        let descriptors = self.block_ranges.invalidate_ranges(ranges);
         self.address_space.invalidate_basic_blocks(&descriptors);
     }
 
-    pub fn block_ranges(&self) -> &[BlockRange32] {
-        &self.block_ranges
+    #[cfg(test)]
+    pub fn block_ranges(&self) -> &[(RangeInclusive<u32>, LocationDescriptor)] {
+        self.block_ranges.ranges()
     }
 }
 
@@ -1114,10 +1098,6 @@ extern "C" fn a32_return_to_dispatcher(
 
 fn emit_prelude(address_space: &mut A32AddressSpace) -> Result<(), String> {
     address_space.address_space.emit_bootstrap_prelude()
-}
-
-fn ranges_overlap_u32(start: u32, end: u32, range: &RangeInclusive<u32>) -> bool {
-    start <= *range.end() && *range.start() <= end
 }
 
 #[cfg(test)]
@@ -1335,11 +1315,11 @@ mod tests {
 
         address_space.register_new_basic_block(&block);
         assert_eq!(address_space.block_ranges().len(), 1);
-        assert_eq!(address_space.block_ranges()[0].start, 0);
-        assert_eq!(address_space.block_ranges()[0].end, 3);
+        assert_eq!(address_space.block_ranges()[0].0, 0..=3);
+        assert_eq!(address_space.block_ranges()[0].1, descriptor);
 
         address_space.invalidate_cache_ranges(&[2..=2]);
-        assert!(address_space.block_ranges().is_empty());
+        assert_eq!(address_space.block_ranges().len(), 1);
     }
 
     #[test]

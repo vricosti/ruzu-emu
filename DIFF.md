@@ -11267,3 +11267,103 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: this code generates decoder metadata and does not serialize or raw-copy a payload. The
   regression fixture covers parentheses in both the quoted display name and trailing comment.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/block_range_information.rs` vs Eden `backend/block_range_information.{h,cpp}`
+
+### Intentional differences
+- Rust stores one closed range and descriptor per registration in a `Vec`, while Eden's Boost
+  interval map splits/coalesces overlapping intervals and stores descriptor sets. Iterating every
+  registered interval produces the same union of descriptors for invalidation without adding a
+  nonstandard interval-map dependency.
+- Rust accepts a slice of closed ranges in place of Boost's `interval_set`; callers construct the
+  same closed invalidation intervals at their architecture boundary.
+
+### Unintentional differences (to fix)
+- Fixed: the shared owner was absent and its range lookup was duplicated partially in the ARM64
+  address spaces or replaced by entry-PC filtering in the x64 emitters.
+- Fixed: the ARM64 duplicates erased matched registrations, unlike Eden's current implementation,
+  which deliberately retains them and carries an efficiency TODO.
+
+### Missing items
+- None for `AddRange`, `ClearCache`, `InvalidateRanges`, and the `u32`/`u64` instantiations.
+
+### Binary layout verification
+- N/A: this is host-only cache metadata and is never serialized or copied as a binary payload.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a32_address_space.rs` vs Eden `backend/arm64/a32_address_space.{h,cpp}` (block ranges)
+
+### Intentional differences
+- Rust forwards a `HashSet<LocationDescriptor>` to its address-space invalidator rather than
+  Eden's `ankerl::unordered_dense::set`; both represent the same unique descriptor set.
+
+### Unintentional differences (to fix)
+- Fixed: A32 owned a local `BlockRange32` vector and overlap loop instead of consuming the shared
+  backend owner. Registration and invalidation now preserve Eden's exact start-PC through
+  `EndLocation().PC() - 1` closed interval and descriptor lookup ordering.
+
+### Missing items
+- None in the reviewed `RegisterNewBasicBlock` and `InvalidateCacheRanges` paths.
+
+### Binary layout verification
+- N/A: block-range information is host-only cache metadata.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a64_address_space.rs` vs Eden `backend/arm64/a64_address_space.{h,cpp}` (block ranges)
+
+### Intentional differences
+- Rust forwards a `HashSet<LocationDescriptor>` to its address-space invalidator rather than
+  Eden's `ankerl::unordered_dense::set`; both represent the same unique descriptor set.
+
+### Unintentional differences (to fix)
+- Fixed: A64 owned a local `BlockRange64` vector and overlap loop instead of consuming the shared
+  backend owner. Registration and invalidation now preserve Eden's exact start-PC through
+  `EndLocation().PC() - 1` closed interval and descriptor lookup ordering.
+
+### Missing items
+- None in the reviewed `RegisterNewBasicBlock` and `InvalidateCacheRanges` paths.
+
+### Binary layout verification
+- N/A: block-range information is host-only cache metadata.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_x64.rs` vs Eden `backend/x64/a32_emit_x64.{h,cpp}` (block ranges)
+
+### Intentional differences
+- The Rust public wrapper still supplies one start/length pair, which this owner converts to the
+  same closed `u32` interval that Eden's interface queues in its Boost interval set.
+
+### Unintentional differences (to fix)
+- Fixed: range invalidation filtered cached descriptors only by their entry PC. A write touching a
+  later instruction in a compiled block could therefore leave stale host code active. Every
+  emitted block now registers its complete guest-PC interval before cache insertion and
+  invalidation removes all overlapping descriptors through `BlockRangeInformation`.
+- Fixed: the x64-only `BlockCache::invalidate_range` entry-PC filter and its associated test were
+  removed; exact-descriptor removal remains owned by the cache.
+- Fixed: clearing the emitter cache did not clear its range metadata. It now follows Eden's
+  `EmitX64::ClearCache` then `block_ranges.ClearCache` lifecycle.
+
+### Missing items
+- None in the reviewed range registration, clear, and invalidation paths.
+
+### Binary layout verification
+- N/A: this change affects host code-cache metadata only. A full-JIT regression test mutates the
+  middle instruction of an A32 block and proves that invalidating four bytes recompiles it.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_emit_x64.rs` vs Eden `backend/x64/a64_emit_x64.{h,cpp}` (block ranges)
+
+### Intentional differences
+- The Rust public wrapper still supplies one start/length pair, which this owner converts to the
+  same closed `u64` interval that Eden's interface queues in its Boost interval set.
+
+### Unintentional differences (to fix)
+- Fixed: range invalidation filtered cached descriptors only by their entry PC. Every emitted A64
+  block now registers the complete closed guest-PC interval before cache insertion and removes all
+  descriptors overlapping the requested range.
+- Fixed: clearing the emitter cache did not clear its range metadata, and invalidating the last
+  cached block reset the whole code buffer even though Eden only unpatches and erases selected
+  descriptors. Both lifecycle paths now match Eden.
+
+### Missing items
+- None in the reviewed range registration, clear, and invalidation paths.
+
+### Binary layout verification
+- N/A: this change affects host code-cache metadata only. A full-JIT regression test mutates the
+  middle instruction of an A64 block and proves that invalidating four bytes recompiles it.

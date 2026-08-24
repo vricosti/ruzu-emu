@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
+use crate::backend::block_range_information::BlockRangeInformation;
 use crate::frontend::a64::translate::{translate, TranslationOptions};
 use crate::interface::a64::config::{
     DataCacheOperation, Exception, InstructionCacheOperation, UserCallbacks, UserConfig,
@@ -23,20 +23,13 @@ fn trace_a64_exclusive_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_A64_EXCLUSIVE").is_some())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockRange64 {
-    pub start: u64,
-    pub end: u64,
-    pub descriptor: LocationDescriptor,
-}
-
 /// A64-specific ARM64 address-space owner.
 ///
 /// Upstream owner: `backend/arm64/a64_address_space.h/.cpp`.
 pub struct A64AddressSpace {
     address_space: AddressSpace,
     conf: UserConfig,
-    block_ranges: Vec<BlockRange64>,
+    block_ranges: BlockRangeInformation<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -524,7 +517,7 @@ impl A64AddressSpace {
         Ok(Self {
             address_space,
             conf,
-            block_ranges: Vec::new(),
+            block_ranges: BlockRangeInformation::default(),
         })
     }
 
@@ -774,29 +767,20 @@ impl A64AddressSpace {
     pub fn register_new_basic_block(&mut self, block: &Block) {
         let descriptor = A64LocationDescriptor::from_location(block.location);
         let end_location = A64LocationDescriptor::from_location(block.end_location());
-        self.block_ranges.push(BlockRange64 {
-            start: descriptor.pc(),
-            end: end_location.pc().wrapping_sub(1),
-            descriptor: block.location,
-        });
+        self.block_ranges.add_range(
+            descriptor.pc()..=end_location.pc().wrapping_sub(1),
+            block.location,
+        );
     }
 
     pub fn invalidate_cache_ranges(&mut self, ranges: &[RangeInclusive<u64>]) {
-        let mut descriptors = HashSet::new();
-        self.block_ranges.retain(|block_range| {
-            let overlaps = ranges
-                .iter()
-                .any(|range| ranges_overlap_u64(block_range.start, block_range.end, range));
-            if overlaps {
-                descriptors.insert(block_range.descriptor);
-            }
-            !overlaps
-        });
+        let descriptors = self.block_ranges.invalidate_ranges(ranges);
         self.address_space.invalidate_basic_blocks(&descriptors);
     }
 
-    pub fn block_ranges(&self) -> &[BlockRange64] {
-        &self.block_ranges
+    #[cfg(test)]
+    pub fn block_ranges(&self) -> &[(RangeInclusive<u64>, LocationDescriptor)] {
+        self.block_ranges.ranges()
     }
 }
 
@@ -808,10 +792,6 @@ fn emit_prelude(address_space: &mut AddressSpace, conf: &UserConfig) -> Result<(
         page_table_pointer: conf.page_table.map_or(0, |p| p as u64),
         fastmem_pointer: conf.fastmem_pointer.map_or(0, |p| p as u64),
     })
-}
-
-fn ranges_overlap_u64(start: u64, end: u64, range: &RangeInclusive<u64>) -> bool {
-    start <= *range.end() && *range.start() <= end
 }
 
 #[cfg(test)]
@@ -1049,11 +1029,11 @@ mod tests {
 
         address_space.register_new_basic_block(&block);
         assert_eq!(address_space.block_ranges().len(), 1);
-        assert_eq!(address_space.block_ranges()[0].start, 0);
-        assert_eq!(address_space.block_ranges()[0].end, 3);
+        assert_eq!(address_space.block_ranges()[0].0, 0..=3);
+        assert_eq!(address_space.block_ranges()[0].1, descriptor);
 
         address_space.invalidate_cache_ranges(&[2..=2]);
-        assert!(address_space.block_ranges().is_empty());
+        assert_eq!(address_space.block_ranges().len(), 1);
     }
 
     #[test]

@@ -55,15 +55,6 @@ impl BlockCache {
         self.blocks.clear();
     }
 
-    /// Invalidate blocks whose PC falls within [start, start+length).
-    pub fn invalidate_range(&mut self, start: u64, length: u64) {
-        let end = start.wrapping_add(length);
-        self.blocks.retain(|loc, _| {
-            let pc = loc.value() & 0x00FF_FFFF_FFFF_FFFF; // PC mask (56 bits)
-            pc < start || pc >= end
-        });
-    }
-
     /// Number of cached blocks.
     pub fn len(&self) -> usize {
         self.blocks.len()
@@ -106,41 +97,6 @@ mod tests {
         let block = cache.get(&loc).unwrap();
         assert_eq!(block.entrypoint_offset, 0x100);
         assert_eq!(block.size, 64);
-    }
-
-    #[test]
-    fn test_block_cache_invalidate_range() {
-        let mut cache = BlockCache::new();
-        cache.insert(
-            LocationDescriptor::new(0x1000),
-            CachedBlock {
-                entrypoint: std::ptr::null(),
-                entrypoint_offset: 0,
-                size: 32,
-            },
-        );
-        cache.insert(
-            LocationDescriptor::new(0x2000),
-            CachedBlock {
-                entrypoint: std::ptr::null(),
-                entrypoint_offset: 32,
-                size: 32,
-            },
-        );
-        cache.insert(
-            LocationDescriptor::new(0x3000),
-            CachedBlock {
-                entrypoint: std::ptr::null(),
-                entrypoint_offset: 64,
-                size: 32,
-            },
-        );
-        assert_eq!(cache.len(), 3);
-
-        // Invalidate range [0x1000, 0x2800) — should remove 0x1000 and 0x2000
-        cache.invalidate_range(0x1000, 0x1800);
-        assert_eq!(cache.len(), 1);
-        assert!(cache.get(&LocationDescriptor::new(0x3000)).is_some());
     }
 
     #[test]

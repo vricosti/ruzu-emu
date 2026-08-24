@@ -17,7 +17,7 @@ use crate::memory::memory::Memory;
 use common::page_table::PageInfo;
 use common::settings_enums::CpuAccuracy;
 
-use rdynarmic::backend::x64::jit_state::A64JitState;
+use rdynarmic::backend::x64::a64_jitstate::A64JitState;
 use rdynarmic::interface::a64::config::{
     Exception as A64Exception, InstructionCacheOperation, UserCallbacks as A64UserCallbacks,
     UserConfig as A64UserConfig, Vector as A64Vector,
@@ -777,6 +777,8 @@ struct DynarmicCallbacks64 {
     /// Raw pointer to `A64JitState::pc` for diagnostic logging.
     /// Set after JIT creation via `set_pc_ptr()`.
     jit_pc_ptr: Option<*const u64>,
+    /// Stable TPIDR_EL0 backing pointer used by generated code and snapshots.
+    tpidr_el0_ptr: Option<*const u64>,
 }
 
 // Safety: the installed JIT state pointers remain valid for the callback/JIT lifetime.
@@ -796,6 +798,7 @@ impl DynarmicCallbacks64 {
         debugger_enabled: bool,
         watchpoints: SharedWatchpointArray,
         halted_watchpoint: Arc<Mutex<Option<DebugWatchpoint>>>,
+        tpidr_el0_ptr: Option<*const u64>,
     ) -> Self {
         Self {
             memory,
@@ -815,6 +818,7 @@ impl DynarmicCallbacks64 {
             halted_watchpoint,
             halt_reason_ptr: None,
             jit_pc_ptr: None,
+            tpidr_el0_ptr,
         }
     }
 
@@ -875,7 +879,11 @@ impl DynarmicCallbacks64 {
             unsafe { (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState };
         let jit_state = unsafe { &*jit_state_ptr };
         let mut ctx = self.breakpoint_context.lock().unwrap();
-        *ctx = thread_context_from_jit_state(jit_state, pc);
+        let tpidr = self
+            .tpidr_el0_ptr
+            .map(|pointer| unsafe { pointer.read() })
+            .unwrap_or(0);
+        *ctx = thread_context_from_jit_state(jit_state, pc, tpidr);
     }
 
     /// Matches upstream `DynarmicCallbacks64::CheckMemoryAccess`.
@@ -2244,6 +2252,11 @@ impl ArmDynarmic64 {
                 .filter(|p| !p.is_null())
         };
 
+        let tpidrro_el0 = Box::new(0u64);
+        let mut tpidr_el0 = Box::new(0u64);
+        let tpidrro_el0_ptr = (&*tpidrro_el0) as *const u64;
+        let tpidr_el0_ptr = (&mut *tpidr_el0) as *mut u64;
+
         // Create JIT callbacks with shared memory reference
         let svc = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
@@ -2262,6 +2275,7 @@ impl ArmDynarmic64 {
             debugger_enabled,
             base.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
+            Some(tpidr_el0_ptr),
         );
 
         log::warn!(
@@ -2397,11 +2411,6 @@ impl ArmDynarmic64 {
             optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
             unsafe_optimizations = false;
         }
-
-        let tpidrro_el0 = Box::new(0u64);
-        let mut tpidr_el0 = Box::new(0u64);
-        let tpidrro_el0_ptr = (&*tpidrro_el0) as *const u64;
-        let tpidr_el0_ptr = (&mut *tpidr_el0) as *mut u64;
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
@@ -2613,7 +2622,7 @@ impl ArmInterface for ArmDynarmic64 {
 
         ctx.fpcr = jit.get_fpcr();
         ctx.fpsr = jit.get_fpsr();
-        ctx.tpidr = jit.get_tpidr_el0();
+        ctx.tpidr = *self.tpidr_el0;
     }
 
     fn set_context(&mut self, ctx: &ThreadContext) {
@@ -2646,14 +2655,10 @@ impl ArmInterface for ArmDynarmic64 {
         jit.set_fpcr(ctx.fpcr);
         jit.set_fpsr(ctx.fpsr);
         *self.tpidr_el0 = ctx.tpidr;
-        jit.set_tpidr_el0(ctx.tpidr);
     }
 
     fn set_tpidrro_el0(&mut self, value: u64) {
         *self.tpidrro_el0 = value;
-        if let Some(jit) = self.jit.as_mut() {
-            jit.set_tpidrro_el0(value);
-        }
     }
 
     fn set_watchpoint_array(&mut self, watchpoints: *const WatchpointArray) {
@@ -2661,10 +2666,7 @@ impl ArmInterface for ArmDynarmic64 {
     }
 
     fn get_tpidrro_el0(&self) -> u64 {
-        self.jit
-            .as_ref()
-            .map(|jit| jit.get_tpidrro_el0())
-            .unwrap_or(*self.tpidrro_el0)
+        *self.tpidrro_el0
     }
 
     fn get_svc_arguments(&self, args: &mut [u64; 8]) {
@@ -2749,7 +2751,7 @@ impl ArmInterface for ArmDynarmic64 {
     }
 }
 
-fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64) -> ThreadContext {
+fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64, tpidr: u64) -> ThreadContext {
     let mut ctx = ThreadContext::default();
     ctx.r.copy_from_slice(&jit_state.reg[..29]);
     ctx.fp = jit_state.reg[29];
@@ -2764,7 +2766,7 @@ fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64) -> ThreadCont
     }
     ctx.fpcr = jit_state.get_fpcr();
     ctx.fpsr = jit_state.get_fpsr();
-    ctx.tpidr = jit_state.tpidr_el0;
+    ctx.tpidr = tpidr;
     ctx
 }
 
@@ -2782,7 +2784,7 @@ mod tests {
     use crate::hle::kernel::k_process::ProcessMemoryData;
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use common::settings_enums::CpuAccuracy;
-    use rdynarmic::backend::x64::jit_state::A64JitState;
+    use rdynarmic::backend::x64::a64_jitstate::A64JitState;
     use rdynarmic::interface::a64::config::UserCallbacks;
     use rdynarmic::interface::optimization_flags::OptimizationFlag;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -2823,9 +2825,7 @@ mod tests {
         jit_state.vec[1] = 0x0FED_CBA9_7654_3210;
         jit_state.set_fpcr(0x0100_0000);
         jit_state.set_fpsr(0x0800_001F);
-        jit_state.tpidr_el0 = 0x3333;
-
-        let ctx = thread_context_from_jit_state(&jit_state, 0x4444);
+        let ctx = thread_context_from_jit_state(&jit_state, 0x4444, 0x3333);
         assert_eq!(ctx.r[0], 0x1000);
         assert_eq!(ctx.r[28], 0x1000 + 28);
         assert_eq!(ctx.fp, 0x1000 + 29);
@@ -2935,6 +2935,7 @@ mod tests {
             true,
             interface.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
+            None,
         );
         let halt_reason = AtomicU32::new(0);
         callbacks.set_halt_reason_ptr(halt_reason.as_ptr());

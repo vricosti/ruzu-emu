@@ -262,39 +262,6 @@ impl A64Interface {
         String::new()
     }
 
-    pub fn tpidrro_el0(&self) -> u64 {
-        self.current_address_space
-            .config()
-            .tpidrro_el0
-            .map(|ptr| unsafe { ptr.read() })
-            .unwrap_or(0)
-    }
-
-    pub fn set_tpidrro_el0(&mut self, value: u64) {
-        if let Some(ptr) = self
-            .current_address_space
-            .config()
-            .tpidrro_el0
-            .map(|ptr| ptr as *mut u64)
-        {
-            unsafe { ptr.write(value) };
-        }
-    }
-
-    pub fn tpidr_el0(&self) -> u64 {
-        self.current_address_space
-            .config()
-            .tpidr_el0
-            .map(|ptr| unsafe { ptr.read() })
-            .unwrap_or(0)
-    }
-
-    pub fn set_tpidr_el0(&mut self, value: u64) {
-        if let Some(ptr) = self.current_address_space.config().tpidr_el0 {
-            unsafe { ptr.write(value) };
-        }
-    }
-
     pub(crate) fn current_address_space(&self) -> &A64AddressSpace {
         &self.current_address_space
     }

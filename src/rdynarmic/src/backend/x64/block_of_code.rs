@@ -5,11 +5,11 @@ use rxbyak::xmmword_ptr;
 use rxbyak::{CodeAssembler, JmpType, Reg, RegExp};
 use rxbyak::{R14, R15, RAX, RBX, RSP};
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::constant_pool::ConstantPool;
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::stack_layout::StackLayout;
 
 pub(crate) fn get_host_features() -> HostFeature {

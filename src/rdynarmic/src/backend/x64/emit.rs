@@ -1,5 +1,7 @@
 use crate::backend::x64::a32_emit_a32 as a32;
+use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::a64_emit_x64_memory;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::emit_a64;
 use crate::backend::x64::emit_aes;
 use crate::backend::x64::emit_context::{BlockDescriptor, EmitContext};
@@ -25,7 +27,6 @@ use crate::backend::x64::emit_vector_shift as vshift;
 use crate::backend::x64::emit_x64;
 use crate::backend::x64::emit_x64_vector;
 use crate::backend::x64::hostloc::HOST_RCX;
-use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::{PatchEntry, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::block::Block;
@@ -118,11 +119,13 @@ pub fn emit_push_rsb_location(
         .unwrap();
 
     ra.asm.add(index_reg.cvt32().unwrap(), 1).unwrap();
+    let rsb_ptr_mask = if ctx.arch.is_a32() {
+        A32JitState::RSB_PTR_MASK
+    } else {
+        A64JitState::RSB_PTR_MASK
+    };
     ra.asm
-        .and_(
-            index_reg.cvt32().unwrap(),
-            crate::backend::x64::jit_state::RSB_PTR_MASK as i32,
-        )
+        .and_(index_reg.cvt32().unwrap(), rsb_ptr_mask as i32)
         .unwrap();
     ra.asm
         .mov(

@@ -572,6 +572,8 @@ mod tests {
             enable_cycle_counting: false,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,

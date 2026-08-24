@@ -116,14 +116,6 @@ impl Jit {
         self.inner.set_ext_reg(index, value);
     }
 
-    pub fn get_cntpct(&self) -> u64 {
-        self.inner.get_cntpct()
-    }
-
-    pub fn set_cntpct(&mut self, value: u64) {
-        self.inner.set_cntpct(value);
-    }
-
     pub fn clear_exclusive_state(&mut self) {
         self.inner.clear_exclusive_state();
     }
@@ -152,7 +144,6 @@ impl Jit {
 #[cfg(target_arch = "aarch64")]
 pub struct Jit {
     inner: crate::backend::arm64::a32_interface::A32Interface,
-    cntpct: u64,
     is_executing: bool,
 }
 
@@ -161,7 +152,6 @@ impl Jit {
     pub fn new(config: UserConfig) -> Result<Self, String> {
         Ok(Self {
             inner: crate::backend::arm64::a32_interface::A32Interface::new(config)?,
-            cntpct: 0,
             is_executing: false,
         })
     }
@@ -264,14 +254,6 @@ impl Jit {
 
     pub fn set_ext_reg(&mut self, index: usize, value: u32) {
         self.inner.ext_regs_mut().0[index] = value;
-    }
-
-    pub fn get_cntpct(&self) -> u64 {
-        self.cntpct
-    }
-
-    pub fn set_cntpct(&mut self, value: u64) {
-        self.cntpct = value;
     }
 
     pub fn clear_exclusive_state(&mut self) {

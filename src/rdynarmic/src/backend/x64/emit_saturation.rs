@@ -3,8 +3,8 @@ use rxbyak::RegExp;
 use rxbyak::R15;
 use rxbyak::{byte_ptr, dword_ptr};
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::emit_context::EmitContext;
-use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;

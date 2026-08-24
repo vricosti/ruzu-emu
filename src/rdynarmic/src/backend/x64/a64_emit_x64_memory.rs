@@ -22,6 +22,7 @@ use rxbyak::{
     RDX, RSP,
 };
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::block_of_code::FORCE_RETURN;
 use crate::backend::x64::emit_context::{
@@ -34,7 +35,6 @@ use crate::backend::x64::emit_x64_memory::{
 };
 use crate::backend::x64::exception_handler::{DoNotFastmemMarker, FastmemPatchInfo};
 use crate::backend::x64::hostloc::HostLoc;
-use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::value_classify::{ir_value_is_vector_backed, ir_value_resolves_to_xmm};
 use crate::interface::halt_reason::HaltReason;

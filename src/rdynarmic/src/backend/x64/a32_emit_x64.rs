@@ -10,6 +10,7 @@ use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, EAX, EBP, EBX, ECX, R12, R15, RAX, RBP, RBX, RCX};
 
 use crate::backend::block_range_information::BlockRangeInformation;
+use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
 use crate::backend::x64::abi;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
@@ -23,7 +24,6 @@ use crate::backend::x64::exception_handler::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
-use crate::backend::x64::jit_state::{A32JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{
     PatchTable, PatchType, A32_PATCH_JG_SIZE, A32_PATCH_JMP_SIZE, A32_PATCH_JZ_SIZE,
 };
@@ -690,7 +690,7 @@ impl A32EmitX64 {
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.sub(EAX, 1i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
-        asm.and_(EAX, RSB_PTR_MASK as i32)
+        asm.and_(EAX, A32JitState::RSB_PTR_MASK as i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.mov(dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32), EAX)
             .map_err(|e| format!("RSB handler: {:?}", e))?;

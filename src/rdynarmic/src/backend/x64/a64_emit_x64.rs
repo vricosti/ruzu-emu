@@ -5,6 +5,7 @@ use rxbyak::{JmpType, RegExp, R12, R15, RAX, RBP, RBX};
 
 use crate::backend::block_range_information::BlockRangeInformation;
 use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
     BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn,
@@ -16,7 +17,6 @@ use crate::backend::x64::exception_handler::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
-use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::frontend::a64::translate::{translate, MemoryReadCodeFn, TranslationOptions};
@@ -665,7 +665,7 @@ impl A64EmitX64 {
         .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.sub(rxbyak::Reg::gpr32(0), 1i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
-        asm.and_(rxbyak::Reg::gpr32(0), RSB_PTR_MASK as i32)
+        asm.and_(rxbyak::Reg::gpr32(0), A64JitState::RSB_PTR_MASK as i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         // Store updated pointer
         asm.mov(
@@ -1032,6 +1032,8 @@ mod tests {
             enable_cycle_counting: true,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
@@ -1106,6 +1108,8 @@ mod tests {
             enable_cycle_counting: true,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
@@ -1174,6 +1178,8 @@ mod tests {
             enable_cycle_counting: false,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,

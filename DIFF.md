@@ -11460,8 +11460,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `start + length - 1` expression.
 - Fixed: `GetRegisters`, `SetRegisters`, `GetVector`, `SetVector`, `GetVectors`, `SetVectors`, and
   the empty ARM64 `Disassemble` result were absent from this owner.
-- TPIDR and diagnostic raw-pointer accessors remain Ruzu extensions in this upstream-owned file;
-  a dedicated follow-up must move them behind an explicit extension boundary.
+- Fixed in the x64 JIT-state ownership slice: TPIDR accessors that only mirrored Core-owned
+  backing storage were removed from this upstream owner.
 
 ### Missing items
 - None in the reviewed public A64 method inventory or deferred-invalidation behavior.
@@ -11475,7 +11475,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Intentional differences
 - Rust selects the x64 or ARM64 implementation with target `cfg` blocks instead of a link-selected
   C++ `Impl`, but the public `Jit` remains the owner of the backend object and `is_executing`.
-- `read_halt_reason`, raw state-pointer access, individual register helpers, CNTPCT access,
+- `read_halt_reason`, raw state-pointer access, individual register helpers,
   compile-only, and block-map dumping are Ruzu diagnostic/tool extensions beyond Eden's public
   interface. They delegate to host backends and do not replace an upstream method.
 
@@ -11511,7 +11511,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   interface owner's field at Eden's exact lifecycle points.
 
 ### Missing items
-- Diagnostic state-pointer, CNTPCT, compile-only, trace, and block-map facilities remain mixed into
+- Diagnostic state-pointer, compile-only, trace, and block-map facilities remain mixed into
   this upstream-owned backend file pending an explicit Ruzu extension boundary.
 
 ### Binary layout verification
@@ -11539,8 +11539,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the RSB first, and process every queued closed range before Run/Step report non-execution.
 
 ### Missing items
-- TPIDR and diagnostic raw-pointer/trace facilities remain mixed into this upstream-owned backend
-  file pending an explicit Ruzu extension boundary.
+- Fixed in the x64 JIT-state ownership slice: TPIDR values are no longer mirrored through backend
+  accessors or raw-state fields. Diagnostic raw-pointer/trace facilities remain mixed into this
+  upstream-owned backend file pending an explicit Ruzu extension boundary.
 
 ### Binary layout verification
 - PASS: no A64 JIT-state or callback payload layout changed. The focused capacity test covers the
@@ -11551,7 +11552,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Intentional differences
 - Target-specific Rust `Jit` definitions replace the C++ pImpl selected by the build, while retaining
   the same public method owner and complete register/vector surface.
-- Raw state/halt pointers, halt inspection, tuple vector compatibility, and TPIDR access are Ruzu
+- Raw state/halt pointers, halt inspection, and tuple vector compatibility are Ruzu
   integration extensions delegated to the selected backend.
 
 ### Unintentional differences (to fix)
@@ -11566,3 +11567,85 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: public `Vector` remains `[u64; 2]`; aggregate access tests verify 31 GPRs and 32 vectors,
   including low/high lane order.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_jitstate.rs` vs Eden `backend/x64/a32_jitstate.{h,cpp}`
+
+### Intentional differences
+- Rust spells the fields and methods with Rust naming conventions and uses explicit zeroed padding
+  before `ext_reg`; the padding reproduces Eden's implicit `alignas(16)` gap and makes reserved
+  bytes deterministic.
+- Compile-time `offset_of!` helpers expose the same offsets to the Rust x64 emitter that C++ obtains
+  with `offsetof`.
+
+### Unintentional differences (to fix)
+- Fixed: A32 state was combined with A64 in `jit_state.rs`; it now has the matching upstream owner.
+- Fixed: the raw state had appended `exclusive_value` and `cntpct` fields absent from Eden. The safe
+  no-global-monitor fallback value now belongs to `A32JitInner`; the unused A32 CNTPCT extension was
+  removed.
+- Fixed: `TransferJitState` was missing. The port copies Eden's exact architectural/MXCSR/FPSR
+  fields, preserves `halt_reason`, clears `exclusive_state`, and conditionally copies or resets RSB.
+
+### Missing items
+- None in the state fields, constants, or method inventory of the reviewed header/source pair.
+
+### Binary layout verification
+- PASS: a program compiled against Eden's header and the Rust layout test both report alignment 16,
+  size 528, and identical offsets for every field from `reg` at 0 through `fpsr_nzcv` at 512.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_jitstate.rs` vs Eden `backend/x64/a64_jitstate.{h,cpp}`
+
+### Intentional differences
+- Rust uses explicit zeroed padding after `exclusive_state` to reproduce the C++ compiler's padding
+  before `rsb_ptr`, and compile-time offset helpers stand in for C++ `offsetof` calls.
+
+### Unintentional differences (to fix)
+- Fixed: A64 state was combined with A32 in `jit_state.rs`; it now has the matching upstream owner.
+- Fixed: `exclusive_value`, `tpidr_el0`, and `tpidrro_el0` incorrectly extended the generated-code
+  state. The fallback exclusive value now belongs to `JitInner`, while TPIDR uses the configured
+  stable pointers exactly like Eden.
+
+### Missing items
+- None in the state fields, constants, or method inventory of the reviewed header/source pair.
+
+### Binary layout verification
+- PASS: a program compiled against Eden's header and the Rust layout test both report alignment 16,
+  size 960, and identical offsets for every field from `reg` at 0 through `fpcr` at 944.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/emit_a64.rs` vs Eden `backend/x64/a64_emit_x64.cpp` (TPIDR)
+
+### Intentional differences
+- Rust represents nullable TPIDR pointers as `Option<*mut u64>`/`Option<*const u64>` and materializes
+  their addresses through rxbyak's Rust API; the emitted load/store sequence is otherwise the same.
+
+### Unintentional differences (to fix)
+- Fixed: TPIDR instructions read and wrote private fields appended to `A64JitState`. `MRS/MSR
+  TPIDR_EL0` and `MRS TPIDRRO_EL0` now load/store through the pointers embedded from `UserConfig`;
+  null reads return zero and null writes do nothing.
+
+### Missing items
+- None in the three reviewed TPIDR emitter methods.
+
+### Binary layout verification
+- N/A: TPIDR backing storage is host-owned and outside raw JIT state. An executing five-instruction
+  regression verifies both configured reads and the configured write.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/{a32/a32,a64/a64}.rs` and host interfaces vs Eden `interface/{A32/a32,A64/a64}.h` and `backend/{x64,arm64}/*_interface.cpp`
+
+### Intentional differences
+- When no global monitor is configured, Ruzu's safe callback fallback retains expected exclusive
+  values in the host interface owner. These values are not visible to generated code and are reset
+  with the architectural state.
+
+### Unintentional differences (to fix)
+- Fixed: public A32 CNTPCT accessors stored an inert value that no A32 instruction consumed.
+- Fixed: public A64 TPIDR accessors duplicated Core's configured backing storage; the read-only
+  setter also cast Eden's `const` TPIDRRO pointer to mutable. Core now reads/writes its stable
+  backing allocations directly, as Eden's `ArmDynarmic64` does.
+
+### Missing items
+- Ruzu diagnostic state pointers, halt inspection, compile-only, trace, and block-map helpers still
+  require a separate extension boundary to make the public/upstream interface owners exact.
+
+### Binary layout verification
+- PASS: removing the extra values from raw state is covered by the exact A32/A64 layout assertions;
+  the host interface fallback storage has no generated-code or serialized ABI.

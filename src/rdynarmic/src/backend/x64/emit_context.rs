@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 
+use crate::backend::x64::a32_jitstate::A32JitState;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::exception_handler::FastmemPatchTable;
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
 use crate::interface::a32::config::Coprocessors;
@@ -289,6 +290,11 @@ pub struct EmitConfig {
     /// upstream's `GetExclusiveMonitorLockPointer` /
     /// `GetExclusiveMonitorAddressPointer` / `GetExclusiveMonitorValuePointer`.
     pub global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
+    /// Stable backing pointers embedded in A64 TPIDR instructions.
+    ///
+    /// Upstream owner: `A64::UserConfig::{tpidr_el0,tpidrro_el0}`.
+    pub tpidrro_el0: Option<*const u64>,
+    pub tpidr_el0: Option<*mut u64>,
     /// Counter-timer frequency returned for `MRS CNTFRQ_EL0`.
     /// Upstream `A64::UserConfig::cntfrq_el0`; forwarded from the architecture-owned config.
     pub cntfrq_el0: u32,

@@ -27,7 +27,7 @@ use crate::backend::x64::a64_interface::{
     exclusive_read_32_trampoline, exclusive_write_32_trampoline, JitInner,
 };
 #[cfg(all(test, target_arch = "x86_64"))]
-use crate::backend::x64::jit_state::A64JitState;
+use crate::backend::x64::a64_jitstate::A64JitState;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use crate::backend::x64::a64_interface::a64_block_entry_trace_hook;
@@ -636,7 +636,8 @@ pub(crate) extern "C" fn a32_pc_trace_hook(jit_state_ptr: u64, fastmem_base: u64
     let state =
         unsafe { &*(jit_state_ptr as *const crate::backend::arm64::jit_state::A32JitState) };
     #[cfg(not(target_arch = "aarch64"))]
-    let state = unsafe { &*(jit_state_ptr as *const crate::backend::x64::jit_state::A32JitState) };
+    let state =
+        unsafe { &*(jit_state_ptr as *const crate::backend::x64::a32_jitstate::A32JitState) };
     #[cfg(target_arch = "aarch64")]
     let regs = &state.regs;
     #[cfg(not(target_arch = "aarch64"))]
@@ -1864,9 +1865,6 @@ mod tests {
         jit.set_ext_reg(7, 0xaabb_ccdd);
         assert_eq!(jit.get_ext_reg(7), 0xaabb_ccdd);
 
-        jit.set_cntpct(0x1234_5678_9abc_def0);
-        assert_eq!(jit.get_cntpct(), 0x1234_5678_9abc_def0);
-
         jit.halt_execution(HaltReason::USER_DEFINED2);
         assert_ne!(jit.read_halt_reason() & HaltReason::USER_DEFINED2.bits(), 0);
         jit.clear_halt(HaltReason::USER_DEFINED2);
@@ -1884,6 +1882,7 @@ mod tests {
     ) -> Box<JitInner> {
         Box::new(JitInner {
             jit_state: A64JitState::new(),
+            exclusive_value: [0; 2],
             emitter: None,
             callbacks: Box::new(callbacks),
             run_code_fn: None,
@@ -2302,6 +2301,41 @@ mod tests {
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(jit.get_register(0), 0x1234_5678);
         assert_eq!(jit.get_register(1), 0x17);
+    }
+
+    #[test]
+    fn test_a64_tpidr_system_registers_use_user_config_pointers() {
+        // MRS X0, TPIDR_EL0; MRS X1, TPIDRRO_EL0;
+        // MSR TPIDR_EL0, X2; MRS X3, TPIDR_EL0; SVC #0.
+        let code: [u32; 5] = [
+            0xD53B_D040,
+            0xD53B_D061,
+            0xD51B_D042,
+            0xD53B_D043,
+            0xD400_0001,
+        ];
+        let mut tpidr_el0 = Box::new(0x1111_2222_3333_4444u64);
+        let tpidrro_el0 = Box::new(0xAAAA_BBBB_CCCC_DDDDu64);
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.tpidr_el0 = Some((&mut *tpidr_el0) as *mut u64);
+        config.tpidrro_el0 = Some((&*tpidrro_el0) as *const u64);
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_register(2, 0x5555_6666_7777_8888);
+        jit.set_pc(0x1000);
+
+        let mut halt = jit.run();
+        if halt.is_empty() {
+            halt = jit.run();
+        }
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 0x1111_2222_3333_4444);
+        assert_eq!(jit.get_register(1), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(jit.get_register(3), 0x5555_6666_7777_8888);
+        assert_eq!(*tpidr_el0, 0x5555_6666_7777_8888);
     }
 
     #[test]
@@ -4303,9 +4337,6 @@ mod tests {
 
         assert!(!jit.is_executing());
         assert!(jit.disassemble().contains("generated x86_64 code"));
-
-        jit.set_tpidr_el0(0xABCD);
-        assert_eq!(jit.get_tpidr_el0(), 0xABCD);
 
         jit.reset();
         assert_eq!(jit.get_registers(), [0; 31]);

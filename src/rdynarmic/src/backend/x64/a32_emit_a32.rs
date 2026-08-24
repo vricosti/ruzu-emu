@@ -17,7 +17,7 @@ use crate::backend::x64::emit_x64_memory::{
     emit_read_memory_mov, emit_vaddr_lookup_a32, emit_write_memory_mov, is_ordered,
 };
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::jit_state::A32JitState;
+use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::nzcv_util;
 use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
 use crate::backend::x64::stack_layout::StackLayout;
@@ -2795,6 +2795,8 @@ mod tests {
             enable_cycle_counting: false,
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,

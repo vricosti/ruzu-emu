@@ -2,6 +2,8 @@ use rxbyak::{byte_ptr, dword_ptr, qword_ptr};
 use rxbyak::{CodeAssembler, JmpType, Label, RegExp};
 use rxbyak::{R15, RAX, RBX, RCX, RSP};
 
+use crate::backend::x64::a32_jitstate::A32JitState;
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_of_code::{FORCE_RETURN, STACK_LAYOUT_RSP_OFFSET};
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_data_processing::load_nzcv_into_flags;
@@ -818,15 +820,15 @@ fn emit_push_rsb_terminal(
 ) {
     let (rsb_ptr_offset, rsb_loc_offset, rsb_code_offset) = if ctx.arch.is_a32() {
         (
-            crate::backend::x64::jit_state::A32JitState::offset_of_rsb_ptr(),
-            crate::backend::x64::jit_state::A32JitState::offset_of_rsb_location_descriptors(),
-            crate::backend::x64::jit_state::A32JitState::offset_of_rsb_codeptrs(),
+            A32JitState::offset_of_rsb_ptr(),
+            A32JitState::offset_of_rsb_location_descriptors(),
+            A32JitState::offset_of_rsb_codeptrs(),
         )
     } else {
         (
-            crate::backend::x64::jit_state::A64JitState::offset_of_rsb_ptr(),
-            crate::backend::x64::jit_state::A64JitState::offset_of_rsb_location_descriptors(),
-            crate::backend::x64::jit_state::A64JitState::offset_of_rsb_codeptrs(),
+            A64JitState::offset_of_rsb_ptr(),
+            A64JitState::offset_of_rsb_location_descriptors(),
+            A64JitState::offset_of_rsb_codeptrs(),
         )
     };
 
@@ -865,11 +867,12 @@ fn emit_push_rsb_terminal(
     )
     .unwrap();
     asm.add(RBX.cvt32().unwrap(), 1).unwrap();
-    asm.and_(
-        RBX.cvt32().unwrap(),
-        crate::backend::x64::jit_state::RSB_PTR_MASK as i32,
-    )
-    .unwrap();
+    let rsb_ptr_mask = if ctx.arch.is_a32() {
+        A32JitState::RSB_PTR_MASK
+    } else {
+        A64JitState::RSB_PTR_MASK
+    };
+    asm.and_(RBX.cvt32().unwrap(), rsb_ptr_mask as i32).unwrap();
     asm.mov(
         dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32),
         RBX.cvt32().unwrap(),

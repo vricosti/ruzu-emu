@@ -14,6 +14,7 @@ use rxbyak::{
     R15, RAX, RBX, RCX, RDX, XMM0,
 };
 
+use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::DeferredEmitCtx;
 use crate::backend::x64::exception_handler::{supports_fastmem, FastmemPatchInfo};
@@ -23,7 +24,6 @@ use crate::backend::x64::exclusive_monitor_friend::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
-use crate::backend::x64::jit_state::A64JitState;
 
 // ---------------------------------------------------------------------------
 // EmitExclusiveLock / EmitExclusiveUnlock — inline acquire/release of the

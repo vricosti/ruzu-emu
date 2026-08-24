@@ -1,9 +1,11 @@
 pub mod a32_emit_a32;
 pub mod a32_emit_x64;
 pub mod a32_interface;
+pub mod a32_jitstate;
 pub mod a64_emit_x64;
 pub mod a64_emit_x64_memory;
 pub mod a64_interface;
+pub mod a64_jitstate;
 pub mod abi;
 pub mod block_cache;
 pub mod block_of_code;
@@ -41,7 +43,6 @@ pub mod exclusive_monitor_friend;
 pub mod fp_helpers;
 pub mod host_feature;
 pub mod hostloc;
-pub mod jit_state;
 pub mod nzcv_util;
 #[cfg(feature = "profile_opcodes")]
 pub mod opcode_profile;

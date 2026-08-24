@@ -11385,3 +11385,184 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 - N/A: this only changes Rust module visibility for a host-code emission helper.
+## 2026-08-24 — `src/rdynarmic/src/common/llvm_disassemble.rs` vs Eden `common/llvm_disassemble.{h,cpp}`
+
+### Intentional differences
+- Eden conditionally uses LLVM when `DYNARMIC_USE_LLVM` is enabled. That option defaults to OFF,
+  and rdynarmic currently has no LLVM integration, so Rust ports the exact non-LLVM branch for all
+  three helpers rather than adding a differently formatted disassembler dependency.
+- Rust accepts typed instruction pointers instead of Eden's `void*`; the fallback only formats
+  their numeric addresses and never dereferences them.
+
+### Unintentional differences (to fix)
+- Fixed: the entire common owner was absent, preventing the x64 public interfaces from exposing
+  Eden's `Disassemble()` result without an incorrect empty-string stub.
+
+### Missing items
+- LLVM-enabled x64, AArch32, and AArch64 instruction decoding is not available until rdynarmic
+  gains an explicit equivalent of Eden's optional `DYNARMIC_USE_LLVM` build mode.
+
+### Binary layout verification
+- N/A: the fallback formats pointers and fixed diagnostic strings; it does not serialize or copy
+  an architectural payload.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a32_interface.rs` vs Eden `backend/arm64/a32_interface.cpp` and `interface/A32/a32.h`
+
+### Intentional differences
+- Rust uses a boxed inner value for stable callback/state pointers and `Result` for fallible code
+  allocation/emission. If such an operation fails, Rust restores `is_executing` before returning
+  the error; Eden's corresponding operations do not expose a recoverable error path.
+- `AtomicU32` with `SeqCst` ordering provides the atomic operation plus barrier required by Eden's
+  A32 `HaltExecution`/`ClearHalt` sequence.
+- Rust stores queued closed ranges in a `Vec` instead of Boost's coalescing interval set. Passing
+  every range to the shared invalidator preserves the same union of affected guest blocks.
+
+### Unintentional differences (to fix)
+- Fixed: Run/Step reset `is_executing` before deferred invalidation; successful execution now keeps
+  it set until invalidation completes, matching Eden's lifecycle order.
+- Fixed: deferred invalidation released its mutex before clearing or invalidating the address
+  space. The mutex is now held through the full operation and the halt bit is cleared under it.
+- Fixed: range construction used `saturating_sub(1)`, so a zero length produced `start..=start`
+  instead of Eden's unsigned `start + length - 1` result.
+- Fixed: the backend returned no `Disassemble` surface and the FPSCR setter contained non-upstream
+  environment-driven logging. ARM64 disassembly now returns Eden's empty string and the setter
+  only updates architectural state.
+- The diagnostic block-map/state-pointer and compile-only extensions still live in this upstream
+  owner. They must move behind an explicit Ruzu extension boundary in a dedicated follow-up.
+- Fixed: A32 `is_executing` lived in the backend inner value instead of the public interface owner.
+  Both host backends now update the `interface/a32/a32.rs::Jit` field through an explicit mutable
+  reference while retaining Eden's invalidation/execution ordering.
+
+### Missing items
+- None in the reviewed public A32 method inventory or deferred-invalidation behavior.
+
+### Binary layout verification
+- PASS: this slice does not alter `A32JitState`; register and extension-register access continues
+  through the existing layout-verified state arrays.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a64_interface.rs` vs Eden `backend/arm64/a64_interface.cpp` and `interface/A64/a64.h`
+
+### Intentional differences
+- Rust uses a boxed inner value for stable callback/state pointers and returns `Result` from
+  fallible ARM64 code allocation/emission. Error paths restore `is_executing`; Eden has no
+  equivalent recoverable error path.
+- `AtomicU32` with `SeqCst` ordering is stronger than the atomic operations used by Eden and
+  preserves their cross-thread halt visibility.
+- Rust iterates the 32 two-lane vectors rather than copying them with `memcpy`; `Vector` is exactly
+  `[u64; 2]`, so the value and lane ordering are identical without raw memory access.
+- Queued closed ranges use a `Vec` instead of Boost's coalescing interval set; invalidating every
+  queued range preserves the same union of affected guest blocks.
+
+### Unintentional differences (to fix)
+- Fixed: Run/Step reset `is_executing` before deferred invalidation, and deferred invalidation
+  released its mutex before operating on the address space. Both lifecycle orders now match Eden.
+- Fixed: zero-length range arithmetic used saturation instead of Eden's unsigned wrapping
+  `start + length - 1` expression.
+- Fixed: `GetRegisters`, `SetRegisters`, `GetVector`, `SetVector`, `GetVectors`, `SetVectors`, and
+  the empty ARM64 `Disassemble` result were absent from this owner.
+- TPIDR and diagnostic raw-pointer accessors remain Ruzu extensions in this upstream-owned file;
+  a dedicated follow-up must move them behind an explicit extension boundary.
+
+### Missing items
+- None in the reviewed public A64 method inventory or deferred-invalidation behavior.
+
+### Binary layout verification
+- PASS: `Vector` is two contiguous `u64` lanes (16 bytes), and the focused aggregate-accessor test
+  verifies all 32 vectors preserve low/high lane order. `A64JitState` itself is unchanged.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/a32/a32.rs` vs Eden `interface/A32/a32.h`
+
+### Intentional differences
+- Rust selects the x64 or ARM64 implementation with target `cfg` blocks instead of a link-selected
+  C++ `Impl`, but the public `Jit` remains the owner of the backend object and `is_executing`.
+- `read_halt_reason`, raw state-pointer access, individual register helpers, CNTPCT access,
+  compile-only, and block-map dumping are Ruzu diagnostic/tool extensions beyond Eden's public
+  interface. They delegate to host backends and do not replace an upstream method.
+
+### Unintentional differences (to fix)
+- Fixed: the public owner previously delegated `is_executing` to duplicated backend fields. It now
+  owns one boolean on both hosts, and backend Run/Step receive that exact state so callbacks observe
+  Eden's `false -> true -> false` lifecycle.
+
+### Missing items
+- The diagnostic/tool methods still need a separate explicit extension trait or module before the
+  upstream public owner is structurally exact.
+
+### Binary layout verification
+- N/A: `Jit` is a host-only opaque owner in both implementations; no field is copied or serialized
+  as an architectural payload.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_interface.rs` vs Eden `backend/x64/a32_interface.cpp`
+
+### Intentional differences
+- Rust's fixed-size executable allocation is committed when `BlockOfCode` is created, so there is
+  no separate `EnsureMemoryCommitted` operation after the one-megabyte capacity check.
+- The emitter retains the same one-megabyte check as a defensive guard for direct emitter tests
+  and tools. Production Run, Step, dispatcher lookup, and compile-only paths reach the interface
+  check first.
+- W^X transitions surround slow-path compilation explicitly; Eden performs them through its code
+  emission machinery. Callback trampolines and diagnostic hooks are Rust ABI/adaptation code.
+
+### Unintentional differences (to fix)
+- Fixed: low code space was handled inside `A32EmitX64`, clearing emitter metadata without resetting
+  the interface RSB. The cache-miss owner now applies Eden's strict `< 1 MiB` condition, requests a
+  whole-cache invalidation, clears its halt request under the mutex, resets the RSB, and recompiles.
+- Fixed: Run and Step stored execution state in the x64 backend. They now update the A32 public
+  interface owner's field at Eden's exact lifecycle points.
+
+### Missing items
+- Diagnostic state-pointer, CNTPCT, compile-only, trace, and block-map facilities remain mixed into
+  this upstream-owned backend file pending an explicit Ruzu extension boundary.
+
+### Binary layout verification
+- PASS: no JIT-state field or callback ABI layout changed. Focused full-JIT tests prove that exactly
+  one mebibyte remaining preserves existing blocks, while less than one mebibyte clears blocks and
+  stale RSB descriptor/code-pointer entries.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_interface.rs` vs Eden `backend/x64/a64_interface.cpp`
+
+### Intentional differences
+- Rust uses a fully committed fixed-size code allocation, so Eden's `EnsureMemoryCommitted` call has
+  no separate counterpart; its preceding one-megabyte capacity policy is preserved literally.
+- Rust executes the emitter-provided entrypoint directly. Eden rounds `GetCurrentBlock()` upward to
+  sixteen bytes, but rdynarmic's entrypoint already identifies the first executable instruction;
+  applying Eden's pointer rounding skips emitted code, as covered by the x64 execution regression.
+- The emitter keeps a defensive capacity guard for direct callers, while all production interface
+  cache misses now take the upstream-owned check. W^X transitions, callback trampolines, and Ruzu
+  diagnostic hooks are host-language/runtime adaptations.
+
+### Unintentional differences (to fix)
+- Fixed: the emitter alone evacuated a nearly full code cache, leaving interface RSB entries that
+  could point into reused code. Every A64 interface cache miss now applies Eden's strict `< 1 MiB`
+  check through whole-cache invalidation before translation/emission.
+- Fixed: range invalidation and whole-cache invalidation now share the same locked lifecycle, reset
+  the RSB first, and process every queued closed range before Run/Step report non-execution.
+
+### Missing items
+- TPIDR and diagnostic raw-pointer/trace facilities remain mixed into this upstream-owned backend
+  file pending an explicit Ruzu extension boundary.
+
+### Binary layout verification
+- PASS: no A64 JIT-state or callback payload layout changed. The focused capacity test covers the
+  exact threshold and verifies stale RSB descriptor/code-pointer removal below it.
+
+## 2026-08-24 — `src/rdynarmic/src/interface/a64/a64.rs` vs Eden `interface/A64/a64.h`
+
+### Intentional differences
+- Target-specific Rust `Jit` definitions replace the C++ pImpl selected by the build, while retaining
+  the same public method owner and complete register/vector surface.
+- Raw state/halt pointers, halt inspection, tuple vector compatibility, and TPIDR access are Ruzu
+  integration extensions delegated to the selected backend.
+
+### Unintentional differences (to fix)
+- Fixed in the associated host owners: both x64 and ARM64 implementations now provide the complete
+  aggregate register/vector accessors, disassembly surface, invalidation ordering, and execution
+  state queried by this public interface.
+
+### Missing items
+- The Ruzu-only integration methods need an explicit extension boundary before this owner can be
+  structurally identical to the upstream header.
+
+### Binary layout verification
+- PASS: public `Vector` remains `[u64; 2]`; aggregate access tests verify 31 GPRs and 32 vectors,
+  including low/high lane order.

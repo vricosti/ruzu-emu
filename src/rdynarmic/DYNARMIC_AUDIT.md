@@ -99,10 +99,10 @@ worktree; differential oracle tests can also fail when the external Eden
 oracle does not complete. A bounded single-threaded run with those known tests
 excluded progressed through all frontend and JIT tests relevant to the current
 Thumb32 slices, then timed out in the unrelated `fuzz_neon_f32_vector` test.
-With the external-oracle/fuzz module and the two known standalone blockers
+With the external-oracle/fuzz tests and the two known standalone blockers
 (`a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` and
-`arm64_loop_back_edge_links_directly`) excluded, the remaining crate suite passes
-(1075 passed, 4 ignored). These are
+`arm64_loop_back_edge_links_directly`) excluded, the current remaining crate suite passes
+(1098 passed, 4 ignored, 21 filtered out). These are
 validation blockers, not evidence against the focused slices.
 
 ## Known behavioral gaps found during baseline
@@ -195,5 +195,13 @@ validation blockers, not evidence against the focused slices.
   consumers. Emitted blocks register their complete closed guest-PC interval, so invalidating a
   write into the middle of a block removes every overlapping descriptor rather than filtering on
   entry PC; cache clears and the non-erasing range-map lifecycle match Eden.
+- Public A32/A64 JIT ownership now lives in the matching `interface/{a32,a64}/a*.rs` files, and the
+  x64 implementations have been split from the former combined `jit.rs` owner. The x64 and ARM64
+  owners preserve deferred invalidation ordering and full public state surfaces; A32's execution
+  flag belongs to its public interface as in Eden. On x64, every production cache miss now applies
+  Eden's one-megabyte evacuation policy through whole-cache invalidation, including RSB reset.
+  Focused x64 tests and both ARM64 interface suites execute successfully under AArch64 QEMU. Ruzu's
+  diagnostic/trace methods still require an explicit extension boundary before these owners are
+  structurally exact.
 These are an inventory, not completion claims. Each item must be re-read in
 its upstream-owned file and handled as a separate prerequisite-backed slice.

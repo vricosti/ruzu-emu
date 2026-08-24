@@ -1,7 +1,9 @@
 pub mod a32_emit_a32;
 pub mod a32_emit_x64;
+pub mod a32_interface;
 pub mod a64_emit_x64;
 pub mod a64_emit_x64_memory;
+pub mod a64_interface;
 pub mod abi;
 pub mod block_cache;
 pub mod block_of_code;

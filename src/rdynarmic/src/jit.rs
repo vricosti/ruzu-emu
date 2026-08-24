@@ -1,118 +1,37 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::backend::common::a32_callbacks;
-use crate::backend::x64::a32_emit_x64::A32EmitX64;
-use crate::backend::x64::a64_emit_x64::A64EmitX64;
-use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn, DEFAULT_CODE_SIZE};
-use crate::backend::x64::callback::ArgCallback;
-use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig, RawExclusiveWriteCallbacks};
-use crate::backend::x64::jit_state::{A32JitState, A64JitState};
-use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
-use crate::frontend::a32::translate::TranslationOptions as A32TranslationOptions;
-use crate::frontend::a64::translate::TranslationOptions;
+pub use crate::interface::a32::a32::Jit as A32Jit;
+pub use crate::interface::a64::a64::Jit as A64Jit;
+
+#[cfg(all(test, target_arch = "x86_64"))]
 use crate::interface::a32::config::{
     UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
 };
+#[cfg(all(test, target_arch = "x86_64"))]
 use crate::interface::a64::config::{
     DataCacheOperation as A64DataCacheOperation, Exception as A64Exception,
     InstructionCacheOperation as A64InstructionCacheOperation, UserCallbacks as A64UserCallbacks,
     UserConfig as A64UserConfig,
 };
+#[cfg(all(test, target_arch = "x86_64"))]
 use crate::interface::halt_reason::HaltReason;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 use crate::interface::optimization_flags::OptimizationFlag;
+#[cfg(all(test, target_arch = "x86_64"))]
 use crate::ir::location::LocationDescriptor;
 
-/// Public ARM64 JIT compiler.
-///
-/// This is the main entry point for consumers (e.g., ruzu). Create one
-/// per CPU core, configure callbacks, then call `run()` or `step()`.
-pub struct A64Jit {
-    inner: Box<JitInner>,
-    #[cfg(target_arch = "aarch64")]
-    arm64: Option<crate::backend::arm64::a64_interface::A64Interface>,
-}
+#[cfg(all(test, target_arch = "x86_64"))]
+use crate::backend::x64::a64_interface::{
+    exclusive_read_32_trampoline, exclusive_write_32_trampoline, JitInner,
+};
+#[cfg(all(test, target_arch = "x86_64"))]
+use crate::backend::x64::jit_state::A64JitState;
 
-/// Internal JIT state. Box'd for stable heap pointer used by callback trampolines.
-struct JitInner {
-    jit_state: A64JitState,
-    emitter: Option<A64EmitX64>,
-    callbacks: Box<dyn A64UserCallbacks>,
-    run_code_fn: Option<RunCodeFn>,
-    is_executing: bool,
-    global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
-    processor_id: usize,
-}
+#[cfg(target_arch = "x86_64")]
+pub(crate) use crate::backend::x64::a64_interface::a64_block_entry_trace_hook;
 
-#[cfg(target_arch = "aarch64")]
-struct A64DummyCallbacks;
-
-#[cfg(target_arch = "aarch64")]
-impl A64UserCallbacks for A64DummyCallbacks {
-    fn memory_read_8(&self, _vaddr: u64) -> u8 {
-        0
-    }
-
-    fn memory_read_16(&self, _vaddr: u64) -> u16 {
-        0
-    }
-
-    fn memory_read_32(&self, _vaddr: u64) -> u32 {
-        0
-    }
-
-    fn memory_read_64(&self, _vaddr: u64) -> u64 {
-        0
-    }
-
-    fn memory_read_128(&self, _vaddr: u64) -> [u64; 2] {
-        [0; 2]
-    }
-
-    fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
-    fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
-    fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
-    fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-    fn memory_write_128(&mut self, _vaddr: u64, _value: [u64; 2]) {}
-    fn call_svc(&mut self, _svc_num: u32) {}
-    fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
-    fn add_ticks(&mut self, _ticks: u64) {}
-
-    fn get_ticks_remaining(&self) -> u64 {
-        0
-    }
-
-    fn get_cntpct(&self) -> u64 {
-        0
-    }
-}
-
-fn a64_trace_registry() -> &'static Mutex<HashMap<usize, usize>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn a64_trace_env_enabled() -> bool {
-    std::env::var_os("RUZU_BLOCK_TRACE_PC").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_CALLER_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_LIVE_LR_AT").is_some()
-        || std::env::var_os("RUZU_DUMP_MEM_AT").is_some()
-        || std::env::var_os("RUZU_DUMP_VEC_AT").is_some()
-        || std::env::var_os("RUZU_DUMP_STRING_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_COUNT_PC").is_some()
-        || std::env::var_os("RUZU_FIRST_PCS_PER_CORE").is_some()
-        || PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// RUZU_BLOCK_COUNT_PC=0xLO-0xHI: increment per-core atomic counter on every
-/// block entry where guest PC is in the range. Print summary on Drop or on
-/// SIGUSR1. Lighter than the eprintln-based BLOCK64 trace — designed to NOT
-/// mask multi-core race timing windows.
 pub(crate) fn block_count_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
@@ -297,7 +216,7 @@ fn first_pcs_lengths() -> &'static [std::sync::atomic::AtomicUsize; 16] {
 /// PC equals the most recently captured one (cheap consecutive-dedup) so the
 /// fixed-cap buffer doesn't fill up with `0xADDR ×N` from a hot self-cold-
 /// entered loop. Not a full dedup — non-adjacent repeats still appear.
-fn record_first_pc(core_index: usize, pc: u64) {
+pub(crate) fn record_first_pc(core_index: usize, pc: u64) {
     let cap = first_pcs_capacity();
     if cap == 0 {
         return;
@@ -459,413 +378,6 @@ pub fn block_count_summary_string() -> String {
     out
 }
 
-fn a64_trace_block_entry(inner: &mut JitInner) {
-    // Lightweight per-core counter — no eprintln, no syscall. Designed to
-    // measure cross-core block-entry distribution without masking timing
-    // windows of the multi-core race.
-    if let Some((lo, hi)) = block_count_range() {
-        let pc = inner.jit_state.pc as u32;
-        if pc >= lo && pc < hi {
-            let idx = inner.processor_id.min(15);
-            block_count_counters()[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    // Capture first-N cold-entry PCs per core (in-memory, no eprintln).
-    // No-op when RUZU_FIRST_PCS_PER_CORE is unset.
-    record_first_pc(inner.processor_id, inner.jit_state.pc);
-
-    // PC-window tracer for A64 (mirrors the A32 trampoline). When ruzu's SVC
-    // dispatcher activates the window, emit a [TRACE_PC] line per block
-    // transition. Logs PC + LR (x30) + SP + the args/locals most useful
-    // for STK's random_bytes investigation: x0 (out_ptr), x21 (size),
-    // x22 (saved out_ptr), x20 (loop counter), x18 (rounds counter).
-    if PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        let r = &inner.jit_state.reg;
-        eprintln!(
-            "[TRACE_PC] pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x18=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X}",
-            inner.jit_state.pc,
-            r[30], inner.jit_state.sp, r[0], r[18], r[20], r[21], r[22]
-        );
-    }
-
-    if let Some((lo, hi)) = block_trace_range() {
-        let pc = inner.jit_state.pc as u32;
-        if pc >= lo && pc < hi {
-            let r = &inner.jit_state.reg;
-            // RUZU_TRACE_FREE_X0_RANGE=0xLO-0xHI — only log block entries
-            // where x0 is in the specified range. Used to find the
-            // specific free() call whose freed pointer triggers a
-            // use-after-free wedge. Lower overhead than logging every
-            // block-entry to a wide PC range; preserves the multi-core
-            // race timing window better.
-            let pass_x0_filter = match std::env::var("RUZU_TRACE_FREE_X0_RANGE") {
-                Ok(spec) => {
-                    let mut parts = spec.splitn(2, '-');
-                    let lo_str = parts.next().unwrap_or("").trim_start_matches("0x");
-                    let hi_str = parts.next().unwrap_or("").trim_start_matches("0x");
-                    let lo64 = u64::from_str_radix(lo_str, 16).unwrap_or(0);
-                    let hi64 = u64::from_str_radix(hi_str, 16).unwrap_or(u64::MAX);
-                    r[0] >= lo64 && r[0] < hi64
-                }
-                Err(_) => true,
-            };
-            if pass_x0_filter {
-                // RUZU_BLOCK_TRACE_INCLUDE_TID=1 — also dump host thread id
-                // (gettid()) and emulator core index per block-entry. Used to
-                // identify which guest threads/emulator-cores enter the same
-                // guest block concurrently (multi-core race investigation).
-                let include_tid = std::env::var_os("RUZU_BLOCK_TRACE_INCLUDE_TID").is_some();
-                if include_tid {
-                    #[cfg(target_os = "linux")]
-                    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-                    #[cfg(target_os = "macos")]
-                    let tid = unsafe {
-                        let mut t: u64 = 0;
-                        libc::pthread_threadid_np(libc::pthread_self(), &mut t);
-                        t as i64
-                    };
-                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                    let tid: i64 = 0;
-                    eprintln!(
-                        "[BLOCK64] core={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x23=0x{:016X} x30=0x{:016X}",
-                        inner.processor_id, tid,
-                        inner.jit_state.pc,
-                        r[30],
-                        inner.jit_state.sp,
-                        r[0], r[1], r[2], r[3],
-                        r[19], r[20], r[21], r[22], r[23],
-                        r[30]
-                    );
-                } else {
-                    eprintln!(
-                        "[BLOCK64] pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x23=0x{:016X} x30=0x{:016X}",
-                        inner.jit_state.pc,
-                        r[30],
-                        inner.jit_state.sp,
-                        r[0],
-                        r[1],
-                        r[2],
-                        r[3],
-                        r[19],
-                        r[20],
-                        r[21],
-                        r[22],
-                        r[23],
-                        r[30]
-                    );
-                }
-            }
-        }
-    }
-
-    // Targeted: when entering specific guest PCs, dump saved-LR from stack
-    // (= the BL site that called the function we're now in). Gated by
-    // RUZU_BLOCK_TRACE_CALLER_AT=0xPC1,0xPC2,...
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_CALLER_AT") {
-        let pc64 = inner.jit_state.pc;
-        for raw_target in env.split(',') {
-            let raw = raw_target.trim().trim_start_matches("0x");
-            if let Ok(target) = u64::from_str_radix(raw, 16) {
-                if pc64 == target {
-                    // For 0x80772178: caller PC is at sp+0x8 (saved x30 of mutex_lock prologue).
-                    // Caller's caller (grandparent): for aligned_alloc whose
-                    // prologue pushed x29,x30 with #0x40 decrement, the saved
-                    // x30 is at sp+0x20 + 0x8 = sp+0x28.
-                    let sp = inner.jit_state.sp;
-                    let saved_lr = inner.callbacks.memory_read_64(sp + 8);
-                    let grandparent_lr = inner.callbacks.memory_read_64(sp + 0x28);
-                    eprintln!(
-                        "[CALLER_AT] pc=0x{:X} sp=0x{:X} saved_x30@sp+8=0x{:X} grand_x30@sp+0x28=0x{:X} x19=0x{:X}",
-                        pc64,
-                        sp,
-                        saved_lr,
-                        grandparent_lr,
-                        inner.jit_state.reg[19],
-                    );
-                }
-            }
-        }
-    }
-
-    // Same stack-walk as RUZU_BLOCK_TRACE_CALLER_AT, but only prints when
-    // X19 has STK's shifted-heap-pointer shape (0x00002101...). This keeps
-    // the allocator/free trace low-noise enough to avoid timing perturbation.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT") {
-        let pc64 = inner.jit_state.pc;
-        let x19 = inner.jit_state.reg[19];
-        let bad_x19_shape = (x19 >> 40) == 0x21 && ((x19 >> 32) & 0xFF) == 0x01;
-        if bad_x19_shape {
-            for raw_target in env.split(',') {
-                let raw = raw_target.trim().trim_start_matches("0x");
-                if let Ok(target) = u64::from_str_radix(raw, 16) {
-                    if pc64 == target {
-                        let sp = inner.jit_state.sp;
-                        let saved_lr = inner.callbacks.memory_read_64(sp + 8);
-                        let grandparent_lr = inner.callbacks.memory_read_64(sp + 0x28);
-                        let r = &inner.jit_state.reg;
-                        eprintln!(
-                            "[BAD_X19_CALLER_AT] pc=0x{:X} sp=0x{:X} saved_x30@sp+8=0x{:X} grand_x30@sp+0x28=0x{:X} x0=0x{:X} x1=0x{:X} x2=0x{:X} x3=0x{:X} x4=0x{:X} x5=0x{:X} x19=0x{:X}",
-                            pc64, sp, saved_lr, grandparent_lr, r[0], r[1], r[2], r[3], r[4], r[5], x19,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Function-entry variant for delete/free wrappers: X0 is the pointer
-    // argument before wrapper code moves it to X19 and forwards it as X1 to
-    // the allocator free path.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT") {
-        let pc64 = inner.jit_state.pc;
-        let x0 = inner.jit_state.reg[0];
-        let bad_x0_shape = (x0 >> 40) == 0x21 && ((x0 >> 32) & 0xFF) == 0x01;
-        if bad_x0_shape {
-            for raw_target in env.split(',') {
-                let raw = raw_target.trim().trim_start_matches("0x");
-                if let Ok(target) = u64::from_str_radix(raw, 16) {
-                    if pc64 == target {
-                        let r = &inner.jit_state.reg;
-                        eprintln!(
-                            "[BAD_X0_LIVE_LR_AT] pc=0x{:X} sp=0x{:X} x30=0x{:X} x0=0x{:X} x1=0x{:X} x2=0x{:X} x3=0x{:X} x4=0x{:X} x5=0x{:X}",
-                            pc64, inner.jit_state.sp, r[30], r[0], r[1], r[2], r[3], r[4], r[5],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Function-entry variant for free/delete paths: X1 is the pointer
-    // argument before the prologue copies it to X19. X30 is still the live
-    // caller return address, so no guest stack read is needed.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT") {
-        let pc64 = inner.jit_state.pc;
-        let x1 = inner.jit_state.reg[1];
-        let bad_x1_shape = (x1 >> 40) == 0x21 && ((x1 >> 32) & 0xFF) == 0x01;
-        if bad_x1_shape {
-            for raw_target in env.split(',') {
-                let raw = raw_target.trim().trim_start_matches("0x");
-                if let Ok(target) = u64::from_str_radix(raw, 16) {
-                    if pc64 == target {
-                        let r = &inner.jit_state.reg;
-                        eprintln!(
-                            "[BAD_X1_LIVE_LR_AT] pc=0x{:X} sp=0x{:X} x30=0x{:X} x0=0x{:X} x1=0x{:X} x2=0x{:X} x3=0x{:X} x4=0x{:X} x5=0x{:X}",
-                            pc64, inner.jit_state.sp, r[30], r[0], r[1], r[2], r[3], r[4], r[5],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Same idea but using LIVE x30 (register), useful when at the function-entry
-    // PC where the prologue hasn't yet pushed x30 to stack.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_LIVE_LR_AT") {
-        let pc64 = inner.jit_state.pc;
-        for raw_target in env.split(',') {
-            let raw = raw_target.trim().trim_start_matches("0x");
-            if let Ok(target) = u64::from_str_radix(raw, 16) {
-                if pc64 == target {
-                    let r = &inner.jit_state.reg;
-                    eprintln!(
-                        "[LIVE_LR_AT] pc=0x{:X} sp=0x{:X} x30=0x{:X} x0=0x{:X} x1=0x{:X} x2=0x{:X} x19=0x{:X} x20=0x{:X} x21=0x{:X} x22=0x{:X} x23=0x{:X} x24=0x{:X} x25=0x{:X} x26=0x{:X} x27=0x{:X} x28=0x{:X}",
-                        pc64,
-                        inner.jit_state.sp,
-                        r[30],
-                        r[0],
-                        r[1],
-                        r[2],
-                        r[19],
-                        r[20],
-                        r[21],
-                        r[22],
-                        r[23],
-                        r[24],
-                        r[25],
-                        r[26],
-                        r[27],
-                        r[28],
-                    );
-                }
-            }
-        }
-    }
-
-    // Generic memory-dump-at-PC. Format: RUZU_DUMP_MEM_AT=PC:reg:size,PC:reg:size,...
-    // PC is hex, reg is x register index 0..30 or `sp`, size is number of BYTES
-    // to dump. Reads guest memory at the value of `reg`/SP when the block enters.
-    if let Ok(env) = std::env::var("RUZU_DUMP_MEM_AT") {
-        let pc64 = inner.jit_state.pc;
-        for spec in env.split(',') {
-            let parts: Vec<&str> = spec.split(':').collect();
-            if parts.len() != 3 {
-                continue;
-            }
-            let pc_target = u64::from_str_radix(parts[0].trim().trim_start_matches("0x"), 16).ok();
-            let reg = parts[1].trim();
-            let size = parts[2].trim().parse::<usize>().ok();
-            if let (Some(target), Some(size)) = (pc_target, size) {
-                if pc64 == target && size <= 256 {
-                    let addr = if reg.eq_ignore_ascii_case("sp") {
-                        inner.jit_state.sp
-                    } else if let Ok(reg) = reg.parse::<usize>() {
-                        if reg < 31 {
-                            inner.jit_state.reg[reg]
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    };
-                    let mut bytes = Vec::with_capacity(size);
-                    for off in (0..size).step_by(8) {
-                        let v = inner.callbacks.memory_read_64(addr + off as u64);
-                        for i in 0..8.min(size - off) {
-                            bytes.push(((v >> (i * 8)) & 0xFF) as u8);
-                        }
-                    }
-                    let hex: String = bytes
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let ascii: String = bytes
-                        .iter()
-                        .map(|&b| {
-                            if b >= 0x20 && b < 0x7f {
-                                b as char
-                            } else {
-                                '.'
-                            }
-                        })
-                        .collect();
-                    eprintln!(
-                        "[DUMP_MEM_AT] pc=0x{:X} {}=0x{:X} bytes[{}]: {}  | ascii: {:?}",
-                        pc64, reg, addr, size, hex, ascii,
-                    );
-                }
-            }
-        }
-    }
-
-    // Dump selected A64 vector registers at PC. Format:
-    // RUZU_DUMP_VEC_AT=PC:vN/vM/...,PC:vN/...
-    if let Ok(env) = std::env::var("RUZU_DUMP_VEC_AT") {
-        let pc64 = inner.jit_state.pc;
-        for spec in env.split(',') {
-            let Some((pc_raw, regs_raw)) = spec.split_once(':') else {
-                continue;
-            };
-            let Some(target) = u64::from_str_radix(pc_raw.trim().trim_start_matches("0x"), 16).ok()
-            else {
-                continue;
-            };
-            if pc64 != target {
-                continue;
-            }
-            for reg_raw in regs_raw.split('/') {
-                let reg_raw = reg_raw
-                    .trim()
-                    .trim_start_matches('v')
-                    .trim_start_matches('V');
-                let Some(index) = reg_raw.parse::<usize>().ok() else {
-                    continue;
-                };
-                if index >= 32 {
-                    continue;
-                }
-                let lo = inner.jit_state.vec[index * 2];
-                let hi = inner.jit_state.vec[index * 2 + 1];
-                let mut bytes = [0u8; 16];
-                bytes[..8].copy_from_slice(&lo.to_le_bytes());
-                bytes[8..].copy_from_slice(&hi.to_le_bytes());
-                let hex = bytes
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                eprintln!(
-                    "[DUMP_VEC_AT] pc=0x{:X} v{} lo=0x{:016X} hi=0x{:016X} bytes={}",
-                    pc64, index, lo, hi, hex
-                );
-            }
-        }
-    }
-
-    // Dump a guest std::string-like object at PC. Format:
-    // RUZU_DUMP_STRING_AT=PC:reg[:max],...
-    // `reg` points at an object whose first three qwords are ptr/len/cap.
-    if let Ok(env) = std::env::var("RUZU_DUMP_STRING_AT") {
-        let pc64 = inner.jit_state.pc;
-        for spec in env.split(',') {
-            let parts: Vec<&str> = spec.split(':').collect();
-            if parts.len() < 2 || parts.len() > 3 {
-                continue;
-            }
-            let pc_target = u64::from_str_radix(parts[0].trim().trim_start_matches("0x"), 16).ok();
-            let reg = parts[1].trim().parse::<usize>().ok();
-            let max = parts
-                .get(2)
-                .and_then(|raw| raw.trim().parse::<usize>().ok())
-                .unwrap_or(160);
-            if let (Some(target), Some(reg)) = (pc_target, reg) {
-                if pc64 == target && reg < 31 {
-                    let obj = inner.jit_state.reg[reg];
-                    let ptr = inner.callbacks.memory_read_64(obj);
-                    let len = inner.callbacks.memory_read_64(obj + 8) as usize;
-                    let cap = inner.callbacks.memory_read_64(obj + 16);
-                    let size = len.min(max).min(512);
-                    let mut bytes = Vec::with_capacity(size);
-                    for off in (0..size).step_by(8) {
-                        let v = inner.callbacks.memory_read_64(ptr + off as u64);
-                        for i in 0..8.min(size - off) {
-                            bytes.push(((v >> (i * 8)) & 0xFF) as u8);
-                        }
-                    }
-                    let text: String = bytes
-                        .iter()
-                        .map(|&b| {
-                            if b >= 0x20 && b < 0x7f {
-                                b as char
-                            } else {
-                                '.'
-                            }
-                        })
-                        .collect();
-                    eprintln!(
-                        "[DUMP_STRING_AT] pc=0x{:X} x{}=0x{:X} ptr=0x{:X} len={} cap={} text={:?}",
-                        pc64, reg, obj, ptr, len, cap, text,
-                    );
-                }
-            }
-        }
-    }
-}
-
-pub(crate) extern "C" fn a64_block_entry_trace_hook(jit_state_ptr: u64) {
-    if !a64_trace_env_enabled() {
-        return;
-    }
-    let Some(inner_ptr) = a64_trace_registry()
-        .lock()
-        .ok()
-        .and_then(|registry| registry.get(&(jit_state_ptr as usize)).copied())
-    else {
-        return;
-    };
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    a64_trace_block_entry(inner);
-}
-
-// ---------------------------------------------------------------------------
-// A32 per-PC GPR-capture hook (low overhead: only emitted for a configured
-// target PC at block-compile time; zero per-read cost). Buffered/aggregated —
-// never eprintln! per hit. Enabled by RUZU_A32_PC_TRACE=0xPC.
-// ---------------------------------------------------------------------------
-
-/// Target PC for the A32 GPR-capture hook, parsed once from RUZU_A32_PC_TRACE.
 pub fn a32_pc_trace_target() -> Option<u64> {
     use std::sync::OnceLock;
     static T: OnceLock<Option<u64>> = OnceLock::new();
@@ -1412,846 +924,7 @@ pub(crate) extern "C" fn a32_fastmem_write_trace_hook(
     }
 }
 
-/// ABI-stable two-lane payload used by 128-bit memory-read trampolines.
-/// SysV returns it in RAX:RDX; the MSVC wrapper writes it through an explicit
-/// pointer matching upstream's stack-buffer path.
-#[repr(C)]
-pub struct Pair128 {
-    pub lo: u64,
-    pub hi: u64,
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<Pair128>() == 16);
-    assert!(core::mem::align_of::<Pair128>() == 8);
-};
-
-impl A64Jit {
-    /// Create a new A64Jit from the given configuration.
-    ///
-    /// This allocates the code buffer, generates the dispatcher prelude,
-    /// and wires up all callback trampolines.
-    pub fn new(config: A64UserConfig) -> Result<Self, String> {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let arm64 = crate::backend::arm64::a64_interface::A64Interface::new(config)?;
-            let inner = Box::new(JitInner {
-                jit_state: A64JitState::new(),
-                emitter: None,
-                callbacks: Box::new(A64DummyCallbacks),
-                run_code_fn: None,
-                is_executing: false,
-                global_monitor: None,
-                processor_id: 0,
-            });
-            return Ok(A64Jit {
-                inner,
-                arm64: Some(arm64),
-            });
-        }
-
-        if !cfg!(target_arch = "x86_64") {
-            return Err(format!(
-                "rdynarmic x64 backend is not executable on host architecture {}",
-                std::env::consts::ARCH
-            ));
-        }
-
-        let cache_size = config.code_cache_size as usize;
-        let effective_optimizations = config.effective_optimizations();
-
-        // Phase 1: Create boxed JitInner with stable heap address
-        let mut inner = Box::new(JitInner {
-            jit_state: A64JitState::new(),
-            emitter: None,
-            callbacks: config.callbacks,
-            run_code_fn: None,
-            is_executing: false,
-            global_monitor: config.global_monitor,
-            processor_id: config.processor_id as usize,
-        });
-        let halt_ptr = &inner.jit_state.halt_reason as *const u32;
-        inner.callbacks.set_halt_reason_ptr(halt_ptr);
-        let pc_ptr = &inner.jit_state.pc as *const u64 as *const u32;
-        inner.callbacks.set_pc_ptr(pc_ptr);
-
-        // Phase 2: Take stable pointer for callback trampolines
-        let inner_ptr = &mut *inner as *mut JitInner as u64;
-        let jit_state_ptr = &mut inner.jit_state as *mut A64JitState as usize;
-        a64_trace_registry()
-            .lock()
-            .expect("A64 trace registry poisoned")
-            .insert(jit_state_ptr, inner_ptr as usize);
-
-        // Build RunCodeCallbacks (dispatcher-level callbacks)
-        let run_callbacks = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(
-                lookup_block_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            add_ticks: Box::new(ArgCallback::new(
-                add_ticks_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            get_ticks_remaining: Box::new(ArgCallback::new(
-                get_ticks_remaining_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            enable_cycle_counting: config.enable_cycle_counting,
-            fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
-            page_table_pointer: config
-                .page_table
-                .map(|pointer| pointer.cast::<u8>() as *const u8),
-        };
-
-        // Build EmitCallbacks (block-level callbacks for memory/system ops)
-        let emit_callbacks = EmitCallbacks {
-            memory_read_8: Box::new(ArgCallback::new(
-                memory_read_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_16: Box::new(ArgCallback::new(
-                memory_read_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_32: Box::new(ArgCallback::new(
-                memory_read_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_64: Box::new(ArgCallback::new(
-                memory_read_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_128: Box::new(ArgCallback::new(
-                memory_read_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_8: Box::new(ArgCallback::new(
-                memory_write_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_16: Box::new(ArgCallback::new(
-                memory_write_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_32: Box::new(ArgCallback::new(
-                memory_write_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_64: Box::new(ArgCallback::new(
-                memory_write_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_128: Box::new(ArgCallback::new(
-                memory_write_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            call_supervisor: Box::new(ArgCallback::new(
-                call_supervisor_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exception_raised: Box::new(ArgCallback::new(
-                exception_raised_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            data_cache_operation: Box::new(ArgCallback::new(
-                data_cache_op_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            instruction_cache_operation: Box::new(ArgCallback::new(
-                instruction_cache_op_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            instruction_synchronization_barrier: Box::new(ArgCallback::new(
-                instruction_synchronization_barrier_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            add_ticks: Box::new(ArgCallback::new(
-                add_ticks_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            get_ticks_remaining: Box::new(ArgCallback::new(
-                get_ticks_remaining_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            get_cntpct: Box::new(ArgCallback::new(
-                get_cntpct_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_clear: Box::new(ArgCallback::new(
-                exclusive_clear_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_8: Box::new(ArgCallback::new(
-                exclusive_read_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_16: Box::new(ArgCallback::new(
-                exclusive_read_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_32: Box::new(ArgCallback::new(
-                exclusive_read_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_64: Box::new(ArgCallback::new(
-                exclusive_read_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_128: Box::new(ArgCallback::new(
-                exclusive_read_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_8: Box::new(ArgCallback::new(
-                exclusive_write_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_16: Box::new(ArgCallback::new(
-                exclusive_write_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_32: Box::new(ArgCallback::new(
-                exclusive_write_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_64: Box::new(ArgCallback::new(
-                exclusive_write_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_128: Box::new(ArgCallback::new(
-                exclusive_write_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-        };
-
-        let emit_config = EmitConfig {
-            coprocessors: crate::interface::a32::config::empty_coprocessors(),
-            callbacks: emit_callbacks,
-            raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
-                write_8: Box::new(ArgCallback::new(
-                    raw_exclusive_write_8_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_16: Box::new(ArgCallback::new(
-                    raw_exclusive_write_16_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_32: Box::new(ArgCallback::new(
-                    raw_exclusive_write_32_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_64: Box::new(ArgCallback::new(
-                    raw_exclusive_write_64_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_128: Box::new(ArgCallback::new(
-                    raw_exclusive_write_128_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-            }),
-            enable_cycle_counting: config.enable_cycle_counting,
-            memory: {
-                crate::backend::common::emit_context::MemoryEmitConfig {
-                    fastmem_address_space_bits: config.fastmem_address_space_bits as usize,
-                    silently_mirror_fastmem: config.silently_mirror_fastmem,
-                    fastmem_exclusive_access: config.fastmem_exclusive_access,
-                    recompile_on_exclusive_fastmem_failure: config
-                        .recompile_on_exclusive_fastmem_failure,
-                    recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
-                    page_table_present: config.page_table.is_some(),
-                    page_table_address_space_bits: config.page_table_address_space_bits as usize,
-                    silently_mirror_page_table: config.silently_mirror_page_table,
-                    absolute_offset_page_table: config.absolute_offset_page_table,
-                    page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
-                    page_table_log2_stride: config.page_table_log2_stride,
-                    detect_misaligned_access_via_page_table: config
-                        .detect_misaligned_access_via_page_table
-                        as u32,
-                    only_detect_misalignment_via_page_table_on_page_boundary: config
-                        .only_detect_misalignment_via_page_table_on_page_boundary,
-                    check_halt_on_memory_access: config.check_halt_on_memory_access,
-                    processor_id: config.processor_id as usize,
-                }
-            },
-            global_monitor: config.global_monitor,
-            cntfrq_el0: config.cntfrq_el0,
-            ctr_el0: config.ctr_el0,
-            dczid_el0: config.dczid_el0,
-            hook_data_cache_operations: config.hook_data_cache_operations,
-            hook_isb: config.hook_isb,
-        };
-
-        let translation_options = TranslationOptions {
-            define_unpredictable_behaviour: config.define_unpredictable_behaviour,
-            wall_clock_cntpct: config.wall_clock_cntpct,
-            ..TranslationOptions::default()
-        };
-
-        // Phase 3: Create the emitter (contains code buffer + dispatcher + cache)
-        let mut emitter = A64EmitX64::new(
-            emit_config,
-            run_callbacks,
-            translation_options,
-            effective_optimizations,
-            cache_size,
-        )?;
-        // Forward the per-emulator-core index so JIT-emit-time diagnostics
-        // (e.g. RUZU_BLOCK_PROLOGUE_COUNT_PC) can address the correct slot
-        // in their per-core counter array.
-        emitter.processor_id = config.processor_id as usize;
-
-        // Extract run_code function pointer
-        let run_code_fn = unsafe { emitter.get_run_code_fn()? };
-
-        inner.emitter = Some(emitter);
-        inner.run_code_fn = Some(run_code_fn);
-
-        Ok(A64Jit {
-            inner,
-            #[cfg(target_arch = "aarch64")]
-            arm64: None,
-        })
-    }
-
-    /// Execute JIT code until a halt reason is triggered.
-    ///
-    /// Matches upstream: Run() does RSB check then GetCurrentBlock() then RunCode().
-    /// No mprotect on the hot path — only on cache miss (compilation).
-    pub fn run(&mut self) -> HaltReason {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            return arm64.run().expect("A64 ARM64 run failed");
-        }
-
-        assert!(
-            !self.inner.is_executing,
-            "Recursive JIT execution not allowed"
-        );
-        self.inner.is_executing = true;
-
-        let location = LocationDescriptor::new(self.inner.jit_state.get_unique_hash());
-        let inner_ptr = &mut *self.inner as *mut JitInner;
-        let emitter = self.inner.emitter.as_mut().unwrap();
-
-        // Fast path: block already compiled — no mprotect needed.
-        let code_ptr = if let Some(ptr) = emitter.lookup_cached_block(location) {
-            ptr
-        } else {
-            // Slow path: need to compile — toggle W^X protections.
-            let read_code = move |vaddr: u64| -> Option<u32> {
-                let inner = unsafe { &*inner_ptr };
-                inner.callbacks.memory_read_code(vaddr)
-            };
-            let _ = emitter.make_writable();
-            let ptr = emitter.get_or_compile_block(location, &read_code);
-            let _ = unsafe { emitter.get_run_code_fn() };
-            ptr
-        };
-
-        // Use the run_code_fn cached at construction time — no mprotect.
-        let run_fn = self.inner.run_code_fn.unwrap();
-
-        // Call the dispatcher
-        let halt_bits = unsafe { run_fn(&mut self.inner.jit_state as *mut _, code_ptr) };
-        emitter
-            .process_pending_fastmem_recompiles()
-            .expect("processing A64 fastmem recompiles failed");
-
-        self.inner.is_executing = false;
-        HaltReason::from_bits_truncate(halt_bits)
-    }
-
-    /// Execute a single instruction (single-step).
-    ///
-    /// Uses a dedicated step_code entry point that:
-    /// - Sets cycle budget to 1
-    /// - Atomically sets the STEP bit in halt_reason
-    /// - Compiles a single-instruction block (via single_stepping descriptor)
-    pub fn step(&mut self) -> HaltReason {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            return arm64.step().expect("A64 ARM64 step failed");
-        }
-
-        assert!(
-            !self.inner.is_executing,
-            "Recursive JIT execution not allowed"
-        );
-        self.inner.is_executing = true;
-
-        // Build location with single_stepping=true for 1-instruction block
-        let a64_loc = crate::ir::location::A64LocationDescriptor::new(
-            self.inner.jit_state.pc,
-            self.inner.jit_state.fpcr,
-            true,
-        );
-        let location = a64_loc.to_location();
-
-        let inner_ptr = &mut *self.inner as *mut JitInner;
-
-        // Make code writable for compilation
-        if let Some(ref mut emitter) = self.inner.emitter {
-            let _ = emitter.make_writable();
-        }
-
-        let read_code = move |vaddr: u64| -> Option<u32> {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.memory_read_code(vaddr)
-        };
-
-        let code_ptr = self
-            .inner
-            .emitter
-            .as_mut()
-            .unwrap()
-            .get_or_compile_block(location, &read_code);
-
-        // Get the step_code function pointer
-        let step_fn = {
-            let emitter = self.inner.emitter.as_mut().unwrap();
-            unsafe { emitter.get_step_code_fn().unwrap() }
-        };
-
-        // Call the step_code entry (sets STEP atomically, cycles=1)
-        let halt_bits = unsafe { step_fn(&mut self.inner.jit_state as *mut _, code_ptr) };
-        self.inner
-            .emitter
-            .as_mut()
-            .unwrap()
-            .process_pending_fastmem_recompiles()
-            .expect("processing A64 fastmem recompiles failed");
-
-        self.inner.is_executing = false;
-        HaltReason::from_bits_truncate(halt_bits)
-    }
-
-    /// Request halt from another thread (or same thread in a callback).
-    ///
-    /// Thread-safe: uses atomic OR on halt_reason.
-    pub fn halt_execution(&self, reason: HaltReason) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.halt_execution(reason);
-            return;
-        }
-
-        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
-        let atomic = unsafe { &*halt_ptr };
-        atomic.fetch_or(reason.bits(), Ordering::Release);
-    }
-
-    /// Read the current halt_reason value (diagnostic).
-    pub fn read_halt_reason(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.current_halt_reason().bits();
-        }
-
-        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
-        let atomic = unsafe { &*halt_ptr };
-        atomic.load(Ordering::Acquire)
-    }
-
-    /// Get the address of halt_reason (diagnostic).
-    pub fn halt_reason_ptr(&self) -> *const u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.halt_reason_ptr();
-        }
-
-        &self.inner.jit_state.halt_reason as *const u32
-    }
-
-    /// Get the address of jit_state base (R15 value).
-    pub fn jit_state_ptr(&self) -> *const u8 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.jit_state_ptr();
-        }
-
-        &self.inner.jit_state as *const _ as *const u8
-    }
-
-    /// Clear specific halt reason bits.
-    pub fn clear_halt(&self, reason: HaltReason) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.clear_halt(reason);
-            return;
-        }
-
-        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
-        let atomic = unsafe { &*halt_ptr };
-        atomic.fetch_and(!reason.bits(), Ordering::Release);
-    }
-
-    // ---- Register accessors ----
-
-    pub fn get_register(&self, index: usize) -> u64 {
-        assert!(index < 31, "Register index out of range (0-30)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.regs()[index];
-        }
-
-        self.inner.jit_state.reg[index]
-    }
-
-    pub fn set_register(&mut self, index: usize, value: u64) {
-        assert!(index < 31, "Register index out of range (0-30)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.regs_mut()[index] = value;
-            return;
-        }
-
-        self.inner.jit_state.reg[index] = value;
-    }
-
-    pub fn get_pc(&self) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.pc();
-        }
-
-        self.inner.jit_state.pc
-    }
-
-    pub fn set_pc(&mut self, value: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_pc(value);
-            return;
-        }
-
-        self.inner.jit_state.pc = value;
-    }
-
-    pub fn get_sp(&self) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.sp();
-        }
-
-        self.inner.jit_state.sp
-    }
-
-    pub fn set_sp(&mut self, value: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_sp(value);
-            return;
-        }
-
-        self.inner.jit_state.sp = value;
-    }
-
-    pub fn get_pstate(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.pstate();
-        }
-
-        self.inner.jit_state.get_pstate()
-    }
-
-    pub fn set_pstate(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_pstate(value);
-            return;
-        }
-
-        self.inner.jit_state.set_pstate(value);
-    }
-
-    pub fn get_vector(&self, index: usize) -> (u64, u64) {
-        assert!(index < 32, "Vector register index out of range (0-31)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            let vec = &arm64.vec_regs().0;
-            return (vec[index * 2], vec[index * 2 + 1]);
-        }
-
-        let lo = self.inner.jit_state.vec[index * 2];
-        let hi = self.inner.jit_state.vec[index * 2 + 1];
-        (lo, hi)
-    }
-
-    pub fn set_vector(&mut self, index: usize, lo: u64, hi: u64) {
-        assert!(index < 32, "Vector register index out of range (0-31)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            let vec = &mut arm64.vec_regs_mut().0;
-            vec[index * 2] = lo;
-            vec[index * 2 + 1] = hi;
-            return;
-        }
-
-        self.inner.jit_state.vec[index * 2] = lo;
-        self.inner.jit_state.vec[index * 2 + 1] = hi;
-    }
-
-    pub fn get_fpcr(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.fpcr();
-        }
-
-        self.inner.jit_state.get_fpcr()
-    }
-
-    pub fn set_fpcr(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_fpcr(value);
-            return;
-        }
-
-        self.inner.jit_state.set_fpcr(value);
-    }
-
-    pub fn get_fpsr(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.fpsr();
-        }
-
-        self.inner.jit_state.get_fpsr()
-    }
-
-    pub fn set_fpsr(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_fpsr(value);
-            return;
-        }
-
-        self.inner.jit_state.set_fpsr(value);
-    }
-
-    pub fn get_tpidr_el0(&self) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.tpidr_el0();
-        }
-
-        self.inner.jit_state.tpidr_el0
-    }
-
-    pub fn set_tpidr_el0(&mut self, value: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_tpidr_el0(value);
-            return;
-        }
-
-        self.inner.jit_state.tpidr_el0 = value;
-    }
-
-    pub fn get_tpidrro_el0(&self) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.tpidrro_el0();
-        }
-
-        self.inner.jit_state.tpidrro_el0
-    }
-
-    pub fn set_tpidrro_el0(&mut self, value: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_tpidrro_el0(value);
-            return;
-        }
-
-        self.inner.jit_state.tpidrro_el0 = value;
-    }
-
-    /// Clear exclusive monitor state.
-    /// Matching dynarmic's `Jit::ClearExclusiveState()`.
-    /// Called before `run()` to ensure no stale exclusive reservation persists.
-    pub fn clear_exclusive_state(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.clear_exclusive_state();
-            return;
-        }
-
-        self.inner.jit_state.exclusive_state = 0;
-    }
-
-    /// Invalidate cached blocks in a memory range.
-    pub fn invalidate_cache_range(&mut self, addr: u64, size: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.invalidate_cache_range(addr, size as usize);
-            return;
-        }
-
-        self.inner.jit_state.reset_rsb();
-        if let Some(ref mut emitter) = self.inner.emitter {
-            emitter.invalidate_range(addr, size);
-        }
-    }
-
-    /// Clear all cached blocks.
-    pub fn clear_cache(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.clear_cache();
-            return;
-        }
-
-        self.inner.jit_state.reset_rsb();
-        if let Some(ref mut emitter) = self.inner.emitter {
-            emitter.clear_cache();
-        }
-    }
-}
-
-impl Drop for A64Jit {
-    fn drop(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        if self.arm64.is_some() {
-            return;
-        }
-
-        let jit_state_ptr = &mut self.inner.jit_state as *mut A64JitState as usize;
-        if let Ok(mut registry) = a64_trace_registry().lock() {
-            registry.remove(&jit_state_ptr);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Callback trampolines
-// ---------------------------------------------------------------------------
-//
-// These are `extern "C"` functions called from JIT-generated code via
-// ArgCallback. The first argument is always `inner_ptr: u64` (the fixed
-// arg set up by ArgCallback), which we cast back to &mut JitInner to
-// access the user's UserCallbacks.
-
-/// Dispatcher callback: look up or compile the block at the current PC.
-/// Returns the native code pointer in RAX.
-extern "C" fn lookup_block_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-
-    let location = LocationDescriptor::new(inner.jit_state.get_unique_hash());
-
-    let emitter = inner.emitter.as_mut().unwrap();
-
-    // Fast path: block already compiled — no mprotect needed.
-    if let Some(code_ptr) = emitter.lookup_cached_block(location) {
-        return code_ptr as u64;
-    }
-
-    // Slow path: need to compile — toggle W^X protections.
-    let read_code = move |vaddr: u64| -> Option<u32> {
-        let inner = unsafe { &*(inner_ptr as *const JitInner) };
-        inner.callbacks.memory_read_code(vaddr)
-    };
-
-    if std::env::var_os("RUZU_TRACE_A64_COMPILE_PC").is_some() {
-        eprintln!(
-            "[TRACE_A64_COMPILE_PC] pc=0x{:016X} lr=0x{:016X} sp=0x{:016X}",
-            inner.jit_state.pc, inner.jit_state.reg[30], inner.jit_state.sp
-        );
-    }
-
-    let _ = emitter.make_writable();
-    let code_ptr = emitter.get_or_compile_block(location, &read_code);
-    let _ = unsafe { emitter.get_run_code_fn() };
-    code_ptr as u64
-}
-
-extern "C" fn add_ticks_trampoline(inner_ptr: u64, ticks: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    if PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        static ADD_TRACE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = ADD_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 100 {
-            let r = &inner.jit_state.reg;
-            eprintln!(
-                "[ADDTICKS] ticks={} pc=0x{:016X} lr=0x{:016X} x21=0x{:016X} x22=0x{:016X} x7=0x{:016X} x20=0x{:016X}",
-                ticks, inner.jit_state.pc, r[30], r[21], r[22], r[7], r[20]
-            );
-        }
-    }
-    inner.callbacks.add_ticks(ticks);
-}
-
-extern "C" fn get_ticks_remaining_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    // While PC_TRACE_ACTIVE, log live PC + key regs each tick check. Fires
-    // even when the JIT is in a tight chained-block loop (which the
-    // lookup_block_trampoline misses), since dynarmic checks
-    // ticks_remaining periodically inside compiled blocks.
-    if PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        static TICK_TRACE_COUNT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-        // Throttle to first 50 samples to avoid log flood.
-        let n = TICK_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 50 {
-            let r = &inner.jit_state.reg;
-            eprintln!(
-                "[TICK_PC] pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x18=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x7=0x{:016X}",
-                inner.jit_state.pc,
-                r[30], inner.jit_state.sp, r[18], r[20], r[21], r[22], r[7]
-            );
-        }
-    }
-    inner.callbacks.get_ticks_remaining()
-}
-
-// Memory read trampolines
-extern "C" fn memory_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    inner.callbacks.memory_read_8(vaddr) as u64
-}
-
-extern "C" fn memory_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    inner.callbacks.memory_read_16(vaddr) as u64
-}
-
-extern "C" fn memory_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    inner.callbacks.memory_read_32(vaddr) as u64
-}
-
-extern "C" fn memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    inner.callbacks.memory_read_64(vaddr)
-}
-
-fn memory_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    let [lo, hi] = inner.callbacks.memory_read_128(vaddr);
-    Pair128 { lo, hi }
-}
-
-#[cfg(not(target_os = "windows"))]
-extern "C" fn memory_read_128_trampoline(inner_ptr: u64, vaddr: u64) -> Pair128 {
-    memory_read_128_impl(inner_ptr, vaddr)
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn memory_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: *mut Pair128) {
-    unsafe { ret_ptr.write(memory_read_128_impl(inner_ptr, vaddr)) };
-}
-
-// Memory write trampolines
-
-/// Cached watch target parsed from `RUZU_WATCH_WRITE=0xADDR[:LEN]` (LEN
-/// defaults to 8). When set, every guest memory write that touches
-/// `[addr, addr+len)` logs the JIT PC, LR (X30) and a few key callee-
-/// saved registers to stderr. Useful for finding the writer of a static
-/// that ends up in an unexpected state. Effective only with
-/// `RUZU_NO_FASTMEM=1` — the fastmem fast path bypasses these
-/// trampolines entirely.
-fn watch_write_target() -> Option<(u64, u64)> {
+pub(crate) fn watch_write_target() -> Option<(u64, u64)> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -2267,1312 +940,7 @@ fn watch_write_target() -> Option<(u64, u64)> {
 }
 
 #[inline]
-fn maybe_log_watch_write(inner: &JitInner, vaddr: u64, width: usize, value_lo: u64, value_hi: u64) {
-    let Some((wa, wsize)) = watch_write_target() else {
-        return;
-    };
-    if vaddr.saturating_add(width as u64) <= wa || vaddr >= wa + wsize {
-        return;
-    }
-    let pc = inner.jit_state.pc;
-    let lr = inner.jit_state.reg[30];
-    let x19 = inner.jit_state.reg[19];
-    let x20 = inner.jit_state.reg[20];
-    let x21 = inner.jit_state.reg[21];
-    if width <= 8 {
-        eprintln!(
-            "[WATCH_WRITE] pc=0x{:08X} lr=0x{:08X} x19=0x{:X} x20=0x{:X} x21=0x{:X} vaddr=0x{:08X} width={} value=0x{:X}",
-            pc, lr, x19, x20, x21, vaddr, width, value_lo
-        );
-    } else {
-        eprintln!(
-            "[WATCH_WRITE] pc=0x{:08X} lr=0x{:08X} x19=0x{:X} x20=0x{:X} x21=0x{:X} vaddr=0x{:08X} width=128 lo=0x{:X} hi=0x{:X}",
-            pc, lr, x19, x20, x21, vaddr, value_lo, value_hi
-        );
-        // Dump V0..V31 so we can identify which source register held the
-        // value (when the store is a vector STR Q), and check whether
-        // neighbours (likely set by the same setup code) are zeros, all-
-        // ones, or something else.
-        for i in 0..32 {
-            let vlo = inner.jit_state.vec[i * 2];
-            let vhi = inner.jit_state.vec[i * 2 + 1];
-            let marker = if vlo == value_lo && vhi == value_hi {
-                " <-- match"
-            } else {
-                ""
-            };
-            eprintln!(
-                "[WATCH_WRITE]   V{:<2}=0x{:016X}_{:016X}{}",
-                i, vhi, vlo, marker
-            );
-        }
-        // Also dump X0..X30 — for an STP Xn,Xm,[Xb,#imm] the value comes
-        // from a GPR pair, so two adjacent X registers should hold
-        // value_lo and value_hi.
-        for i in 0..31 {
-            let xv = inner.jit_state.reg[i];
-            let marker = if xv == value_lo {
-                " <-- lo match"
-            } else if xv == value_hi {
-                " <-- hi match"
-            } else {
-                ""
-            };
-            eprintln!("[WATCH_WRITE]   X{:<2}=0x{:016X}{}", i, xv, marker);
-        }
-    }
-}
-
-#[inline]
-fn maybe_log_a32_watch_write(
-    inner: &A32JitInner,
-    vaddr: u64,
-    width: usize,
-    value_lo: u64,
-    value_hi: u64,
-) {
-    let Some((wa, wsize)) = watch_write_target() else {
-        return;
-    };
-    if vaddr.saturating_add(width as u64) <= wa || vaddr >= wa + wsize {
-        return;
-    }
-    let regs = &inner.jit_state.reg;
-
-    if width <= 8 {
-        eprintln!(
-            "[A32_WATCH_WRITE] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:08X} width={} value=0x{:X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X}",
-            regs[15],
-            regs[14],
-            vaddr as u32,
-            width,
-            value_lo,
-            regs[0],
-            regs[1],
-            regs[2],
-            regs[3],
-            regs[4],
-            regs[5],
-            regs[6],
-            regs[7],
-            regs[8],
-            regs[9],
-            regs[10],
-            regs[11],
-        );
-    } else {
-        eprintln!(
-            "[A32_WATCH_WRITE] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:08X} width=128 lo=0x{:X} hi=0x{:X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X}",
-            regs[15],
-            regs[14],
-            vaddr as u32,
-            value_lo,
-            value_hi,
-            regs[0],
-            regs[1],
-            regs[2],
-            regs[3],
-            regs[4],
-            regs[5],
-            regs[6],
-            regs[7],
-            regs[8],
-            regs[9],
-            regs[10],
-            regs[11],
-        );
-    }
-}
-
-extern "C" fn memory_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    maybe_log_watch_write(inner, vaddr, 1, value, 0);
-    inner.callbacks.memory_write_8(vaddr, value as u8);
-}
-
-extern "C" fn memory_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    maybe_log_watch_write(inner, vaddr, 2, value, 0);
-    inner.callbacks.memory_write_16(vaddr, value as u16);
-}
-
-extern "C" fn memory_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    maybe_log_watch_write(inner, vaddr, 4, value, 0);
-    inner.callbacks.memory_write_32(vaddr, value as u32);
-}
-
-extern "C" fn memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    maybe_log_watch_write(inner, vaddr, 8, value, 0);
-    inner.callbacks.memory_write_64(vaddr, value);
-}
-
-fn memory_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    maybe_log_watch_write(inner, vaddr, 16, value_lo, value_hi);
-    inner
-        .callbacks
-        .memory_write_128(vaddr, [value_lo, value_hi]);
-}
-
-#[cfg(not(target_os = "windows"))]
-extern "C" fn memory_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
-) {
-    memory_write_128_impl(inner_ptr, vaddr, value_lo, value_hi);
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn memory_write_128_trampoline(inner_ptr: u64, vaddr: u64, value: *const Pair128) {
-    let value = unsafe { value.read_unaligned() };
-    memory_write_128_impl(inner_ptr, vaddr, value.lo, value.hi);
-}
-
-// System trampolines
-extern "C" fn call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.call_svc(svc_num as u32);
-}
-
-extern "C" fn exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .exception_raised(pc, A64Exception::from_u32(exception as u32));
-}
-
-extern "C" fn data_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .data_cache_operation_raised(A64DataCacheOperation::from_u32(op as u32), vaddr);
-}
-
-extern "C" fn instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.instruction_cache_operation_raised(
-        A64InstructionCacheOperation::from_u32(op as u32),
-        vaddr,
-    );
-}
-
-extern "C" fn instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.instruction_synchronization_barrier_raised();
-}
-
-extern "C" fn get_cntpct_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    inner.callbacks.get_cntpct()
-}
-
-// Exclusive memory trampolines
-extern "C" fn exclusive_clear_trampoline(inner_ptr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.jit_state.exclusive_state = 0;
-}
-
-extern "C" fn exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.jit_state.exclusive_state = 1;
-    let value = if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        unsafe {
-            (&mut *monitor)
-                .read_and_mark(inner.processor_id, vaddr, || callbacks.memory_read_8(vaddr))
-        }
-    } else {
-        inner.callbacks.memory_read_8(vaddr)
-    };
-    inner.jit_state.exclusive_value[0] = value as u64;
-    value as u64
-}
-
-extern "C" fn exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.jit_state.exclusive_state = 1;
-    let value = if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        unsafe {
-            (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.memory_read_16(vaddr)
-            })
-        }
-    } else {
-        inner.callbacks.memory_read_16(vaddr)
-    };
-    inner.jit_state.exclusive_value[0] = value as u64;
-    value as u64
-}
-
-extern "C" fn exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.jit_state.exclusive_state = 1;
-    let value = if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        unsafe {
-            (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.memory_read_32(vaddr)
-            })
-        }
-    } else {
-        inner.callbacks.memory_read_32(vaddr)
-    };
-    inner.jit_state.exclusive_value[0] = value as u64;
-    value as u64
-}
-
-extern "C" fn exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.jit_state.exclusive_state = 1;
-    let value = if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        unsafe {
-            (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.memory_read_64(vaddr)
-            })
-        }
-    } else {
-        inner.callbacks.memory_read_64(vaddr)
-    };
-    inner.jit_state.exclusive_value[0] = value;
-    value
-}
-
-fn exclusive_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.jit_state.exclusive_state = 1;
-    let [lo, hi] = if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        let value: [u64; 2] = unsafe {
-            (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.memory_read_128(vaddr)
-            })
-        };
-        value
-    } else {
-        inner.callbacks.memory_read_128(vaddr)
-    };
-    inner.jit_state.exclusive_value[0] = lo;
-    inner.jit_state.exclusive_value[1] = hi;
-    Pair128 { lo, hi }
-}
-
-#[cfg(not(target_os = "windows"))]
-extern "C" fn exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64) -> Pair128 {
-    exclusive_read_128_impl(inner_ptr, vaddr)
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: *mut Pair128) {
-    unsafe { ret_ptr.write(exclusive_read_128_impl(inner_ptr, vaddr)) };
-}
-
-extern "C" fn exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    if inner.jit_state.exclusive_state == 0 {
-        return 1;
-    }
-    inner.jit_state.exclusive_state = 0;
-    if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        return if unsafe {
-            (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u8| {
-                callbacks.memory_write_exclusive_8(vaddr, value as u8, expected)
-            })
-        } {
-            0
-        } else {
-            1
-        };
-    }
-    let expected = inner.jit_state.exclusive_value[0] as u8;
-    if inner
-        .callbacks
-        .memory_write_exclusive_8(vaddr, value as u8, expected)
-    {
-        0
-    } else {
-        1
-    }
-}
-
-extern "C" fn exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    if inner.jit_state.exclusive_state == 0 {
-        return 1;
-    }
-    inner.jit_state.exclusive_state = 0;
-    if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        return if unsafe {
-            (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u16| {
-                callbacks.memory_write_exclusive_16(vaddr, value as u16, expected)
-            })
-        } {
-            0
-        } else {
-            1
-        };
-    }
-    let expected = inner.jit_state.exclusive_value[0] as u16;
-    if inner
-        .callbacks
-        .memory_write_exclusive_16(vaddr, value as u16, expected)
-    {
-        0
-    } else {
-        1
-    }
-}
-
-extern "C" fn exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    if inner.jit_state.exclusive_state == 0 {
-        return 1;
-    }
-    inner.jit_state.exclusive_state = 0;
-    if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        return if unsafe {
-            (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u32| {
-                callbacks.memory_write_exclusive_32(vaddr, value as u32, expected)
-            })
-        } {
-            0
-        } else {
-            1
-        };
-    }
-    let expected = inner.jit_state.exclusive_value[0] as u32;
-    if inner
-        .callbacks
-        .memory_write_exclusive_32(vaddr, value as u32, expected)
-    {
-        0
-    } else {
-        1
-    }
-}
-
-extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    if inner.jit_state.exclusive_state == 0 {
-        return 1;
-    }
-    inner.jit_state.exclusive_state = 0;
-    if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        return if unsafe {
-            (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u64| {
-                callbacks.memory_write_exclusive_64(vaddr, value, expected)
-            })
-        } {
-            0
-        } else {
-            1
-        };
-    }
-    let expected = inner.jit_state.exclusive_value[0];
-    if inner
-        .callbacks
-        .memory_write_exclusive_64(vaddr, value, expected)
-    {
-        0
-    } else {
-        1
-    }
-}
-
-fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    if inner.jit_state.exclusive_state == 0 {
-        return 1;
-    }
-    inner.jit_state.exclusive_state = 0;
-    if let Some(monitor) = inner.global_monitor {
-        let callbacks = &mut inner.callbacks;
-        return if unsafe {
-            (&mut *monitor).do_exclusive_operation(
-                inner.processor_id,
-                vaddr,
-                |expected: [u64; 2]| {
-                    callbacks.memory_write_exclusive_128(vaddr, [value_lo, value_hi], expected)
-                },
-            )
-        } {
-            0
-        } else {
-            1
-        };
-    }
-    let expected_lo = inner.jit_state.exclusive_value[0];
-    let expected_hi = inner.jit_state.exclusive_value[1];
-    if inner.callbacks.memory_write_exclusive_128(
-        vaddr,
-        [value_lo, value_hi],
-        [expected_lo, expected_hi],
-    ) {
-        0
-    } else {
-        1
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-extern "C" fn exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
-) -> u64 {
-    exclusive_write_128_impl(inner_ptr, vaddr, value_lo, value_hi)
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: *const Pair128,
-) -> u64 {
-    let value = unsafe { value.read_unaligned() };
-    exclusive_write_128_impl(inner_ptr, vaddr, value.lo, value.hi)
-}
-
-extern "C" fn raw_exclusive_write_8_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_8(vaddr, value as u8, expected as u8) as u64
-}
-
-extern "C" fn raw_exclusive_write_16_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_16(vaddr, value as u16, expected as u16) as u64
-}
-
-extern "C" fn raw_exclusive_write_32_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_32(vaddr, value as u32, expected as u32) as u64
-}
-
-extern "C" fn raw_exclusive_write_64_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_64(vaddr, value, expected) as u64
-}
-
-extern "C" fn raw_exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: *const [u64; 2],
-    expected: *const [u64; 2],
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    let value = unsafe { *value };
-    let expected = unsafe { *expected };
-    inner
-        .callbacks
-        .memory_write_exclusive_128(vaddr, value, expected) as u64
-}
-
-// ===========================================================================
-// A32 JIT
-// ===========================================================================
-
-/// Public ARM32 JIT compiler.
-///
-/// Same design as `A64Jit` but uses A32 frontend (ARM/Thumb decoder),
-/// A32JitState (16 × u32 GPRs, split CPSR, ext_reg array), and
-/// A32EmitX64 compilation pipeline.
-pub struct A32Jit {
-    inner: Box<A32JitInner>,
-    #[cfg(target_arch = "aarch64")]
-    arm64: Option<crate::backend::arm64::a32_interface::A32Interface>,
-    #[cfg(target_arch = "aarch64")]
-    arm64_cntpct: u64,
-}
-
-struct A32JitInner {
-    jit_state: A32JitState,
-    emitter: Option<A32EmitX64>,
-    callbacks: Box<dyn A32UserCallbacks>,
-    run_code_fn: Option<RunCodeFn>,
-    is_executing: bool,
-    global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
-    processor_id: usize,
-}
-
-#[cfg(target_arch = "aarch64")]
-struct A32DummyCallbacks;
-
-#[cfg(target_arch = "aarch64")]
-impl A32UserCallbacks for A32DummyCallbacks {
-    fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
-        None
-    }
-
-    fn memory_read_8(&self, _vaddr: u32) -> u8 {
-        0
-    }
-
-    fn memory_read_16(&self, _vaddr: u32) -> u16 {
-        0
-    }
-
-    fn memory_read_32(&self, _vaddr: u32) -> u32 {
-        0
-    }
-
-    fn memory_read_64(&self, _vaddr: u32) -> u64 {
-        0
-    }
-
-    fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
-
-    fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
-
-    fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
-
-    fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
-
-    fn memory_write_exclusive_8(&mut self, _vaddr: u32, _value: u8, _expected: u8) -> bool {
-        false
-    }
-
-    fn memory_write_exclusive_16(&mut self, _vaddr: u32, _value: u16, _expected: u16) -> bool {
-        false
-    }
-
-    fn memory_write_exclusive_32(&mut self, _vaddr: u32, _value: u32, _expected: u32) -> bool {
-        false
-    }
-
-    fn memory_write_exclusive_64(&mut self, _vaddr: u32, _value: u64, _expected: u64) -> bool {
-        false
-    }
-
-    fn call_svc(&mut self, _svc_num: u32) {}
-
-    fn exception_raised(&mut self, _pc: u32, _exception: crate::interface::a32::config::Exception) {
-    }
-
-    fn add_ticks(&mut self, _ticks: u64) {}
-
-    fn get_ticks_remaining(&self) -> u64 {
-        0
-    }
-}
-
-impl A32Jit {
-    /// Diagnostic: write the ARM64 backend's emitted-block map
-    /// (`host_entry guest_descriptor size` per line) to `path`. No-op on
-    /// backends without a native block map.
-    pub fn dump_jit_block_map(&self, path: &str) -> std::io::Result<()> {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
-            return arm64.dump_block_map(&mut file);
-        }
-        let _ = path;
-        Ok(())
-    }
-
-    /// Create a new A32Jit from the given configuration.
-    pub fn new(config: A32UserConfig) -> Result<Self, String> {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let arm64 = crate::backend::arm64::a32_interface::A32Interface::new(config)?;
-            let inner = Box::new(A32JitInner {
-                jit_state: A32JitState::new(),
-                emitter: None,
-                callbacks: Box::new(A32DummyCallbacks),
-                run_code_fn: None,
-                is_executing: false,
-                global_monitor: None,
-                processor_id: 0,
-            });
-            return Ok(A32Jit {
-                inner,
-                arm64: Some(arm64),
-                arm64_cntpct: 0,
-            });
-        }
-
-        if !cfg!(target_arch = "x86_64") {
-            return Err(format!(
-                "rdynarmic x64 backend is not executable on host architecture {}",
-                std::env::consts::ARCH
-            ));
-        }
-
-        let cache_size = if config.code_cache_size > 0 {
-            config.code_cache_size as usize
-        } else {
-            DEFAULT_CODE_SIZE
-        };
-        let effective_optimizations = config.effective_optimizations();
-
-        let mut inner = Box::new(A32JitInner {
-            jit_state: A32JitState::new(),
-            emitter: None,
-            callbacks: config.callbacks,
-            run_code_fn: None,
-            is_executing: false,
-            global_monitor: config.global_monitor,
-            processor_id: config.processor_id as usize,
-        });
-
-        // Wire the halt_reason pointer into callbacks so they can halt execution
-        // from within exception_raised(), matching upstream's m_parent.m_jit->HaltExecution().
-        let halt_ptr = &inner.jit_state.halt_reason as *const u32;
-        inner.callbacks.set_halt_reason_ptr(halt_ptr);
-        let pc_ptr = &inner.jit_state.reg[15] as *const u32;
-        inner.callbacks.set_pc_ptr(pc_ptr);
-
-        let inner_ptr = &mut *inner as *mut A32JitInner as u64;
-
-        let run_callbacks = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(
-                a32_lookup_block_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            add_ticks: Box::new(ArgCallback::new(
-                a32_add_ticks_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            get_ticks_remaining: Box::new(ArgCallback::new(
-                a32_get_ticks_remaining_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            enable_cycle_counting: config.enable_cycle_counting,
-            fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
-            page_table_pointer: config
-                .page_table
-                .map(|pointer| pointer.cast::<u8>() as *const u8),
-        };
-
-        let emit_callbacks = EmitCallbacks {
-            memory_read_8: Box::new(ArgCallback::new(
-                a32_memory_read_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_16: Box::new(ArgCallback::new(
-                a32_memory_read_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_32: Box::new(ArgCallback::new(
-                a32_memory_read_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_64: Box::new(ArgCallback::new(
-                a32_memory_read_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_read_128: Box::new(ArgCallback::new(
-                a32_unreachable_read_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_8: Box::new(ArgCallback::new(
-                a32_memory_write_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_16: Box::new(ArgCallback::new(
-                a32_memory_write_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_32: Box::new(ArgCallback::new(
-                a32_memory_write_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_64: Box::new(ArgCallback::new(
-                a32_memory_write_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            memory_write_128: Box::new(ArgCallback::new(
-                a32_unreachable_write_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            call_supervisor: Box::new(ArgCallback::new(
-                a32_call_supervisor_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exception_raised: Box::new(ArgCallback::new(
-                a32_exception_raised_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            data_cache_operation: Box::new(ArgCallback::new(
-                a32_unreachable_cache_operation_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            instruction_cache_operation: Box::new(ArgCallback::new(
-                a32_unreachable_cache_operation_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            instruction_synchronization_barrier: Box::new(ArgCallback::new(
-                a32_instruction_synchronization_barrier_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            add_ticks: Box::new(ArgCallback::new(
-                a32_add_ticks_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            get_ticks_remaining: Box::new(ArgCallback::new(
-                a32_get_ticks_remaining_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            get_cntpct: Box::new(ArgCallback::new(
-                a32_unreachable_get_cntpct_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_clear: Box::new(ArgCallback::new(
-                a32_exclusive_clear_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_8: Box::new(ArgCallback::new(
-                a32_exclusive_read_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_16: Box::new(ArgCallback::new(
-                a32_exclusive_read_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_32: Box::new(ArgCallback::new(
-                a32_exclusive_read_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_64: Box::new(ArgCallback::new(
-                a32_exclusive_read_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_read_128: Box::new(ArgCallback::new(
-                a32_unreachable_read_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_8: Box::new(ArgCallback::new(
-                a32_exclusive_write_8_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_16: Box::new(ArgCallback::new(
-                a32_exclusive_write_16_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_32: Box::new(ArgCallback::new(
-                a32_exclusive_write_32_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_64: Box::new(ArgCallback::new(
-                a32_exclusive_write_64_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            exclusive_write_128: Box::new(ArgCallback::new(
-                a32_unreachable_write_128_trampoline as usize as u64,
-                inner_ptr,
-            )),
-        };
-
-        let emit_config = EmitConfig {
-            coprocessors: config.coprocessors.clone(),
-            callbacks: emit_callbacks,
-            raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
-                write_8: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_8_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_16: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_16_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_32: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_32_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_64: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_64_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-                write_128: Box::new(ArgCallback::new(
-                    a32_unreachable_raw_exclusive_write_128_trampoline as usize as u64,
-                    inner_ptr,
-                )),
-            }),
-            enable_cycle_counting: config.enable_cycle_counting,
-            // A32 memory emission uses the same fastmem/page-table policy as
-            // upstream Dynarmic::A32::UserConfig. Preserve the caller-provided
-            // settings instead of falling back to default 64-bit mirroring.
-            memory: crate::backend::common::emit_context::MemoryEmitConfig {
-                fastmem_address_space_bits: 32,
-                silently_mirror_fastmem: true,
-                fastmem_exclusive_access: config.fastmem_exclusive_access,
-                recompile_on_exclusive_fastmem_failure: config
-                    .recompile_on_exclusive_fastmem_failure,
-                recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
-                page_table_present: config.page_table.is_some(),
-                page_table_address_space_bits: 32,
-                silently_mirror_page_table: true,
-                absolute_offset_page_table: config.absolute_offset_page_table,
-                page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
-                page_table_log2_stride: config.page_table_log2_stride,
-                detect_misaligned_access_via_page_table: config
-                    .detect_misaligned_access_via_page_table
-                    as u32,
-                only_detect_misalignment_via_page_table_on_page_boundary: config
-                    .only_detect_misalignment_via_page_table_on_page_boundary,
-                check_halt_on_memory_access: config.check_halt_on_memory_access,
-                processor_id: config.processor_id as usize,
-            },
-            global_monitor: config.global_monitor,
-            // Unused by A32 (CNTFRQ is a CP15 read there), but the shared
-            // EmitConfig carries it; forward the configured value anyway.
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: config.hook_isb,
-        };
-
-        let mut emitter = A32EmitX64::new(
-            emit_config,
-            run_callbacks,
-            effective_optimizations,
-            A32TranslationOptions {
-                arch_version: config.arch_version,
-                define_unpredictable_behaviour: config.define_unpredictable_behaviour,
-                hook_hint_instructions: config.hook_hint_instructions,
-            },
-            cache_size,
-        )?;
-
-        let run_code_fn = unsafe { emitter.get_run_code_fn()? };
-
-        inner.emitter = Some(emitter);
-        inner.run_code_fn = Some(run_code_fn);
-
-        Ok(A32Jit {
-            inner,
-            #[cfg(target_arch = "aarch64")]
-            arm64: None,
-            #[cfg(target_arch = "aarch64")]
-            arm64_cntpct: 0,
-        })
-    }
-
-    /// Execute JIT code until a halt reason is triggered.
-    pub fn run(&mut self) -> HaltReason {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            return arm64.run().expect("A32 ARM64 run failed");
-        }
-
-        assert!(
-            !self.inner.is_executing,
-            "Recursive JIT execution not allowed"
-        );
-        self.inner.is_executing = true;
-
-        // Upstream: Run() does RSB check then GetCurrentBlock() then RunCode().
-        // GetCurrentBlock() is a cache lookup (no mprotect). Only on cache miss
-        // does it compile (with EnableWriting/DisableWriting inside Emit()).
-        // RunCode() just calls the stored function pointer — no mprotect ever.
-        let location = LocationDescriptor::new(self.inner.jit_state.get_unique_hash());
-        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
-        let emitter = self.inner.emitter.as_mut().unwrap();
-
-        // Fast path: block already compiled — no mprotect needed.
-        let code_ptr = if let Some(ptr) = emitter.lookup_cached_block(location) {
-            ptr
-        } else {
-            // Slow path: need to compile — toggle W^X protections.
-            let callbacks = unsafe { &*callbacks_ptr };
-            let translate_callbacks = UserCallbacksAdapter::new(callbacks);
-            let is_read_only =
-                move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
-            let _ = emitter.make_writable();
-            let ptr =
-                emitter.get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
-            // Restore RX after compilation.
-            let _ = unsafe { emitter.get_run_code_fn() };
-            ptr
-        };
-
-        // Use the run_code_fn cached at construction time — no mprotect.
-        let run_fn = self.inner.run_code_fn.unwrap();
-
-        let halt_bits = unsafe {
-            run_fn(
-                &mut self.inner.jit_state as *mut _ as *mut A64JitState,
-                code_ptr,
-            )
-        };
-        emitter
-            .process_pending_fastmem_recompiles()
-            .expect("processing A32 fastmem recompiles failed");
-
-        self.inner.is_executing = false;
-        HaltReason::from_bits_truncate(halt_bits)
-    }
-
-    /// Execute a single instruction.
-    pub fn step(&mut self) -> HaltReason {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            return arm64.step().expect("A32 ARM64 step failed");
-        }
-
-        assert!(
-            !self.inner.is_executing,
-            "Recursive JIT execution not allowed"
-        );
-        self.inner.is_executing = true;
-
-        let a32_loc = crate::ir::location::A32LocationDescriptor::from_location(
-            LocationDescriptor::new(self.inner.jit_state.get_unique_hash()),
-        );
-        let location = a32_loc.set_single_stepping(true).to_location();
-
-        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
-
-        if let Some(ref mut emitter) = self.inner.emitter {
-            let _ = emitter.make_writable();
-        }
-
-        let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
-        let is_read_only =
-            move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
-
-        let code_ptr = self
-            .inner
-            .emitter
-            .as_mut()
-            .unwrap()
-            .get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
-
-        let step_fn = {
-            let emitter = self.inner.emitter.as_mut().unwrap();
-            unsafe { emitter.get_step_code_fn().unwrap() }
-        };
-
-        let halt_bits = unsafe {
-            step_fn(
-                &mut self.inner.jit_state as *mut _ as *mut A64JitState,
-                code_ptr,
-            )
-        };
-        self.inner
-            .emitter
-            .as_mut()
-            .unwrap()
-            .process_pending_fastmem_recompiles()
-            .expect("processing A32 fastmem recompiles failed");
-
-        self.inner.is_executing = false;
-        HaltReason::from_bits_truncate(halt_bits)
-    }
-
-    /// Request halt from another thread.
-    pub fn halt_execution(&self, reason: HaltReason) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.halt_execution(reason);
-            return;
-        }
-
-        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
-        let atomic = unsafe { &*halt_ptr };
-        atomic.fetch_or(reason.bits(), Ordering::Release);
-    }
-
-    /// Read the current halt_reason value (diagnostic).
-    pub fn read_halt_reason(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.current_halt_reason().bits();
-        }
-
-        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
-        let atomic = unsafe { &*halt_ptr };
-        atomic.load(Ordering::Acquire)
-    }
-
-    /// Get the address of halt_reason (diagnostic).
-    pub fn halt_reason_ptr(&self) -> *const u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.halt_reason_ptr();
-        }
-
-        &self.inner.jit_state.halt_reason as *const u32
-    }
-
-    /// Get the address of jit_state base (R15 value).
-    pub fn jit_state_ptr(&self) -> *const u8 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.jit_state_ptr();
-        }
-
-        &self.inner.jit_state as *const A32JitState as *const u8
-    }
-
-    /// Clear specific halt reason bits.
-    pub fn clear_halt(&self, reason: HaltReason) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.clear_halt(reason);
-            return;
-        }
-
-        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
-        let atomic = unsafe { &*halt_ptr };
-        atomic.fetch_and(!reason.bits(), Ordering::Release);
-    }
-
-    // ---- Register accessors (R0-R15, u32) ----
-
-    pub fn get_register(&self, index: usize) -> u32 {
-        assert!(index < 16, "A32 register index out of range (0-15)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.regs()[index];
-        }
-
-        self.inner.jit_state.reg[index]
-    }
-
-    pub fn set_register(&mut self, index: usize, value: u32) {
-        assert!(index < 16, "A32 register index out of range (0-15)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.regs_mut()[index] = value;
-            return;
-        }
-
-        self.inner.jit_state.reg[index] = value;
-    }
-
-    pub fn get_pc(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.regs()[15];
-        }
-
-        self.inner.jit_state.reg[15]
-    }
-
-    pub fn set_pc(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.regs_mut()[15] = value;
-            return;
-        }
-
-        self.inner.jit_state.reg[15] = value;
-    }
-
-    pub fn get_cpsr(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.cpsr();
-        }
-
-        self.inner.jit_state.get_cpsr()
-    }
-
-    pub fn set_cpsr(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_cpsr(value);
-            return;
-        }
-
-        // A32JitState::set_cpsr handles both cpsr fields and upper_location_descriptor
-        self.inner.jit_state.set_cpsr(value);
-    }
-
-    pub fn get_fpscr(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.fpscr();
-        }
-
-        self.inner.jit_state.get_fpscr()
-    }
-
-    pub fn set_fpscr(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_fpscr(value);
-            return;
-        }
-
-        // set_fpscr updates fpsr_nzcv, mode bits, mxcsr, AND upper_location_descriptor
-        self.inner.jit_state.set_fpscr(value);
-    }
-
-    /// Get extension register (S/D backing store, u32 element).
-    pub fn get_ext_reg(&self, index: usize) -> u32 {
-        assert!(index < 64, "A32 ext_reg index out of range (0-63)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.ext_regs().0[index];
-        }
-
-        self.inner.jit_state.ext_reg[index]
-    }
-
-    /// Set extension register.
-    pub fn set_ext_reg(&mut self, index: usize, value: u32) {
-        assert!(index < 64, "A32 ext_reg index out of range (0-63)");
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.ext_regs_mut().0[index] = value;
-            return;
-        }
-
-        self.inner.jit_state.ext_reg[index] = value;
-    }
-
-    /// Get CNTPCT (Physical Count Timer) value.
-    pub fn get_cntpct(&self) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        if self.arm64.is_some() {
-            return self.arm64_cntpct;
-        }
-
-        self.inner.jit_state.cntpct
-    }
-
-    /// Set CNTPCT (Physical Count Timer) value.
-    /// Should be set before `run()` to provide the current tick count.
-    /// Read by MRRC p15, 0, Rt, Rt2, c14.
-    pub fn set_cntpct(&mut self, value: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if self.arm64.is_some() {
-            self.arm64_cntpct = value;
-            return;
-        }
-
-        self.inner.jit_state.cntpct = value;
-    }
-
-    /// Clear exclusive monitor state.
-    /// Matching dynarmic's `Jit::ClearExclusiveState()`.
-    /// Called before `run()` to ensure no stale exclusive reservation persists.
-    pub fn clear_exclusive_state(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.clear_exclusive_state();
-            return;
-        }
-
-        self.inner.jit_state.exclusive_state = 0;
-    }
-
-    /// Invalidate cached blocks in a memory range.
-    pub fn invalidate_cache_range(&mut self, addr: u64, size: u64) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.invalidate_cache_range(addr as u32, size as usize);
-            return;
-        }
-
-        self.inner.jit_state.reset_rsb();
-        if let Some(ref mut emitter) = self.inner.emitter {
-            emitter.invalidate_range(addr, size);
-        }
-    }
-
-    /// Clear all cached blocks.
-    pub fn clear_cache(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            arm64.clear_cache();
-            return;
-        }
-
-        self.inner.jit_state.reset_rsb();
-        if let Some(ref mut emitter) = self.inner.emitter {
-            emitter.clear_cache();
-        }
-    }
-
-    /// Force compilation of the block at the current PC (without executing it).
-    ///
-    /// Returns the entrypoint pointer of the compiled block. Used by the
-    /// deterministic JIT microbenchmark (`compile_bench` binary) to isolate
-    /// compile cost from execution cost. Not part of normal JIT operation.
-    ///
-    /// The caller is responsible for setting PC + CPSR via `set_pc` / `set_cpsr`
-    /// before invoking this method. Invokes the same `get_or_compile_block_with_ro`
-    /// path that `step()` uses.
-    pub fn compile_block_only(&mut self) -> *const u8 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            return arm64
-                .compile_block_only()
-                .expect("A32 ARM64 compile_block_only failed");
-        }
-
-        let a32_loc = crate::ir::location::A32LocationDescriptor::from_location(
-            LocationDescriptor::new(self.inner.jit_state.get_unique_hash()),
-        );
-        let location = a32_loc.to_location();
-
-        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
-
-        if let Some(ref mut emitter) = self.inner.emitter {
-            let _ = emitter.make_writable();
-        }
-
-        let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
-        let is_read_only =
-            move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
-
-        self.inner
-            .emitter
-            .as_mut()
-            .unwrap()
-            .get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// A32 Callback trampolines
-// ---------------------------------------------------------------------------
-
-/// Env-gated block-entry logger. Reads `RUZU_BLOCK_TRACE_PC=0xLO-0xHI`
-/// once; for every block lookup whose target PC falls in that range, logs
-/// `[BLOCK] pc=... lr=... r0=... r4=...` to stderr. Zero cost when unset.
-fn block_trace_range() -> Option<(u32, u32)> {
+pub(crate) fn block_trace_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *RANGE.get_or_init(|| {
@@ -3595,479 +963,9 @@ fn block_trace_range() -> Option<(u32, u32)> {
     })
 }
 
-fn block_trace_verbose() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("RUZU_BLOCK_TRACE_VERBOSE").is_ok())
-}
-
-fn block_trace_code_words() -> usize {
-    use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("RUZU_BLOCK_TRACE_CODE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    })
-}
-
-/// `RUZU_TRACK_PC_LR=0xPC,0xLR` — when block trampoline sees this PC+LR pair,
-/// log r4 + memory at the offsets in `RUZU_TRACK_OFFSETS` (default `0x1c,0x70`)
-/// every iteration. Used to watch how a target struct's fields evolve across
-/// loop iterations without paying the fastmem-absorption tax of WATCH_ADDR.
-fn track_pc_lr() -> Option<(u32, u32)> {
-    use std::sync::OnceLock;
-    static SPEC: OnceLock<Option<(u32, u32)>> = OnceLock::new();
-    *SPEC.get_or_init(|| {
-        let raw = std::env::var("RUZU_TRACK_PC_LR").ok()?;
-        let (a, b) = raw.split_once(',')?;
-        let parse = |s: &str| -> Option<u32> {
-            let s = s.trim();
-            let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
-            match stripped {
-                Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                None => s.parse::<u32>().ok(),
-            }
-        };
-        Some((parse(a)?, parse(b)?))
-    })
-}
-
-fn track_offsets() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static OFFS: OnceLock<Vec<u32>> = OnceLock::new();
-    OFFS.get_or_init(|| {
-        let raw = std::env::var("RUZU_TRACK_OFFSETS").unwrap_or_else(|_| "0x1c,0x70".to_string());
-        raw.split(',')
-            .filter_map(|tok| {
-                let s = tok.trim();
-                let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
-                match stripped {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => s.parse::<u32>().ok(),
-                }
-            })
-            .collect()
-    })
-}
-
-/// `RUZU_A32_DUMP_MEM_AT=0xPC:rN:SIZE[,0xPC:rN:SIZE...]` — when an A32 block
-/// starts at PC, dump SIZE bytes from the guest address currently held in rN.
-/// This is intentionally diagnostic-only and reads through callbacks so it
-/// observes guest memory even when generated code uses direct fastmem.
-fn a32_dump_mem_specs() -> &'static [(u32, usize, usize)] {
-    use std::sync::OnceLock;
-    static SPECS: OnceLock<Vec<(u32, usize, usize)>> = OnceLock::new();
-    SPECS.get_or_init(|| {
-        let raw = match std::env::var("RUZU_A32_DUMP_MEM_AT") {
-            Ok(raw) => raw,
-            Err(_) => return Vec::new(),
-        };
-        raw.split(',')
-            .filter_map(|spec| {
-                let mut parts = spec.split(':');
-                let pc = parts.next()?.trim();
-                let reg = parts.next()?.trim();
-                let size = parts.next()?.trim();
-                if parts.next().is_some() {
-                    return None;
-                }
-                let parse_hex = |s: &str| -> Option<u32> {
-                    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
-                    match stripped {
-                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                        None => s.parse::<u32>().ok(),
-                    }
-                };
-                let pc = parse_hex(pc)?;
-                let reg = reg.strip_prefix('r').unwrap_or(reg);
-                let reg = reg.parse::<usize>().ok()?;
-                let size = size.parse::<usize>().ok()?;
-                if reg >= 16 || size == 0 || size > 256 {
-                    return None;
-                }
-                Some((pc, reg, size))
-            })
-            .collect()
-    })
-}
-
-/// Public flag that gates per-block-lookup PC tracing (`[TRACE_PC]` lines).
-/// Toggled externally by the ruzu SVC dispatcher to mark a window between two
-/// main-thread SVCs. When true, `a32_lookup_block_trampoline` logs PC+LR on
-/// every block transition. This is the counterpart to zuyu's
-/// `Core::ArmDynarmic32SetPcTraceActive`.
 pub static PC_TRACE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-
-    // Same low-overhead counter as the A64 path, but for A32 block lookups.
-    // This counts dispatcher/block-transition entries only; direct block links
-    // intentionally bypass it. Use RUZU_BLOCK_PROLOGUE_COUNT_PC for emitted
-    // prologue counts once the ARM64 A32 emitter grows that hook.
-    if let Some((lo, hi)) = block_count_range() {
-        let pc = inner.jit_state.reg[15];
-        if pc >= lo && pc < hi {
-            let idx = inner.processor_id.min(15);
-            block_count_counters()[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    // PC-window tracer: when ruzu's SVC dispatcher has activated the window,
-    // emit a compact [TRACE_PC] line per block transition. Matches zuyu's
-    // AddTicks hook gated on `Core::ArmDynarmic32SetPcTraceActive`. The load
-    // is Relaxed — losing a sample at the edge is fine.
-    // Logs r4..r11 + sp to help pinpoint which block first diverges in
-    // a callee-saved register (callers outside can filter to a single reg).
-    if PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        let r = &inner.jit_state.reg;
-        eprintln!(
-            "[TRACE_PC] pc=0x{:08X} lr=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} sp=0x{:08X}",
-            r[15], r[14], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[13]
-        );
-    }
-
-    // Block-entry tracing: log (pc, lr, r0, r4) when the lookup target PC
-    // is in RUZU_BLOCK_TRACE_PC. This fires on every block transition in
-    // the JIT, so the env gate must stay cheap.
-    // RUZU_TRACK_PC_LR: per-iteration field tracker. When the block trampoline
-    // enters with the configured (PC, LR) pair, log r4 plus N memory words at
-    // `r4 + RUZU_TRACK_OFFSETS`. Reads go through `memory_read_32` (the slow
-    // callback path), so they always see the authoritative guest memory even
-    // when fastmem absorbs the JIT-emitted accesses.
-    if let Some((target_pc, target_lr)) = track_pc_lr() {
-        if inner.jit_state.reg[15] == target_pc && inner.jit_state.reg[14] == target_lr {
-            let r4 = inner.jit_state.reg[4];
-            let mut buf = format!("[TRACK] r4=0x{:08X}", r4);
-            for &off in track_offsets() {
-                let addr = r4.wrapping_add(off);
-                let v = inner.callbacks.memory_read_32(addr);
-                use std::fmt::Write;
-                let _ = write!(buf, " *(this+0x{:x})=0x{:08X}", off, v);
-            }
-            eprintln!("{}", buf);
-        }
-    }
-
-    let pc_for_mem_dump = inner.jit_state.reg[15];
-    for &(target_pc, reg, size) in a32_dump_mem_specs() {
-        if pc_for_mem_dump == target_pc {
-            let base = inner.jit_state.reg[reg];
-            let mut bytes = Vec::with_capacity(size);
-            for off in (0..size).step_by(4) {
-                let word = inner
-                    .callbacks
-                    .memory_read_32(base.wrapping_add(off as u32));
-                for i in 0..4.min(size - off) {
-                    bytes.push(((word >> (i * 8)) & 0xff) as u8);
-                }
-            }
-            let hex = bytes
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            eprintln!(
-                "[A32_DUMP_MEM_AT] pc=0x{:08X} r{}=0x{:08X} size={} bytes={}",
-                pc_for_mem_dump, reg, base, size, hex
-            );
-        }
-    }
-
-    if let Some((lo, hi)) = block_trace_range() {
-        let pc = inner.jit_state.reg[15];
-        if pc >= lo && pc < hi {
-            if block_trace_verbose() {
-                let r = &inner.jit_state.reg;
-                eprintln!(
-                    "[BLOCK] pc=0x{:08X} cpsr_nzcv=0x{:08X} cpsr_q={}",
-                    pc, inner.jit_state.cpsr_nzcv, inner.jit_state.cpsr_q,
-                );
-                eprintln!(
-                    "        r0=0x{:08X}  r1=0x{:08X}  r2=0x{:08X}  r3=0x{:08X}",
-                    r[0], r[1], r[2], r[3],
-                );
-                eprintln!(
-                    "        r4=0x{:08X}  r5=0x{:08X}  r6=0x{:08X}  r7=0x{:08X}",
-                    r[4], r[5], r[6], r[7],
-                );
-                eprintln!(
-                    "        r8=0x{:08X}  r9=0x{:08X} r10=0x{:08X} r11=0x{:08X}",
-                    r[8], r[9], r[10], r[11],
-                );
-                eprintln!(
-                    "       r12=0x{:08X}  sp=0x{:08X}  lr=0x{:08X}  pc=0x{:08X}",
-                    r[12], r[13], r[14], r[15],
-                );
-            } else {
-                eprintln!(
-                    "[BLOCK] pc=0x{:08X} lr=0x{:08X} r0=0x{:08X} r4=0x{:08X}",
-                    pc, inner.jit_state.reg[14], inner.jit_state.reg[0], inner.jit_state.reg[4],
-                );
-            }
-            let n = block_trace_code_words();
-            if n > 0 {
-                for i in 0..n {
-                    let vaddr = pc.wrapping_add((i * 4) as u32);
-                    let word = inner.callbacks.memory_read_code(vaddr).unwrap_or(0);
-                    eprintln!("        code[0x{:08X}] = 0x{:08X}", vaddr as u32, word);
-                }
-            }
-        }
-    }
-
-    let location = LocationDescriptor::new(inner.jit_state.get_unique_hash());
-
-    let callbacks_ptr = inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
-    let emitter = inner.emitter.as_mut().unwrap();
-
-    // Fast path: block already compiled — no mprotect needed.
-    if let Some(code_ptr) = emitter.lookup_cached_block(location) {
-        return code_ptr as u64;
-    }
-
-    // Slow path: compile new block
-    let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
-    let is_read_only =
-        move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
-
-    let _ = emitter.make_writable();
-    let code_ptr =
-        emitter.get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
-    let _ = unsafe { emitter.get_run_code_fn() };
-    code_ptr as u64
-}
-
-extern "C" fn a32_add_ticks_trampoline(inner_ptr: u64, ticks: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::add_ticks(inner.callbacks.as_mut(), ticks);
-}
-
-extern "C" fn a32_get_ticks_remaining_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::get_ticks_remaining(inner.callbacks.as_ref())
-}
-
-extern "C" fn a32_memory_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::memory_read_8(inner.callbacks.as_ref(), vaddr)
-}
-extern "C" fn a32_memory_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::memory_read_16(inner.callbacks.as_ref(), vaddr)
-}
-extern "C" fn a32_memory_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::memory_read_32(inner.callbacks.as_ref(), vaddr)
-}
-extern "C" fn a32_memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::memory_read_64(inner.callbacks.as_ref(), vaddr)
-}
-extern "C" fn a32_unreachable_read_128_trampoline(_inner_ptr: u64, _vaddr: u64, _ret_ptr: u64) {
-    unreachable!("A32 has no 128-bit memory callback")
-}
-
-extern "C" fn a32_memory_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 1, value, 0);
-    a32_callbacks::memory_write_8(inner.callbacks.as_mut(), vaddr, value);
-}
-extern "C" fn a32_memory_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 2, value, 0);
-    a32_callbacks::memory_write_16(inner.callbacks.as_mut(), vaddr, value);
-}
-extern "C" fn a32_memory_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 4, value, 0);
-    a32_callbacks::memory_write_32(inner.callbacks.as_mut(), vaddr, value);
-}
-extern "C" fn a32_memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 8, value, 0);
-    a32_callbacks::memory_write_64(inner.callbacks.as_mut(), vaddr, value);
-}
-extern "C" fn a32_unreachable_write_128_trampoline(
-    _inner_ptr: u64,
-    _vaddr: u64,
-    _value_lo: u64,
-    _value_hi: u64,
-) {
-    unreachable!("A32 has no 128-bit memory callback")
-}
-
-extern "C" fn a32_call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::call_supervisor(inner.callbacks.as_mut(), svc_num);
-}
-extern "C" fn a32_exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exception_raised(inner.callbacks.as_mut(), pc, exception);
-}
-extern "C" fn a32_unreachable_cache_operation_trampoline(_inner_ptr: u64, _op: u64, _vaddr: u64) {
-    unreachable!("A32 has no A64 cache-operation callback")
-}
-
-extern "C" fn a32_instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner.callbacks.instruction_synchronization_barrier_raised();
-}
-
-extern "C" fn a32_unreachable_get_cntpct_trampoline(_inner_ptr: u64) -> u64 {
-    unreachable!("A32 has no GetCNTPCT callback")
-}
-
-extern "C" fn a32_exclusive_clear_trampoline(inner_ptr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_clear(&mut inner.jit_state);
-}
-extern "C" fn a32_exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_8(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-    )
-}
-extern "C" fn a32_exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_16(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-    )
-}
-extern "C" fn a32_exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_32(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-    )
-}
-extern "C" fn a32_exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_64(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-    )
-}
-extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_8(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        value,
-    )
-}
-extern "C" fn a32_exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_16(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        value,
-    )
-}
-extern "C" fn a32_exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 4, value, 0);
-    a32_callbacks::exclusive_write_32(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        value,
-    )
-}
-extern "C" fn a32_exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_64(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        value,
-    )
-}
-extern "C" fn a32_raw_exclusive_write_8_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_8(vaddr as u32, value as u8, expected as u8) as u64
-}
-
-extern "C" fn a32_raw_exclusive_write_16_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_16(vaddr as u32, value as u16, expected as u16) as u64
-}
-
-extern "C" fn a32_raw_exclusive_write_32_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_32(vaddr as u32, value as u32, expected as u32) as u64
-}
-
-extern "C" fn a32_raw_exclusive_write_64_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: u64,
-    expected: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner
-        .callbacks
-        .memory_write_exclusive_64(vaddr as u32, value, expected) as u64
-}
-
-extern "C" fn a32_unreachable_raw_exclusive_write_128_trampoline(
-    _inner_ptr: u64,
-    _vaddr: u64,
-    _value: *const [u64; 2],
-    _expected: *const [u64; 2],
-) -> u64 {
-    unreachable!("A32 has no 128-bit exclusive-write callback")
-}
-
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -4673,14 +1571,14 @@ mod tests {
         jit.set_register(0, 0x2000);
         jit.set_register(3, 0x4000);
         jit.set_register(15, 0x1000);
-        let location = LocationDescriptor::new(jit.inner.jit_state.get_unique_hash());
+        let location = LocationDescriptor::new(jit.inner.inner.jit_state.get_unique_hash());
 
         let first_halt = jit.run();
         assert!(first_halt.contains(HaltReason::SVC));
         assert_eq!(jit.get_register(1), 0xCAFE_BABE);
         assert_eq!(jit.get_register(2), 0x1234_5678);
         {
-            let emitter = jit.inner.emitter.as_ref().unwrap();
+            let emitter = jit.inner.inner.emitter.as_ref().unwrap();
             assert_eq!(emitter.do_not_fastmem.len(), 1);
             assert!(!emitter.cache.contains(&location));
         }
@@ -4692,7 +1590,7 @@ mod tests {
         assert_eq!(jit.get_register(1), 0xCAFE_BABE);
         assert_eq!(jit.get_register(2), 0x1234_5678);
         {
-            let emitter = jit.inner.emitter.as_ref().unwrap();
+            let emitter = jit.inner.inner.emitter.as_ref().unwrap();
             assert_eq!(emitter.do_not_fastmem.len(), 1);
             assert!(emitter.cache.contains(&location));
         }
@@ -4903,14 +1801,14 @@ mod tests {
         jit.set_register(0, 0x2000);
         jit.set_register(3, 0x4000);
         jit.set_pc(0x1000);
-        let location = LocationDescriptor::new(jit.inner.jit_state.get_unique_hash());
+        let location = LocationDescriptor::new(jit.inner.inner.jit_state.get_unique_hash());
 
         let first_halt = jit.run();
         assert!(first_halt.contains(HaltReason::SVC));
         assert_eq!(jit.get_register(1), 0xCAFE_BABE);
         assert_eq!(jit.get_register(2), 0x1234_5678);
         {
-            let emitter = jit.inner.emitter.as_ref().unwrap();
+            let emitter = jit.inner.inner.emitter.as_ref().unwrap();
             assert_eq!(emitter.do_not_fastmem.len(), 1);
             assert!(!emitter.cache.contains(&location));
         }
@@ -4922,7 +1820,7 @@ mod tests {
         assert_eq!(jit.get_register(1), 0xCAFE_BABE);
         assert_eq!(jit.get_register(2), 0x1234_5678);
         {
-            let emitter = jit.inner.emitter.as_ref().unwrap();
+            let emitter = jit.inner.inner.emitter.as_ref().unwrap();
             assert_eq!(emitter.do_not_fastmem.len(), 1);
             assert!(emitter.cache.contains(&location));
         }
@@ -4992,6 +1890,9 @@ mod tests {
             is_executing: false,
             global_monitor,
             processor_id,
+            invalidate_entire_cache: false,
+            invalid_cache_ranges: Vec::new(),
+            invalidation_mutex: std::sync::Mutex::new(()),
         })
     }
 
@@ -5178,10 +2079,10 @@ mod tests {
         config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
-        jit.set_vector(28, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF);
+        jit.set_vector_parts(28, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF);
         jit.run();
 
-        assert_eq!(jit.get_vector(28), (0, 0));
+        assert_eq!(jit.get_vector_parts(28), (0, 0));
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5627,7 +2528,7 @@ mod tests {
         config.fastmem_exclusive_access = false;
 
         let jit = A32Jit::new(config).expect("A32 JIT");
-        let emitter = jit.inner.emitter.as_ref().expect("x64 emitter");
+        let emitter = jit.inner.inner.emitter.as_ref().expect("x64 emitter");
 
         assert!(!emitter.emit_config.memory.fastmem_exclusive_access);
     }
@@ -5813,7 +2714,7 @@ mod tests {
         let halt = jit.run();
 
         assert!(halt.contains(HaltReason::SVC));
-        assert_eq!(jit.get_vector(0), (lo, hi));
+        assert_eq!(jit.get_vector_parts(0), (lo, hi));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5854,7 +2755,7 @@ mod tests {
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(1, 0x1100);
-        jit.set_vector(0, lo, hi);
+        jit.set_vector_parts(0, lo, hi);
 
         let halt = jit.run();
 
@@ -6021,11 +2922,11 @@ mod tests {
         ];
         let input = (0x3280_0000u64 << 32) | 0x3280_0000;
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(0, input, input);
+            jit.set_vector_parts(0, input, input);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(0), (0, 0));
+        assert_eq!(jit.get_vector_parts(0), (0, 0));
         assert_eq!(jit.get_fpsr() & 0x18, 0x18);
     }
 
@@ -6037,13 +2938,13 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(0, 0x0001_7c01_c000_3c00, 0);
+            jit.set_vector_parts(0, 0x0001_7c01_c000_3c00, 0);
             jit.set_fpcr(1 << 25);
             jit.set_fpsr(0);
         });
 
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             (0xc000_0000_3f80_0000, 0x3380_0000_7fc0_0000)
         );
         assert_eq!(jit.get_fpsr() & 1, 1);
@@ -6057,13 +2958,13 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(14, 0, 0);
-            jit.set_vector(0, 0, 0);
+            jit.set_vector_parts(14, 0, 0);
+            jit.set_vector_parts(0, 0, 0);
             jit.set_fpcr(1 << 25);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(11).0 as u32, 0x7fc0_0000);
+        assert_eq!(jit.get_vector_parts(11).0 as u32, 0x7fc0_0000);
         assert_eq!(jit.get_fpsr() & 1, 1);
     }
 
@@ -6075,7 +2976,7 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(0, 1.5f32.to_bits() as u64, 0);
+            jit.set_vector_parts(0, 1.5f32.to_bits() as u64, 0);
             jit.set_fpsr(0);
         });
 
@@ -6094,7 +2995,7 @@ mod tests {
             &code,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             |jit| {
-                jit.set_vector(1, 1.5f32.to_bits() as u64, 0);
+                jit.set_vector_parts(1, 1.5f32.to_bits() as u64, 0);
                 jit.set_fpsr(0);
             },
         );
@@ -6112,7 +3013,7 @@ mod tests {
         ];
         let initial_fpsr = 0x0800_001c;
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(0, 0x43cd_9a29_e4a6_d831, 0);
+            jit.set_vector_parts(0, 0x43cd_9a29_e4a6_d831, 0);
             jit.set_fpsr(initial_fpsr);
         });
 
@@ -6128,12 +3029,12 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(1, 0x7f80_0001, u64::MAX);
+            jit.set_vector_parts(1, 0x7f80_0001, u64::MAX);
             jit.set_fpcr(1 << 25);
             jit.set_fpsr(1 << 1);
         });
 
-        assert_eq!(jit.get_vector(0), (0x7fc0_0000, 0));
+        assert_eq!(jit.get_vector_parts(0), (0x7fc0_0000, 0));
         assert_eq!(jit.get_fpsr(), (1 << 1) | 1);
     }
 
@@ -6145,12 +3046,12 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(1, 4.0f32.to_bits() as u64, u64::MAX);
-            jit.set_vector(2, 0.25f32.to_bits() as u64, u64::MAX);
+            jit.set_vector_parts(1, 4.0f32.to_bits() as u64, u64::MAX);
+            jit.set_vector_parts(2, 0.25f32.to_bits() as u64, u64::MAX);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(0), (1.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(0), (1.0f32.to_bits() as u64, 0));
         assert_eq!(jit.get_fpsr(), 0);
     }
 
@@ -6162,12 +3063,12 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(1, 0.0f32.to_bits() as u64, u64::MAX);
-            jit.set_vector(2, f32::INFINITY.to_bits() as u64, u64::MAX);
+            jit.set_vector_parts(1, 0.0f32.to_bits() as u64, u64::MAX);
+            jit.set_vector_parts(2, f32::INFINITY.to_bits() as u64, u64::MAX);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(0), (2.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(0), (2.0f32.to_bits() as u64, 0));
         // The native FMA is attempted before its NaN redirects execution to
         // the architectural helper, so Eden retains IOC in MXCSR.
         assert_eq!(jit.get_fpsr(), 1);
@@ -6181,12 +3082,12 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(1, 4.0f32.to_bits() as u64, u64::MAX);
-            jit.set_vector(2, 0.5f32.to_bits() as u64, u64::MAX);
+            jit.set_vector_parts(1, 4.0f32.to_bits() as u64, u64::MAX);
+            jit.set_vector_parts(2, 0.5f32.to_bits() as u64, u64::MAX);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(0), (0.5f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(0), (0.5f32.to_bits() as u64, 0));
         assert_eq!(jit.get_fpsr(), 0);
     }
 
@@ -6198,13 +3099,13 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(5, 0xFC6A_0206, 0);
-            jit.set_vector(24, 0xFC6A_0206, 0);
+            jit.set_vector_parts(5, 0xFC6A_0206, 0);
+            jit.set_vector_parts(24, 0xFC6A_0206, 0);
             jit.set_fpcr(0x0040_0000);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(13), (0xFF7F_FFFF, 0));
+        assert_eq!(jit.get_vector_parts(13), (0xFF7F_FFFF, 0));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -6223,13 +3124,13 @@ mod tests {
             let v1_high = (16.0f32.to_bits() as u64) | ((32.0f32.to_bits() as u64) << 32);
             let v2_low = (0.25f32.to_bits() as u64) | ((0.125f32.to_bits() as u64) << 32);
             let v2_high = (0.0625f32.to_bits() as u64) | ((0.03125f32.to_bits() as u64) << 32);
-            jit.set_vector(1, v1_low, v1_high);
-            jit.set_vector(2, v2_low, v2_high);
+            jit.set_vector_parts(1, v1_low, v1_high);
+            jit.set_vector_parts(2, v2_low, v2_high);
             jit.set_fpsr(0);
         });
 
         let one_pair = (1.0f32.to_bits() as u64) | ((1.0f32.to_bits() as u64) << 32);
-        assert_eq!(jit.get_vector(0), (one_pair, one_pair));
+        assert_eq!(jit.get_vector_parts(0), (one_pair, one_pair));
         assert_eq!(jit.get_fpsr(), 0);
     }
 
@@ -6249,13 +3150,13 @@ mod tests {
             let v1_high = (16.0f32.to_bits() as u64) | ((32.0f32.to_bits() as u64) << 32);
             let v2_low = (0.5f32.to_bits() as u64) | ((0.25f32.to_bits() as u64) << 32);
             let v2_high = (0.125f32.to_bits() as u64) | ((0.0625f32.to_bits() as u64) << 32);
-            jit.set_vector(1, v1_low, v1_high);
-            jit.set_vector(2, v2_low, v2_high);
+            jit.set_vector_parts(1, v1_low, v1_high);
+            jit.set_vector_parts(2, v2_low, v2_high);
             jit.set_fpsr(0);
         });
 
         let half_pair = (0.5f32.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
-        assert_eq!(jit.get_vector(0), (half_pair, half_pair));
+        assert_eq!(jit.get_vector_parts(0), (half_pair, half_pair));
         assert_eq!(jit.get_fpsr(), 0);
     }
 
@@ -6271,14 +3172,14 @@ mod tests {
             let v1_high = (8.0f32.to_bits() as u64) | ((16.0f32.to_bits() as u64) << 32);
             let v2_low = (f32::INFINITY.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
             let v2_high = (0.25f32.to_bits() as u64) | ((0.125f32.to_bits() as u64) << 32);
-            jit.set_vector(1, v1_low, v1_high);
-            jit.set_vector(2, v2_low, v2_high);
+            jit.set_vector_parts(1, v1_low, v1_high);
+            jit.set_vector_parts(2, v2_low, v2_high);
             jit.set_fpsr(0);
         });
 
         let low = (1.5f32.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
         let high = (0.5f32.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
-        assert_eq!(jit.get_vector(0), (low, high));
+        assert_eq!(jit.get_vector_parts(0), (low, high));
         // The speculative native FMA raises IOC for 0 * infinity before the
         // vector is redirected to the reference fallback. Upstream retains
         // that sticky host exception in FPSR.
@@ -6295,13 +3196,13 @@ mod tests {
         let jit = run_a64_alu(&code, |jit| {
             let v4 = (4.0f32.to_bits() as u64) | ((0xffd4_e6ddu64) << 32);
             let v5 = (1.0f32.to_bits() as u64) | ((2.0f32.to_bits() as u64) << 32);
-            jit.set_vector(4, v4, 0);
-            jit.set_vector(5, v5, 0);
+            jit.set_vector_parts(4, v4, 0);
+            jit.set_vector_parts(5, v5, 0);
             jit.set_fpcr(1 << 25);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(4), (0x7fc0_0000_40a0_0000, 0));
+        assert_eq!(jit.get_vector_parts(4), (0x7fc0_0000_40a0_0000, 0));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -6312,13 +3213,13 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(3, 1, 0);
-            jit.set_vector(0, 0, 0);
+            jit.set_vector_parts(3, 1, 0);
+            jit.set_vector_parts(0, 0, 0);
             jit.set_fpcr(1 << 24);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(3).0 as u32, 0);
+        assert_eq!(jit.get_vector_parts(3).0 as u32, 0);
         assert_eq!(jit.get_fpsr() & (1 << 7), 0);
     }
 
@@ -6330,12 +3231,12 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(&code, |jit| {
-            jit.set_vector(9, 0x7ff0_62c7, 0);
+            jit.set_vector_parts(9, 0x7ff0_62c7, 0);
             jit.set_fpcr(1 << 25);
             jit.set_fpsr(0);
         });
 
-        assert_eq!(jit.get_vector(0).0, 0x7ff8_0000_0000_0000);
+        assert_eq!(jit.get_vector_parts(0).0, 0x7ff8_0000_0000_0000);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -6491,7 +3392,7 @@ mod tests {
             0xD400_0001, // SVC #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 1.5f32.to_bits() as u64, 0);
+            j.set_vector_parts(1, 1.5f32.to_bits() as u64, 0);
         });
         assert_eq!(jit.get_register(0), 384);
     }
@@ -6505,7 +3406,7 @@ mod tests {
                 0xD400_0001, // SVC #0
             ];
             let jit = run_a64_alu(code, |jit| {
-                jit.set_vector(30, value.to_bits(), 0);
+                jit.set_vector_parts(30, value.to_bits(), 0);
             });
             (jit.get_register(2), jit.get_fpsr())
         };
@@ -6524,7 +3425,7 @@ mod tests {
         let convert = |instruction: u32, value: f64| {
             let code = [instruction, 0xD400_0001];
             let jit = run_a64_alu(&code, |jit| {
-                jit.set_vector(30, value.to_bits(), 0);
+                jit.set_vector_parts(30, value.to_bits(), 0);
             });
             jit.get_register(2)
         };
@@ -6603,18 +3504,18 @@ mod tests {
         let else_bits = (-2.5f32).to_bits() as u64;
 
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 0xAAAA_AAAA_0000_0000 | then_bits, u64::MAX);
-            j.set_vector(2, 0xBBBB_BBBB_0000_0000 | else_bits, u64::MAX);
+            j.set_vector_parts(1, 0xAAAA_AAAA_0000_0000 | then_bits, u64::MAX);
+            j.set_vector_parts(2, 0xBBBB_BBBB_0000_0000 | else_bits, u64::MAX);
             j.set_pstate(NZCV_Z);
         });
-        assert_eq!(jit.get_vector(0), (then_bits, 0));
+        assert_eq!(jit.get_vector_parts(0), (then_bits, 0));
 
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 0xAAAA_AAAA_0000_0000 | then_bits, u64::MAX);
-            j.set_vector(2, 0xBBBB_BBBB_0000_0000 | else_bits, u64::MAX);
+            j.set_vector_parts(1, 0xAAAA_AAAA_0000_0000 | then_bits, u64::MAX);
+            j.set_vector_parts(2, 0xBBBB_BBBB_0000_0000 | else_bits, u64::MAX);
             j.set_pstate(0);
         });
-        assert_eq!(jit.get_vector(0), (else_bits, 0));
+        assert_eq!(jit.get_vector_parts(0), (else_bits, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -6631,16 +3532,16 @@ mod tests {
 
         let positive = 0.25f32.to_bits() as u64;
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(23, positive, u64::MAX);
-            j.set_vector(25, u64::MAX, u64::MAX);
+            j.set_vector_parts(23, positive, u64::MAX);
+            j.set_vector_parts(25, u64::MAX, u64::MAX);
         });
-        assert_eq!(jit.get_vector(23), (positive, 0));
+        assert_eq!(jit.get_vector_parts(23), (positive, 0));
 
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(23, (-0.25f32).to_bits() as u64, u64::MAX);
-            j.set_vector(25, u64::MAX, u64::MAX);
+            j.set_vector_parts(23, (-0.25f32).to_bits() as u64, u64::MAX);
+            j.set_vector_parts(25, u64::MAX, u64::MAX);
         });
-        assert_eq!(jit.get_vector(23), (0, 0));
+        assert_eq!(jit.get_vector_parts(23), (0, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -6701,10 +3602,10 @@ mod tests {
         // REV32 V0.8H, V1.8H ; SVC #0
         let code: &[u32] = &[0x6E60_0820, 0xD400_0001];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 0x0004_0003_0002_0001, 0x0008_0007_0006_0005);
+            j.set_vector_parts(1, 0x0004_0003_0002_0001, 0x0008_0007_0006_0005);
         });
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             (0x0003_0004_0001_0002, 0x0007_0008_0005_0006)
         );
     }
@@ -6730,31 +3631,31 @@ mod tests {
         };
         let jit = run_a64_alu(code, |j| {
             let (lo, hi) = pack(input);
-            j.set_vector(16, lo, hi);
+            j.set_vector_parts(16, lo, hi);
         });
 
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             pack([1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14])
         );
         assert_eq!(
-            jit.get_vector(1),
+            jit.get_vector_parts(1),
             pack([3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12])
         );
         assert_eq!(
-            jit.get_vector(2),
+            jit.get_vector_parts(2),
             pack([2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13])
         );
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             pack([7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8])
         );
         assert_eq!(
-            jit.get_vector(4),
+            jit.get_vector_parts(4),
             pack([6, 7, 4, 5, 2, 3, 0, 1, 14, 15, 12, 13, 10, 11, 8, 9])
         );
         assert_eq!(
-            jit.get_vector(5),
+            jit.get_vector_parts(5),
             pack([4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11])
         );
     }
@@ -6800,8 +3701,8 @@ mod tests {
         let jit = run_a64_alu(code, |jit| {
             let (a_lo, a_hi) = pack(&a);
             let (b_lo, b_hi) = pack(&b);
-            jit.set_vector(16, a_lo, a_hi);
-            jit.set_vector(17, b_lo, b_hi);
+            jit.set_vector_parts(16, a_lo, a_hi);
+            jit.set_vector_parts(17, b_lo, b_hi);
         });
 
         for (register, lane_bytes, part) in [
@@ -6815,7 +3716,7 @@ mod tests {
             (7, 8, 1),
         ] {
             assert_eq!(
-                jit.get_vector(register),
+                jit.get_vector_parts(register),
                 expected(lane_bytes, part),
                 "TRN{} with {}-bit elements",
                 part + 1,
@@ -6831,10 +3732,10 @@ mod tests {
         // software FPRoundInt<u16> fallback instead of host FP16 instructions.
         let code: &[u32] = &[0x4E79_8820, 0xD400_0001];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 0xc100_be00_4100_3e00, 0x8000_0000_bc00_3c00);
+            j.set_vector_parts(1, 0xc100_be00_4100_3e00, 0x8000_0000_bc00_3c00);
         });
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             (0xc000_c000_4000_4000, 0x8000_0000_bc00_3c00)
         );
     }
@@ -6871,11 +3772,11 @@ mod tests {
             A64Jit::new(config).unwrap()
         };
         jit.set_pc(0x1000);
-        jit.set_vector(1, (f(2.0) << 32) | f(1.0), (f(4.0) << 32) | f(3.0));
-        jit.set_vector(2, (f(6.0) << 32) | f(5.0), (f(8.0) << 32) | f(7.0));
+        jit.set_vector_parts(1, (f(2.0) << 32) | f(1.0), (f(4.0) << 32) | f(3.0));
+        jit.set_vector_parts(2, (f(6.0) << 32) | f(5.0), (f(8.0) << 32) | f(7.0));
         let _ = jit.run();
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             ((f(12.0) << 32) | f(5.0), (f(32.0) << 32) | f(21.0)),
             "FMUL V0.4S must be lanewise product"
         );
@@ -6894,14 +3795,14 @@ mod tests {
         let qnan = 0x7FC5_4321u64;
         let one = 1.0f32.to_bits() as u64;
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, (one << 32) | qnan, 0);
-            j.set_vector(2, 0x0000_0000_8000_0000, 0);
+            j.set_vector_parts(1, (one << 32) | qnan, 0);
+            j.set_vector_parts(2, 0x0000_0000_8000_0000, 0);
         });
 
-        assert_eq!(jit.get_vector(0), (qnan, 0));
-        assert_eq!(jit.get_vector(3), (0x8000_0000_0000_0000 | qnan, 0));
-        assert_eq!(jit.get_vector(4), (one, 0));
-        assert_eq!(jit.get_vector(5), (0x8000_0000_0000_0000 | one, 0));
+        assert_eq!(jit.get_vector_parts(0), (qnan, 0));
+        assert_eq!(jit.get_vector_parts(3), (0x8000_0000_0000_0000 | qnan, 0));
+        assert_eq!(jit.get_vector_parts(4), (one, 0));
+        assert_eq!(jit.get_vector_parts(5), (0x8000_0000_0000_0000 | one, 0));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -6921,18 +3822,24 @@ mod tests {
         let two = 2.0f32.to_bits() as u64;
         let minus_three = (-3.0f32).to_bits() as u64;
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, qnan | (snan << 32), 0x8000_0000 | (two << 32));
-            j.set_vector(2, one | (qnan << 32), minus_three << 32);
+            j.set_vector_parts(1, qnan | (snan << 32), 0x8000_0000 | (two << 32));
+            j.set_vector_parts(2, one | (qnan << 32), minus_three << 32);
         });
 
-        assert_eq!(jit.get_vector(0), (qnan | (quiet_snan << 32), two << 32));
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(0),
+            (qnan | (quiet_snan << 32), two << 32)
+        );
+        assert_eq!(
+            jit.get_vector_parts(3),
             (qnan | (quiet_snan << 32), 0x8000_0000 | (minus_three << 32))
         );
-        assert_eq!(jit.get_vector(4), (one | (quiet_snan << 32), two << 32));
         assert_eq!(
-            jit.get_vector(5),
+            jit.get_vector_parts(4),
+            (one | (quiet_snan << 32), two << 32)
+        );
+        assert_eq!(
+            jit.get_vector_parts(5),
             (one | (quiet_snan << 32), 0x8000_0000 | (minus_three << 32))
         );
         assert_ne!(jit.get_fpsr() & 1, 0, "signaling NaN must set FPSR.IOC");
@@ -6987,11 +3894,76 @@ mod tests {
         let mut jit = A64Jit::new(config).unwrap();
 
         jit.set_pc(0x1000);
+        let location = LocationDescriptor::new(jit.inner.inner.jit_state.get_unique_hash());
         assert!(jit.run().contains(HaltReason::SVC));
         assert_eq!(jit.get_register(0), 2);
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
+
+        let entrypoint = jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .get(&location)
+            .unwrap()
+            .entrypoint;
+        jit.inner.inner.jit_state.rsb_ptr = 0;
+        jit.inner.inner.jit_state.rsb_location_descriptors[7] = location.value();
+        jit.inner.inner.jit_state.rsb_codeptrs[7] = entrypoint as u64;
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_mut()
+            .unwrap()
+            .cache
+            .remove(&location));
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1000);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert!(!jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
+
+        jit.inner.inner.jit_state.reset_rsb();
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1000);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
 
         memory.lock().unwrap()[4..8].copy_from_slice(&0xd280_0060_u32.to_le_bytes());
         jit.invalidate_cache_range(0x1004, 4);
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
+        assert!(HaltReason::from_bits_truncate(jit.read_halt_reason())
+            .contains(HaltReason::CACHE_INVALIDATION));
         jit.clear_halt(HaltReason::SVC);
         jit.set_pc(0x1000);
 
@@ -7022,16 +3994,260 @@ mod tests {
         let mut jit = A32Jit::new(config).unwrap();
 
         jit.set_pc(0x1000);
+        let location = LocationDescriptor::new(jit.inner.inner.jit_state.get_unique_hash());
         assert!(jit.run().contains(HaltReason::SVC));
         assert_eq!(jit.get_register(0), 2);
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
+
+        let entrypoint = jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .get(&location)
+            .unwrap()
+            .entrypoint;
+        jit.inner.inner.jit_state.rsb_ptr = 0;
+        jit.inner.inner.jit_state.rsb_location_descriptors[7] = location.value();
+        jit.inner.inner.jit_state.rsb_codeptrs[7] = entrypoint as u64;
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_mut()
+            .unwrap()
+            .cache
+            .remove(&location));
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1000);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert!(!jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
+
+        jit.inner.inner.jit_state.reset_rsb();
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1000);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
 
         memory.lock().unwrap()[4..8].copy_from_slice(&0xe3a0_0003_u32.to_le_bytes());
         jit.invalidate_cache_range(0x1004, 4);
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .cache
+            .contains(&location));
+        assert!(HaltReason::from_bits_truncate(jit.read_halt_reason())
+            .contains(HaltReason::CACHE_INVALIDATION));
         jit.clear_halt(HaltReason::SVC);
         jit.set_pc(0x1000);
 
         assert!(jit.run().contains(HaltReason::SVC));
         assert_eq!(jit.get_register(0), 3);
+    }
+
+    #[test]
+    fn a64_low_code_space_evacuation_resets_the_interface_rsb() {
+        const MINIMUM_REMAINING_CODE_SIZE: usize = 1024 * 1024;
+        let mut memory = vec![0_u8; 0x10000];
+        for offset in [0, 0x100, 0x200] {
+            memory[offset..offset + 4].copy_from_slice(&0xd400_0001_u32.to_le_bytes());
+        }
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        let mut jit = A64Jit::new(config).unwrap();
+
+        jit.set_pc(0x1000);
+        let first_location = LocationDescriptor::new(jit.inner.inner.jit_state.get_unique_hash());
+        assert!(jit.run().contains(HaltReason::SVC));
+        let first_entrypoint = jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .lookup_cached_block(first_location)
+            .unwrap();
+
+        {
+            let emitter = jit.inner.inner.emitter.as_mut().unwrap();
+            let capacity = emitter.code.asm.capacity();
+            emitter
+                .code
+                .asm
+                .set_size(capacity - MINIMUM_REMAINING_CODE_SIZE);
+            assert_eq!(emitter.code.space_remaining(), MINIMUM_REMAINING_CODE_SIZE);
+        }
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1100);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .lookup_cached_block(first_location)
+            .is_some());
+        assert!(
+            jit.inner
+                .inner
+                .emitter
+                .as_ref()
+                .unwrap()
+                .code
+                .space_remaining()
+                < MINIMUM_REMAINING_CODE_SIZE
+        );
+
+        jit.inner.inner.jit_state.rsb_ptr = 0;
+        jit.inner.inner.jit_state.rsb_location_descriptors[7] = first_location.value();
+        jit.inner.inner.jit_state.rsb_codeptrs[7] = first_entrypoint as u64;
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1200);
+        assert!(jit.run().contains(HaltReason::SVC));
+
+        assert_eq!(
+            jit.inner.inner.jit_state.rsb_location_descriptors[7],
+            u64::MAX
+        );
+        assert_eq!(jit.inner.inner.jit_state.rsb_codeptrs[7], 0);
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .lookup_cached_block(first_location)
+            .is_none());
+    }
+
+    #[test]
+    fn a32_low_code_space_evacuation_resets_the_interface_rsb() {
+        const MINIMUM_REMAINING_CODE_SIZE: usize = 1024 * 1024;
+        let mut memory = vec![0_u8; 0x10000];
+        for offset in [0, 0x100, 0x200] {
+            memory[offset..offset + 4].copy_from_slice(&0xef00_0000_u32.to_le_bytes());
+        }
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        let mut jit = A32Jit::new(config).unwrap();
+
+        jit.set_pc(0x1000);
+        let first_location = LocationDescriptor::new(jit.inner.inner.jit_state.get_unique_hash());
+        assert!(jit.run().contains(HaltReason::SVC));
+        let first_entrypoint = jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .lookup_cached_block(first_location)
+            .unwrap();
+
+        {
+            let emitter = jit.inner.inner.emitter.as_mut().unwrap();
+            let capacity = emitter.code.asm.capacity();
+            emitter
+                .code
+                .asm
+                .set_size(capacity - MINIMUM_REMAINING_CODE_SIZE);
+            assert_eq!(emitter.code.space_remaining(), MINIMUM_REMAINING_CODE_SIZE);
+        }
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1100);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .lookup_cached_block(first_location)
+            .is_some());
+        assert!(
+            jit.inner
+                .inner
+                .emitter
+                .as_ref()
+                .unwrap()
+                .code
+                .space_remaining()
+                < MINIMUM_REMAINING_CODE_SIZE
+        );
+
+        jit.inner.inner.jit_state.rsb_ptr = 0;
+        jit.inner.inner.jit_state.rsb_location_descriptors[7] = first_location.value();
+        jit.inner.inner.jit_state.rsb_codeptrs[7] = first_entrypoint as u64;
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_pc(0x1200);
+        assert!(jit.run().contains(HaltReason::SVC));
+
+        assert_eq!(
+            jit.inner.inner.jit_state.rsb_location_descriptors[7],
+            u64::MAX
+        );
+        assert_eq!(jit.inner.inner.jit_state.rsb_codeptrs[7], 0);
+        assert!(jit
+            .inner
+            .inner
+            .emitter
+            .as_ref()
+            .unwrap()
+            .lookup_cached_block(first_location)
+            .is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a32_public_state_surface_matches_upstream() {
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        let mut jit = A32Jit::new(config).unwrap();
+
+        jit.regs_mut()[0] = 0x1234_5678;
+        jit.regs_mut()[15] = 0x1000;
+        jit.ext_regs_mut()[63] = 0xaabb_ccdd;
+        assert_eq!(jit.regs()[0], 0x1234_5678);
+        assert_eq!(jit.regs()[15], 0x1000);
+        assert_eq!(jit.ext_regs()[63], 0xaabb_ccdd);
+        assert!(!jit.is_executing());
+        assert!(jit.disassemble().contains("generated x86_64 code"));
+
+        jit.reset();
+        assert_eq!(jit.regs(), &[0; 16]);
+        assert_eq!(jit.ext_regs(), &[0; 64]);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -7070,11 +4286,31 @@ mod tests {
         jit.set_register(30, 0xDEAD);
         assert_eq!(jit.get_register(30), 0xDEAD);
 
-        jit.set_vector(0, 0x1111, 0x2222);
-        assert_eq!(jit.get_vector(0), (0x1111, 0x2222));
+        jit.set_register(31, 0xCAFE);
+        assert_eq!(jit.get_register(31), 0xCAFE);
+        assert_eq!(jit.get_sp(), 0xCAFE);
+
+        let registers = std::array::from_fn(|index| index as u64 * 3);
+        jit.set_registers(registers);
+        assert_eq!(jit.get_registers(), registers);
+
+        jit.set_vector_parts(0, 0x1111, 0x2222);
+        assert_eq!(jit.get_vector_parts(0), (0x1111, 0x2222));
+
+        let vectors = std::array::from_fn(|index| [index as u64, !(index as u64)]);
+        jit.set_vectors(vectors);
+        assert_eq!(jit.get_vectors(), vectors);
+
+        assert!(!jit.is_executing());
+        assert!(jit.disassemble().contains("generated x86_64 code"));
 
         jit.set_tpidr_el0(0xABCD);
         assert_eq!(jit.get_tpidr_el0(), 0xABCD);
+
+        jit.reset();
+        assert_eq!(jit.get_registers(), [0; 31]);
+        assert_eq!(jit.get_vectors(), [[0; 2]; 32]);
+        assert_eq!(jit.get_sp(), 0);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -7103,11 +4339,11 @@ mod tests {
 
         jit.halt_execution(HaltReason::EXTERNAL_HALT);
         // Read back via the jit_state directly
-        let halt = HaltReason::from_bits_truncate(jit.inner.jit_state.halt_reason);
+        let halt = HaltReason::from_bits_truncate(jit.inner.inner.jit_state.halt_reason);
         assert!(halt.contains(HaltReason::EXTERNAL_HALT));
 
         jit.clear_halt(HaltReason::EXTERNAL_HALT);
-        let halt = HaltReason::from_bits_truncate(jit.inner.jit_state.halt_reason);
+        let halt = HaltReason::from_bits_truncate(jit.inner.inner.jit_state.halt_reason);
         assert!(!halt.contains(HaltReason::EXTERNAL_HALT));
     }
 
@@ -7490,14 +4726,14 @@ mod tests {
 
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
-        jit.set_vector(0, 0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908);
-        jit.set_vector(1, 0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918);
-        jit.set_vector(2, 0x211F_2011_100F_0100, 0x0302_0100_FF20_1E10);
+        jit.set_vector_parts(0, 0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908);
+        jit.set_vector_parts(1, 0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918);
+        jit.set_vector_parts(2, 0x211F_2011_100F_0100, 0x0302_0100_FF20_1E10);
 
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             (0x001F_0011_100F_0100, 0x0302_0100_0000_1E10)
         );
     }
@@ -7531,15 +4767,15 @@ mod tests {
 
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
-        jit.set_vector(0, 0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908);
-        jit.set_vector(1, 0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918);
-        jit.set_vector(2, 0x211F_2011_100F_0100, 0x0302_0100_FF20_1E10);
-        jit.set_vector(3, 0xA7A6_A5A4_A3A2_A1A0, 0xAFAE_ADAC_ABAA_A9A8);
+        jit.set_vector_parts(0, 0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908);
+        jit.set_vector_parts(1, 0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918);
+        jit.set_vector_parts(2, 0x211F_2011_100F_0100, 0x0302_0100_FF20_1E10);
+        jit.set_vector_parts(3, 0xA7A6_A5A4_A3A2_A1A0, 0xAFAE_ADAC_ABAA_A9A8);
 
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             (0xA71F_A511_100F_0100, 0x0302_0100_ABAA_1E10)
         );
     }
@@ -8096,7 +5332,7 @@ mod tests {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            jit.inner.jit_state.exclusive_state = 1;
+            jit.inner.inner.jit_state.exclusive_state = 1;
         }
 
         let halt = jit.step();
@@ -8112,7 +5348,7 @@ mod tests {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            assert_eq!(jit.inner.jit_state.exclusive_state, 0);
+            assert_eq!(jit.inner.inner.jit_state.exclusive_state, 0);
         }
     }
 
@@ -9905,18 +7141,18 @@ mod tests {
         let v0_lane: u64 = u64::from_le_bytes([
             target, target, target, target, target, target, target, target,
         ]);
-        jit.set_vector(0, v0_lane, v0_lane);
+        jit.set_vector_parts(0, v0_lane, v0_lane);
 
         // v1 = first 16 bytes of "//share/supertuxkart/data/skins\0":
         // "//share/supertux" (no NUL, no ':')
         let v1_lo = u64::from_le_bytes(*b"//share/");
         let v1_hi = u64::from_le_bytes(*b"supertux");
-        jit.set_vector(1, v1_lo, v1_hi);
+        jit.set_vector_parts(1, v1_lo, v1_hi);
 
         // v2 = next 16 bytes: "kart/data/skins" + NUL at byte 31 (= byte 15 of v2).
         let v2_lo = u64::from_le_bytes(*b"kart/dat");
         let v2_hi = u64::from_le_bytes(*b"a/skins\0");
-        jit.set_vector(2, v2_lo, v2_hi);
+        jit.set_vector_parts(2, v2_lo, v2_hi);
 
         // v7 = (v16 + v16) per u32 lane — see prologue at 0x80E3C69C.
         // v16 broadcasts 0xC0300C03 → bytes per lane [0x03,0x0C,0x30,0xC0].
@@ -9925,8 +7161,8 @@ mod tests {
         let v7_lane: u32 = v16_lane.wrapping_add(v16_lane); // 0x8060_1806
         let v16_64 = (v16_lane as u64) | ((v16_lane as u64) << 32);
         let v7_64 = (v7_lane as u64) | ((v7_lane as u64) << 32);
-        jit.set_vector(7, v7_64, v7_64);
-        jit.set_vector(16, v16_64, v16_64);
+        jit.set_vector_parts(7, v7_64, v7_64);
+        jit.set_vector_parts(16, v16_64, v16_64);
 
         let halt = jit.run();
         assert!(
@@ -9954,10 +7190,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(&code, |j| {
-            j.set_vector(3, n.0, n.1);
-            j.set_vector(5, m.0, m.1);
+            j.set_vector_parts(3, n.0, n.1);
+            j.set_vector_parts(5, m.0, m.1);
         });
-        assert_eq!(jit.get_vector(3), (n.0 | !m.0, n.1 | !m.1));
+        assert_eq!(jit.get_vector_parts(3), (n.0 | !m.0, n.1 | !m.1));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -9970,10 +7206,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(&code, |j| {
-            j.set_vector(3, n, u64::MAX);
-            j.set_vector(5, m, u64::MAX);
+            j.set_vector_parts(3, n, u64::MAX);
+            j.set_vector_parts(5, m, u64::MAX);
         });
-        assert_eq!(jit.get_vector(3), (n | !m, 0));
+        assert_eq!(jit.get_vector_parts(3), (n | !m, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -10010,14 +7246,14 @@ mod tests {
         let n_hi = 0x5555_6666_7777_8888;
         let m_lo = 0xAAAA_BBBB_CCCC_DDDD;
         let m_hi = 0xEEEE_FFFF_9999_0000;
-        jit.set_vector(3, d_lo, d_hi);
-        jit.set_vector(5, n_lo, n_hi);
-        jit.set_vector(7, m_lo, m_hi);
+        jit.set_vector_parts(3, d_lo, d_hi);
+        jit.set_vector_parts(5, n_lo, n_hi);
+        jit.set_vector_parts(7, m_lo, m_hi);
 
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             (m_lo ^ ((m_lo ^ n_lo) & d_lo), m_hi ^ ((m_hi ^ n_hi) & d_hi),)
         );
     }
@@ -10056,14 +7292,14 @@ mod tests {
         let n_hi = 0x0000_FFFF_0000_FFFF;
         let m_lo = 0x0F0F_F0F0_AAAA_5555;
         let m_hi = 0x3333_CCCC_55AA_AA55;
-        jit.set_vector(3, d_lo, d_hi);
-        jit.set_vector(5, n_lo, n_hi);
-        jit.set_vector(7, m_lo, m_hi);
+        jit.set_vector_parts(3, d_lo, d_hi);
+        jit.set_vector_parts(5, n_lo, n_hi);
+        jit.set_vector_parts(7, m_lo, m_hi);
 
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             (d_lo ^ ((d_lo ^ n_lo) & m_lo), d_hi ^ ((d_hi ^ n_hi) & m_hi),)
         );
     }
@@ -10105,10 +7341,10 @@ mod tests {
         config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
-        jit.set_vector(31, 0xDEADBEEFCAFEBABE, 0x1234567890ABCDEF);
+        jit.set_vector_parts(31, 0xDEADBEEFCAFEBABE, 0x1234567890ABCDEF);
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
-        let (lo, hi) = jit.get_vector(31);
+        let (lo, hi) = jit.get_vector_parts(31);
         assert_eq!(
             lo, 0,
             "MOVI v31.4s,#0 must zero lower 64; got 0x{:016X}",
@@ -10162,14 +7398,14 @@ mod tests {
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         // Pre-fill v31 with the EXACT sentinel pattern STK observed.
-        jit.set_vector(31, 0xFFFFFFFFFFFFFFFF, 0x00FFFFFF00FFFFFF);
+        jit.set_vector_parts(31, 0xFFFFFFFFFFFFFFFF, 0x00FFFFFF00FFFFFF);
         let halt = jit.run();
         assert!(
             halt.contains(HaltReason::SVC),
             "expected SVC, got {:?}",
             halt
         );
-        let (lo, hi) = jit.get_vector(31);
+        let (lo, hi) = jit.get_vector_parts(31);
         assert_eq!(
             lo, 0,
             "MOVI v31.4s,#0 must zero lower 64 even after subsequent str+stp; \
@@ -10219,14 +7455,14 @@ mod tests {
         jit.set_pc(0x1000);
         // V0.8B = bytes [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
         // sum = 0x24 = 36; truncated to 8 bits → 0x24
-        jit.set_vector(0, 0x0807060504030201, 0xFFFFFFFFFFFFFFFF);
+        jit.set_vector_parts(0, 0x0807060504030201, 0xFFFFFFFFFFFFFFFF);
         let halt = jit.run();
         assert!(
             halt.contains(HaltReason::SVC),
             "expected SVC, got {:?}",
             halt
         );
-        let (lo, hi) = jit.get_vector(0);
+        let (lo, hi) = jit.get_vector_parts(0);
         assert_eq!(
             lo & 0xFF,
             0x24,
@@ -10252,9 +7488,9 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, 0x0807_0605_0403_0201, 0xFFFF_FFFF_FFFF_FFFF);
+            j.set_vector_parts(0, 0x0807_0605_0403_0201, 0xFFFF_FFFF_FFFF_FFFF);
         });
-        let (lo, hi) = jit.get_vector(0);
+        let (lo, hi) = jit.get_vector_parts(0);
         assert_eq!(
             lo, 0x24,
             "UADDLV should write 16-bit sum and clear Vd low D"
@@ -10270,12 +7506,12 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(2, 0x0067_0066_0065_0064, 0x006B_006A_0069_0068);
-            j.set_vector(4, 0x0807_0605_0403_0201, u64::MAX);
-            j.set_vector(6, u64::MAX, u64::MAX);
+            j.set_vector_parts(2, 0x0067_0066_0065_0064, 0x006B_006A_0069_0068);
+            j.set_vector_parts(4, 0x0807_0605_0403_0201, u64::MAX);
+            j.set_vector_parts(6, u64::MAX, u64::MAX);
         });
         assert_eq!(
-            jit.get_vector(6),
+            jit.get_vector_parts(6),
             (0x006B_0069_0067_0065, 0x0073_0071_006F_006D)
         );
     }
@@ -10288,11 +7524,11 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 0x03E8_03E8_03E8_03E8, 0x03E8_03E8_03E8_03E8);
-            j.set_vector(7, 0x4000_0000_0000_0000, 0);
+            j.set_vector_parts(1, 0x03E8_03E8_03E8_03E8, 0x03E8_03E8_03E8_03E8);
+            j.set_vector_parts(7, 0x4000_0000_0000_0000, 0);
         });
         assert_eq!(
-            jit.get_vector(1),
+            jit.get_vector_parts(1),
             (0x01F4_01F4_01F4_01F4, 0x01F4_01F4_01F4_01F4)
         );
     }
@@ -10307,9 +7543,9 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             // Bytes: [-1, -2, 1, 2, 3, 4, 5, 6] => 18 = 0x0012.
-            j.set_vector(0, 0x0605_0403_0201_FEFF, 0xFFFF_FFFF_FFFF_FFFF);
+            j.set_vector_parts(0, 0x0605_0403_0201_FEFF, 0xFFFF_FFFF_FFFF_FFFF);
         });
-        let (lo, hi) = jit.get_vector(0);
+        let (lo, hi) = jit.get_vector_parts(0);
         assert_eq!(lo, 0x12, "SADDLV should sign-extend bytes before summing");
         assert_eq!(hi, 0, "SADDLV should clear Vd upper D");
     }
@@ -10322,28 +7558,28 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, 0x00F0_0000_0000_0001, u64::MAX);
+            j.set_vector_parts(0, 0x00F0_0000_0000_0001, u64::MAX);
         });
 
-        assert_eq!(jit.get_vector(0), (0x0000_0008_0000_001F, 0));
+        assert_eq!(jit.get_vector_parts(0), (0x0000_0008_0000_001F, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn test_a64_shll_and_shll2_zero_extend_selected_half_and_shift_by_element_size() {
         let shll = run_a64_alu(&[0x2E61_3800, 0xD400_0001], |j| {
-            j.set_vector(0, 0xFFFF_8000_7FFF_0001, u64::MAX);
+            j.set_vector_parts(0, 0xFFFF_8000_7FFF_0001, u64::MAX);
         });
         assert_eq!(
-            shll.get_vector(0),
+            shll.get_vector_parts(0),
             (0x7FFF_0000_0001_0000, 0xFFFF_0000_8000_0000)
         );
 
         let shll2 = run_a64_alu(&[0x6E61_3800, 0xD400_0001], |j| {
-            j.set_vector(0, u64::MAX, 0x0005_0004_0003_0002);
+            j.set_vector_parts(0, u64::MAX, 0x0005_0004_0003_0002);
         });
         assert_eq!(
-            shll2.get_vector(0),
+            shll2.get_vector_parts(0),
             (0x0003_0000_0002_0000, 0x0005_0000_0004_0000)
         );
     }
@@ -10357,10 +7593,10 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             // Signed halfwords: [-129, -128, -1, 0, 1, 127, 128, 300].
-            j.set_vector(15, 0x0000_FFFF_FF80_FF7F, 0x012C_0080_007F_0001);
-            j.set_vector(16, u64::MAX, u64::MAX);
+            j.set_vector_parts(15, 0x0000_FFFF_FF80_FF7F, 0x012C_0080_007F_0001);
+            j.set_vector_parts(16, u64::MAX, u64::MAX);
         });
-        let (lo, hi) = jit.get_vector(16);
+        let (lo, hi) = jit.get_vector_parts(16);
         assert_eq!(lo, 0x7F7F_7F01_00FF_8080);
         assert_eq!(hi, 0, "SQXTN must zero the destination's upper half");
         assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQXTN must set FPSR.QC");
@@ -10374,10 +7610,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(15, 0xABCD_EF01_2345_FF7F, u64::MAX);
-            j.set_vector(16, u64::MAX, u64::MAX);
+            j.set_vector_parts(15, 0xABCD_EF01_2345_FF7F, u64::MAX);
+            j.set_vector_parts(16, u64::MAX, u64::MAX);
         });
-        assert_eq!(jit.get_vector(16), (0x80, 0));
+        assert_eq!(jit.get_vector_parts(16), (0x80, 0));
         assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQXTN must set FPSR.QC");
     }
 
@@ -10389,12 +7625,12 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(18, 0, 0x0007_FFFA_0005_FFFC);
-            j.set_vector(0, 0x0000_FFFD_0000_0000, 0);
-            j.set_vector(19, u64::MAX, u64::MAX);
+            j.set_vector_parts(18, 0, 0x0007_FFFA_0005_FFFC);
+            j.set_vector_parts(0, 0x0000_FFFD_0000_0000, 0);
+            j.set_vector_parts(19, u64::MAX, u64::MAX);
         });
         assert_eq!(
-            jit.get_vector(19),
+            jit.get_vector_parts(19),
             (0xFFFF_FFF1_0000_000C, 0xFFFF_FFEB_0000_0012)
         );
     }
@@ -10408,10 +7644,10 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             // Signed halfwords: [-1000, -6, -5, -4, 2, 3, 4, 1000].
-            j.set_vector(2, 0xFFFC_FFFB_FFFA_FC18, 0x03E8_0004_0003_0002);
-            j.set_vector(28, u64::MAX, u64::MAX);
+            j.set_vector_parts(2, 0xFFFC_FFFB_FFFA_FC18, 0x03E8_0004_0003_0002);
+            j.set_vector_parts(28, u64::MAX, u64::MAX);
         });
-        assert_eq!(jit.get_vector(28), (0x7F01_0101_FFFF_FF80, 0));
+        assert_eq!(jit.get_vector_parts(28), (0x7F01_0101_FFFF_FF80, 0));
         assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQRSHRN must set FPSR.QC");
     }
 
@@ -10423,11 +7659,11 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(28, 0x0000_0064_0000_0001, 0x2000_0000_1000_0000);
-            j.set_vector(29, 0xFFFE_C000_0001_2000, 0x8000_0000_7FFF_FFFF);
+            j.set_vector_parts(28, 0x0000_0064_0000_0001, 0x2000_0000_1000_0000);
+            j.set_vector_parts(29, 0xFFFE_C000_0001_2000, 0x8000_0000_7FFF_FFFF);
         });
         assert_eq!(
-            jit.get_vector(28),
+            jit.get_vector_parts(28),
             (0x0000_0050_0000_0013, 0x1FF8_0000_1007_FFFF)
         );
     }
@@ -10442,10 +7678,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, 0x8000_0000_0000_0001, 0xFFFF_FFFF_FFFF_FFFF);
-            j.set_vector(1, 0xFFFF_FFFF_0000_0003, 0);
+            j.set_vector_parts(0, 0x8000_0000_0000_0001, 0xFFFF_FFFF_FFFF_FFFF);
+            j.set_vector_parts(1, 0xFFFF_FFFF_0000_0003, 0);
         });
-        let (lo, hi) = jit.get_vector(0);
+        let (lo, hi) = jit.get_vector_parts(0);
         assert_eq!(lo, 0x4000_0000_0000_0008);
         assert_eq!(hi, 0);
     }
@@ -10459,10 +7695,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(1, 0xFFFF_FFF6_0000_0005, 0xFFFF_FFFF_FFFF_FFFF);
-            j.set_vector(3, 0x0000_0014_FFFF_FFFE, 0);
+            j.set_vector_parts(1, 0xFFFF_FFF6_0000_0005, 0xFFFF_FFFF_FFFF_FFFF);
+            j.set_vector_parts(3, 0x0000_0014_FFFF_FFFE, 0);
         });
-        let (lo, hi) = jit.get_vector(1);
+        let (lo, hi) = jit.get_vector_parts(1);
         assert_eq!(lo, 0xFFFF_FFF6_FFFF_FFFE);
         assert_eq!(hi, 0);
     }
@@ -10500,10 +7736,10 @@ mod tests {
         // V0.4H = halfs [0x1234, 0x5678, 0x9ABC, 0xDEF0]
         // sum_u32 = 0x1234 + 0x5678 + 0x9ABC + 0xDEF0 = 0x1E258;
         // truncated to 16 bits → 0xE258.
-        jit.set_vector(0, 0xDEF0_9ABC_5678_1234, 0xCAFEBABE_DEADBEEF);
+        jit.set_vector_parts(0, 0xDEF0_9ABC_5678_1234, 0xCAFEBABE_DEADBEEF);
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
-        let (lo, hi) = jit.get_vector(0);
+        let (lo, hi) = jit.get_vector_parts(0);
         assert_eq!(
             lo & 0xFFFF,
             0xE258,
@@ -10556,10 +7792,10 @@ mod tests {
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         // Pre-fill v31 with a distinguishable sentinel that is NOT 0.
-        jit.set_vector(31, 0xDEADBEEFCAFEBABE, 0x1234567890ABCDEF);
+        jit.set_vector_parts(31, 0xDEADBEEFCAFEBABE, 0x1234567890ABCDEF);
         let halt = jit.run();
         assert!(halt.contains(HaltReason::SVC));
-        let (lo, hi) = jit.get_vector(31);
+        let (lo, hi) = jit.get_vector_parts(31);
         assert_eq!(
             lo, 0,
             "MOVI v31.4s,#0 must zero lower 64 bits; got 0x{:016X}",
@@ -10580,12 +7816,12 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(4, 0x8032_C801_64FF_0A00, 0);
-            j.set_vector(7, 0x8046_64FF_9600_0305, 0);
-            j.set_vector(5, u64::MAX, u64::MAX);
+            j.set_vector_parts(4, 0x8032_C801_64FF_0A00, 0);
+            j.set_vector_parts(7, 0x8046_64FF_9600_0305, 0);
+            j.set_vector_parts(5, u64::MAX, u64::MAX);
         });
         assert_eq!(
-            jit.get_vector(5),
+            jit.get_vector_parts(5),
             (0x0032_00FF_0007_0005, 0x0000_0014_0064_00FE)
         );
     }
@@ -10598,11 +7834,11 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(4, 0x0000_0000_00FF_7F80, 0);
-            j.set_vector(7, 0x0000_0000_FF01_807F, 0);
-            j.set_vector(5, u64::MAX, u64::MAX);
+            j.set_vector_parts(4, 0x0000_0000_00FF_7F80, 0);
+            j.set_vector_parts(7, 0x0000_0000_FF01_807F, 0);
+            j.set_vector_parts(5, u64::MAX, u64::MAX);
         });
-        let (lo, hi) = jit.get_vector(5);
+        let (lo, hi) = jit.get_vector_parts(5);
         assert_eq!(lo, 0x0001_0002_00FF_00FF);
         assert_eq!(hi, 0);
     }
@@ -10615,11 +7851,11 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(28, 0xFFFF_0064_0001_0000, 0x1234_00C8_0032_8000);
-            j.set_vector(6, 0x0000_0014_FFFF_0005, 0x4321_0032_0064_7FFF);
+            j.set_vector_parts(28, 0xFFFF_0064_0001_0000, 0x1234_00C8_0032_8000);
+            j.set_vector_parts(6, 0x0000_0014_FFFF_0005, 0x4321_0032_0064_7FFF);
         });
         assert_eq!(
-            jit.get_vector(28),
+            jit.get_vector_parts(28),
             (0xFFFF_0050_FFFE_0005, 0x30ED_0096_0032_0001)
         );
     }
@@ -10633,11 +7869,11 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             // V28 is both the initial accumulator and the first operand.
-            j.set_vector(28, 0x000A_FFFF_007F_FF80, 0xFFFE_0003_8000_7FFF);
-            j.set_vector(6, 0xFFEC_0001_FF80_007F, 0x0002_FFFD_7FFF_8000);
+            j.set_vector_parts(28, 0x000A_FFFF_007F_FF80, 0xFFFE_0003_8000_7FFF);
+            j.set_vector_parts(6, 0xFFEC_0001_FF80_007F, 0x0002_FFFD_7FFF_8000);
         });
         assert_eq!(
-            jit.get_vector(28),
+            jit.get_vector_parts(28),
             (0x0028_0001_017E_007F, 0x0002_0009_7FFF_7FFE)
         );
     }
@@ -10652,12 +7888,12 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             let operand = 0xFFFE_C864_0302_0100;
-            j.set_vector(0, operand, u64::MAX);
-            j.set_vector(2, operand, u64::MAX);
-            j.set_vector(20, 0xFFFF_64C8_0403_0200, u64::MAX);
+            j.set_vector_parts(0, operand, u64::MAX);
+            j.set_vector_parts(2, operand, u64::MAX);
+            j.set_vector_parts(20, 0xFFFF_64C8_0403_0200, u64::MAX);
         });
-        assert_eq!(jit.get_vector(0), (0xFFFE_9696_0302_0100, 0));
-        assert_eq!(jit.get_vector(1), (0xFFFF_9696_0403_0200, 0));
+        assert_eq!(jit.get_vector_parts(0), (0xFFFE_9696_0302_0100, 0));
+        assert_eq!(jit.get_vector_parts(1), (0xFFFF_9696_0403_0200, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -10731,16 +7967,16 @@ mod tests {
         let jit = run_a64_alu(code, |j| {
             let (a_low, a_high) = vector_pair(a);
             let (b_low, b_high) = vector_pair(b);
-            j.set_vector(20, a_low, a_high);
-            j.set_vector(21, b_low, b_high);
+            j.set_vector_parts(20, a_low, a_high);
+            j.set_vector_parts(21, b_low, b_high);
         });
 
-        assert_eq!(jit.get_vector(0), vector_pair(signed8));
-        assert_eq!(jit.get_vector(1), vector_pair(signed16));
-        assert_eq!(jit.get_vector(2), vector_pair(signed32));
-        assert_eq!(jit.get_vector(3), vector_pair(unsigned8));
-        assert_eq!(jit.get_vector(4), vector_pair(unsigned16));
-        assert_eq!(jit.get_vector(5), vector_pair(unsigned32));
+        assert_eq!(jit.get_vector_parts(0), vector_pair(signed8));
+        assert_eq!(jit.get_vector_parts(1), vector_pair(signed16));
+        assert_eq!(jit.get_vector_parts(2), vector_pair(signed32));
+        assert_eq!(jit.get_vector_parts(3), vector_pair(unsigned8));
+        assert_eq!(jit.get_vector_parts(4), vector_pair(unsigned16));
+        assert_eq!(jit.get_vector_parts(5), vector_pair(unsigned32));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -10808,17 +8044,38 @@ mod tests {
         let jit = run_a64_alu(code, |j| {
             let (a_low, a_high) = vector_pair(a);
             let (b_low, b_high) = vector_pair(b);
-            j.set_vector(20, a_low, a_high);
-            j.set_vector(21, b_low, b_high);
+            j.set_vector_parts(20, a_low, a_high);
+            j.set_vector_parts(21, b_low, b_high);
         });
 
-        assert_eq!(jit.get_vector(0), vector_pair(paired_add(a, b, 1, false)));
-        assert_eq!(jit.get_vector(1), vector_pair(paired_add(a, b, 2, false)));
-        assert_eq!(jit.get_vector(2), vector_pair(paired_add(a, b, 4, false)));
-        assert_eq!(jit.get_vector(3), vector_pair(paired_add(a, b, 8, false)));
-        assert_eq!(jit.get_vector(4), vector_pair(paired_add(a, b, 1, true)));
-        assert_eq!(jit.get_vector(5), vector_pair(paired_add(a, b, 2, true)));
-        assert_eq!(jit.get_vector(6), vector_pair(paired_add(a, b, 4, true)));
+        assert_eq!(
+            jit.get_vector_parts(0),
+            vector_pair(paired_add(a, b, 1, false))
+        );
+        assert_eq!(
+            jit.get_vector_parts(1),
+            vector_pair(paired_add(a, b, 2, false))
+        );
+        assert_eq!(
+            jit.get_vector_parts(2),
+            vector_pair(paired_add(a, b, 4, false))
+        );
+        assert_eq!(
+            jit.get_vector_parts(3),
+            vector_pair(paired_add(a, b, 8, false))
+        );
+        assert_eq!(
+            jit.get_vector_parts(4),
+            vector_pair(paired_add(a, b, 1, true))
+        );
+        assert_eq!(
+            jit.get_vector_parts(5),
+            vector_pair(paired_add(a, b, 2, true))
+        );
+        assert_eq!(
+            jit.get_vector_parts(6),
+            vector_pair(paired_add(a, b, 4, true))
+        );
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -10875,31 +8132,31 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             let (low, high) = vector_pair(source);
-            j.set_vector(20, low, high);
+            j.set_vector_parts(20, low, high);
         });
 
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             vector_pair(paired_add_widen(source, 1, true))
         );
         assert_eq!(
-            jit.get_vector(1),
+            jit.get_vector_parts(1),
             vector_pair(paired_add_widen(source, 2, true))
         );
         assert_eq!(
-            jit.get_vector(2),
+            jit.get_vector_parts(2),
             vector_pair(paired_add_widen(source, 4, true))
         );
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             vector_pair(paired_add_widen(source, 1, false))
         );
         assert_eq!(
-            jit.get_vector(4),
+            jit.get_vector_parts(4),
             vector_pair(paired_add_widen(source, 2, false))
         );
         assert_eq!(
-            jit.get_vector(5),
+            jit.get_vector_parts(5),
             vector_pair(paired_add_widen(source, 4, false))
         );
     }
@@ -10912,11 +8169,11 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(7, 0x7530_9C40_0002_FFFF, 0x0001_0001_0001_0001);
-            j.set_vector(1, 0x2710_D8F0_7FFE_8000, 0x0002_0002_0002_0002);
+            j.set_vector_parts(7, 0x7530_9C40_0002_FFFF, 0x0001_0001_0001_0001);
+            j.set_vector_parts(1, 0x2710_D8F0_7FFE_8000, 0x0002_0002_0002_0002);
         });
         assert_eq!(
-            jit.get_vector(1),
+            jit.get_vector_parts(1),
             (0x7FFF_8000_7FFF_8000, 0x0003_0003_0003_0003)
         );
         assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQADD must set FPSR.QC");
@@ -10931,11 +8188,11 @@ mod tests {
         ];
         let jit = run_a64_alu(code, |j| {
             // Signed words: [1, 2, 0x20000000, -1].
-            j.set_vector(1, 0x0000_0002_0000_0001, 0xFFFF_FFFF_2000_0000);
+            j.set_vector_parts(1, 0x0000_0002_0000_0001, 0xFFFF_FFFF_2000_0000);
         });
 
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             (0x0000_0010_0000_0008, 0x0000_0000_FFFF_FFFF)
         );
         assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQSHLU must set FPSR.QC");
@@ -10949,10 +8206,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(30, 0x3FC0_0000_3FB3_3333, 0xBFC0_0000_4020_0000);
+            j.set_vector_parts(30, 0x3FC0_0000_3FB3_3333, 0xBFC0_0000_4020_0000);
         });
         assert_eq!(
-            jit.get_vector(30),
+            jit.get_vector_parts(30),
             (0x4000_0000_3F80_0000, 0xC000_0000_4000_0000)
         );
     }
@@ -11053,11 +8310,11 @@ mod tests {
                             ^ (0xA5A5_A5A5_A5A5_A5A5u64
                                 .wrapping_add((i as u64).wrapping_mul(0x0101_0101_0101_0101)))
                     };
-                    jit.set_vector(index, pattern(lo_index), pattern(hi_index));
+                    jit.set_vector_parts(index, pattern(lo_index), pattern(hi_index));
                 }
             });
             assert_eq!(
-                jit.get_vector(destination),
+                jit.get_vector_parts(destination),
                 (expected_lo, expected_hi),
                 "native AArch64 mismatch for instruction 0x{word:08X}"
             );
@@ -11099,11 +8356,11 @@ mod tests {
             let code = [instruction, 0xD400_0001];
             let jit = run_a64_alu(&code, |jit| {
                 for (index, [lo, hi]) in initial.into_iter().enumerate() {
-                    jit.set_vector(index, lo, hi);
+                    jit.set_vector_parts(index, lo, hi);
                 }
             });
             let translated = std::array::from_fn(|index| {
-                let (lo, hi) = jit.get_vector(index);
+                let (lo, hi) = jit.get_vector_parts(index);
                 [lo, hi]
             });
             assert_eq!(
@@ -11135,12 +8392,21 @@ mod tests {
         );
 
         assert_eq!(
-            jit.get_vector(16),
+            jit.get_vector_parts(16),
             (((NOP as u64) << 32) | code[0] as u64, 0)
         );
-        assert_eq!(jit.get_vector(17), (((NOP as u64) << 32) | NOP as u64, 0));
-        assert_eq!(jit.get_vector(18), (((NOP as u64) << 32) | NOP as u64, 0));
-        assert_eq!(jit.get_vector(19), (((NOP as u64) << 32) | NOP as u64, 0));
+        assert_eq!(
+            jit.get_vector_parts(17),
+            (((NOP as u64) << 32) | NOP as u64, 0)
+        );
+        assert_eq!(
+            jit.get_vector_parts(18),
+            (((NOP as u64) << 32) | NOP as u64, 0)
+        );
+        assert_eq!(
+            jit.get_vector_parts(19),
+            (((NOP as u64) << 32) | NOP as u64, 0)
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -11187,12 +8453,21 @@ mod tests {
         run_a64_until_svc(&mut jit);
 
         assert_eq!(
-            jit.get_vector(16),
+            jit.get_vector_parts(16),
             (((NOP as u64) << 32) | code[16] as u64, 0)
         );
-        assert_eq!(jit.get_vector(17), (((NOP as u64) << 32) | NOP as u64, 0));
-        assert_eq!(jit.get_vector(18), (((NOP as u64) << 32) | NOP as u64, 0));
-        assert_eq!(jit.get_vector(19), (((NOP as u64) << 32) | NOP as u64, 0));
+        assert_eq!(
+            jit.get_vector_parts(17),
+            (((NOP as u64) << 32) | NOP as u64, 0)
+        );
+        assert_eq!(
+            jit.get_vector_parts(18),
+            (((NOP as u64) << 32) | NOP as u64, 0)
+        );
+        assert_eq!(
+            jit.get_vector_parts(19),
+            (((NOP as u64) << 32) | NOP as u64, 0)
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -11332,9 +8607,12 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(23, 1.25f64.to_bits(), 2.0f64.to_bits());
+            j.set_vector_parts(23, 1.25f64.to_bits(), 2.0f64.to_bits());
         });
-        assert_eq!(jit.get_vector(22), (1.0f64.to_bits(), 2.0f64.to_bits()));
+        assert_eq!(
+            jit.get_vector_parts(22),
+            (1.0f64.to_bits(), 2.0f64.to_bits())
+        );
         assert_ne!(jit.get_fpsr() & (1 << 4), 0, "FRINTX must set FPSR.IXC");
     }
 
@@ -11346,14 +8624,14 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(
+            j.set_vector_parts(
                 1,
                 (4.0f32.to_bits() as u64) << 32 | 1.0f32.to_bits() as u64,
                 (16.0f32.to_bits() as u64) << 32 | 9.0f32.to_bits() as u64,
             );
         });
         assert_eq!(
-            jit.get_vector(0),
+            jit.get_vector_parts(0),
             (
                 (2.0f32.to_bits() as u64) << 32 | 1.0f32.to_bits() as u64,
                 (4.0f32.to_bits() as u64) << 32 | 3.0f32.to_bits() as u64,
@@ -11370,11 +8648,11 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, 1.25f32.to_bits() as u64, u64::MAX);
-            j.set_vector(1, 2.5f32.to_bits() as u64, u64::MAX);
+            j.set_vector_parts(0, 1.25f32.to_bits() as u64, u64::MAX);
+            j.set_vector_parts(1, 2.5f32.to_bits() as u64, u64::MAX);
         });
-        assert_eq!(jit.get_vector(0), (1.0f32.to_bits() as u64, 0));
-        assert_eq!(jit.get_vector(1), (3.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(0), (1.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(1), (3.0f32.to_bits() as u64, 0));
         assert_ne!(jit.get_fpsr() & (1 << 4), 0, "FRINTX must set FPSR.IXC");
     }
 
@@ -11387,10 +8665,10 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, 7.0f64.to_bits(), u64::MAX);
+            j.set_vector_parts(0, 7.0f64.to_bits(), u64::MAX);
         });
         assert_eq!(jit.get_register(19), 7);
-        assert_eq!(jit.get_vector(0), (7.0f64.to_bits(), 0));
+        assert_eq!(jit.get_vector_parts(0), (7.0f64.to_bits(), 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -11402,8 +8680,8 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, 1.5f64.to_bits(), u64::MAX);
-            j.set_vector(1, 2.25f32.to_bits() as u64, u64::MAX);
+            j.set_vector_parts(0, 1.5f64.to_bits(), u64::MAX);
+            j.set_vector_parts(1, 2.25f32.to_bits() as u64, u64::MAX);
         });
         assert_eq!(jit.get_register(0), 3);
         assert_eq!(jit.get_register(1), 4);
@@ -11422,15 +8700,15 @@ mod tests {
         let pack_2s =
             |lane0: f32, lane1: f32| (lane1.to_bits() as u64) << 32 | lane0.to_bits() as u64;
         let jit = run_a64_alu(code, |j| {
-            j.set_vector(0, pack_2s(6.0, 8.0), u64::MAX);
-            j.set_vector(29, pack_2s(2.0, 4.0), u64::MAX);
-            j.set_vector(30, 10.0f32.to_bits() as u64, u64::MAX);
-            j.set_vector(31, 12.0f32.to_bits() as u64, u64::MAX);
+            j.set_vector_parts(0, pack_2s(6.0, 8.0), u64::MAX);
+            j.set_vector_parts(29, pack_2s(2.0, 4.0), u64::MAX);
+            j.set_vector_parts(30, 10.0f32.to_bits() as u64, u64::MAX);
+            j.set_vector_parts(31, 12.0f32.to_bits() as u64, u64::MAX);
         });
 
-        assert_eq!(jit.get_vector(28), (pack_2s(0.5, 0.5), 0));
-        assert_eq!(jit.get_vector(29), (pack_2s(4.0, 6.0), 0));
-        assert_eq!(jit.get_vector(30), (16.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(28), (pack_2s(0.5, 0.5), 0));
+        assert_eq!(jit.get_vector_parts(29), (pack_2s(4.0, 6.0), 0));
+        assert_eq!(jit.get_vector_parts(30), (16.0f32.to_bits() as u64, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -11464,9 +8742,9 @@ mod tests {
         ];
         let run = |r: f32, g: f32, b: f32| {
             run_a64_alu(code, |j| {
-                j.set_vector(0, r.to_bits() as u64, u64::MAX);
-                j.set_vector(1, g.to_bits() as u64, u64::MAX);
-                j.set_vector(2, b.to_bits() as u64, u64::MAX);
+                j.set_vector_parts(0, r.to_bits() as u64, u64::MAX);
+                j.set_vector_parts(1, g.to_bits() as u64, u64::MAX);
+                j.set_vector_parts(2, b.to_bits() as u64, u64::MAX);
             })
             .get_register(0) as u16
         };
@@ -11485,8 +8763,8 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let jit = run_a64_alu(code, |jit| {
-            jit.set_vector(4, u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]), u64::MAX);
-            jit.set_vector(
+            jit.set_vector_parts(4, u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]), u64::MAX);
+            jit.set_vector_parts(
                 1,
                 u64::from_le_bytes([8, 9, 10, 11, 12, 13, 14, 15]),
                 u64::MAX,
@@ -11494,7 +8772,7 @@ mod tests {
         });
 
         assert_eq!(
-            jit.get_vector(3),
+            jit.get_vector_parts(3),
             (u64::from_le_bytes([3, 4, 5, 6, 7, 8, 9, 10]), 0)
         );
     }
@@ -11539,11 +8817,11 @@ mod tests {
         jit.set_pc(CODE_ADDRESS as u64);
         jit.set_sp(0xF000);
         jit.set_register(19, BYTE_ADDRESS as u64);
-        jit.set_vector(13, u64::MAX, u64::MAX);
+        jit.set_vector_parts(13, u64::MAX, u64::MAX);
         let halt = run_a64_until_svc(&mut jit);
 
         assert!(halt.contains(HaltReason::SVC));
-        assert_eq!(jit.get_vector(13), (127.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_vector_parts(13), (127.0f32.to_bits() as u64, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -11626,9 +8904,15 @@ mod tests {
         let halt = run_a64_until_svc(&mut jit);
 
         assert!(halt.contains(HaltReason::SVC));
-        assert_eq!(jit.get_vector(0), ((1.0f32 / 65536.0).to_bits() as u64, 0));
-        assert_eq!(jit.get_vector(1), ((1.0f32 / 256.0).to_bits() as u64, 0));
-        assert_eq!(jit.get_vector(2), (1.0f32.to_bits() as u64, 0));
+        assert_eq!(
+            jit.get_vector_parts(0),
+            ((1.0f32 / 65536.0).to_bits() as u64, 0)
+        );
+        assert_eq!(
+            jit.get_vector_parts(1),
+            ((1.0f32 / 256.0).to_bits() as u64, 0)
+        );
+        assert_eq!(jit.get_vector_parts(2), (1.0f32.to_bits() as u64, 0));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

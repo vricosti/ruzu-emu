@@ -12,12 +12,12 @@ use crate::backend::arm64::inst;
 use crate::backend::arm64::jit_state::A64JitState;
 use crate::backend::arm64::label::Label;
 use crate::backend::arm64::stack_layout::{RSBEntry, StackLayout, RSB_INDEX_MASK};
-use crate::halt_reason::HaltReason;
+use crate::interface::halt_reason::HaltReason;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::terminal::Terminal;
 use crate::ir::value::InstRef;
-use crate::jit_config::OptimizationFlag;
 
 const X0: u8 = 0;
 const X1: u8 = 1;
@@ -150,6 +150,36 @@ pub fn emit_a64_exception_raised(
     Ok(())
 }
 
+pub fn emit_a64_data_cache_operation_raised(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    ctx.reg_alloc
+        .prepare_for_call(code, ctx.fpsr, [None, Some(args[1]), Some(args[2]), None])?;
+    emit_relocation(
+        code,
+        ctx.emitted_block_info,
+        LinkTarget::DataCacheOperationRaised,
+    )
+}
+
+pub fn emit_a64_instruction_cache_operation_raised(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    ctx.reg_alloc
+        .prepare_for_call(code, ctx.fpsr, [None, Some(args[0]), Some(args[1]), None])?;
+    emit_relocation(
+        code,
+        ctx.emitted_block_info,
+        LinkTarget::InstructionCacheOperationRaised,
+    )
+}
+
 fn emit_a64_terminal_inner(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -159,27 +189,6 @@ fn emit_a64_terminal_inner(
 ) -> Result<(), String> {
     match terminal {
         Terminal::Invalid => Err("Invalid A64 terminal".to_string()),
-        Terminal::Interpret {
-            next,
-            num_instructions,
-        } => {
-            let next = A64LocationDescriptor::from_location(next);
-            ctx.reg_alloc
-                .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
-            emit_mov_x_imm(code, X1, next.pc())?;
-            code.write_u32(inst::str_x_unsigned(
-                X1,
-                XSTATE,
-                core::mem::offset_of!(A64JitState, pc) as u32,
-            ))?;
-            emit_mov_x_imm(code, X2, num_instructions as u64)?;
-            emit_relocation(
-                code,
-                ctx.emitted_block_info,
-                LinkTarget::InterpreterFallback,
-            )?;
-            emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnFromRunCode)
-        }
         Terminal::ReturnToDispatch => {
             emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
         }
@@ -400,13 +409,17 @@ mod tests {
     use crate::backend::arm64::fastmem::FastmemManager;
     use crate::backend::arm64::fpsr_manager::FpsrManager;
     use crate::backend::arm64::reg_alloc::RegAlloc;
+    use crate::interface::a64::config::{
+        Exception as A64Exception, UserCallbacks as A64UserCallbacks, UserConfig as A64UserConfig,
+        Vector as A64Vector,
+    };
     use crate::ir::block::Block;
-    use crate::jit_config::{JitConfig, UserCallbacks};
-    use std::collections::HashMap;
+    use crate::ir::opcode::Opcode;
+    use crate::ir::value::Value;
 
     struct DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
+    impl A64UserCallbacks for DummyCallbacks {
         fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
             None
         }
@@ -422,87 +435,41 @@ mod tests {
         fn memory_read_64(&self, _vaddr: u64) -> u64 {
             0
         }
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_128(&self, _vaddr: u64) -> A64Vector {
+            [0, 0]
         }
         fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
         fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
         fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-            0
-        }
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-            0
-        }
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-            0
-        }
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-            0
-        }
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-        fn exclusive_clear(&mut self) {}
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn memory_write_128(&mut self, _vaddr: u64, _value: A64Vector) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
         fn get_ticks_remaining(&self) -> u64 {
             0
         }
-    }
 
-    fn config_with(optimizations: OptimizationFlag, enable_cycle_counting: bool) -> JitConfig {
-        JitConfig {
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting,
-            code_cache_size: 0,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: Default::default(),
+        fn get_cntpct(&self) -> u64 {
+            0
         }
     }
 
-    fn config() -> JitConfig {
+    fn config_with(optimizations: OptimizationFlag, enable_cycle_counting: bool) -> A64UserConfig {
+        let mut config = A64UserConfig::new(Box::new(DummyCallbacks));
+        config.enable_cycle_counting = enable_cycle_counting;
+        config.code_cache_size = 0;
+        config.optimizations = optimizations;
+        config
+    }
+
+    fn config() -> A64UserConfig {
         config_with(OptimizationFlag::NO_OPTIMIZATIONS, false)
     }
 
-    fn config_with_memory_abort_check() -> JitConfig {
+    fn config_with_memory_abort_check() -> A64UserConfig {
         let mut config = config();
-        config.memory.check_halt_on_memory_access = true;
+        config.check_halt_on_memory_access = true;
         config
     }
 
@@ -528,7 +495,7 @@ mod tests {
     fn with_context_config(
         block: &mut Block,
         code: &mut BlockOfCode,
-        config: JitConfig,
+        config: A64UserConfig,
         f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         let conf = EmitConfig::from_a64_config(&config);
@@ -555,6 +522,70 @@ mod tests {
             f(code, &mut ctx);
         }
         info
+    }
+
+    #[test]
+    fn data_cache_callback_uses_operation_and_value_arguments() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
+        let inst_ref = block.append(
+            Opcode::A64DataCacheOperationRaised,
+            &[
+                Value::ImmU64(0x1000),
+                Value::ImmU64(7),
+                Value::ImmU64(0x1234),
+            ],
+        );
+
+        let info = with_context(&mut block, &mut code, |code, ctx| {
+            emit_a64_data_cache_operation_raised(code, ctx, inst_ref).unwrap();
+        });
+
+        assert_eq!(
+            emitted_words(&code),
+            vec![
+                inst::movz_x(X1, 7, 0),
+                inst::movz_x(X2, 0x1234, 0),
+                inst::nop(),
+            ]
+        );
+        assert_eq!(
+            info.relocations,
+            vec![Relocation {
+                code_offset: 8,
+                target: LinkTarget::DataCacheOperationRaised,
+            }]
+        );
+    }
+
+    #[test]
+    fn instruction_cache_callback_uses_operation_and_value_arguments() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
+        let inst_ref = block.append(
+            Opcode::A64InstructionCacheOperationRaised,
+            &[Value::ImmU64(2), Value::ImmU64(0x5678)],
+        );
+
+        let info = with_context(&mut block, &mut code, |code, ctx| {
+            emit_a64_instruction_cache_operation_raised(code, ctx, inst_ref).unwrap();
+        });
+
+        assert_eq!(
+            emitted_words(&code),
+            vec![
+                inst::movz_x(X1, 2, 0),
+                inst::movz_x(X2, 0x5678, 0),
+                inst::nop(),
+            ]
+        );
+        assert_eq!(
+            info.relocations,
+            vec![Relocation {
+                code_offset: 8,
+                target: LinkTarget::InstructionCacheOperationRaised,
+            }]
+        );
     }
 
     #[test]

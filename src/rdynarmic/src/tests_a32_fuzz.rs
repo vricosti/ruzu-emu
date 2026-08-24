@@ -4,15 +4,18 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::interface::a32::config::{
+        Exception as A32Exception, UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+    };
+    use crate::interface::optimization_flags::OptimizationFlag;
     use crate::jit::A32Jit;
-    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
     use std::collections::HashMap;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     struct FuzzEnv {
         code_mem: Vec<u32>,
-        data_mem: HashMap<u64, u8>,
+        data_mem: HashMap<u32, u8>,
         ticks_left: u64,
     }
 
@@ -26,8 +29,8 @@ mod tests {
         }
     }
 
-    impl UserCallbacks for FuzzEnv {
-        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for FuzzEnv {
+        fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
             let idx = (vaddr as usize) / 4;
             if idx < self.code_mem.len() {
                 Some(self.code_mem[idx])
@@ -35,81 +38,56 @@ mod tests {
                 Some(0xEAFFFFFE)
             }
         }
-        fn memory_read_8(&self, vaddr: u64) -> u8 {
+        fn memory_read_8(&self, vaddr: u32) -> u8 {
             *self.data_mem.get(&vaddr).unwrap_or(&0)
         }
-        fn memory_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_8(vaddr) as u16 | (self.memory_read_8(vaddr + 1) as u16) << 8
+        fn memory_read_16(&self, vaddr: u32) -> u16 {
+            self.memory_read_8(vaddr) as u16
+                | (self.memory_read_8(vaddr.wrapping_add(1)) as u16) << 8
         }
-        fn memory_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_16(vaddr) as u32 | (self.memory_read_16(vaddr + 2) as u32) << 16
+        fn memory_read_32(&self, vaddr: u32) -> u32 {
+            self.memory_read_16(vaddr) as u32
+                | (self.memory_read_16(vaddr.wrapping_add(2)) as u32) << 16
         }
-        fn memory_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_32(vaddr) as u64 | (self.memory_read_32(vaddr + 4) as u64) << 32
+        fn memory_read_64(&self, vaddr: u32) -> u64 {
+            self.memory_read_32(vaddr) as u64
+                | (self.memory_read_32(vaddr.wrapping_add(4)) as u64) << 32
         }
-        fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-            (self.memory_read_64(vaddr), self.memory_read_64(vaddr + 8))
-        }
-        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        fn memory_write_8(&mut self, vaddr: u32, value: u8) {
             self.data_mem.insert(vaddr, value);
         }
-        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        fn memory_write_16(&mut self, vaddr: u32, value: u16) {
             self.memory_write_8(vaddr, value as u8);
-            self.memory_write_8(vaddr + 1, (value >> 8) as u8);
+            self.memory_write_8(vaddr.wrapping_add(1), (value >> 8) as u8);
         }
-        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        fn memory_write_32(&mut self, vaddr: u32, value: u32) {
             self.memory_write_16(vaddr, value as u16);
-            self.memory_write_16(vaddr + 2, (value >> 16) as u16);
+            self.memory_write_16(vaddr.wrapping_add(2), (value >> 16) as u16);
         }
-        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        fn memory_write_64(&mut self, vaddr: u32, value: u64) {
             self.memory_write_32(vaddr, value as u32);
-            self.memory_write_32(vaddr + 4, (value >> 32) as u32);
+            self.memory_write_32(vaddr.wrapping_add(4), (value >> 32) as u32);
         }
-        fn memory_write_128(&mut self, vaddr: u64, lo: u64, hi: u64) {
-            self.memory_write_64(vaddr, lo);
-            self.memory_write_64(vaddr + 8, hi);
-        }
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
-        fn exclusive_write_8(&mut self, _: u64, _: u8, _: u8) -> bool {
+        fn memory_write_exclusive_8(&mut self, _: u32, _: u8, _: u8) -> bool {
             true
         }
-        fn exclusive_write_16(&mut self, _: u64, _: u16, _: u16) -> bool {
+        fn memory_write_exclusive_16(&mut self, _: u32, _: u16, _: u16) -> bool {
             true
         }
-        fn exclusive_write_32(&mut self, _: u64, _: u32, _: u32) -> bool {
+        fn memory_write_exclusive_32(&mut self, _: u32, _: u32, _: u32) -> bool {
             true
         }
-        fn exclusive_write_64(&mut self, _: u64, _: u64, _: u64) -> bool {
+        fn memory_write_exclusive_64(&mut self, _: u32, _: u64, _: u64) -> bool {
             true
         }
-        fn exclusive_write_128(&mut self, _: u64, _: u64, _: u64, _: u64, _: u64) -> bool {
-            true
-        }
-        fn exclusive_clear(&mut self) {}
-        fn call_supervisor(&mut self, _: u32) {}
-        fn exception_raised(&mut self, _: u64, _: u64) {}
+        fn call_svc(&mut self, _: u32) {}
+        fn exception_raised(&mut self, _: u32, _: A32Exception) {}
         fn add_ticks(&mut self, ticks: u64) {
             self.ticks_left = self.ticks_left.saturating_sub(ticks);
         }
         fn get_ticks_remaining(&self) -> u64 {
             self.ticks_left
         }
-        fn data_cache_operation(&mut self, _: u64, _: u64) {}
-        fn instruction_cache_operation(&mut self, _: u64, _: u64) {}
     }
 
     const ORACLE: &str = "/home/vricosti/Dev/emulators/zuyu/build/a32_oracle";
@@ -680,23 +658,9 @@ mod tests {
         code_with_loop.push(0xEAFFFFFE); // infinite loop
 
         let env = FuzzEnv::new(code_with_loop);
-        let config = JitConfig {
-            callbacks: Box::new(env),
-            enable_cycle_counting: true,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(env));
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = optimizations;
         let mut jit = A32Jit::new(config).expect("JIT creation failed");
 
         for i in 0..15 {
@@ -715,6 +679,18 @@ mod tests {
 
     fn run_rdynarmic(code: &[u32], regs: &[u32; 15], cpsr: u32) -> ([u32; 16], u32) {
         run_rdynarmic_with_optimizations(code, regs, cpsr, OptimizationFlag::NO_OPTIMIZATIONS)
+    }
+
+    #[test]
+    fn fuzz_environment_runs_through_the_a32_callback_contract() {
+        fn assert_a32_callbacks<T: A32UserCallbacks>() {}
+        assert_a32_callbacks::<FuzzEnv>();
+
+        let mut regs = [0u32; 15];
+        regs[1] = 7;
+        regs[2] = 5;
+        let (result, _) = run_rdynarmic(&[0xE081_0002], &regs, 0x0000_01D0);
+        assert_eq!(result[0], 12);
     }
 
     fn run_oracle(code: &[u32], regs: &[u32; 15], cpsr: u32) -> Option<([u32; 16], u32)> {
@@ -1380,7 +1356,7 @@ mod tests {
             // --- LDREX + STREX pair on same address ---
             // LDREX Rt, [Rn, #imm8*4]: hw0 = 0xE850 | Rn, hw1 = (Rt<<12) | 0x0F00 | imm8
             // STREX Rd, Rt2, [Rn, #imm8*4]: hw0 = 0xE840 | Rn, hw1 = (Rt2<<12) | (Rd<<8) | imm8
-            // The FuzzEnv exclusive_write_* callbacks always return true (success),
+            // The FuzzEnv memory_write_exclusive_* callbacks always return true (success),
             // so the store should succeed symmetrically in both emulators.
             _ => {
                 let rn = next_rand(rng) % 13;

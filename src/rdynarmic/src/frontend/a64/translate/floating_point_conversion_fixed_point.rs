@@ -159,7 +159,6 @@ mod tests {
     use crate::frontend::a64::translate::{translate, TranslationOptions};
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_single(raw: u32) -> crate::ir::block::Block {
         let loc = A64LocationDescriptor::new(0x1000, 0, true);
@@ -179,7 +178,6 @@ mod tests {
     #[test]
     fn scvtf_float_fix_translates_without_interpret_terminal() {
         let block = translate_single(0x1e02fc20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| matches!(
             inst.opcode,
             Opcode::FPFixedS32ToSingle | Opcode::FPFixedS64ToSingle
@@ -189,7 +187,6 @@ mod tests {
     #[test]
     fn fcvtzs_float_fix_translates_without_interpret_terminal() {
         let block = translate_single(0x1e18fc20);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| matches!(
             inst.opcode,
             Opcode::FPSingleToFixedS32 | Opcode::FPDoubleToFixedS32

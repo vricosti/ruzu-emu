@@ -1,8 +1,7 @@
-use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, Reg, RegExp, R15, RSP};
+use rxbyak::{byte_ptr, dword_ptr, qword_ptr, xmmword_ptr, Reg, RegExp, R15, RSP};
 
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::EmitContext;
-use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
@@ -40,27 +39,6 @@ pub fn emit_vector_op_imm(
     let result = ra.use_scratch_xmm(&mut args[0]);
     let imm = args[1].get_immediate_u8();
     op(&mut *ra.asm, result, imm).unwrap();
-    ra.define_value(inst_ref, result);
-}
-
-// ---------------------------------------------------------------------------
-// Native SSE binary op with imm8 (3-operand form like pshufd/palignr):
-//   result = op(arg0, arg1, imm)
-// ScratchXmm → op(dst, src, imm) → DefineValue
-// ---------------------------------------------------------------------------
-
-pub fn emit_vector_shuffle_op(
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-    op: fn(&mut rxbyak::CodeAssembler, Reg, Reg, u8) -> rxbyak::Result<()>,
-) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let src = ra.use_xmm(&mut args[0]);
-    let imm = args[1].get_immediate_u8();
-    let result = ra.scratch_xmm();
-    op(&mut *ra.asm, result, src, imm).unwrap();
-    ra.release(src);
     ra.define_value(inst_ref, result);
 }
 
@@ -931,6 +909,7 @@ pub fn emit_one_arg_fallback_with_imm(
 // ---------------------------------------------------------------------------
 
 pub fn emit_two_arg_fallback_saturated(
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
@@ -989,11 +968,83 @@ pub fn emit_two_arg_fallback_saturated(
     ra.asm.call_reg(rxbyak::RAX).unwrap();
 
     // OR QC flag: fpsr_qc |= RAX
-    let qc_offset = A64JitState::offset_of_fpsr_qc() as i32;
+    let qc_offset = ctx.arch.fpsr_qc_offset() as i32;
     ra.asm
         .or_(
-            rxbyak::dword_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
-            rxbyak::EAX,
+            byte_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
+            rxbyak::EAX.cvt8().unwrap(),
+        )
+        .unwrap();
+
+    ra.asm
+        .movaps(
+            result,
+            rxbyak::xmmword_ptr(rxbyak::RegExp::from(rxbyak::RSP) + result_offset),
+        )
+        .unwrap();
+
+    ra.release_stack_space(frame_size);
+    ra.define_value(inst_ref, result);
+}
+
+// ---------------------------------------------------------------------------
+// Saturation fallback with an immediate second argument.
+// fn(result: *mut [u8;16], a: *const [u8;16], imm: u8) -> u32
+// Mirrors upstream EmitTwoArgumentFallbackWithSaturationAndImmediate.
+// ---------------------------------------------------------------------------
+
+pub fn emit_two_arg_fallback_with_saturation_and_immediate(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    func: usize,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let arg1 = ra.use_xmm(&mut args[0]);
+    let imm = args[1].get_immediate_u8();
+    let result = ra.scratch_xmm();
+    ra.end_of_alloc_scope();
+
+    ra.host_call(None, &mut [None, None, None, None]);
+
+    let result_offset = abi::ABI_SHADOW_SPACE as i32;
+    let operand_offset = result_offset + 16;
+    let frame_size = abi::ABI_SHADOW_SPACE + 32;
+    ra.alloc_stack_space(frame_size);
+
+    ra.asm
+        .movaps(
+            rxbyak::xmmword_ptr(rxbyak::RegExp::from(rxbyak::RSP) + operand_offset),
+            arg1,
+        )
+        .unwrap();
+
+    let result_param = abi::ABI_PARAMS[0].to_reg64();
+    let operand_param = abi::ABI_PARAMS[1].to_reg64();
+    let immediate_param = abi::ABI_PARAMS[2].to_reg64();
+    ra.asm
+        .lea(
+            result_param,
+            rxbyak::xmmword_ptr(rxbyak::RegExp::from(rxbyak::RSP) + result_offset),
+        )
+        .unwrap();
+    ra.asm
+        .lea(
+            operand_param,
+            rxbyak::xmmword_ptr(rxbyak::RegExp::from(rxbyak::RSP) + operand_offset),
+        )
+        .unwrap();
+    ra.asm.mov(immediate_param, imm as i64).unwrap();
+
+    ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
+    ra.asm.call_reg(rxbyak::RAX).unwrap();
+
+    let qc_offset = ctx.arch.fpsr_qc_offset() as i32;
+    ra.asm
+        .or_(
+            byte_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
+            rxbyak::EAX.cvt8().unwrap(),
         )
         .unwrap();
 
@@ -1014,6 +1065,7 @@ pub fn emit_two_arg_fallback_saturated(
 // ---------------------------------------------------------------------------
 
 pub fn emit_one_arg_fallback_saturated(
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
@@ -1056,11 +1108,11 @@ pub fn emit_one_arg_fallback_saturated(
     ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
     ra.asm.call_reg(rxbyak::RAX).unwrap();
 
-    let qc_offset = A64JitState::offset_of_fpsr_qc() as i32;
+    let qc_offset = ctx.arch.fpsr_qc_offset() as i32;
     ra.asm
         .or_(
-            rxbyak::dword_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
-            rxbyak::EAX,
+            byte_ptr(rxbyak::RegExp::from(rxbyak::R15) + qc_offset),
+            rxbyak::EAX.cvt8().unwrap(),
         )
         .unwrap();
 
@@ -1106,8 +1158,12 @@ mod tests {
         let _: fn(&mut RegAlloc, InstRef, &Inst, usize) = emit_two_arg_fallback_with_imm;
         let _: fn(&mut RegAlloc, InstRef, &Inst, usize) = emit_three_arg_fallback;
         let _: fn(&mut RegAlloc, InstRef, &Inst, usize) = emit_one_arg_fallback_with_imm;
-        let _: fn(&mut RegAlloc, InstRef, &Inst, usize) = emit_two_arg_fallback_saturated;
-        let _: fn(&mut RegAlloc, InstRef, &Inst, usize) = emit_one_arg_fallback_saturated;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst, usize) =
+            emit_two_arg_fallback_saturated;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst, usize) =
+            emit_two_arg_fallback_with_saturation_and_immediate;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst, usize) =
+            emit_one_arg_fallback_saturated;
     }
 
     #[test]

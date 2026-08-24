@@ -14,8 +14,11 @@
 use std::env;
 use std::time::Instant;
 
+use rdynarmic::interface::a32::config::{
+    Exception as A32Exception, UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+};
+use rdynarmic::interface::optimization_flags::OptimizationFlag;
 use rdynarmic::jit::A32Jit;
-use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 const BASE_PC: u32 = 0x0001_0000;
 const SP_INIT: u32 = 0x0010_0000;
@@ -45,9 +48,8 @@ impl BenchEnv {
     }
 }
 
-impl UserCallbacks for BenchEnv {
-    fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        let v = vaddr as u32;
+impl A32UserCallbacks for BenchEnv {
+    fn memory_read_code(&self, v: u32) -> Option<u32> {
         if v < self.base {
             return Some(0xEAFF_FFFE); // b .
         }
@@ -58,59 +60,36 @@ impl UserCallbacks for BenchEnv {
             Some(0xEAFF_FFFE)
         }
     }
-    fn memory_read_8(&self, _: u64) -> u8 {
+    fn memory_read_8(&self, _: u32) -> u8 {
         0
     }
-    fn memory_read_16(&self, _: u64) -> u16 {
+    fn memory_read_16(&self, _: u32) -> u16 {
         0
     }
-    fn memory_read_32(&self, _: u64) -> u32 {
+    fn memory_read_32(&self, _: u32) -> u32 {
         0
     }
-    fn memory_read_64(&self, _: u64) -> u64 {
+    fn memory_read_64(&self, _: u32) -> u64 {
         0
     }
-    fn memory_read_128(&self, _: u64) -> (u64, u64) {
-        (0, 0)
-    }
-    fn memory_write_8(&mut self, _: u64, _: u8) {}
-    fn memory_write_16(&mut self, _: u64, _: u16) {}
-    fn memory_write_32(&mut self, _: u64, _: u32) {}
-    fn memory_write_64(&mut self, _: u64, _: u64) {}
-    fn memory_write_128(&mut self, _: u64, _: u64, _: u64) {}
-    fn exclusive_read_8(&self, _: u64) -> u8 {
-        0
-    }
-    fn exclusive_read_16(&self, _: u64) -> u16 {
-        0
-    }
-    fn exclusive_read_32(&self, _: u64) -> u32 {
-        0
-    }
-    fn exclusive_read_64(&self, _: u64) -> u64 {
-        0
-    }
-    fn exclusive_read_128(&self, _: u64) -> (u64, u64) {
-        (0, 0)
-    }
-    fn exclusive_write_8(&mut self, _: u64, _: u8, _: u8) -> bool {
+    fn memory_write_8(&mut self, _: u32, _: u8) {}
+    fn memory_write_16(&mut self, _: u32, _: u16) {}
+    fn memory_write_32(&mut self, _: u32, _: u32) {}
+    fn memory_write_64(&mut self, _: u32, _: u64) {}
+    fn memory_write_exclusive_8(&mut self, _: u32, _: u8, _: u8) -> bool {
         true
     }
-    fn exclusive_write_16(&mut self, _: u64, _: u16, _: u16) -> bool {
+    fn memory_write_exclusive_16(&mut self, _: u32, _: u16, _: u16) -> bool {
         true
     }
-    fn exclusive_write_32(&mut self, _: u64, _: u32, _: u32) -> bool {
+    fn memory_write_exclusive_32(&mut self, _: u32, _: u32, _: u32) -> bool {
         true
     }
-    fn exclusive_write_64(&mut self, _: u64, _: u64, _: u64) -> bool {
+    fn memory_write_exclusive_64(&mut self, _: u32, _: u64, _: u64) -> bool {
         true
     }
-    fn exclusive_write_128(&mut self, _: u64, _: u64, _: u64, _: u64, _: u64) -> bool {
-        true
-    }
-    fn exclusive_clear(&mut self) {}
-    fn call_supervisor(&mut self, _: u32) {}
-    fn exception_raised(&mut self, _: u64, _: u64) {}
+    fn call_svc(&mut self, _: u32) {}
+    fn exception_raised(&mut self, _: u32, _: A32Exception) {}
     fn add_ticks(&mut self, ticks: u64) {
         self.ticks_left = self.ticks_left.saturating_sub(ticks);
     }
@@ -248,23 +227,10 @@ fn pat_large(n: usize) -> Vec<u32> {
 
 fn make_jit(code: Vec<u32>, optimizations: OptimizationFlag) -> A32Jit {
     let env = BenchEnv::new(code, BASE_PC);
-    let config = JitConfig {
-        callbacks: Box::new(env),
-        enable_cycle_counting: false,
-        code_cache_size: 32 * 1024 * 1024,
-        optimizations,
-        unsafe_optimizations: false,
-        global_monitor: None,
-        fastmem_pointer: None,
-        page_table_pointer: None,
-        define_unpredictable_behaviour: false,
-        processor_id: 0,
-        wall_clock_cntpct: false,
-        cntfrq_el0: 600_000_000,
-        tpidrro_el0: None,
-        tpidr_el0: None,
-        memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default(),
-    };
+    let mut config = A32UserConfig::new(Box::new(env));
+    config.enable_cycle_counting = false;
+    config.code_cache_size = 32 * 1024 * 1024;
+    config.optimizations = optimizations;
     let mut jit = A32Jit::new(config).expect("A32Jit::new failed");
     for i in 0..15 {
         jit.set_register(i, 0);
@@ -430,5 +396,17 @@ fn main() {
     #[cfg(feature = "profile_opcodes")]
     if env::var_os("RDYNARMIC_PROFILE_OPCODES").is_some() {
         rdynarmic::backend::x64::opcode_profile::dump_top(30);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_environment_implements_a32_callbacks_directly() {
+        fn assert_a32_callbacks<T: A32UserCallbacks>() {}
+
+        assert_a32_callbacks::<BenchEnv>();
     }
 }

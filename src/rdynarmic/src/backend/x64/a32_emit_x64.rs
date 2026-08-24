@@ -27,12 +27,13 @@ use crate::backend::x64::patch_info::{
     PatchTable, PatchType, A32_PATCH_JG_SIZE, A32_PATCH_JMP_SIZE, A32_PATCH_JZ_SIZE,
 };
 use crate::backend::x64::reg_alloc::RegAlloc;
-use crate::frontend::a32::translate::translate as a32_translate;
+use crate::frontend::a32::translate::translate_callbacks::TranslateCallbacks;
+use crate::frontend::a32::translate::{translate as a32_translate, TranslationOptions};
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::opt;
 use crate::ir::types::Type;
-use crate::jit_config::OptimizationFlag;
 
 /// Minimum space remaining in the code buffer before triggering a cache clear.
 const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
@@ -75,6 +76,7 @@ pub struct A32EmitX64 {
     pub run_code_callbacks: RunCodeCallbacks,
     /// Fine-grained optimization flags (replaces separate booleans).
     pub optimizations: OptimizationFlag,
+    pub translation_options: TranslationOptions,
     pub patch_table: PatchTable,
     pub terminal_handler_pop_rsb_hint: Option<usize>,
     pub terminal_handler_fast_dispatch_hint: Option<usize>,
@@ -116,6 +118,7 @@ impl A32EmitX64 {
         emit_config: EmitConfig,
         run_callbacks: RunCodeCallbacks,
         optimizations: OptimizationFlag,
+        translation_options: TranslationOptions,
         cache_size: usize,
     ) -> Result<Self, String> {
         let mut code = BlockOfCode::with_size_and_offsets(
@@ -143,6 +146,7 @@ impl A32EmitX64 {
             emit_config,
             run_code_callbacks: run_callbacks,
             optimizations,
+            translation_options,
             patch_table: PatchTable::new(),
             terminal_handler_pop_rsb_hint: None,
             terminal_handler_fast_dispatch_hint: None,
@@ -227,9 +231,9 @@ impl A32EmitX64 {
     pub fn get_or_compile_block(
         &mut self,
         location: LocationDescriptor,
-        read_code: &dyn Fn(u32) -> Option<u32>,
+        callbacks: &dyn TranslateCallbacks,
     ) -> *const u8 {
-        self.get_or_compile_block_with_ro(location, read_code, &|_| false)
+        self.get_or_compile_block_with_ro(location, callbacks, &|_| false)
     }
 
     /// Get or compile a block with an is_read_only_memory callback for
@@ -237,7 +241,7 @@ impl A32EmitX64 {
     pub fn get_or_compile_block_with_ro(
         &mut self,
         location: LocationDescriptor,
-        read_code: &dyn Fn(u32) -> Option<u32>,
+        callbacks: &dyn TranslateCallbacks,
         is_read_only: &dyn Fn(u32) -> bool,
     ) -> *const u8 {
         // Check cache first
@@ -253,7 +257,8 @@ impl A32EmitX64 {
         // Translate: ARM32/Thumb → IR (A32 frontend)
         let a32_loc = A32LocationDescriptor::from_location(location);
         let pc = a32_loc.pc();
-        let mut block = a32_translate(a32_loc, read_code);
+        let mut block = a32_translate(a32_loc, callbacks, self.translation_options);
+        let read_code = |vaddr| callbacks.memory_read_code(vaddr);
 
         if Self::should_log_compile_range(location) {
             let ops = block
@@ -297,7 +302,7 @@ impl A32EmitX64 {
         if self.optimizations.contains(OptimizationFlag::CONST_PROP) {
             // Upstream: A32ConstantMemoryReads runs BEFORE ConstantPropagation
             // so that folded memory values can propagate further.
-            opt::a32_constant_memory_reads(&mut block, read_code, is_read_only);
+            opt::a32_constant_memory_reads(&mut block, &read_code, is_read_only);
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
         }

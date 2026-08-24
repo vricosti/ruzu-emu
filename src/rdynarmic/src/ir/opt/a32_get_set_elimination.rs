@@ -884,7 +884,11 @@ mod tests {
             _ => None,
         };
 
-        let mut block = translate(loc, &read_code);
+        let mut block = translate(
+            loc,
+            &read_code,
+            crate::frontend::a32::translate::TranslationOptions::default(),
+        );
         run_gse(&mut block);
         verification_pass(&block);
 

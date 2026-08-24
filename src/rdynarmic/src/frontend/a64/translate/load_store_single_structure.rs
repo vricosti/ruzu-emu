@@ -4,12 +4,7 @@
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::{AccType, Reg, Vec};
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MemOp {
-    Load,
-    Store,
-}
+use crate::ir::emitter::MemOp;
 
 impl<'a> TranslatorVisitor<'a> {
     fn single_structure_shared_decode_and_operation(
@@ -99,6 +94,7 @@ impl<'a> TranslatorVisitor<'a> {
                         let element = self.ir.ir().vector_get_element(esize, current, index as u8);
                         self.mem_write(addr, element, ebytes, AccType::Vec);
                     }
+                    MemOp::Prefetch => unreachable!(),
                 }
 
                 let delta = self.ir.ir().imm64(ebytes as u64);
@@ -550,7 +546,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_one(raw: u32) -> (Block, bool, A64InstructionName) {
         let decoded = decode(raw).expect("instruction should decode");
@@ -558,7 +553,7 @@ mod tests {
         let mut visitor = TranslatorVisitor::new(
             &mut block,
             A64LocationDescriptor::new(0x1000, 0, false),
-            crate::frontend::a64::translate::visitor::TranslationOptions::default(),
+            crate::frontend::a64::translate::TranslationOptions::default(),
         );
         let should_continue = visitor.dispatch(&decoded);
         drop(visitor);
@@ -574,7 +569,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::A64WriteMemory32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -591,7 +585,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorBroadcast32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -612,7 +605,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::ZeroExtendLongToQuad));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -629,6 +621,5 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorGetElement32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 }

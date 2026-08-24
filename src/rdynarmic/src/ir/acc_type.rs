@@ -6,46 +6,57 @@ use std::fmt;
 pub enum AccType {
     Normal = 0,
     Vec = 1,
-    VecStreaming = 2,
-    Atomic = 3,
-    Ordered = 4,
-    OrderedAtomic = 5,
-    LimitedOrdered = 6,
-    Unpriv = 7,
-    IfetchOrdered = 8,
-    VecIfetchStreaming = 9,
-    Stream = 10,
-    Aligned = 11,
-    NonTemporal = 12,
-    AtNonTemporal = 13,
-    AtAligned = 14,
-}
-
-impl AccType {
-    pub fn from_u8(val: u8) -> Self {
-        match val {
-            0 => AccType::Normal,
-            1 => AccType::Vec,
-            2 => AccType::VecStreaming,
-            3 => AccType::Atomic,
-            4 => AccType::Ordered,
-            5 => AccType::OrderedAtomic,
-            6 => AccType::LimitedOrdered,
-            7 => AccType::Unpriv,
-            8 => AccType::IfetchOrdered,
-            9 => AccType::VecIfetchStreaming,
-            10 => AccType::Stream,
-            11 => AccType::Aligned,
-            12 => AccType::NonTemporal,
-            13 => AccType::AtNonTemporal,
-            14 => AccType::AtAligned,
-            _ => AccType::Normal,
-        }
-    }
+    Stream = 2,
+    VecStream = 3,
+    Atomic = 4,
+    Ordered = 5,
+    OrderedRw = 6,
+    LimitedOrdered = 7,
+    Unpriv = 8,
+    Ifetch = 9,
+    Ptw = 10,
+    Dc = 11,
+    Ic = 12,
+    Dczva = 13,
+    At = 14,
+    Swap = 15,
 }
 
 impl fmt::Display for AccType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccType;
+
+    #[test]
+    fn inventory_and_discriminants_match_upstream() {
+        let access_types = [
+            AccType::Normal,
+            AccType::Vec,
+            AccType::Stream,
+            AccType::VecStream,
+            AccType::Atomic,
+            AccType::Ordered,
+            AccType::OrderedRw,
+            AccType::LimitedOrdered,
+            AccType::Unpriv,
+            AccType::Ifetch,
+            AccType::Ptw,
+            AccType::Dc,
+            AccType::Ic,
+            AccType::Dczva,
+            AccType::At,
+            AccType::Swap,
+        ];
+
+        assert_eq!(std::mem::size_of::<AccType>(), 1);
+        assert_eq!(std::mem::align_of::<AccType>(), 1);
+        for (expected, access_type) in access_types.into_iter().enumerate() {
+            assert_eq!(access_type as usize, expected);
+        }
     }
 }

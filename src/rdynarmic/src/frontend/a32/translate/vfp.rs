@@ -449,7 +449,7 @@ pub fn arm_vmov_u32_f64(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let d = to_ext_reg(d_bit, vd, true);
     let reg_d = ir.get_extended_register_64(d);
     let reg_t = ir.get_register(rt);
-    let hi = ir.ir().most_significant_word(reg_d);
+    let hi = ir.ir().most_significant_word(reg_d).result;
     let result = ir.ir().pack_2x32_to_1x64(reg_t, hi);
     ir.set_extended_register_64(d, result);
     true
@@ -495,6 +495,105 @@ pub fn arm_vmov_f32_u32(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let n = to_ext_reg(n_bit, vn, false);
     let reg_n = ir.get_extended_register_32(n);
     ir.set_register(rt, reg_n);
+    true
+}
+
+fn vfp_two_word_move_fields(raw: u32, sz: bool) -> (Reg, Reg, ExtReg) {
+    let t2 = Reg::from_u32((raw >> 16) & 0xF);
+    let t = Reg::from_u32((raw >> 12) & 0xF);
+    let m_bit = raw & (1 << 5) != 0;
+    let vm = raw & 0xF;
+    (t2, t, to_ext_reg(m_bit, vm, sz))
+}
+
+// VMOV<c> <Sm>, <Sm1>, <Rt>, <Rt2>
+pub fn vfp_vmov_2u32_2f32(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, false);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let word1 = ir.get_register(t);
+    let word2 = ir.get_register(t2);
+    ir.set_extended_register_32(m, word1);
+    ir.set_extended_register_32(advance_ext_reg(m, 1), word2);
+    true
+}
+
+// VMOV<c> <Rt>, <Rt2>, <Sm>, <Sm1>
+pub fn vfp_vmov_2f32_2u32(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, false);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 || t == t2 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let word1 = ir.get_extended_register_32(m);
+    let word2 = ir.get_extended_register_32(advance_ext_reg(m, 1));
+    ir.set_register(t, word1);
+    ir.set_register(t2, word2);
+    true
+}
+
+// VMOV<c> <Dm>, <Rt>, <Rt2>
+pub fn vfp_vmov_2u32_f64(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, true);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let word1 = ir.get_register(t);
+    let word2 = ir.get_register(t2);
+    let value = ir.ir().pack_2x32_to_1x64(word1, word2);
+    ir.set_extended_register_64(m, value);
+    true
+}
+
+// VMOV<c> <Rt>, <Rt2>, <Dm>
+pub fn vfp_vmov_f64_2u32(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let (t2, t, m) = vfp_two_word_move_fields(raw, true);
+    if t == Reg::R15 || t2 == Reg::R15 || m == ExtReg::S31 || t == t2 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let value = ir.get_extended_register_64(m);
+    let word1 = ir.ir().least_significant_word(value);
+    let word2 = ir.ir().most_significant_word(value).result;
+    ir.set_register(t, word1);
+    ir.set_register(t2, word2);
+    true
+}
+
+// VMSR FPSCR, <Rt>
+pub fn vfp_vmsr(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let t = Reg::from_u32((raw >> 12) & 0xF);
+    if t == Reg::R15 {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let next_location = ir
+        .current_location
+        .expect("current_location not set")
+        .advance_pc(4)
+        .advance_it();
+    ir.base.push_rsb(next_location.into());
+    ir.update_upper_location_descriptor();
+    let value = ir.get_register(t);
+    ir.set_fpscr(value);
+    ir.branch_write_pc(Value::ImmU32(next_location.pc()));
+    ir.set_term(Terminal::PopRSBHint);
+    false
+}
+
+// VMRS <Rt>, FPSCR
+pub fn vfp_vmrs(ir: &mut A32IREmitter, raw: u32) -> bool {
+    let t = Reg::from_u32((raw >> 12) & 0xF);
+    if t == Reg::R15 {
+        let nzcv = ir.get_fpscr_nzcv();
+        ir.set_cpsr_nzcv_raw(nzcv);
+    } else {
+        let value = ir.get_fpscr();
+        ir.set_register(t, value);
+    }
     true
 }
 
@@ -639,6 +738,8 @@ pub fn arm_vmov_fp_imm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 mod tests {
     use super::*;
     use crate::frontend::a32::decoder::ArmInstId;
+    use crate::frontend::a32::fpscr::FPSCR;
+    use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::ExtReg;
     use crate::ir::block::Block;
     use crate::ir::location::A32LocationDescriptor;
@@ -699,6 +800,187 @@ mod tests {
             .find(|inst| inst.opcode == Opcode::A32SetExtendedRegister32)
             .expect("VCVT.U32.F64 should write a single register");
         assert_eq!(set_ext.args[0], Value::ImmA32ExtReg(ExtReg::S0));
+    }
+
+    fn vfp_location(big_endian: bool) -> A32LocationDescriptor {
+        let mut cpsr = PSR::default();
+        cpsr.set_e(big_endian);
+        A32LocationDescriptor::new(0x2000, cpsr, FPSCR::default(), false)
+    }
+
+    fn translate_vfp_memory(
+        raw: u32,
+        id: ArmInstId,
+        big_endian: bool,
+        translate: VfpMemoryTranslator,
+    ) -> Block {
+        let loc = vfp_location(big_endian);
+        let mut block = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut block, loc);
+            assert!(translate(&mut ir, &DecodedArm { raw, id }));
+        }
+        block
+    }
+
+    type VfpMemoryTranslator = fn(&mut A32IREmitter, &DecodedArm) -> bool;
+
+    fn assert_all_memory_accesses_are_atomic(block: &Block) {
+        let accesses = block.instructions.iter().filter(|inst| {
+            matches!(
+                inst.opcode,
+                Opcode::A32ReadMemory32 | Opcode::A32WriteMemory32
+            )
+        });
+        let mut count = 0;
+        for access in accesses {
+            count += 1;
+            let acc_type = match access.opcode {
+                Opcode::A32ReadMemory32 => access.args[2],
+                Opcode::A32WriteMemory32 => access.args[3],
+                _ => unreachable!(),
+            };
+            assert_eq!(acc_type, Value::ImmAccType(AccType::Atomic));
+        }
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn vfp_load_store_families_use_atomic_accesses() {
+        let cases: [(u32, ArmInstId, VfpMemoryTranslator); 6] = [
+            (0x0000_0B02, ArmInstId::VPUSH, arm_vpush),
+            (0x0000_0B02, ArmInstId::VPOP, arm_vpop),
+            (0x0080_0B00, ArmInstId::VLDR_fp, arm_vldr_fp),
+            (0x0080_0B00, ArmInstId::VSTR_fp, arm_vstr_fp),
+            (0x0080_0B02, ArmInstId::VSTM, arm_vstm),
+            (0x0080_0B02, ArmInstId::VLDM, arm_vldm),
+        ];
+
+        for (raw, id, translate) in cases {
+            let block = translate_vfp_memory(raw, id, false, translate);
+            assert_all_memory_accesses_are_atomic(&block);
+        }
+    }
+
+    #[test]
+    fn big_endian_double_load_swaps_words_before_packing() {
+        let block = translate_vfp_memory(0x0080_0B00, ArmInstId::VLDR_fp, true, arm_vldr_fp);
+        let reversals = block
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.opcode == Opcode::ByteReverseWord)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(reversals.len(), 2);
+
+        let pack = block
+            .instructions
+            .iter()
+            .find(|inst| inst.opcode == Opcode::Pack2x32To1x64)
+            .expect("double load must pack two words");
+        assert_eq!(
+            pack.args[0],
+            Value::Inst(crate::ir::value::InstRef(reversals[1] as u32))
+        );
+        assert_eq!(
+            pack.args[1],
+            Value::Inst(crate::ir::value::InstRef(reversals[0] as u32))
+        );
+    }
+
+    #[test]
+    fn big_endian_double_store_writes_high_word_first() {
+        let block = translate_vfp_memory(0x0080_0B00, ArmInstId::VSTR_fp, true, arm_vstr_fp);
+        let least = block
+            .instructions
+            .iter()
+            .position(|inst| inst.opcode == Opcode::LeastSignificantWord)
+            .expect("least-significant word extraction");
+        let most = block
+            .instructions
+            .iter()
+            .position(|inst| inst.opcode == Opcode::MostSignificantWord)
+            .expect("most-significant word extraction");
+        let writes = block
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode == Opcode::A32WriteMemory32)
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2);
+
+        let first_reversal = match writes[0].args[2] {
+            Value::Inst(reference) => reference,
+            other => panic!("expected reversed first word, got {other:?}"),
+        };
+        let second_reversal = match writes[1].args[2] {
+            Value::Inst(reference) => reference,
+            other => panic!("expected reversed second word, got {other:?}"),
+        };
+        assert_eq!(
+            block.get(first_reversal).args[0],
+            Value::Inst(crate::ir::value::InstRef(most as u32))
+        );
+        assert_eq!(
+            block.get(second_reversal).args[0],
+            Value::Inst(crate::ir::value::InstRef(least as u32))
+        );
+    }
+
+    #[test]
+    fn vfp_writeback_precedes_memory_accesses() {
+        let cases: [(u32, ArmInstId, VfpMemoryTranslator); 3] = [
+            (0x0000_0B02, ArmInstId::VPOP, arm_vpop),
+            (0x00A0_0B02, ArmInstId::VSTM, arm_vstm),
+            (0x00A0_0B02, ArmInstId::VLDM, arm_vldm),
+        ];
+        for (raw, id, translate) in cases {
+            let block = translate_vfp_memory(raw, id, false, translate);
+            let writeback = block
+                .instructions
+                .iter()
+                .position(|inst| inst.opcode == Opcode::A32SetRegister)
+                .expect("base-register writeback");
+            let memory = block
+                .instructions
+                .iter()
+                .position(|inst| {
+                    matches!(
+                        inst.opcode,
+                        Opcode::A32ReadMemory32 | Opcode::A32WriteMemory32
+                    )
+                })
+                .expect("memory access");
+            assert!(writeback < memory);
+        }
+    }
+
+    #[test]
+    fn empty_vfp_register_lists_are_unpredictable() {
+        let cases: [(ArmInstId, VfpMemoryTranslator); 4] = [
+            (ArmInstId::VPUSH, arm_vpush),
+            (ArmInstId::VPOP, arm_vpop),
+            (ArmInstId::VSTM, arm_vstm),
+            (ArmInstId::VLDM, arm_vldm),
+        ];
+        for (id, translate) in cases {
+            let raw = if matches!(id, ArmInstId::VSTM | ArmInstId::VLDM) {
+                0x0080_0B00
+            } else {
+                0x0000_0B00
+            };
+            let loc = vfp_location(false);
+            let mut block = Block::new(loc.to_location());
+            let ok = {
+                let mut ir = A32IREmitter::with_location(&mut block, loc);
+                translate(&mut ir, &DecodedArm { raw, id })
+            };
+            assert!(!ok);
+            assert!(block
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode == Opcode::A32ExceptionRaised));
+        }
     }
 }
 
@@ -895,9 +1177,10 @@ pub fn arm_vcvt_to_s32(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 
 pub fn arm_vpush(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let (d_bit, vd, sz, imm8) = vfp_fields(inst);
+    let d = to_ext_reg(d_bit, vd, sz);
     let regs = reg_count(sz, imm8);
-    if regs == 0 {
-        return true;
+    if regs == 0 || d.index() as u32 + regs > 32 || (sz && regs > 16) {
+        return super::unpredictable_instruction(ir);
     }
 
     let imm32 = imm8 * 4;
@@ -905,22 +1188,28 @@ pub fn arm_vpush(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let new_sp = ir.ir().sub_32(sp, Value::ImmU32(imm32), Value::ImmU1(true));
     ir.set_register(Reg::R13, new_sp);
 
-    let d = to_ext_reg(d_bit, vd, sz);
     let mut addr = new_sp;
+    let e_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .e_flag();
 
     for i in 0..regs {
         let reg = advance_ext_reg(d, i);
         if sz {
             let val = ir.get_extended_register_64(reg);
-            let lo = ir.ir().least_significant_word(val);
-            let hi = ir.ir().most_significant_word(val);
-            ir.write_memory_32(addr, lo, AccType::Normal);
+            let mut lo = ir.ir().least_significant_word(val);
+            let mut hi = ir.ir().most_significant_word(val).result;
+            if e_flag {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            ir.write_memory_32(addr, lo, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-            ir.write_memory_32(addr, hi, AccType::Normal);
+            ir.write_memory_32(addr, hi, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
         } else {
             let val = ir.get_extended_register_32(reg);
-            ir.write_memory_32(addr, val, AccType::Normal);
+            ir.write_memory_32(addr, val, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
         }
     }
@@ -934,36 +1223,42 @@ pub fn arm_vpush(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 
 pub fn arm_vpop(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let (d_bit, vd, sz, imm8) = vfp_fields(inst);
+    let d = to_ext_reg(d_bit, vd, sz);
     let regs = reg_count(sz, imm8);
-    if regs == 0 {
-        return true;
+    if regs == 0 || d.index() as u32 + regs > 32 || (sz && regs > 16) {
+        return super::unpredictable_instruction(ir);
     }
 
     let imm32 = imm8 * 4;
     let sp = ir.get_register(Reg::R13);
-    let d = to_ext_reg(d_bit, vd, sz);
-    let mut addr = sp;
-
-    for i in 0..regs {
-        let reg = advance_ext_reg(d, i);
-        if sz {
-            let lo = ir.read_memory_32(addr, AccType::Normal);
-            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-            let hi = ir.read_memory_32(addr, AccType::Normal);
-            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-            let val = ir.ir().pack_2x32_to_1x64(lo, hi);
-            ir.set_extended_register_64(reg, val);
-        } else {
-            let val = ir.read_memory_32(addr, AccType::Normal);
-            ir.set_extended_register_32(reg, val);
-            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-        }
-    }
-
     let new_sp = ir
         .ir()
         .add_32(sp, Value::ImmU32(imm32), Value::ImmU1(false));
     ir.set_register(Reg::R13, new_sp);
+    let mut addr = sp;
+    let e_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .e_flag();
+
+    for i in 0..regs {
+        let reg = advance_ext_reg(d, i);
+        if sz {
+            let mut lo = ir.read_memory_32(addr, AccType::Atomic);
+            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
+            let mut hi = ir.read_memory_32(addr, AccType::Atomic);
+            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
+            if e_flag {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            let val = ir.ir().pack_2x32_to_1x64(lo, hi);
+            ir.set_extended_register_64(reg, val);
+        } else {
+            let val = ir.read_memory_32(addr, AccType::Atomic);
+            ir.set_extended_register_32(reg, val);
+            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
+        }
+    }
     true
 }
 
@@ -978,9 +1273,7 @@ pub fn arm_vldr_fp(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 
     let imm32 = imm8 * 4;
     let base = if rn == Reg::R15 {
-        let loc = ir.current_location.expect("location not set");
-        let pc_aligned = loc.pc().wrapping_add(8) & !3;
-        Value::ImmU32(pc_aligned)
+        Value::ImmU32(ir.align_pc(4))
     } else {
         ir.get_register(rn)
     };
@@ -994,17 +1287,24 @@ pub fn arm_vldr_fp(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     };
 
     let d = to_ext_reg(d_bit, vd, sz);
+    let e_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .e_flag();
 
     if sz {
-        let lo = ir.read_memory_32(address, AccType::Normal);
+        let mut lo = ir.read_memory_32(address, AccType::Atomic);
         let hi_addr = ir
             .ir()
             .add_32(address, Value::ImmU32(4), Value::ImmU1(false));
-        let hi = ir.read_memory_32(hi_addr, AccType::Normal);
+        let mut hi = ir.read_memory_32(hi_addr, AccType::Atomic);
+        if e_flag {
+            std::mem::swap(&mut lo, &mut hi);
+        }
         let val = ir.ir().pack_2x32_to_1x64(lo, hi);
         ir.set_extended_register_64(d, val);
     } else {
-        let val = ir.read_memory_32(address, AccType::Normal);
+        let val = ir.read_memory_32(address, AccType::Atomic);
         ir.set_extended_register_32(d, val);
     }
 
@@ -1021,7 +1321,11 @@ pub fn arm_vstr_fp(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let rn = inst.rn();
 
     let imm32 = imm8 * 4;
-    let base = ir.get_register(rn);
+    let base = if rn == Reg::R15 {
+        Value::ImmU32(ir.align_pc(4))
+    } else {
+        ir.get_register(rn)
+    };
 
     let address = if u {
         ir.ir()
@@ -1032,19 +1336,26 @@ pub fn arm_vstr_fp(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     };
 
     let d = to_ext_reg(d_bit, vd, sz);
+    let e_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .e_flag();
 
     if sz {
         let val = ir.get_extended_register_64(d);
-        let lo = ir.ir().least_significant_word(val);
-        let hi = ir.ir().most_significant_word(val);
-        ir.write_memory_32(address, lo, AccType::Normal);
+        let mut lo = ir.ir().least_significant_word(val);
+        let mut hi = ir.ir().most_significant_word(val).result;
+        if e_flag {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        ir.write_memory_32(address, lo, AccType::Atomic);
         let hi_addr = ir
             .ir()
             .add_32(address, Value::ImmU32(4), Value::ImmU1(false));
-        ir.write_memory_32(hi_addr, hi, AccType::Normal);
+        ir.write_memory_32(hi_addr, hi, AccType::Atomic);
     } else {
         let val = ir.get_extended_register_32(d);
-        ir.write_memory_32(address, val, AccType::Normal);
+        ir.write_memory_32(address, val, AccType::Atomic);
     }
 
     true
@@ -1054,19 +1365,33 @@ pub fn arm_vstr_fp(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 // VSTM (floating-point store multiple)
 // ---------------------------------------------------------------------------
 
+// Eden exposes separate `vfp_VSTM_a1` (double) and `vfp_VSTM_a2` (single)
+// visitors. The Rust decoder currently owns one `VSTM` identity, so this
+// same-file visitor selects the corresponding validation and transfer shape
+// through `sz` while preserving both upstream paths.
 pub fn arm_vstm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let (d_bit, vd, sz, imm8) = vfp_fields(inst);
+    let p = (inst.raw >> 24) & 1 != 0;
     let u = (inst.raw >> 23) & 1 != 0;
     let w = (inst.raw >> 21) & 1 != 0;
     let rn = inst.rn();
+    assert!(p || u || w, "VSTM decode error");
+    assert!(!p || w, "VSTM decode error");
+    if p == u && w {
+        return super::undefined_instruction(ir);
+    }
+    if rn == Reg::R15 && w {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let d = to_ext_reg(d_bit, vd, sz);
     let regs = reg_count(sz, imm8);
-    if regs == 0 {
-        return true;
+    if regs == 0 || d.index() as u32 + regs > 32 || (sz && regs > 16) {
+        return super::unpredictable_instruction(ir);
     }
 
     let imm32 = imm8 * 4;
     let base_val = ir.get_register(rn);
-    let d = to_ext_reg(d_bit, vd, sz);
 
     let start = if u {
         base_val
@@ -1074,34 +1399,39 @@ pub fn arm_vstm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         ir.ir()
             .sub_32(base_val, Value::ImmU32(imm32), Value::ImmU1(true))
     };
+    if w {
+        let wb = if u {
+            ir.ir()
+                .add_32(start, Value::ImmU32(imm32), Value::ImmU1(false))
+        } else {
+            start
+        };
+        ir.set_register(rn, wb);
+    }
 
     let mut addr = start;
+    let e_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .e_flag();
     for i in 0..regs {
         let reg = advance_ext_reg(d, i);
         if sz {
             let val = ir.get_extended_register_64(reg);
-            let lo = ir.ir().least_significant_word(val);
-            let hi = ir.ir().most_significant_word(val);
-            ir.write_memory_32(addr, lo, AccType::Normal);
+            let mut lo = ir.ir().least_significant_word(val);
+            let mut hi = ir.ir().most_significant_word(val).result;
+            if e_flag {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            ir.write_memory_32(addr, lo, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-            ir.write_memory_32(addr, hi, AccType::Normal);
+            ir.write_memory_32(addr, hi, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
         } else {
             let val = ir.get_extended_register_32(reg);
-            ir.write_memory_32(addr, val, AccType::Normal);
+            ir.write_memory_32(addr, val, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
         }
-    }
-
-    if w {
-        let wb = if u {
-            ir.ir()
-                .add_32(base_val, Value::ImmU32(imm32), Value::ImmU1(false))
-        } else {
-            ir.ir()
-                .sub_32(base_val, Value::ImmU32(imm32), Value::ImmU1(true))
-        };
-        ir.set_register(rn, wb);
     }
 
     true
@@ -1111,19 +1441,36 @@ pub fn arm_vstm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 // VLDM (floating-point load multiple)
 // ---------------------------------------------------------------------------
 
+// Eden exposes separate `vfp_VLDM_a1` (double) and `vfp_VLDM_a2` (single)
+// visitors. See `arm_vstm` for why the two paths remain one same-file Rust
+// entry point.
 pub fn arm_vldm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let (d_bit, vd, sz, imm8) = vfp_fields(inst);
+    let p = (inst.raw >> 24) & 1 != 0;
     let u = (inst.raw >> 23) & 1 != 0;
     let w = (inst.raw >> 21) & 1 != 0;
     let rn = inst.rn();
+    assert!(p || u || w, "VLDM decode error");
+    assert!(!p || w, "VLDM decode error");
+    if p == u && w {
+        return super::undefined_instruction(ir);
+    }
+    let t_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .t_flag();
+    if rn == Reg::R15 && (w || t_flag) {
+        return super::unpredictable_instruction(ir);
+    }
+
+    let d = to_ext_reg(d_bit, vd, sz);
     let regs = reg_count(sz, imm8);
-    if regs == 0 {
-        return true;
+    if regs == 0 || d.index() as u32 + regs > 32 || (sz && regs > 16) {
+        return super::unpredictable_instruction(ir);
     }
 
     let imm32 = imm8 * 4;
     let base_val = ir.get_register(rn);
-    let d = to_ext_reg(d_bit, vd, sz);
 
     let start = if u {
         base_val
@@ -1131,33 +1478,38 @@ pub fn arm_vldm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         ir.ir()
             .sub_32(base_val, Value::ImmU32(imm32), Value::ImmU1(true))
     };
-
-    let mut addr = start;
-    for i in 0..regs {
-        let reg = advance_ext_reg(d, i);
-        if sz {
-            let lo = ir.read_memory_32(addr, AccType::Normal);
-            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-            let hi = ir.read_memory_32(addr, AccType::Normal);
-            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-            let val = ir.ir().pack_2x32_to_1x64(lo, hi);
-            ir.set_extended_register_64(reg, val);
-        } else {
-            let val = ir.read_memory_32(addr, AccType::Normal);
-            ir.set_extended_register_32(reg, val);
-            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-        }
-    }
-
     if w {
         let wb = if u {
             ir.ir()
-                .add_32(base_val, Value::ImmU32(imm32), Value::ImmU1(false))
+                .add_32(start, Value::ImmU32(imm32), Value::ImmU1(false))
         } else {
-            ir.ir()
-                .sub_32(base_val, Value::ImmU32(imm32), Value::ImmU1(true))
+            start
         };
         ir.set_register(rn, wb);
+    }
+
+    let mut addr = start;
+    let e_flag = ir
+        .current_location
+        .expect("current_location not set")
+        .e_flag();
+    for i in 0..regs {
+        let reg = advance_ext_reg(d, i);
+        if sz {
+            let mut lo = ir.read_memory_32(addr, AccType::Atomic);
+            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
+            let mut hi = ir.read_memory_32(addr, AccType::Atomic);
+            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
+            if e_flag {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            let val = ir.ir().pack_2x32_to_1x64(lo, hi);
+            ir.set_extended_register_64(reg, val);
+        } else {
+            let val = ir.read_memory_32(addr, AccType::Atomic);
+            ir.set_extended_register_32(reg, val);
+            addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
+        }
     }
 
     true

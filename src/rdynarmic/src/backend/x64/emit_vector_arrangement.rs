@@ -809,35 +809,6 @@ pub fn emit_vector_transpose64(
     ra.define_value(inst_ref, lower);
 }
 
-// ---------------------------------------------------------------------------
-// VectorShuffle — native SSE: pshufd/pshufhw/pshuflw
-// ---------------------------------------------------------------------------
-
-pub fn emit_vector_shuffle_words(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshufd);
-}
-pub fn emit_vector_shuffle_high_halfwords(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshufhw);
-}
-pub fn emit_vector_shuffle_low_halfwords(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshuflw);
-}
-
 // Narrow16: truncate 8×u16 from a to 8×u8 in the low half, zero upper half.
 pub fn emit_vector_narrow16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -1111,6 +1082,7 @@ mod tests {
         }
 
         EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: EmitCallbacks {
                 memory_read_8: cb(),
                 memory_read_16: cb(),
@@ -1123,7 +1095,6 @@ mod tests {
                 memory_write_64: cb(),
                 memory_write_128: cb(),
                 call_supervisor: cb(),
-                interpreter_fallback: cb(),
                 exception_raised: cb(),
                 data_cache_operation: cb(),
                 instruction_cache_operation: cb(),
@@ -1148,6 +1119,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         }
     }
 
@@ -1182,7 +1157,6 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_deinterleave_even8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_deinterleave_odd64;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_transpose8;
-        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_shuffle_words;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_narrow16;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend64;

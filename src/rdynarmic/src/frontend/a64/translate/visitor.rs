@@ -1,19 +1,13 @@
 use crate::frontend::a64::decoder::{A64InstructionName, DecodedInst};
 use crate::frontend::a64::types::{Exception, Reg};
 use crate::ir::a64_emitter::A64IREmitter;
+use crate::ir::acc_type::AccType;
 use crate::ir::block::Block;
 use crate::ir::location::A64LocationDescriptor;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
-/// Options controlling translation behavior.
-#[derive(Debug, Clone, Default)]
-pub struct TranslationOptions {
-    /// Hook hint instructions (YIELD, WFE, WFI, SEV, SEVL) as exceptions.
-    pub hook_hint_instructions: bool,
-    /// Use wall clock for CNTPCT (instead of cycle-accurate).
-    pub wall_clock_cntpct: bool,
-}
+use super::a64_translate::TranslationOptions;
 
 /// Translator visitor: translates decoded ARM64 instructions into IR.
 pub struct TranslatorVisitor<'a> {
@@ -170,6 +164,57 @@ impl<'a> TranslatorVisitor<'a> {
         }
     }
 
+    /// Read exclusive memory by size.
+    pub(crate) fn exclusive_mem_read(
+        &mut self,
+        address: Value,
+        bytes: usize,
+        acc_type: AccType,
+    ) -> Value {
+        match bytes {
+            1 => self.ir.exclusive_read_memory_8(address, acc_type),
+            2 => self.ir.exclusive_read_memory_16(address, acc_type),
+            4 => self.ir.exclusive_read_memory_32(address, acc_type),
+            8 => self.ir.exclusive_read_memory_64(address, acc_type),
+            16 => self.ir.exclusive_read_memory_128(address, acc_type),
+            _ => unreachable!("invalid exclusive memory read size {bytes}"),
+        }
+    }
+
+    /// Write exclusive memory by size and return the store status.
+    pub(crate) fn exclusive_mem_write(
+        &mut self,
+        address: Value,
+        bytes: usize,
+        acc_type: AccType,
+        value: Value,
+    ) -> Value {
+        match bytes {
+            1 => self.ir.exclusive_write_memory_8(address, value, acc_type),
+            2 => self.ir.exclusive_write_memory_16(address, value, acc_type),
+            4 => self.ir.exclusive_write_memory_32(address, value, acc_type),
+            8 => self.ir.exclusive_write_memory_64(address, value, acc_type),
+            16 => self.ir.exclusive_write_memory_128(address, value, acc_type),
+            _ => unreachable!("invalid exclusive memory write size {bytes}"),
+        }
+    }
+
+    pub(crate) fn sign_extend(&mut self, value: Value, to_size: usize) -> Value {
+        match to_size {
+            32 => self.ir.ir().sign_extend_to_word(value),
+            64 => self.ir.ir().sign_extend_to_long(value),
+            _ => unreachable!("invalid sign-extension destination size {to_size}"),
+        }
+    }
+
+    pub(crate) fn zero_extend(&mut self, value: Value, to_size: usize) -> Value {
+        match to_size {
+            32 => self.ir.ir().zero_extend_to_word(value),
+            64 => self.ir.ir().zero_extend_to_long(value),
+            _ => unreachable!("invalid zero-extension destination size {to_size}"),
+        }
+    }
+
     /// Get base address (Rn == R31 uses SP in load/store context).
     pub(crate) fn base_address(&mut self, rn: Reg) -> Value {
         if rn == Reg::ZR {
@@ -311,23 +356,11 @@ impl<'a> TranslatorVisitor<'a> {
         vec: crate::frontend::a64::types::Vec,
         value: Value,
     ) {
-        let value_type = match value {
-            Value::Inst(inst_ref) => self.ir.base.block.inst_real_return_type(inst_ref),
-            value => value.get_type(),
-        };
-
-        let zero_extend_scalar_to_quad = |this: &mut Self, datasize: usize, value: Value| {
-            let value = match datasize {
-                8 => this.ir.ir().zero_extend_byte_to_long(value),
-                16 => this.ir.ir().zero_extend_half_to_long(value),
-                32 => this.ir.ir().zero_extend_word_to_long(value),
-                64 => value,
-                _ => panic!("Invalid FP/SIMD scalar datasize {}", datasize),
-            };
-            this.ir.ir().zero_extend_to_quad(value)
-        };
-
         if datasize == 128 {
+            let value_type = match value {
+                Value::Inst(inst_ref) => self.ir.base.block.inst_real_return_type(inst_ref),
+                value => value.get_type(),
+            };
             assert_eq!(
                 value_type,
                 crate::ir::types::Type::U128,
@@ -342,42 +375,11 @@ impl<'a> TranslatorVisitor<'a> {
             "Invalid FP/SIMD datasize {}",
             datasize
         );
-        let value = zero_extend_scalar_to_quad(self, datasize, value);
+        let value = self.ir.ir().zero_extend_to_quad(value);
         self.ir.set_q(vec, value);
     }
 
     // --- Error handlers ---
-
-    /// Fallback: interpret this instruction.
-    pub fn interpret_this_instruction(&mut self) -> bool {
-        let loc = self.ir.current_location.expect("location not set");
-        // RUZU_LOG_INTERPRET_PC=1 — log every PC where translation fell back
-        // to the interpret terminal. Useful for finding interpret-fallback
-        // instructions in tight loops (each occurrence costs a JIT
-        // exit/re-enter at ~10µs/iter, easily wedging boot if hit millions
-        // of times).
-        if std::env::var_os("RUZU_LOG_INTERPRET_PC").is_some() {
-            static COUNTS: std::sync::OnceLock<
-                std::sync::Mutex<std::collections::HashMap<u64, u64>>,
-            > = std::sync::OnceLock::new();
-            let pc = loc.pc();
-            let mut counts = COUNTS
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-                .lock()
-                .unwrap();
-            let n = counts.entry(pc).and_modify(|c| *c += 1).or_insert(1);
-            // Log first occurrence + powers of 16 (1, 16, 256, 4k, 65k, 1M, 16M, ...)
-            // so a hot fallback shows growth without spamming.
-            if *n == 1 || n.is_power_of_two() && (*n).trailing_zeros() % 4 == 0 {
-                eprintln!("[INTERPRET_FALLBACK] pc=0x{:016X} count={}", pc, *n);
-            }
-        }
-        self.ir.set_term(Terminal::Interpret {
-            next: loc.to_location(),
-            num_instructions: 1,
-        });
-        false
-    }
 
     /// Unpredictable instruction — treat as interpret.
     pub fn unpredictable_instruction(&mut self) -> bool {
@@ -460,9 +462,8 @@ impl<'a> TranslatorVisitor<'a> {
             // SBFM aliases — separate handlers matching upstream
             // `data_processing_bitfield.cpp:87-134`. These have more
             // specific encoding patterns than SBFM, so the decoder picks
-            // them first. Without explicit handlers the block fell into
-            // `interpret_this_instruction()` (a no-op) and silently
-            // skipped the shift/sign-extend — STK's NVN driver at
+            // them first. Without explicit handlers the shift/sign-extend
+            // was skipped — STK's NVN driver at
             // NRO+0xE43F4C uses `asr w1, w0, #2` and without the
             // dispatch the result was wrong → bad pointer reads → no
             // display.
@@ -766,12 +767,19 @@ impl<'a> TranslatorVisitor<'a> {
             MLA_vec => self.mla_vec(inst),
             MLS_vec => self.mls_vec(inst),
             MUL_vec => self.mul_vec(inst),
+            PMUL => self.pmul(inst),
+            SQDMULH_vec_2 => self.sqdmulh_vec_2(inst),
+            SQRDMULH_vec_2 => self.sqrdmulh_vec_2(inst),
             FMAXNMP_vec_2 => self.fmaxnmp_vec_2(inst),
             FMAXP_vec_2 => self.fmaxp_vec_2(inst),
             FMINNMP_vec_2 => self.fminnmp_vec_2(inst),
             FMINP_vec_2 => self.fminp_vec_2(inst),
             SSHL_2 => self.sshl_2(inst),
+            SQSHL_reg_2 => self.sqshl_reg_2(inst),
+            SRSHL_2 => self.srshl_2(inst),
             USHL_2 => self.ushl_2(inst),
+            UQSHL_reg_2 => self.uqshl_reg_2(inst),
+            URSHL_2 => self.urshl_2(inst),
             AND_asimd => self.and_asimd(inst),
             BIC_asimd_reg => self.bic_asimd_reg(inst),
             ORR_asimd_reg => self.orr_asimd_reg(inst),
@@ -786,6 +794,8 @@ impl<'a> TranslatorVisitor<'a> {
             FCMGT_reg_4 => self.fcmgt_reg_4(inst),
             FADD_2 => self.fadd_2(inst),
             FSUB_2 => self.fsub_2(inst),
+            FMLA_vec_1 => self.fmla_vec_1(inst),
+            FMLS_vec_1 => self.fmls_vec_1(inst),
 
             // SIMD two-register misc: compare against zero (CMEQ #0).
             // Same strlen loop reduces UMINP results then compares to 0
@@ -873,21 +883,34 @@ impl<'a> TranslatorVisitor<'a> {
             // `build.rs` (mirrors upstream `decoder/a64.h:48-57`). So we
             // can call the shift handlers directly and trust they only
             // see well-formed encodings.
+            SSHR_2 => self.sshr_2(inst),
+            SSRA_2 => self.ssra_2(inst),
+            SRSHR_2 => self.srshr_2(inst),
+            SRSRA_2 => self.srsra_2(inst),
             SHL_2 => self.shl_2(inst),
+            SQSHL_imm_2 => self.sqshl_imm_2(inst),
             SHRN => self.shrn(inst),
             RSHRN => self.rshrn(inst),
             SQSHRN_2 => self.sqshrn_2(inst),
             SQRSHRN_2 => self.sqrshrn_2(inst),
-            SQSHRUN_2 => self.sqshrun_2(inst),
-            SQRSHRUN_2 => self.sqrshrun_2(inst),
-            UQSHRN_2 => self.uqshrn_2(inst),
-            UQRSHRN_2 => self.uqrshrn_2(inst),
+            SSHLL => self.sshll(inst),
+            SCVTF_fix_2 => self.scvtf_fix_2(inst),
+            FCVTZS_fix_2 => self.fcvtzs_fix_2(inst),
             USHR_2 => self.ushr_2(inst),
             USRA_2 => self.usra_2(inst),
             URSHR_2 => self.urshr_2(inst),
             URSRA_2 => self.ursra_2(inst),
-            SSHLL => self.sshll(inst),
+            SRI_2 => self.sri_2(inst),
+            SLI_2 => self.sli_2(inst),
+            SQSHLU_2 => self.sqshlu_2(inst),
+            UQSHL_imm_2 => self.uqshl_imm_2(inst),
+            SQSHRUN_2 => self.sqshrun_2(inst),
+            SQRSHRUN_2 => self.sqrshrun_2(inst),
+            UQSHRN_2 => self.uqshrn_2(inst),
+            UQRSHRN_2 => self.uqrshrn_2(inst),
             USHLL => self.ushll(inst),
+            UCVTF_fix_2 => self.ucvtf_fix_2(inst),
+            FCVTZU_fix_2 => self.fcvtzu_fix_2(inst),
 
             // SIMD three-different — long add/sub.
             SADDL => self.saddl(inst),
@@ -905,11 +928,17 @@ impl<'a> TranslatorVisitor<'a> {
             SMLAL_vec => self.smlal_vec(inst),
             SMLSL_vec => self.smlsl_vec(inst),
             SMULL_vec => self.smull_vec(inst),
+            PMULL => self.pmull(inst),
             UMLAL_vec => self.umlal_vec(inst),
             UMLSL_vec => self.umlsl_vec(inst),
             UMULL_vec => self.umull_vec(inst),
+            SQDMULL_vec_2 => self.sqdmull_vec_2(inst),
 
             // SIMD scalar three-same / scalar zero-compare.
+            SQADD_1 => self.sqadd_1(inst),
+            SQSUB_1 => self.sqsub_1(inst),
+            UQADD_1 => self.uqadd_1(inst),
+            UQSUB_1 => self.uqsub_1(inst),
             ADD_1 => self.add_1(inst),
             SUB_1 => self.sub_1(inst),
             CMEQ_reg_1 => self.cmeq_reg_1(inst),
@@ -920,6 +949,12 @@ impl<'a> TranslatorVisitor<'a> {
             CMTST_1 => self.cmtst_1(inst),
             SSHL_1 => self.sshl_1(inst),
             USHL_1 => self.ushl_1(inst),
+            SQSHL_reg_1 => self.sqshl_reg_1(inst),
+            UQSHL_reg_1 => self.uqshl_reg_1(inst),
+            SRSHL_1 => self.srshl_1(inst),
+            URSHL_1 => self.urshl_1(inst),
+            SQDMULH_vec_1 => self.sqdmulh_vec_1(inst),
+            SQRDMULH_vec_1 => self.sqrdmulh_vec_1(inst),
             CMEQ_zero_1 => self.cmeq_zero_1(inst),
             CMGE_zero_1 => self.cmge_zero_1(inst),
             CMGT_zero_1 => self.cmgt_zero_1(inst),
@@ -930,6 +965,9 @@ impl<'a> TranslatorVisitor<'a> {
             FCMGE_reg_2 => self.fcmge_reg_2(inst),
             FCMGT_reg_2 => self.fcmgt_reg_2(inst),
             FABD_2 => self.fabd_2(inst),
+            FMULX_vec_2 => self.fmulx_vec_2(inst),
+            FACGE_2 => self.facge_2(inst),
+            FACGT_2 => self.facgt_2(inst),
             FRECPS_1 => self.frecps_1(inst),
             FRECPS_2 => self.frecps_2(inst),
             FRSQRTS_1 => self.frsqrts_1(inst),
@@ -942,6 +980,8 @@ impl<'a> TranslatorVisitor<'a> {
             FCMEQ_zero_2 => self.fcmeq_zero_2(inst),
             FCMGE_zero_2 => self.fcmge_zero_2(inst),
             FCMGT_zero_2 => self.fcmgt_zero_2(inst),
+            FCMLE_2 => self.fcmle_2(inst),
+            FCMLT_2 => self.fcmlt_2(inst),
             FCMLE_4 => self.fcmle_4(inst),
             FCMLT_4 => self.fcmlt_4(inst),
             FCVTAS_2 => self.fcvtas_2(inst),
@@ -952,6 +992,7 @@ impl<'a> TranslatorVisitor<'a> {
             FCVTNU_2 => self.fcvtnu_2(inst),
             FCVTPS_2 => self.fcvtps_2(inst),
             FCVTPU_2 => self.fcvtpu_2(inst),
+            FCVTXN_1 => self.fcvtxn_1(inst),
             FCVTZS_int_2 => self.fcvtzs_int_2(inst),
             FCVTZU_int_2 => self.fcvtzu_int_2(inst),
             FRECPE_1 => self.frecpe_1(inst),
@@ -961,7 +1002,11 @@ impl<'a> TranslatorVisitor<'a> {
             FRSQRTE_1 => self.frsqrte_1(inst),
             FRSQRTE_2 => self.frsqrte_2(inst),
             SCVTF_int_2 => self.scvtf_int_2(inst),
+            SQABS_1 => self.sqabs_1(inst),
+            SQNEG_1 => self.sqneg_1(inst),
+            SUQADD_1 => self.suqadd_1(inst),
             UCVTF_int_2 => self.ucvtf_int_2(inst),
+            USQADD_1 => self.usqadd_1(inst),
 
             // SIMD scalar pairwise.
             ADDP_pair => self.addp_pair(inst),
@@ -987,7 +1032,21 @@ impl<'a> TranslatorVisitor<'a> {
             // SIMD scalar shift by immediate.
             USHR_1 => self.ushr_1(inst),
             SSHR_1 => self.sshr_1(inst),
+            USRA_1 => self.usra_1(inst),
+            SSRA_1 => self.ssra_1(inst),
+            URSHR_1 => self.urshr_1(inst),
+            SRSHR_1 => self.srshr_1(inst),
+            URSRA_1 => self.ursra_1(inst),
+            SRSRA_1 => self.srsra_1(inst),
+            SRI_1 => self.sri_1(inst),
+            SLI_1 => self.sli_1(inst),
             SHL_1 => self.shl_1(inst),
+            SQSHL_imm_1 => self.sqshl_imm_1(inst),
+            SQSHLU_1 => self.sqshlu_1(inst),
+            UQSHL_imm_1 => self.uqshl_imm_1(inst),
+            SQSHRN_1 => self.sqshrn_1(inst),
+            SQSHRUN_1 => self.sqshrun_1(inst),
+            UQSHRN_1 => self.uqshrn_1(inst),
             FCVTZS_fix_1 => self.fcvtzs_fix_1(inst),
             FCVTZU_fix_1 => self.fcvtzu_fix_1(inst),
             SCVTF_fix_1 => self.scvtf_fix_1(inst),
@@ -1028,6 +1087,9 @@ impl<'a> TranslatorVisitor<'a> {
             SMLAL_elt => self.smlal_elt(inst),
             SMLSL_elt => self.smlsl_elt(inst),
             SMULL_elt => self.smull_elt(inst),
+            SQDMULL_elt_1 => self.sqdmull_elt_1(inst),
+            SQDMULH_elt_1 => self.sqdmulh_elt_1(inst),
+            SQRDMULH_elt_1 => self.sqrdmulh_elt_1(inst),
             SQDMULL_elt_2 => self.sqdmull_elt_2(inst),
             UMLAL_elt => self.umlal_elt(inst),
             UMLSL_elt => self.umlsl_elt(inst),
@@ -1036,6 +1098,10 @@ impl<'a> TranslatorVisitor<'a> {
             SQRDMULH_elt_2 => self.sqrdmulh_elt_2(inst),
             SDOT_elt => self.sdot_elt(inst),
             UDOT_elt => self.udot_elt(inst),
+            SDOT_vec => self.sdot_vec(inst),
+            UDOT_vec => self.udot_vec(inst),
+            FCMLA_vec => self.fcmla_vec(inst),
+            FCADD_vec => self.fcadd_vec(inst),
             FMUL_vec_2 => self.fmul_vec_2(inst),
             FMULX_vec_4 => self.fmulx_vec_4(inst),
             FDIV_2 => self.fdiv_2(inst),
@@ -1053,10 +1119,10 @@ impl<'a> TranslatorVisitor<'a> {
             ADCS => self.adcs(inst),
             SBC => self.sbc(inst),
             SBCS => self.sbcs(inst),
-            SSHR_2 => self.sshr_2(inst),
-            SSRA_2 => self.ssra_2(inst),
-            SRSHR_2 => self.srshr_2(inst),
-            SRSRA_2 => self.srsra_2(inst),
+            CFINV => self.cfinv(inst),
+            RMIF => self.rmif(inst),
+            XAFlag => self.xaflag(inst),
+            AXFlag => self.axflag(inst),
 
             // Crypto
             AESE => self.aese(inst),
@@ -1070,9 +1136,26 @@ impl<'a> TranslatorVisitor<'a> {
             SHA256H => self.sha256h(inst),
             SHA256H2 => self.sha256h2(inst),
             SHA256SU1 => self.sha256su1(inst),
+            SHA512SU0 => self.sha512su0(inst),
+            SHA512SU1 => self.sha512su1(inst),
+            SHA512H => self.sha512h(inst),
+            SHA512H2 => self.sha512h2(inst),
+            RAX1 => self.rax1(inst),
+            XAR => self.xar(inst),
+            SM3PARTW1 => self.sm3partw1(inst),
+            SM3PARTW2 => self.sm3partw2(inst),
+            SM4E => self.sm4e(inst),
+            SM4EKEY => self.sm4ekey(inst),
             SHA1H => self.sha1h(inst),
             SHA1SU1 => self.sha1su1(inst),
             SHA256SU0 => self.sha256su0(inst),
+            EOR3 => self.eor3(inst),
+            BCAX => self.bcax(inst),
+            SM3SS1 => self.sm3ss1(inst),
+            SM3TT1A => self.sm3tt1a(inst),
+            SM3TT1B => self.sm3tt1b(inst),
+            SM3TT2A => self.sm3tt2a(inst),
+            SM3TT2B => self.sm3tt2b(inst),
 
             // Cache maintenance (NOP in userspace)
             DC_IVAC => self.dc_ivac(inst),
@@ -1088,9 +1171,6 @@ impl<'a> TranslatorVisitor<'a> {
             IC_IALLUIS => self.ic_ialluis(inst),
             IC_IVAU => self.ic_ivau(inst),
             UnallocatedEncoding => self.unallocated_encoding(),
-
-            // Unimplemented — fallback to interpreter
-            _ => self.interpret_this_instruction(),
         }
     }
 }
@@ -1100,6 +1180,82 @@ mod tests {
     use super::*;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
+
+    #[test]
+    fn generic_exclusive_memory_helpers_select_all_upstream_widths() {
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        {
+            let mut visitor =
+                TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+            let address = Value::ImmU64(0x2000);
+            let values = [
+                (1, Value::ImmU8(1)),
+                (2, Value::ImmU16(2)),
+                (4, Value::ImmU32(4)),
+                (8, Value::ImmU64(8)),
+            ];
+            for (bytes, value) in values {
+                let _ = visitor.exclusive_mem_read(address, bytes, AccType::Atomic);
+                let _ = visitor.exclusive_mem_write(address, bytes, AccType::Atomic, value);
+            }
+            let vector = visitor.ir.ir().zero_vector();
+            let _ = visitor.exclusive_mem_read(address, 16, AccType::Atomic);
+            let _ = visitor.exclusive_mem_write(address, 16, AccType::Atomic, vector);
+        }
+
+        let opcodes: Vec<_> = block
+            .instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            [
+                Opcode::A64ExclusiveReadMemory8,
+                Opcode::A64ExclusiveWriteMemory8,
+                Opcode::A64ExclusiveReadMemory16,
+                Opcode::A64ExclusiveWriteMemory16,
+                Opcode::A64ExclusiveReadMemory32,
+                Opcode::A64ExclusiveWriteMemory32,
+                Opcode::A64ExclusiveReadMemory64,
+                Opcode::A64ExclusiveWriteMemory64,
+                Opcode::ZeroVector,
+                Opcode::A64ExclusiveReadMemory128,
+                Opcode::A64ExclusiveWriteMemory128,
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_extension_helpers_select_upstream_destination_widths() {
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        {
+            let mut visitor =
+                TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+            let byte = Value::ImmU8(0x80);
+            let _ = visitor.sign_extend(byte, 32);
+            let _ = visitor.sign_extend(byte, 64);
+            let _ = visitor.zero_extend(byte, 32);
+            let _ = visitor.zero_extend(byte, 64);
+        }
+
+        let opcodes: Vec<_> = block
+            .instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            [
+                Opcode::SignExtendByteToWord,
+                Opcode::SignExtendByteToLong,
+                Opcode::ZeroExtendByteToWord,
+                Opcode::ZeroExtendByteToLong,
+            ]
+        );
+    }
 
     fn assert_exception_terminal(block: &Block) {
         assert!(matches!(
@@ -1155,27 +1311,6 @@ mod tests {
         drop(visitor);
 
         assert_exception_terminal(&block);
-    }
-
-    #[test]
-    fn interpret_this_instruction_uses_current_location_like_upstream() {
-        let loc = A64LocationDescriptor::new(0x1000, 0, false);
-        let mut block = Block::new(loc.to_location());
-        let mut visitor = TranslatorVisitor::new(&mut block, loc, TranslationOptions::default());
-
-        assert!(!visitor.interpret_this_instruction());
-        drop(visitor);
-
-        match &block.terminal {
-            Terminal::Interpret {
-                next,
-                num_instructions,
-            } => {
-                assert_eq!(*next, loc.to_location());
-                assert_eq!(*num_instructions, 1);
-            }
-            other => panic!("expected Interpret terminal, got {other:?}"),
-        }
     }
 
     #[test]

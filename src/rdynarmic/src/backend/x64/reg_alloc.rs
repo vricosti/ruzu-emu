@@ -1367,6 +1367,24 @@ mod tests {
     }
 
     #[test]
+    fn register_multi_result_pseudo_operation_preserves_inline_value() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let inst_info = vec![(1, 0), (1, 128)];
+        let mut ra = RegAlloc::new_default(&mut asm, inst_info);
+
+        let result = ra.scratch_xmm();
+        let result_loc = reg_to_hostloc(result);
+        ra.define_value(InstRef(1), result);
+        ra.end_of_alloc_scope();
+
+        let size_before = ra.asm.size();
+        ra.register_pseudo_operation(InstRef(1), &[Value::Inst(InstRef(0))], 1);
+
+        assert_eq!(ra.asm.size(), size_before);
+        assert_eq!(ra.value_location(InstRef(1)), Some(result_loc));
+    }
+
+    #[test]
     fn test_spill_and_reload() {
         let mut asm = CodeAssembler::new(4096).unwrap();
         // Create values with 2 uses each to keep them alive

@@ -3,14 +3,23 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::interface::a32::config::{
+        empty_coprocessors, Exception as A32Exception, UserCallbacks as A32UserCallbacks,
+        UserConfig as A32UserConfig,
+    };
+    use crate::interface::a32::coprocessor::{
+        Callback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords, Coprocessor,
+    };
+    use crate::interface::a32::coprocessor_util::CoprocReg;
+    use crate::interface::optimization_flags::OptimizationFlag;
     use crate::jit::A32Jit;
-    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
+    use std::cell::UnsafeCell;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     struct TestEnv {
         code_mem: Vec<u32>,
-        data_mem: HashMap<u64, u8>,
+        data_mem: HashMap<u32, u8>,
         ticks_left: u64,
     }
 
@@ -24,8 +33,8 @@ mod tests {
         }
     }
 
-    impl UserCallbacks for TestEnv {
-        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for TestEnv {
+        fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
             let idx = (vaddr as usize) / 4;
             if idx < self.code_mem.len() {
                 Some(self.code_mem[idx])
@@ -35,128 +44,171 @@ mod tests {
             }
         }
 
-        fn memory_read_8(&self, vaddr: u64) -> u8 {
+        fn memory_read_8(&self, vaddr: u32) -> u8 {
             *self.data_mem.get(&vaddr).unwrap_or(&0)
         }
-        fn memory_read_16(&self, vaddr: u64) -> u16 {
+        fn memory_read_16(&self, vaddr: u32) -> u16 {
             let lo = self.memory_read_8(vaddr) as u16;
-            let hi = self.memory_read_8(vaddr + 1) as u16;
+            let hi = self.memory_read_8(vaddr.wrapping_add(1)) as u16;
             lo | (hi << 8)
         }
-        fn memory_read_32(&self, vaddr: u64) -> u32 {
+        fn memory_read_32(&self, vaddr: u32) -> u32 {
             let lo = self.memory_read_16(vaddr) as u32;
-            let hi = self.memory_read_16(vaddr + 2) as u32;
+            let hi = self.memory_read_16(vaddr.wrapping_add(2)) as u32;
             lo | (hi << 16)
         }
-        fn memory_read_64(&self, vaddr: u64) -> u64 {
+        fn memory_read_64(&self, vaddr: u32) -> u64 {
             let lo = self.memory_read_32(vaddr) as u64;
-            let hi = self.memory_read_32(vaddr + 4) as u64;
+            let hi = self.memory_read_32(vaddr.wrapping_add(4)) as u64;
             lo | (hi << 32)
         }
-        fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-            (self.memory_read_64(vaddr), self.memory_read_64(vaddr + 8))
-        }
 
-        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        fn memory_write_8(&mut self, vaddr: u32, value: u8) {
             self.data_mem.insert(vaddr, value);
         }
-        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        fn memory_write_16(&mut self, vaddr: u32, value: u16) {
             self.memory_write_8(vaddr, value as u8);
-            self.memory_write_8(vaddr + 1, (value >> 8) as u8);
+            self.memory_write_8(vaddr.wrapping_add(1), (value >> 8) as u8);
         }
-        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        fn memory_write_32(&mut self, vaddr: u32, value: u32) {
             self.memory_write_16(vaddr, value as u16);
-            self.memory_write_16(vaddr + 2, (value >> 16) as u16);
+            self.memory_write_16(vaddr.wrapping_add(2), (value >> 16) as u16);
         }
-        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        fn memory_write_64(&mut self, vaddr: u32, value: u64) {
             self.memory_write_32(vaddr, value as u32);
-            self.memory_write_32(vaddr + 4, (value >> 32) as u32);
-        }
-        fn memory_write_128(&mut self, vaddr: u64, lo: u64, hi: u64) {
-            self.memory_write_64(vaddr, lo);
-            self.memory_write_64(vaddr + 8, hi);
+            self.memory_write_32(vaddr.wrapping_add(4), (value >> 32) as u32);
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
+        fn memory_write_exclusive_8(&mut self, _vaddr: u32, _value: u8, _expected: u8) -> bool {
             true
         }
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
+        fn memory_write_exclusive_16(&mut self, _vaddr: u32, _value: u16, _expected: u16) -> bool {
             true
         }
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
+        fn memory_write_exclusive_32(&mut self, _vaddr: u32, _value: u32, _expected: u32) -> bool {
             true
         }
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
+        fn memory_write_exclusive_64(&mut self, _vaddr: u32, _value: u64, _expected: u64) -> bool {
             true
         }
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _lo: u64,
-            _hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            true
-        }
-        fn exclusive_clear(&mut self) {}
-
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, ticks: u64) {
             self.ticks_left = self.ticks_left.saturating_sub(ticks);
         }
         fn get_ticks_remaining(&self) -> u64 {
             self.ticks_left
         }
-        fn data_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
-        fn instruction_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
+    }
+
+    fn make_jit_with_coprocessors(
+        env: TestEnv,
+        coprocessors: crate::interface::a32::config::Coprocessors,
+    ) -> A32Jit {
+        let mut config = A32UserConfig::new(Box::new(env));
+        config.coprocessors = coprocessors;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        A32Jit::new(config).expect("JIT creation should succeed")
     }
 
     fn make_jit(env: TestEnv) -> A32Jit {
-        let config = JitConfig {
-            callbacks: Box::new(env),
-            enable_cycle_counting: true,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: crate::jit_config::OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
-        A32Jit::new(config).expect("JIT creation should succeed")
+        make_jit_with_coprocessors(env, empty_coprocessors())
+    }
+
+    struct ThreadPointerCoprocessor {
+        uro: UnsafeCell<u32>,
+    }
+
+    unsafe impl Send for ThreadPointerCoprocessor {}
+    unsafe impl Sync for ThreadPointerCoprocessor {}
+
+    impl Coprocessor for ThreadPointerCoprocessor {
+        fn compile_internal_operation(
+            &self,
+            _two: bool,
+            _opc1: u32,
+            _crd: CoprocReg,
+            _crn: CoprocReg,
+            _crm: CoprocReg,
+            _opc2: u32,
+        ) -> Option<Callback> {
+            None
+        }
+
+        fn compile_send_one_word(
+            &self,
+            _two: bool,
+            _opc1: u32,
+            _crn: CoprocReg,
+            _crm: CoprocReg,
+            _opc2: u32,
+        ) -> CallbackOrAccessOneWord {
+            CallbackOrAccessOneWord::CoprocessorException
+        }
+
+        fn compile_send_two_words(
+            &self,
+            _two: bool,
+            _opc: u32,
+            _crm: CoprocReg,
+        ) -> CallbackOrAccessTwoWords {
+            CallbackOrAccessTwoWords::CoprocessorException
+        }
+
+        fn compile_get_one_word(
+            &self,
+            two: bool,
+            opc1: u32,
+            crn: CoprocReg,
+            crm: CoprocReg,
+            opc2: u32,
+        ) -> CallbackOrAccessOneWord {
+            if !two && opc1 == 0 && crn == CoprocReg::C13 && crm == CoprocReg::C0 && opc2 == 3 {
+                CallbackOrAccessOneWord::Memory(self.uro.get())
+            } else {
+                CallbackOrAccessOneWord::CoprocessorException
+            }
+        }
+
+        fn compile_get_two_words(
+            &self,
+            _two: bool,
+            _opc: u32,
+            _crm: CoprocReg,
+        ) -> CallbackOrAccessTwoWords {
+            CallbackOrAccessTwoWords::CoprocessorException
+        }
+
+        fn compile_load_words(
+            &self,
+            _two: bool,
+            _long_transfer: bool,
+            _crd: CoprocReg,
+            _option: Option<u8>,
+        ) -> Option<Callback> {
+            None
+        }
+
+        fn compile_store_words(
+            &self,
+            _two: bool,
+            _long_transfer: bool,
+            _crd: CoprocReg,
+            _option: Option<u8>,
+        ) -> Option<Callback> {
+            None
+        }
     }
 
     struct SharedEnv {
         code_mem: Vec<u32>,
-        data_mem: Arc<Mutex<HashMap<u64, u8>>>,
+        data_mem: Arc<Mutex<HashMap<u32, u8>>>,
         ticks_left: u64,
     }
 
     impl SharedEnv {
-        fn new(code: Vec<u32>, data_mem: Arc<Mutex<HashMap<u64, u8>>>) -> Self {
+        fn new(code: Vec<u32>, data_mem: Arc<Mutex<HashMap<u32, u8>>>) -> Self {
             Self {
                 code_mem: code,
                 data_mem,
@@ -165,8 +217,8 @@ mod tests {
         }
     }
 
-    impl UserCallbacks for SharedEnv {
-        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for SharedEnv {
+        fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
             let idx = (vaddr as usize) / 4;
             if idx < self.code_mem.len() {
                 Some(self.code_mem[idx])
@@ -175,128 +227,78 @@ mod tests {
             }
         }
 
-        fn memory_read_8(&self, vaddr: u64) -> u8 {
+        fn memory_read_8(&self, vaddr: u32) -> u8 {
             *self.data_mem.lock().unwrap().get(&vaddr).unwrap_or(&0)
         }
-        fn memory_read_16(&self, vaddr: u64) -> u16 {
+        fn memory_read_16(&self, vaddr: u32) -> u16 {
             let lo = self.memory_read_8(vaddr) as u16;
-            let hi = self.memory_read_8(vaddr + 1) as u16;
+            let hi = self.memory_read_8(vaddr.wrapping_add(1)) as u16;
             lo | (hi << 8)
         }
-        fn memory_read_32(&self, vaddr: u64) -> u32 {
+        fn memory_read_32(&self, vaddr: u32) -> u32 {
             let lo = self.memory_read_16(vaddr) as u32;
-            let hi = self.memory_read_16(vaddr + 2) as u32;
+            let hi = self.memory_read_16(vaddr.wrapping_add(2)) as u32;
             lo | (hi << 16)
         }
-        fn memory_read_64(&self, vaddr: u64) -> u64 {
+        fn memory_read_64(&self, vaddr: u32) -> u64 {
             let lo = self.memory_read_32(vaddr) as u64;
-            let hi = self.memory_read_32(vaddr + 4) as u64;
+            let hi = self.memory_read_32(vaddr.wrapping_add(4)) as u64;
             lo | (hi << 32)
         }
-        fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-            (self.memory_read_64(vaddr), self.memory_read_64(vaddr + 8))
-        }
 
-        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        fn memory_write_8(&mut self, vaddr: u32, value: u8) {
             self.data_mem.lock().unwrap().insert(vaddr, value);
         }
-        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        fn memory_write_16(&mut self, vaddr: u32, value: u16) {
             self.memory_write_8(vaddr, value as u8);
-            self.memory_write_8(vaddr + 1, (value >> 8) as u8);
+            self.memory_write_8(vaddr.wrapping_add(1), (value >> 8) as u8);
         }
-        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        fn memory_write_32(&mut self, vaddr: u32, value: u32) {
             self.memory_write_16(vaddr, value as u16);
-            self.memory_write_16(vaddr + 2, (value >> 16) as u16);
+            self.memory_write_16(vaddr.wrapping_add(2), (value >> 16) as u16);
         }
-        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        fn memory_write_64(&mut self, vaddr: u32, value: u64) {
             self.memory_write_32(vaddr, value as u32);
-            self.memory_write_32(vaddr + 4, (value >> 32) as u32);
-        }
-        fn memory_write_128(&mut self, vaddr: u64, lo: u64, hi: u64) {
-            self.memory_write_64(vaddr, lo);
-            self.memory_write_64(vaddr + 8, hi);
+            self.memory_write_32(vaddr.wrapping_add(4), (value >> 32) as u32);
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
+        fn memory_write_exclusive_8(&mut self, _vaddr: u32, _value: u8, _expected: u8) -> bool {
             true
         }
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
+        fn memory_write_exclusive_16(&mut self, _vaddr: u32, _value: u16, _expected: u16) -> bool {
             true
         }
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
+        fn memory_write_exclusive_32(&mut self, _vaddr: u32, _value: u32, _expected: u32) -> bool {
             true
         }
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
+        fn memory_write_exclusive_64(&mut self, _vaddr: u32, _value: u64, _expected: u64) -> bool {
             true
         }
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _lo: u64,
-            _hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            true
-        }
-        fn exclusive_clear(&mut self) {}
-
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, ticks: u64) {
             self.ticks_left = self.ticks_left.saturating_sub(ticks);
         }
         fn get_ticks_remaining(&self) -> u64 {
             self.ticks_left
         }
-        fn data_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
-        fn instruction_cache_operation(&mut self, _op: u64, _vaddr: u64) {}
     }
 
     fn make_jit_with_optimizations(env: SharedEnv, optimizations: OptimizationFlag) -> A32Jit {
-        let config = JitConfig {
-            callbacks: Box::new(env),
-            enable_cycle_counting: true,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(env));
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = optimizations;
         A32Jit::new(config).expect("JIT creation should succeed")
     }
 
-    fn read_u16(mem: &Arc<Mutex<HashMap<u64, u8>>>, addr: u64) -> u16 {
+    fn read_u16(mem: &Arc<Mutex<HashMap<u32, u8>>>, addr: u32) -> u16 {
         let mem = mem.lock().unwrap();
         let lo = *mem.get(&addr).unwrap_or(&0) as u16;
         let hi = *mem.get(&(addr + 1)).unwrap_or(&0) as u16;
         lo | (hi << 8)
     }
 
-    fn read_u32(mem: &Arc<Mutex<HashMap<u64, u8>>>, addr: u64) -> u32 {
+    fn read_u32(mem: &Arc<Mutex<HashMap<u32, u8>>>, addr: u32) -> u32 {
         let lo = read_u16(mem, addr) as u32;
         let hi = read_u16(mem, addr + 2) as u32;
         lo | (hi << 16)
@@ -344,7 +346,7 @@ mod tests {
 
     fn run_arm_writer_block_with_opts(
         optimizations: OptimizationFlag,
-    ) -> Arc<Mutex<HashMap<u64, u8>>> {
+    ) -> Arc<Mutex<HashMap<u32, u8>>> {
         let code = vec![
             0xE1C130B0, // strh r3, [r1]
             0xE9810005, // stmib r1, {r0, r2}
@@ -559,8 +561,11 @@ mod tests {
             0xee1d0f70, // mrc p15, 0, r0, c13, c0, 3
             0xeafffffe, // b +#0
         ]);
-        let mut jit = make_jit(env);
-        jit.set_cp15_uro(0xDEADBEEF);
+        let mut coprocessors = empty_coprocessors();
+        coprocessors[15] = Some(Arc::new(ThreadPointerCoprocessor {
+            uro: UnsafeCell::new(0xDEADBEEF),
+        }));
+        let mut jit = make_jit_with_coprocessors(env, coprocessors);
         jit.set_cpsr(0x000001d0);
 
         jit.run();
@@ -1538,23 +1543,10 @@ mod tests {
     }
 
     fn make_jit_no_cycles(env: TestEnv) -> A32Jit {
-        let config = JitConfig {
-            callbacks: Box::new(env),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: crate::jit_config::OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(env));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         A32Jit::new(config).expect("JIT creation should succeed")
     }
 

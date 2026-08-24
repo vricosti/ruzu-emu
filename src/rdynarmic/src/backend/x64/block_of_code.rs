@@ -732,7 +732,10 @@ impl BlockOfCode {
         self.asm.jnz(&step_already_halted, JmpType::Near)?;
 
         // Atomically set STEP bit in halt_reason
-        self.emit_lock_or_dword_r15(halt_offset, crate::halt_reason::HaltReason::STEP.bits())?;
+        self.emit_lock_or_dword_r15(
+            halt_offset,
+            crate::interface::halt_reason::HaltReason::STEP.bits(),
+        )?;
 
         // Switch MXCSR to guest mode
         self.emit_switch_mxcsr_on_entry()?;

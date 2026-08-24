@@ -65,10 +65,6 @@ pub enum Opcode {
     NZCVFromPackedFlags,
     // AddWithCarry returns a combined result + flags
     // handled via GetCarryFromOp/GetOverflowFromOp
-    // --- Pseudo ---
-    SetInsertionPoint,
-    GetInsertionPoint,
-
     // --- ALU 32-bit ---
     Pack2x32To1x64,
     Pack2x64To1x128,
@@ -89,8 +85,8 @@ pub enum Opcode {
     LogicalShiftRight64,
     ArithmeticShiftRight32,
     ArithmeticShiftRight64,
-    RotateRight32,
-    RotateRight64,
+    BitRotateRight32,
+    BitRotateRight64,
     RotateRightExtended,
     LogicalShiftLeftMasked32,
     LogicalShiftLeftMasked64,
@@ -208,7 +204,7 @@ pub enum Opcode {
     PackedSaturatedAddS16,
     PackedSaturatedSubU16,
     PackedSaturatedSubS16,
-    PackedAbsDiffSumS8,
+    PackedAbsDiffSumU8,
     PackedSelect,
 
     // --- CRC32 ---
@@ -267,6 +263,13 @@ pub enum Opcode {
     VectorBroadcast16,
     VectorBroadcast32,
     VectorBroadcast64,
+    VectorBroadcastElementLower8,
+    VectorBroadcastElementLower16,
+    VectorBroadcastElementLower32,
+    VectorBroadcastElement8,
+    VectorBroadcastElement16,
+    VectorBroadcastElement32,
+    VectorBroadcastElement64,
     VectorCountLeadingZeros8,
     VectorCountLeadingZeros16,
     VectorCountLeadingZeros32,
@@ -293,38 +296,22 @@ pub enum Opcode {
     VectorExtract,
     VectorExtractLower,
     VectorRotateWholeVectorRight,
-    VectorGreaterEqualSigned8,
-    VectorGreaterEqualSigned16,
-    VectorGreaterEqualSigned32,
-    VectorGreaterEqualSigned64,
-    VectorGreaterEqualUnsigned8,
-    VectorGreaterEqualUnsigned16,
-    VectorGreaterEqualUnsigned32,
-    VectorGreaterEqualUnsigned64,
-    VectorGreaterSigned8,
-    VectorGreaterSigned16,
-    VectorGreaterSigned32,
-    VectorGreaterSigned64,
-    VectorLessEqualSigned8,
-    VectorLessEqualSigned16,
-    VectorLessEqualSigned32,
-    VectorLessEqualSigned64,
-    VectorLessSigned8,
-    VectorLessSigned16,
-    VectorLessSigned32,
-    VectorLessSigned64,
-    VectorHalvingAddSigned8,
-    VectorHalvingAddSigned16,
-    VectorHalvingAddSigned32,
-    VectorHalvingAddUnsigned8,
-    VectorHalvingAddUnsigned16,
-    VectorHalvingAddUnsigned32,
-    VectorHalvingSubSigned8,
-    VectorHalvingSubSigned16,
-    VectorHalvingSubSigned32,
-    VectorHalvingSubUnsigned8,
-    VectorHalvingSubUnsigned16,
-    VectorHalvingSubUnsigned32,
+    VectorGreaterS8,
+    VectorGreaterS16,
+    VectorGreaterS32,
+    VectorGreaterS64,
+    VectorHalvingAddS8,
+    VectorHalvingAddS16,
+    VectorHalvingAddS32,
+    VectorHalvingAddU8,
+    VectorHalvingAddU16,
+    VectorHalvingAddU32,
+    VectorHalvingSubS8,
+    VectorHalvingSubS16,
+    VectorHalvingSubS32,
+    VectorHalvingSubU8,
+    VectorHalvingSubU16,
+    VectorHalvingSubU32,
     VectorInterleaveLower8,
     VectorInterleaveLower16,
     VectorInterleaveLower32,
@@ -345,22 +332,22 @@ pub enum Opcode {
     VectorLogicalVShift16,
     VectorLogicalVShift32,
     VectorLogicalVShift64,
-    VectorMaxSigned8,
-    VectorMaxSigned16,
-    VectorMaxSigned32,
-    VectorMaxSigned64,
-    VectorMaxUnsigned8,
-    VectorMaxUnsigned16,
-    VectorMaxUnsigned32,
-    VectorMaxUnsigned64,
-    VectorMinSigned8,
-    VectorMinSigned16,
-    VectorMinSigned32,
-    VectorMinSigned64,
-    VectorMinUnsigned8,
-    VectorMinUnsigned16,
-    VectorMinUnsigned32,
-    VectorMinUnsigned64,
+    VectorMaxS8,
+    VectorMaxS16,
+    VectorMaxS32,
+    VectorMaxS64,
+    VectorMaxU8,
+    VectorMaxU16,
+    VectorMaxU32,
+    VectorMaxU64,
+    VectorMinS8,
+    VectorMinS16,
+    VectorMinS32,
+    VectorMinS64,
+    VectorMinU8,
+    VectorMinU16,
+    VectorMinU32,
+    VectorMinU64,
     VectorMultiply8,
     VectorMultiply16,
     VectorMultiply32,
@@ -389,30 +376,30 @@ pub enum Opcode {
     VectorPairedAddUnsignedWiden8,
     VectorPairedAddUnsignedWiden16,
     VectorPairedAddUnsignedWiden32,
-    VectorPairedMaxSigned8,
-    VectorPairedMaxSigned16,
-    VectorPairedMaxSigned32,
-    VectorPairedMaxUnsigned8,
-    VectorPairedMaxUnsigned16,
-    VectorPairedMaxUnsigned32,
-    VectorPairedMaxSignedLower8,
-    VectorPairedMaxSignedLower16,
-    VectorPairedMaxSignedLower32,
-    VectorPairedMaxUnsignedLower8,
-    VectorPairedMaxUnsignedLower16,
-    VectorPairedMaxUnsignedLower32,
-    VectorPairedMinSigned8,
-    VectorPairedMinSigned16,
-    VectorPairedMinSigned32,
-    VectorPairedMinUnsigned8,
-    VectorPairedMinUnsigned16,
-    VectorPairedMinUnsigned32,
-    VectorPairedMinSignedLower8,
-    VectorPairedMinSignedLower16,
-    VectorPairedMinSignedLower32,
-    VectorPairedMinUnsignedLower8,
-    VectorPairedMinUnsignedLower16,
-    VectorPairedMinUnsignedLower32,
+    VectorPairedMaxS8,
+    VectorPairedMaxS16,
+    VectorPairedMaxS32,
+    VectorPairedMaxU8,
+    VectorPairedMaxU16,
+    VectorPairedMaxU32,
+    VectorPairedMaxLowerS8,
+    VectorPairedMaxLowerS16,
+    VectorPairedMaxLowerS32,
+    VectorPairedMaxLowerU8,
+    VectorPairedMaxLowerU16,
+    VectorPairedMaxLowerU32,
+    VectorPairedMinS8,
+    VectorPairedMinS16,
+    VectorPairedMinS32,
+    VectorPairedMinU8,
+    VectorPairedMinU16,
+    VectorPairedMinU32,
+    VectorPairedMinLowerS8,
+    VectorPairedMinLowerS16,
+    VectorPairedMinLowerS32,
+    VectorPairedMinLowerU8,
+    VectorPairedMinLowerU16,
+    VectorPairedMinLowerU32,
     VectorPolynomialMultiply8,
     VectorPolynomialMultiplyLong8,
     VectorPolynomialMultiplyLong64,
@@ -424,23 +411,24 @@ pub enum Opcode {
     VectorReverseElementsInLongGroups8,
     VectorReverseElementsInLongGroups16,
     VectorReverseElementsInLongGroups32,
-    VectorRoundingHalvingAddSigned8,
-    VectorRoundingHalvingAddSigned16,
-    VectorRoundingHalvingAddSigned32,
-    VectorRoundingHalvingAddUnsigned8,
-    VectorRoundingHalvingAddUnsigned16,
-    VectorRoundingHalvingAddUnsigned32,
-    VectorRoundingShiftLeftSigned8,
-    VectorRoundingShiftLeftSigned16,
-    VectorRoundingShiftLeftSigned32,
-    VectorRoundingShiftLeftSigned64,
-    VectorRoundingShiftLeftUnsigned8,
-    VectorRoundingShiftLeftUnsigned16,
-    VectorRoundingShiftLeftUnsigned32,
-    VectorRoundingShiftLeftUnsigned64,
-    VectorShuffleHighHalfwords,
-    VectorShuffleLowHalfwords,
-    VectorShuffleWords,
+    VectorReduceAdd8,
+    VectorReduceAdd16,
+    VectorReduceAdd32,
+    VectorReduceAdd64,
+    VectorRoundingHalvingAddS8,
+    VectorRoundingHalvingAddS16,
+    VectorRoundingHalvingAddS32,
+    VectorRoundingHalvingAddU8,
+    VectorRoundingHalvingAddU16,
+    VectorRoundingHalvingAddU32,
+    VectorRoundingShiftLeftS8,
+    VectorRoundingShiftLeftS16,
+    VectorRoundingShiftLeftS32,
+    VectorRoundingShiftLeftS64,
+    VectorRoundingShiftLeftU8,
+    VectorRoundingShiftLeftU16,
+    VectorRoundingShiftLeftU32,
+    VectorRoundingShiftLeftU64,
     VectorSignExtend8,
     VectorSignExtend16,
     VectorSignExtend32,
@@ -448,8 +436,8 @@ pub enum Opcode {
     VectorSignedAbsoluteDifference8,
     VectorSignedAbsoluteDifference16,
     VectorSignedAbsoluteDifference32,
-    VectorSignedMultiplyLong16,
-    VectorSignedMultiplyLong32,
+    VectorSignedMultiply16,
+    VectorSignedMultiply32,
     VectorSignedSaturatedAbs8,
     VectorSignedSaturatedAbs16,
     VectorSignedSaturatedAbs32,
@@ -504,8 +492,8 @@ pub enum Opcode {
     VectorUnsignedAbsoluteDifference8,
     VectorUnsignedAbsoluteDifference16,
     VectorUnsignedAbsoluteDifference32,
-    VectorUnsignedMultiplyLong16,
-    VectorUnsignedMultiplyLong32,
+    VectorUnsignedMultiply16,
+    VectorUnsignedMultiply32,
     VectorUnsignedRecipEstimate,
     VectorUnsignedRecipSqrtEstimate,
     VectorUnsignedSaturatedAccumulateSigned8,
@@ -743,11 +731,6 @@ pub enum Opcode {
     A32BXWritePC,
     A32UpdateUpperLocationDescriptor,
     A32CallSupervisor,
-    /// Debug-only: per-instruction PC execution hook (RUZU_A32_PC_EXEC). Arg is
-    /// the guest PC. Lowered to a host call into `a32_pc_trace_hook` after a
-    /// guest-register flush, so the callback observes accurate r0-r15. Gated by
-    /// an env var at translate time; no-op (not emitted) when unset.
-    A32PcExecHook,
     A32ExceptionRaised,
     A32DataSynchronizationBarrier,
     A32DataMemoryBarrier,
@@ -838,7 +821,7 @@ impl Opcode {
             A32SetCpsrNZ | A32SetCpsrNZC | A32OrQFlag |
             A32SetGEFlags | A32SetGEFlagsCompressed |
             A32BXWritePC | A32UpdateUpperLocationDescriptor |
-            A32CallSupervisor | A32PcExecHook | A32ExceptionRaised |
+            A32CallSupervisor | A32ExceptionRaised |
             A32DataSynchronizationBarrier | A32DataMemoryBarrier |
             A32InstructionSynchronizationBarrier |
             A32SetFpscr | A32SetFpscrNZCV |
@@ -1020,7 +1003,6 @@ impl Opcode {
                 | A32BXWritePC
                 | A32UpdateUpperLocationDescriptor
                 | A32CallSupervisor
-                | A32PcExecHook
                 | A32ExceptionRaised
                 | A32DataSynchronizationBarrier
                 | A32DataMemoryBarrier
@@ -1107,7 +1089,7 @@ impl Opcode {
             A64SetFPSR => OpcodeInfo { ret: V, args: &[U32] },
             A64CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
             A64ExceptionRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
-            A64DataCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
+            A64DataCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64, U64] },
             A64InstructionCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
             A64DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
             A64DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },
@@ -1134,9 +1116,6 @@ impl Opcode {
             GetCFlagFromNZCV => OpcodeInfo { ret: U1, args: &[NZCV] },
             NZCVFromPackedFlags => OpcodeInfo { ret: NZCV, args: &[U32] },
 
-            // Pseudo
-            SetInsertionPoint | GetInsertionPoint => OpcodeInfo { ret: V, args: &[] },
-
             // Pack/extract
             Pack2x32To1x64 => OpcodeInfo { ret: U64, args: &[U32, U32] },
             Pack2x64To1x128 => OpcodeInfo { ret: U128, args: &[U64, U64] },
@@ -1159,8 +1138,8 @@ impl Opcode {
             LogicalShiftRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
             ArithmeticShiftRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
             ArithmeticShiftRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
-            RotateRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            RotateRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
+            BitRotateRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
+            BitRotateRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
             RotateRightExtended => OpcodeInfo { ret: U32, args: &[U32, U1] },
             LogicalShiftLeftMasked32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
             LogicalShiftLeftMasked64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
@@ -1265,13 +1244,13 @@ impl Opcode {
             PackedSaturatedAddU8 | PackedSaturatedAddS8 | PackedSaturatedSubU8 | PackedSaturatedSubS8 |
             PackedSaturatedAddU16 | PackedSaturatedAddS16 | PackedSaturatedSubU16 | PackedSaturatedSubS16
                 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            PackedAbsDiffSumS8 => OpcodeInfo { ret: U32, args: &[U32, U32] },
+            PackedAbsDiffSumU8 => OpcodeInfo { ret: U32, args: &[U32, U32] },
             PackedSelect => OpcodeInfo { ret: U32, args: &[U32, U32, U32] },
 
             // CRC32
-            CRC32Castagnoli8 | CRC32ISO8 => OpcodeInfo { ret: U32, args: &[U32, U8] },
-            CRC32Castagnoli16 | CRC32ISO16 => OpcodeInfo { ret: U32, args: &[U32, U16] },
-            CRC32Castagnoli32 | CRC32ISO32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
+            CRC32Castagnoli8 | CRC32Castagnoli16 | CRC32Castagnoli32 |
+            CRC32ISO8 | CRC32ISO16 | CRC32ISO32
+                => OpcodeInfo { ret: U32, args: &[U32, U32] },
             CRC32Castagnoli64 | CRC32ISO64 => OpcodeInfo { ret: U32, args: &[U32, U64] },
 
             // AES
@@ -1304,6 +1283,9 @@ impl Opcode {
             VectorReverseElementsInHalfGroups8 |
             VectorReverseElementsInWordGroups8 | VectorReverseElementsInWordGroups16 |
             VectorReverseElementsInLongGroups8 | VectorReverseElementsInLongGroups16 | VectorReverseElementsInLongGroups32 |
+            VectorReduceAdd8 | VectorReduceAdd16 | VectorReduceAdd32 | VectorReduceAdd64 |
+            VectorPairedAddSignedWiden8 | VectorPairedAddSignedWiden16 | VectorPairedAddSignedWiden32 |
+            VectorPairedAddUnsignedWiden8 | VectorPairedAddUnsignedWiden16 | VectorPairedAddUnsignedWiden32 |
             VectorSignExtend8 | VectorSignExtend16 | VectorSignExtend32 | VectorSignExtend64 |
             VectorZeroExtend8 | VectorZeroExtend16 | VectorZeroExtend32 | VectorZeroExtend64 |
             VectorZeroUpper |
@@ -1317,6 +1299,10 @@ impl Opcode {
 
             ZeroVector => OpcodeInfo { ret: U128, args: &[] },
 
+            VectorSignedMultiply16 | VectorSignedMultiply32 |
+            VectorUnsignedMultiply16 | VectorUnsignedMultiply32
+                => OpcodeInfo { ret: V, args: &[U128, U128] },
+
             // Binary vector -> vector ops
             VectorAdd8 | VectorAdd16 | VectorAdd32 | VectorAdd64 |
             VectorSub8 | VectorSub16 | VectorSub32 | VectorSub64 |
@@ -1325,40 +1311,34 @@ impl Opcode {
             VectorMultiplyUnsignedWiden8 | VectorMultiplyUnsignedWiden16 | VectorMultiplyUnsignedWiden32 |
             VectorAnd | VectorAndNot | VectorEor | VectorOr |
             VectorEqual8 | VectorEqual16 | VectorEqual32 | VectorEqual64 | VectorEqual128 |
-            VectorGreaterEqualSigned8 | VectorGreaterEqualSigned16 | VectorGreaterEqualSigned32 | VectorGreaterEqualSigned64 |
-            VectorGreaterEqualUnsigned8 | VectorGreaterEqualUnsigned16 | VectorGreaterEqualUnsigned32 | VectorGreaterEqualUnsigned64 |
-            VectorGreaterSigned8 | VectorGreaterSigned16 | VectorGreaterSigned32 | VectorGreaterSigned64 |
-            VectorLessEqualSigned8 | VectorLessEqualSigned16 | VectorLessEqualSigned32 | VectorLessEqualSigned64 |
-            VectorLessSigned8 | VectorLessSigned16 | VectorLessSigned32 | VectorLessSigned64 |
-            VectorHalvingAddSigned8 | VectorHalvingAddSigned16 | VectorHalvingAddSigned32 |
-            VectorHalvingAddUnsigned8 | VectorHalvingAddUnsigned16 | VectorHalvingAddUnsigned32 |
-            VectorHalvingSubSigned8 | VectorHalvingSubSigned16 | VectorHalvingSubSigned32 |
-            VectorHalvingSubUnsigned8 | VectorHalvingSubUnsigned16 | VectorHalvingSubUnsigned32 |
-            VectorMaxSigned8 | VectorMaxSigned16 | VectorMaxSigned32 | VectorMaxSigned64 |
-            VectorMaxUnsigned8 | VectorMaxUnsigned16 | VectorMaxUnsigned32 | VectorMaxUnsigned64 |
-            VectorMinSigned8 | VectorMinSigned16 | VectorMinSigned32 | VectorMinSigned64 |
-            VectorMinUnsigned8 | VectorMinUnsigned16 | VectorMinUnsigned32 | VectorMinUnsigned64 |
+            VectorGreaterS8 | VectorGreaterS16 | VectorGreaterS32 | VectorGreaterS64 |
+            VectorHalvingAddS8 | VectorHalvingAddS16 | VectorHalvingAddS32 |
+            VectorHalvingAddU8 | VectorHalvingAddU16 | VectorHalvingAddU32 |
+            VectorHalvingSubS8 | VectorHalvingSubS16 | VectorHalvingSubS32 |
+            VectorHalvingSubU8 | VectorHalvingSubU16 | VectorHalvingSubU32 |
+            VectorMaxS8 | VectorMaxS16 | VectorMaxS32 | VectorMaxS64 |
+            VectorMaxU8 | VectorMaxU16 | VectorMaxU32 | VectorMaxU64 |
+            VectorMinS8 | VectorMinS16 | VectorMinS32 | VectorMinS64 |
+            VectorMinU8 | VectorMinU16 | VectorMinU32 | VectorMinU64 |
             VectorPairedAdd8 | VectorPairedAdd16 | VectorPairedAdd32 | VectorPairedAdd64 |
             VectorPairedAddLower8 | VectorPairedAddLower16 | VectorPairedAddLower32 |
-            VectorPairedAddSignedWiden8 | VectorPairedAddSignedWiden16 | VectorPairedAddSignedWiden32 |
-            VectorPairedAddUnsignedWiden8 | VectorPairedAddUnsignedWiden16 | VectorPairedAddUnsignedWiden32 |
-            VectorPairedMaxSigned8 | VectorPairedMaxSigned16 | VectorPairedMaxSigned32 |
-            VectorPairedMaxUnsigned8 | VectorPairedMaxUnsigned16 | VectorPairedMaxUnsigned32 |
-            VectorPairedMaxSignedLower8 | VectorPairedMaxSignedLower16 | VectorPairedMaxSignedLower32 |
-            VectorPairedMaxUnsignedLower8 | VectorPairedMaxUnsignedLower16 | VectorPairedMaxUnsignedLower32 |
-            VectorPairedMinSigned8 | VectorPairedMinSigned16 | VectorPairedMinSigned32 |
-            VectorPairedMinUnsigned8 | VectorPairedMinUnsigned16 | VectorPairedMinUnsigned32 |
-            VectorPairedMinSignedLower8 | VectorPairedMinSignedLower16 | VectorPairedMinSignedLower32 |
-            VectorPairedMinUnsignedLower8 | VectorPairedMinUnsignedLower16 | VectorPairedMinUnsignedLower32 |
+            VectorPairedMaxS8 | VectorPairedMaxS16 | VectorPairedMaxS32 |
+            VectorPairedMaxU8 | VectorPairedMaxU16 | VectorPairedMaxU32 |
+            VectorPairedMaxLowerS8 | VectorPairedMaxLowerS16 | VectorPairedMaxLowerS32 |
+            VectorPairedMaxLowerU8 | VectorPairedMaxLowerU16 | VectorPairedMaxLowerU32 |
+            VectorPairedMinS8 | VectorPairedMinS16 | VectorPairedMinS32 |
+            VectorPairedMinU8 | VectorPairedMinU16 | VectorPairedMinU32 |
+            VectorPairedMinLowerS8 | VectorPairedMinLowerS16 | VectorPairedMinLowerS32 |
+            VectorPairedMinLowerU8 | VectorPairedMinLowerU16 | VectorPairedMinLowerU32 |
             VectorPolynomialMultiply8 | VectorPolynomialMultiplyLong8 | VectorPolynomialMultiplyLong64 |
-            VectorRoundingHalvingAddSigned8 | VectorRoundingHalvingAddSigned16 | VectorRoundingHalvingAddSigned32 |
-            VectorRoundingHalvingAddUnsigned8 | VectorRoundingHalvingAddUnsigned16 | VectorRoundingHalvingAddUnsigned32 |
-            VectorRoundingShiftLeftSigned8 | VectorRoundingShiftLeftSigned16 | VectorRoundingShiftLeftSigned32 | VectorRoundingShiftLeftSigned64 |
-            VectorRoundingShiftLeftUnsigned8 | VectorRoundingShiftLeftUnsigned16 | VectorRoundingShiftLeftUnsigned32 | VectorRoundingShiftLeftUnsigned64 |
+            VectorRoundingHalvingAddS8 | VectorRoundingHalvingAddS16 | VectorRoundingHalvingAddS32 |
+            VectorRoundingHalvingAddU8 | VectorRoundingHalvingAddU16 | VectorRoundingHalvingAddU32 |
+            VectorRoundingShiftLeftS8 | VectorRoundingShiftLeftS16 | VectorRoundingShiftLeftS32 | VectorRoundingShiftLeftS64 |
+            VectorRoundingShiftLeftU8 | VectorRoundingShiftLeftU16 | VectorRoundingShiftLeftU32 | VectorRoundingShiftLeftU64 |
             VectorSignedAbsoluteDifference8 | VectorSignedAbsoluteDifference16 | VectorSignedAbsoluteDifference32 |
-            VectorSignedMultiplyLong16 | VectorSignedMultiplyLong32 |
-            VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32 |
-            VectorUnsignedMultiplyLong16 | VectorUnsignedMultiplyLong32 |
+            VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32
+                => OpcodeInfo { ret: U128, args: &[U128, U128] },
+
             // Vector shifts: the non-V (scalar) forms take an immediate U8
             // shift amount. Upstream `opcodes.inc` signature:
             // `OPCODE(VectorLogicalShiftLeft32, U128, U128, U8)`.
@@ -1407,15 +1387,16 @@ impl Opcode {
                 => OpcodeInfo { ret: U128, args: &[U32] },
             VectorBroadcast64
                 => OpcodeInfo { ret: U128, args: &[U64] },
+            VectorBroadcastElementLower8 | VectorBroadcastElementLower16 |
+            VectorBroadcastElementLower32 | VectorBroadcastElement8 |
+            VectorBroadcastElement16 | VectorBroadcastElement32 |
+            VectorBroadcastElement64
+                => OpcodeInfo { ret: U128, args: &[U128, U8] },
 
             // Vector extract
             VectorExtract => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
             VectorExtractLower => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
             VectorRotateWholeVectorRight => OpcodeInfo { ret: U128, args: &[U128, U8] },
-
-            // Vector shuffle (imm8 control)
-            VectorShuffleHighHalfwords | VectorShuffleLowHalfwords | VectorShuffleWords
-                => OpcodeInfo { ret: U128, args: &[U128, U8] },
 
             // Vector table lookup
             VectorTable => OpcodeInfo { ret: Type::Table, args: &[OPQ, OPQ, OPQ, OPQ] },
@@ -1605,7 +1586,6 @@ impl Opcode {
             A32BXWritePC => OpcodeInfo { ret: V, args: &[U32] },
             A32UpdateUpperLocationDescriptor => OpcodeInfo { ret: V, args: &[] },
             A32CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
-            A32PcExecHook => OpcodeInfo { ret: V, args: &[U32, U32, U32, U32, U32] },
             A32ExceptionRaised => OpcodeInfo { ret: V, args: &[U32, U64] },
             A32DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
             A32DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },
@@ -1640,8 +1620,8 @@ impl Opcode {
             A32CoprocSendTwoWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U32] },
             A32CoprocGetOneWord => OpcodeInfo { ret: U32, args: &[COPROC] },
             A32CoprocGetTwoWords => OpcodeInfo { ret: U64, args: &[COPROC] },
-            A32CoprocLoadWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U1] },
-            A32CoprocStoreWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U1] },
+            A32CoprocLoadWords => OpcodeInfo { ret: V, args: &[COPROC, U32] },
+            A32CoprocStoreWords => OpcodeInfo { ret: V, args: &[COPROC, U32] },
         }
     }
 }
@@ -1674,6 +1654,83 @@ mod tests {
 
         assert_eq!(Opcode::A64ReadMemory64.return_type(), Type::U64);
         assert_eq!(Opcode::A64ReadMemory64.num_args(), 3);
+
+        for opcode in [
+            Opcode::VectorSignedMultiply16,
+            Opcode::VectorSignedMultiply32,
+            Opcode::VectorUnsignedMultiply16,
+            Opcode::VectorUnsignedMultiply32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::Void);
+            assert_eq!(opcode.arg_types(), &[Type::U128, Type::U128]);
+        }
+
+        for opcode in [
+            Opcode::CRC32Castagnoli8,
+            Opcode::CRC32Castagnoli16,
+            Opcode::CRC32Castagnoli32,
+            Opcode::CRC32ISO8,
+            Opcode::CRC32ISO16,
+            Opcode::CRC32ISO32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U32);
+            assert_eq!(opcode.arg_types(), &[Type::U32, Type::U32]);
+        }
+        for opcode in [Opcode::CRC32Castagnoli64, Opcode::CRC32ISO64] {
+            assert_eq!(opcode.return_type(), Type::U32);
+            assert_eq!(opcode.arg_types(), &[Type::U32, Type::U64]);
+        }
+    }
+
+    #[test]
+    fn test_vector_operand_metadata_matches_upstream_groups() {
+        for opcode in [
+            Opcode::VectorAdd8,
+            Opcode::VectorAnd,
+            Opcode::VectorEqual128,
+            Opcode::VectorGreaterS64,
+            Opcode::VectorHalvingSubU32,
+            Opcode::VectorMaxS64,
+            Opcode::VectorMinU64,
+            Opcode::VectorMultiply64,
+            Opcode::VectorMultiplySignedWiden32,
+            Opcode::VectorMultiplyUnsignedWiden32,
+            Opcode::VectorPairedAdd64,
+            Opcode::VectorPairedAddLower32,
+            Opcode::VectorPairedMaxLowerU32,
+            Opcode::VectorPairedMinLowerS32,
+            Opcode::VectorPolynomialMultiplyLong64,
+            Opcode::VectorRoundingHalvingAddU32,
+            Opcode::VectorRoundingShiftLeftS64,
+            Opcode::VectorSignedAbsoluteDifference32,
+            Opcode::VectorSub64,
+            Opcode::VectorUnsignedAbsoluteDifference32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U128);
+            assert_eq!(opcode.arg_types(), &[Type::U128, Type::U128]);
+        }
+
+        for opcode in [
+            Opcode::VectorPairedAddSignedWiden8,
+            Opcode::VectorPairedAddSignedWiden16,
+            Opcode::VectorPairedAddSignedWiden32,
+            Opcode::VectorPairedAddUnsignedWiden8,
+            Opcode::VectorPairedAddUnsignedWiden16,
+            Opcode::VectorPairedAddUnsignedWiden32,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U128);
+            assert_eq!(opcode.arg_types(), &[Type::U128]);
+        }
+
+        for opcode in [
+            Opcode::VectorArithmeticShiftRight8,
+            Opcode::VectorLogicalShiftLeft32,
+            Opcode::VectorLogicalShiftRight64,
+            Opcode::VectorSignedSaturatedShiftLeftUnsigned16,
+        ] {
+            assert_eq!(opcode.return_type(), Type::U128);
+            assert_eq!(opcode.arg_types(), &[Type::U128, Type::U8]);
+        }
     }
 
     #[test]

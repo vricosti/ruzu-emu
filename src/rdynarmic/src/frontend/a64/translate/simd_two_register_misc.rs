@@ -978,7 +978,6 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
 
     fn translate_one(raw: u32) -> (Block, bool) {
@@ -987,7 +986,7 @@ mod tests {
         let mut visitor = TranslatorVisitor::new(
             &mut block,
             A64LocationDescriptor::new(0x1000, 0, false),
-            crate::frontend::a64::translate::visitor::TranslationOptions::default(),
+            crate::frontend::a64::translate::TranslationOptions::default(),
         );
         let should_continue = visitor.dispatch(&decoded);
         drop(visitor);
@@ -1002,29 +1001,34 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorEqual8));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
-    fn cmle_2_uses_vector_less_equal_signed_opcode() {
+    fn cmle_2_uses_edens_greater_then_not_sequence() {
         let (block, should_continue) = translate_one(0x2E209820);
         assert!(should_continue);
         assert!(block
             .instructions
             .iter()
-            .any(|inst| inst.opcode == Opcode::VectorLessEqualSigned8));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
-    }
-
-    #[test]
-    fn cmlt_2_uses_vector_less_signed_opcode() {
-        let (block, should_continue) = translate_one(0x0E20A820);
-        assert!(should_continue);
+            .any(|inst| inst.opcode == Opcode::VectorGreaterS8));
         assert!(block
             .instructions
             .iter()
-            .any(|inst| inst.opcode == Opcode::VectorLessSigned8));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+            .any(|inst| inst.opcode == Opcode::VectorNot));
+    }
+
+    #[test]
+    fn cmlt_2_uses_edens_greater_equal_or_not_sequence() {
+        let (block, should_continue) = translate_one(0x0E20A820);
+        assert!(should_continue);
+        for opcode in [
+            Opcode::VectorGreaterS8,
+            Opcode::VectorEqual8,
+            Opcode::VectorOr,
+            Opcode::VectorNot,
+        ] {
+            assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
+        }
     }
 
     #[test]
@@ -1035,7 +1039,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorCountLeadingZeros32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1055,7 +1058,6 @@ mod tests {
                 "CLS did not emit {expected:?}: {opcodes:?}"
             );
         }
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1066,7 +1068,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPDoubleToSingle));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1077,7 +1078,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPHalfToSingle));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1091,7 +1091,6 @@ mod tests {
                 "SHLL did not emit {expected:?}: {opcodes:?}"
             );
         }
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1142,7 +1141,6 @@ mod tests {
                     .map(|inst| inst.opcode)
                     .collect::<std::vec::Vec<_>>()
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1164,7 +1162,6 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
@@ -1176,7 +1173,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::VectorEor));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1187,7 +1183,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorGreater32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1199,7 +1194,6 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| inst.opcode == Opcode::FPVectorGreaterEqual32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
     }
 
     #[test]
@@ -1234,7 +1228,6 @@ mod tests {
             assert_eq!(round.args[1], Value::ImmU8(expected_rounding));
             assert_eq!(round.args[2], Value::ImmU1(expected_exact));
             assert_eq!(round.args[3], Value::ImmU1(true));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 }

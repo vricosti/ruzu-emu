@@ -4,16 +4,9 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-/// Represents a single instruction pattern from a64.inc
-struct Pattern {
-    name: String,
-    #[allow(dead_code)]
-    display_name: String,
-    bitstring: String,
-    mask: u32,
-    expect: u32,
-    specificity: u32, // number of fixed bits
-}
+mod a64_decoder_parser;
+
+use a64_decoder_parser::{parse_inst_line, Pattern};
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -208,78 +201,6 @@ fn main() {
         unique_names.len(),
         subtable.len()
     );
-}
-
-fn parse_inst_line(line: &str) -> Option<Pattern> {
-    // INST(NAME, "display", "bitstring")
-    let line = line.strip_prefix("INST(")?;
-    let line = line.strip_suffix(')')?;
-
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-
-    for ch in line.chars() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-        } else if ch == ',' && !in_quotes {
-            parts.push(current.trim().to_string());
-            current = String::new();
-        } else {
-            current.push(ch);
-        }
-    }
-    parts.push(current.trim().to_string());
-
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let name = parts[0].trim().to_string();
-    let display_name = parts[1].trim().to_string();
-    let bitstring = parts[2].trim().to_string();
-
-    if bitstring.len() != 32 {
-        eprintln!(
-            "Warning: bitstring for {} is {} chars: '{}'",
-            name,
-            bitstring.len(),
-            bitstring
-        );
-        return None;
-    }
-
-    let mut mask = 0u32;
-    let mut expect = 0u32;
-    let mut specificity = 0u32;
-
-    for (i, ch) in bitstring.chars().enumerate() {
-        let bit_pos = 31 - i;
-        match ch {
-            '0' => {
-                mask |= 1 << bit_pos;
-                specificity += 1;
-            }
-            '1' => {
-                mask |= 1 << bit_pos;
-                expect |= 1 << bit_pos;
-                specificity += 1;
-            }
-            // Variable fields: lowercase letters and uppercase letters
-            _ => {
-                // Don't care bit - not part of mask
-            }
-        }
-    }
-
-    Some(Pattern {
-        name,
-        display_name,
-        bitstring,
-        mask,
-        expect,
-        specificity,
-    })
 }
 
 /// Extract the 12-bit fast lookup mask from a bitstring.

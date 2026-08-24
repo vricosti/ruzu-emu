@@ -1,3 +1,4 @@
+mod a32_translate;
 pub mod asimd;
 pub mod asimd_three_regs;
 pub mod asimd_two_regs_misc;
@@ -23,18 +24,70 @@ pub mod status_register;
 pub mod synchronization;
 pub mod thumb16;
 pub mod thumb32;
+pub mod thumb32_branch;
 pub mod thumb32_control;
+pub mod thumb32_coprocessor;
+pub mod thumb32_data_processing_modified_immediate;
+pub mod thumb32_data_processing_plain_binary_immediate;
+pub mod thumb32_data_processing_register;
+pub mod thumb32_data_processing_shifted_register;
+pub mod thumb32_load_byte;
+pub mod thumb32_load_halfword;
+pub mod thumb32_load_store_dual;
+pub mod thumb32_load_store_multiple;
+pub mod thumb32_load_word;
+pub mod thumb32_long_multiply;
+pub mod thumb32_misc;
+pub mod thumb32_multiply;
+pub mod thumb32_parallel;
+pub mod thumb32_store_single_data_item;
+mod translate_arm;
+pub mod translate_callbacks;
+mod translate_thumb;
 pub mod vfp;
 
-use crate::frontend::a32::decoder::{decode_arm, ArmInstId};
-use crate::frontend::a32::decoder_thumb16::{decode_thumb16, Thumb16InstId};
-use crate::frontend::a32::decoder_thumb32::decode_thumb32;
+use crate::frontend::a32::decoder::ArmInstId;
 use crate::frontend::a32::types::Exception;
 use crate::ir::a32_emitter::A32IREmitter;
-use crate::ir::block::Block;
-use crate::ir::location::A32LocationDescriptor;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
+
+pub use a32_translate::{translate, translate_single_instruction, TranslationOptions};
+
+/// Result of Eden's immediate-expansion helpers.
+pub(crate) struct ImmAndCarry {
+    pub imm32: u32,
+    pub carry: Value,
+}
+
+/// Matches `TranslatorVisitor::ThumbExpandImm_C` from `a32_translate_impl.h`.
+pub(crate) fn thumb_expand_imm_c(imm12: u32, carry_in: Value) -> ImmAndCarry {
+    if (imm12 >> 10) & 3 == 0 {
+        let imm8 = imm12 & 0xff;
+        let imm32 = match (imm12 >> 8) & 3 {
+            0b00 => imm8,
+            0b01 => (imm8 << 16) | imm8,
+            0b10 => (imm8 << 24) | (imm8 << 8),
+            0b11 => imm8 * 0x0101_0101,
+            _ => unreachable!(),
+        };
+        return ImmAndCarry {
+            imm32,
+            carry: carry_in,
+        };
+    }
+
+    let imm32 = (0x80 | (imm12 & 0x7f)).rotate_right((imm12 >> 7) & 0x1f);
+    ImmAndCarry {
+        imm32,
+        carry: Value::ImmU1(imm32 & (1 << 31) != 0),
+    }
+}
+
+/// Matches `TranslatorVisitor::ThumbExpandImm` from `a32_translate_impl.h`.
+pub(crate) fn thumb_expand_imm(imm12: u32) -> u32 {
+    thumb_expand_imm_c(imm12, Value::ImmU1(false)).imm32
+}
 
 /// Matches upstream `TranslatorVisitor::RaiseException`.
 pub(crate) fn raise_exception_with_instruction_size(
@@ -74,98 +127,58 @@ pub(crate) fn decode_error(ir: &mut A32IREmitter) -> bool {
     raise_exception(ir, Exception::DecodeError)
 }
 
-/// Maximum number of instructions to translate per block.
-/// Upstream dynarmic has no fixed limit (blocks end on branches/exceptions).
-/// Larger blocks improve block linking and reduce dispatch overhead.
-/// Raised from 64 to 1024 to be closer to upstream behavior.
-const MAX_BLOCK_INSTRUCTIONS: usize = 1024;
+#[cfg(test)]
+mod immediate_tests {
+    use super::{thumb_expand_imm, thumb_expand_imm_c};
+    use crate::ir::value::{InstRef, Value};
 
-/// Debug-only: guest PCs at which to emit a per-instruction execution hook.
-/// Parsed once from `RUZU_A32_PC_EXEC=0xPC1,0xPC2,...`. When the env var is
-/// unset this is empty and no hook is ever emitted (zero codegen cost). Unlike
-/// the block-entry `RUZU_A32_PC_TRACE`, this fires regardless of dynarmic block
-/// boundaries, so it can observe a precise mid-block PC. Captured registers are
-/// aggregated by `crate::jit::a32_pc_trace_hook` (tagged by PC); needs
-/// `RUZU_A32_PC_TRACE` UNSET-safe — the hook self-dumps independent of it.
-fn a32_pc_exec_targets() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static TARGETS: OnceLock<Vec<u32>> = OnceLock::new();
-    TARGETS.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_EXEC")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|tok| {
-                        let h = tok.trim_start_matches("0x").trim_start_matches("0X");
-                        u32::from_str_radix(h, 16).ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThumbInstSize {
-    Thumb16,
-    Thumb32,
-}
-
-fn is_thumb16(first_part: u16) -> bool {
-    first_part < 0xE800
-}
-
-fn read_thumb_instruction(
-    arm_pc: u32,
-    read_code: &dyn Fn(u32) -> Option<u32>,
-) -> Option<(u32, ThumbInstSize)> {
-    let first_part = read_code(arm_pc & 0xFFFF_FFFC)?;
-
-    let mut instruction = if (arm_pc & 0x2) != 0 {
-        first_part >> 16
-    } else {
-        first_part & 0xFFFF
-    };
-
-    if is_thumb16(instruction as u16) {
-        return Some((instruction, ThumbInstSize::Thumb16));
+    fn reference_thumb_expand_imm(imm12: u32) -> u32 {
+        if imm12 & 0xc00 == 0 {
+            let imm8 = imm12 & 0xff;
+            return match imm12 & 0x300 {
+                0x000 => imm8,
+                0x100 => (imm8 << 16) | imm8,
+                0x200 => (imm8 << 24) | (imm8 << 8),
+                0x300 => (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8,
+                _ => unreachable!(),
+            };
+        }
+        (0x80 | (imm12 & 0x7f)).rotate_right((imm12 >> 7) & 31)
     }
 
-    instruction <<= 16;
-
-    let second_part = read_code((arm_pc.wrapping_add(2)) & 0xFFFF_FFFC)?;
-    instruction |= if ((arm_pc.wrapping_add(2)) & 0x2) != 0 {
-        second_part >> 16
-    } else {
-        second_part & 0xFFFF
-    };
-
-    Some((instruction, ThumbInstSize::Thumb32))
-}
-
-fn convert_asimd_instruction(thumb_instruction: u32) -> u32 {
-    if (thumb_instruction & 0xEF00_0000) == 0xEF00_0000 {
-        let u = (thumb_instruction >> 28) & 1;
-        return 0xF200_0000 | (u << 24) | (thumb_instruction & 0x00FF_FFFF);
+    #[test]
+    fn thumb_expand_imm_matches_all_twelve_bit_inputs() {
+        for imm12 in 0..=0xfff {
+            assert_eq!(thumb_expand_imm(imm12), reference_thumb_expand_imm(imm12));
+        }
     }
 
-    if (thumb_instruction & 0xFF00_0000) == 0xF900_0000 {
-        return 0xF400_0000 | (thumb_instruction & 0x00FF_FFFF);
+    #[test]
+    fn thumb_expand_imm_c_preserves_dynamic_carry_only_for_replication_forms() {
+        let dynamic_carry = Value::Inst(InstRef(42));
+        for imm12 in 0..=0x3ff {
+            let expanded = thumb_expand_imm_c(imm12, dynamic_carry);
+            assert_eq!(expanded.carry, dynamic_carry, "imm12={imm12:03X}");
+        }
+
+        for imm12 in 0x400..=0xfff {
+            let expanded = thumb_expand_imm_c(imm12, dynamic_carry);
+            assert_eq!(
+                expanded.carry,
+                Value::ImmU1(expanded.imm32 & (1 << 31) != 0),
+                "imm12={imm12:03X}"
+            );
+        }
     }
-
-    0xF7F0_A000
-}
-
-fn maybe_vfp_or_asimd_instruction(thumb_instruction: u32) -> bool {
-    (thumb_instruction & 0xEC00_0000) == 0xEC00_0000
-        || (thumb_instruction & 0xFF10_0000) == 0xF900_0000
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_asimd_instruction, read_thumb_instruction, translate, ThumbInstSize};
+    use super::translate_thumb::{
+        convert_asimd_instruction, decode_thumb_vfp_or_asimd, read_thumb_instruction, ThumbInstSize,
+    };
+    use super::{translate, TranslationOptions};
+    use crate::frontend::a32::decoder::ArmInstId;
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::Exception;
@@ -199,6 +212,19 @@ mod tests {
     fn convert_asimd_instruction_uses_upstream_second_mask() {
         let thumb_instruction = 0xF910_0000;
         assert_eq!(convert_asimd_instruction(thumb_instruction), 0xF410_0000);
+    }
+
+    #[test]
+    fn thumb_vfp_decode_precedes_generic_thumb32_coprocessor_decode() {
+        assert_eq!(
+            decode_thumb_vfp_or_asimd(0xEC42_3A1E).map(|decoded| decoded.id),
+            Some(ArmInstId::VMOV_2u32_2f32)
+        );
+        assert_eq!(
+            decode_thumb_vfp_or_asimd(0xEEF1_FA10).map(|decoded| decoded.id),
+            Some(ArmInstId::VMRS)
+        );
+        assert!(decode_thumb_vfp_or_asimd(0xEC42_3F1E).is_none());
     }
 
     #[test]
@@ -239,7 +265,7 @@ mod tests {
             _ => None,
         };
 
-        let block = translate(loc, &read_code);
+        let block = translate(loc, &read_code, TranslationOptions::default());
         assert_eq!(block.end_location(), loc.advance_pc(4).to_location());
     }
 
@@ -253,14 +279,14 @@ mod tests {
             _ => None,
         };
 
-        let block = translate(loc, &read_code);
+        let block = translate(loc, &read_code, TranslationOptions::default());
         assert_eq!(block.end_location(), loc.advance_pc(2).to_location());
     }
 
     #[test]
     fn translate_arm_missing_code_raises_no_execute_fault() {
         let loc = A32LocationDescriptor::new(0x4000, PSR::default(), FPSCR::default(), false);
-        let block = translate(loc, &|_| None);
+        let block = translate(loc, &|_| None, TranslationOptions::default());
 
         assert_no_execute_fault(&block, loc.advance_pc(4));
     }
@@ -270,243 +296,17 @@ mod tests {
         let mut psr = PSR::default();
         psr.set_t(true);
         let loc = A32LocationDescriptor::new(0x4000, psr, FPSCR::default(), false);
-        let block = translate(loc, &|_| None);
+        let block = translate(loc, &|_| None, TranslationOptions::default());
 
         assert_no_execute_fault(&block, loc.advance_pc(2).advance_it());
     }
-}
-
-/// Translate a block of A32 code starting at the given location descriptor.
-///
-/// Matches upstream dynarmic `TranslateArm()` / `TranslateThumb()`.
-/// `read_code` provides guest memory read access for instruction fetching.
-/// Returns an IR Block ready for optimization and emission.
-pub fn translate(desc: A32LocationDescriptor, read_code: &dyn Fn(u32) -> Option<u32>) -> Block {
-    let mut block = Block::new(desc.to_location());
-    let mut current = desc;
-
-    if current.t_flag() {
-        translate_thumb(&mut block, &mut current, read_code);
-    } else {
-        translate_arm(&mut block, &mut current, &desc, read_code);
-    }
-
-    // Fallback: if no terminal was set (e.g. Thumb path without branch,
-    // or MAX_BLOCK_INSTRUCTIONS reached), link to the next block.
-    // Upstream uses ASSERT_MSG(block.HasTerminal()) but we keep the fallback
-    // for robustness during the port.
-    if block.terminal.is_invalid() {
-        let next = current.to_location();
-        if desc.single_stepping() {
-            block.set_terminal(Terminal::LinkBlock { next });
-        } else {
-            block.set_terminal(Terminal::LinkBlockFast { next });
-        }
-    }
-
-    block
-}
-
-/// Translate a block of ARM (A32) instructions.
-///
-/// Matches upstream dynarmic `TranslateArm()` in `translate_arm.cpp`.
-/// Key differences from the previous rdynarmic implementation:
-/// - Uses `ConditionalState` state machine (matching upstream) instead of
-///   the ad-hoc translate_conditional_arm approach
-/// - Checks `!single_step` in the loop exit condition
-/// - Sets terminal after loop for Translating/Trailing/single_step states
-fn translate_arm(
-    block: &mut Block,
-    current: &mut A32LocationDescriptor,
-    desc: &A32LocationDescriptor,
-    read_code: &dyn Fn(u32) -> Option<u32>,
-) {
-    use conditional_state::{cond_can_continue, is_condition_passed, ConditionalState};
-
-    let single_step = desc.single_stepping();
-    let mut cond_state = ConditionalState::None;
-    let mut should_continue = true;
-
-    for _ in 0..MAX_BLOCK_INSTRUCTIONS {
-        let pc = current.pc();
-        let instr_word = match read_code(pc) {
-            Some(w) => w,
-            None => {
-                let mut ir = A32IREmitter::with_location(block, *current);
-                should_continue =
-                    raise_exception_with_instruction_size(&mut ir, Exception::NoExecuteFault, 4);
-                *current = current.advance_pc(4);
-                block.cycle_count += 1;
-                break;
-            }
-        };
-
-        let decoded = decode_arm(instr_word);
-        let cond = decoded.cond();
-        let is_unconditional_space = ((instr_word >> 28) & 0xF) == 0xF;
-
-        // Check condition code via state machine (matches upstream
-        // ArmConditionPassed → IsConditionPassed). This may set
-        // cond_state to Break and set a terminal on the block.
-        if !is_unconditional_space
-            && !is_condition_passed(&mut cond_state, block, *current, 4, cond)
-        {
-            break;
-        }
-
-        // Translate the instruction (condition already handled above).
-        let mut ir = A32IREmitter::with_location(block, *current);
-        should_continue = translate_arm_instruction(&mut ir, &decoded);
-        // Debug-only per-instruction PC execution hook (RUZU_A32_PC_EXEC).
-        // Emitted after the instruction's IR so call-argument setup sequences
-        // can be observed by targeting the final MOV before BL. Empty target
-        // set => never emitted.
-        if a32_pc_exec_targets().contains(&pc) {
-            ir.pc_exec_hook(pc);
-        }
-
-        // If state machine requested a break (e.g. condition changed mid-block),
-        // stop immediately. Matches upstream check after instruction decode.
-        if cond_state == ConditionalState::Break {
-            break;
-        }
-
-        *current = current.advance_pc(4);
-        block.cycle_count += 1;
-
-        // Loop exit: matches upstream
-        // `while (should_continue && CondCanContinue(cond_state, ir) && !single_step)`
-        if !should_continue || !cond_can_continue(cond_state, block) || single_step {
-            break;
-        }
-    }
-
-    // Post-loop terminal setup.
-    // Matches upstream: if Translating/Trailing/single_step && should_continue,
-    // set terminal to LinkBlock (single_step) or LinkBlockFast (normal).
-    if matches!(
-        cond_state,
-        ConditionalState::Translating | ConditionalState::Trailing
-    ) || single_step
-    {
-        if should_continue {
-            let next = current.to_location();
-            if single_step {
-                block.set_terminal(Terminal::LinkBlock { next });
-            } else {
-                block.set_terminal(Terminal::LinkBlockFast { next });
-            }
-        }
-    }
-
-    block.set_end_location(current.to_location());
-}
-
-fn translate_thumb(
-    block: &mut Block,
-    current: &mut A32LocationDescriptor,
-    read_code: &dyn Fn(u32) -> Option<u32>,
-) {
-    use conditional_state::{cond_can_continue, ConditionalState};
-
-    let single_step = current.single_stepping();
-    let mut it_state = current.it();
-    let cond_state = ConditionalState::None;
-    let mut should_continue = true;
-
-    for _ in 0..MAX_BLOCK_INSTRUCTIONS {
-        let pc = current.pc();
-        let (thumb_raw, inst_size) = match read_thumb_instruction(pc, read_code) {
-            Some(v) => v,
-            None => {
-                let mut ir = A32IREmitter::with_location(block, *current);
-                should_continue =
-                    raise_exception_with_instruction_size(&mut ir, Exception::NoExecuteFault, 2);
-                *current = current.advance_pc(2).advance_it();
-                block.cycle_count += 1;
-                break;
-            }
-        };
-
-        let (cont, advance): (bool, i32) = if inst_size == ThumbInstSize::Thumb32 {
-            let hw1 = (thumb_raw >> 16) as u16;
-            let hw2 = thumb_raw as u16;
-            let maybe_arm_like = if maybe_vfp_or_asimd_instruction(thumb_raw) {
-                Some(decode_arm(convert_asimd_instruction(thumb_raw)))
-            } else {
-                None
-            };
-            let decoded = decode_thumb32(hw1, hw2);
-            let mut ir = A32IREmitter::with_location(block, *current);
-
-            let c = if let Some(arm_decoded) = maybe_arm_like.filter(|d| d.id != ArmInstId::Unknown)
-            {
-                translate_arm_instruction(&mut ir, &arm_decoded)
-            } else if it_state.is_in_it_block() {
-                let cond = it_state.cond();
-                conditional_state::translate_conditional_thumb32(&mut ir, &decoded, cond)
-            } else {
-                translate_thumb32_instruction(&mut ir, &decoded)
-            };
-
-            (c, 4i32)
-        } else {
-            let hw1 = thumb_raw as u16;
-            let decoded = decode_thumb16(hw1);
-            let mut ir = A32IREmitter::with_location(block, *current);
-
-            let c = if it_state.is_in_it_block() && decoded.id != Thumb16InstId::IT {
-                let cond = it_state.cond();
-                conditional_state::translate_conditional_thumb16(&mut ir, &decoded, cond)
-            } else {
-                translate_thumb16_instruction(&mut ir, &decoded)
-            };
-
-            // Advance IT state (but not for the IT instruction itself)
-            if decoded.id != Thumb16InstId::IT {
-                if it_state.is_in_it_block() {
-                    it_state.advance();
-                }
-            }
-
-            (c, 2i32)
-        };
-
-        should_continue = cont;
-        block.cycle_count += 1;
-        *current = current.advance_pc(advance);
-
-        // Loop exit: matches upstream do-while condition:
-        // `while (should_continue && CondCanContinue(cond_state, ir) && !single_step)`
-        if !should_continue || !cond_can_continue(cond_state, block) || single_step {
-            break;
-        }
-    }
-
-    // Post-loop terminal: matches upstream exactly.
-    // `if (cond_state == Translating || cond_state == Trailing || single_step)`
-    if matches!(
-        cond_state,
-        ConditionalState::Translating | ConditionalState::Trailing
-    ) || single_step
-    {
-        if should_continue {
-            let next = current.to_location();
-            if single_step {
-                block.set_terminal(Terminal::LinkBlock { next });
-            } else {
-                block.set_terminal(Terminal::LinkBlockFast { next });
-            }
-        }
-    }
-
-    block.set_end_location(current.to_location());
 }
 
 /// Translate a single ARM instruction. Returns true to continue translating.
 fn translate_arm_instruction(
     ir: &mut A32IREmitter,
     decoded: &crate::frontend::a32::decoder::DecodedArm,
+    options: TranslationOptions,
 ) -> bool {
     use ArmInstId::*;
     match decoded.id {
@@ -532,23 +332,29 @@ fn translate_arm_instruction(
         BLX_reg => branch::arm_blx_reg(ir, decoded),
         BLX_imm => branch::arm_blx_imm(ir, decoded),
         // Load/Store
-        LDR_imm | LDR_lit => load_store::arm_ldr_imm(ir, decoded),
+        LDR_lit => load_store::arm_ldr_lit(ir, decoded),
+        LDR_imm => load_store::arm_ldr_imm(ir, decoded),
         LDR_reg => load_store::arm_ldr_reg(ir, decoded),
         STR_imm => load_store::arm_str_imm(ir, decoded),
         STR_reg => load_store::arm_str_reg(ir, decoded),
-        LDRB_imm | LDRB_lit => load_store::arm_ldrb_imm(ir, decoded),
+        LDRB_lit => load_store::arm_ldrb_lit(ir, decoded),
+        LDRB_imm => load_store::arm_ldrb_imm(ir, decoded),
         LDRB_reg => load_store::arm_ldrb_reg(ir, decoded),
         STRB_imm => load_store::arm_strb_imm(ir, decoded),
         STRB_reg => load_store::arm_strb_reg(ir, decoded),
-        LDRH_imm | LDRH_lit => load_store::arm_ldrh_imm(ir, decoded),
+        LDRH_lit => load_store::arm_ldrh_lit(ir, decoded),
+        LDRH_imm => load_store::arm_ldrh_imm(ir, decoded),
         LDRH_reg => load_store::arm_ldrh_reg(ir, decoded),
         STRH_imm => load_store::arm_strh_imm(ir, decoded),
         STRH_reg => load_store::arm_strh_reg(ir, decoded),
-        LDRSB_imm | LDRSB_lit => load_store::arm_ldrsb_imm(ir, decoded),
+        LDRSB_lit => load_store::arm_ldrsb_lit(ir, decoded),
+        LDRSB_imm => load_store::arm_ldrsb_imm(ir, decoded),
         LDRSB_reg => load_store::arm_ldrsb_reg(ir, decoded),
-        LDRSH_imm | LDRSH_lit => load_store::arm_ldrsh_imm(ir, decoded),
+        LDRSH_lit => load_store::arm_ldrsh_lit(ir, decoded),
+        LDRSH_imm => load_store::arm_ldrsh_imm(ir, decoded),
         LDRSH_reg => load_store::arm_ldrsh_reg(ir, decoded),
-        LDRD_imm | LDRD_lit => load_store::arm_ldrd_imm(ir, decoded),
+        LDRD_lit => load_store::arm_ldrd_lit(ir, decoded),
+        LDRD_imm => load_store::arm_ldrd_imm(ir, decoded),
         LDRD_reg => load_store::arm_ldrd_reg(ir, decoded),
         STRD_imm => load_store::arm_strd_imm(ir, decoded),
         STRD_reg => load_store::arm_strd_reg(ir, decoded),
@@ -622,6 +428,8 @@ fn translate_arm_instruction(
         CDP => coprocessor::arm_cdp(ir, decoded),
         MRRC => coprocessor::arm_mrrc(ir, decoded),
         MCRR => coprocessor::arm_mcrr(ir, decoded),
+        LDC => coprocessor::arm_ldc(ir, decoded),
+        STC => coprocessor::arm_stc(ir, decoded),
         // Synchronization
         STL => synchronization::arm_stl(ir, decoded),
         STLEX => synchronization::arm_stlex(ir, decoded),
@@ -659,7 +467,7 @@ fn translate_arm_instruction(
         // Exception
         SVC => exception::arm_svc(ir, decoded),
         UDF => exception::arm_udf(ir, decoded),
-        BKPT => exception::arm_bkpt(ir, decoded),
+        BKPT => exception::arm_bkpt(ir, decoded, options),
         // VFP three-register data processing
         VMLA_fp => vfp::arm_vmla_fp(ir, decoded),
         VMLS_fp => vfp::arm_vmls_fp(ir, decoded),
@@ -694,8 +502,14 @@ fn translate_arm_instruction(
         VMOV_f64_u32 => vfp::arm_vmov_f64_u32(ir, decoded),
         VMOV_u32_f32 => vfp::arm_vmov_u32_f32(ir, decoded),
         VMOV_f32_u32 => vfp::arm_vmov_f32_u32(ir, decoded),
+        VMOV_2u32_2f32 => vfp::vfp_vmov_2u32_2f32(ir, decoded.raw),
+        VMOV_2f32_2u32 => vfp::vfp_vmov_2f32_2u32(ir, decoded.raw),
+        VMOV_2u32_f64 => vfp::vfp_vmov_2u32_f64(ir, decoded.raw),
+        VMOV_f64_2u32 => vfp::vfp_vmov_f64_2u32(ir, decoded.raw),
         VMOV_from_i32 => vfp::arm_vmov_from_i32(ir, decoded),
         VMOV_to_i32 => vfp::arm_vmov_to_i32(ir, decoded),
+        VMSR => vfp::vfp_vmsr(ir, decoded.raw),
+        VMRS => vfp::vfp_vmrs(ir, decoded.raw),
         VFP_VDUP => vfp::arm_vdup(ir, decoded),
         VFP_VRINT_rm => vfp::arm_vfp_vrint_rm(ir, decoded),
         VFP_VCVT_rm => vfp::arm_vfp_vcvt_rm(ir, decoded),
@@ -803,11 +617,12 @@ fn translate_arm_instruction(
         ASIMD_VNEG_int => asimd::arm_asimd_vneg_int(ir, decoded),
         ASIMD_VABS_int => asimd::arm_asimd_vabs_int(ir, decoded),
         // Hints
-        PLD_imm | PLD_reg => true, // PLD is a hint, NOP for correctness
-        SEV => true,
-        WFI => hint::arm_wfi(ir),
-        WFE => hint::arm_wfe(ir),
-        YIELD => hint::arm_yield(ir),
+        PLD_imm | PLD_reg => hint::arm_pld(ir, decoded, options),
+        SEV => hint::arm_sev(ir, options),
+        SEVL => hint::arm_sevl(ir, options),
+        WFI => hint::arm_wfi(ir, options),
+        WFE => hint::arm_wfe(ir, options),
+        YIELD => hint::arm_yield(ir, options),
         // An unmatched encoding is treated as undefined, matching upstream's
         // behaviour where any bit pattern not claimed by a decode-table entry
         // raises UndefinedInstruction. Use the shared helper so the full
@@ -821,14 +636,16 @@ fn translate_arm_instruction(
 fn translate_thumb16_instruction(
     ir: &mut A32IREmitter,
     decoded: &crate::frontend::a32::decoder_thumb16::DecodedThumb16,
+    options: TranslationOptions,
 ) -> bool {
-    thumb16::translate_thumb16(ir, decoded)
+    thumb16::translate_thumb16(ir, decoded, options)
 }
 
 /// Translate a single Thumb32 instruction. Returns true to continue translating.
 fn translate_thumb32_instruction(
     ir: &mut A32IREmitter,
     decoded: &crate::frontend::a32::decoder_thumb32::DecodedThumb32,
+    options: TranslationOptions,
 ) -> bool {
-    thumb32::translate_thumb32(ir, decoded)
+    thumb32::translate_thumb32(ir, decoded, options)
 }

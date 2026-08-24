@@ -192,10 +192,9 @@ mod tests {
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     #[test]
-    fn sha_family_translates_without_interpreter_fallback() {
+    fn sha_family_translates_to_upstream_ir() {
         let cases = [
             (0x5e00_0000, None),
             (0x5e00_1000, None),
@@ -223,7 +222,6 @@ mod tests {
             if let Some(opcode) = expected_opcode {
                 assert!(block.instructions.iter().any(|inst| inst.opcode == opcode));
             }
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 }

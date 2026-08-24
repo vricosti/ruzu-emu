@@ -1,26 +1,29 @@
-// Port of dynarmic/interface/exclusive_monitor.h and backend/x64/exclusive_monitor.cpp
+// Port of dynarmic/interface/exclusive_monitor.h and the host exclusive_monitor.cpp files.
 //
 // Multi-core exclusive monitor for ARM load-exclusive/store-exclusive
 // synchronization. Each processor marks an address via ReadAndMark, then
 // attempts a store via DoExclusiveOperation which succeeds only if the
 // address is still exclusively held.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::mem::MaybeUninit;
+
+use crate::common::spin_lock::SpinLock;
 
 /// 128-bit value storage (two u64s), matching Dynarmic::Vector.
 pub type Vector = [u64; 2];
 
 const RESERVATION_GRANULE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const INVALID_EXCLUSIVE_ADDRESS: u64 = 0xDEAD_DEAD_DEAD_DEAD;
+const MAX_NUM_CPU_CORES: usize = 4;
 
 /// Multi-core exclusive monitor.
 ///
 /// Matches `Dynarmic::ExclusiveMonitor` — provides ReadAndMark / DoExclusiveOperation
 /// for implementing ARM LDXR/STXR (load-exclusive/store-exclusive) across cores.
 pub struct ExclusiveMonitor {
-    lock: SpinLock,
-    exclusive_addresses: Vec<u64>,
-    exclusive_values: Vec<Vector>,
+    pub(crate) lock: SpinLock,
+    pub(crate) exclusive_addresses: Vec<u64>,
+    pub(crate) exclusive_values: Vec<Vector>,
 }
 
 impl ExclusiveMonitor {
@@ -28,6 +31,7 @@ impl ExclusiveMonitor {
     ///
     /// Matches `Dynarmic::ExclusiveMonitor::ExclusiveMonitor(size_t processor_count)`.
     pub fn new(processor_count: usize) -> Self {
+        assert!(processor_count <= MAX_NUM_CPU_CORES);
         Self {
             lock: SpinLock::new(),
             exclusive_addresses: vec![INVALID_EXCLUSIVE_ADDRESS; processor_count],
@@ -44,7 +48,7 @@ impl ExclusiveMonitor {
     ///
     /// Matches `Dynarmic::ExclusiveMonitor::ReadAndMark<T>`.
     /// The closure `op` performs the actual memory read.
-    pub fn read_and_mark<T: Copy + Default>(
+    pub fn read_and_mark<T: Copy>(
         &mut self,
         processor_id: usize,
         address: u64,
@@ -56,8 +60,7 @@ impl ExclusiveMonitor {
         self.lock.lock();
         self.exclusive_addresses[processor_id] = masked_address;
         let value = op();
-        // Store value bytes into the vector slot.
-        self.exclusive_values[processor_id] = [0u64; 2];
+        // Store exactly sizeof(T) bytes, matching upstream's memcpy.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &value as *const T as *const u8,
@@ -75,7 +78,7 @@ impl ExclusiveMonitor {
     /// If this processor still has exclusive access, calls `op(saved_value)`
     /// which should perform a compare-and-swap write. Returns true if the
     /// operation succeeded.
-    pub fn do_exclusive_operation<T: Copy + Default>(
+    pub fn do_exclusive_operation<T: Copy>(
         &mut self,
         processor_id: usize,
         address: u64,
@@ -86,16 +89,16 @@ impl ExclusiveMonitor {
             return false;
         }
 
-        // Extract saved value.
-        let mut saved_value = T::default();
+        // Extract exactly sizeof(T) bytes, matching upstream's memcpy.
+        let mut saved_value = MaybeUninit::<T>::uninit();
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.exclusive_values[processor_id].as_ptr() as *const u8,
-                &mut saved_value as *mut T as *mut u8,
+                saved_value.as_mut_ptr() as *mut u8,
                 std::mem::size_of::<T>(),
             );
         }
-        let result = op(saved_value);
+        let result = op(unsafe { saved_value.assume_init() });
 
         self.lock.unlock();
         result
@@ -143,85 +146,11 @@ impl ExclusiveMonitor {
         // Lock remains held — caller (DoExclusiveOperation) will unlock.
         true
     }
-
-    // Accessors for JIT backend integration (matching dynarmic friend functions).
-
-    /// Get a mutable pointer to the exclusive address for a processor.
-    pub fn get_address_ptr(&mut self, index: usize) -> *mut u64 {
-        &mut self.exclusive_addresses[index]
-    }
-
-    /// Get a mutable pointer to the exclusive value for a processor.
-    pub fn get_value_ptr(&mut self, index: usize) -> *mut Vector {
-        &mut self.exclusive_values[index]
-    }
-
-    /// Get a pointer to the lock for JIT backend use.
-    pub fn get_lock_ptr(&mut self) -> *mut SpinLock {
-        &mut self.lock
-    }
-
-    /// Get a raw pointer to the lock's underlying u32 storage, suitable for
-    /// the JIT-emitted inline lock sequence (`lock xchg dword [ptr]`).
-    ///
-    /// Matches upstream `GetExclusiveMonitorLockPointer` which returns
-    /// `volatile int*` pointing at the same 4-byte storage as `SpinLock`'s
-    /// `storage` field. The AtomicU32 has the same layout as a `u32`.
-    pub fn get_lock_storage_ptr(&mut self) -> *mut u32 {
-        &raw mut self.lock.locked as *mut u32
-    }
-
-    /// Processor count, exposed for the JIT-emitted `EmitExclusiveTestAndClear`
-    /// loop that needs to invalidate other processors' reservations.
-    pub fn processor_count(&self) -> usize {
-        self.exclusive_addresses.len()
-    }
 }
 
-// SAFETY: ExclusiveMonitor uses a SpinLock for thread safety.
+// SAFETY: ExclusiveMonitor uses a SpinLock for thread safety, and its vectors are never resized.
 unsafe impl Send for ExclusiveMonitor {}
 unsafe impl Sync for ExclusiveMonitor {}
-
-/// Simple spin lock matching `Dynarmic::SpinLock`.
-///
-/// Uses `AtomicU32` (4-byte storage) rather than `AtomicBool` (1-byte) to
-/// match upstream Dynarmic's `volatile int* storage`. The JIT-emitted
-/// inline lock/unlock sequences (`EmitSpinLockLock`/`EmitSpinLockUnlock` in
-/// `spin_lock_x64.cpp`) use 32-bit `lock xchg [dword ptr]` against this
-/// field, so byte alignment / width must match.
-#[repr(C)]
-pub struct SpinLock {
-    locked: AtomicU32,
-}
-
-impl SpinLock {
-    pub fn new() -> Self {
-        Self {
-            locked: AtomicU32::new(0),
-        }
-    }
-
-    pub fn lock(&self) {
-        while self
-            .locked
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // Spin with a hint to reduce contention.
-            std::hint::spin_loop();
-        }
-    }
-
-    pub fn unlock(&self) {
-        self.locked.store(0, Ordering::Release);
-    }
-}
-
-impl Default for SpinLock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -327,5 +256,11 @@ mod tests {
         assert!(!monitor.do_exclusive_operation::<u32>(0, 0x7000, |_| true));
         assert!(!monitor.do_exclusive_operation::<u32>(1, 0x8000, |_| true));
         assert!(!monitor.do_exclusive_operation::<u32>(2, 0x9000, |_| true));
+    }
+
+    #[test]
+    #[should_panic]
+    fn processor_count_cannot_exceed_upstream_capacity() {
+        let _monitor = ExclusiveMonitor::new(MAX_NUM_CPU_CORES + 1);
     }
 }

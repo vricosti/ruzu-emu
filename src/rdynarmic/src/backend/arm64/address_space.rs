@@ -532,9 +532,6 @@ impl AddressSpace {
                 self.callback_target(target, prelude_info.exclusive_write_memory_128)
             }
             LinkTarget::CallSVC => self.callback_target(target, prelude_info.call_svc),
-            LinkTarget::InterpreterFallback => {
-                self.callback_target(target, prelude_info.interpreter_fallback)
-            }
             LinkTarget::ExceptionRaised => {
                 self.callback_target(target, prelude_info.exception_raised)
             }

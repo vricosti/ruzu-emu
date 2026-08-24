@@ -34,9 +34,10 @@ ARM64 instruction → Frontend decoder → IR Block (SSA opcodes) → Optimizati
 ### Key Modules
 
 ```
-src/halt_reason.rs   → HaltReason bitflags (Step, Svc, Breakpoint, ExternalHalt, etc.)
-src/jit_config.rs    → JitCallbacks trait (25+ host methods) + JitConfig struct
-src/jit.rs           → Public A64Jit: run()/step(), register accessors, callback trampolines
+src/halt_reason.rs          → HaltReason bitflags (Step, Svc, Breakpoint, ExternalHalt, etc.)
+src/interface/A32/config.rs → A32 UserCallbacks + UserConfig
+src/interface/A64/config.rs → A64 UserCallbacks + UserConfig
+src/jit.rs                  → Public A32Jit/A64Jit wrappers and callback trampolines
 
 src/ir/              → IR definition: Opcode enum (~650 opcodes), Inst, Block, Value, Type
   opcode.rs          → All IR opcodes (core, vector, FP scalar, FP vector, memory, A64)
@@ -107,12 +108,13 @@ A64Jit::run()
 ### Public API (src/jit.rs)
 
 ```rust
-let mut jit = A64Jit::new(JitConfig {
-    callbacks: Box::new(my_callbacks),  // impl JitCallbacks
-    enable_cycle_counting: true,
-    code_cache_size: 128 * 1024 * 1024,
-    enable_optimizations: true,
-})?;
+use rdynarmic::interface::a64::config::UserConfig;
+use rdynarmic::A64Jit;
+
+let mut config = UserConfig::new(Box::new(my_callbacks));
+config.enable_cycle_counting = true;
+config.code_cache_size = 128 * 1024 * 1024;
+let mut jit = A64Jit::new(config)?;
 
 jit.set_pc(entry_point);
 jit.set_sp(stack_top);
@@ -135,7 +137,7 @@ During JIT execution:
 - **Phase 1-9**: IR definition, frontend decoder, optimization passes, core x64 backend scaffolding
 - **Phase 10**: ALU, memory, FP scalar, packed, crypto, CRC32, exclusive memory, saturation emit (~155 opcodes)
 - **Phase 11**: All vector/SIMD opcodes (~350 opcodes across 10 new files + 2 FP vector files). Native SSE for common ops, stack-based Rust fallback for complex ops.
-- **Phase 12**: Public JIT API, block cache, and execution loop. `A64Jit` struct with `run()`/`step()`, `JitCallbacks` trait, `BlockCache`, `A64EmitX64` compilation pipeline, dispatcher assembly (`gen_run_code`), terminal-to-dispatcher wiring, 25+ callback trampolines. 159 tests pass, 0 clippy warnings.
+- **Phase 12**: Public JIT API, block cache, and execution loop. `A64Jit` struct with `run()`/`step()`, architecture-owned callback traits, `BlockCache`, `A64EmitX64` compilation pipeline, dispatcher assembly (`gen_run_code`), terminal-to-dispatcher wiring, and callback trampolines.
 - **Phase 13**: Block linking, fast dispatch, atomic halt_reason, step mode. Atomic `xchg` for halt_reason read-and-clear, dedicated `step_code` entry with `lock or` STEP bit, direct block-to-block jump patching via fixed-size NOP-padded slots (`PatchTable`), RSB pop handler with descriptor matching, fast dispatch hash table (1M entries), `patch()`/`unpatch()` for cache invalidation. 175 tests pass, 0 clippy warnings.
 
 ### Current State

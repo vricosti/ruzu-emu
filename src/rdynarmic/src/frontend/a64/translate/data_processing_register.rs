@@ -67,7 +67,7 @@ impl<'a> TranslatorVisitor<'a> {
             // low arg and rbit32(input.low) as the high arg.
             let lsw_operand = ir.least_significant_word(operand);
             let lsw_reversed = rbit32(ir, lsw_operand);
-            let msw_operand = ir.most_significant_word(operand);
+            let msw_operand = ir.most_significant_word(operand).result;
             let msw_reversed = rbit32(ir, msw_operand);
             let result = ir.pack_2x32_to_1x64(msw_reversed, lsw_reversed);
             self.set_x(64, rd, result);
@@ -125,7 +125,7 @@ impl<'a> TranslatorVisitor<'a> {
         let ir = self.ir.ir();
         let lo_operand = ir.least_significant_word(operand);
         let lo = ir.byte_reverse_word(lo_operand);
-        let hi_operand = ir.most_significant_word(operand);
+        let hi_operand = ir.most_significant_word(operand).result;
         let hi = ir.byte_reverse_word(hi_operand);
         let result = ir.pack_2x32_to_1x64(lo, hi);
         self.set_x(64, rd, result);
@@ -232,7 +232,6 @@ mod tests {
     use crate::frontend::a64::translate::{translate, TranslationOptions};
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
     fn translate_single(raw: u32) -> crate::ir::block::Block {
         let loc = A64LocationDescriptor::new(0x1000, 0, true);
@@ -252,7 +251,6 @@ mod tests {
     #[test]
     fn rev16_int_translates_without_interpret_terminal() {
         let block = translate_single(0x5AC00441);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -262,7 +260,6 @@ mod tests {
     #[test]
     fn rev32_int_translates_without_interpret_terminal() {
         let block = translate_single(0xDAC00841);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(
             block
                 .instructions
@@ -276,7 +273,6 @@ mod tests {
     #[test]
     fn cls_int_translates_without_interpret_terminal() {
         let block = translate_single(0x5AC01441);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -290,7 +286,6 @@ mod tests {
     #[test]
     fn udiv_translates_without_interpret_terminal() {
         let block = translate_single(0x9AC10841);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -300,7 +295,6 @@ mod tests {
     #[test]
     fn sdiv_translates_without_interpret_terminal() {
         let block = translate_single(0x9AC10C41);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()

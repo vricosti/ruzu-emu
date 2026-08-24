@@ -51,7 +51,7 @@ fn inline_watch_ranges() -> &'static [(u64, u64)] {
 fn is_ordered(acc_type: AccType) -> bool {
     matches!(
         acc_type,
-        AccType::Ordered | AccType::OrderedAtomic | AccType::LimitedOrdered
+        AccType::Ordered | AccType::OrderedRw | AccType::LimitedOrdered
     )
 }
 
@@ -581,7 +581,12 @@ fn inline_page_table_emit_vaddr_lookup<const BITSIZE: usize>(
         fallback.b_cond(code, Cond::NE)?;
     }
 
-    code.write_u32(inst::ldr_x_reg_lsl3(XSCRATCH0, XPAGETABLE, XSCRATCH0))?;
+    code.write_u32(inst::lsl_x_imm(
+        XSCRATCH0,
+        XSCRATCH0,
+        ctx.conf.page_table_log2_stride as u8,
+    ))?;
+    code.write_u32(inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0))?;
 
     if ctx.conf.page_table_pointer_mask_bits != 0 {
         let mask = u64::MAX << ctx.conf.page_table_pointer_mask_bits;
@@ -795,19 +800,21 @@ mod tests {
     use crate::backend::arm64::jit_state::A64JitState;
     use crate::backend::arm64::reg_alloc::RegAlloc;
     use crate::backend::arm64::stack_layout::StackLayout;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
+    use crate::interface::a64::config::{
+        Exception as A64Exception, UserCallbacks as A64UserCallbacks, UserConfig as A64UserConfig,
+        Vector as A64Vector,
+    };
+    use crate::interface::optimization_flags::OptimizationFlag;
     use crate::ir::block::Block;
     use crate::ir::inst::Inst;
     use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
     use crate::ir::opcode::Opcode;
     use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
-    use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
-    use std::collections::HashMap;
 
     struct DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
+    impl A64UserCallbacks for DummyCallbacks {
         fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
             None
         }
@@ -828,93 +835,36 @@ mod tests {
             0
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_128(&self, _vaddr: u64) -> A64Vector {
+            [0, 0]
         }
 
         fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
         fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
         fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-        fn exclusive_clear(&mut self) {}
+        fn memory_write_128(&mut self, _vaddr: u64, _value: A64Vector) {}
 
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-            0
-        }
-
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-            0
-        }
-
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-            0
-        }
-
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-            0
-        }
-
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
             0
         }
+
+        fn get_cntpct(&self) -> u64 {
+            0
+        }
     }
 
     fn config() -> EmitConfig {
-        let mut jit_config = JitConfig {
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 0,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        };
-        jit_config.memory.check_halt_on_memory_access = true;
-        EmitConfig::from_a64_config(&jit_config)
+        let mut config = A64UserConfig::new(Box::new(DummyCallbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 0;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.check_halt_on_memory_access = true;
+        EmitConfig::from_a64_config(&config)
     }
 
     fn block_with_inst(opcode: Opcode, args: &[Value]) -> Block {
@@ -1053,6 +1003,7 @@ mod tests {
         config.check_halt_on_memory_access = false;
         config.page_table_pointer = 0x1000_0000;
         config.page_table_address_space_bits = 32;
+        config.page_table_log2_stride = 4;
         config.silently_mirror_page_table = true;
         config.absolute_offset_page_table = false;
 
@@ -1079,7 +1030,7 @@ mod tests {
         assert_eq!(
             info.relocations,
             vec![Relocation {
-                code_offset: 32,
+                code_offset: 36,
                 target: LinkTarget::WrappedReadMemory32,
             }]
         );
@@ -1093,28 +1044,32 @@ mod tests {
         );
         assert_eq!(
             read_instruction(&code, 8),
-            inst::ldr_x_reg_lsl3(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+            inst::lsl_x_imm(XSCRATCH0, XSCRATCH0, 4)
         );
-        assert_eq!(read_instruction(&code, 12), inst::cbz_x(XSCRATCH0, 16));
         assert_eq!(
-            read_instruction(&code, 16),
+            read_instruction(&code, 12),
+            inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+        );
+        assert_eq!(read_instruction(&code, 16), inst::cbz_x(XSCRATCH0, 16));
+        assert_eq!(
+            read_instruction(&code, 20),
             inst::and_x_imm(XSCRATCH1, test_gpr(0), PAGE_MASK)
         );
         assert_eq!(
-            read_instruction(&code, 20),
+            read_instruction(&code, 24),
             inst::ldr_w_reg_lsl(test_gpr(1), XSCRATCH0, XSCRATCH1)
         );
-        assert_eq!(read_instruction(&code, 24), inst::brk(0));
+        assert_eq!(read_instruction(&code, 28), inst::brk(0));
         assert_eq!(
-            read_instruction(&code, 28),
+            read_instruction(&code, 32),
             inst::mov_x(XSCRATCH0, test_gpr(0))
         );
-        assert_eq!(read_instruction(&code, 32), inst::nop());
+        assert_eq!(read_instruction(&code, 36), inst::nop());
         assert_eq!(
-            read_instruction(&code, 36),
+            read_instruction(&code, 40),
             inst::mov_x(test_gpr(1), XSCRATCH0)
         );
-        assert_eq!(read_instruction(&code, 40), inst::b_imm(-16));
+        assert_eq!(read_instruction(&code, 44), inst::b_imm(-16));
     }
 
     #[test]
@@ -1155,16 +1110,20 @@ mod tests {
             read_instruction(&code, 8),
             inst::tst_x_imm(XSCRATCH0, 0xffff_ffff_f800_0000)
         );
-        assert_eq!(read_instruction(&code, 12), inst::b_cond(Cond::NE, 24));
+        assert_eq!(read_instruction(&code, 12), inst::b_cond(Cond::NE, 28));
         assert_eq!(
             read_instruction(&code, 16),
-            inst::ldr_x_reg_lsl3(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+            inst::lsl_x_imm(XSCRATCH0, XSCRATCH0, 3)
         );
         assert_eq!(
             read_instruction(&code, 20),
+            inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+        );
+        assert_eq!(
+            read_instruction(&code, 24),
             inst::and_x_imm(XSCRATCH0, XSCRATCH0, 0xffff_ffff_ffff_ffe0)
         );
-        assert_eq!(read_instruction(&code, 24), inst::cbz_x(XSCRATCH0, 12));
+        assert_eq!(read_instruction(&code, 28), inst::cbz_x(XSCRATCH0, 12));
     }
 
     #[test]
@@ -1200,7 +1159,7 @@ mod tests {
         assert_eq!(
             info.relocations,
             vec![Relocation {
-                code_offset: 44,
+                code_offset: 48,
                 target: LinkTarget::WrappedWriteMemory64,
             }]
         );
@@ -1222,28 +1181,32 @@ mod tests {
         );
         assert_eq!(
             read_instruction(&code, 16),
-            inst::ldr_x_reg_lsl3(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+            inst::lsl_x_imm(XSCRATCH0, XSCRATCH0, 3)
         );
-        assert_eq!(read_instruction(&code, 20), inst::cbz_x(XSCRATCH0, 16));
         assert_eq!(
-            read_instruction(&code, 24),
+            read_instruction(&code, 20),
+            inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+        );
+        assert_eq!(read_instruction(&code, 24), inst::cbz_x(XSCRATCH0, 16));
+        assert_eq!(
+            read_instruction(&code, 28),
             inst::and_x_imm(XSCRATCH1, test_gpr(0), PAGE_MASK)
         );
         assert_eq!(
-            read_instruction(&code, 28),
+            read_instruction(&code, 32),
             inst::str_x_reg_lsl(test_gpr(1), XSCRATCH0, XSCRATCH1)
         );
-        assert_eq!(read_instruction(&code, 32), inst::brk(0));
+        assert_eq!(read_instruction(&code, 36), inst::brk(0));
         assert_eq!(
-            read_instruction(&code, 36),
+            read_instruction(&code, 40),
             inst::mov_x(XSCRATCH0, test_gpr(0))
         );
         assert_eq!(
-            read_instruction(&code, 40),
+            read_instruction(&code, 44),
             inst::mov_x(XSCRATCH1, test_gpr(1))
         );
-        assert_eq!(read_instruction(&code, 44), inst::nop());
-        assert_eq!(read_instruction(&code, 48), inst::b_imm(-16));
+        assert_eq!(read_instruction(&code, 48), inst::nop());
+        assert_eq!(read_instruction(&code, 52), inst::b_imm(-16));
     }
 
     #[test]

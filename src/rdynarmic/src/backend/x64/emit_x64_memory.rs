@@ -48,12 +48,12 @@ pub const PAGE_MASK: usize = PAGE_SIZE - 1;
 ///
 /// Matches upstream `inline bool IsOrdered(IR::AccType acctype)` in
 /// `emit_x64_memory.h:382-384`. ARM's "ORDEREDRW" maps to rdynarmic's
-/// `OrderedAtomic`.
+/// `OrderedRw`.
 #[inline]
 pub fn is_ordered(acc: AccType) -> bool {
     matches!(
         acc,
-        AccType::Ordered | AccType::OrderedAtomic | AccType::LimitedOrdered
+        AccType::Ordered | AccType::OrderedRw | AccType::LimitedOrdered
     )
 }
 
@@ -446,9 +446,11 @@ pub fn emit_vaddr_lookup_a64(
         ra.asm.jne(&abort, rxbyak::JmpType::Near).unwrap();
     }
 
-    // page = r14[tmp * 8]
     ra.asm
-        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp * 8u8))
+        .shl(tmp, mem_conf.page_table_log2_stride as u8)
+        .unwrap();
+    ra.asm
+        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp))
         .unwrap();
 
     if mem_conf.page_table_pointer_mask_bits == 0 {
@@ -470,8 +472,7 @@ pub fn emit_vaddr_lookup_a64(
 
 /// Emit the A32 page-table lookup from upstream
 /// `EmitVAddrLookup<A32EmitContext>`. Reden's host-pointer table stores
-/// eight-byte entries directly, so `tmp * 8` is the Rust counterpart of
-/// upstream's configurable `page_table_log2_stride`.
+/// entries with the caller-provided upstream stride.
 pub fn emit_vaddr_lookup_a32(
     ra: &mut RegAlloc,
     ctx: &EmitContext,
@@ -495,7 +496,10 @@ pub fn emit_vaddr_lookup_a32(
         .unwrap();
     ra.asm.shr(tmp.cvt32().unwrap(), PAGE_BITS as u8).unwrap();
     ra.asm
-        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp * 8u8))
+        .shl(tmp.cvt32().unwrap(), mem_conf.page_table_log2_stride as u8)
+        .unwrap();
+    ra.asm
+        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp))
         .unwrap();
 
     if mem_conf.page_table_pointer_mask_bits == 0 {
@@ -533,10 +537,10 @@ mod tests {
         assert!(!is_ordered(AccType::Vec));
         assert!(!is_ordered(AccType::Atomic));
         assert!(is_ordered(AccType::Ordered));
-        assert!(is_ordered(AccType::OrderedAtomic));
+        assert!(is_ordered(AccType::OrderedRw));
         assert!(is_ordered(AccType::LimitedOrdered));
         assert!(!is_ordered(AccType::Unpriv));
-        assert!(!is_ordered(AccType::IfetchOrdered));
+        assert!(!is_ordered(AccType::Ifetch));
     }
 
     /// `mov eax, dword [r13+rax]` should be 5 bytes

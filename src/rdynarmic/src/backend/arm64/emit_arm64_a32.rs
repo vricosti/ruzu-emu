@@ -14,13 +14,13 @@ use crate::backend::arm64::label::Label;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::backend::arm64::stack_layout::{RSBEntry, StackLayout, RSB_INDEX_MASK};
 use crate::frontend::a32::types::{ExtReg, Reg};
-use crate::halt_reason::HaltReason;
+use crate::interface::halt_reason::HaltReason;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::InstRef;
-use crate::jit_config::OptimizationFlag;
 
 const WZR: u8 = 31;
 
@@ -960,7 +960,6 @@ fn emit_a32_terminal_inner(
 ) -> Result<(), String> {
     match terminal {
         Terminal::Invalid => Err("Invalid A32 terminal".to_string()),
-        Terminal::Interpret { .. } => Err("Interpret should never be emitted".to_string()),
         Terminal::ReturnToDispatch => {
             emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
         }
@@ -1242,111 +1241,58 @@ mod tests {
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::{ExtReg, Reg};
+    use crate::interface::a32::config::{
+        Exception as A32Exception, UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+    };
     use crate::ir::block::Block;
     use crate::ir::opcode::Opcode;
     use crate::ir::value::Value;
-    use crate::jit_config::{JitConfig, UserCallbacks};
-    use std::collections::HashMap;
 
     struct DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
-        fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for DummyCallbacks {
+        fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
             None
         }
-        fn memory_read_8(&self, _vaddr: u64) -> u8 {
+        fn memory_read_8(&self, _vaddr: u32) -> u8 {
             0
         }
-        fn memory_read_16(&self, _vaddr: u64) -> u16 {
+        fn memory_read_16(&self, _vaddr: u32) -> u16 {
             0
         }
-        fn memory_read_32(&self, _vaddr: u64) -> u32 {
+        fn memory_read_32(&self, _vaddr: u32) -> u32 {
             0
         }
-        fn memory_read_64(&self, _vaddr: u64) -> u64 {
+        fn memory_read_64(&self, _vaddr: u32) -> u64 {
             0
         }
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-        fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
-        fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
-        fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
-        fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-            0
-        }
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-            0
-        }
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-            0
-        }
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-            0
-        }
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-        fn exclusive_clear(&mut self) {}
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
+        fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
+        fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
+        fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
         fn get_ticks_remaining(&self) -> u64 {
             0
         }
     }
 
-    fn config_with(optimizations: OptimizationFlag, enable_cycle_counting: bool) -> JitConfig {
-        JitConfig {
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting,
-            code_cache_size: 0,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: Default::default(),
-        }
+    fn config_with(optimizations: OptimizationFlag, enable_cycle_counting: bool) -> A32UserConfig {
+        let mut config = A32UserConfig::new(Box::new(DummyCallbacks));
+        config.enable_cycle_counting = enable_cycle_counting;
+        config.code_cache_size = 0;
+        config.optimizations = optimizations;
+        config
     }
 
-    fn config() -> JitConfig {
+    fn config() -> A32UserConfig {
         config_with(OptimizationFlag::NO_OPTIMIZATIONS, false)
     }
 
-    fn config_with_memory_abort_check() -> JitConfig {
+    fn config_with_memory_abort_check() -> A32UserConfig {
         let mut config = config();
-        config.memory.check_halt_on_memory_access = true;
+        config.check_halt_on_memory_access = true;
         config
     }
 
@@ -1380,7 +1326,7 @@ mod tests {
     fn with_context_config(
         block: &mut Block,
         code: &mut BlockOfCode,
-        config: JitConfig,
+        config: A32UserConfig,
         f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         with_context_config_mut(block, code, config, |_| {}, f)
@@ -1389,7 +1335,7 @@ mod tests {
     fn with_context_config_mut(
         block: &mut Block,
         code: &mut BlockOfCode,
-        config: JitConfig,
+        config: A32UserConfig,
         mutate_conf: impl FnOnce(&mut EmitConfig),
         f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {

@@ -6,9 +6,6 @@
 /// same frontend-facing configuration instead of adding a second user config.
 #[derive(Clone, Debug)]
 pub struct MemoryEmitConfig {
-    /// Whether ISB instructions invoke the user callback. Upstream keeps this
-    /// disabled by default through `UserConfig::hook_isb`.
-    pub hook_isb: bool,
     /// Number of bits in the guest VA space reachable via the fastmem
     /// region. `64` means no masking. `< 64` means either silently mirror or
     /// abort out-of-range accesses to the fallback path.
@@ -37,6 +34,8 @@ pub struct MemoryEmitConfig {
     pub absolute_offset_page_table: bool,
     /// Number of low bits in page-table entries that are attribute flags.
     pub page_table_pointer_mask_bits: u32,
+    /// Log2 byte stride between page-table entries; upstream permits 3 or 4.
+    pub page_table_log2_stride: usize,
     /// Bitmask of access widths to detect misalignment for via the page-table
     /// path. `16 | 32 | 64 | 128` matches upstream zuyu.
     pub detect_misaligned_access_via_page_table: u32,
@@ -53,7 +52,6 @@ pub struct MemoryEmitConfig {
 impl Default for MemoryEmitConfig {
     fn default() -> Self {
         Self {
-            hook_isb: false,
             fastmem_address_space_bits: 64,
             silently_mirror_fastmem: true,
             fastmem_exclusive_access: false,
@@ -64,6 +62,7 @@ impl Default for MemoryEmitConfig {
             silently_mirror_page_table: true,
             absolute_offset_page_table: false,
             page_table_pointer_mask_bits: 0,
+            page_table_log2_stride: 3,
             detect_misaligned_access_via_page_table: 0,
             only_detect_misalignment_via_page_table_on_page_boundary: false,
             check_halt_on_memory_access: false,
@@ -79,7 +78,6 @@ mod tests {
     #[test]
     fn fastmem_failure_recompilation_is_enabled_by_default() {
         let config = MemoryEmitConfig::default();
-        assert!(!config.hook_isb);
         assert!(config.recompile_on_fastmem_failure);
         assert!(config.recompile_on_exclusive_fastmem_failure);
     }

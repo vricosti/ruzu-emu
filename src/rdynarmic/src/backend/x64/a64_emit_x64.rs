@@ -19,11 +19,11 @@ use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::frontend::a64::translate::{translate, MemoryReadCodeFn, TranslationOptions};
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::types::Type;
-use crate::jit_config::OptimizationFlag;
 
 /// Minimum space remaining in the code buffer before triggering a cache clear.
 const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
@@ -302,6 +302,11 @@ impl A64EmitX64 {
                 vector_multiply_widen: true,
             },
         );
+        opt::a64_callback_config(
+            &mut block,
+            self.emit_config.hook_data_cache_operations,
+            self.emit_config.dczid_el0,
+        );
         let skip_getset_at_pc: Vec<u64> = std::env::var("RUZU_SKIP_GETSET_AT_PC")
             .ok()
             .map(|s| {
@@ -345,9 +350,7 @@ impl A64EmitX64 {
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
         }
-        if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {
-            opt::a64_merge_interpret_blocks(&mut block);
-        }
+        if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {}
         block.rebuild_pseudo_op_links();
 
         // Build inst_info for register allocator.
@@ -1005,6 +1008,7 @@ mod tests {
     #[test]
     fn test_rsb_handler_generated() {
         let emit_config = crate::backend::x64::emit_context::EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: crate::backend::x64::emit_context::EmitCallbacks {
                 memory_read_8: Box::new(ArgCallback::new(0, 0)),
                 memory_read_16: Box::new(ArgCallback::new(0, 0)),
@@ -1017,7 +1021,6 @@ mod tests {
                 memory_write_64: Box::new(ArgCallback::new(0, 0)),
                 memory_write_128: Box::new(ArgCallback::new(0, 0)),
                 call_supervisor: Box::new(ArgCallback::new(0, 0)),
-                interpreter_fallback: Box::new(ArgCallback::new(0, 0)),
                 exception_raised: Box::new(ArgCallback::new(0, 0)),
                 data_cache_operation: Box::new(ArgCallback::new(0, 0)),
                 instruction_cache_operation: Box::new(ArgCallback::new(0, 0)),
@@ -1042,6 +1045,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
@@ -1075,6 +1082,7 @@ mod tests {
     #[test]
     fn test_fast_dispatch_table_allocated() {
         let emit_config = crate::backend::x64::emit_context::EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: crate::backend::x64::emit_context::EmitCallbacks {
                 memory_read_8: Box::new(ArgCallback::new(0, 0)),
                 memory_read_16: Box::new(ArgCallback::new(0, 0)),
@@ -1087,7 +1095,6 @@ mod tests {
                 memory_write_64: Box::new(ArgCallback::new(0, 0)),
                 memory_write_128: Box::new(ArgCallback::new(0, 0)),
                 call_supervisor: Box::new(ArgCallback::new(0, 0)),
-                interpreter_fallback: Box::new(ArgCallback::new(0, 0)),
                 exception_raised: Box::new(ArgCallback::new(0, 0)),
                 data_cache_operation: Box::new(ArgCallback::new(0, 0)),
                 instruction_cache_operation: Box::new(ArgCallback::new(0, 0)),
@@ -1112,6 +1119,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
@@ -1139,6 +1150,7 @@ mod tests {
     fn test_single_step_disables_rsb_and_fast_dispatch() {
         // When is_single_step is true, RSB and fast dispatch should be bypassed
         let emit_config = crate::backend::x64::emit_context::EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: crate::backend::x64::emit_context::EmitCallbacks {
                 memory_read_8: Box::new(ArgCallback::new(0, 0)),
                 memory_read_16: Box::new(ArgCallback::new(0, 0)),
@@ -1151,7 +1163,6 @@ mod tests {
                 memory_write_64: Box::new(ArgCallback::new(0, 0)),
                 memory_write_128: Box::new(ArgCallback::new(0, 0)),
                 call_supervisor: Box::new(ArgCallback::new(0, 0)),
-                interpreter_fallback: Box::new(ArgCallback::new(0, 0)),
                 exception_raised: Box::new(ArgCallback::new(0, 0)),
                 data_cache_operation: Box::new(ArgCallback::new(0, 0)),
                 instruction_cache_operation: Box::new(ArgCallback::new(0, 0)),
@@ -1176,6 +1187,10 @@ mod tests {
             memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
             global_monitor: None,
             cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: false,
         };
 
         // Create a single-stepping location descriptor

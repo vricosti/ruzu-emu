@@ -2,9 +2,9 @@ use crate::backend::x64::a64_emit_x64_memory::{
     emit_a64_check_memory_abort, emit_call_to_offset, should_fastmem, FastmemFallbacksTable,
 };
 use crate::backend::x64::emit_context::EmitContext;
-use crate::backend::x64::emit_spin_lock_x64::{emit_spin_lock_lock, emit_spin_lock_unlock};
 use crate::backend::x64::emit_x64_memory::{emit_fastmem_vaddr_a64, emit_read_memory_mov};
 use crate::backend::x64::reg_alloc::RegAlloc;
+use crate::common::spin_lock_x64::{emit_spin_lock_lock, emit_spin_lock_unlock};
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
 #[cfg(target_os = "windows")]
@@ -17,6 +17,10 @@ use rxbyak::{
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::DeferredEmitCtx;
 use crate::backend::x64::exception_handler::{supports_fastmem, FastmemPatchInfo};
+use crate::backend::x64::exclusive_monitor_friend::{
+    get_exclusive_monitor_address_pointer, get_exclusive_monitor_lock_pointer,
+    get_exclusive_monitor_processor_count, get_exclusive_monitor_value_pointer,
+};
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
 use crate::backend::x64::jit_state::A64JitState;
@@ -27,7 +31,7 @@ use crate::backend::x64::jit_state::A64JitState;
 //
 // Port of upstream Dynarmic `EmitExclusiveLock` / `EmitExclusiveUnlock`
 // (emit_x64_memory.h:341-359). The lock pointer is resolved at compile time
-// via `ExclusiveMonitor::get_lock_storage_ptr()` and burned into the emitted
+// via `GetExclusiveMonitorLockPointer` and burned into the emitted
 // code as an absolute `mov reg, imm64`.
 //
 // Both helpers do nothing when no global_monitor is configured — i.e. when
@@ -54,9 +58,14 @@ pub fn emit_exclusive_lock(
         return false;
     };
     // SAFETY: monitor_ptr was checked non-null when set in EmitConfig.
-    let lock_storage_ptr = unsafe { (*monitor_ptr).get_lock_storage_ptr() };
+    let lock_storage_ptr = unsafe { get_exclusive_monitor_lock_pointer(monitor_ptr) };
     asm.mov(ptr_reg, lock_storage_ptr as u64 as i64).unwrap();
-    emit_spin_lock_lock(asm, ptr_reg, tmp32_reg);
+    emit_spin_lock_lock(
+        asm,
+        ptr_reg,
+        tmp32_reg,
+        ctx.has_host_feature(HostFeature::WAITPKG),
+    );
     true
 }
 
@@ -73,7 +82,7 @@ pub fn emit_exclusive_unlock(
     let Some(monitor_ptr) = ctx.config.global_monitor else {
         return false;
     };
-    let lock_storage_ptr = unsafe { (*monitor_ptr).get_lock_storage_ptr() };
+    let lock_storage_ptr = unsafe { get_exclusive_monitor_lock_pointer(monitor_ptr) };
     asm.mov(ptr_reg, lock_storage_ptr as u64 as i64).unwrap();
     emit_spin_lock_unlock(asm, ptr_reg, tmp32_reg);
     true
@@ -83,7 +92,7 @@ pub fn emit_exclusive_unlock(
 /// pointer for use as an `imm64` load target.
 pub fn exclusive_address_ptr(ctx: &EmitContext, index: usize) -> Option<*mut u64> {
     let monitor_ptr = ctx.config.global_monitor?;
-    Some(unsafe { (*monitor_ptr).get_address_ptr(index) })
+    Some(unsafe { get_exclusive_monitor_address_pointer(monitor_ptr, index) })
 }
 
 /// Resolve `&monitor.exclusive_values[index]` to an absolute host pointer
@@ -91,9 +100,9 @@ pub fn exclusive_address_ptr(ctx: &EmitContext, index: usize) -> Option<*mut u64
 pub fn exclusive_value_ptr(
     ctx: &EmitContext,
     index: usize,
-) -> Option<*mut crate::exclusive_monitor::Vector> {
+) -> Option<*mut crate::interface::exclusive_monitor::Vector> {
     let monitor_ptr = ctx.config.global_monitor?;
-    Some(unsafe { (*monitor_ptr).get_value_ptr(index) })
+    Some(unsafe { get_exclusive_monitor_value_pointer(monitor_ptr, index) })
 }
 
 /// Number of guest processors the monitor was configured for. Used by
@@ -103,7 +112,7 @@ pub fn exclusive_monitor_processor_count(ctx: &EmitContext) -> usize {
     let Some(monitor_ptr) = ctx.config.global_monitor else {
         return 0;
     };
-    unsafe { (*monitor_ptr).processor_count() }
+    unsafe { get_exclusive_monitor_processor_count(monitor_ptr) }
 }
 
 /// Emit the upstream `EmitExclusiveTestAndClear` sequence: for every other

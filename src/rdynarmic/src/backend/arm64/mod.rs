@@ -23,6 +23,7 @@ pub mod emit_arm64_cryptography;
 pub mod emit_arm64_data_processing;
 pub mod emit_arm64_floating_point;
 pub mod emit_arm64_memory;
+pub mod emit_arm64_packed;
 pub mod emit_arm64_saturation;
 pub mod emit_arm64_vector;
 pub mod emit_arm64_vector_floating_point;

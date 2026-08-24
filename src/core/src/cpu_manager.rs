@@ -65,7 +65,6 @@ pub struct CpuManager {
 
 /// Maximum number of cycle runs before preemption in single-core mode.
 const _MAX_CYCLE_RUNS: usize = 5;
-static TID17_HALT_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
 static THREAD_PROBE_HALT_COUNT: AtomicU32 = AtomicU32::new(0);
 static PC_PROBE_HALT_COUNT: AtomicU32 = AtomicU32::new(0);
 static RUNNING_GUEST_THREADS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
@@ -169,6 +168,11 @@ fn log_thread_probe_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_LOG_THREAD_PROBE").is_some())
 }
 
+#[inline]
+fn needs_halt_context(interrupt: bool, spin_trace: bool) -> bool {
+    interrupt || spin_trace
+}
+
 /// Returns true when `RUZU_TRACE_CORE_DISPATCH` is set AND the given core
 /// index is in the (optional) comma-separated allow list. `RUZU_TRACE_CORE_DISPATCH=1`
 /// enables all cores. `RUZU_TRACE_CORE_DISPATCH=1,2` enables cores 1 and 2 only.
@@ -204,7 +208,7 @@ fn should_trace_core_dispatch(core_index: usize) -> bool {
 mod diagnostic_config_tests {
     use std::sync::Arc;
 
-    use super::{parse_core_dispatch_filter, CpuManager};
+    use super::{needs_halt_context, parse_core_dispatch_filter, CpuManager};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     #[test]
@@ -220,6 +224,13 @@ mod diagnostic_config_tests {
         for value in ["", "1", "all", "ALL"] {
             assert_eq!(parse_core_dispatch_filter(value), (true, Vec::new()));
         }
+    }
+
+    #[test]
+    fn ordinary_budget_expiration_does_not_capture_jit_context() {
+        assert!(!needs_halt_context(false, false));
+        assert!(needs_halt_context(true, false));
+        assert!(needs_halt_context(false, true));
     }
 
     #[test]
@@ -1190,41 +1201,6 @@ impl CpuManager {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
                     halt_reason,
                 ) => {
-                    // Refresh the SIGUSR1-dumper PC+LR+SP snapshot. Halts
-                    // fire on preemption interrupts (~10ms), so even a
-                    // guest-code spin loop with no SVCs gets its PC/LR/SP
-                    // surfaced via `kernel::{GUEST_PC,GUEST_LR,GUEST_SP}
-                    // [core_index]` after each preempt.
-                    let _spin_pc = {
-                        let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
-                        jit_ref.get_context(&mut tc_pc);
-                        crate::hle::kernel::kernel::record_guest_full(
-                            core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
-                        );
-                        tc_pc
-                    };
-                    // RUZU_SPIN_TRACE=1 — log live PC/LR/key registers on
-                    // every halt for the configured tid (default 73).
-                    // Bypasses the preemption-thread SIGUSR1 dump path which
-                    // gets starved when the JIT thread saturates a host core.
-                    if let Some(target_tid) = spin_trace_target_tid() {
-                        let cur_tid = thread_arc.lock().unwrap().get_thread_id() as u64;
-                        if cur_tid == target_tid {
-                            static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
-                            let n = SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
-                            // Throttle: log first 200, then every 1000th.
-                            if n < 200 || n % 1000 == 0 {
-                                log::warn!(
-                                    "[SPIN] n={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x21=0x{:X} x22=0x{:X} x7=0x{:X} x18=0x{:X} x20=0x{:X} halt={:?}",
-                                    n, cur_tid,
-                                    _spin_pc.pc, _spin_pc.lr, _spin_pc.sp,
-                                    _spin_pc.r[21], _spin_pc.r[22], _spin_pc.r[7],
-                                    _spin_pc.r[18], _spin_pc.r[20],
-                                    halt_reason
-                                );
-                            }
-                        }
-                    }
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
                     let step_completed = physical_core.step_completed(halt_reason, thread_arc);
                     let interrupt = !step_completed && halt_reason.contains(HaltReason::BREAK_LOOP);
@@ -1234,23 +1210,42 @@ impl CpuManager {
                         !step_completed && halt_reason.contains(HaltReason::PREFETCH_ABORT);
                     let breakpoint =
                         !step_completed && halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
-                    if current_thread_id == 17
-                        && TID17_HALT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) < 500
-                    {
-                        let mut tc = crate::arm::arm_interface::ThreadContext::default();
-                        jit_ref.get_context(&mut tc);
-                        log::trace!(
-                            "multi_core_run_guest_thread: tid=17 core={} halted={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r4=0x{:X} r7=0x{:X} r0=0x{:X} r1=0x{:X}",
-                            core_index,
-                            halt_reason,
-                            tc.pc,
-                            tc.lr,
-                            tc.sp,
-                            tc.r[4],
-                            tc.r[7],
-                            tc.r[0],
-                            tc.r[1],
-                        );
+
+                    // Eden does not copy the full JIT context when a run simply exhausts its
+                    // cycle budget. Keep context capture off that hot path and perform it only
+                    // for the explicit spin trace or the Rust null-PC BreakLoop workaround.
+                    let spin_trace_target = spin_trace_target_tid();
+                    let needs_spin_trace =
+                        spin_trace_target.is_some_and(|target_tid| current_thread_id == target_tid);
+                    let halt_context = if needs_halt_context(interrupt, needs_spin_trace) {
+                        let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc_pc);
+                        Some(tc_pc)
+                    } else {
+                        None
+                    };
+
+                    // RUZU_SPIN_TRACE=1 — log live PC/LR/key registers on
+                    // every halt for the configured tid (default 73).
+                    // Bypasses the preemption-thread SIGUSR1 dump path which
+                    // gets starved when the JIT thread saturates a host core.
+                    if needs_spin_trace {
+                        let spin_pc = halt_context
+                            .as_ref()
+                            .expect("spin tracing requested a halt context");
+                        static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+                        let n = SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
+                        // Throttle: log first 200, then every 1000th.
+                        if n < 200 || n % 1000 == 0 {
+                            log::warn!(
+                                "[SPIN] n={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x21=0x{:X} x22=0x{:X} x7=0x{:X} x18=0x{:X} x20=0x{:X} halt={:?}",
+                                n, current_thread_id,
+                                spin_pc.pc, spin_pc.lr, spin_pc.sp,
+                                spin_pc.r[21], spin_pc.r[22], spin_pc.r[7],
+                                spin_pc.r[18], spin_pc.r[20],
+                                halt_reason
+                            );
+                        }
                     }
                     if log_thread_probe_enabled()
                         && THREAD_PROBE_HALT_COUNT.fetch_add(1, Ordering::Relaxed) < 400
@@ -1271,7 +1266,8 @@ impl CpuManager {
                             breakpoint,
                         );
                     }
-                    let zero_pc_break_loop = interrupt && _spin_pc.pc == 0;
+                    let zero_pc_break_loop =
+                        interrupt && halt_context.as_ref().is_some_and(|context| context.pc == 0);
 
                     if !system_ref.is_null()
                         && physical_core.handle_debug_halt(
@@ -1296,8 +1292,9 @@ impl CpuManager {
                     // Without this, the thread re-executes the faulting PC forever.
                     if zero_pc_break_loop {
                         {
-                            let mut tc = crate::arm::arm_interface::ThreadContext::default();
-                            jit_ref.get_context(&mut tc);
+                            let tc = halt_context
+                                .as_ref()
+                                .expect("null-PC BreakLoop captured its JIT context");
                             let reason = if zero_pc_break_loop {
                                 "BreakLoopNullPc"
                             } else if data_abort {

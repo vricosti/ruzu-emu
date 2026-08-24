@@ -1,4 +1,4 @@
-use crate::backend::arm64::abi::{XFASTMEM, XSTATE};
+use crate::backend::arm64::abi::XSTATE;
 use crate::backend::arm64::abi::{XSCRATCH0, XSCRATCH1, XSCRATCH2, XTICKS};
 use crate::backend::arm64::emit_arm64_a32::{
     emit_a32_bx_write_pc, emit_a32_call_supervisor, emit_a32_check_memory_abort, emit_a32_cond,
@@ -25,7 +25,8 @@ use crate::backend::arm64::emit_arm64_a32_memory::{
 };
 use crate::backend::arm64::emit_arm64_a64::{
     emit_a64_call_supervisor, emit_a64_check_memory_abort, emit_a64_cond,
-    emit_a64_condition_failed_terminal, emit_a64_exception_raised, emit_a64_terminal,
+    emit_a64_condition_failed_terminal, emit_a64_data_cache_operation_raised,
+    emit_a64_exception_raised, emit_a64_instruction_cache_operation_raised, emit_a64_terminal,
 };
 use crate::backend::arm64::emit_arm64_a64_memory::{
     emit_a64_clear_exclusive, emit_a64_exclusive_read_memory, emit_a64_exclusive_write_memory,
@@ -83,6 +84,7 @@ use crate::backend::arm64::emit_arm64_floating_point::{
     emit_fp_single_to_fixed_u64, emit_fp_single_to_half, emit_fp_sqrt32, emit_fp_sqrt64,
     emit_fp_sub32, emit_fp_sub64,
 };
+use crate::backend::arm64::emit_arm64_packed::emit_packed_instruction;
 use crate::backend::arm64::emit_arm64_saturation::{
     emit_signed_saturated_add_with_flag32, emit_signed_saturated_sub_with_flag32,
     emit_signed_saturation, emit_unsigned_saturation,
@@ -104,12 +106,14 @@ use crate::backend::arm64::{
     inst,
 };
 use crate::backend::common::emit_context::MemoryEmitConfig;
+use crate::interface::a32::config::UserConfig as A32UserConfig;
+use crate::interface::a64::config::UserConfig as A64UserConfig;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::cond::Cond;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
-use crate::jit_config::{JitConfig, OptimizationFlag};
 
 pub type CodePtr = *const u8;
 
@@ -148,7 +152,6 @@ pub enum LinkTarget {
     ExclusiveWriteMemory64,
     ExclusiveWriteMemory128,
     CallSVC,
-    InterpreterFallback,
     ExceptionRaised,
     InstructionSynchronizationBarrierRaised,
     InstructionCacheOperationRaised,
@@ -209,8 +212,9 @@ pub type EmitCheckMemoryAbort = for<'a> fn(
 /// Upstream owner: `backend/arm64/emit_arm64.h::EmitConfig`.
 /// This is intentionally backend-local; it should grow with the ARM64 emitter
 /// instead of reusing the x64 `EmitConfig` shape.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EmitConfig {
+    pub coprocessors: crate::interface::a32::config::Coprocessors,
     pub is_a32: bool,
     pub optimizations: OptimizationFlag,
     pub hook_isb: bool,
@@ -228,6 +232,7 @@ pub struct EmitConfig {
     pub page_table_pointer: u64,
     pub page_table_address_space_bits: usize,
     pub page_table_pointer_mask_bits: u32,
+    pub page_table_log2_stride: usize,
     pub silently_mirror_page_table: bool,
     pub absolute_offset_page_table: bool,
     pub detect_misaligned_access_via_page_table: u32,
@@ -243,8 +248,6 @@ pub struct EmitConfig {
     pub state_nzcv_offset: usize,
     pub state_fpsr_offset: usize,
     pub state_exclusive_state_offset: usize,
-    pub a32_cp15_uprw: *mut u32,
-    pub a32_cp15_uro: *mut u32,
 }
 
 impl EmitConfig {
@@ -252,20 +255,32 @@ impl EmitConfig {
         (self.optimizations & flag) != OptimizationFlag::NO_OPTIMIZATIONS
     }
 
-    pub fn from_a32_config(config: &JitConfig) -> Self {
-        let mut memory = config.memory.clone();
-        memory.processor_id = config.processor_id;
-        memory.fastmem_address_space_bits = 32;
-        memory.silently_mirror_fastmem = true;
-        memory.page_table_address_space_bits = 32;
-        memory.silently_mirror_page_table = true;
-        memory.fastmem_exclusive_access =
-            config.fastmem_pointer.is_some() && config.global_monitor.is_some();
+    pub fn from_a32_config(config: &A32UserConfig) -> Self {
+        let memory = MemoryEmitConfig {
+            fastmem_address_space_bits: 32,
+            silently_mirror_fastmem: true,
+            fastmem_exclusive_access: config.fastmem_exclusive_access,
+            recompile_on_exclusive_fastmem_failure: config.recompile_on_exclusive_fastmem_failure,
+            recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+            page_table_present: config.page_table.is_some(),
+            page_table_address_space_bits: 32,
+            silently_mirror_page_table: true,
+            absolute_offset_page_table: config.absolute_offset_page_table,
+            page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+            page_table_log2_stride: config.page_table_log2_stride,
+            detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
+                as u32,
+            only_detect_misalignment_via_page_table_on_page_boundary: config
+                .only_detect_misalignment_via_page_table_on_page_boundary,
+            check_halt_on_memory_access: config.check_halt_on_memory_access,
+            processor_id: config.processor_id as usize,
+        };
 
         Self {
+            coprocessors: config.coprocessors.clone(),
             is_a32: true,
-            optimizations: effective_optimizations(config),
-            hook_isb: config.memory.hook_isb,
+            optimizations: config.effective_optimizations(),
+            hook_isb: config.hook_isb,
             cntfreq_el0: 0,
             ctr_el0: 0,
             dczid_el0: 0,
@@ -276,9 +291,10 @@ impl EmitConfig {
             recompile_on_fastmem_failure: memory.recompile_on_fastmem_failure,
             fastmem_address_space_bits: 32,
             silently_mirror_fastmem: true,
-            page_table_pointer: config.page_table_pointer.map_or(0, |p| p as u64),
+            page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: 32,
             page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
+            page_table_log2_stride: config.page_table_log2_stride,
             silently_mirror_page_table: true,
             absolute_offset_page_table: memory.absolute_offset_page_table,
             detect_misaligned_access_via_page_table: memory.detect_misaligned_access_via_page_table,
@@ -287,7 +303,7 @@ impl EmitConfig {
             memory,
             wall_clock_cntpct: config.wall_clock_cntpct,
             enable_cycle_counting: config.enable_cycle_counting,
-            always_little_endian: true,
+            always_little_endian: config.always_little_endian,
             descriptor_to_fpcr: descriptor_to_a32_fpcr,
             emit_cond: emit_a32_cond,
             emit_condition_failed_terminal: emit_a32_condition_failed_terminal,
@@ -296,25 +312,41 @@ impl EmitConfig {
             state_nzcv_offset: core::mem::offset_of!(A32JitState, cpsr_nzcv),
             state_fpsr_offset: core::mem::offset_of!(A32JitState, fpsr),
             state_exclusive_state_offset: core::mem::offset_of!(A32JitState, exclusive_state),
-            a32_cp15_uprw: core::ptr::null_mut(),
-            a32_cp15_uro: core::ptr::null_mut(),
         }
     }
 
-    pub fn from_a64_config(config: &JitConfig) -> Self {
-        let mut memory = config.memory.clone();
-        memory.processor_id = config.processor_id;
+    pub fn from_a64_config(config: &A64UserConfig) -> Self {
+        let memory = MemoryEmitConfig {
+            fastmem_address_space_bits: config.fastmem_address_space_bits as usize,
+            silently_mirror_fastmem: config.silently_mirror_fastmem,
+            fastmem_exclusive_access: config.fastmem_exclusive_access,
+            recompile_on_exclusive_fastmem_failure: config.recompile_on_exclusive_fastmem_failure,
+            recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+            page_table_present: config.page_table.is_some(),
+            page_table_address_space_bits: config.page_table_address_space_bits as usize,
+            silently_mirror_page_table: config.silently_mirror_page_table,
+            absolute_offset_page_table: config.absolute_offset_page_table,
+            page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+            page_table_log2_stride: config.page_table_log2_stride,
+            detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
+                as u32,
+            only_detect_misalignment_via_page_table_on_page_boundary: config
+                .only_detect_misalignment_via_page_table_on_page_boundary,
+            check_halt_on_memory_access: config.check_halt_on_memory_access,
+            processor_id: config.processor_id as usize,
+        };
 
         Self {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             is_a32: false,
-            optimizations: effective_optimizations(config),
-            hook_isb: config.memory.hook_isb,
+            optimizations: config.effective_optimizations(),
+            hook_isb: config.hook_isb,
             // Upstream A64::UserConfig::cntfrq_el0 — forwarded from the
             // emulator (yuzu sets the Switch's 19'200'000 Hz; the dynarmic
             // default of 600'000'000 only applies when left unconfigured).
             cntfreq_el0: config.cntfrq_el0 as u64,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
+            ctr_el0: config.ctr_el0,
+            dczid_el0: config.dczid_el0,
             tpidrro_el0: config.tpidrro_el0.unwrap_or(core::ptr::null()),
             tpidr_el0: config.tpidr_el0.unwrap_or(core::ptr::null_mut()),
             check_halt_on_memory_access: memory.check_halt_on_memory_access,
@@ -322,9 +354,10 @@ impl EmitConfig {
             recompile_on_fastmem_failure: memory.recompile_on_fastmem_failure,
             fastmem_address_space_bits: memory.fastmem_address_space_bits,
             silently_mirror_fastmem: memory.silently_mirror_fastmem,
-            page_table_pointer: config.page_table_pointer.map_or(0, |p| p as u64),
+            page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: memory.page_table_address_space_bits,
             page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
+            page_table_log2_stride: config.page_table_log2_stride,
             silently_mirror_page_table: memory.silently_mirror_page_table,
             absolute_offset_page_table: memory.absolute_offset_page_table,
             detect_misaligned_access_via_page_table: memory.detect_misaligned_access_via_page_table,
@@ -342,17 +375,7 @@ impl EmitConfig {
             state_nzcv_offset: core::mem::offset_of!(A64JitState, cpsr_nzcv),
             state_fpsr_offset: core::mem::offset_of!(A64JitState, fpsr),
             state_exclusive_state_offset: core::mem::offset_of!(A64JitState, exclusive_state),
-            a32_cp15_uprw: core::ptr::null_mut(),
-            a32_cp15_uro: core::ptr::null_mut(),
         }
-    }
-}
-
-fn effective_optimizations(config: &JitConfig) -> OptimizationFlag {
-    if config.unsafe_optimizations {
-        config.optimizations
-    } else {
-        config.optimizations & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
     }
 }
 
@@ -545,6 +568,16 @@ fn emit_ir_instruction(
             }
             Ok(())
         }
+        Opcode::GetUpperFromOp | Opcode::GetLowerFromOp => {
+            let _args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+            if !ctx.reg_alloc.was_value_defined(inst_ref) {
+                return Err(format!(
+                    "ARM64 {:?} reached emitter before producer defined it",
+                    ctx.block.get(inst_ref).opcode
+                ));
+            }
+            Ok(())
+        }
         Opcode::GetNZCVFromOp | Opcode::GetNZFromOp => emit_get_nzcv_from_op(code, ctx, inst_ref),
         Opcode::GetCFlagFromNZCV => emit_get_c_flag_from_nzcv(code, ctx, inst_ref),
         Opcode::IsZero32 => emit_is_zero32(code, ctx, inst_ref),
@@ -575,7 +608,6 @@ fn emit_ir_instruction(
             code.write_u32(inst::blr(XSCRATCH0))?;
             Ok(())
         }
-        Opcode::A32PcExecHook => emit_a32_pc_exec_hook(code, ctx, inst_ref),
         Opcode::PushRSB => emit_push_rsb(code, ctx, inst_ref),
         Opcode::Pack2x32To1x64 => emit_pack_2x32_to_1x64(code, ctx, inst_ref),
         Opcode::Pack2x64To1x128 => emit_pack_2x64_to_1x128(code, ctx, inst_ref),
@@ -705,8 +737,8 @@ fn emit_ir_instruction(
         Opcode::LogicalShiftRight64 => emit_logical_shift_right64(code, ctx, inst_ref),
         Opcode::ArithmeticShiftRight32 => emit_arithmetic_shift_right32(code, ctx, inst_ref),
         Opcode::ArithmeticShiftRight64 => emit_arithmetic_shift_right64(code, ctx, inst_ref),
-        Opcode::RotateRight32 => emit_rotate_right32(code, ctx, inst_ref),
-        Opcode::RotateRight64 => emit_rotate_right64(code, ctx, inst_ref),
+        Opcode::BitRotateRight32 => emit_rotate_right32(code, ctx, inst_ref),
+        Opcode::BitRotateRight64 => emit_rotate_right64(code, ctx, inst_ref),
         Opcode::LogicalShiftLeftMasked32 => emit_logical_shift_left_masked32(code, ctx, inst_ref),
         Opcode::LogicalShiftLeftMasked64 => emit_logical_shift_left_masked64(code, ctx, inst_ref),
         Opcode::LogicalShiftRightMasked32 => emit_logical_shift_right_masked32(code, ctx, inst_ref),
@@ -754,6 +786,40 @@ fn emit_ir_instruction(
         Opcode::SHA256Hash => emit_sha256_hash(code, ctx, inst_ref),
         Opcode::SHA256MessageSchedule0 => emit_sha256_message_schedule_0(code, ctx, inst_ref),
         Opcode::SHA256MessageSchedule1 => emit_sha256_message_schedule_1(code, ctx, inst_ref),
+        Opcode::PackedAddU8
+        | Opcode::PackedAddS8
+        | Opcode::PackedSubU8
+        | Opcode::PackedSubS8
+        | Opcode::PackedAddU16
+        | Opcode::PackedAddS16
+        | Opcode::PackedSubU16
+        | Opcode::PackedSubS16
+        | Opcode::PackedAddSubU16
+        | Opcode::PackedAddSubS16
+        | Opcode::PackedSubAddU16
+        | Opcode::PackedSubAddS16
+        | Opcode::PackedHalvingAddU8
+        | Opcode::PackedHalvingAddS8
+        | Opcode::PackedHalvingSubU8
+        | Opcode::PackedHalvingSubS8
+        | Opcode::PackedHalvingAddU16
+        | Opcode::PackedHalvingAddS16
+        | Opcode::PackedHalvingSubU16
+        | Opcode::PackedHalvingSubS16
+        | Opcode::PackedHalvingAddSubU16
+        | Opcode::PackedHalvingAddSubS16
+        | Opcode::PackedHalvingSubAddU16
+        | Opcode::PackedHalvingSubAddS16
+        | Opcode::PackedSaturatedAddU8
+        | Opcode::PackedSaturatedAddS8
+        | Opcode::PackedSaturatedSubU8
+        | Opcode::PackedSaturatedSubS8
+        | Opcode::PackedSaturatedAddU16
+        | Opcode::PackedSaturatedAddS16
+        | Opcode::PackedSaturatedSubU16
+        | Opcode::PackedSaturatedSubS16
+        | Opcode::PackedAbsDiffSumU8
+        | Opcode::PackedSelect => emit_packed_instruction(code, ctx, inst_ref),
         Opcode::VectorSignedSaturatedAdd8
         | Opcode::VectorSignedSaturatedAdd16
         | Opcode::VectorSignedSaturatedAdd32
@@ -845,6 +911,13 @@ fn emit_ir_instruction(
         | Opcode::VectorBroadcast16
         | Opcode::VectorBroadcast32
         | Opcode::VectorBroadcast64
+        | Opcode::VectorBroadcastElementLower8
+        | Opcode::VectorBroadcastElementLower16
+        | Opcode::VectorBroadcastElementLower32
+        | Opcode::VectorBroadcastElement8
+        | Opcode::VectorBroadcastElement16
+        | Opcode::VectorBroadcastElement32
+        | Opcode::VectorBroadcastElement64
         | Opcode::VectorAbs8
         | Opcode::VectorAbs16
         | Opcode::VectorAbs32
@@ -861,6 +934,10 @@ fn emit_ir_instruction(
         | Opcode::VectorReverseElementsInLongGroups8
         | Opcode::VectorReverseElementsInLongGroups16
         | Opcode::VectorReverseElementsInLongGroups32
+        | Opcode::VectorReduceAdd8
+        | Opcode::VectorReduceAdd16
+        | Opcode::VectorReduceAdd32
+        | Opcode::VectorReduceAdd64
         | Opcode::VectorZeroExtend8
         | Opcode::VectorZeroExtend16
         | Opcode::VectorZeroExtend32
@@ -897,50 +974,34 @@ fn emit_ir_instruction(
         | Opcode::VectorEqual16
         | Opcode::VectorEqual32
         | Opcode::VectorEqual64
-        | Opcode::VectorGreaterSigned8
-        | Opcode::VectorGreaterSigned16
-        | Opcode::VectorGreaterSigned32
-        | Opcode::VectorGreaterSigned64
-        | Opcode::VectorGreaterEqualSigned8
-        | Opcode::VectorGreaterEqualSigned16
-        | Opcode::VectorGreaterEqualSigned32
-        | Opcode::VectorGreaterEqualSigned64
-        | Opcode::VectorGreaterEqualUnsigned8
-        | Opcode::VectorGreaterEqualUnsigned16
-        | Opcode::VectorGreaterEqualUnsigned32
-        | Opcode::VectorGreaterEqualUnsigned64
-        | Opcode::VectorLessSigned8
-        | Opcode::VectorLessSigned16
-        | Opcode::VectorLessSigned32
-        | Opcode::VectorLessSigned64
-        | Opcode::VectorLessEqualSigned8
-        | Opcode::VectorLessEqualSigned16
-        | Opcode::VectorLessEqualSigned32
-        | Opcode::VectorLessEqualSigned64
-        | Opcode::VectorHalvingAddSigned8
-        | Opcode::VectorHalvingAddSigned16
-        | Opcode::VectorHalvingAddSigned32
-        | Opcode::VectorHalvingAddUnsigned8
-        | Opcode::VectorHalvingAddUnsigned16
-        | Opcode::VectorHalvingAddUnsigned32
-        | Opcode::VectorHalvingSubSigned8
-        | Opcode::VectorHalvingSubSigned16
-        | Opcode::VectorHalvingSubSigned32
-        | Opcode::VectorHalvingSubUnsigned8
-        | Opcode::VectorHalvingSubUnsigned16
-        | Opcode::VectorHalvingSubUnsigned32
-        | Opcode::VectorMaxSigned8
-        | Opcode::VectorMaxSigned16
-        | Opcode::VectorMaxSigned32
-        | Opcode::VectorMaxUnsigned8
-        | Opcode::VectorMaxUnsigned16
-        | Opcode::VectorMaxUnsigned32
-        | Opcode::VectorMinSigned8
-        | Opcode::VectorMinSigned16
-        | Opcode::VectorMinSigned32
-        | Opcode::VectorMinUnsigned8
-        | Opcode::VectorMinUnsigned16
-        | Opcode::VectorMinUnsigned32
+        | Opcode::VectorGreaterS8
+        | Opcode::VectorGreaterS16
+        | Opcode::VectorGreaterS32
+        | Opcode::VectorGreaterS64
+        | Opcode::VectorHalvingAddS8
+        | Opcode::VectorHalvingAddS16
+        | Opcode::VectorHalvingAddS32
+        | Opcode::VectorHalvingAddU8
+        | Opcode::VectorHalvingAddU16
+        | Opcode::VectorHalvingAddU32
+        | Opcode::VectorHalvingSubS8
+        | Opcode::VectorHalvingSubS16
+        | Opcode::VectorHalvingSubS32
+        | Opcode::VectorHalvingSubU8
+        | Opcode::VectorHalvingSubU16
+        | Opcode::VectorHalvingSubU32
+        | Opcode::VectorMaxS8
+        | Opcode::VectorMaxS16
+        | Opcode::VectorMaxS32
+        | Opcode::VectorMaxU8
+        | Opcode::VectorMaxU16
+        | Opcode::VectorMaxU32
+        | Opcode::VectorMinS8
+        | Opcode::VectorMinS16
+        | Opcode::VectorMinS32
+        | Opcode::VectorMinU8
+        | Opcode::VectorMinU16
+        | Opcode::VectorMinU32
         | Opcode::VectorPairedAddLower8
         | Opcode::VectorPairedAddLower16
         | Opcode::VectorPairedAddLower32
@@ -954,30 +1015,30 @@ fn emit_ir_instruction(
         | Opcode::VectorPairedAddUnsignedWiden8
         | Opcode::VectorPairedAddUnsignedWiden16
         | Opcode::VectorPairedAddUnsignedWiden32
-        | Opcode::VectorPairedMaxSigned8
-        | Opcode::VectorPairedMaxSigned16
-        | Opcode::VectorPairedMaxSigned32
-        | Opcode::VectorPairedMaxUnsigned8
-        | Opcode::VectorPairedMaxUnsigned16
-        | Opcode::VectorPairedMaxUnsigned32
-        | Opcode::VectorPairedMaxSignedLower8
-        | Opcode::VectorPairedMaxSignedLower16
-        | Opcode::VectorPairedMaxSignedLower32
-        | Opcode::VectorPairedMaxUnsignedLower8
-        | Opcode::VectorPairedMaxUnsignedLower16
-        | Opcode::VectorPairedMaxUnsignedLower32
-        | Opcode::VectorPairedMinSigned8
-        | Opcode::VectorPairedMinSigned16
-        | Opcode::VectorPairedMinSigned32
-        | Opcode::VectorPairedMinUnsigned8
-        | Opcode::VectorPairedMinUnsigned16
-        | Opcode::VectorPairedMinUnsigned32
-        | Opcode::VectorPairedMinSignedLower8
-        | Opcode::VectorPairedMinSignedLower16
-        | Opcode::VectorPairedMinSignedLower32
-        | Opcode::VectorPairedMinUnsignedLower8
-        | Opcode::VectorPairedMinUnsignedLower16
-        | Opcode::VectorPairedMinUnsignedLower32
+        | Opcode::VectorPairedMaxS8
+        | Opcode::VectorPairedMaxS16
+        | Opcode::VectorPairedMaxS32
+        | Opcode::VectorPairedMaxU8
+        | Opcode::VectorPairedMaxU16
+        | Opcode::VectorPairedMaxU32
+        | Opcode::VectorPairedMaxLowerS8
+        | Opcode::VectorPairedMaxLowerS16
+        | Opcode::VectorPairedMaxLowerS32
+        | Opcode::VectorPairedMaxLowerU8
+        | Opcode::VectorPairedMaxLowerU16
+        | Opcode::VectorPairedMaxLowerU32
+        | Opcode::VectorPairedMinS8
+        | Opcode::VectorPairedMinS16
+        | Opcode::VectorPairedMinS32
+        | Opcode::VectorPairedMinU8
+        | Opcode::VectorPairedMinU16
+        | Opcode::VectorPairedMinU32
+        | Opcode::VectorPairedMinLowerS8
+        | Opcode::VectorPairedMinLowerS16
+        | Opcode::VectorPairedMinLowerS32
+        | Opcode::VectorPairedMinLowerU8
+        | Opcode::VectorPairedMinLowerU16
+        | Opcode::VectorPairedMinLowerU32
         | Opcode::VectorPolynomialMultiply8
         | Opcode::VectorPolynomialMultiplyLong8
         | Opcode::VectorPolynomialMultiplyLong64
@@ -989,26 +1050,28 @@ fn emit_ir_instruction(
         | Opcode::VectorLogicalVShift16
         | Opcode::VectorLogicalVShift32
         | Opcode::VectorLogicalVShift64
-        | Opcode::VectorRoundingShiftLeftSigned8
-        | Opcode::VectorRoundingShiftLeftSigned16
-        | Opcode::VectorRoundingShiftLeftSigned32
-        | Opcode::VectorRoundingShiftLeftSigned64
-        | Opcode::VectorRoundingShiftLeftUnsigned8
-        | Opcode::VectorRoundingShiftLeftUnsigned16
-        | Opcode::VectorRoundingShiftLeftUnsigned32
-        | Opcode::VectorRoundingShiftLeftUnsigned64
+        | Opcode::VectorRoundingShiftLeftS8
+        | Opcode::VectorRoundingShiftLeftS16
+        | Opcode::VectorRoundingShiftLeftS32
+        | Opcode::VectorRoundingShiftLeftS64
+        | Opcode::VectorRoundingShiftLeftU8
+        | Opcode::VectorRoundingShiftLeftU16
+        | Opcode::VectorRoundingShiftLeftU32
+        | Opcode::VectorRoundingShiftLeftU64
         | Opcode::VectorSignedAbsoluteDifference8
         | Opcode::VectorSignedAbsoluteDifference16
         | Opcode::VectorSignedAbsoluteDifference32
+        | Opcode::VectorSignedMultiply16
+        | Opcode::VectorSignedMultiply32
         | Opcode::VectorUnsignedAbsoluteDifference8
         | Opcode::VectorUnsignedAbsoluteDifference16
         | Opcode::VectorUnsignedAbsoluteDifference32
-        | Opcode::VectorRoundingHalvingAddSigned8
-        | Opcode::VectorRoundingHalvingAddSigned16
-        | Opcode::VectorRoundingHalvingAddSigned32
-        | Opcode::VectorRoundingHalvingAddUnsigned8
-        | Opcode::VectorRoundingHalvingAddUnsigned16
-        | Opcode::VectorRoundingHalvingAddUnsigned32
+        | Opcode::VectorRoundingHalvingAddS8
+        | Opcode::VectorRoundingHalvingAddS16
+        | Opcode::VectorRoundingHalvingAddS32
+        | Opcode::VectorRoundingHalvingAddU8
+        | Opcode::VectorRoundingHalvingAddU16
+        | Opcode::VectorRoundingHalvingAddU32
         | Opcode::VectorSignedSaturatedAbs8
         | Opcode::VectorSignedSaturatedAbs16
         | Opcode::VectorSignedSaturatedAbs32
@@ -1046,6 +1109,8 @@ fn emit_ir_instruction(
         | Opcode::VectorTableLookup128
         | Opcode::VectorUnsignedRecipEstimate
         | Opcode::VectorUnsignedRecipSqrtEstimate
+        | Opcode::VectorUnsignedMultiply16
+        | Opcode::VectorUnsignedMultiply32
         | Opcode::VectorUnsignedSaturatedAccumulateSigned8
         | Opcode::VectorUnsignedSaturatedAccumulateSigned16
         | Opcode::VectorUnsignedSaturatedAccumulateSigned32
@@ -1247,6 +1312,12 @@ fn emit_ir_instruction(
         Opcode::A64SetFPSR => emit_a64_set_fpsr(code, ctx, inst_ref),
         Opcode::A64CallSupervisor => emit_a64_call_supervisor(code, ctx, inst_ref),
         Opcode::A64ExceptionRaised => emit_a64_exception_raised(code, ctx, inst_ref),
+        Opcode::A64DataCacheOperationRaised => {
+            emit_a64_data_cache_operation_raised(code, ctx, inst_ref)
+        }
+        Opcode::A64InstructionCacheOperationRaised => {
+            emit_a64_instruction_cache_operation_raised(code, ctx, inst_ref)
+        }
         Opcode::A64DataSynchronizationBarrier => emit_a64_data_synchronization_barrier(code),
         Opcode::A64DataMemoryBarrier => emit_a64_data_memory_barrier(code),
         Opcode::A64InstructionSynchronizationBarrier => {
@@ -1696,48 +1767,6 @@ fn emit_a64_get_dczid(
     Ok(())
 }
 
-fn emit_a32_pc_exec_hook(
-    code: &mut BlockOfCode,
-    ctx: &mut EmitContext<'_>,
-    inst_ref: InstRef,
-) -> Result<(), String> {
-    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
-    let pc = args[0].get_immediate_u64();
-
-    // The trace hook reads A32JitState. Make the guest-register values explicit
-    // IR operands and materialize them into the state before the host call;
-    // otherwise A32 get/set elimination can leave the state with stale values.
-    const REG_INDEXES: [usize; 4] = [0, 1, 2, 14];
-    for (arg_index, reg_index) in REG_INDEXES.iter().copied().enumerate() {
-        let mut value = ctx.reg_alloc.read_w(args[arg_index + 1]);
-        let value_reg = value.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::str_w_unsigned(
-            value_reg,
-            XSTATE,
-            a32_gpr_offset(reg_index),
-        ))?;
-    }
-
-    ctx.reg_alloc
-        .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
-
-    // a32_pc_trace_hook(jit_state_ptr: XSTATE, fastmem_base: XFASTMEM, tag: pc).
-    code.write_u32(inst::mov_x(0, XSTATE))?;
-    code.write_u32(inst::mov_x(1, XFASTMEM))?;
-    emit_mov_x_imm(code, 2, pc)?;
-    emit_mov_x_imm(
-        code,
-        XSCRATCH0,
-        crate::jit::a32_pc_trace_hook as usize as u64,
-    )?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
-    Ok(())
-}
-
-fn a32_gpr_offset(reg_index: usize) -> u32 {
-    (core::mem::offset_of!(A32JitState, regs) + core::mem::size_of::<u32>() * reg_index) as u32
-}
-
 fn emit_a64_set_tpidr(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -1950,16 +1979,20 @@ fn emitted_block_offset(
 mod tests {
     use super::*;
     use crate::frontend::a64::types::{Reg as A64Reg, Vec as A64Vec};
+    use crate::interface::a32::config::{
+        Exception as A32Exception, UserCallbacks as A32UserCallbacks,
+    };
+    use crate::interface::a64::config::{
+        Exception as A64Exception, UserCallbacks as A64UserCallbacks,
+    };
     use crate::ir::acc_type::AccType;
     use crate::ir::inst::Inst;
     use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
-    use crate::jit_config::UserCallbacks;
-    use std::collections::HashMap;
 
-    struct DummyCallbacks;
+    struct A64DummyCallbacks;
 
-    impl UserCallbacks for DummyCallbacks {
+    impl A64UserCallbacks for A64DummyCallbacks {
         fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
             None
         }
@@ -1980,66 +2013,57 @@ mod tests {
             0
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_128(&self, _vaddr: u64) -> [u64; 2] {
+            [0, 0]
         }
 
         fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
         fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
         fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
+        fn memory_write_128(&mut self, _vaddr: u64, _value: [u64; 2]) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
+        fn add_ticks(&mut self, _ticks: u64) {}
 
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
+        fn get_ticks_remaining(&self) -> u64 {
             0
         }
 
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
+        fn get_cntpct(&self) -> u64 {
+            0
+        }
+    }
+
+    struct A32DummyCallbacks;
+
+    impl A32UserCallbacks for A32DummyCallbacks {
+        fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
+            None
+        }
+
+        fn memory_read_8(&self, _vaddr: u32) -> u8 {
             0
         }
 
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
+        fn memory_read_16(&self, _vaddr: u32) -> u16 {
             0
         }
 
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
+        fn memory_read_32(&self, _vaddr: u32) -> u32 {
             0
         }
 
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_64(&self, _vaddr: u32) -> u64 {
+            0
         }
 
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-
-        fn exclusive_clear(&mut self) {}
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
+        fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
+        fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
+        fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
@@ -2047,25 +2071,30 @@ mod tests {
         }
     }
 
-    fn config(unsafe_optimizations: bool) -> JitConfig {
-        JitConfig {
-            callbacks: Box::new(DummyCallbacks),
-            enable_cycle_counting: true,
-            code_cache_size: 0,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
-                | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR,
-            unsafe_optimizations,
-            global_monitor: None,
-            fastmem_pointer: Some(0x1000 as *mut u8),
-            page_table_pointer: Some(0x2000 as *const u8),
-            define_unpredictable_behaviour: false,
-            processor_id: 3,
-            wall_clock_cntpct: true,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn a64_config(unsafe_optimizations: bool) -> A64UserConfig {
+        let mut config = A64UserConfig::new(Box::new(A64DummyCallbacks));
+        config.fastmem_pointer = Some(0x1000 as *mut u8);
+        config.page_table = Some(0x2000 as *mut *mut std::ffi::c_void);
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        config.code_cache_size = 0;
+        config.processor_id = 3;
+        config.unsafe_optimizations = unsafe_optimizations;
+        config.wall_clock_cntpct = true;
+        config
+    }
+
+    fn a32_config(unsafe_optimizations: bool) -> A32UserConfig {
+        let mut config = A32UserConfig::new(Box::new(A32DummyCallbacks));
+        config.page_table = Some(0x2000 as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        config.fastmem_pointer = Some(0x1000 as *mut u8);
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        config.code_cache_size = 0;
+        config.processor_id = 3;
+        config.unsafe_optimizations = unsafe_optimizations;
+        config.wall_clock_cntpct = true;
+        config
     }
 
     fn empty_block_info(code: &BlockOfCode) -> EmittedBlockInfo {
@@ -2122,7 +2151,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2150,18 +2179,178 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
     }
 
     #[test]
+    fn emit_arm64_routes_all_eden_packed_opcodes() {
+        let binary_opcodes = [
+            Opcode::PackedAddU8,
+            Opcode::PackedAddS8,
+            Opcode::PackedSubU8,
+            Opcode::PackedSubS8,
+            Opcode::PackedAddU16,
+            Opcode::PackedAddS16,
+            Opcode::PackedSubU16,
+            Opcode::PackedSubS16,
+            Opcode::PackedAddSubU16,
+            Opcode::PackedAddSubS16,
+            Opcode::PackedSubAddU16,
+            Opcode::PackedSubAddS16,
+            Opcode::PackedHalvingAddU8,
+            Opcode::PackedHalvingAddS8,
+            Opcode::PackedHalvingSubU8,
+            Opcode::PackedHalvingSubS8,
+            Opcode::PackedHalvingAddU16,
+            Opcode::PackedHalvingAddS16,
+            Opcode::PackedHalvingSubU16,
+            Opcode::PackedHalvingSubS16,
+            Opcode::PackedHalvingAddSubU16,
+            Opcode::PackedHalvingAddSubS16,
+            Opcode::PackedHalvingSubAddU16,
+            Opcode::PackedHalvingSubAddS16,
+            Opcode::PackedSaturatedAddU8,
+            Opcode::PackedSaturatedAddS8,
+            Opcode::PackedSaturatedSubU8,
+            Opcode::PackedSaturatedSubS8,
+            Opcode::PackedSaturatedAddU16,
+            Opcode::PackedSaturatedAddS16,
+            Opcode::PackedSaturatedSubU16,
+            Opcode::PackedSaturatedSubS16,
+            Opcode::PackedAbsDiffSumU8,
+        ];
+
+        for opcode in binary_opcodes {
+            let mut block = return_to_dispatch_block();
+            block.append(
+                opcode,
+                &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
+            );
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&a64_config(false)),
+            )
+            .unwrap_or_else(|error| panic!("{opcode:?} failed ARM64 emission: {error}"));
+        }
+
+        let mut block = return_to_dispatch_block();
+        block.append(
+            Opcode::PackedSelect,
+            &[
+                Value::ImmU32(0x00ff_00ff),
+                Value::ImmU32(0x1122_3344),
+                Value::ImmU32(0xaabb_ccdd),
+            ],
+        );
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&a64_config(false)),
+        )
+        .expect("PackedSelect must be routed to the packed emitter");
+    }
+
+    #[test]
+    fn emit_arm64_packed_add_u8_emits_eden_ge_sequence() {
+        let mut block = return_to_dispatch_block();
+        let result = block.append(
+            Opcode::PackedAddU8,
+            &[Value::ImmU32(0xffff_00ff), Value::ImmU32(0x0102_0304)],
+        );
+        let ge = block.append(Opcode::GetGEFromOp, &[Value::Inst(result)]);
+        block.append(
+            Opcode::A64SetW,
+            &[Value::ImmA64Reg(A64Reg::R0), Value::Inst(result)],
+        );
+        block.append(
+            Opcode::A64SetW,
+            &[Value::ImmA64Reg(A64Reg::R1), Value::Inst(ge)],
+        );
+        block.rebuild_pseudo_op_links();
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+
+        let info = emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&a64_config(false)),
+        )
+        .unwrap();
+        let words = (0..info.size)
+            .step_by(4)
+            .map(|offset| read_instruction(&code, offset))
+            .collect::<Vec<_>>();
+
+        assert!(words.contains(&inst::add_v(8, 9, 10, 8, false)));
+        assert!(words.contains(&inst::cmhi_v(11, 9, 8, 8, false)));
+    }
+
+    #[test]
+    fn emit_arm64_packed_complex_sequences_match_eden_scratch_usage() {
+        let mut block = return_to_dispatch_block();
+        block.append(
+            Opcode::PackedAddSubU16,
+            &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
+        );
+        block.append(
+            Opcode::PackedSaturatedAddU16,
+            &[Value::ImmU32(0xffff_ffff), Value::ImmU32(0x0001_0001)],
+        );
+        block.append(
+            Opcode::PackedAbsDiffSumU8,
+            &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
+        );
+        block.append(
+            Opcode::PackedSelect,
+            &[
+                Value::ImmU32(0x00ff_00ff),
+                Value::ImmU32(0x1122_3344),
+                Value::ImmU32(0xaabb_ccdd),
+            ],
+        );
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+
+        let info = emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&a64_config(false)),
+        )
+        .unwrap();
+        let words = (0..info.size)
+            .step_by(4)
+            .map(|offset| read_instruction(&code, offset))
+            .collect::<Vec<_>>();
+
+        assert!(words.contains(&inst::uxtl_v(0, 9, 16)));
+        assert!(words.contains(&inst::uxtl_v(1, 10, 16)));
+        assert!(words.contains(&inst::ext_v16b(1, 1, 1, 4, false)));
+        assert!(words.contains(&inst::movi_v8b_imm(2, 0xf0)));
+        assert!(words.contains(&inst::eor_v8b(1, 1, 2)));
+        assert!(words.contains(&inst::sub_v(8, 0, 1, 32, false)));
+        assert!(words.contains(&inst::xtn_v(8, 8, 32)));
+        assert!(words.iter().any(|word| {
+            *word == inst::uqadd_v(8, 9, 10, 16, false)
+                || *word == inst::uqadd_v(9, 10, 11, 16, false)
+        }));
+        assert!(words.contains(&inst::uabd_v(8, 9, 10, 8, false)));
+        assert!(words.contains(&inst::and_v8b(8, 8, 2)));
+        assert!(words.contains(&inst::uaddlv_from_v(8, 8, 8, false)));
+        assert!(words.contains(&inst::fmov_d(8, 9)));
+        assert!(words.contains(&inst::bsl_v8b(8, 11, 10)));
+    }
+
+    #[test]
     fn masks_unsafe_optimizations_unless_enabled() {
-        let safe = EmitConfig::from_a64_config(&config(false));
+        let safe = EmitConfig::from_a64_config(&a64_config(false));
         assert!(!safe.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
 
-        let unsafe_enabled = EmitConfig::from_a64_config(&config(true));
+        let unsafe_enabled = EmitConfig::from_a64_config(&a64_config(true));
         assert!(unsafe_enabled.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
     }
 
@@ -2239,7 +2428,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a32_config(&config(false)),
+            EmitConfig::from_a32_config(&a32_config(false)),
         )
         .expect("PushRSB block should emit");
 
@@ -2290,11 +2479,17 @@ mod tests {
 
     #[test]
     fn a32_emit_config_forces_32_bit_mirrored_memory_spaces() {
-        let cfg = EmitConfig::from_a32_config(&config(false));
+        let mut a32_config = a32_config(false);
+        a32_config.always_little_endian = true;
+        a32_config.fastmem_exclusive_access = true;
+        a32_config.recompile_on_exclusive_fastmem_failure = false;
+        let cfg = EmitConfig::from_a32_config(&a32_config);
         assert_eq!(cfg.memory.fastmem_address_space_bits, 32);
         assert_eq!(cfg.memory.page_table_address_space_bits, 32);
         assert!(cfg.memory.silently_mirror_fastmem);
         assert!(cfg.memory.silently_mirror_page_table);
+        assert!(cfg.memory.fastmem_exclusive_access);
+        assert!(!cfg.memory.recompile_on_exclusive_fastmem_failure);
         assert_eq!(cfg.fastmem_address_space_bits, 32);
         assert_eq!(cfg.page_table_address_space_bits, 32);
         assert!(cfg.silently_mirror_fastmem);
@@ -2309,6 +2504,7 @@ mod tests {
         assert_eq!(cfg.memory.processor_id, 3);
         assert!(cfg.wall_clock_cntpct);
         assert!(cfg.enable_cycle_counting);
+        assert!(cfg.always_little_endian);
         assert!(std::ptr::fn_addr_eq(
             cfg.emit_cond,
             emit_a32_cond as EmitCond
@@ -2333,20 +2529,19 @@ mod tests {
 
     #[test]
     fn a64_emit_config_preserves_memory_and_system_defaults() {
-        let mut config = config(false);
+        let mut config = a64_config(false);
         config.cntfrq_el0 = 19_200_000;
-        config.memory.fastmem_address_space_bits = 39;
-        config.memory.silently_mirror_fastmem = false;
-        config.memory.recompile_on_fastmem_failure = true;
-        config.memory.page_table_address_space_bits = 40;
-        config.memory.page_table_pointer_mask_bits = 3;
-        config.memory.silently_mirror_page_table = false;
-        config.memory.absolute_offset_page_table = true;
-        config.memory.detect_misaligned_access_via_page_table = 16 | 32 | 64;
-        config
-            .memory
-            .only_detect_misalignment_via_page_table_on_page_boundary = true;
-        config.memory.check_halt_on_memory_access = true;
+        config.fastmem_address_space_bits = 39;
+        config.silently_mirror_fastmem = false;
+        config.recompile_on_fastmem_failure = true;
+        config.page_table_address_space_bits = 40;
+        config.page_table_pointer_mask_bits = 3;
+        config.page_table_log2_stride = 4;
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = true;
+        config.detect_misaligned_access_via_page_table = 16 | 32 | 64;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = true;
+        config.check_halt_on_memory_access = true;
 
         let cfg = EmitConfig::from_a64_config(&config);
 
@@ -2358,6 +2553,7 @@ mod tests {
         assert!(cfg.recompile_on_fastmem_failure);
         assert_eq!(cfg.page_table_address_space_bits, 40);
         assert_eq!(cfg.page_table_pointer_mask_bits, 3);
+        assert_eq!(cfg.page_table_log2_stride, 4);
         assert!(!cfg.silently_mirror_page_table);
         assert!(cfg.absolute_offset_page_table);
         assert_eq!(cfg.detect_misaligned_access_via_page_table, 16 | 32 | 64);
@@ -2391,7 +2587,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             return_to_dispatch_block(),
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2418,7 +2614,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2447,7 +2643,7 @@ mod tests {
         emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2487,7 +2683,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2509,7 +2705,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2518,15 +2714,15 @@ mod tests {
     #[test]
     fn emit_arm64_routes_crc32_to_cryptography_owner() {
         for (opcode, data) in [
-            (Opcode::CRC32Castagnoli8, Value::ImmU8(0x12)),
-            (Opcode::CRC32Castagnoli16, Value::ImmU16(0x1234)),
+            (Opcode::CRC32Castagnoli8, Value::ImmU32(0x12)),
+            (Opcode::CRC32Castagnoli16, Value::ImmU32(0x1234)),
             (Opcode::CRC32Castagnoli32, Value::ImmU32(0x1234_5678)),
             (
                 Opcode::CRC32Castagnoli64,
                 Value::ImmU64(0x1234_5678_9abc_def0),
             ),
-            (Opcode::CRC32ISO8, Value::ImmU8(0x12)),
-            (Opcode::CRC32ISO16, Value::ImmU16(0x1234)),
+            (Opcode::CRC32ISO8, Value::ImmU32(0x12)),
+            (Opcode::CRC32ISO16, Value::ImmU32(0x1234)),
             (Opcode::CRC32ISO32, Value::ImmU32(0x1234_5678)),
             (Opcode::CRC32ISO64, Value::ImmU64(0x1234_5678_9abc_def0)),
         ] {
@@ -2538,7 +2734,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2572,7 +2768,7 @@ mod tests {
         emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
     }
@@ -2637,7 +2833,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2664,7 +2860,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2687,7 +2883,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2711,7 +2907,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2731,7 +2927,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2748,7 +2944,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2764,7 +2960,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2785,7 +2981,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2807,7 +3003,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2827,7 +3023,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2843,7 +3039,7 @@ mod tests {
             emit_arm64(
                 &mut code,
                 block,
-                EmitConfig::from_a64_config(&config(false)),
+                EmitConfig::from_a64_config(&a64_config(false)),
             )
             .unwrap();
         }
@@ -2858,7 +3054,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2888,7 +3084,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2908,7 +3104,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2929,7 +3125,7 @@ mod tests {
         let info = emit_arm64(
             &mut code,
             block,
-            EmitConfig::from_a64_config(&config(false)),
+            EmitConfig::from_a64_config(&a64_config(false)),
         )
         .unwrap();
 
@@ -2973,11 +3169,11 @@ mod tests {
             ],
         );
         let mut code = BlockOfCode::with_size(4096).unwrap();
-        let mut jit_config = config(false);
-        jit_config.fastmem_pointer = None;
-        jit_config.page_table_pointer = None;
+        let mut config = a32_config(false);
+        config.fastmem_pointer = None;
+        config.page_table = None;
 
-        let info = emit_arm64(&mut code, block, EmitConfig::from_a32_config(&jit_config)).unwrap();
+        let info = emit_arm64(&mut code, block, EmitConfig::from_a32_config(&config)).unwrap();
 
         assert_eq!(info.size, 20);
         assert_eq!(

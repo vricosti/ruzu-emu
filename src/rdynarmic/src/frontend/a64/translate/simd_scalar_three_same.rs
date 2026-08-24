@@ -1,16 +1,12 @@
-//! Port of upstream
-//! `dynarmic/frontend/A64/translate/impl/simd_scalar_three_same.cpp`
-//! (subset of integer/FP scalar comparisons + add/sub/shifts/reciprocal steps) and the
-//! "scalar (zero)" comparison forms which upstream lumps into the same
-//! family.
+//! Port of upstream `dynarmic/frontend/A64/translate/impl/simd_scalar_three_same.cpp`.
 
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::Vec;
 use crate::ir::value::Value;
 
-#[derive(Copy, Clone)]
-enum CmpKind {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComparisonType {
     Eq,
     Ge,
     Gt,
@@ -20,430 +16,740 @@ enum CmpKind {
     Lt,
 }
 
-#[derive(Copy, Clone)]
-enum CmpVariant {
-    Register(Vec),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComparisonVariant {
+    Register,
     Zero,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignednessSsts {
+    Signed,
+    Unsigned,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FpComparisonType {
+    Eq,
+    Ge,
+    AbsoluteGe,
+    Gt,
+    AbsoluteGt,
+}
+
+fn rounding_shift_left(
+    visitor: &mut TranslatorVisitor<'_>,
+    size: u32,
+    vm: Vec,
+    vn: Vec,
+    vd: Vec,
+    signedness: SignednessSsts,
+) -> bool {
+    if size != 0b11 {
+        return visitor.reserved_value();
+    }
+
+    let operand1 = visitor.v_read(64, vn);
+    let operand2 = visitor.v_read(64, vm);
+    let result = match signedness {
+        SignednessSsts::Signed => visitor
+            .ir
+            .ir()
+            .vector_rounding_shift_left_signed(64, operand1, operand2),
+        SignednessSsts::Unsigned => visitor
+            .ir
+            .ir()
+            .vector_rounding_shift_left_unsigned(64, operand1, operand2),
+    };
+
+    visitor.v_write(64, vd, result);
+    true
+}
+
+fn scalar_compare(
+    visitor: &mut TranslatorVisitor<'_>,
+    size: u32,
+    vm: Option<Vec>,
+    vn: Vec,
+    vd: Vec,
+    comparison_type: ComparisonType,
+    variant: ComparisonVariant,
+) -> bool {
+    if size != 0b11 {
+        return visitor.reserved_value();
+    }
+
+    let esize = 64usize;
+    let datasize = 64usize;
+    let operand1 = visitor.v_read(datasize, vn);
+    let operand2 = match variant {
+        ComparisonVariant::Register => visitor.v_read(datasize, vm.expect("register variant")),
+        ComparisonVariant::Zero => visitor.ir.ir().zero_vector(),
+    };
+    let result = match comparison_type {
+        ComparisonType::Eq => visitor.ir.ir().vector_equal(esize, operand1, operand2),
+        ComparisonType::Ge => visitor
+            .ir
+            .ir()
+            .vector_greater_equal_signed(esize, operand1, operand2),
+        ComparisonType::Gt => visitor
+            .ir
+            .ir()
+            .vector_greater_signed(esize, operand1, operand2),
+        ComparisonType::Hi => visitor
+            .ir
+            .ir()
+            .vector_greater_unsigned(esize, operand1, operand2),
+        ComparisonType::Hs => visitor
+            .ir
+            .ir()
+            .vector_greater_equal_unsigned(esize, operand1, operand2),
+        ComparisonType::Le => visitor
+            .ir
+            .ir()
+            .vector_less_equal_signed(esize, operand1, operand2),
+        ComparisonType::Lt => visitor
+            .ir
+            .ir()
+            .vector_less_signed(esize, operand1, operand2),
+    };
+
+    let element = visitor.ir.ir().vector_get_element(esize, result, 0);
+    visitor.v_scalar_write(datasize, vd, element);
+    true
+}
+
+fn scalar_fp_compare_register(
+    visitor: &mut TranslatorVisitor<'_>,
+    sz: bool,
+    vm: Vec,
+    vn: Vec,
+    vd: Vec,
+    comparison_type: FpComparisonType,
+) -> bool {
+    let esize = if sz { 64 } else { 32 };
+    let datasize = esize;
+    let operand1 = visitor.v_read(datasize, vn);
+    let operand2 = visitor.v_read(datasize, vm);
+    let result = match comparison_type {
+        FpComparisonType::Eq => visitor
+            .ir
+            .ir()
+            .fp_vector_equal(esize, operand1, operand2, true),
+        FpComparisonType::Ge => visitor
+            .ir
+            .ir()
+            .fp_vector_greater_equal(esize, operand1, operand2, true),
+        FpComparisonType::AbsoluteGe => {
+            let operand1 = visitor.ir.ir().fp_vector_abs(esize, operand1);
+            let operand2 = visitor.ir.ir().fp_vector_abs(esize, operand2);
+            visitor
+                .ir
+                .ir()
+                .fp_vector_greater_equal(esize, operand1, operand2, true)
+        }
+        FpComparisonType::Gt => visitor
+            .ir
+            .ir()
+            .fp_vector_greater(esize, operand1, operand2, true),
+        FpComparisonType::AbsoluteGt => {
+            let operand1 = visitor.ir.ir().fp_vector_abs(esize, operand1);
+            let operand2 = visitor.ir.ir().fp_vector_abs(esize, operand2);
+            visitor
+                .ir
+                .ir()
+                .fp_vector_greater(esize, operand1, operand2, true)
+        }
+    };
+
+    let element = visitor.ir.ir().vector_get_element(esize, result, 0);
+    visitor.v_scalar_write(datasize, vd, element);
+    true
+}
+
 impl<'a> TranslatorVisitor<'a> {
-    /// All scalar integer compares operate on 64-bit operands; size==0b11 only.
-    fn scalar_compare(
-        &mut self,
-        size: u32,
-        vn: Vec,
-        vd: Vec,
-        variant: CmpVariant,
-        kind: CmpKind,
-    ) -> bool {
-        if size != 0b11 {
-            return self.reserved_value();
-        }
-        let esize = 64usize;
-        let datasize = 64usize;
-        let operand1 = self.v_scalar_read(datasize, vn);
-        let operand2 = match variant {
-            CmpVariant::Register(vm) => self.v_scalar_read(datasize, vm),
-            CmpVariant::Zero => self.ir.ir().zero_vector(),
-        };
-        let result = match kind {
-            CmpKind::Eq => self.ir.ir().vector_equal(esize, operand1, operand2),
-            CmpKind::Ge => self
-                .ir
-                .ir()
-                .vector_greater_equal_signed(esize, operand1, operand2),
-            CmpKind::Gt => self
-                .ir
-                .ir()
-                .vector_greater_signed(esize, operand1, operand2),
-            CmpKind::Hi => {
-                // a > b unsigned <=> NOT(b >= a unsigned)
-                let ge = self
-                    .ir
-                    .ir()
-                    .vector_greater_equal_unsigned(esize, operand2, operand1);
-                self.ir.ir().vector_not(ge)
-            }
-            CmpKind::Hs => self
-                .ir
-                .ir()
-                .vector_greater_equal_unsigned(esize, operand1, operand2),
-            CmpKind::Le => {
-                // a <= b signed <=> b >= a signed
-                self.ir
-                    .ir()
-                    .vector_greater_equal_signed(esize, operand2, operand1)
-            }
-            CmpKind::Lt => {
-                // a < b signed <=> b > a signed
-                self.ir
-                    .ir()
-                    .vector_greater_signed(esize, operand2, operand1)
-            }
-        };
-        let elem = self.ir.ir().vector_get_element(esize, result, 0);
-        self.v_scalar_write(esize, vd, elem);
+    pub fn sqadd_1(&mut self, inst: &DecodedInst) -> bool {
+        let esize = 8usize << inst.bits(23, 22);
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().signed_saturated_add(operand1, operand2);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
         true
     }
 
-    fn scalar_three_same_args(&mut self, inst: &DecodedInst) -> (u32, Vec, Vec, Vec) {
+    pub fn sqdmulh_vec_1(&mut self, inst: &DecodedInst) -> bool {
         let size = inst.bits(23, 22);
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        (size, vm, vn, vd)
+        if size == 0 || size == 0b11 {
+            return self.reserved_value();
+        }
+        let esize = 8usize << size;
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let result = self
+            .ir
+            .ir()
+            .signed_saturated_doubling_multiply_return_high(operand1, operand2);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
+        true
     }
 
-    fn scalar_two_zero_args(&mut self, inst: &DecodedInst) -> (u32, Vec, Vec) {
+    pub fn sqrdmulh_vec_1(&mut self, inst: &DecodedInst) -> bool {
         let size = inst.bits(23, 22);
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        (size, vn, vd)
+        if size == 0 || size == 0b11 {
+            return self.reserved_value();
+        }
+        let esize = 8usize << size;
+        let vn = self.v_read(128, Vec::from_u32(inst.rn()));
+        let operand1 = self.ir.ir().vector_get_element(esize, vn, 0);
+        let operand1 = self.ir.ir().zero_extend_to_quad(operand1);
+        let vm = self.v_read(128, Vec::from_u32(inst.rm()));
+        let operand2 = self.ir.ir().vector_get_element(esize, vm, 0);
+        let operand2 = self.ir.ir().zero_extend_to_quad(operand2);
+        let result = self
+            .ir
+            .ir()
+            .vector_signed_saturated_doubling_multiply_high_rounding(esize, operand1, operand2);
+        let element = self.ir.ir().vector_get_element(esize, result, 0);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), element);
+        true
     }
 
-    /// ADD (vector, scalar). `01011110zz1mmmmm100001nnnnnddddd`.
+    pub fn sqsub_1(&mut self, inst: &DecodedInst) -> bool {
+        let esize = 8usize << inst.bits(23, 22);
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().signed_saturated_sub(operand1, operand2);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
+        true
+    }
+
+    pub fn uqadd_1(&mut self, inst: &DecodedInst) -> bool {
+        let esize = 8usize << inst.bits(23, 22);
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().unsigned_saturated_add(operand1, operand2);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
+        true
+    }
+
+    pub fn uqsub_1(&mut self, inst: &DecodedInst) -> bool {
+        let esize = 8usize << inst.bits(23, 22);
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().unsigned_saturated_sub(operand1, operand2);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
+        true
+    }
+
     pub fn add_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
+        let size = inst.bits(23, 22);
         if size != 0b11 {
             return self.reserved_value();
         }
-        let esize = 64usize;
-        let op1 = self.v_scalar_read(esize, vn);
-        let op2 = self.v_scalar_read(esize, vm);
-        let elem1 = self.ir.ir().vector_get_element(esize, op1, 0);
-        let elem2 = self.ir.ir().vector_get_element(esize, op2, 0);
-        let zero = self.ir.ir().imm1(false);
-        let result = self.ir.ir().add_64(elem1, elem2, zero);
-        self.v_scalar_write(esize, vd, result);
-        true
-    }
-
-    /// SUB (vector, scalar). `01111110zz1mmmmm100001nnnnnddddd`.
-    pub fn sub_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        if size != 0b11 {
-            return self.reserved_value();
-        }
-        let esize = 64usize;
-        let op1 = self.v_scalar_read(esize, vn);
-        let op2 = self.v_scalar_read(esize, vm);
-        let elem1 = self.ir.ir().vector_get_element(esize, op1, 0);
-        let elem2 = self.ir.ir().vector_get_element(esize, op2, 0);
-        let one = self.ir.ir().imm1(true);
-        let result = self.ir.ir().sub_64(elem1, elem2, one);
-        self.v_scalar_write(esize, vd, result);
+        let operand1 = self.v_scalar_read(64, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(64, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().add_64(operand1, operand2, Value::ImmU1(false));
+        self.v_scalar_write(64, Vec::from_u32(inst.rd()), result);
         true
     }
 
     pub fn cmeq_reg_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Register(vm), CmpKind::Eq)
-    }
-    pub fn cmge_reg_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Register(vm), CmpKind::Ge)
-    }
-    pub fn cmgt_reg_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Register(vm), CmpKind::Gt)
-    }
-    pub fn cmhi_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Register(vm), CmpKind::Hi)
-    }
-    pub fn cmhs_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Register(vm), CmpKind::Hs)
-    }
-
-    /// CMTST (scalar). `01011110zz1mmmmm100011nnnnnddddd`.
-    pub fn cmtst_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        if size != 0b11 {
-            return self.reserved_value();
-        }
-        let op1 = self.v_scalar_read(64, vn);
-        let op2 = self.v_scalar_read(64, vm);
-        let anded = self.ir.ir().vector_and(op1, op2);
-        let zero = self.ir.ir().zero_vector();
-        let eq = self.ir.ir().vector_equal(64, anded, zero);
-        let result = self.ir.ir().vector_not(eq);
-        self.v_scalar_write(64, vd, result);
-        true
-    }
-
-    /// SSHL (scalar). `01011110zz1mmmmm010001nnnnnddddd`.
-    pub fn sshl_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        if size != 0b11 {
-            return self.reserved_value();
-        }
-        let op1 = self.v_scalar_read(64, vn);
-        let op2 = self.v_scalar_read(64, vm);
-        let result = self.ir.ir().vector_arithmetic_v_shift(64, op1, op2);
-        self.v_scalar_write(64, vd, result);
-        true
-    }
-
-    /// USHL (scalar). `01111110zz1mmmmm010001nnnnnddddd`.
-    pub fn ushl_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vm, vn, vd) = self.scalar_three_same_args(inst);
-        if size != 0b11 {
-            return self.reserved_value();
-        }
-        let op1 = self.v_scalar_read(64, vn);
-        let op2 = self.v_scalar_read(64, vm);
-        let result = self.ir.ir().vector_logical_v_shift(64, op1, op2);
-        self.v_scalar_write(64, vd, result);
-        true
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            Some(Vec::from_u32(inst.rm())),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Eq,
+            ComparisonVariant::Register,
+        )
     }
 
     pub fn cmeq_zero_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vn, vd) = self.scalar_two_zero_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Zero, CmpKind::Eq)
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            None,
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Eq,
+            ComparisonVariant::Zero,
+        )
     }
+
+    pub fn cmge_reg_1(&mut self, inst: &DecodedInst) -> bool {
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            Some(Vec::from_u32(inst.rm())),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Ge,
+            ComparisonVariant::Register,
+        )
+    }
+
     pub fn cmge_zero_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vn, vd) = self.scalar_two_zero_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Zero, CmpKind::Ge)
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            None,
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Ge,
+            ComparisonVariant::Zero,
+        )
     }
+
+    pub fn cmgt_reg_1(&mut self, inst: &DecodedInst) -> bool {
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            Some(Vec::from_u32(inst.rm())),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Gt,
+            ComparisonVariant::Register,
+        )
+    }
+
     pub fn cmgt_zero_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vn, vd) = self.scalar_two_zero_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Zero, CmpKind::Gt)
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            None,
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Gt,
+            ComparisonVariant::Zero,
+        )
     }
+
     pub fn cmle_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vn, vd) = self.scalar_two_zero_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Zero, CmpKind::Le)
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            None,
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Le,
+            ComparisonVariant::Zero,
+        )
     }
+
     pub fn cmlt_1(&mut self, inst: &DecodedInst) -> bool {
-        let (size, vn, vd) = self.scalar_two_zero_args(inst);
-        self.scalar_compare(size, vn, vd, CmpVariant::Zero, CmpKind::Lt)
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            None,
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Lt,
+            ComparisonVariant::Zero,
+        )
     }
 
-    /// FCMEQ (register, scalar, half-precision).
-    /// `01011110010mmmmm001001nnnnnddddd` — esize=16.
-    pub fn fcmeq_reg_1(&mut self, inst: &DecodedInst) -> bool {
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        let lhs = self.v_scalar_read(128, vn);
-        let rhs = self.v_scalar_read(128, vm);
-        let result = self.ir.ir().fp_vector_equal(16, lhs, rhs, true);
-        let elem = self.ir.ir().vector_get_element(16, result, 0);
-        self.v_scalar_write(16, vd, elem);
+    pub fn cmhi_1(&mut self, inst: &DecodedInst) -> bool {
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            Some(Vec::from_u32(inst.rm())),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Hi,
+            ComparisonVariant::Register,
+        )
+    }
+
+    pub fn cmhs_1(&mut self, inst: &DecodedInst) -> bool {
+        scalar_compare(
+            self,
+            inst.bits(23, 22),
+            Some(Vec::from_u32(inst.rm())),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            ComparisonType::Hs,
+            ComparisonVariant::Register,
+        )
+    }
+
+    pub fn cmtst_1(&mut self, inst: &DecodedInst) -> bool {
+        if inst.bits(23, 22) != 0b11 {
+            return self.reserved_value();
+        }
+        let operand1 = self.v_read(64, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_read(64, Vec::from_u32(inst.rm()));
+        let anded = self.ir.ir().vector_and(operand1, operand2);
+        let zero = self.ir.ir().zero_vector();
+        let equal = self.ir.ir().vector_equal(64, anded, zero);
+        let result = self.ir.ir().vector_not(equal);
+        self.v_write(64, Vec::from_u32(inst.rd()), result);
         true
     }
 
-    /// FCMEQ (register, scalar, single/double).
-    /// `010111100z1mmmmm111001nnnnnddddd` — sz at bit 22.
-    pub fn fcmeq_reg_2(&mut self, inst: &DecodedInst) -> bool {
-        let sz = inst.bit(22);
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_compare_register(sz, vm, vn, vd, FpCmpKind::Eq)
-    }
-
-    fn scalar_fp_compare_register(
-        &mut self,
-        sz: bool,
-        vm: Vec,
-        vn: Vec,
-        vd: Vec,
-        kind: FpCmpKind,
-    ) -> bool {
-        let esize = if sz { 64 } else { 32 };
-        let op1 = self.v_scalar_read(esize, vn);
-        let op2 = self.v_scalar_read(esize, vm);
-        let result: Value = match kind {
-            FpCmpKind::Eq => self.ir.ir().fp_vector_equal(esize, op1, op2, true),
-            FpCmpKind::Ge => self.ir.ir().fp_vector_greater_equal(esize, op1, op2, true),
-            FpCmpKind::Gt => self.ir.ir().fp_vector_greater(esize, op1, op2, true),
-        };
-        let elem = self.ir.ir().vector_get_element(esize, result, 0);
-        self.v_scalar_write(esize, vd, elem);
-        true
-    }
-
-    /// FCMGE (register, scalar). `011111100z1mmmmm111001nnnnnddddd`. sz at bit 22.
-    pub fn fcmge_reg_2(&mut self, inst: &DecodedInst) -> bool {
-        let sz = inst.bit(22);
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_compare_register(sz, vm, vn, vd, FpCmpKind::Ge)
-    }
-
-    /// FCMGT (register, scalar). `011111101z1mmmmm111001nnnnnddddd`. sz at bit 22.
-    pub fn fcmgt_reg_2(&mut self, inst: &DecodedInst) -> bool {
-        let sz = inst.bit(22);
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        self.scalar_fp_compare_register(sz, vm, vn, vd, FpCmpKind::Gt)
-    }
-
-    /// FABD (scalar, single/double). `011111101z1mmmmm110101nnnnnddddd`.
-    /// Upstream: `TranslatorVisitor::FABD_2`.
     pub fn fabd_2(&mut self, inst: &DecodedInst) -> bool {
-        let sz = inst.bit(22);
-        let esize = if sz { 64 } else { 32 };
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-
-        let op1 = self.v_scalar_read(esize, vn);
-        let op2 = self.v_scalar_read(esize, vm);
-        let diff = self.ir.ir().fp_sub(esize, op1, op2);
-        let result = self.ir.ir().fp_abs(esize, diff);
-        self.v_scalar_write(esize, vd, result);
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let difference = self.ir.ir().fp_sub(esize, operand1, operand2);
+        let result = self.ir.ir().fp_abs(esize, difference);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
         true
     }
 
-    /// FRECPS (scalar, half-precision). `01011110010mmmmm001111nnnnnddddd`.
+    pub fn fmulx_vec_2(&mut self, inst: &DecodedInst) -> bool {
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().fp_mulx(esize, operand1, operand2);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
+        true
+    }
+
     pub fn frecps_1(&mut self, inst: &DecodedInst) -> bool {
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        let operand1 = self.v_scalar_read(16, vn);
-        let operand2 = self.v_scalar_read(16, vm);
+        let operand1 = self.v_scalar_read(16, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(16, Vec::from_u32(inst.rm()));
         let result = self.ir.ir().fp_recip_step_fused(16, operand1, operand2);
-        self.v_scalar_write(16, vd, result);
+        self.v_scalar_write(16, Vec::from_u32(inst.rd()), result);
         true
     }
 
-    /// FRECPS (scalar, single/double). `010111100z1mmmmm111111nnnnnddddd`.
     pub fn frecps_2(&mut self, inst: &DecodedInst) -> bool {
         let esize = if inst.bit(22) { 64 } else { 32 };
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        let operand1 = self.v_scalar_read(esize, vn);
-        let operand2 = self.v_scalar_read(esize, vm);
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
         let result = self.ir.ir().fp_recip_step_fused(esize, operand1, operand2);
-        self.v_scalar_write(esize, vd, result);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
         true
     }
 
-    /// FRSQRTS (scalar, half-precision). `01011110110mmmmm001111nnnnnddddd`.
     pub fn frsqrts_1(&mut self, inst: &DecodedInst) -> bool {
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        let operand1 = self.v_scalar_read(16, vn);
-        let operand2 = self.v_scalar_read(16, vm);
+        let operand1 = self.v_scalar_read(16, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(16, Vec::from_u32(inst.rm()));
         let result = self.ir.ir().fp_rsqrt_step_fused(16, operand1, operand2);
-        self.v_scalar_write(16, vd, result);
+        self.v_scalar_write(16, Vec::from_u32(inst.rd()), result);
         true
     }
 
-    /// FRSQRTS (scalar, single/double). `010111101z1mmmmm111111nnnnnddddd`.
     pub fn frsqrts_2(&mut self, inst: &DecodedInst) -> bool {
         let esize = if inst.bit(22) { 64 } else { 32 };
-        let vm = Vec::from_u32(inst.bits(20, 16));
-        let vn = Vec::from_u32(inst.bits(9, 5));
-        let vd = Vec::from_u32(inst.rd());
-        let operand1 = self.v_scalar_read(esize, vn);
-        let operand2 = self.v_scalar_read(esize, vm);
+        let operand1 = self.v_scalar_read(esize, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(esize, Vec::from_u32(inst.rm()));
         let result = self.ir.ir().fp_rsqrt_step_fused(esize, operand1, operand2);
-        self.v_scalar_write(esize, vd, result);
+        self.v_scalar_write(esize, Vec::from_u32(inst.rd()), result);
         true
     }
-}
 
-#[derive(Copy, Clone)]
-enum FpCmpKind {
-    Eq,
-    Ge,
-    Gt,
+    pub fn facge_2(&mut self, inst: &DecodedInst) -> bool {
+        scalar_fp_compare_register(
+            self,
+            inst.bit(22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            FpComparisonType::AbsoluteGe,
+        )
+    }
+
+    pub fn facgt_2(&mut self, inst: &DecodedInst) -> bool {
+        scalar_fp_compare_register(
+            self,
+            inst.bit(22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            FpComparisonType::AbsoluteGt,
+        )
+    }
+
+    pub fn fcmeq_reg_1(&mut self, inst: &DecodedInst) -> bool {
+        let lhs = self.v_read(128, Vec::from_u32(inst.rn()));
+        let rhs = self.v_read(128, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().fp_vector_equal(16, lhs, rhs, true);
+        let element = self.ir.ir().vector_get_element(16, result, 0);
+        self.v_scalar_write(16, Vec::from_u32(inst.rd()), element);
+        true
+    }
+
+    pub fn fcmeq_reg_2(&mut self, inst: &DecodedInst) -> bool {
+        scalar_fp_compare_register(
+            self,
+            inst.bit(22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            FpComparisonType::Eq,
+        )
+    }
+
+    pub fn fcmge_reg_2(&mut self, inst: &DecodedInst) -> bool {
+        scalar_fp_compare_register(
+            self,
+            inst.bit(22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            FpComparisonType::Ge,
+        )
+    }
+
+    pub fn fcmgt_reg_2(&mut self, inst: &DecodedInst) -> bool {
+        scalar_fp_compare_register(
+            self,
+            inst.bit(22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            FpComparisonType::Gt,
+        )
+    }
+
+    pub fn sqshl_reg_1(&mut self, inst: &DecodedInst) -> bool {
+        let esize = 8usize << inst.bits(23, 22);
+        let vn = self.v_read(128, Vec::from_u32(inst.rn()));
+        let operand1 = self.ir.ir().vector_get_element(esize, vn, 0);
+        let operand1 = self.ir.ir().zero_extend_to_quad(operand1);
+        let vm = self.v_read(128, Vec::from_u32(inst.rm()));
+        let operand2 = self.ir.ir().vector_get_element(esize, vm, 0);
+        let operand2 = self.ir.ir().zero_extend_to_quad(operand2);
+        let result = self
+            .ir
+            .ir()
+            .vector_signed_saturated_shift_left(esize, operand1, operand2);
+        self.ir.set_q(Vec::from_u32(inst.rd()), result);
+        true
+    }
+
+    pub fn srshl_1(&mut self, inst: &DecodedInst) -> bool {
+        rounding_shift_left(
+            self,
+            inst.bits(23, 22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            SignednessSsts::Signed,
+        )
+    }
+
+    pub fn sshl_1(&mut self, inst: &DecodedInst) -> bool {
+        if inst.bits(23, 22) != 0b11 {
+            return self.reserved_value();
+        }
+        let operand1 = self.v_read(64, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_read(64, Vec::from_u32(inst.rm()));
+        let result = self
+            .ir
+            .ir()
+            .vector_arithmetic_v_shift(64, operand1, operand2);
+        self.v_write(64, Vec::from_u32(inst.rd()), result);
+        true
+    }
+
+    pub fn sub_1(&mut self, inst: &DecodedInst) -> bool {
+        if inst.bits(23, 22) != 0b11 {
+            return self.reserved_value();
+        }
+        let operand1 = self.v_scalar_read(64, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_scalar_read(64, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().sub_64(operand1, operand2, Value::ImmU1(true));
+        self.v_scalar_write(64, Vec::from_u32(inst.rd()), result);
+        true
+    }
+
+    pub fn uqshl_reg_1(&mut self, inst: &DecodedInst) -> bool {
+        let esize = 8usize << inst.bits(23, 22);
+        let vn = self.v_read(128, Vec::from_u32(inst.rn()));
+        let operand1 = self.ir.ir().vector_get_element(esize, vn, 0);
+        let operand1 = self.ir.ir().zero_extend_to_quad(operand1);
+        let vm = self.v_read(128, Vec::from_u32(inst.rm()));
+        let operand2 = self.ir.ir().vector_get_element(esize, vm, 0);
+        let operand2 = self.ir.ir().zero_extend_to_quad(operand2);
+        let result = self
+            .ir
+            .ir()
+            .vector_unsigned_saturated_shift_left(esize, operand1, operand2);
+        self.ir.set_q(Vec::from_u32(inst.rd()), result);
+        true
+    }
+
+    pub fn urshl_1(&mut self, inst: &DecodedInst) -> bool {
+        rounding_shift_left(
+            self,
+            inst.bits(23, 22),
+            Vec::from_u32(inst.rm()),
+            Vec::from_u32(inst.rn()),
+            Vec::from_u32(inst.rd()),
+            SignednessSsts::Unsigned,
+        )
+    }
+
+    pub fn ushl_1(&mut self, inst: &DecodedInst) -> bool {
+        if inst.bits(23, 22) != 0b11 {
+            return self.reserved_value();
+        }
+        let operand1 = self.v_read(64, Vec::from_u32(inst.rn()));
+        let operand2 = self.v_read(64, Vec::from_u32(inst.rm()));
+        let result = self.ir.ir().vector_logical_v_shift(64, operand1, operand2);
+        self.v_write(64, Vec::from_u32(inst.rd()), result);
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frontend::a64::decoder::{decode, A64InstructionName};
+    use crate::frontend::a64::translate::TranslationOptions;
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;
     use crate::ir::opcode::Opcode;
-    use crate::ir::terminal::Terminal;
 
-    fn translate_one(raw: u32) -> (Block, bool, A64InstructionName) {
-        let decoded = decode(raw).expect("instruction should decode");
-        let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
-        let mut visitor = TranslatorVisitor::new(
-            &mut block,
-            A64LocationDescriptor::new(0x1000, 0, false),
-            crate::frontend::a64::translate::visitor::TranslationOptions::default(),
-        );
+    fn integer_encoding(unsigned: bool, size: u32, opcode: u32) -> u32 {
+        (if unsigned { 0x7e20_0000 } else { 0x5e20_0000 })
+            | (size << 22)
+            | (1 << 16)
+            | (opcode << 10)
+            | (2 << 5)
+            | 3
+    }
+
+    fn fp_encoding(base: u32, sz: bool, opcode: u32) -> u32 {
+        base | ((sz as u32) << 22) | (1 << 16) | (opcode << 10) | (2 << 5) | 3
+    }
+
+    fn translate_one(raw: u32) -> (A64InstructionName, Block, bool) {
+        let decoded = decode(raw).expect("scalar three-same instruction must decode");
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        let mut visitor =
+            TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
         let should_continue = visitor.dispatch(&decoded);
         drop(visitor);
-        (block, should_continue, decoded.name)
+        (decoded.name, block, should_continue)
     }
 
     #[test]
-    fn fabd_2_encoding_translates_without_interpret_terminal() {
-        let (block, should_continue, name) = translate_one(0x7EA8_D560);
-        assert_eq!(name, A64InstructionName::FABD_2);
-        assert!(should_continue);
-        assert!(block
-            .instructions
-            .iter()
-            .any(|inst| inst.opcode == Opcode::FPAbs32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
-    }
-
-    #[test]
-    fn observed_frsqrts_scalar_encoding_translates_instead_of_interpreting() {
-        let (block, should_continue, name) = translate_one(0x5EB0_FE52);
-        assert_eq!(name, A64InstructionName::FRSQRTS_2);
-        assert!(should_continue);
-        assert!(block
-            .instructions
-            .iter()
-            .any(|inst| inst.opcode == Opcode::FPRSqrtStepFused32));
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
-    }
-
-    #[test]
-    fn scalar_fp_reciprocal_step_families_use_matching_ir_opcodes() {
+    fn missing_scalar_three_same_identities_now_dispatch() {
         let cases = [
-            (0x5E40_3C00, Opcode::FPRecipStepFused16),
-            (0x5E20_FC00, Opcode::FPRecipStepFused32),
-            (0x5E60_FC00, Opcode::FPRecipStepFused64),
-            (0x5EC0_3C00, Opcode::FPRSqrtStepFused16),
-            (0x5EA0_FC00, Opcode::FPRSqrtStepFused32),
-            (0x5EE0_FC00, Opcode::FPRSqrtStepFused64),
+            (integer_encoding(false, 2, 3), A64InstructionName::SQADD_1),
+            (integer_encoding(false, 2, 11), A64InstructionName::SQSUB_1),
+            (
+                integer_encoding(false, 1, 45),
+                A64InstructionName::SQDMULH_vec_1,
+            ),
+            (
+                integer_encoding(true, 1, 45),
+                A64InstructionName::SQRDMULH_vec_1,
+            ),
+            (integer_encoding(true, 2, 3), A64InstructionName::UQADD_1),
+            (integer_encoding(true, 2, 11), A64InstructionName::UQSUB_1),
+            (
+                integer_encoding(false, 2, 19),
+                A64InstructionName::SQSHL_reg_1,
+            ),
+            (integer_encoding(false, 3, 21), A64InstructionName::SRSHL_1),
+            (
+                integer_encoding(true, 2, 19),
+                A64InstructionName::UQSHL_reg_1,
+            ),
+            (integer_encoding(true, 3, 21), A64InstructionName::URSHL_1),
+            (
+                fp_encoding(0x5e20_0000, false, 55),
+                A64InstructionName::FMULX_vec_2,
+            ),
+            (
+                fp_encoding(0x7e20_0000, false, 59),
+                A64InstructionName::FACGE_2,
+            ),
+            (
+                fp_encoding(0x7ea0_0000, false, 59),
+                A64InstructionName::FACGT_2,
+            ),
         ];
 
-        for (encoding, expected_opcode) in cases {
-            let (block, should_continue, _) = translate_one(encoding);
-            assert!(should_continue, "encoding 0x{encoding:08X}");
+        for (raw, expected_name) in cases {
+            let (name, block, should_continue) = translate_one(raw);
+            assert_eq!(name, expected_name, "encoding 0x{raw:08x}");
+            assert!(should_continue, "encoding 0x{raw:08x}");
+        }
+    }
+
+    #[test]
+    fn scalar_saturation_visitors_select_matching_ir_operations() {
+        let cases = [
+            (integer_encoding(false, 2, 3), Opcode::SignedSaturatedAdd32),
+            (integer_encoding(false, 2, 11), Opcode::SignedSaturatedSub32),
+            (integer_encoding(true, 2, 3), Opcode::UnsignedSaturatedAdd32),
+            (
+                integer_encoding(true, 2, 11),
+                Opcode::UnsignedSaturatedSub32,
+            ),
+            (
+                integer_encoding(false, 1, 45),
+                Opcode::SignedSaturatedDoublingMultiplyReturnHigh16,
+            ),
+            (
+                integer_encoding(true, 1, 45),
+                Opcode::VectorSignedSaturatedDoublingMultiplyHighRounding16,
+            ),
+        ];
+
+        for (raw, expected_opcode) in cases {
+            let (_, block, should_continue) = translate_one(raw);
+            assert!(should_continue);
             assert!(
                 block
                     .instructions
                     .iter()
                     .any(|inst| inst.opcode == expected_opcode),
-                "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
+                "encoding 0x{raw:08x} did not emit {expected_opcode:?}"
             );
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }
 
     #[test]
-    fn scalar_fcmeq_register_single_and_double_match_upstream() {
-        let cases = [
-            (0x5E20_E400, Opcode::FPVectorEqual32),
-            (0x5E60_E400, Opcode::FPVectorEqual64),
-        ];
+    fn existing_scalar_and_vector_paths_use_upstream_operand_shapes() {
+        let (_, add, _) = translate_one(integer_encoding(false, 3, 33));
+        assert_eq!(
+            add.instructions
+                .iter()
+                .filter(|inst| inst.opcode == Opcode::VectorGetElement64)
+                .count(),
+            2
+        );
 
-        for (encoding, expected_opcode) in cases {
-            let (block, should_continue, name) = translate_one(encoding);
-            assert_eq!(name, A64InstructionName::FCMEQ_reg_2);
-            assert!(should_continue, "encoding 0x{encoding:08X}");
-            assert!(block
+        let (_, compare, _) = translate_one(integer_encoding(false, 3, 15));
+        assert_eq!(
+            compare
                 .instructions
                 .iter()
-                .any(|inst| inst.opcode == expected_opcode));
-            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
-        }
+                .filter(|inst| inst.opcode == Opcode::A64GetD)
+                .count(),
+            2
+        );
+        assert_eq!(
+            compare
+                .instructions
+                .iter()
+                .filter(|inst| inst.opcode == Opcode::VectorGetElement64)
+                .count(),
+            1
+        );
+
+        let (_, cmtst, _) = translate_one(integer_encoding(false, 3, 35));
+        assert!(!cmtst
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::VectorGetElement64));
+    }
+
+    #[test]
+    fn invalid_rounding_shift_size_is_reserved_not_interpreted() {
+        let (_, block, should_continue) = translate_one(integer_encoding(false, 2, 21));
+        assert!(!should_continue);
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A64ExceptionRaised));
     }
 }

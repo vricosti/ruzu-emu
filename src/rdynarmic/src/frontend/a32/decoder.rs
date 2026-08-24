@@ -201,6 +201,7 @@ pub enum ArmInstId {
     PLD_imm,
     PLD_reg,
     SEV,
+    SEVL,
     WFE,
     WFI,
     YIELD,
@@ -213,6 +214,8 @@ pub enum ArmInstId {
     CDP,
     MRRC,
     MCRR,
+    LDC,
+    STC,
     // VFP load/store
     VPUSH,
     VPOP,
@@ -254,8 +257,14 @@ pub enum ArmInstId {
     VMOV_f64_u32,
     VMOV_u32_f32,
     VMOV_f32_u32,
+    VMOV_2u32_2f32,
+    VMOV_2f32_2u32,
+    VMOV_2u32_f64,
+    VMOV_f64_2u32,
     VMOV_from_i32,
     VMOV_to_i32,
+    VMSR,
+    VMRS,
     VFP_VDUP,
     // ASIMD
     ASIMD_VMOV_imm,
@@ -455,6 +464,10 @@ impl DecodedArm {
     pub fn coproc_opc1(&self) -> u32 {
         (self.raw >> 21) & 0x7
     }
+    /// Coprocessor data-processing opc1 (bits [23:20]) for CDP.
+    pub fn coproc_dp_opc1(&self) -> u32 {
+        (self.raw >> 20) & 0xF
+    }
     /// Coprocessor opc2 (bits [7:5]) for MCR/MRC.
     pub fn coproc_opc2(&self) -> u32 {
         (self.raw >> 5) & 0x7
@@ -477,30 +490,9 @@ impl DecodedArm {
         (self.raw >> 4) & 0xF
     }
 
-    /// Pack coprocessor info for MRRC/MCRR into a u64.
-    /// For two-register operations, the layout matches dynarmic's CoprocessorInfo
-    /// with `two=true` and opc in the opc1 slot.
-    pub fn pack_coproc_info_two(&self) -> u64 {
-        let cp = self.coproc_no() as u64;
-        let tw = 0u64; // "two" flag for MRRC/MCRR
-        let opc = self.mrrc_opc() as u64;
-        let crm = self.crm() as u64;
-        cp | (tw << 8) | (opc << 16) | (crm << 32)
-    }
-
-    /// Pack coprocessor info for MCR/MRC into a u64 matching dynarmic's
-    /// `CoprocessorInfo` layout (8 bytes packed as a u64).
-    ///
-    /// Byte layout: [0]=coproc_no, [1]=two, [2]=opc1, [3]=CRn,
-    ///              [4]=CRm, [5]=unused, [6]=opc2, [7]=unused
-    pub fn pack_coproc_info(&self, two: bool) -> u64 {
-        let cp = self.coproc_no() as u64;
-        let tw = if two { 1u64 } else { 0u64 };
-        let opc1 = self.coproc_opc1() as u64;
-        let crn = self.crn() as u64;
-        let crm = self.crm() as u64;
-        let opc2 = self.coproc_opc2() as u64;
-        cp | (tw << 8) | (opc1 << 16) | (crn << 24) | (crm << 32) | (opc2 << 48)
+    /// The `2` encoding selector used by unconditional-space coprocessor forms.
+    pub fn coproc_two(&self) -> bool {
+        self.cond() == Cond::NV
     }
 }
 
@@ -510,25 +502,40 @@ pub fn decode_arm(instr: u32) -> DecodedArm {
     let op1 = (instr >> 25) & 0x7;
     let op = (instr >> 4) & 0xF;
 
-    let id = match (cond_bits, op1) {
-        // Unconditional instructions (cond=0xF)
-        (0xF, _) => decode_arm_unconditional(instr),
-        // Data processing & misc
-        (_, 0b000) => decode_arm_dp_misc(instr),
-        (_, 0b001) => decode_arm_dp_imm_misc(instr),
-        // Load/Store immediate offset
-        (_, 0b010) => decode_arm_ls_imm(instr),
-        // Load/Store register offset
-        (_, 0b011) if op & 1 == 0 => decode_arm_ls_reg(instr),
-        (_, 0b011) => decode_arm_media(instr),
-        // Load/Store multiple
-        (_, 0b100) => decode_arm_ls_multi(instr),
-        // Branch
-        (_, 0b101) => decode_arm_branch(instr),
-        // Coprocessor / SVC
-        (_, 0b110) => decode_arm_coproc_ls(instr),
-        (_, 0b111) => decode_arm_coproc_svc(instr),
-        _ => ArmInstId::Unknown,
+    // Upstream arm.inc lists the architectural hint encodings before the
+    // data-processing-immediate family. The low-nibble values 6..=15 are
+    // reserved hints and, like upstream's catch-all entry, decode as NOP.
+    let id = if matches_arm(instr, 0x0FFF_FFF0, 0x0320_F000) {
+        match instr & 0xF {
+            0 => ArmInstId::NOP,
+            1 => ArmInstId::YIELD,
+            2 => ArmInstId::WFE,
+            3 => ArmInstId::WFI,
+            4 => ArmInstId::SEV,
+            5 => ArmInstId::SEVL,
+            _ => ArmInstId::NOP,
+        }
+    } else {
+        match (cond_bits, op1) {
+            // Unconditional instructions (cond=0xF)
+            (0xF, _) => decode_arm_unconditional(instr),
+            // Data processing & misc
+            (_, 0b000) => decode_arm_dp_misc(instr),
+            (_, 0b001) => decode_arm_dp_imm_misc(instr),
+            // Load/Store immediate offset
+            (_, 0b010) => decode_arm_ls_imm(instr),
+            // Load/Store register offset
+            (_, 0b011) if op & 1 == 0 => decode_arm_ls_reg(instr),
+            (_, 0b011) => decode_arm_media(instr),
+            // Load/Store multiple
+            (_, 0b100) => decode_arm_ls_multi(instr),
+            // Branch
+            (_, 0b101) => decode_arm_branch(instr),
+            // Coprocessor / SVC
+            (_, 0b110) => decode_arm_coproc_ls(instr),
+            (_, 0b111) => decode_arm_coproc_svc(instr),
+            _ => ArmInstId::Unknown,
+        }
     };
 
     DecodedArm { raw: instr, id }
@@ -766,6 +773,16 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
         _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B1_0300) => ArmInstId::ASIMD_VABS_int,
         // VCVT_integer: 111100111D11zz11dddd011oUQM0mmmm
         _ if matches_arm(instr, 0xFFB3_0E10, 0xF3B3_0600) => ArmInstId::ASIMD_VCVT_integer,
+        // Generic coprocessor instructions in the unconditional encoding space.
+        // Specific VFP/ASIMD encodings above retain priority, matching Eden's
+        // DecodeVFP/DecodeASIMD-before-DecodeArm dispatch order.
+        _ if matches_arm(instr, 0x0FF0_0000, 0x0C40_0000) => ArmInstId::MCRR,
+        _ if matches_arm(instr, 0x0FF0_0000, 0x0C50_0000) => ArmInstId::MRRC,
+        _ if matches_arm(instr, 0x0F10_0010, 0x0E00_0010) => ArmInstId::MCR,
+        _ if matches_arm(instr, 0x0F10_0010, 0x0E10_0010) => ArmInstId::MRC,
+        _ if matches_arm(instr, 0x0F00_0010, 0x0E00_0000) => ArmInstId::CDP,
+        _ if matches_arm(instr, 0x0E10_0000, 0x0C10_0000) => ArmInstId::LDC,
+        _ if matches_arm(instr, 0x0E10_0000, 0x0C00_0000) => ArmInstId::STC,
         // Barriers
         _ if instr & 0xFFFF_FFF0 == 0xF57F_F040 => ArmInstId::DSB,
         _ if instr & 0xFFFF_FFF0 == 0xF57F_F050 => ArmInstId::DMB,
@@ -1035,18 +1052,25 @@ fn decode_arm_extra_ls(instr: u32) -> ArmInstId {
     let op2 = (instr >> 5) & 3;
     let load = op1 & 1 != 0;
     let imm = op1 & 0x4 != 0; // bit 22
+    let rn = (instr >> 16) & 0xF;
+    let p = instr & (1 << 24) != 0;
+    let w = instr & (1 << 21) != 0;
 
     match (load, op2) {
         (false, 0b01) if imm => ArmInstId::STRH_imm,
         (false, 0b01) => ArmInstId::STRH_reg,
+        (false, 0b10) if imm && rn == 15 && p && !w => ArmInstId::LDRD_lit,
         (false, 0b10) if imm => ArmInstId::LDRD_imm,
         (false, 0b10) => ArmInstId::LDRD_reg,
         (false, 0b11) if imm => ArmInstId::STRD_imm,
         (false, 0b11) => ArmInstId::STRD_reg,
+        (true, 0b01) if imm && rn == 15 => ArmInstId::LDRH_lit,
         (true, 0b01) if imm => ArmInstId::LDRH_imm,
         (true, 0b01) => ArmInstId::LDRH_reg,
+        (true, 0b10) if imm && rn == 15 && p && !w => ArmInstId::LDRSB_lit,
         (true, 0b10) if imm => ArmInstId::LDRSB_imm,
         (true, 0b10) => ArmInstId::LDRSB_reg,
+        (true, 0b11) if imm && rn == 15 && p && !w => ArmInstId::LDRSH_lit,
         (true, 0b11) if imm => ArmInstId::LDRSH_imm,
         (true, 0b11) => ArmInstId::LDRSH_reg,
         _ => ArmInstId::Unknown,
@@ -1261,6 +1285,25 @@ fn decode_arm_vfp_coproc(instr: u32) -> Option<ArmInstId> {
         return None;
     }
 
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C40_0A10) {
+        return Some(ArmInstId::VMOV_2u32_2f32);
+    }
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C50_0A10) {
+        return Some(ArmInstId::VMOV_2f32_2u32);
+    }
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C40_0B10) {
+        return Some(ArmInstId::VMOV_2u32_f64);
+    }
+    if matches_arm(instr, 0x0FF0_0FD0, 0x0C50_0B10) {
+        return Some(ArmInstId::VMOV_f64_2u32);
+    }
+    if matches_arm(instr, 0x0FFF_0FFF, 0x0EE1_0A10) {
+        return Some(ArmInstId::VMSR);
+    }
+    if matches_arm(instr, 0x0FFF_0FFF, 0x0EF1_0A10) {
+        return Some(ArmInstId::VMRS);
+    }
+
     // Upstream decoder/vfp.inc ownership:
     //   VMLA:  cccc11100D00nnnndddd101zN0M0mmmm
     //   VMLS:  cccc11100D00nnnndddd101zN1M0mmmm
@@ -1404,6 +1447,10 @@ fn decode_arm_vfp_coproc(instr: u32) -> Option<ArmInstId> {
 
 fn decode_arm_coproc_ls(instr: u32) -> ArmInstId {
     // Category 0b110: coprocessor load/store and register transfers.
+    if let Some(vfp) = decode_arm_vfp_coproc(instr) {
+        return vfp;
+    }
+
     // MRRC/MCRR: bits [27:21] = 1100_010, bit[20] = L (1=MRRC, 0=MCRR)
     if instr & 0x0FE0_0000 == 0x0C40_0000 {
         return if instr & (1 << 20) != 0 {
@@ -1469,8 +1516,11 @@ fn decode_arm_coproc_ls(instr: u32) -> ArmInstId {
         };
     }
 
-    // Non-VFP LDC/STC — stub as Unknown
-    ArmInstId::Unknown
+    if instr & (1 << 20) != 0 {
+        ArmInstId::LDC
+    } else {
+        ArmInstId::STC
+    }
 }
 
 /// Expand an ARM immediate: 8-bit value rotated right by 2*rotate.
@@ -1563,6 +1613,42 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_arm_literal_loads_match_upstream_patterns() {
+        for (instruction, expected) in [
+            (0xE59F_0000, ArmInstId::LDR_lit),
+            (0xE5DF_0000, ArmInstId::LDRB_lit),
+            (0xE1DF_00B0, ArmInstId::LDRH_lit),
+            (0xE1DF_00D0, ArmInstId::LDRSB_lit),
+            (0xE1DF_00F0, ArmInstId::LDRSH_lit),
+            (0xE1CF_00D0, ArmInstId::LDRD_lit),
+        ] {
+            assert_eq!(
+                decode_arm(instruction).id,
+                expected,
+                "instruction 0x{instruction:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_invalid_pc_based_extra_loads_stay_immediate() {
+        // Eden's LDRD/LDRSB/LDRSH literal patterns require P=1 and W=0.
+        // Other PC-based encodings must reach their immediate visitors, which
+        // report UnpredictableInstruction.
+        for (instruction, expected) in [
+            (0xE0EF_00D0, ArmInstId::LDRD_imm),
+            (0xE0FF_00D0, ArmInstId::LDRSB_imm),
+            (0xE0FF_00F0, ArmInstId::LDRSH_imm),
+        ] {
+            assert_eq!(
+                decode_arm(instruction).id,
+                expected,
+                "instruction 0x{instruction:08X}"
+            );
+        }
+    }
+
+    #[test]
     fn test_decode_str_imm() {
         // STR R0, [R1, #4]
         let instr = 0xE581_0004;
@@ -1607,6 +1693,21 @@ mod tests {
         // Upstream arm_PLD_reg: 11110111uz01nnnn1111iiiiitt0mmmm.
         let dec = decode_arm(0xF795_F000);
         assert_eq!(dec.id, ArmInstId::PLD_reg);
+    }
+
+    #[test]
+    fn test_decode_arm_hints_match_upstream_priority() {
+        for (raw, expected) in [
+            (0xE320_F000, ArmInstId::NOP),
+            (0x1320_F001, ArmInstId::YIELD),
+            (0x2320_F002, ArmInstId::WFE),
+            (0x3320_F003, ArmInstId::WFI),
+            (0x4320_F004, ArmInstId::SEV),
+            (0x5320_F005, ArmInstId::SEVL),
+            (0xE320_F00F, ArmInstId::NOP),
+        ] {
+            assert_eq!(decode_arm(raw).id, expected);
+        }
     }
 
     #[test]
@@ -1665,6 +1766,42 @@ mod tests {
         assert_eq!(dec.rt2(), Reg::R3);
         assert_eq!(dec.mrrc_opc(), 0);
         assert_eq!(dec.crm(), 14);
+    }
+
+    #[test]
+    fn test_decode_generic_coprocessor_load_store() {
+        let ldc = decode_arm(0xEDB4_7F22);
+        assert_eq!(ldc.id, ArmInstId::LDC);
+        assert_eq!(ldc.rn(), Reg::R4);
+        assert_eq!(ldc.coproc_no(), 15);
+        assert_eq!(ldc.rd(), Reg::R7);
+        assert_eq!(ldc.imm8(), 0x22);
+
+        let stc = decode_arm(0xED24_7F22);
+        assert_eq!(stc.id, ArmInstId::STC);
+    }
+
+    #[test]
+    fn test_decode_unconditional_coprocessor_two_forms() {
+        assert_eq!(decode_arm(0xFE64_3F51).id, ArmInstId::MCR);
+        assert_eq!(decode_arm(0xFE74_3F51).id, ArmInstId::MRC);
+        assert_eq!(decode_arm(0xFEF4_3F41).id, ArmInstId::CDP);
+        assert_eq!(decode_arm(0xFC42_3F1E).id, ArmInstId::MCRR);
+        assert_eq!(decode_arm(0xFC52_3F1E).id, ArmInstId::MRRC);
+        assert_eq!(decode_arm(0xFDB4_7F22).id, ArmInstId::LDC);
+        assert_eq!(decode_arm(0xFD24_7F22).id, ArmInstId::STC);
+        assert_eq!(decode_arm(0xFC42_3A1E).id, ArmInstId::MCRR);
+        assert_eq!(decode_arm(0xFC52_3A1E).id, ArmInstId::MRRC);
+    }
+
+    #[test]
+    fn test_vfp_specific_patterns_precede_generic_coprocessor_patterns() {
+        assert_eq!(decode_arm(0xEC42_3A1E).id, ArmInstId::VMOV_2u32_2f32);
+        assert_eq!(decode_arm(0xEC52_3A1E).id, ArmInstId::VMOV_2f32_2u32);
+        assert_eq!(decode_arm(0xEC42_3B1E).id, ArmInstId::VMOV_2u32_f64);
+        assert_eq!(decode_arm(0xEC52_3B1E).id, ArmInstId::VMOV_f64_2u32);
+        assert_eq!(decode_arm(0xEEE1_0A10).id, ArmInstId::VMSR);
+        assert_eq!(decode_arm(0xEEF1_FA10).id, ArmInstId::VMRS);
     }
 
     #[test]

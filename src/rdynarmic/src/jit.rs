@@ -9,12 +9,21 @@ use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn, DEFAULT_CO
 use crate::backend::x64::callback::ArgCallback;
 use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig, RawExclusiveWriteCallbacks};
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
+use crate::frontend::a32::translate::translate_callbacks::UserCallbacksAdapter;
+use crate::frontend::a32::translate::TranslationOptions as A32TranslationOptions;
 use crate::frontend::a64::translate::TranslationOptions;
-use crate::halt_reason::HaltReason;
-use crate::ir::location::LocationDescriptor;
+use crate::interface::a32::config::{
+    UserCallbacks as A32UserCallbacks, UserConfig as A32UserConfig,
+};
+use crate::interface::a64::config::{
+    DataCacheOperation as A64DataCacheOperation, Exception as A64Exception,
+    InstructionCacheOperation as A64InstructionCacheOperation, UserCallbacks as A64UserCallbacks,
+    UserConfig as A64UserConfig,
+};
+use crate::interface::halt_reason::HaltReason;
 #[cfg(test)]
-use crate::jit_config::OptimizationFlag;
-use crate::jit_config::{JitConfig, UserCallbacks};
+use crate::interface::optimization_flags::OptimizationFlag;
+use crate::ir::location::LocationDescriptor;
 
 /// Public ARM64 JIT compiler.
 ///
@@ -30,11 +39,54 @@ pub struct A64Jit {
 struct JitInner {
     jit_state: A64JitState,
     emitter: Option<A64EmitX64>,
-    callbacks: Box<dyn UserCallbacks>,
+    callbacks: Box<dyn A64UserCallbacks>,
     run_code_fn: Option<RunCodeFn>,
     is_executing: bool,
-    global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+    global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
     processor_id: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct A64DummyCallbacks;
+
+#[cfg(target_arch = "aarch64")]
+impl A64UserCallbacks for A64DummyCallbacks {
+    fn memory_read_8(&self, _vaddr: u64) -> u8 {
+        0
+    }
+
+    fn memory_read_16(&self, _vaddr: u64) -> u16 {
+        0
+    }
+
+    fn memory_read_32(&self, _vaddr: u64) -> u32 {
+        0
+    }
+
+    fn memory_read_64(&self, _vaddr: u64) -> u64 {
+        0
+    }
+
+    fn memory_read_128(&self, _vaddr: u64) -> [u64; 2] {
+        [0; 2]
+    }
+
+    fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
+    fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
+    fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
+    fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
+    fn memory_write_128(&mut self, _vaddr: u64, _value: [u64; 2]) {}
+    fn call_svc(&mut self, _svc_num: u32) {}
+    fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
+    fn add_ticks(&mut self, _ticks: u64) {}
+
+    fn get_ticks_remaining(&self) -> u64 {
+        0
+    }
+
+    fn get_cntpct(&self) -> u64 {
+        0
+    }
 }
 
 fn a64_trace_registry() -> &'static Mutex<HashMap<usize, usize>> {
@@ -829,21 +881,6 @@ pub fn a32_pc_trace_target() -> Option<u64> {
     })
 }
 
-/// True when the per-instruction `RUZU_A32_PC_EXEC` hook is active. Cached so
-/// the `a32_pc_trace_hook` entry guard does not do a per-hit env lookup. The
-/// per-instruction hook (emitted by the A32 translator) shares the same
-/// aggregation as `RUZU_A32_PC_TRACE`, so the hook must NOT early-return when
-/// only `RUZU_A32_PC_EXEC` is set.
-pub fn a32_pc_exec_active() -> bool {
-    use std::sync::OnceLock;
-    static A: OnceLock<bool> = OnceLock::new();
-    *A.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_EXEC")
-            .ok()
-            .is_some_and(|s| !s.trim().is_empty())
-    })
-}
-
 /// Aggregated capture state: per-(r6 value) hit counts + last seen GPR snapshot.
 struct A32PcTraceAgg {
     total: u64,
@@ -1078,7 +1115,7 @@ fn a32_pc_trace_match_count() -> &'static std::sync::atomic::AtomicU64 {
 /// Reads the 16 GPRs, tallies r0/r6, and (if RUZU_A32_PC_TRACE_MEM set) reads
 /// guest memory at [rN+off] via fastmem_base. Buffered aggregate; no per-hit I/O.
 pub(crate) extern "C" fn a32_pc_trace_hook(jit_state_ptr: u64, fastmem_base: u64, tag: u64) {
-    if a32_pc_trace_target().is_none() && !a32_pc_exec_active() {
+    if a32_pc_trace_target().is_none() {
         return;
     }
     // The x64 and arm64 backends intentionally mirror their upstream JitState
@@ -1394,14 +1431,14 @@ impl A64Jit {
     ///
     /// This allocates the code buffer, generates the dispatcher prelude,
     /// and wires up all callback trampolines.
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: A64UserConfig) -> Result<Self, String> {
         #[cfg(target_arch = "aarch64")]
         {
             let arm64 = crate::backend::arm64::a64_interface::A64Interface::new(config)?;
             let inner = Box::new(JitInner {
                 jit_state: A64JitState::new(),
                 emitter: None,
-                callbacks: Box::new(A32DummyCallbacks),
+                callbacks: Box::new(A64DummyCallbacks),
                 run_code_fn: None,
                 is_executing: false,
                 global_monitor: None,
@@ -1420,11 +1457,7 @@ impl A64Jit {
             ));
         }
 
-        let cache_size = if config.code_cache_size > 0 {
-            config.code_cache_size
-        } else {
-            DEFAULT_CODE_SIZE
-        };
+        let cache_size = config.code_cache_size as usize;
         let effective_optimizations = config.effective_optimizations();
 
         // Phase 1: Create boxed JitInner with stable heap address
@@ -1435,7 +1468,7 @@ impl A64Jit {
             run_code_fn: None,
             is_executing: false,
             global_monitor: config.global_monitor,
-            processor_id: config.processor_id,
+            processor_id: config.processor_id as usize,
         });
         let halt_ptr = &inner.jit_state.halt_reason as *const u32;
         inner.callbacks.set_halt_reason_ptr(halt_ptr);
@@ -1466,7 +1499,9 @@ impl A64Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
-            page_table_pointer: config.page_table_pointer,
+            page_table_pointer: config
+                .page_table
+                .map(|pointer| pointer.cast::<u8>() as *const u8),
         };
 
         // Build EmitCallbacks (block-level callbacks for memory/system ops)
@@ -1513,10 +1548,6 @@ impl A64Jit {
             )),
             call_supervisor: Box::new(ArgCallback::new(
                 call_supervisor_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            interpreter_fallback: Box::new(ArgCallback::new(
-                interpreter_fallback_trampoline as usize as u64,
                 inner_ptr,
             )),
             exception_raised: Box::new(ArgCallback::new(
@@ -1594,6 +1625,7 @@ impl A64Jit {
         };
 
         let emit_config = EmitConfig {
+            coprocessors: crate::interface::a32::config::empty_coprocessors(),
             callbacks: emit_callbacks,
             raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
                 write_8: Box::new(ArgCallback::new(
@@ -1619,18 +1651,41 @@ impl A64Jit {
             }),
             enable_cycle_counting: config.enable_cycle_counting,
             memory: {
-                let mut m = config.memory.clone();
-                // `processor_id` lives at the top level of JitConfig but
-                // mirror it into MemoryEmitConfig so the helpers can read
-                // it via `ctx.config.memory.processor_id`.
-                m.processor_id = config.processor_id;
-                m
+                crate::backend::common::emit_context::MemoryEmitConfig {
+                    fastmem_address_space_bits: config.fastmem_address_space_bits as usize,
+                    silently_mirror_fastmem: config.silently_mirror_fastmem,
+                    fastmem_exclusive_access: config.fastmem_exclusive_access,
+                    recompile_on_exclusive_fastmem_failure: config
+                        .recompile_on_exclusive_fastmem_failure,
+                    recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+                    page_table_present: config.page_table.is_some(),
+                    page_table_address_space_bits: config.page_table_address_space_bits as usize,
+                    silently_mirror_page_table: config.silently_mirror_page_table,
+                    absolute_offset_page_table: config.absolute_offset_page_table,
+                    page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+                    page_table_log2_stride: config.page_table_log2_stride,
+                    detect_misaligned_access_via_page_table: config
+                        .detect_misaligned_access_via_page_table
+                        as u32,
+                    only_detect_misalignment_via_page_table_on_page_boundary: config
+                        .only_detect_misalignment_via_page_table_on_page_boundary,
+                    check_halt_on_memory_access: config.check_halt_on_memory_access,
+                    processor_id: config.processor_id as usize,
+                }
             },
             global_monitor: config.global_monitor,
             cntfrq_el0: config.cntfrq_el0,
+            ctr_el0: config.ctr_el0,
+            dczid_el0: config.dczid_el0,
+            hook_data_cache_operations: config.hook_data_cache_operations,
+            hook_isb: config.hook_isb,
         };
 
-        let translation_options = TranslationOptions::default();
+        let translation_options = TranslationOptions {
+            define_unpredictable_behaviour: config.define_unpredictable_behaviour,
+            wall_clock_cntpct: config.wall_clock_cntpct,
+            ..TranslationOptions::default()
+        };
 
         // Phase 3: Create the emitter (contains code buffer + dispatcher + cache)
         let mut emitter = A64EmitX64::new(
@@ -1643,7 +1698,7 @@ impl A64Jit {
         // Forward the per-emulator-core index so JIT-emit-time diagnostics
         // (e.g. RUZU_BLOCK_PROLOGUE_COUNT_PC) can address the correct slot
         // in their per-core counter array.
-        emitter.processor_id = config.processor_id;
+        emitter.processor_id = config.processor_id as usize;
 
         // Extract run_code function pointer
         let run_code_fn = unsafe { emitter.get_run_code_fn()? };
@@ -2173,7 +2228,7 @@ extern "C" fn memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
 
 fn memory_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     let inner = unsafe { &*(inner_ptr as *const JitInner) };
-    let (lo, hi) = inner.callbacks.memory_read_128(vaddr);
+    let [lo, hi] = inner.callbacks.memory_read_128(vaddr);
     Pair128 { lo, hi }
 }
 
@@ -2356,7 +2411,9 @@ extern "C" fn memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64)
 fn memory_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     maybe_log_watch_write(inner, vaddr, 16, value_lo, value_hi);
-    inner.callbacks.memory_write_128(vaddr, value_lo, value_hi);
+    inner
+        .callbacks
+        .memory_write_128(vaddr, [value_lo, value_hi]);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2378,29 +2435,29 @@ extern "C" fn memory_write_128_trampoline(inner_ptr: u64, vaddr: u64, value: *co
 // System trampolines
 extern "C" fn call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.call_supervisor(svc_num as u32);
-}
-
-extern "C" fn interpreter_fallback_trampoline(inner_ptr: u64, pc: u64, num_instructions: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner
-        .callbacks
-        .interpreter_fallback(pc, num_instructions as usize);
+    inner.callbacks.call_svc(svc_num as u32);
 }
 
 extern "C" fn exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.exception_raised(pc, exception);
+    inner
+        .callbacks
+        .exception_raised(pc, A64Exception::from_u32(exception as u32));
 }
 
 extern "C" fn data_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.data_cache_operation(op, vaddr);
+    inner
+        .callbacks
+        .data_cache_operation_raised(A64DataCacheOperation::from_u32(op as u32), vaddr);
 }
 
 extern "C" fn instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.instruction_cache_operation(op, vaddr);
+    inner.callbacks.instruction_cache_operation_raised(
+        A64InstructionCacheOperation::from_u32(op as u32),
+        vaddr,
+    );
 }
 
 extern "C" fn instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
@@ -2417,7 +2474,6 @@ extern "C" fn get_cntpct_trampoline(inner_ptr: u64) -> u64 {
 extern "C" fn exclusive_clear_trampoline(inner_ptr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner.jit_state.exclusive_state = 0;
-    inner.callbacks.exclusive_clear();
 }
 
 extern "C" fn exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
@@ -2426,12 +2482,11 @@ extern "C" fn exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let value = if let Some(monitor) = inner.global_monitor {
         let callbacks = &mut inner.callbacks;
         unsafe {
-            (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.exclusive_read_8(vaddr)
-            })
+            (&mut *monitor)
+                .read_and_mark(inner.processor_id, vaddr, || callbacks.memory_read_8(vaddr))
         }
     } else {
-        inner.callbacks.exclusive_read_8(vaddr)
+        inner.callbacks.memory_read_8(vaddr)
     };
     inner.jit_state.exclusive_value[0] = value as u64;
     value as u64
@@ -2444,11 +2499,11 @@ extern "C" fn exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
         let callbacks = &mut inner.callbacks;
         unsafe {
             (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.exclusive_read_16(vaddr)
+                callbacks.memory_read_16(vaddr)
             })
         }
     } else {
-        inner.callbacks.exclusive_read_16(vaddr)
+        inner.callbacks.memory_read_16(vaddr)
     };
     inner.jit_state.exclusive_value[0] = value as u64;
     value as u64
@@ -2461,11 +2516,11 @@ extern "C" fn exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
         let callbacks = &mut inner.callbacks;
         unsafe {
             (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.exclusive_read_32(vaddr)
+                callbacks.memory_read_32(vaddr)
             })
         }
     } else {
-        inner.callbacks.exclusive_read_32(vaddr)
+        inner.callbacks.memory_read_32(vaddr)
     };
     inner.jit_state.exclusive_value[0] = value as u64;
     value as u64
@@ -2478,11 +2533,11 @@ extern "C" fn exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
         let callbacks = &mut inner.callbacks;
         unsafe {
             (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                callbacks.exclusive_read_64(vaddr)
+                callbacks.memory_read_64(vaddr)
             })
         }
     } else {
-        inner.callbacks.exclusive_read_64(vaddr)
+        inner.callbacks.memory_read_64(vaddr)
     };
     inner.jit_state.exclusive_value[0] = value;
     value
@@ -2491,17 +2546,16 @@ extern "C" fn exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
 fn exclusive_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner.jit_state.exclusive_state = 1;
-    let (lo, hi) = if let Some(monitor) = inner.global_monitor {
+    let [lo, hi] = if let Some(monitor) = inner.global_monitor {
         let callbacks = &mut inner.callbacks;
         let value: [u64; 2] = unsafe {
             (&mut *monitor).read_and_mark(inner.processor_id, vaddr, || {
-                let (lo, hi) = callbacks.exclusive_read_128(vaddr);
-                [lo, hi]
+                callbacks.memory_read_128(vaddr)
             })
         };
-        (value[0], value[1])
+        value
     } else {
-        inner.callbacks.exclusive_read_128(vaddr)
+        inner.callbacks.memory_read_128(vaddr)
     };
     inner.jit_state.exclusive_value[0] = lo;
     inner.jit_state.exclusive_value[1] = hi;
@@ -2528,7 +2582,7 @@ extern "C" fn exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u6
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u8| {
-                callbacks.exclusive_write_8(vaddr, value as u8, expected)
+                callbacks.memory_write_exclusive_8(vaddr, value as u8, expected)
             })
         } {
             0
@@ -2539,7 +2593,7 @@ extern "C" fn exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u6
     let expected = inner.jit_state.exclusive_value[0] as u8;
     if inner
         .callbacks
-        .exclusive_write_8(vaddr, value as u8, expected)
+        .memory_write_exclusive_8(vaddr, value as u8, expected)
     {
         0
     } else {
@@ -2557,7 +2611,7 @@ extern "C" fn exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u16| {
-                callbacks.exclusive_write_16(vaddr, value as u16, expected)
+                callbacks.memory_write_exclusive_16(vaddr, value as u16, expected)
             })
         } {
             0
@@ -2568,7 +2622,7 @@ extern "C" fn exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u
     let expected = inner.jit_state.exclusive_value[0] as u16;
     if inner
         .callbacks
-        .exclusive_write_16(vaddr, value as u16, expected)
+        .memory_write_exclusive_16(vaddr, value as u16, expected)
     {
         0
     } else {
@@ -2586,7 +2640,7 @@ extern "C" fn exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u32| {
-                callbacks.exclusive_write_32(vaddr, value as u32, expected)
+                callbacks.memory_write_exclusive_32(vaddr, value as u32, expected)
             })
         } {
             0
@@ -2597,7 +2651,7 @@ extern "C" fn exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u
     let expected = inner.jit_state.exclusive_value[0] as u32;
     if inner
         .callbacks
-        .exclusive_write_32(vaddr, value as u32, expected)
+        .memory_write_exclusive_32(vaddr, value as u32, expected)
     {
         0
     } else {
@@ -2615,7 +2669,7 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
         let callbacks = &mut inner.callbacks;
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(inner.processor_id, vaddr, |expected: u64| {
-                callbacks.exclusive_write_64(vaddr, value, expected)
+                callbacks.memory_write_exclusive_64(vaddr, value, expected)
             })
         } {
             0
@@ -2624,7 +2678,10 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
         };
     }
     let expected = inner.jit_state.exclusive_value[0];
-    if inner.callbacks.exclusive_write_64(vaddr, value, expected) {
+    if inner
+        .callbacks
+        .memory_write_exclusive_64(vaddr, value, expected)
+    {
         0
     } else {
         1
@@ -2644,13 +2701,7 @@ fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi:
                 inner.processor_id,
                 vaddr,
                 |expected: [u64; 2]| {
-                    callbacks.exclusive_write_128(
-                        vaddr,
-                        value_lo,
-                        value_hi,
-                        expected[0],
-                        expected[1],
-                    )
+                    callbacks.memory_write_exclusive_128(vaddr, [value_lo, value_hi], expected)
                 },
             )
         } {
@@ -2661,10 +2712,11 @@ fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi:
     }
     let expected_lo = inner.jit_state.exclusive_value[0];
     let expected_hi = inner.jit_state.exclusive_value[1];
-    if inner
-        .callbacks
-        .exclusive_write_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
-    {
+    if inner.callbacks.memory_write_exclusive_128(
+        vaddr,
+        [value_lo, value_hi],
+        [expected_lo, expected_hi],
+    ) {
         0
     } else {
         1
@@ -2700,7 +2752,7 @@ extern "C" fn raw_exclusive_write_8_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner
         .callbacks
-        .exclusive_write_8(vaddr, value as u8, expected as u8) as u64
+        .memory_write_exclusive_8(vaddr, value as u8, expected as u8) as u64
 }
 
 extern "C" fn raw_exclusive_write_16_trampoline(
@@ -2712,7 +2764,7 @@ extern "C" fn raw_exclusive_write_16_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner
         .callbacks
-        .exclusive_write_16(vaddr, value as u16, expected as u16) as u64
+        .memory_write_exclusive_16(vaddr, value as u16, expected as u16) as u64
 }
 
 extern "C" fn raw_exclusive_write_32_trampoline(
@@ -2724,7 +2776,7 @@ extern "C" fn raw_exclusive_write_32_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     inner
         .callbacks
-        .exclusive_write_32(vaddr, value as u32, expected as u32) as u64
+        .memory_write_exclusive_32(vaddr, value as u32, expected as u32) as u64
 }
 
 extern "C" fn raw_exclusive_write_64_trampoline(
@@ -2734,7 +2786,9 @@ extern "C" fn raw_exclusive_write_64_trampoline(
     expected: u64,
 ) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    inner.callbacks.exclusive_write_64(vaddr, value, expected) as u64
+    inner
+        .callbacks
+        .memory_write_exclusive_64(vaddr, value, expected) as u64
 }
 
 extern "C" fn raw_exclusive_write_128_trampoline(
@@ -2748,7 +2802,7 @@ extern "C" fn raw_exclusive_write_128_trampoline(
     let expected = unsafe { *expected };
     inner
         .callbacks
-        .exclusive_write_128(vaddr, value[0], value[1], expected[0], expected[1]) as u64
+        .memory_write_exclusive_128(vaddr, value, expected) as u64
 }
 
 // ===========================================================================
@@ -2771,10 +2825,10 @@ pub struct A32Jit {
 struct A32JitInner {
     jit_state: A32JitState,
     emitter: Option<A32EmitX64>,
-    callbacks: Box<dyn UserCallbacks>,
+    callbacks: Box<dyn A32UserCallbacks>,
     run_code_fn: Option<RunCodeFn>,
     is_executing: bool,
-    global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+    global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
     processor_id: usize,
 }
 
@@ -2782,93 +2836,55 @@ struct A32JitInner {
 struct A32DummyCallbacks;
 
 #[cfg(target_arch = "aarch64")]
-impl UserCallbacks for A32DummyCallbacks {
-    fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
+impl A32UserCallbacks for A32DummyCallbacks {
+    fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
         None
     }
 
-    fn memory_read_8(&self, _vaddr: u64) -> u8 {
+    fn memory_read_8(&self, _vaddr: u32) -> u8 {
         0
     }
 
-    fn memory_read_16(&self, _vaddr: u64) -> u16 {
+    fn memory_read_16(&self, _vaddr: u32) -> u16 {
         0
     }
 
-    fn memory_read_32(&self, _vaddr: u64) -> u32 {
+    fn memory_read_32(&self, _vaddr: u32) -> u32 {
         0
     }
 
-    fn memory_read_64(&self, _vaddr: u64) -> u64 {
+    fn memory_read_64(&self, _vaddr: u32) -> u64 {
         0
     }
 
-    fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-        (0, 0)
-    }
+    fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
 
-    fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
+    fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
 
-    fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
+    fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
 
-    fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
+    fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
 
-    fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-
-    fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-
-    fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-        0
-    }
-
-    fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-        0
-    }
-
-    fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-        0
-    }
-
-    fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-        0
-    }
-
-    fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-        (0, 0)
-    }
-
-    fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
+    fn memory_write_exclusive_8(&mut self, _vaddr: u32, _value: u8, _expected: u8) -> bool {
         false
     }
 
-    fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
+    fn memory_write_exclusive_16(&mut self, _vaddr: u32, _value: u16, _expected: u16) -> bool {
         false
     }
 
-    fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
+    fn memory_write_exclusive_32(&mut self, _vaddr: u32, _value: u32, _expected: u32) -> bool {
         false
     }
 
-    fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
+    fn memory_write_exclusive_64(&mut self, _vaddr: u32, _value: u64, _expected: u64) -> bool {
         false
     }
 
-    fn exclusive_write_128(
-        &mut self,
-        _vaddr: u64,
-        _value_lo: u64,
-        _value_hi: u64,
-        _expected_lo: u64,
-        _expected_hi: u64,
-    ) -> bool {
-        false
+    fn call_svc(&mut self, _svc_num: u32) {}
+
+    fn exception_raised(&mut self, _pc: u32, _exception: crate::interface::a32::config::Exception) {
     }
-
-    fn exclusive_clear(&mut self) {}
-
-    fn call_supervisor(&mut self, _svc_num: u32) {}
-
-    fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
 
     fn add_ticks(&mut self, _ticks: u64) {}
 
@@ -2892,7 +2908,7 @@ impl A32Jit {
     }
 
     /// Create a new A32Jit from the given configuration.
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: A32UserConfig) -> Result<Self, String> {
         #[cfg(target_arch = "aarch64")]
         {
             let arm64 = crate::backend::arm64::a32_interface::A32Interface::new(config)?;
@@ -2920,7 +2936,7 @@ impl A32Jit {
         }
 
         let cache_size = if config.code_cache_size > 0 {
-            config.code_cache_size
+            config.code_cache_size as usize
         } else {
             DEFAULT_CODE_SIZE
         };
@@ -2933,7 +2949,7 @@ impl A32Jit {
             run_code_fn: None,
             is_executing: false,
             global_monitor: config.global_monitor,
-            processor_id: config.processor_id,
+            processor_id: config.processor_id as usize,
         });
 
         // Wire the halt_reason pointer into callbacks so they can halt execution
@@ -2960,7 +2976,9 @@ impl A32Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
-            page_table_pointer: config.page_table_pointer,
+            page_table_pointer: config
+                .page_table
+                .map(|pointer| pointer.cast::<u8>() as *const u8),
         };
 
         let emit_callbacks = EmitCallbacks {
@@ -2981,7 +2999,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             memory_read_128: Box::new(ArgCallback::new(
-                a32_memory_read_128_trampoline as usize as u64,
+                a32_unreachable_read_128_trampoline as usize as u64,
                 inner_ptr,
             )),
             memory_write_8: Box::new(ArgCallback::new(
@@ -3001,15 +3019,11 @@ impl A32Jit {
                 inner_ptr,
             )),
             memory_write_128: Box::new(ArgCallback::new(
-                a32_memory_write_128_trampoline as usize as u64,
+                a32_unreachable_write_128_trampoline as usize as u64,
                 inner_ptr,
             )),
             call_supervisor: Box::new(ArgCallback::new(
                 a32_call_supervisor_trampoline as usize as u64,
-                inner_ptr,
-            )),
-            interpreter_fallback: Box::new(ArgCallback::new(
-                a32_interpreter_fallback_trampoline as usize as u64,
                 inner_ptr,
             )),
             exception_raised: Box::new(ArgCallback::new(
@@ -3017,11 +3031,11 @@ impl A32Jit {
                 inner_ptr,
             )),
             data_cache_operation: Box::new(ArgCallback::new(
-                a32_data_cache_op_trampoline as usize as u64,
+                a32_unreachable_cache_operation_trampoline as usize as u64,
                 inner_ptr,
             )),
             instruction_cache_operation: Box::new(ArgCallback::new(
-                a32_instruction_cache_op_trampoline as usize as u64,
+                a32_unreachable_cache_operation_trampoline as usize as u64,
                 inner_ptr,
             )),
             instruction_synchronization_barrier: Box::new(ArgCallback::new(
@@ -3037,7 +3051,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             get_cntpct: Box::new(ArgCallback::new(
-                a32_get_cntpct_trampoline as usize as u64,
+                a32_unreachable_get_cntpct_trampoline as usize as u64,
                 inner_ptr,
             )),
             exclusive_clear: Box::new(ArgCallback::new(
@@ -3061,7 +3075,7 @@ impl A32Jit {
                 inner_ptr,
             )),
             exclusive_read_128: Box::new(ArgCallback::new(
-                a32_exclusive_read_128_trampoline as usize as u64,
+                a32_unreachable_read_128_trampoline as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_8: Box::new(ArgCallback::new(
@@ -3081,12 +3095,13 @@ impl A32Jit {
                 inner_ptr,
             )),
             exclusive_write_128: Box::new(ArgCallback::new(
-                a32_exclusive_write_128_trampoline as usize as u64,
+                a32_unreachable_write_128_trampoline as usize as u64,
                 inner_ptr,
             )),
         };
 
         let emit_config = EmitConfig {
+            coprocessors: config.coprocessors.clone(),
             callbacks: emit_callbacks,
             raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
                 write_8: Box::new(ArgCallback::new(
@@ -3106,7 +3121,7 @@ impl A32Jit {
                     inner_ptr,
                 )),
                 write_128: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_128_trampoline as usize as u64,
+                    a32_unreachable_raw_exclusive_write_128_trampoline as usize as u64,
                     inner_ptr,
                 )),
             }),
@@ -3114,24 +3129,46 @@ impl A32Jit {
             // A32 memory emission uses the same fastmem/page-table policy as
             // upstream Dynarmic::A32::UserConfig. Preserve the caller-provided
             // settings instead of falling back to default 64-bit mirroring.
-            memory: {
-                let mut m = config.memory.clone();
-                m.processor_id = config.processor_id;
-                m.fastmem_exclusive_access = m.fastmem_exclusive_access
-                    && config.fastmem_pointer.is_some()
-                    && config.global_monitor.is_some();
-                m
+            memory: crate::backend::common::emit_context::MemoryEmitConfig {
+                fastmem_address_space_bits: 32,
+                silently_mirror_fastmem: true,
+                fastmem_exclusive_access: config.fastmem_exclusive_access,
+                recompile_on_exclusive_fastmem_failure: config
+                    .recompile_on_exclusive_fastmem_failure,
+                recompile_on_fastmem_failure: config.recompile_on_fastmem_failure,
+                page_table_present: config.page_table.is_some(),
+                page_table_address_space_bits: 32,
+                silently_mirror_page_table: true,
+                absolute_offset_page_table: config.absolute_offset_page_table,
+                page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
+                page_table_log2_stride: config.page_table_log2_stride,
+                detect_misaligned_access_via_page_table: config
+                    .detect_misaligned_access_via_page_table
+                    as u32,
+                only_detect_misalignment_via_page_table_on_page_boundary: config
+                    .only_detect_misalignment_via_page_table_on_page_boundary,
+                check_halt_on_memory_access: config.check_halt_on_memory_access,
+                processor_id: config.processor_id as usize,
             },
             global_monitor: config.global_monitor,
             // Unused by A32 (CNTFRQ is a CP15 read there), but the shared
             // EmitConfig carries it; forward the configured value anyway.
-            cntfrq_el0: config.cntfrq_el0,
+            cntfrq_el0: 600_000_000,
+            ctr_el0: 0x8444_c004,
+            dczid_el0: 4,
+            hook_data_cache_operations: false,
+            hook_isb: config.hook_isb,
         };
 
         let mut emitter = A32EmitX64::new(
             emit_config,
             run_callbacks,
             effective_optimizations,
+            A32TranslationOptions {
+                arch_version: config.arch_version,
+                define_unpredictable_behaviour: config.define_unpredictable_behaviour,
+                hook_hint_instructions: config.hook_hint_instructions,
+            },
             cache_size,
         )?;
 
@@ -3167,7 +3204,7 @@ impl A32Jit {
         // does it compile (with EnableWriting/DisableWriting inside Emit()).
         // RunCode() just calls the stored function pointer — no mprotect ever.
         let location = LocationDescriptor::new(self.inner.jit_state.get_unique_hash());
-        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
         let emitter = self.inner.emitter.as_mut().unwrap();
 
         // Fast path: block already compiled — no mprotect needed.
@@ -3175,16 +3212,13 @@ impl A32Jit {
             ptr
         } else {
             // Slow path: need to compile — toggle W^X protections.
-            let read_code = move |vaddr: u32| -> Option<u32> {
-                let inner = unsafe { &*inner_ptr };
-                inner.callbacks.memory_read_code(vaddr as u64)
-            };
-            let is_read_only = move |vaddr: u32| -> bool {
-                let inner = unsafe { &*inner_ptr };
-                inner.callbacks.is_read_only_memory(vaddr)
-            };
+            let callbacks = unsafe { &*callbacks_ptr };
+            let translate_callbacks = UserCallbacksAdapter::new(callbacks);
+            let is_read_only =
+                move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
             let _ = emitter.make_writable();
-            let ptr = emitter.get_or_compile_block_with_ro(location, &read_code, &is_read_only);
+            let ptr =
+                emitter.get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
             // Restore RX after compilation.
             let _ = unsafe { emitter.get_run_code_fn() };
             ptr
@@ -3225,27 +3259,22 @@ impl A32Jit {
         );
         let location = a32_loc.set_single_stepping(true).to_location();
 
-        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
 
         if let Some(ref mut emitter) = self.inner.emitter {
             let _ = emitter.make_writable();
         }
 
-        let read_code = move |vaddr: u32| -> Option<u32> {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.memory_read_code(vaddr as u64)
-        };
-        let is_read_only = move |vaddr: u32| -> bool {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.is_read_only_memory(vaddr)
-        };
+        let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
+        let is_read_only =
+            move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
 
         let code_ptr = self
             .inner
             .emitter
             .as_mut()
             .unwrap()
-            .get_or_compile_block_with_ro(location, &read_code, &is_read_only);
+            .get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
 
         let step_fn = {
             let emitter = self.inner.emitter.as_mut().unwrap();
@@ -3432,50 +3461,6 @@ impl A32Jit {
         self.inner.jit_state.ext_reg[index] = value;
     }
 
-    /// Get CP15 TPIDR_UPRW (User Read/Write Thread Pointer).
-    /// Matching dynarmic's `DynarmicCP15::uprw`.
-    pub fn get_cp15_uprw(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.cp15_uprw();
-        }
-
-        self.inner.jit_state.cp15_uprw
-    }
-
-    /// Set CP15 TPIDR_UPRW (User Read/Write Thread Pointer).
-    pub fn set_cp15_uprw(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_cp15_uprw(value);
-            return;
-        }
-
-        self.inner.jit_state.cp15_uprw = value;
-    }
-
-    /// Get CP15 TPIDR_URO (User Read-Only Thread Pointer).
-    /// Matching dynarmic's `DynarmicCP15::uro`.
-    pub fn get_cp15_uro(&self) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_ref() {
-            return arm64.cp15_uro();
-        }
-
-        self.inner.jit_state.cp15_uro
-    }
-
-    /// Set CP15 TPIDR_URO (User Read-Only Thread Pointer).
-    pub fn set_cp15_uro(&mut self, value: u32) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(arm64) = self.arm64.as_mut() {
-            arm64.set_cp15_uro(value);
-            return;
-        }
-
-        self.inner.jit_state.cp15_uro = value;
-    }
-
     /// Get CNTPCT (Physical Count Timer) value.
     pub fn get_cntpct(&self) -> u64 {
         #[cfg(target_arch = "aarch64")]
@@ -3562,26 +3547,21 @@ impl A32Jit {
         );
         let location = a32_loc.to_location();
 
-        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+        let callbacks_ptr = self.inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
 
         if let Some(ref mut emitter) = self.inner.emitter {
             let _ = emitter.make_writable();
         }
 
-        let read_code = move |vaddr: u32| -> Option<u32> {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.memory_read_code(vaddr as u64)
-        };
-        let is_read_only = move |vaddr: u32| -> bool {
-            let inner = unsafe { &*inner_ptr };
-            inner.callbacks.is_read_only_memory(vaddr)
-        };
+        let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
+        let is_read_only =
+            move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
 
         self.inner
             .emitter
             .as_mut()
             .unwrap()
-            .get_or_compile_block_with_ro(location, &read_code, &is_read_only)
+            .get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only)
     }
 }
 
@@ -3764,7 +3744,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
             let mut buf = format!("[TRACK] r4=0x{:08X}", r4);
             for &off in track_offsets() {
                 let addr = r4.wrapping_add(off);
-                let v = inner.callbacks.memory_read_32(addr as u64);
+                let v = inner.callbacks.memory_read_32(addr);
                 use std::fmt::Write;
                 let _ = write!(buf, " *(this+0x{:x})=0x{:08X}", off, v);
             }
@@ -3780,7 +3760,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
             for off in (0..size).step_by(4) {
                 let word = inner
                     .callbacks
-                    .memory_read_32(base.wrapping_add(off as u32) as u64);
+                    .memory_read_32(base.wrapping_add(off as u32));
                 for i in 0..4.min(size - off) {
                     bytes.push(((word >> (i * 8)) & 0xff) as u8);
                 }
@@ -3831,7 +3811,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
             let n = block_trace_code_words();
             if n > 0 {
                 for i in 0..n {
-                    let vaddr = pc.wrapping_add((i * 4) as u32) as u64;
+                    let vaddr = pc.wrapping_add((i * 4) as u32);
                     let word = inner.callbacks.memory_read_code(vaddr).unwrap_or(0);
                     eprintln!("        code[0x{:08X}] = 0x{:08X}", vaddr as u32, word);
                 }
@@ -3841,6 +3821,7 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
 
     let location = LocationDescriptor::new(inner.jit_state.get_unique_hash());
 
+    let callbacks_ptr = inner.callbacks.as_ref() as *const dyn A32UserCallbacks;
     let emitter = inner.emitter.as_mut().unwrap();
 
     // Fast path: block already compiled — no mprotect needed.
@@ -3849,17 +3830,13 @@ extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
     }
 
     // Slow path: compile new block
-    let read_code = move |vaddr: u32| -> Option<u32> {
-        let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-        inner.callbacks.memory_read_code(vaddr as u64)
-    };
-    let is_read_only = move |vaddr: u32| -> bool {
-        let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-        inner.callbacks.is_read_only_memory(vaddr)
-    };
+    let translate_callbacks = UserCallbacksAdapter::new(unsafe { &*callbacks_ptr });
+    let is_read_only =
+        move |vaddr: u32| -> bool { unsafe { &*callbacks_ptr }.is_read_only_memory(vaddr) };
 
     let _ = emitter.make_writable();
-    let code_ptr = emitter.get_or_compile_block_with_ro(location, &read_code, &is_read_only);
+    let code_ptr =
+        emitter.get_or_compile_block_with_ro(location, &translate_callbacks, &is_read_only);
     let _ = unsafe { emitter.get_run_code_fn() };
     code_ptr as u64
 }
@@ -3890,9 +3867,8 @@ extern "C" fn a32_memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
     a32_callbacks::memory_read_64(inner.callbacks.as_ref(), vaddr)
 }
-extern "C" fn a32_memory_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: u64) {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::memory_read_128(inner.callbacks.as_ref(), vaddr, ret_ptr);
+extern "C" fn a32_unreachable_read_128_trampoline(_inner_ptr: u64, _vaddr: u64, _ret_ptr: u64) {
+    unreachable!("A32 has no 128-bit memory callback")
 }
 
 extern "C" fn a32_memory_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
@@ -3915,36 +3891,25 @@ extern "C" fn a32_memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: 
     maybe_log_a32_watch_write(inner, vaddr, 8, value, 0);
     a32_callbacks::memory_write_64(inner.callbacks.as_mut(), vaddr, value);
 }
-extern "C" fn a32_memory_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
+extern "C" fn a32_unreachable_write_128_trampoline(
+    _inner_ptr: u64,
+    _vaddr: u64,
+    _value_lo: u64,
+    _value_hi: u64,
 ) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    maybe_log_a32_watch_write(inner, vaddr, 16, value_lo, value_hi);
-    a32_callbacks::memory_write_128(inner.callbacks.as_mut(), vaddr, value_lo, value_hi);
+    unreachable!("A32 has no 128-bit memory callback")
 }
 
 extern "C" fn a32_call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     a32_callbacks::call_supervisor(inner.callbacks.as_mut(), svc_num);
 }
-extern "C" fn a32_interpreter_fallback_trampoline(inner_ptr: u64, pc: u64, num_instructions: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::interpreter_fallback(inner.callbacks.as_mut(), pc, num_instructions);
-}
 extern "C" fn a32_exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     a32_callbacks::exception_raised(inner.callbacks.as_mut(), pc, exception);
 }
-extern "C" fn a32_data_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::data_cache_operation(inner.callbacks.as_mut(), op, vaddr);
-}
-extern "C" fn a32_instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::instruction_cache_operation(inner.callbacks.as_mut(), op, vaddr);
+extern "C" fn a32_unreachable_cache_operation_trampoline(_inner_ptr: u64, _op: u64, _vaddr: u64) {
+    unreachable!("A32 has no A64 cache-operation callback")
 }
 
 extern "C" fn a32_instruction_synchronization_barrier_trampoline(inner_ptr: u64) {
@@ -3952,14 +3917,13 @@ extern "C" fn a32_instruction_synchronization_barrier_trampoline(inner_ptr: u64)
     inner.callbacks.instruction_synchronization_barrier_raised();
 }
 
-extern "C" fn a32_get_cntpct_trampoline(inner_ptr: u64) -> u64 {
-    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
-    a32_callbacks::get_cntpct(inner.callbacks.as_ref())
+extern "C" fn a32_unreachable_get_cntpct_trampoline(_inner_ptr: u64) -> u64 {
+    unreachable!("A32 has no GetCNTPCT callback")
 }
 
 extern "C" fn a32_exclusive_clear_trampoline(inner_ptr: u64) {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_clear(&mut inner.jit_state, inner.callbacks.as_mut());
+    a32_callbacks::exclusive_clear(&mut inner.jit_state);
 }
 extern "C" fn a32_exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
@@ -4000,17 +3964,6 @@ extern "C" fn a32_exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u6
         inner.processor_id,
         vaddr,
     )
-}
-extern "C" fn a32_exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: u64) {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_read_128(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        ret_ptr,
-    );
 }
 extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
@@ -4057,24 +4010,6 @@ extern "C" fn a32_exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, valu
         value,
     )
 }
-extern "C" fn a32_exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    a32_callbacks::exclusive_write_128(
-        &mut inner.jit_state,
-        inner.callbacks.as_mut(),
-        inner.global_monitor,
-        inner.processor_id,
-        vaddr,
-        value_lo,
-        value_hi,
-    )
-}
-
 extern "C" fn a32_raw_exclusive_write_8_trampoline(
     inner_ptr: u64,
     vaddr: u64,
@@ -4084,7 +4019,7 @@ extern "C" fn a32_raw_exclusive_write_8_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     inner
         .callbacks
-        .exclusive_write_8(vaddr, value as u8, expected as u8) as u64
+        .memory_write_exclusive_8(vaddr as u32, value as u8, expected as u8) as u64
 }
 
 extern "C" fn a32_raw_exclusive_write_16_trampoline(
@@ -4096,7 +4031,7 @@ extern "C" fn a32_raw_exclusive_write_16_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     inner
         .callbacks
-        .exclusive_write_16(vaddr, value as u16, expected as u16) as u64
+        .memory_write_exclusive_16(vaddr as u32, value as u16, expected as u16) as u64
 }
 
 extern "C" fn a32_raw_exclusive_write_32_trampoline(
@@ -4108,7 +4043,7 @@ extern "C" fn a32_raw_exclusive_write_32_trampoline(
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     inner
         .callbacks
-        .exclusive_write_32(vaddr, value as u32, expected as u32) as u64
+        .memory_write_exclusive_32(vaddr as u32, value as u32, expected as u32) as u64
 }
 
 extern "C" fn a32_raw_exclusive_write_64_trampoline(
@@ -4118,21 +4053,18 @@ extern "C" fn a32_raw_exclusive_write_64_trampoline(
     expected: u64,
 ) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    inner.callbacks.exclusive_write_64(vaddr, value, expected) as u64
-}
-
-extern "C" fn a32_raw_exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value: *const [u64; 2],
-    expected: *const [u64; 2],
-) -> u64 {
-    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
-    let value = unsafe { *value };
-    let expected = unsafe { *expected };
     inner
         .callbacks
-        .exclusive_write_128(vaddr, value[0], value[1], expected[0], expected[1]) as u64
+        .memory_write_exclusive_64(vaddr as u32, value, expected) as u64
+}
+
+extern "C" fn a32_unreachable_raw_exclusive_write_128_trampoline(
+    _inner_ptr: u64,
+    _vaddr: u64,
+    _value: *const [u64; 2],
+    _expected: *const [u64; 2],
+) -> u64 {
+    unreachable!("A32 has no 128-bit exclusive-write callback")
 }
 
 #[cfg(test)]
@@ -4201,6 +4133,8 @@ mod tests {
         last_svc: Option<u32>,
         svc_sink: Option<Arc<AtomicU32>>,
         isb_sink: Option<Arc<AtomicU32>>,
+        data_cache_sink: Option<Arc<Mutex<Vec<(u64, u64)>>>>,
+        instruction_cache_sink: Option<Arc<Mutex<Vec<(u64, u64)>>>>,
         memory_read_address_sink: Option<Arc<AtomicU64>>,
         memory_read_64_count: Option<Arc<AtomicU64>>,
         halt_reason_ptr: Option<usize>,
@@ -4223,6 +4157,8 @@ mod tests {
                 last_svc: None,
                 svc_sink: None,
                 isb_sink: None,
+                data_cache_sink: None,
+                instruction_cache_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4239,6 +4175,8 @@ mod tests {
                 last_svc: None,
                 svc_sink: None,
                 isb_sink: None,
+                data_cache_sink: None,
+                instruction_cache_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4255,6 +4193,8 @@ mod tests {
                 last_svc: None,
                 svc_sink: None,
                 isb_sink: None,
+                data_cache_sink: None,
+                instruction_cache_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4284,6 +4224,8 @@ mod tests {
                 last_svc: None,
                 svc_sink: Some(svc_sink),
                 isb_sink: None,
+                data_cache_sink: None,
+                instruction_cache_sink: None,
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
@@ -4307,9 +4249,21 @@ mod tests {
             callbacks.isb_sink = Some(isb_sink);
             callbacks
         }
+
+        fn with_cache_operation_sinks(
+            base_addr: u64,
+            code: &[u32],
+            data_cache_sink: Arc<Mutex<Vec<(u64, u64)>>>,
+            instruction_cache_sink: Arc<Mutex<Vec<(u64, u64)>>>,
+        ) -> Self {
+            let mut callbacks = Self::new(base_addr, code);
+            callbacks.data_cache_sink = Some(data_cache_sink);
+            callbacks.instruction_cache_sink = Some(instruction_cache_sink);
+            callbacks
+        }
     }
 
-    impl UserCallbacks for MockCallbacks {
+    impl MockCallbacks {
         fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
             let offset = vaddr.wrapping_sub(self.base_addr) as usize;
             let memory = self.memory.lock().expect("mock memory poisoned");
@@ -4400,21 +4354,6 @@ mod tests {
             self.memory_write_64(vaddr + 8, hi);
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
         fn exclusive_write_8(&mut self, vaddr: u64, value: u8, _expected: u8) -> bool {
             self.memory_write_8(vaddr, value);
             true
@@ -4442,8 +4381,6 @@ mod tests {
             self.memory_write_128(vaddr, lo, hi);
             true
         }
-        fn exclusive_clear(&mut self) {}
-
         fn call_supervisor(&mut self, svc_num: u32) {
             self.last_svc = Some(svc_num);
             if let Some(ref sink) = self.svc_sink {
@@ -4464,6 +4401,22 @@ mod tests {
             }
         }
 
+        fn data_cache_operation(&mut self, op: u64, vaddr: u64) {
+            if let Some(ref sink) = self.data_cache_sink {
+                sink.lock()
+                    .expect("data-cache sink poisoned")
+                    .push((op, vaddr));
+            }
+        }
+
+        fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {
+            if let Some(ref sink) = self.instruction_cache_sink {
+                sink.lock()
+                    .expect("instruction-cache sink poisoned")
+                    .push((op, vaddr));
+            }
+        }
+
         fn get_cntpct(&self) -> u64 {
             self.cntpct
         }
@@ -4477,6 +4430,207 @@ mod tests {
 
         fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
             self.halt_reason_ptr = Some(ptr as usize);
+        }
+    }
+
+    impl A64UserCallbacks for MockCallbacks {
+        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+            MockCallbacks::memory_read_code(self, vaddr)
+        }
+
+        fn memory_read_8(&self, vaddr: u64) -> u8 {
+            MockCallbacks::memory_read_8(self, vaddr)
+        }
+
+        fn memory_read_16(&self, vaddr: u64) -> u16 {
+            MockCallbacks::memory_read_16(self, vaddr)
+        }
+
+        fn memory_read_32(&self, vaddr: u64) -> u32 {
+            MockCallbacks::memory_read_32(self, vaddr)
+        }
+
+        fn memory_read_64(&self, vaddr: u64) -> u64 {
+            MockCallbacks::memory_read_64(self, vaddr)
+        }
+
+        fn memory_read_128(&self, vaddr: u64) -> [u64; 2] {
+            let (lo, hi) = MockCallbacks::memory_read_128(self, vaddr);
+            [lo, hi]
+        }
+
+        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+            MockCallbacks::memory_write_8(self, vaddr, value);
+        }
+
+        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+            MockCallbacks::memory_write_16(self, vaddr, value);
+        }
+
+        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+            MockCallbacks::memory_write_32(self, vaddr, value);
+        }
+
+        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+            MockCallbacks::memory_write_64(self, vaddr, value);
+        }
+
+        fn memory_write_128(&mut self, vaddr: u64, value: [u64; 2]) {
+            MockCallbacks::memory_write_128(self, vaddr, value[0], value[1]);
+        }
+
+        fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+            MockCallbacks::exclusive_write_8(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+            MockCallbacks::exclusive_write_16(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+            MockCallbacks::exclusive_write_32(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+            MockCallbacks::exclusive_write_64(self, vaddr, value, expected)
+        }
+
+        fn memory_write_exclusive_128(
+            &mut self,
+            vaddr: u64,
+            value: [u64; 2],
+            expected: [u64; 2],
+        ) -> bool {
+            MockCallbacks::exclusive_write_128(
+                self,
+                vaddr,
+                value[0],
+                value[1],
+                expected[0],
+                expected[1],
+            )
+        }
+
+        fn call_svc(&mut self, swi: u32) {
+            MockCallbacks::call_supervisor(self, swi);
+        }
+
+        fn exception_raised(&mut self, pc: u64, exception: A64Exception) {
+            MockCallbacks::exception_raised(self, pc, exception as u64);
+        }
+
+        fn data_cache_operation_raised(&mut self, op: A64DataCacheOperation, value: u64) {
+            MockCallbacks::data_cache_operation(self, op as u64, value);
+        }
+
+        fn instruction_cache_operation_raised(
+            &mut self,
+            op: A64InstructionCacheOperation,
+            value: u64,
+        ) {
+            MockCallbacks::instruction_cache_operation(self, op as u64, value);
+        }
+
+        fn instruction_synchronization_barrier_raised(&mut self) {
+            MockCallbacks::instruction_synchronization_barrier_raised(self);
+        }
+
+        fn add_ticks(&mut self, ticks: u64) {
+            MockCallbacks::add_ticks(self, ticks);
+        }
+
+        fn get_ticks_remaining(&self) -> u64 {
+            MockCallbacks::get_ticks_remaining(self)
+        }
+
+        fn get_cntpct(&self) -> u64 {
+            MockCallbacks::get_cntpct(self)
+        }
+
+        fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
+            MockCallbacks::set_halt_reason_ptr(self, ptr);
+        }
+    }
+
+    impl A32UserCallbacks for MockCallbacks {
+        fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
+            MockCallbacks::memory_read_code(self, vaddr as u64)
+        }
+
+        fn memory_read_8(&self, vaddr: u32) -> u8 {
+            MockCallbacks::memory_read_8(self, vaddr as u64)
+        }
+
+        fn memory_read_16(&self, vaddr: u32) -> u16 {
+            MockCallbacks::memory_read_16(self, vaddr as u64)
+        }
+
+        fn memory_read_32(&self, vaddr: u32) -> u32 {
+            MockCallbacks::memory_read_32(self, vaddr as u64)
+        }
+
+        fn memory_read_64(&self, vaddr: u32) -> u64 {
+            MockCallbacks::memory_read_64(self, vaddr as u64)
+        }
+
+        fn memory_write_8(&mut self, vaddr: u32, value: u8) {
+            MockCallbacks::memory_write_8(self, vaddr as u64, value);
+        }
+
+        fn memory_write_16(&mut self, vaddr: u32, value: u16) {
+            MockCallbacks::memory_write_16(self, vaddr as u64, value);
+        }
+
+        fn memory_write_32(&mut self, vaddr: u32, value: u32) {
+            MockCallbacks::memory_write_32(self, vaddr as u64, value);
+        }
+
+        fn memory_write_64(&mut self, vaddr: u32, value: u64) {
+            MockCallbacks::memory_write_64(self, vaddr as u64, value);
+        }
+
+        fn memory_write_exclusive_8(&mut self, vaddr: u32, value: u8, expected: u8) -> bool {
+            MockCallbacks::exclusive_write_8(self, vaddr as u64, value, expected)
+        }
+
+        fn memory_write_exclusive_16(&mut self, vaddr: u32, value: u16, expected: u16) -> bool {
+            MockCallbacks::exclusive_write_16(self, vaddr as u64, value, expected)
+        }
+
+        fn memory_write_exclusive_32(&mut self, vaddr: u32, value: u32, expected: u32) -> bool {
+            MockCallbacks::exclusive_write_32(self, vaddr as u64, value, expected)
+        }
+
+        fn memory_write_exclusive_64(&mut self, vaddr: u32, value: u64, expected: u64) -> bool {
+            MockCallbacks::exclusive_write_64(self, vaddr as u64, value, expected)
+        }
+
+        fn call_svc(&mut self, swi: u32) {
+            MockCallbacks::call_supervisor(self, swi);
+        }
+
+        fn exception_raised(
+            &mut self,
+            pc: u32,
+            exception: crate::interface::a32::config::Exception,
+        ) {
+            MockCallbacks::exception_raised(self, pc as u64, exception.as_u32() as u64);
+        }
+
+        fn instruction_synchronization_barrier_raised(&mut self) {
+            MockCallbacks::instruction_synchronization_barrier_raised(self);
+        }
+
+        fn add_ticks(&mut self, ticks: u64) {
+            MockCallbacks::add_ticks(self, ticks);
+        }
+
+        fn get_ticks_remaining(&self) -> u64 {
+            MockCallbacks::get_ticks_remaining(self)
+        }
+
+        fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
+            MockCallbacks::set_halt_reason_ptr(self, ptr);
         }
     }
 
@@ -4501,23 +4655,20 @@ mod tests {
         let mapping = TestFastmemMapping::new(0x10_000);
         mapping.map_u32(0x2000, 0xCAFE_BABE);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: Some(mapping.ptr.cast()),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(mapping.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(0, 0x2000);
         jit.set_register(3, 0x4000);
@@ -4567,32 +4718,23 @@ mod tests {
         mapping.map_u32(0x2000, 0xCAFE_BABE);
         let page_table = vec![0usize; 1 << (16 - 12)];
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: Some(mapping.ptr.cast()),
-            page_table_pointer: Some(page_table.as_ptr().cast()),
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
-                fastmem_address_space_bits: 16,
-                silently_mirror_fastmem: true,
-                page_table_present: true,
-                page_table_address_space_bits: 16,
-                silently_mirror_page_table: true,
-                absolute_offset_page_table: true,
-                ..Default::default()
-            },
-        };
+        let mut config =
+            A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(mapping.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table =
+            Some((page_table.as_ptr()) as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        config.absolute_offset_page_table = true;
         let mut jit = A32Jit::new(config).expect("A32 JIT");
         jit.set_register(0, 0x2000);
         jit.set_register(15, 0);
@@ -4605,6 +4747,65 @@ mod tests {
         drop(jit);
         drop(page_table);
         drop(mapping);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a32_page_table_honors_sixteen_byte_entry_stride() {
+        #[repr(C)]
+        struct PageTableEntry {
+            pointer: usize,
+            reserved: usize,
+        }
+
+        let code: [u32; 2] = [
+            0xE590_1000, // ldr r1, [r0]
+            0xEF00_0000, // svc #0
+        ];
+        let mut callback_memory = vec![0u8; 0x10_000];
+        for (index, instruction) in code.iter().enumerate() {
+            callback_memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        callback_memory[0x3000..0x3004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mut page_memory = vec![0u8; 0x1000];
+        page_memory[0..4].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let mut page_table: Vec<PageTableEntry> = (0..1 << (16 - 12))
+            .map(|_| PageTableEntry {
+                pointer: 0,
+                reserved: usize::MAX,
+            })
+            .collect();
+        page_table[3].pointer = (page_memory.as_ptr() as usize).wrapping_sub(0x3000);
+
+        let mut config =
+            A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table =
+            Some((page_table.as_ptr()) as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        config.page_table_log2_stride = 4;
+        config.absolute_offset_page_table = true;
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x3000);
+        jit.set_register(15, 0);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xCAFE_BABE);
+
+        drop(jit);
+        drop(page_table);
+        drop(page_memory);
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -4626,32 +4827,23 @@ mod tests {
         let mut page_table = vec![0usize; 1 << (16 - 12)];
         page_table[3] = (page_memory.as_ptr() as usize).wrapping_sub(0x3000);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: Some(mapping.ptr.cast()),
-            page_table_pointer: Some(page_table.as_ptr().cast()),
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
-                fastmem_address_space_bits: 16,
-                silently_mirror_fastmem: true,
-                page_table_present: true,
-                page_table_address_space_bits: 16,
-                silently_mirror_page_table: true,
-                absolute_offset_page_table: true,
-                ..Default::default()
-            },
-        };
+        let mut config =
+            A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(mapping.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table =
+            Some((page_table.as_ptr()) as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        config.absolute_offset_page_table = true;
         let mut jit = A32Jit::new(config).expect("A32 JIT");
         jit.set_register(0, 0x3000);
         jit.set_register(15, 0);
@@ -4688,23 +4880,25 @@ mod tests {
         let mapping = TestFastmemMapping::new(0x10_000);
         mapping.map_u32(0x2000, 0xCAFE_BABE);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: Some(mapping.ptr.cast()),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(mapping.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_register(0, 0x2000);
         jit.set_register(3, 0x4000);
@@ -4740,23 +4934,20 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn a32_public_jit_uses_arm64_interface_on_aarch64() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[0xe1a0_0000])),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xe1a0_0000])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
 
         let mut jit = A32Jit::new(config).expect("A32 ARM64 public JIT");
         assert!(!jit.jit_state_ptr().is_null());
@@ -4775,11 +4966,6 @@ mod tests {
         jit.set_ext_reg(7, 0xaabb_ccdd);
         assert_eq!(jit.get_ext_reg(7), 0xaabb_ccdd);
 
-        jit.set_cp15_uprw(0x1122_3344);
-        jit.set_cp15_uro(0x5566_7788);
-        assert_eq!(jit.get_cp15_uprw(), 0x1122_3344);
-        assert_eq!(jit.get_cp15_uro(), 0x5566_7788);
-
         jit.set_cntpct(0x1234_5678_9abc_def0);
         assert_eq!(jit.get_cntpct(), 0x1234_5678_9abc_def0);
 
@@ -4795,7 +4981,7 @@ mod tests {
 
     fn test_a64_inner(
         callbacks: MockCallbacks,
-        global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+        global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
         processor_id: usize,
     ) -> Box<JitInner> {
         Box::new(JitInner {
@@ -4811,7 +4997,7 @@ mod tests {
 
     #[test]
     fn test_a64_exclusive_trampolines_use_global_monitor_cross_core() {
-        let mut monitor = crate::exclusive_monitor::ExclusiveMonitor::new(2);
+        let mut monitor = crate::interface::exclusive_monitor::ExclusiveMonitor::new(2);
         let monitor_ptr = &mut monitor as *mut _;
         let mut core0 = test_a64_inner(
             MockCallbacks::from_memory(0x1000, vec![0; 0x100]),
@@ -4838,7 +5024,7 @@ mod tests {
 
     #[test]
     fn test_a64_exclusive_write_without_reservation_fails() {
-        let mut monitor = crate::exclusive_monitor::ExclusiveMonitor::new(1);
+        let mut monitor = crate::interface::exclusive_monitor::ExclusiveMonitor::new(1);
         let mut inner = test_a64_inner(
             MockCallbacks::from_memory(0x1000, vec![0; 0x100]),
             Some(&mut monitor as *mut _),
@@ -4858,27 +5044,29 @@ mod tests {
     fn test_a64_mrs_cntpct_writes_callback_value() {
         // MRS X1, CNTPCT_EL0; SVC #0
         let code: [u32; 2] = [0xD53B_E021, 0xD400_0001];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::with_cntpct(
-                0x1000,
-                &code,
-                0x1234_5678_9ABC_DEF0,
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::with_cntpct(
+            0x1000,
+            &code,
+            0x1234_5678_9ABC_DEF0,
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.run();
@@ -4895,23 +5083,25 @@ mod tests {
             crate::backend::arm64::inst::extr_x(3, 0, 1, 16),
             0xD400_0001,
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(0, 0x1122_3344_5566_7788);
@@ -4932,23 +5122,25 @@ mod tests {
             crate::backend::arm64::inst::rev_x(3, 0),
             0xD400_0001,
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(0, 0x1122_3344_5566_7788);
@@ -4965,23 +5157,25 @@ mod tests {
         // MOVI D28, #0; SVC #0. This frontend path materializes a U64 immediate
         // and emits ZeroExtendLongToQuad for the scalar SIMD destination.
         let code: [u32; 2] = [0x2F00_E41C, 0xD400_0001];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_vector(28, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF);
@@ -5011,23 +5205,25 @@ mod tests {
 
         // SBFM W1, W0, #4, #11; SBFM X2, X0, #4, #11; SVC #0
         let code: [u32; 3] = [sbfm_w(1, 0, 4, 11), sbfm_x(2, 0, 4, 11), 0xD400_0001];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(0, 0x0000_0000_0000_0F80);
@@ -5042,30 +5238,29 @@ mod tests {
         // DSB SY; DMB SY; ISB SY; SVC #0
         let code: [u32; 4] = [0xD503_3F9F, 0xD503_3FBF, 0xD503_3FDF, 0xD400_0001];
         let isb_count = Arc::new(AtomicU32::new(0));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::with_isb_sink(
-                0x1000,
-                &code,
-                Arc::clone(&isb_count),
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: true,
-                ..Default::default()
-            },
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::with_isb_sink(
+            0x1000,
+            &code,
+            Arc::clone(&isb_count),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = true;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
 
@@ -5078,27 +5273,29 @@ mod tests {
         assert_eq!(isb_count.load(Ordering::Relaxed), 1);
 
         let isb_count = Arc::new(AtomicU32::new(0));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::with_isb_sink(
-                0x1000,
-                &code,
-                Arc::clone(&isb_count),
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::with_isb_sink(
+            0x1000,
+            &code,
+            Arc::clone(&isb_count),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         let mut halt = jit.run();
@@ -5108,6 +5305,150 @@ mod tests {
 
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(isb_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_a64_cache_maintenance_callbacks_match_upstream() {
+        // IC IVAU, X0; DC IVAC, X1; SVC #0.
+        let code: [u32; 3] = [0xD50B_7520, 0xD508_7621, 0xD400_0001];
+        let data_cache = Arc::new(Mutex::new(Vec::new()));
+        let instruction_cache = Arc::new(Mutex::new(Vec::new()));
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::with_cache_operation_sinks(
+            0x1000,
+            &code,
+            Arc::clone(&data_cache),
+            Arc::clone(&instruction_cache),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 7;
+        config.hook_data_cache_operations = true;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(0, 0xCAFE_D00D);
+        jit.set_register(1, 0xCAFE_BABE);
+
+        let mut halt = jit.run();
+        if halt.is_empty() {
+            halt = jit.run();
+        }
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(
+            *instruction_cache
+                .lock()
+                .expect("instruction-cache sink poisoned"),
+            vec![(
+                crate::interface::a64::config::InstructionCacheOperation::InvalidateByVaToPoU
+                    as u64,
+                0xCAFE_D00D,
+            )]
+        );
+        assert_eq!(
+            *data_cache.lock().expect("data-cache sink poisoned"),
+            vec![(
+                crate::interface::a64::config::DataCacheOperation::InvalidateByVaToPoC as u64,
+                0xCAFE_BABE,
+            )]
+        );
+    }
+
+    #[test]
+    fn test_a64_cache_system_registers_use_user_config() {
+        // MRS X0, CTR_EL0; MRS X1, DCZID_EL0; SVC #0.
+        let code: [u32; 3] = [0xD53B_0020, 0xD53B_00E1, 0xD400_0001];
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x1234_5678;
+        config.dczid_el0 = 0x0000_0017;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+
+        let mut halt = jit.run();
+        if halt.is_empty() {
+            halt = jit.run();
+        }
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(0), 0x1234_5678);
+        assert_eq!(jit.get_register(1), 0x17);
+    }
+
+    #[test]
+    fn test_a64_unhooked_dc_zva_uses_configured_block_size() {
+        // DC ZVA, X0; SVC #0.
+        let code: [u32; 2] = [0xD50B_7420, 0xD400_0001];
+        let memory = Arc::new(Mutex::new(vec![0xAA; 0x3000]));
+        {
+            let mut bytes = memory.lock().expect("mock memory poisoned");
+            for (index, word) in code.iter().enumerate() {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            Arc::clone(&memory),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 0;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(0, 0x2000);
+
+        let mut halt = jit.run();
+        if halt.is_empty() {
+            halt = jit.run();
+        }
+
+        assert!(halt.contains(HaltReason::SVC));
+        let bytes = memory.lock().expect("mock memory poisoned");
+        assert_eq!(&bytes[0x1000..0x1004], &[0, 0, 0, 0]);
+        assert_eq!(bytes[0x1004], 0xAA);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5130,23 +5471,28 @@ mod tests {
         memory[0x2000..0x2004].copy_from_slice(&0u32.to_le_bytes());
         let memory = Arc::new(Mutex::new(memory));
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory.clone())),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.run();
@@ -5186,42 +5532,46 @@ mod tests {
         memory[0x2018..0x2020].copy_from_slice(&old_hi.to_le_bytes());
         let fastmem_pointer = memory.as_mut_ptr();
         let memory = Arc::new(Mutex::new(memory));
-        let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
         let monitor_ptr = Some(&mut *monitor as *mut _);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory.clone())),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: monitor_ptr,
-            fastmem_pointer: Some(fastmem_pointer),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
-                fastmem_address_space_bits: 16,
-                silently_mirror_fastmem: true,
-                fastmem_exclusive_access: true,
-                recompile_on_exclusive_fastmem_failure: true,
-                recompile_on_fastmem_failure: true,
-                page_table_present: false,
-                page_table_address_space_bits: 16,
-                silently_mirror_page_table: true,
-                absolute_offset_page_table: true,
-                page_table_pointer_mask_bits: 0,
-                detect_misaligned_access_via_page_table: 0,
-                only_detect_misalignment_via_page_table_on_page_boundary: false,
-                check_halt_on_memory_access: false,
-                processor_id: 0,
-            },
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = monitor_ptr;
+        config.fastmem_pointer = Some(fastmem_pointer);
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 16;
+        config.silently_mirror_fastmem = true;
+        config.fastmem_exclusive_access = true;
+        config.recompile_on_exclusive_fastmem_failure = true;
+        config.recompile_on_fastmem_failure = true;
+        config.page_table_address_space_bits = 16;
+        config.silently_mirror_page_table = true;
+        config.absolute_offset_page_table = true;
+        config.page_table_pointer_mask_bits = 0;
+        config.page_table_log2_stride = 3;
+        config.detect_misaligned_access_via_page_table = 0;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = false;
+        config.check_halt_on_memory_access = false;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         let new_lo = 0x0123_4567_89AB_CDEFu64;
@@ -5257,27 +5607,24 @@ mod tests {
         memory[0x1000..0x1004].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // svc #0
         let fastmem_pointer = memory.as_mut_ptr();
         let memory = Arc::new(Mutex::new(memory));
-        let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: Some(&mut *monitor as *mut _),
-            fastmem_pointer: Some(fastmem_pointer),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                fastmem_exclusive_access: false,
-                ..Default::default()
-            },
-        };
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(0, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = Some(&mut *monitor as *mut _);
+        config.fastmem_pointer = Some(fastmem_pointer);
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
+        config.fastmem_exclusive_access = false;
 
         let jit = A32Jit::new(config).expect("A32 JIT");
         let emitter = jit.inner.emitter.as_ref().expect("x64 emitter");
@@ -5309,41 +5656,45 @@ mod tests {
         memory[0x2018..0x2020].copy_from_slice(&old_hi.to_le_bytes());
         let memory = Arc::new(Mutex::new(memory));
         let fastmem = TestFastmemMapping::new(0x1_0000);
-        let mut monitor = Box::new(crate::exclusive_monitor::ExclusiveMonitor::new(1));
+        let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(
+            1,
+        ));
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0, memory.clone())),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: Some(&mut *monitor as *mut _),
-            fastmem_pointer: Some(fastmem.ptr.cast()),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
-                fastmem_address_space_bits: 16,
-                silently_mirror_fastmem: true,
-                fastmem_exclusive_access: true,
-                recompile_on_exclusive_fastmem_failure: true,
-                recompile_on_fastmem_failure: true,
-                page_table_present: false,
-                page_table_address_space_bits: 16,
-                silently_mirror_page_table: true,
-                absolute_offset_page_table: true,
-                page_table_pointer_mask_bits: 0,
-                detect_misaligned_access_via_page_table: 0,
-                only_detect_misalignment_via_page_table_on_page_boundary: false,
-                check_halt_on_memory_access: false,
-                processor_id: 0,
-            },
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = Some(&mut *monitor as *mut _);
+        config.fastmem_pointer = Some(fastmem.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 16;
+        config.silently_mirror_fastmem = true;
+        config.fastmem_exclusive_access = true;
+        config.recompile_on_exclusive_fastmem_failure = true;
+        config.recompile_on_fastmem_failure = true;
+        config.page_table_address_space_bits = 16;
+        config.silently_mirror_page_table = true;
+        config.absolute_offset_page_table = true;
+        config.page_table_pointer_mask_bits = 0;
+        config.page_table_log2_stride = 3;
+        config.detect_misaligned_access_via_page_table = 0;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = false;
+        config.check_halt_on_memory_access = false;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         let new_lo = 0x0123_4567_89AB_CDEFu64;
@@ -5392,23 +5743,25 @@ mod tests {
         memory[0x1000..0x1008].copy_from_slice(&lo.to_le_bytes());
         memory[0x1008..0x1010].copy_from_slice(&hi.to_le_bytes());
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(2, 0x2000);
@@ -5434,23 +5787,25 @@ mod tests {
         }
         memory[0x100..0x108].copy_from_slice(&lo.to_le_bytes());
         memory[0x108..0x110].copy_from_slice(&hi.to_le_bytes());
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(1, 0x1100);
@@ -5474,23 +5829,28 @@ mod tests {
         for (index, word) in code.iter().copied().enumerate() {
             memory.lock().unwrap()[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0x1000, memory.clone())),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(1, 0x1100);
@@ -5529,23 +5889,28 @@ mod tests {
         contents[0x100..0x108].copy_from_slice(&old_lo.to_le_bytes());
         contents[0x108..0x110].copy_from_slice(&old_hi.to_le_bytes());
         let memory = Arc::new(Mutex::new(contents));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0x1000, memory.clone())),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(0x1000);
         jit.set_register(6, 0x1100);
@@ -5578,23 +5943,25 @@ mod tests {
         optimizations: OptimizationFlag,
         setup: impl FnOnce(&mut A64Jit),
     ) -> A64Jit {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = optimizations;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         setup(&mut jit);
@@ -5993,28 +6360,30 @@ mod tests {
         memory[0x1018..0x1020].copy_from_slice(&0x1020u64.to_le_bytes());
 
         let shared_memory = Arc::new(Mutex::new(memory));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(
-                0x1000,
-                Arc::clone(&shared_memory),
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::BLOCK_LINKING
-                | OptimizationFlag::RETURN_STACK_BUFFER
-                | OptimizationFlag::FAST_DISPATCH,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0x1000,
+            Arc::clone(&shared_memory),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::BLOCK_LINKING
+            | OptimizationFlag::RETURN_STACK_BUFFER
+            | OptimizationFlag::FAST_DISPATCH;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_sp(0x3000);
@@ -6296,23 +6665,25 @@ mod tests {
         }
         memory[0x1000..0x1008].copy_from_slice(&0x0000_B0B5_0000_A140u64.to_le_bytes());
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0x1000, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0x1000, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(0, 0x2000);
@@ -6478,23 +6849,25 @@ mod tests {
         let f = |x: f32| x.to_bits() as u64;
         // V1 = [1,2,3,4], V2 = [5,6,7,8] → V0 = [5,12,21,32]
         let mut jit = {
-            let config = JitConfig {
-                callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-                enable_cycle_counting: false,
-                code_cache_size: 4 * 1024 * 1024,
-                optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-                unsafe_optimizations: false,
-                global_monitor: None,
-                fastmem_pointer: None,
-                page_table_pointer: None,
-                define_unpredictable_behaviour: false,
-                processor_id: 0,
-                wall_clock_cntpct: false,
-                cntfrq_el0: 600_000_000,
-                tpidrro_el0: None,
-                tpidr_el0: None,
-                memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-            };
+            let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+            config.enable_cycle_counting = false;
+            config.code_cache_size = 4 * 1024 * 1024;
+            config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+            config.unsafe_optimizations = false;
+            config.global_monitor = None;
+            config.fastmem_pointer = None;
+            config.define_unpredictable_behaviour = false;
+            config.hook_hint_instructions = false;
+            config.processor_id = 0;
+            config.wall_clock_cntpct = false;
+            config.cntfrq_el0 = 600_000_000;
+            config.ctr_el0 = 0x8444_c004;
+            config.dczid_el0 = 4;
+            config.hook_data_cache_operations = false;
+            config.hook_isb = false;
+            config.tpidrro_el0 = None;
+            config.tpidr_el0 = None;
+            config.page_table = None;
             A64Jit::new(config).unwrap()
         };
         jit.set_pc(0x1000);
@@ -6568,23 +6941,25 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_jit_creation() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[0xD4000001])),
-            enable_cycle_counting: true,
-            code_cache_size: 4 * 1024 * 1024, // 4 MB for tests
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xD4000001])));
+        config.enable_cycle_counting = true;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let jit = A64Jit::new(config);
         assert!(jit.is_ok(), "JIT creation failed: {:?}", jit.err());
     }
@@ -6592,23 +6967,25 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_jit_register_accessors() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[])),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
 
         jit.set_pc(0x1000);
@@ -6633,23 +7010,25 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_halt_execution() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[])),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let jit = A64Jit::new(config).unwrap();
 
         jit.halt_execution(HaltReason::EXTERNAL_HALT);
@@ -6679,27 +7058,27 @@ mod tests {
                 0xF940_0020, // ldr x0, [x1]
                 0x17FF_FFFF, // b 0x1000
             ];
-            let config = JitConfig {
-                callbacks: Box::new(MockCallbacks::with_memory_read_64_count(
-                    0x1000,
-                    &code,
-                    runner_count,
-                )),
-                enable_cycle_counting: false,
-                code_cache_size: 4 * 1024 * 1024,
-                optimizations: OptimizationFlag::BLOCK_LINKING,
-                unsafe_optimizations: false,
-                global_monitor: None,
-                fastmem_pointer: None,
-                page_table_pointer: None,
-                define_unpredictable_behaviour: false,
-                processor_id: 0,
-                wall_clock_cntpct: false,
-                cntfrq_el0: 600_000_000,
-                tpidrro_el0: None,
-                tpidr_el0: None,
-                memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-            };
+            let mut config = A64UserConfig::new(Box::new(
+                MockCallbacks::with_memory_read_64_count(0x1000, &code, runner_count),
+            ));
+            config.enable_cycle_counting = false;
+            config.code_cache_size = 4 * 1024 * 1024;
+            config.optimizations = OptimizationFlag::BLOCK_LINKING;
+            config.unsafe_optimizations = false;
+            config.global_monitor = None;
+            config.fastmem_pointer = None;
+            config.define_unpredictable_behaviour = false;
+            config.hook_hint_instructions = false;
+            config.processor_id = 0;
+            config.wall_clock_cntpct = false;
+            config.cntfrq_el0 = 600_000_000;
+            config.ctr_el0 = 0x8444_c004;
+            config.dczid_el0 = 4;
+            config.hook_data_cache_operations = false;
+            config.hook_isb = false;
+            config.tpidrro_el0 = None;
+            config.tpidr_el0 = None;
+            config.page_table = None;
             let mut jit = A64Jit::new(config).expect("A64 JIT");
             jit.set_pc(0x1000);
             jit.set_register(1, 0x1100);
@@ -6739,23 +7118,29 @@ mod tests {
         let code: &[u32] = &[
             0xD400_04C1, // svc #0x26
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::with_svc_sink(0x1000, code, svc_sink.clone())),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::with_svc_sink(
+            0x1000,
+            code,
+            svc_sink.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
 
@@ -6782,23 +7167,25 @@ mod tests {
         let callbacks = MockCallbacks::from_shared_memory(0, shared_memory.clone());
         let mut callbacks = callbacks;
         callbacks.svc_sink = Some(svc_sink.clone());
-        let config = JitConfig {
-            callbacks: Box::new(callbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(callbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_sp(0x2000);
@@ -6838,39 +7225,38 @@ mod tests {
         let callbacks = MockCallbacks::from_shared_memory(0, shared_memory.clone());
         let mut callbacks = callbacks;
         callbacks.svc_sink = Some(svc_sink.clone());
-        let config = JitConfig {
-            callbacks: Box::new(callbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: Some(fastmem_pointer),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
-                hook_isb: false,
-                fastmem_address_space_bits: 39,
-                silently_mirror_fastmem: false,
-                fastmem_exclusive_access: false,
-                recompile_on_exclusive_fastmem_failure: true,
-                recompile_on_fastmem_failure: true,
-                page_table_present: false,
-                page_table_address_space_bits: 39,
-                silently_mirror_page_table: false,
-                absolute_offset_page_table: true,
-                page_table_pointer_mask_bits: 0,
-                detect_misaligned_access_via_page_table: 0,
-                only_detect_misalignment_via_page_table_on_page_boundary: false,
-                check_halt_on_memory_access: false,
-                processor_id: 0,
-            },
-        };
+        let mut config = A64UserConfig::new(Box::new(callbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(fastmem_pointer);
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
+        config.fastmem_address_space_bits = 39;
+        config.silently_mirror_fastmem = false;
+        config.fastmem_exclusive_access = false;
+        config.recompile_on_exclusive_fastmem_failure = true;
+        config.recompile_on_fastmem_failure = true;
+        config.page_table_address_space_bits = 39;
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = true;
+        config.page_table_pointer_mask_bits = 0;
+        config.page_table_log2_stride = 3;
+        config.detect_misaligned_access_via_page_table = 0;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = false;
+        config.check_halt_on_memory_access = false;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_sp(0x2000);
@@ -6914,23 +7300,25 @@ mod tests {
         let callbacks = MockCallbacks::from_shared_memory(0, shared_memory);
         let mut callbacks = callbacks;
         callbacks.svc_sink = Some(svc_sink.clone());
-        let config = JitConfig {
-            callbacks: Box::new(callbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(callbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
 
@@ -6975,23 +7363,25 @@ mod tests {
             0xF2C0_0433, // movk x19, #0x0021, lsl #32
             0xD400_0001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
 
@@ -7008,23 +7398,25 @@ mod tests {
             0x4E02_2003, // tbl v3.16b, {v0.16b, v1.16b}, v2.16b
             0xD400_0001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
 
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
@@ -7047,23 +7439,25 @@ mod tests {
             0x4E02_3003, // tbx v3.16b, {v0.16b, v1.16b}, v2.16b
             0xD400_0001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
 
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
@@ -7090,46 +7484,50 @@ mod tests {
             0xD4000001, // 0x1004: svc #0 (fall-through if b.ne not taken)
             0xD4000021, // 0x1008: svc #1 (b.ne target)
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_pstate(NZCV_Z);
         let halt = run_a64_until_svc(&mut jit);
         assert!(halt.contains(HaltReason::SVC));
 
-        let config2 = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config2 = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config2.enable_cycle_counting = false;
+        config2.code_cache_size = 4 * 1024 * 1024;
+        config2.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config2.unsafe_optimizations = false;
+        config2.global_monitor = None;
+        config2.fastmem_pointer = None;
+        config2.define_unpredictable_behaviour = false;
+        config2.hook_hint_instructions = false;
+        config2.processor_id = 0;
+        config2.wall_clock_cntpct = false;
+        config2.cntfrq_el0 = 600_000_000;
+        config2.ctr_el0 = 0x8444_c004;
+        config2.dczid_el0 = 4;
+        config2.hook_data_cache_operations = false;
+        config2.hook_isb = false;
+        config2.tpidrro_el0 = None;
+        config2.tpidr_el0 = None;
+        config2.page_table = None;
         let mut jit2 = A64Jit::new(config2).unwrap();
         jit2.set_pc(0x1000);
         jit2.set_pstate(0);
@@ -7165,23 +7563,25 @@ mod tests {
             0xD4000001, // svc #0
             0xD4000021, // svc #1
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         // Test 1: x1 == 0, should TAKE branch → svc #1 → PC=0x100C
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
@@ -7189,23 +7589,25 @@ mod tests {
         let halt = run_a64_until_svc(&mut jit);
         assert!(halt.contains(HaltReason::SVC));
 
-        let config2 = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config2 = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config2.enable_cycle_counting = false;
+        config2.code_cache_size = 4 * 1024 * 1024;
+        config2.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config2.unsafe_optimizations = false;
+        config2.global_monitor = None;
+        config2.fastmem_pointer = None;
+        config2.define_unpredictable_behaviour = false;
+        config2.hook_hint_instructions = false;
+        config2.processor_id = 0;
+        config2.wall_clock_cntpct = false;
+        config2.cntfrq_el0 = 600_000_000;
+        config2.ctr_el0 = 0x8444_c004;
+        config2.dczid_el0 = 4;
+        config2.hook_data_cache_operations = false;
+        config2.hook_isb = false;
+        config2.tpidrro_el0 = None;
+        config2.tpidr_el0 = None;
+        config2.page_table = None;
         // Test 2: x1 != 0, should NOT branch → svc #0 → PC=0x1008
         let mut jit2 = A64Jit::new(config2).unwrap();
         jit2.set_pc(0x1000);
@@ -7224,23 +7626,25 @@ mod tests {
             0x5AC0_0020, // rbit w0, w1
             0xD400_0001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(1, 7);
@@ -7262,23 +7666,25 @@ mod tests {
             0xDAC0_0020, // rbit x0, x1
             0xD400_0001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(1, 7);
@@ -7330,23 +7736,25 @@ mod tests {
             0xD4000021, // svc #1   (failure — b.ne taken when it shouldn't have)
         ];
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(1, 0x30444F4D); // STK MOD0 magic value
@@ -7360,23 +7768,28 @@ mod tests {
         );
 
         // Now run again with x1 != x2 — b.ne SHOULD take the branch.
-        let mut jit2 = A64Jit::new(JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        })
+        let mut jit2 = {
+            let mut config2 = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+            config2.enable_cycle_counting = false;
+            config2.code_cache_size = 4 * 1024 * 1024;
+            config2.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+            config2.unsafe_optimizations = false;
+            config2.global_monitor = None;
+            config2.fastmem_pointer = None;
+            config2.define_unpredictable_behaviour = false;
+            config2.hook_hint_instructions = false;
+            config2.processor_id = 0;
+            config2.wall_clock_cntpct = false;
+            config2.cntfrq_el0 = 600_000_000;
+            config2.ctr_el0 = 0x8444_c004;
+            config2.dczid_el0 = 4;
+            config2.hook_data_cache_operations = false;
+            config2.hook_isb = false;
+            config2.tpidrro_el0 = None;
+            config2.tpidr_el0 = None;
+            config2.page_table = None;
+            A64Jit::new(config2)
+        }
         .unwrap();
         jit2.set_pc(0x1000);
         jit2.set_register(1, 0x30444F4D);
@@ -7423,23 +7836,25 @@ mod tests {
                    processed: u64,
                    expected_count: u64,
                    expected_result: u64| {
-            let config = JitConfig {
-                callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-                enable_cycle_counting: false,
-                code_cache_size: 4 * 1024 * 1024,
-                optimizations,
-                unsafe_optimizations: false,
-                global_monitor: None,
-                fastmem_pointer: None,
-                page_table_pointer: None,
-                define_unpredictable_behaviour: false,
-                processor_id: 0,
-                wall_clock_cntpct: false,
-                cntfrq_el0: 600_000_000,
-                tpidrro_el0: None,
-                tpidr_el0: None,
-                memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-            };
+            let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+            config.enable_cycle_counting = false;
+            config.code_cache_size = 4 * 1024 * 1024;
+            config.optimizations = optimizations;
+            config.unsafe_optimizations = false;
+            config.global_monitor = None;
+            config.fastmem_pointer = None;
+            config.define_unpredictable_behaviour = false;
+            config.hook_hint_instructions = false;
+            config.processor_id = 0;
+            config.wall_clock_cntpct = false;
+            config.cntfrq_el0 = 600_000_000;
+            config.ctr_el0 = 0x8444_c004;
+            config.dczid_el0 = 4;
+            config.hook_data_cache_operations = false;
+            config.hook_isb = false;
+            config.tpidrro_el0 = None;
+            config.tpidr_el0 = None;
+            config.page_table = None;
             let mut jit = A64Jit::new(config).unwrap();
             jit.set_pc(0x1000);
             {
@@ -7475,23 +7890,25 @@ mod tests {
             0xD400_0001, // svc #0
             0xD400_0021, // bad: svc #1
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(0, 1);
@@ -7516,23 +7933,25 @@ mod tests {
             0x9100_0400, // func: add x0, x0, #1
             0xD65F_03C0, // ret
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
 
@@ -7549,23 +7968,20 @@ mod tests {
         let decoded = crate::frontend::a32::decoder::decode_arm(0xE7DF_0E1F);
         assert_eq!(decoded.id, crate::frontend::a32::decoder::ArmInstId::BFC);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[0xE7DF_0E1F])),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xE7DF_0E1F])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
 
         jit.set_pc(0x1000);
@@ -7583,23 +7999,20 @@ mod tests {
         let decoded = crate::frontend::a32::decoder::decode_arm(0xF57F_F01F);
         assert_eq!(decoded.id, crate::frontend::a32::decoder::ArmInstId::CLREX);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[0xF57F_F01F])),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xF57F_F01F])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
 
         jit.set_pc(0x1000);
@@ -7638,23 +8051,20 @@ mod tests {
         let decoded = crate::frontend::a32::decoder::decode_arm(0xE7E3_52D1);
         assert_eq!(decoded.id, crate::frontend::a32::decoder::ArmInstId::UBFX);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &[0xE7E3_52D1])),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &[0xE7E3_52D1])));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
 
         jit.set_pc(0x1000);
@@ -7675,32 +8085,29 @@ mod tests {
         // BNE -12 (to ADD) = 1AFFFFFC
         // MOV r0, #42     = E3A0002A
         // SVC #0          = EF000000
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, // ADD r7, r7, #1
-                    0xE1540007, // CMP r4, r7
-                    0x1AFFFFFC, // BNE back to ADD
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, // ADD r7, r7, #1
+                0xE1540007, // CMP r4, r7
+                0x1AFFFFFC, // BNE back to ADD
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5); // r4 = limit
         jit.set_register(7, 3); // r7 = start counter
@@ -7720,33 +8127,30 @@ mod tests {
 
     #[test]
     fn test_a32_scalar_saturation_results_and_q_flag() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE6A7_2011, // SSAT r2, #8, r1
-                    0xE6E8_3010, // USAT r3, #8, r0
-                    0xE102_4051, // QADD r4, r1, r2
-                    0xE6A7_5F36, // SSAT16 r5, #8, r6
-                    0xE6E8_7F38, // USAT16 r7, #8, r8
-                    0xEF00_0000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE6A7_2011, // SSAT r2, #8, r1
+                0xE6E8_3010, // USAT r3, #8, r0
+                0xE102_4051, // QADD r4, r1, r2
+                0xE6A7_5F36, // SSAT16 r5, #8, r6
+                0xE6E8_7F38, // USAT16 r7, #8, r8
+                0xEF00_0000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(0, u32::MAX);
         jit.set_register(1, i32::MAX as u32);
@@ -7769,32 +8173,29 @@ mod tests {
     #[test]
     fn test_a32_cmp_bne_loop_with_all_optimizations() {
         // Same loop but with all optimizations + block linking enabled
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, // ADD r7, r7, #1
-                    0xE1540007, // CMP r4, r7
-                    0x1AFFFFFC, // BNE back to ADD
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, // ADD r7, r7, #1
+                0xE1540007, // CMP r4, r7
+                0x1AFFFFFC, // BNE back to ADD
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -7815,35 +8216,32 @@ mod tests {
     #[test]
     fn test_a32_cmp_bne_with_vfp_no_getset_elim() {
         // Same VFP+CMP loop but WITHOUT GetSetElimination
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, // ADD r7, r7, #1
-                    0xEEB48AC0, // VCMPE.F32 s16, s0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0xE1540007, // CMP r4, r7
-                    0x1AFFFFFA, // BNE back
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
-                & !OptimizationFlag::GET_SET_ELIMINATION,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, // ADD r7, r7, #1
+                0xEEB48AC0, // VCMPE.F32 s16, s0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0xE1540007, // CMP r4, r7
+                0x1AFFFFFA, // BNE back
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations =
+            OptimizationFlag::ALL_SAFE_OPTIMIZATIONS & !OptimizationFlag::GET_SET_ELIMINATION;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -7864,34 +8262,31 @@ mod tests {
     #[test]
     fn test_a32_cmp_bne_with_vfp_all_opts() {
         // Same loop WITH all optimizations including GetSetElimination
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, // ADD r7, r7, #1
-                    0xEEB48AC0, // VCMPE.F32 s16, s0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0xE1540007, // CMP r4, r7
-                    0x1AFFFFFA, // BNE back
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, // ADD r7, r7, #1
+                0xEEB48AC0, // VCMPE.F32 s16, s0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0xE1540007, // CMP r4, r7
+                0x1AFFFFFA, // BNE back
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -7911,29 +8306,25 @@ mod tests {
 
     #[test]
     fn test_vfp_cmp_bne_gse_only() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A,
-                    0xEF000000,
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::GET_SET_ELIMINATION,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A, 0xEF000000,
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -7946,29 +8337,25 @@ mod tests {
 
     #[test]
     fn test_vfp_cmp_bne_gse_only_single_step_progress() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A,
-                    0xEF000000,
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::GET_SET_ELIMINATION,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A, 0xEF000000,
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -8010,29 +8397,25 @@ mod tests {
 
     #[test]
     fn test_vfp_cmp_bne_gse_only_with_cycle_counting() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A,
-                    0xEF000000,
-                ],
-            )),
-            enable_cycle_counting: true,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::GET_SET_ELIMINATION,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A, 0xEF000000,
+            ],
+        )));
+        config.enable_cycle_counting = true;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -8051,32 +8434,29 @@ mod tests {
 
     #[test]
     fn test_vfp_vmrs_apsr_then_bne_uses_equal_flags() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEB48AC0, // VCMPE.F32 s16, s0  (0.0 == 0.0 => Z=1, C=1)
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0x1A000000, // BNE +0  (skip next MOV only if Z == 0)
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEB48AC0, // VCMPE.F32 s16, s0  (0.0 == 0.0 => Z=1, C=1)
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0x1A000000, // BNE +0  (skip next MOV only if Z == 0)
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(15, 0x1000);
         jit.set_cpsr(0x10);
@@ -8114,30 +8494,27 @@ mod tests {
     /// >= 2^32 or for NaN/negative.
     #[test]
     fn test_vcvt_u32_f32_small_positive_float() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEBC0AC9, // VCVT.U32.F32 s0, s18  (round-toward-zero form)
-                    0xEE100A10, // VMOV r0, s0
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEBC0AC9, // VCVT.U32.F32 s0, s18  (round-toward-zero form)
+                0xEE100A10, // VMOV r0, s0
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         // s18 = 1920.0f32; bit pattern 0x44F00000.
         jit.set_ext_reg(18, 1920.0f32.to_bits());
@@ -8161,30 +8538,27 @@ mod tests {
 
     #[test]
     fn test_vcvt_u32_f64_does_not_truncate_to_u16() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEBC0BC8, // VCVT.U32.F64 s0, d8
-                    0xEE100A10, // VMOV r0, s0
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEBC0BC8, // VCVT.U32.F64 s0, d8
+                0xEE100A10, // VMOV r0, s0
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let value = 1_000_000.0f64.to_bits();
         jit.set_ext_reg(16, value as u32);
@@ -8219,23 +8593,20 @@ mod tests {
         let literal = 268_435_456.0f64.to_bits();
         memory[literal_addr..literal_addr + 8].copy_from_slice(&literal.to_le_bytes());
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(base, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(base, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(15, base as u32);
         jit.set_cpsr(0x10);
@@ -8269,23 +8640,20 @@ mod tests {
         let literal = 268_435_456.0f64.to_bits();
         memory[literal_addr..literal_addr + 8].copy_from_slice(&literal.to_le_bytes());
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(base, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(base, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = 1.56328125f64.to_bits();
         jit.set_ext_reg(16, d8 as u32);
@@ -8331,23 +8699,20 @@ mod tests {
         let literal = 1_000_000_000.0f64.to_bits();
         memory[literal_addr..literal_addr + 8].copy_from_slice(&literal.to_le_bytes());
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(base, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_memory(base, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = (1.56328125f64 * 268_435_456.0f64).to_bits();
         jit.set_ext_reg(16, d8 as u32);
@@ -8377,35 +8742,32 @@ mod tests {
 
     #[test]
     fn test_vcvt_vsub_vmul_loop_reaches_zero_with_backedge() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEBC0BC8, // VCVT.U32.F64 s0, d8
-                    0xEEF81B40, // VCVT.F64.U32 d17, s0
-                    0xEE781B61, // VSUB.F64 d17, d8, d17
-                    0xEE218BA0, // VMUL.F64 d8, d17, d16
-                    0xEEB58BC0, // VCMPE.F64 d8, #0.0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0x1AFFFFF8, // BNE back to 0x1000
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEBC0BC8, // VCVT.U32.F64 s0, d8
+                0xEEF81B40, // VCVT.F64.U32 d17, s0
+                0xEE781B61, // VSUB.F64 d17, d8, d17
+                0xEE218BA0, // VMUL.F64 d8, d17, d16
+                0xEEB58BC0, // VCMPE.F64 d8, #0.0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0x1AFFFFF8, // BNE back to 0x1000
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = (1.56328125f64 * 268_435_456.0f64).to_bits();
         let d16 = 1_000_000_000.0f64.to_bits();
@@ -8430,35 +8792,32 @@ mod tests {
 
     #[test]
     fn test_vcvt_vsub_vmul_loop_single_step_converges_to_zero() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEBC0BC8, // VCVT.U32.F64 s0, d8
-                    0xEEF81B40, // VCVT.F64.U32 d17, s0
-                    0xEE781B61, // VSUB.F64 d17, d8, d17
-                    0xEE218BA0, // VMUL.F64 d8, d17, d16
-                    0xEEB58BC0, // VCMPE.F64 d8, #0.0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0x1AFFFFF8, // BNE back to 0x1000
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEBC0BC8, // VCVT.U32.F64 s0, d8
+                0xEEF81B40, // VCVT.F64.U32 d17, s0
+                0xEE781B61, // VSUB.F64 d17, d8, d17
+                0xEE218BA0, // VMUL.F64 d8, d17, d16
+                0xEEB58BC0, // VCMPE.F64 d8, #0.0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0x1AFFFFF8, // BNE back to 0x1000
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = (1.56328125f64 * 268_435_456.0f64).to_bits();
         let d16 = 1_000_000_000.0f64.to_bits();
@@ -8485,35 +8844,32 @@ mod tests {
     }
 
     fn run_vcvt_vsub_vmul_loop_with_opts(optimizations: OptimizationFlag) -> (HaltReason, f64) {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEBC0BC8, // VCVT.U32.F64 s0, d8
-                    0xEEF81B40, // VCVT.F64.U32 d17, s0
-                    0xEE781B61, // VSUB.F64 d17, d8, d17
-                    0xEE218BA0, // VMUL.F64 d8, d17, d16
-                    0xEEB58BC0, // VCMPE.F64 d8, #0.0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0x1AFFFFF8, // BNE back to 0x1000
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEBC0BC8, // VCVT.U32.F64 s0, d8
+                0xEEF81B40, // VCVT.F64.U32 d17, s0
+                0xEE781B61, // VSUB.F64 d17, d8, d17
+                0xEE218BA0, // VMUL.F64 d8, d17, d16
+                0xEEB58BC0, // VCMPE.F64 d8, #0.0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0x1AFFFFF8, // BNE back to 0x1000
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = optimizations;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = (1.56328125f64 * 268_435_456.0f64).to_bits();
         let d16 = 1_000_000_000.0f64.to_bits();
@@ -8556,32 +8912,29 @@ mod tests {
 
     #[test]
     fn test_vfp_f64_vmrs_apsr_then_bne_uses_equal_flags() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEB58BC0, // VCMPE.F64 d8, #0.0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0x1A000000, // BNE +0
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEB58BC0, // VCMPE.F64 d8, #0.0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0x1A000000, // BNE +0
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_ext_reg(16, 0);
         jit.set_ext_reg(17, 0);
@@ -8604,34 +8957,31 @@ mod tests {
 
     #[test]
     fn test_vfp_f64_vmrs_apsr_then_bne_branches_on_nonzero() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEB58BC0, // VCMPE.F64 d8, #0.0
-                    0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
-                    0x1A000001, // BNE +1
-                    0xE3A0002A, // MOV r0, #42
-                    0xEF000000, // SVC #0
-                    0xE3A00063, // MOV r0, #99
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEB58BC0, // VCMPE.F64 d8, #0.0
+                0xEEF1FA10, // VMRS APSR_nzcv, FPSCR
+                0x1A000001, // BNE +1
+                0xE3A0002A, // MOV r0, #42
+                0xEF000000, // SVC #0
+                0xE3A00063, // MOV r0, #99
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = 1.0f64.to_bits();
         jit.set_ext_reg(16, d8 as u32);
@@ -8674,23 +9024,20 @@ mod tests {
             0xEF000000, // SVC #0
         ]);
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = (1.56328125f64 * 268_435_456.0f64).to_bits();
         let d16 = 1_000_000_000.0f64.to_bits();
@@ -8733,23 +9080,20 @@ mod tests {
         }
         code.push(0xEF000000); // SVC #0
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(0x1000, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let d8 = (1.56328125f64 * 268_435_456.0f64).to_bits();
         let d16 = 1_000_000_000.0f64.to_bits();
@@ -8790,31 +9134,28 @@ mod tests {
 
     #[test]
     fn test_a32_set_cpsr_nzc_empty_marker_backend_path() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE3A01001, // MOV  r1, #1
-                    0xE1B000A1, // MOVS r0, r1, LSR #1  => result=0, carry=1
-                    0xE2A22000, // ADC  r2, r2, #0      => consumes carry only
-                    0xEF000000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::GET_SET_ELIMINATION,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE3A01001, // MOV  r1, #1
+                0xE1B000A1, // MOVS r0, r1, LSR #1  => result=0, carry=1
+                0xE2A22000, // ADC  r2, r2, #0      => consumes carry only
+                0xEF000000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::GET_SET_ELIMINATION;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(2, 41);
         jit.set_register(15, 0x1000);
@@ -8836,39 +9177,36 @@ mod tests {
 
     #[test]
     fn test_a32_cmp_addhs_subhs_division_tail_with_all_optimizations() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE1500101, // CMP   r0, r1, LSL #2
-                    0x22833004, // ADDHS r3, r3, #4
-                    0x20400101, // SUBHS r0, r0, r1, LSL #2
-                    0xE1500081, // CMP   r0, r1, LSL #1
-                    0x22833002, // ADDHS r3, r3, #2
-                    0x20400081, // SUBHS r0, r0, r1, LSL #1
-                    0xE1500001, // CMP   r0, r1
-                    0x22833001, // ADDHS r3, r3, #1
-                    0x20400001, // SUBHS r0, r0, r1
-                    0xE1A04000, // MOV   r4, r0   ; remainder
-                    0xE1A00003, // MOV   r0, r3   ; quotient
-                    0xEF000000, // SVC   #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE1500101, // CMP   r0, r1, LSL #2
+                0x22833004, // ADDHS r3, r3, #4
+                0x20400101, // SUBHS r0, r0, r1, LSL #2
+                0xE1500081, // CMP   r0, r1, LSL #1
+                0x22833002, // ADDHS r3, r3, #2
+                0x20400081, // SUBHS r0, r0, r1, LSL #1
+                0xE1500001, // CMP   r0, r1
+                0x22833001, // ADDHS r3, r3, #1
+                0x20400001, // SUBHS r0, r0, r1
+                0xE1A04000, // MOV   r4, r0   ; remainder
+                0xE1A00003, // MOV   r0, r3   ; quotient
+                0xEF000000, // SVC   #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(0, 13); // dividend
         jit.set_register(1, 3); // divisor
@@ -8916,23 +9254,20 @@ mod tests {
 
         let callbacks = MockCallbacks::new(base, &code);
         let memory = callbacks.memory.clone();
-        let config = JitConfig {
-            callbacks: Box::new(callbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(callbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let remainder_addr = base + 0x800;
         jit.set_register(0, dividend);
@@ -9009,26 +9344,23 @@ mod tests {
         memory[svc_off..svc_off + 4].copy_from_slice(&0xEF00_0000u32.to_le_bytes());
 
         let memory = Arc::new(Mutex::new(memory));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(
-                RTLD_BASE as u64,
-                memory.clone(),
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            RTLD_BASE as u64,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(0, MAIN_MODULE_OBJ);
         jit.set_register(1, symbol_addr);
@@ -9096,26 +9428,23 @@ mod tests {
         memory[svc_off..svc_off + 4].copy_from_slice(&0xEF00_0000u32.to_le_bytes());
 
         let memory = Arc::new(Mutex::new(memory));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(
-                RTLD_BASE as u64,
-                memory.clone(),
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            RTLD_BASE as u64,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(0, symbol_addr);
         jit.set_register(13, svc_addr as u32 - 0x100);
@@ -9186,26 +9515,23 @@ mod tests {
         memory[svc_off..svc_off + 4].copy_from_slice(&0xEF00_0000u32.to_le_bytes());
 
         let memory = Arc::new(Mutex::new(memory));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(
-                RTLD_BASE as u64,
-                memory.clone(),
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            RTLD_BASE as u64,
+            memory.clone(),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = optimizations;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         let sp = svc_addr as u32 - 0x200;
         jit.set_register(0, RTLD_MODULE_OBJ);
@@ -9300,34 +9626,31 @@ mod tests {
 
     #[test]
     fn test_a32_tst_imm_beq_takes_zero_path() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE3A08000, // mov r8, #0
-                    0xE3180C03, // tst r8, #0x300
-                    0x0A000001, // beq +1
-                    0xE3A00000, // mov r0, #0
-                    0xEF000000, // svc 0
-                    0xE3A00001, // mov r0, #1
-                    0xEF000000, // svc 0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE3A08000, // mov r8, #0
+                0xE3180C03, // tst r8, #0x300
+                0x0A000001, // beq +1
+                0xE3A00000, // mov r0, #0
+                0xEF000000, // svc 0
+                0xE3A00001, // mov r0, #1
+                0xEF000000, // svc 0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(15, 0x1000);
         jit.set_register(14, 0x2000);
@@ -9343,30 +9666,64 @@ mod tests {
     }
 
     #[test]
+    fn test_thumb32_tst_imm_beq_uses_result_nz() {
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xF011_2100, // movs r1, #0; first half of tst.w r1, #0x55
+                0xD001_0F55, // second half of tst.w; beq +1
+                0xDF00_2000, // movs r0, #0; svc 0
+                0xDF00_2001, // movs r0, #1; svc 0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
+        let mut jit = A32Jit::new(config).unwrap();
+        jit.set_register(15, 0x1000);
+        jit.set_register(14, 0x2000);
+        jit.set_cpsr(0x30);
+
+        let hr = jit.run();
+        assert!(
+            hr.contains(HaltReason::SVC),
+            "expected SVC halt, got {:?}",
+            hr
+        );
+        assert_eq!(jit.get_register(0), 1);
+    }
+
+    #[test]
     fn test_vfp_cmp_bne_const_prop_only() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A,
-                    0xEF000000,
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::CONST_PROP,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A, 0xEF000000,
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::CONST_PROP;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -9379,29 +9736,25 @@ mod tests {
 
     #[test]
     fn test_vfp_cmp_bne_block_linking_only() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A,
-                    0xEF000000,
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::BLOCK_LINKING,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xE2877001, 0xEEB48AC0, 0xEEF1FA10, 0xE1540007, 0x1AFFFFFA, 0xE3A0002A, 0xEF000000,
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::BLOCK_LINKING;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).unwrap();
         jit.set_register(4, 5);
         jit.set_register(7, 3);
@@ -9455,23 +9808,25 @@ mod tests {
             0xD4000001, // svc  #0
         ];
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
 
@@ -9558,23 +9913,25 @@ mod tests {
             0x6E671CA3, // bsl v3.16b, v5.16b, v7.16b
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         let d_lo = 0x00FF_00FF_F0F0_F0F0;
@@ -9602,23 +9959,25 @@ mod tests {
             0x6EA71CA3, // bit v3.16b, v5.16b, v7.16b
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         let d_lo = 0x0123_4567_89AB_CDEF;
@@ -9655,23 +10014,25 @@ mod tests {
             0x4F00041F, // movi v31.4s, #0
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_vector(31, 0xDEADBEEFCAFEBABE, 0x1234567890ABCDEF);
@@ -9709,23 +10070,25 @@ mod tests {
             0xAD007C3F, // stp q31, q31, [x1]
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         // Pre-fill v31 with the EXACT sentinel pattern STK observed.
@@ -9763,23 +10126,25 @@ mod tests {
             0x0E31B800, // addv b0, v0.8b
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         // V0.8B = bytes [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
@@ -10041,23 +10406,25 @@ mod tests {
             0x0E71B800, // addv h0, v0.4h
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         // V0.4H = halfs [0x1234, 0x5678, 0x9ABC, 0xDEF0]
@@ -10097,23 +10464,25 @@ mod tests {
             0xF900001F, // str xzr, [x0]
             0xD4000001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         // Pre-fill v31 with a distinguishable sentinel that is NOT 0.
@@ -10485,6 +10854,25 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn test_a64_sqshlu_v0_4s_applies_immediate_to_every_lane() {
+        let code: &[u32] = &[
+            0x6F23_6420, // sqshlu v0.4s, v1.4s, #3
+            0xD400_0001, // svc #0
+        ];
+        let jit = run_a64_alu(code, |j| {
+            // Signed words: [1, 2, 0x20000000, -1].
+            j.set_vector(1, 0x0000_0002_0000_0001, 0xFFFF_FFFF_2000_0000);
+        });
+
+        assert_eq!(
+            jit.get_vector(0),
+            (0x0000_0010_0000_0008, 0x0000_0000_FFFF_FFFF)
+        );
+        assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQSHLU must set FPSR.QC");
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn test_a64_frintn_v30_4s_rounds_to_nearest_tie_even() {
         let code: &[u32] = &[
             0x4E21_8BDE, // frintn v30.4s, v30.4s
@@ -10802,23 +11190,25 @@ mod tests {
             0xB000_30A1, // adrp x1, 0x8147a000
             0xD400_0001, // svc #0
         ];
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(PC, &code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(PC, &code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(PC);
         run_a64_until_svc(&mut jit);
@@ -10836,26 +11226,27 @@ mod tests {
             0xD400_0001, // svc #0
         ];
         let read_address = Arc::new(AtomicU64::new(u64::MAX));
-        let config = JitConfig {
-            callbacks: Box::new(
-                MockCallbacks::new(PC, &code)
-                    .with_memory_read_address_sink(Arc::clone(&read_address)),
-            ),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(
+            MockCallbacks::new(PC, &code).with_memory_read_address_sink(Arc::clone(&read_address)),
+        ));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(PC);
         run_a64_until_svc(&mut jit);
@@ -11055,23 +11446,25 @@ mod tests {
         }
         memory[BYTE_ADDRESS] = 127;
 
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_memory(0, memory)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_memory(0, memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(CODE_ADDRESS as u64);
         jit.set_sp(0xF000);
@@ -11134,23 +11527,28 @@ mod tests {
         }
 
         let memory = Arc::new(Mutex::new(memory));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0, Arc::clone(&memory))),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            Arc::clone(&memory),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(CODE_ADDRESS as u64);
         jit.set_sp(0xF000);
@@ -11248,23 +11646,28 @@ mod tests {
         }
 
         let memory = Arc::new(Mutex::new(memory));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::from_shared_memory(0, Arc::clone(&memory))),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+            0,
+            Arc::clone(&memory),
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).expect("A64 JIT");
         jit.set_pc(CODE_ADDRESS as u64);
         jit.set_sp(0xF000);
@@ -11290,30 +11693,27 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_a32_vmsr_vmrs_fpscr_uses_host_abi_registers() {
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(
-                0x1000,
-                &[
-                    0xEEE1_0A10, // VMSR FPSCR, r0
-                    0xEEF1_1A10, // VMRS r1, FPSCR
-                    0xEF00_0000, // SVC #0
-                ],
-            )),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+            0x1000,
+            &[
+                0xEEE1_0A10, // VMSR FPSCR, r0
+                0xEEF1_1A10, // VMRS r1, FPSCR
+                0xEF00_0000, // SVC #0
+            ],
+        )));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).expect("A32 JIT");
         let fpscr_mode = 0x03C0_0000;
         jit.set_register(0, fpscr_mode);
@@ -11330,27 +11730,24 @@ mod tests {
     #[test]
     fn test_a32_svc_with_cycle_counting_matches_callback_contract() {
         let svc_sink = Arc::new(AtomicU32::new(u32::MAX));
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::with_svc_sink(
-                0x1000,
-                &[0xEF00_0026], // SVC #0x26
-                svc_sink.clone(),
-            )),
-            enable_cycle_counting: true,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A32UserConfig::new(Box::new(MockCallbacks::with_svc_sink(
+            0x1000,
+            &[0xEF00_0026], // SVC #0x26
+            svc_sink.clone(),
+        )));
+        config.enable_cycle_counting = true;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table = None;
         let mut jit = A32Jit::new(config).expect("A32 JIT");
         jit.set_register(15, 0x1000);
         jit.set_cpsr(0x10);
@@ -11401,23 +11798,25 @@ mod tests {
         ];
         let mapping = TestFastmemMapping::new(0x10_000);
         mapping.map_u32(0x2000, 0);
-        let config = JitConfig {
-            callbacks: Box::new(MockCallbacks::new(0x1000, code)),
-            enable_cycle_counting: false,
-            code_cache_size: 4 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: Some(mapping.ptr.cast()),
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
-        };
+        let mut config = A64UserConfig::new(Box::new(MockCallbacks::new(0x1000, code)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = Some(mapping.ptr.cast());
+        config.define_unpredictable_behaviour = false;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.cntfrq_el0 = 600_000_000;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.tpidrro_el0 = None;
+        config.tpidr_el0 = None;
+        config.page_table = None;
         let mut jit = A64Jit::new(config).unwrap();
         jit.set_pc(0x1000);
         jit.set_register(19, 0x2100);

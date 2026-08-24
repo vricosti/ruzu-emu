@@ -79,6 +79,7 @@ pub enum Thumb16InstId {
     REVSH,
     NOP,
     SEV,
+    SEVL,
     WFE,
     WFI,
     YIELD,
@@ -381,6 +382,7 @@ fn decode_thumb16_hint(instr: u16) -> Thumb16InstId {
         0b0010_0000 => Thumb16InstId::WFE,
         0b0011_0000 => Thumb16InstId::WFI,
         0b0100_0000 => Thumb16InstId::SEV,
+        0b0101_0000 => Thumb16InstId::SEVL,
         _ if (instr >> 8) & 0xFF == 0xBF && (instr & 0xF) != 0 => Thumb16InstId::IT,
         _ => Thumb16InstId::NOP,
     }
@@ -407,6 +409,11 @@ mod tests {
         assert_eq!(dec.id, Thumb16InstId::MOV_imm);
         assert_eq!(dec.rt_hi(), Reg::R0);
         assert_eq!(dec.imm8(), 42);
+    }
+
+    #[test]
+    fn test_decode_thumb16_sevl() {
+        assert_eq!(decode_thumb16(0xBF50).id, Thumb16InstId::SEVL);
     }
 
     #[test]

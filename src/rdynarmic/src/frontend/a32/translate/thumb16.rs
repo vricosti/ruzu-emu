@@ -1,13 +1,19 @@
 use super::helpers::emit_imm_shift;
 use crate::frontend::a32::decoder_thumb16::{DecodedThumb16, Thumb16InstId};
-use crate::frontend::a32::types::{Reg, ShiftType};
+use crate::frontend::a32::types::{Exception, Reg, ShiftType};
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::acc_type::AccType;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
+use super::TranslationOptions;
+
 /// Translate a single Thumb16 instruction. Returns true to continue.
-pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
+pub fn translate_thumb16(
+    ir: &mut A32IREmitter,
+    inst: &DecodedThumb16,
+    options: TranslationOptions,
+) -> bool {
     use Thumb16InstId::*;
     match inst.id {
         // Shift immediate
@@ -49,7 +55,7 @@ pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
         MOV_reg => thumb16_mov_reg(ir, inst),
 
         // Branch
-        BX => thumb16_bx(ir, inst),
+        BX => thumb16_bx(ir, inst.rm_hi()),
         BLX_reg => thumb16_blx_reg(ir, inst),
         B_t1 => thumb16_b_cond(ir, inst),
         B_t2 => thumb16_b_uncond(ir, inst),
@@ -97,13 +103,12 @@ pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
         REVSH => thumb16_revsh(ir, inst),
 
         // Misc
-        NOP | SEV | YIELD => true,
-        WFE | WFI => {
-            // Upstream: WFE/WFI are NOPs when hook_hint_instructions is false.
-            // They just continue execution (return true = continue translating).
-            // Only when hook_hint_instructions is true do they raise an exception.
-            true
-        }
+        NOP => true,
+        SEV => thumb16_hint(ir, options, Exception::SendEvent),
+        SEVL => thumb16_hint(ir, options, Exception::SendEventLocal),
+        WFE => thumb16_hint(ir, options, Exception::WaitForEvent),
+        WFI => thumb16_hint(ir, options, Exception::WaitForInterrupt),
+        YIELD => thumb16_hint(ir, options, Exception::Yield),
         BKPT => super::raise_exception_with_instruction_size(
             ir,
             crate::frontend::a32::types::Exception::Breakpoint,
@@ -131,6 +136,13 @@ pub fn translate_thumb16(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     }
 }
 
+fn thumb16_hint(ir: &mut A32IREmitter, options: TranslationOptions, exception: Exception) -> bool {
+    if !options.hook_hint_instructions {
+        return true;
+    }
+    super::raise_exception_with_instruction_size(ir, exception, 2)
+}
+
 // --- Shift immediate ---
 
 fn thumb16_lsl_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
@@ -140,8 +152,8 @@ fn thumb16_lsl_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let carry_in = ir.get_c_flag();
     let rm_val = ir.get_register(rm);
     let (result, carry) = emit_imm_shift(ir, rm_val, ShiftType::LSL, imm5, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rd, result);
     true
 }
@@ -153,8 +165,8 @@ fn thumb16_lsr_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let carry_in = ir.get_c_flag();
     let rm_val = ir.get_register(rm);
     let (result, carry) = emit_imm_shift(ir, rm_val, ShiftType::LSR, imm5, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rd, result);
     true
 }
@@ -166,8 +178,8 @@ fn thumb16_asr_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let carry_in = ir.get_c_flag();
     let rm_val = ir.get_register(rm);
     let (result, carry) = emit_imm_shift(ir, rm_val, ShiftType::ASR, imm5, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rd, result);
     true
 }
@@ -181,7 +193,7 @@ fn thumb16_add_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn_val = ir.get_register(rn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().add_32(rn_val, rm_val, Value::ImmU1(false));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rd, result);
     true
@@ -194,7 +206,7 @@ fn thumb16_sub_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn_val = ir.get_register(rn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().sub_32(rn_val, rm_val, Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rd, result);
     true
@@ -208,7 +220,7 @@ fn thumb16_add_imm3(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let result = ir
         .ir()
         .add_32(rn_val, Value::ImmU32(imm3), Value::ImmU1(false));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rd, result);
     true
@@ -222,7 +234,7 @@ fn thumb16_sub_imm3(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let result = ir
         .ir()
         .sub_32(rn_val, Value::ImmU32(imm3), Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rd, result);
     true
@@ -236,8 +248,8 @@ fn thumb16_mov_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let r = ir
         .ir()
         .add_32(result, Value::ImmU32(0), Value::ImmU1(false));
-    let nzcv = ir.ir().get_nzcv_from_op(r);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(r);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rd, result);
     true
 }
@@ -249,7 +261,7 @@ fn thumb16_cmp_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let result = ir
         .ir()
         .sub_32(rn_val, Value::ImmU32(imm8), Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     true
 }
@@ -261,7 +273,7 @@ fn thumb16_add_imm8(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let result = ir
         .ir()
         .add_32(rdn_val, Value::ImmU32(imm8), Value::ImmU1(false));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rdn, result);
     true
@@ -274,7 +286,7 @@ fn thumb16_sub_imm8(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let result = ir
         .ir()
         .sub_32(rdn_val, Value::ImmU32(imm8), Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rdn, result);
     true
@@ -288,8 +300,8 @@ fn thumb16_and_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rdn_val = ir.get_register(rdn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().and_32(rdn_val, rm_val);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rdn, result);
     true
 }
@@ -300,8 +312,8 @@ fn thumb16_eor_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rdn_val = ir.get_register(rdn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().eor_32(rdn_val, rm_val);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rdn, result);
     true
 }
@@ -314,9 +326,9 @@ fn thumb16_lsl_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rm_val = ir.get_register(rm);
     let amount = ir.ir().least_significant_byte(rm_val);
     let result = ir.ir().logical_shift_left_32(rdn_val, amount, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nz = ir.nz_from(result);
     let carry = ir.ir().get_carry_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rdn, result);
     true
 }
@@ -329,9 +341,9 @@ fn thumb16_lsr_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rm_val = ir.get_register(rm);
     let amount = ir.ir().least_significant_byte(rm_val);
     let result = ir.ir().logical_shift_right_32(rdn_val, amount, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nz = ir.nz_from(result);
     let carry = ir.ir().get_carry_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rdn, result);
     true
 }
@@ -344,9 +356,9 @@ fn thumb16_asr_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rm_val = ir.get_register(rm);
     let amount = ir.ir().least_significant_byte(rm_val);
     let result = ir.ir().arithmetic_shift_right_32(rdn_val, amount, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nz = ir.nz_from(result);
     let carry = ir.ir().get_carry_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rdn, result);
     true
 }
@@ -358,7 +370,7 @@ fn thumb16_adc_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rdn_val = ir.get_register(rdn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().add_32(rdn_val, rm_val, c);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rdn, result);
     true
@@ -371,7 +383,7 @@ fn thumb16_sbc_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rdn_val = ir.get_register(rdn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().sub_32(rdn_val, rm_val, c);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rdn, result);
     true
@@ -385,9 +397,9 @@ fn thumb16_ror_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rm_val = ir.get_register(rm);
     let amount = ir.ir().least_significant_byte(rm_val);
     let result = ir.ir().rotate_right_32(rdn_val, amount, carry_in);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nz = ir.nz_from(result);
     let carry = ir.ir().get_carry_from_op(result);
-    ir.set_cpsr_nzc(nzcv, carry);
+    ir.set_cpsr_nzc(nz, carry);
     ir.set_register(rdn, result);
     true
 }
@@ -398,8 +410,8 @@ fn thumb16_tst_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn_val = ir.get_register(rn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().and_32(rn_val, rm_val);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     true
 }
 
@@ -409,7 +421,7 @@ fn thumb16_rsb_imm(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn = inst.rn_lo();
     let rn_val = ir.get_register(rn);
     let result = ir.ir().sub_32(Value::ImmU32(0), rn_val, Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     ir.set_register(rd, result);
     true
@@ -421,7 +433,7 @@ fn thumb16_cmp_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn_val = ir.get_register(rn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().sub_32(rn_val, rm_val, Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     true
 }
@@ -432,7 +444,7 @@ fn thumb16_cmn_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn_val = ir.get_register(rn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().add_32(rn_val, rm_val, Value::ImmU1(false));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     true
 }
@@ -443,8 +455,8 @@ fn thumb16_orr_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rdn_val = ir.get_register(rdn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().or_32(rdn_val, rm_val);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rdn, result);
     true
 }
@@ -455,8 +467,8 @@ fn thumb16_mul_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rdn_val = ir.get_register(rdn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().mul_32(rdn_val, rm_val);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rdn, result);
     true
 }
@@ -468,8 +480,8 @@ fn thumb16_bic_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rm_val = ir.get_register(rm);
     let not_rm = ir.ir().not_32(rm_val);
     let result = ir.ir().and_32(rdn_val, not_rm);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rdn, result);
     true
 }
@@ -479,8 +491,8 @@ fn thumb16_mvn_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rm = inst.rn_lo();
     let rm_val = ir.get_register(rm);
     let result = ir.ir().not_32(rm_val);
-    let nzcv = ir.ir().get_nzcv_from_op(result);
-    ir.set_cpsr_nz(nzcv);
+    let nz = ir.nz_from(result);
+    ir.set_cpsr_nz(nz);
     ir.set_register(rd, result);
     true
 }
@@ -509,7 +521,7 @@ fn thumb16_cmp_reg_t2(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn_val = ir.get_register(rn);
     let rm_val = ir.get_register(rm);
     let result = ir.ir().sub_32(rn_val, rm_val, Value::ImmU1(true));
-    let nzcv = ir.ir().get_nzcv_from_op(result);
+    let nzcv = ir.nzcv_from(result);
     ir.set_cpsr_nzcv(nzcv);
     true
 }
@@ -530,12 +542,16 @@ fn thumb16_mov_reg(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 
 // --- Branch ---
 
-fn thumb16_bx(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
-    let rm = inst.rm_hi();
-    let target = ir.get_register(rm);
+pub(super) fn thumb16_bx(ir: &mut A32IREmitter, m: Reg) -> bool {
+    let location = ir.current_location.expect("current_location not set");
+    if location.it().is_in_it_block() && !location.it().is_last_in_it_block() {
+        return super::unpredictable_instruction(ir);
+    }
+
     ir.update_upper_location_descriptor();
+    let target = ir.get_register(m);
     ir.bx_write_pc(target);
-    if rm == Reg::R14 {
+    if m == Reg::R14 {
         ir.set_term(Terminal::PopRSBHint);
     } else {
         ir.set_term(Terminal::FastDispatchHint);
@@ -1140,12 +1156,70 @@ fn thumb16_cbz_cbnz(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 mod tests {
     use super::*;
     use crate::frontend::a32::fpscr::FPSCR;
+    use crate::frontend::a32::it_state::ITState;
     use crate::frontend::a32::psr::PSR;
     use crate::ir::block::Block;
     use crate::ir::location::A32LocationDescriptor;
     use crate::ir::opcode::Opcode;
     use crate::ir::terminal::Terminal;
     use crate::ir::value::Value;
+
+    #[test]
+    fn logical_and_arithmetic_flags_use_distinct_upstream_extractors() {
+        let loc = A32LocationDescriptor::new(0x4000, PSR::new(0x20), FPSCR::default(), false);
+
+        let mut logical = Block::new(loc.to_location());
+        assert!(thumb16_and_reg(
+            &mut A32IREmitter::with_location(&mut logical, loc),
+            &DecodedThumb16 {
+                raw: 0x4008,
+                id: Thumb16InstId::AND_reg,
+            },
+        ));
+        assert!(logical
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetNZFromOp));
+        assert!(!logical
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetNZCVFromOp));
+
+        let mut arithmetic = Block::new(loc.to_location());
+        assert!(thumb16_add_reg(
+            &mut A32IREmitter::with_location(&mut arithmetic, loc),
+            &DecodedThumb16 {
+                raw: 0x1808,
+                id: Thumb16InstId::ADD_reg_t1,
+            },
+        ));
+        assert!(arithmetic
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetNZCVFromOp));
+        assert!(!arithmetic
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetNZFromOp));
+    }
+
+    #[test]
+    fn thumb16_bx_rejects_nonfinal_it_instruction_before_reading_m() {
+        let loc = A32LocationDescriptor::new(0x4000, PSR::new(0x20), FPSCR::default(), false)
+            .set_it(ITState::new(0x0c));
+        let mut block = Block::new(loc.to_location());
+        let mut ir = A32IREmitter::with_location(&mut block, loc);
+
+        assert!(!thumb16_bx(&mut ir, Reg::R3));
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32ExceptionRaised));
+        assert!(!block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32GetRegister));
+    }
 
     #[test]
     fn thumb16_blx_reg_writes_pc_before_link_register() {
@@ -1228,7 +1302,11 @@ mod tests {
             id: Thumb16InstId::UDF,
         };
 
-        assert!(!translate_thumb16(&mut ir, &inst));
+        assert!(!translate_thumb16(
+            &mut ir,
+            &inst,
+            TranslationOptions::default(),
+        ));
         let exception = block
             .instructions
             .iter()
@@ -1245,6 +1323,42 @@ mod tests {
                 && inst.args[0] == Value::ImmU32(0x4002)
                 && inst.args[1] == Value::ImmU32(0xFFFF_FFFE)
         }));
+    }
+
+    #[test]
+    fn thumb16_hint_option_selects_nop_or_exception() {
+        let loc = A32LocationDescriptor::new(0x4000, PSR::new(0x20), FPSCR::default(), false);
+        let inst = DecodedThumb16 {
+            raw: 0xBF30,
+            id: Thumb16InstId::WFI,
+        };
+
+        let mut disabled = Block::new(loc.to_location());
+        assert!(translate_thumb16(
+            &mut A32IREmitter::with_location(&mut disabled, loc),
+            &inst,
+            TranslationOptions {
+                hook_hint_instructions: false,
+                ..TranslationOptions::default()
+            },
+        ));
+        assert!(disabled.instructions.is_empty());
+
+        let mut enabled = Block::new(loc.to_location());
+        assert!(!translate_thumb16(
+            &mut A32IREmitter::with_location(&mut enabled, loc),
+            &inst,
+            TranslationOptions::default(),
+        ));
+        let exception = enabled
+            .instructions
+            .iter()
+            .find(|instruction| instruction.opcode == Opcode::A32ExceptionRaised)
+            .expect("missing A32ExceptionRaised");
+        assert_eq!(
+            exception.args[1],
+            Value::ImmU64(crate::frontend::a32::types::Exception::WaitForInterrupt.as_u32() as u64)
+        );
     }
 
     #[test]

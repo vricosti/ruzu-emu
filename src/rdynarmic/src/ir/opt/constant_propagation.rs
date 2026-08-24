@@ -123,9 +123,9 @@ pub fn constant_propagation(block: &mut Block) {
                     replace_with_sized(block, inst_ref, is_32, result as u64);
                 }
             }
-            Opcode::RotateRight32 | Opcode::RotateRight64 => {
+            Opcode::BitRotateRight32 | Opcode::BitRotateRight64 => {
                 if fold_shift_zero(block, inst_ref) && all_args_immediate(block, inst_ref) {
-                    let is_32 = opcode == Opcode::RotateRight32;
+                    let is_32 = opcode == Opcode::BitRotateRight32;
                     let a = block.instructions[i].args[0].get_imm_as_u64();
                     let b = block.instructions[i].args[1].get_u8();
                     let result = if is_32 {

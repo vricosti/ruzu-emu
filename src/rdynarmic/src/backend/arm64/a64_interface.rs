@@ -3,8 +3,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use crate::halt_reason::HaltReason;
-use crate::jit_config::JitConfig;
+use crate::interface::a64::config::{UserCallbacks, UserConfig};
+use crate::interface::halt_reason::HaltReason;
 
 use super::a64_address_space::{A64AddressSpace, A64CallbackContext};
 use super::a64_core::A64Core;
@@ -48,7 +48,8 @@ struct A64Invalidation {
 }
 
 impl A64Interface {
-    pub fn new(config: JitConfig) -> Result<Self, String> {
+    pub fn new(config: impl Into<UserConfig>) -> Result<Self, String> {
+        let config = config.into();
         let current_address_space = A64AddressSpace::new(config)?;
         let core = A64Core::new(current_address_space.config());
         let mut interface = Self {
@@ -285,13 +286,13 @@ impl A64Interface {
         let processor_id = inner.current_address_space.config().processor_id;
         let callbacks = {
             let callbacks = &mut inner.current_address_space.config_mut().callbacks;
-            callbacks.as_mut() as *mut dyn crate::jit_config::UserCallbacks
+            callbacks.as_mut() as *mut dyn UserCallbacks
         };
         inner.callback_context = Some(A64CallbackContext::new(
             &mut inner.current_state,
             callbacks,
             global_monitor,
-            processor_id,
+            processor_id as usize,
         ));
         let callback_context_ptr = inner
             .callback_context
@@ -308,8 +309,8 @@ impl A64Interface {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
-    use crate::jit_config::{OptimizationFlag, UserCallbacks};
+    use crate::interface::a64::config::{Exception as A64Exception, Vector as A64Vector};
+    use crate::interface::optimization_flags::OptimizationFlag;
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -343,69 +344,25 @@ mod tests {
             0
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
+        fn memory_read_128(&self, _vaddr: u64) -> A64Vector {
+            [0, 0]
         }
 
         fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
         fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
         fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
+        fn memory_write_128(&mut self, _vaddr: u64, _value: A64Vector) {}
 
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-            0
-        }
-
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-            0
-        }
-
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-            0
-        }
-
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-            0
-        }
-
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-
-        fn exclusive_clear(&mut self) {}
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
+            0
+        }
+
+        fn get_cntpct(&self) -> u64 {
             0
         }
 
@@ -422,27 +379,15 @@ mod tests {
         }
     }
 
-    fn config_with_pointers(pointers: Option<Arc<Mutex<PointerState>>>) -> JitConfig {
-        JitConfig {
-            callbacks: Box::new(TestCallbacks { pointers }),
-            enable_cycle_counting: false,
-            code_cache_size: 4096,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn config_with_pointers(pointers: Option<Arc<Mutex<PointerState>>>) -> UserConfig {
+        let mut config = UserConfig::new(Box::new(TestCallbacks { pointers }));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4096;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config
     }
 
-    fn config() -> JitConfig {
+    fn config() -> UserConfig {
         config_with_pointers(None)
     }
 

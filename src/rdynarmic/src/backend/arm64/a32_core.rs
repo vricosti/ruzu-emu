@@ -1,6 +1,6 @@
-use crate::halt_reason::HaltReason;
+use crate::interface::a32::config::UserConfig as A32UserConfig;
+use crate::interface::halt_reason::HaltReason;
 use crate::ir::location::A32LocationDescriptor;
-use crate::jit_config::JitConfig;
 
 use super::a32_address_space::A32AddressSpace;
 use super::jit_state::A32JitState;
@@ -11,7 +11,7 @@ use super::jit_state::A32JitState;
 pub struct A32Core;
 
 impl A32Core {
-    pub fn new(_config: &JitConfig) -> Self {
+    pub fn new(_config: &A32UserConfig) -> Self {
         Self
     }
 
@@ -59,96 +59,45 @@ impl A32Core {
 mod tests {
     use super::*;
     use crate::backend::arm64::emit_arm64::EmittedBlockInfo;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
+    use crate::interface::a32::config::{
+        Exception as A32Exception, UserCallbacks as A32UserCallbacks,
+    };
+    use crate::interface::optimization_flags::OptimizationFlag;
     use crate::ir::location::LocationDescriptor;
-    use crate::jit_config::{OptimizationFlag, UserCallbacks};
     use std::collections::HashMap;
 
     struct TestCallbacks;
 
-    impl UserCallbacks for TestCallbacks {
-        fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
+    impl A32UserCallbacks for TestCallbacks {
+        fn memory_read_code(&self, _vaddr: u32) -> Option<u32> {
             Some(0xE12F_FF1E) // BX LR: a real terminal instruction for compile-only tests.
         }
 
-        fn memory_read_8(&self, _vaddr: u64) -> u8 {
+        fn memory_read_8(&self, _vaddr: u32) -> u8 {
             0
         }
 
-        fn memory_read_16(&self, _vaddr: u64) -> u16 {
+        fn memory_read_16(&self, _vaddr: u32) -> u16 {
             0
         }
 
-        fn memory_read_32(&self, _vaddr: u64) -> u32 {
+        fn memory_read_32(&self, _vaddr: u32) -> u32 {
             0
         }
 
-        fn memory_read_64(&self, _vaddr: u64) -> u64 {
+        fn memory_read_64(&self, _vaddr: u32) -> u64 {
             0
         }
 
-        fn memory_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
+        fn memory_write_8(&mut self, _vaddr: u32, _value: u8) {}
+        fn memory_write_16(&mut self, _vaddr: u32, _value: u16) {}
+        fn memory_write_32(&mut self, _vaddr: u32, _value: u32) {}
+        fn memory_write_64(&mut self, _vaddr: u32, _value: u64) {}
 
-        fn memory_write_8(&mut self, _vaddr: u64, _value: u8) {}
-        fn memory_write_16(&mut self, _vaddr: u64, _value: u16) {}
-        fn memory_write_32(&mut self, _vaddr: u64, _value: u32) {}
-        fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
-        fn memory_write_128(&mut self, _vaddr: u64, _value_lo: u64, _value_hi: u64) {}
-
-        fn exclusive_read_8(&self, _vaddr: u64) -> u8 {
-            0
-        }
-
-        fn exclusive_read_16(&self, _vaddr: u64) -> u16 {
-            0
-        }
-
-        fn exclusive_read_32(&self, _vaddr: u64) -> u32 {
-            0
-        }
-
-        fn exclusive_read_64(&self, _vaddr: u64) -> u64 {
-            0
-        }
-
-        fn exclusive_read_128(&self, _vaddr: u64) -> (u64, u64) {
-            (0, 0)
-        }
-
-        fn exclusive_write_8(&mut self, _vaddr: u64, _value: u8, _expected: u8) -> bool {
-            false
-        }
-
-        fn exclusive_write_16(&mut self, _vaddr: u64, _value: u16, _expected: u16) -> bool {
-            false
-        }
-
-        fn exclusive_write_32(&mut self, _vaddr: u64, _value: u32, _expected: u32) -> bool {
-            false
-        }
-
-        fn exclusive_write_64(&mut self, _vaddr: u64, _value: u64, _expected: u64) -> bool {
-            false
-        }
-
-        fn exclusive_write_128(
-            &mut self,
-            _vaddr: u64,
-            _value_lo: u64,
-            _value_hi: u64,
-            _expected_lo: u64,
-            _expected_hi: u64,
-        ) -> bool {
-            false
-        }
-
-        fn exclusive_clear(&mut self) {}
-        fn call_supervisor(&mut self, _svc_num: u32) {}
-        fn exception_raised(&mut self, _pc: u64, _exception: u64) {}
+        fn call_svc(&mut self, _svc_num: u32) {}
+        fn exception_raised(&mut self, _pc: u32, _exception: A32Exception) {}
         fn add_ticks(&mut self, _ticks: u64) {}
 
         fn get_ticks_remaining(&self) -> u64 {
@@ -156,24 +105,12 @@ mod tests {
         }
     }
 
-    fn config() -> JitConfig {
-        JitConfig {
-            callbacks: Box::new(TestCallbacks),
-            enable_cycle_counting: false,
-            code_cache_size: 4096,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn config() -> A32UserConfig {
+        let mut config = A32UserConfig::new(Box::new(TestCallbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4096;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config
     }
 
     #[test]

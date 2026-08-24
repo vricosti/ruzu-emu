@@ -145,6 +145,26 @@ impl DecodedInst {
 }
 
 #[cfg(test)]
+mod system_flag_decoder_tests {
+    use super::{decode, A64InstructionName};
+
+    #[test]
+    fn patterns_with_trailing_architecture_comments_are_generated() {
+        let cases = [
+            (0xD500_401F, A64InstructionName::CFINV),
+            (0xBA02_8465, A64InstructionName::RMIF),
+            (0xD500_403F, A64InstructionName::XAFlag),
+            (0xD500_405F, A64InstructionName::AXFlag),
+        ];
+
+        for (encoding, expected_name) in cases {
+            let decoded = decode(encoding).expect("system-flag instruction should decode");
+            assert_eq!(decoded.name, expected_name, "encoding 0x{encoding:08X}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

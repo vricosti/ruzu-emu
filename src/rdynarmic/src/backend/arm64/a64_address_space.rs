@@ -3,12 +3,15 @@ use std::ffi::c_void;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
-use crate::exclusive_monitor::ExclusiveMonitor;
 use crate::frontend::a64::translate::{translate, TranslationOptions};
+use crate::interface::a64::config::{
+    DataCacheOperation, Exception, InstructionCacheOperation, UserCallbacks, UserConfig,
+};
+use crate::interface::exclusive_monitor::ExclusiveMonitor;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::block::Block;
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
-use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 use super::address_space::AddressSpace;
 use super::emit_arm64::{CodePtr, EmitConfig};
@@ -32,7 +35,7 @@ pub struct BlockRange64 {
 /// Upstream owner: `backend/arm64/a64_address_space.h/.cpp`.
 pub struct A64AddressSpace {
     address_space: AddressSpace,
-    conf: JitConfig,
+    conf: UserConfig,
     block_ranges: Vec<BlockRange64>,
 }
 
@@ -59,7 +62,6 @@ pub struct A64CallbackFns {
     pub exclusive_write_memory_64: *const c_void,
     pub exclusive_write_memory_128: *const c_void,
     pub call_svc: *const c_void,
-    pub interpreter_fallback: *const c_void,
     pub exception_raised: *const c_void,
     pub isb_raised: *const c_void,
     pub ic_raised: *const c_void,
@@ -130,7 +132,6 @@ impl A64CallbackContext {
             exclusive_write_memory_64: a64_arm64_exclusive_write_64 as *const () as *const c_void,
             exclusive_write_memory_128: a64_arm64_exclusive_write_128 as *const () as *const c_void,
             call_svc: a64_arm64_call_svc as *const () as *const c_void,
-            interpreter_fallback: a64_arm64_interpreter_fallback as *const () as *const c_void,
             exception_raised: a64_arm64_exception_raised as *const () as *const c_void,
             isb_raised: a64_arm64_isb_raised as *const () as *const c_void,
             ic_raised: a64_arm64_instruction_cache_operation as *const () as *const c_void,
@@ -172,7 +173,7 @@ extern "C" fn a64_arm64_memory_read_64(ctx: *mut A64CallbackContext, vaddr: u64)
 
 extern "C" fn a64_arm64_memory_read_128(ctx: *mut A64CallbackContext, vaddr: u64) -> Pair128 {
     let context = unsafe { &mut *ctx };
-    let (lo, hi) = context.callbacks().memory_read_128(vaddr);
+    let [lo, hi] = context.callbacks().memory_read_128(vaddr);
     Pair128 { lo, hi }
 }
 
@@ -205,28 +206,19 @@ extern "C" fn a64_arm64_memory_write_128(
     let context = unsafe { &mut *ctx };
     context
         .callbacks_mut()
-        .memory_write_128(vaddr, value_lo, value_hi);
+        .memory_write_128(vaddr, [value_lo, value_hi]);
 }
 
 extern "C" fn a64_arm64_call_svc(ctx: *mut A64CallbackContext, svc_num: u64) {
     let context = unsafe { &mut *ctx };
-    context.callbacks_mut().call_supervisor(svc_num as u32);
-}
-
-extern "C" fn a64_arm64_interpreter_fallback(
-    ctx: *mut A64CallbackContext,
-    pc: u64,
-    num_instructions: u64,
-) {
-    let context = unsafe { &mut *ctx };
-    context
-        .callbacks_mut()
-        .interpreter_fallback(pc, num_instructions as usize);
+    context.callbacks_mut().call_svc(svc_num as u32);
 }
 
 extern "C" fn a64_arm64_exception_raised(ctx: *mut A64CallbackContext, pc: u64, exception: u64) {
     let context = unsafe { &mut *ctx };
-    context.callbacks_mut().exception_raised(pc, exception);
+    context
+        .callbacks_mut()
+        .exception_raised(pc, Exception::from_u32(exception as u32));
 }
 
 extern "C" fn a64_arm64_isb_raised(ctx: *mut A64CallbackContext) {
@@ -244,12 +236,14 @@ extern "C" fn a64_arm64_instruction_cache_operation(
     let context = unsafe { &mut *ctx };
     context
         .callbacks_mut()
-        .instruction_cache_operation(op, vaddr);
+        .instruction_cache_operation_raised(InstructionCacheOperation::from_u32(op as u32), vaddr);
 }
 
 extern "C" fn a64_arm64_data_cache_operation(ctx: *mut A64CallbackContext, op: u64, vaddr: u64) {
     let context = unsafe { &mut *ctx };
-    context.callbacks_mut().data_cache_operation(op, vaddr);
+    context
+        .callbacks_mut()
+        .data_cache_operation_raised(DataCacheOperation::from_u32(op as u32), vaddr);
 }
 
 extern "C" fn a64_arm64_get_cntpct(ctx: *mut A64CallbackContext) -> u64 {
@@ -277,10 +271,10 @@ extern "C" fn a64_arm64_exclusive_read_8(ctx: *mut A64CallbackContext, vaddr: u6
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_8(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_8(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_8(vaddr)
+        context.callbacks().memory_read_8(vaddr)
     };
     context.exclusive_value[0] = value as u64;
     value as u64
@@ -296,11 +290,10 @@ extern "C" fn a64_arm64_exclusive_read_16(ctx: *mut A64CallbackContext, vaddr: u
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_16(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_16(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_16(vaddr)
+        context.callbacks().memory_read_16(vaddr)
     };
     context.exclusive_value[0] = value as u64;
     value as u64
@@ -316,11 +309,10 @@ extern "C" fn a64_arm64_exclusive_read_32(ctx: *mut A64CallbackContext, vaddr: u
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_32(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_32(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_32(vaddr)
+        context.callbacks().memory_read_32(vaddr)
     };
     context.exclusive_value[0] = value as u64;
     if trace_a64_exclusive_enabled() {
@@ -342,11 +334,10 @@ extern "C" fn a64_arm64_exclusive_read_64(ctx: *mut A64CallbackContext, vaddr: u
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor)
-                .read_and_mark(processor_id, vaddr, || callbacks.exclusive_read_64(vaddr))
+            (&mut *monitor).read_and_mark(processor_id, vaddr, || callbacks.memory_read_64(vaddr))
         }
     } else {
-        context.callbacks().exclusive_read_64(vaddr)
+        context.callbacks().memory_read_64(vaddr)
     };
     context.exclusive_value[0] = value;
     value
@@ -362,14 +353,11 @@ extern "C" fn a64_arm64_exclusive_read_128(ctx: *mut A64CallbackContext, vaddr: 
     let value = if let Some(monitor) = global_monitor {
         let callbacks = context.callbacks_mut();
         unsafe {
-            (&mut *monitor).read_and_mark::<[u64; 2]>(processor_id, vaddr, || {
-                let (lo, hi) = callbacks.exclusive_read_128(vaddr);
-                [lo, hi]
-            })
+            (&mut *monitor)
+                .read_and_mark::<[u64; 2]>(processor_id, vaddr, || callbacks.memory_read_128(vaddr))
         }
     } else {
-        let (lo, hi) = context.callbacks().exclusive_read_128(vaddr);
-        [lo, hi]
+        context.callbacks().memory_read_128(vaddr)
     };
     context.exclusive_value = value;
     Pair128 {
@@ -390,7 +378,7 @@ extern "C" fn a64_arm64_exclusive_write_8(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u8| {
-                callbacks.exclusive_write_8(vaddr, value as u8, expected)
+                callbacks.memory_write_exclusive_8(vaddr, value as u8, expected)
             })
         } {
             0
@@ -401,7 +389,7 @@ extern "C" fn a64_arm64_exclusive_write_8(
     let expected = context.exclusive_value[0] as u8;
     context
         .callbacks_mut()
-        .exclusive_write_8(vaddr, value as u8, expected) as u64
+        .memory_write_exclusive_8(vaddr, value as u8, expected) as u64
         ^ 1
 }
 
@@ -417,7 +405,7 @@ extern "C" fn a64_arm64_exclusive_write_16(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u16| {
-                callbacks.exclusive_write_16(vaddr, value as u16, expected)
+                callbacks.memory_write_exclusive_16(vaddr, value as u16, expected)
             })
         } {
             0
@@ -428,7 +416,7 @@ extern "C" fn a64_arm64_exclusive_write_16(
     let expected = context.exclusive_value[0] as u16;
     context
         .callbacks_mut()
-        .exclusive_write_16(vaddr, value as u16, expected) as u64
+        .memory_write_exclusive_16(vaddr, value as u16, expected) as u64
         ^ 1
 }
 
@@ -452,7 +440,7 @@ extern "C" fn a64_arm64_exclusive_write_32(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u32| {
-                callbacks.exclusive_write_32(vaddr, value as u32, expected)
+                callbacks.memory_write_exclusive_32(vaddr, value as u32, expected)
             })
         } {
             0
@@ -463,7 +451,7 @@ extern "C" fn a64_arm64_exclusive_write_32(
     let expected = context.exclusive_value[0] as u32;
     let result = context
         .callbacks_mut()
-        .exclusive_write_32(vaddr, value as u32, expected);
+        .memory_write_exclusive_32(vaddr, value as u32, expected);
     if trace_a64_exclusive_enabled() {
         eprintln!("[A64_EXCL_W32_EXIT] result={result}");
     }
@@ -482,7 +470,7 @@ extern "C" fn a64_arm64_exclusive_write_64(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation(processor_id, vaddr, |expected: u64| {
-                callbacks.exclusive_write_64(vaddr, value, expected)
+                callbacks.memory_write_exclusive_64(vaddr, value, expected)
             })
         } {
             0
@@ -493,7 +481,7 @@ extern "C" fn a64_arm64_exclusive_write_64(
     let expected = context.exclusive_value[0];
     context
         .callbacks_mut()
-        .exclusive_write_64(vaddr, value, expected) as u64
+        .memory_write_exclusive_64(vaddr, value, expected) as u64
         ^ 1
 }
 
@@ -510,7 +498,7 @@ extern "C" fn a64_arm64_exclusive_write_128(
         let callbacks = context.callbacks_mut();
         return if unsafe {
             (&mut *monitor).do_exclusive_operation::<[u64; 2]>(processor_id, vaddr, |expected| {
-                callbacks.exclusive_write_128(vaddr, value_lo, value_hi, expected[0], expected[1])
+                callbacks.memory_write_exclusive_128(vaddr, [value_lo, value_hi], expected)
             })
         } {
             0
@@ -521,17 +509,14 @@ extern "C" fn a64_arm64_exclusive_write_128(
     let expected = context.exclusive_value;
     context
         .callbacks_mut()
-        .exclusive_write_128(vaddr, value_lo, value_hi, expected[0], expected[1]) as u64
+        .memory_write_exclusive_128(vaddr, [value_lo, value_hi], expected) as u64
         ^ 1
 }
 
 impl A64AddressSpace {
-    pub fn new(conf: JitConfig) -> Result<Self, String> {
-        let code_cache_size = if conf.code_cache_size == 0 {
-            crate::jit_config::JitConfig::DEFAULT_CODE_CACHE_SIZE
-        } else {
-            conf.code_cache_size
-        };
+    pub fn new(conf: impl Into<UserConfig>) -> Result<Self, String> {
+        let conf = conf.into();
+        let code_cache_size = conf.code_cache_size as usize;
 
         let mut address_space = AddressSpace::new(code_cache_size)?;
         emit_prelude(&mut address_space, &conf)?;
@@ -547,11 +532,11 @@ impl A64AddressSpace {
         &self.address_space
     }
 
-    pub fn config(&self) -> &JitConfig {
+    pub fn config(&self) -> &UserConfig {
         &self.conf
     }
 
-    pub(crate) fn config_mut(&mut self) -> &mut JitConfig {
+    pub(crate) fn config_mut(&mut self) -> &mut UserConfig {
         &mut self.conf
     }
 
@@ -579,15 +564,23 @@ impl A64AddressSpace {
             a64_descriptor,
             &read_code,
             TranslationOptions {
-                hook_hint_instructions: false,
+                define_unpredictable_behaviour: self.conf.define_unpredictable_behaviour,
                 wall_clock_cntpct: self.conf.wall_clock_cntpct,
+                ..TranslationOptions::default()
             },
+        );
+
+        opt::polyfill(&mut block, opt::PolyfillOptions::default());
+        opt::a64_callback_config(
+            &mut block,
+            self.conf.hook_data_cache_operations,
+            self.conf.dczid_el0,
         );
 
         if self
             .conf
             .has_optimization(OptimizationFlag::GET_SET_ELIMINATION)
-            && !self.conf.memory.check_halt_on_memory_access
+            && !self.conf.check_halt_on_memory_access
         {
             opt::a64_get_set_elimination(&mut block);
             block.recompute_use_counts();
@@ -598,9 +591,7 @@ impl A64AddressSpace {
             block.recompute_use_counts();
             opt::dead_code_elimination(&mut block);
         }
-        if self.conf.has_optimization(OptimizationFlag::MISC_IR_OPT) {
-            opt::a64_merge_interpret_blocks(&mut block);
-        }
+        if self.conf.has_optimization(OptimizationFlag::MISC_IR_OPT) {}
         block.recompute_use_counts();
         #[cfg(debug_assertions)]
         opt::verification_pass(&block);
@@ -716,9 +707,6 @@ impl A64AddressSpace {
         let call_svc = self
             .address_space
             .emit_call_trampoline(callback_context_ptr, fns.call_svc)?;
-        let interpreter_fallback = self
-            .address_space
-            .emit_call_trampoline(callback_context_ptr, fns.interpreter_fallback)?;
         let exception_raised = self
             .address_space
             .emit_call_trampoline(callback_context_ptr, fns.exception_raised)?;
@@ -773,7 +761,6 @@ impl A64AddressSpace {
         prelude_info.exclusive_write_memory_64 = Some(exclusive_write_memory_64);
         prelude_info.exclusive_write_memory_128 = Some(exclusive_write_memory_128);
         prelude_info.call_svc = Some(call_svc);
-        prelude_info.interpreter_fallback = Some(interpreter_fallback);
         prelude_info.exception_raised = Some(exception_raised);
         prelude_info.isb_raised = Some(isb_raised);
         prelude_info.ic_raised = Some(ic_raised);
@@ -813,12 +800,12 @@ impl A64AddressSpace {
     }
 }
 
-fn emit_prelude(address_space: &mut AddressSpace, conf: &JitConfig) -> Result<(), String> {
+fn emit_prelude(address_space: &mut AddressSpace, conf: &UserConfig) -> Result<(), String> {
     address_space.emit_bootstrap_prelude_with_options(PreludeOptions {
         isa: PreludeIsa::A64,
         dispatcher: None,
         return_stack_buffer: conf.has_optimization(OptimizationFlag::RETURN_STACK_BUFFER),
-        page_table_pointer: conf.page_table_pointer.map_or(0, |p| p as u64),
+        page_table_pointer: conf.page_table.map_or(0, |p| p as u64),
         fastmem_pointer: conf.fastmem_pointer.map_or(0, |p| p as u64),
     })
 }
@@ -830,8 +817,6 @@ fn ranges_overlap_u64(start: u64, end: u64, range: &RangeInclusive<u64>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
-    use crate::jit_config::UserCallbacks;
 
     struct TestCallbacks {
         code: Vec<u32>,
@@ -878,10 +863,10 @@ mod tests {
             u64::from_le_bytes(self.read_le(vaddr))
         }
 
-        fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
+        fn memory_read_128(&self, vaddr: u64) -> [u64; 2] {
             let lo = u64::from_le_bytes(self.read_le(vaddr));
             let hi = u64::from_le_bytes(self.read_le(vaddr + 8));
-            (lo, hi)
+            [lo, hi]
         }
 
         fn memory_write_8(&mut self, vaddr: u64, value: u8) {
@@ -900,32 +885,12 @@ mod tests {
             self.write_le(vaddr, value.to_le_bytes());
         }
 
-        fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-            self.write_le(vaddr, value_lo.to_le_bytes());
-            self.write_le(vaddr + 8, value_hi.to_le_bytes());
+        fn memory_write_128(&mut self, vaddr: u64, value: [u64; 2]) {
+            self.write_le(vaddr, value[0].to_le_bytes());
+            self.write_le(vaddr + 8, value[1].to_le_bytes());
         }
 
-        fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-            self.memory_read_8(vaddr)
-        }
-
-        fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-            self.memory_read_16(vaddr)
-        }
-
-        fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-            self.memory_read_32(vaddr)
-        }
-
-        fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-            self.memory_read_64(vaddr)
-        }
-
-        fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-            self.memory_read_128(vaddr)
-        }
-
-        fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
             if self.memory_read_8(vaddr) == expected {
                 self.memory_write_8(vaddr, value);
                 true
@@ -934,7 +899,7 @@ mod tests {
             }
         }
 
-        fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
             if self.memory_read_16(vaddr) == expected {
                 self.memory_write_16(vaddr, value);
                 true
@@ -943,7 +908,7 @@ mod tests {
             }
         }
 
-        fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
             if self.memory_read_32(vaddr) == expected {
                 self.memory_write_32(vaddr, value);
                 true
@@ -952,7 +917,7 @@ mod tests {
             }
         }
 
-        fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
             if self.memory_read_64(vaddr) == expected {
                 self.memory_write_64(vaddr, value);
                 true
@@ -961,38 +926,38 @@ mod tests {
             }
         }
 
-        fn exclusive_write_128(
+        fn memory_write_exclusive_128(
             &mut self,
             vaddr: u64,
-            value_lo: u64,
-            value_hi: u64,
-            expected_lo: u64,
-            expected_hi: u64,
+            value: [u64; 2],
+            expected: [u64; 2],
         ) -> bool {
-            if self.memory_read_128(vaddr) == (expected_lo, expected_hi) {
-                self.memory_write_128(vaddr, value_lo, value_hi);
+            if self.memory_read_128(vaddr) == expected {
+                self.memory_write_128(vaddr, value);
                 true
             } else {
                 false
             }
         }
 
-        fn exclusive_clear(&mut self) {}
-
-        fn call_supervisor(&mut self, svc_num: u32) {
+        fn call_svc(&mut self, svc_num: u32) {
             self.svc_num = svc_num;
         }
 
-        fn exception_raised(&mut self, pc: u64, exception: u64) {
-            self.exception = (pc, exception);
+        fn exception_raised(&mut self, pc: u64, exception: Exception) {
+            self.exception = (pc, exception as u32 as u64);
         }
 
-        fn data_cache_operation(&mut self, op: u64, vaddr: u64) {
-            self.data_cache_op = (op, vaddr);
+        fn data_cache_operation_raised(&mut self, op: DataCacheOperation, value: u64) {
+            self.data_cache_op = (op as u32 as u64, value);
         }
 
-        fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {
-            self.instruction_cache_op = (op, vaddr);
+        fn instruction_cache_operation_raised(
+            &mut self,
+            op: InstructionCacheOperation,
+            value: u64,
+        ) {
+            self.instruction_cache_op = (op as u32 as u64, value);
         }
 
         fn get_cntpct(&self) -> u64 {
@@ -1008,33 +973,22 @@ mod tests {
         }
     }
 
-    fn config(code: Vec<u32>) -> JitConfig {
-        JitConfig {
-            callbacks: Box::new(TestCallbacks {
-                code,
-                memory: [0; 64],
-                svc_num: 0,
-                exception: (0, 0),
-                data_cache_op: (0, 0),
-                instruction_cache_op: (0, 0),
-                ticks_added: 0,
-                cntpct: 0xfeed_beef,
-            }),
-            enable_cycle_counting: false,
-            code_cache_size: 4096,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
+    fn config(code: Vec<u32>) -> UserConfig {
+        let callbacks = TestCallbacks {
+            code,
+            memory: [0; 64],
+            svc_num: 0,
+            exception: (0, 0),
+            data_cache_op: (0, 0),
+            instruction_cache_op: (0, 0),
+            ticks_added: 0,
+            cntpct: 0xfeed_beef,
+        };
+        let mut config = UserConfig::new(Box::new(callbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4096;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config
     }
 
     extern "C" fn dummy_callback() {}
@@ -1063,7 +1017,6 @@ mod tests {
             exclusive_write_memory_64: ptr,
             exclusive_write_memory_128: ptr,
             call_svc: ptr,
-            interpreter_fallback: ptr,
             exception_raised: ptr,
             isb_raised: ptr,
             ic_raised: ptr,
@@ -1185,9 +1138,14 @@ mod tests {
             ticks_added: 0,
             cntpct: 0x5678,
         };
-        callbacks.memory_write_32(4, 0x1122_3344);
-        callbacks.memory_write_128(16, 0x0011_2233_4455_6677, 0x8899_aabb_ccdd_eeff);
-        let callbacks_ptr = &mut callbacks as &mut dyn UserCallbacks as *mut dyn UserCallbacks;
+        UserCallbacks::memory_write_32(&mut callbacks, 4, 0x1122_3344);
+        UserCallbacks::memory_write_128(
+            &mut callbacks,
+            16,
+            [0x0011_2233_4455_6677, 0x8899_aabb_ccdd_eeff],
+        );
+        let a64_callbacks: &mut dyn crate::interface::a64::config::UserCallbacks = &mut callbacks;
+        let callbacks_ptr = a64_callbacks as *mut dyn crate::interface::a64::config::UserCallbacks;
         let mut context = A64CallbackContext::new(&mut state, callbacks_ptr, None, 0);
         let fns = A64CallbackContext::callback_fns();
 
@@ -1270,17 +1228,37 @@ mod tests {
         );
 
         call_svc(&mut context, 0x42);
-        exception_raised(&mut context, 0x1000, 0x2000);
-        data_cache_op(&mut context, 0x11, 0x22);
-        instruction_cache_op(&mut context, 0x33, 0x44);
+        exception_raised(&mut context, 0x1000, Exception::Breakpoint as u32 as u64);
+        data_cache_op(
+            &mut context,
+            DataCacheOperation::ZeroByVa as u32 as u64,
+            0x22,
+        );
+        instruction_cache_op(
+            &mut context,
+            InstructionCacheOperation::InvalidateAllToPoU as u32 as u64,
+            0x44,
+        );
         add_ticks(&mut context, 9);
         assert_eq!(get_cntpct(&mut context), 0x5678);
         assert_eq!(get_ticks_remaining(&mut context), 0x1234);
 
         assert_eq!(callbacks.svc_num, 0x42);
-        assert_eq!(callbacks.exception, (0x1000, 0x2000));
-        assert_eq!(callbacks.data_cache_op, (0x11, 0x22));
-        assert_eq!(callbacks.instruction_cache_op, (0x33, 0x44));
+        assert_eq!(
+            callbacks.exception,
+            (0x1000, Exception::Breakpoint as u32 as u64)
+        );
+        assert_eq!(
+            callbacks.data_cache_op,
+            (DataCacheOperation::ZeroByVa as u32 as u64, 0x22)
+        );
+        assert_eq!(
+            callbacks.instruction_cache_op,
+            (
+                InstructionCacheOperation::InvalidateAllToPoU as u32 as u64,
+                0x44
+            )
+        );
         assert_eq!(callbacks.ticks_added, 9);
     }
 }

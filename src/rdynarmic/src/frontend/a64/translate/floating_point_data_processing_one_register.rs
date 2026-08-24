@@ -244,14 +244,12 @@ mod tests {
     #[test]
     fn fmov_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E204020);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(!block.instructions.is_empty());
     }
 
     #[test]
     fn fsqrt_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E21C020);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block
             .instructions
             .iter()
@@ -271,14 +269,12 @@ mod tests {
     #[test]
     fn fmov_float_imm_translates_without_interpret_terminal() {
         let block = translate_single(0x1E2E1000);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(!block.instructions.is_empty());
     }
 
     #[test]
     fn fcvt_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E22C020);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| {
             matches!(
                 inst.opcode,
@@ -295,7 +291,6 @@ mod tests {
     #[test]
     fn frintn_float_translates_without_interpret_terminal() {
         let block = translate_single(0x1E244020);
-        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         assert!(block.instructions.iter().any(|inst| {
             matches!(
                 inst.opcode,

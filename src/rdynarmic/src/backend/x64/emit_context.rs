@@ -6,8 +6,9 @@ use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
+use crate::interface::a32::config::Coprocessors;
+use crate::interface::optimization_flags::OptimizationFlag;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
-use crate::jit_config::OptimizationFlag;
 
 pub use crate::backend::common::emit_context::MemoryEmitConfig;
 
@@ -157,6 +158,13 @@ impl ArchConfig {
         }
     }
 
+    pub fn fpsr_qc_offset(self) -> usize {
+        match self {
+            Self::A64 => A64JitState::offset_of_fpsr_qc(),
+            Self::A32 => A32JitState::offset_of_fpsr_qc(),
+        }
+    }
+
     pub fn guest_mxcsr_offset(self) -> usize {
         match self {
             Self::A64 => A64JitState::offset_of_guest_mxcsr(),
@@ -205,9 +213,6 @@ pub struct EmitCallbacks {
 
     /// Called when an exception is raised.
     pub exception_raised: Box<dyn Callback>,
-
-    /// Called when execution falls back to the interpreter path.
-    pub interpreter_fallback: Box<dyn Callback>,
 
     /// Called for data cache operations.
     pub data_cache_operation: Box<dyn Callback>,
@@ -265,6 +270,8 @@ pub struct RawExclusiveWriteCallbacks {
 
 /// Configuration for the A64 emitter.
 pub struct EmitConfig {
+    /// Configurable A32 coprocessors from `A32::UserConfig`.
+    pub coprocessors: Coprocessors,
     /// Callbacks for host-side operations.
     pub callbacks: EmitCallbacks,
     /// Direct user callbacks for faulting inline exclusive stores.
@@ -281,10 +288,19 @@ pub struct EmitConfig {
     /// reservation address, and the per-processor saved value — matching
     /// upstream's `GetExclusiveMonitorLockPointer` /
     /// `GetExclusiveMonitorAddressPointer` / `GetExclusiveMonitorValuePointer`.
-    pub global_monitor: Option<*mut crate::exclusive_monitor::ExclusiveMonitor>,
+    pub global_monitor: Option<*mut crate::interface::exclusive_monitor::ExclusiveMonitor>,
     /// Counter-timer frequency returned for `MRS CNTFRQ_EL0`.
-    /// Upstream `A64::UserConfig::cntfrq_el0`; forwarded from `JitConfig`.
+    /// Upstream `A64::UserConfig::cntfrq_el0`; forwarded from the architecture-owned config.
     pub cntfrq_el0: u32,
+    /// Cache-type register returned for `MRS CTR_EL0`.
+    pub ctr_el0: u32,
+    /// Data-cache zero ID register returned for `MRS DCZID_EL0` and consumed
+    /// by the A64 callback-configuration pass.
+    pub dczid_el0: u32,
+    /// Whether data-cache maintenance operations reach the user callback.
+    pub hook_data_cache_operations: bool,
+    /// Whether ISB instructions reach the user callback.
+    pub hook_isb: bool,
 }
 
 /// Per-block emission context.
@@ -499,5 +515,21 @@ mod tests {
         };
         assert_eq!(desc.entrypoint_offset, 0x100);
         assert_eq!(desc.size, 64);
+    }
+
+    #[test]
+    fn architecture_selects_its_own_saturation_flag_offset() {
+        assert_eq!(
+            ArchConfig::A64.fpsr_qc_offset(),
+            A64JitState::offset_of_fpsr_qc()
+        );
+        assert_eq!(
+            ArchConfig::A32.fpsr_qc_offset(),
+            A32JitState::offset_of_fpsr_qc()
+        );
+        assert_ne!(
+            ArchConfig::A64.fpsr_qc_offset(),
+            ArchConfig::A32.fpsr_qc_offset()
+        );
     }
 }

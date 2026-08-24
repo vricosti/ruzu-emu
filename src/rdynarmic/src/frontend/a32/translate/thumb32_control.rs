@@ -1,11 +1,22 @@
 use crate::frontend::a32::decoder_thumb32::DecodedThumb32;
-use crate::frontend::a32::types::Reg;
+use crate::frontend::a32::types::{Exception, Reg};
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
+use super::TranslationOptions;
+
 /// Rust counterpart of upstream dynarmic
 /// `frontend/A32/translate/impl/thumb32_control.cpp`.
+
+pub fn thumb32_bxj(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
+    let m = inst.rn();
+    if m == Reg::PC {
+        return super::unpredictable_instruction(ir);
+    }
+
+    super::thumb16::thumb16_bx(ir, m)
+}
 
 pub fn thumb32_clrex(ir: &mut A32IREmitter) -> bool {
     ir.clear_exclusive();
@@ -39,23 +50,31 @@ pub fn thumb32_nop() -> bool {
     true
 }
 
-pub fn thumb32_sev() -> bool {
-    true
+pub fn thumb32_sev(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::SendEvent)
 }
 
-pub fn thumb32_wfe(ir: &mut A32IREmitter) -> bool {
-    let _ = ir;
-    true
+pub fn thumb32_sevl(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::SendEventLocal)
 }
 
-pub fn thumb32_wfi(_ir: &mut A32IREmitter) -> bool {
-    // Upstream: NOP when hook_hint_instructions is false (default)
-    true
+pub fn thumb32_wfe(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::WaitForEvent)
 }
 
-pub fn thumb32_yield(ir: &mut A32IREmitter) -> bool {
-    let _ = ir;
-    true
+pub fn thumb32_wfi(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::WaitForInterrupt)
+}
+
+pub fn thumb32_yield(ir: &mut A32IREmitter, options: TranslationOptions) -> bool {
+    thumb32_hint(ir, options, Exception::Yield)
+}
+
+fn thumb32_hint(ir: &mut A32IREmitter, options: TranslationOptions, exception: Exception) -> bool {
+    if !options.hook_hint_instructions {
+        return true;
+    }
+    super::raise_exception(ir, exception)
 }
 
 pub fn thumb32_udf(ir: &mut A32IREmitter) -> bool {
@@ -141,6 +160,44 @@ mod tests {
         let mut psr = PSR::default();
         psr.set_t(true);
         A32LocationDescriptor::new(pc, psr, FPSCR::default(), false)
+    }
+
+    #[test]
+    fn thumb32_bxj_matches_upstream_validation_and_thumb16_bx_lifecycle() {
+        let loc = thumb_loc(0x1000);
+
+        let mut invalid = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut invalid, loc);
+            let inst = DecodedThumb32 {
+                raw: 0xf3cf_8f00,
+                id: Thumb32InstId::BXJ,
+            };
+            assert!(!thumb32_bxj(&mut ir, &inst));
+        }
+        assert!(invalid
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32ExceptionRaised));
+        assert!(!invalid
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32GetRegister));
+
+        let mut valid = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut valid, loc);
+            let inst = DecodedThumb32 {
+                raw: 0xf3ce_8f00,
+                id: Thumb32InstId::BXJ,
+            };
+            assert!(!thumb32_bxj(&mut ir, &inst));
+        }
+        assert!(valid
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32BXWritePC));
+        assert!(matches!(valid.terminal, Terminal::PopRSBHint));
     }
 
     /// Assert `f(raw)` stops translation raising exactly `expected` with the

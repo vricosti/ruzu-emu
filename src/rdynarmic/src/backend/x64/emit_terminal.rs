@@ -9,7 +9,7 @@ use crate::backend::x64::patch_info::{
     PatchEntry, PatchType, A32_PATCH_JG_SIZE, A32_PATCH_JMP_SIZE, A32_PATCH_JZ_SIZE,
     A64_PATCH_JG_SIZE, A64_PATCH_JMP_SIZE, A64_PATCH_JZ_SIZE,
 };
-use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
+use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::cond::Cond;
 use crate::ir::terminal::Terminal;
@@ -29,13 +29,6 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
         Terminal::Invalid => {
             // Should never reach an invalid terminal at runtime — emit int3
             ra.asm.int3().unwrap();
-        }
-
-        Terminal::Interpret {
-            next,
-            num_instructions,
-        } => {
-            emit_terminal_interpret(ctx, ra, *next, *num_instructions);
         }
 
         Terminal::ReturnToDispatch => {
@@ -473,40 +466,6 @@ fn emit_terminal_link_block_fast(
         } else {
             emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
         }
-    } else {
-        if ctx.config.enable_cycle_counting {
-            emit_add_ticks(ctx, ra);
-        }
-        ra.asm.ret().unwrap();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Interpret: fall back to interpreter for N instructions
-// ---------------------------------------------------------------------------
-
-/// Emit: set PC, return to dispatcher with FORCE_RETURN.
-fn emit_terminal_interpret(
-    ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    next: crate::ir::location::LocationDescriptor,
-    num_instructions: usize,
-) {
-    let mut no_args: [Option<&mut Argument>; 0] = [];
-    ra.host_call(None, &mut no_args);
-    emit_store_pc(ctx, ra, next);
-
-    ctx.config
-        .callbacks
-        .interpreter_fallback
-        .emit_call(&mut *ra.asm, &|code, params| {
-            code.mov(params[0], ctx.arch.extract_pc(next) as i64)?;
-            code.mov(params[1], num_instructions as i64)
-        })
-        .unwrap();
-
-    if let Some(offsets) = ctx.dispatcher_offsets {
-        emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
     } else {
         if ctx.config.enable_cycle_counting {
             emit_add_ticks(ctx, ra);

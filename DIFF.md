@@ -11788,6 +11788,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `A32JitState` layout is unchanged. An executing LDREX/STREX/STREX regression verifies the global
   monitor value, first-store success, reservation consumption, and second-store failure.
 
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/constants.rs` vs Eden `backend/x64/constants.h`
+
+### Intentional differences
+- Eden's `Cmp`, `CmpInt`, `Tern`, and `FpClass` namespaces are Rust modules, with constant and enum
+  spellings changed only to Rust naming conventions.
+- Rust has no default function arguments, so `fixup_lut` requires all eight `FpFixup` operands;
+  callers that omit trailing operands upstream pass `FpFixup::Dest` explicitly.
+- `convert_rounding_mode_to_x64_immediate` retains Eden's `Option<i32>` result. Consumers cast the
+  proven two-bit value to `u8` only at rxbyak's more strongly typed instruction boundary.
+
+### Unintentional differences (to fix)
+- Fixed: the complete constants owner was absent and consumers embedded raw compare predicates and
+  duplicated rounding-mode maps. The full predicate, ternary, floating-point class, fixup, range,
+  and rounding inventories now live in the matching module.
+
+### Missing items
+- No item is missing from the reviewed constants owner; AVX-512 consumers that use some currently
+  unreferenced constants remain part of their respective emitter-file audits.
+
+### Binary layout verification
+- PASS: `FpFixup`, `FpRangeSelect`, and `FpRangeSign` use `repr(u8)` and exhaustive tests verify all
+  discriminants, bitmasks, LUT bit placement, aliases, and rounding immediates.
+
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.rs` vs Eden `backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.{h,cpp}` (prelude lifecycle)
 
 ### Intentional differences

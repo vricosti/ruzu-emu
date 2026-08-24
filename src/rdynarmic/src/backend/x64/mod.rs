@@ -12,6 +12,7 @@ pub mod block_cache;
 pub mod block_of_code;
 pub mod callback;
 pub mod constant_pool;
+pub mod constants;
 pub mod emit;
 pub mod emit_a64;
 pub mod emit_aes;

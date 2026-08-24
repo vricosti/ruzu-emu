@@ -1,6 +1,7 @@
 use rxbyak::{qword_ptr, JmpType, Reg, RegExp, CL, R15, RSP};
 
 use crate::backend::x64::abi;
+use crate::backend::x64::constants::convert_rounding_mode_to_x64_immediate;
 use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
 use crate::backend::x64::fp_helpers;
 use crate::backend::x64::host_feature::HostFeature;
@@ -1780,13 +1781,8 @@ pub fn emit_fp_single_to_half(
             ra.asm.bind(&not_nan).unwrap();
         }
 
-        let round_imm = match rounding {
-            0 => 0b00,
-            1 => 0b10,
-            2 => 0b01,
-            3 => 0b11,
-            _ => unreachable!("unsupported hardware FP conversion rounding mode"),
-        };
+        let round_imm = convert_rounding_mode_to_x64_immediate(scalar_rounding_mode(rounding))
+            .expect("hardware FP conversion rounding mode") as u8;
         ra.asm.vcvtps2ph(result, result, round_imm).unwrap();
         ra.define_value(inst_ref, result);
         return;

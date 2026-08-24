@@ -7,6 +7,7 @@
 use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, JmpType, Reg, RegExp, R15, RSP, XMM0};
 
 use crate::backend::x64::abi;
+use crate::backend::x64::constants::{cmp, convert_rounding_mode_to_x64_immediate};
 use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
 use crate::backend::x64::emit_fp_vector::force_to_default_nan_vector;
 use crate::backend::x64::emit_vector_helpers::*;
@@ -331,17 +332,21 @@ fn emit_fp_vector_muladd(
                 .get_constant(smallest_lo, smallest_hi);
             ra.asm.andps(nan_mask, xmmword_ptr(non_sign)).unwrap();
             if fsize == 32 {
-                ra.asm.cmpps(nan_mask, xmmword_ptr(smallest), 0).unwrap();
+                ra.asm
+                    .cmpps(nan_mask, xmmword_ptr(smallest), cmp::EQUAL_OQ)
+                    .unwrap();
             } else {
-                ra.asm.cmppd(nan_mask, xmmword_ptr(smallest), 0).unwrap();
+                ra.asm
+                    .cmppd(nan_mask, xmmword_ptr(smallest), cmp::EQUAL_OQ)
+                    .unwrap();
             }
             if needs_nan_correction {
                 let unordered = ra.scratch_xmm();
                 ra.asm.movaps(unordered, result).unwrap();
                 if fsize == 32 {
-                    ra.asm.cmpps(unordered, result, 3).unwrap();
+                    ra.asm.cmpps(unordered, result, cmp::UNORDERED_Q).unwrap();
                 } else {
-                    ra.asm.cmppd(unordered, result, 3).unwrap();
+                    ra.asm.cmppd(unordered, result, cmp::UNORDERED_Q).unwrap();
                 }
                 ra.asm.orps(nan_mask, unordered).unwrap();
                 ra.release(unordered);
@@ -350,9 +355,9 @@ fn emit_fp_vector_muladd(
             debug_assert!(needs_nan_correction);
             ra.asm.movaps(nan_mask, result).unwrap();
             if fsize == 32 {
-                ra.asm.cmpps(nan_mask, result, 3).unwrap();
+                ra.asm.cmpps(nan_mask, result, cmp::UNORDERED_Q).unwrap();
             } else {
-                ra.asm.cmppd(nan_mask, result, 3).unwrap();
+                ra.asm.cmppd(nan_mask, result, cmp::UNORDERED_Q).unwrap();
             }
         }
         ra.asm.vptest(nan_mask, nan_mask).unwrap();
@@ -700,10 +705,14 @@ fn emit_fp_vector_recip_step_fused(
             ra.asm.movaps(result, xmmword_ptr(two)).unwrap();
             if esize == 32 {
                 ra.asm.vfnmadd231ps(result, operand1, operand2).unwrap();
-                ra.asm.vcmpps(tmp, result, result, 3).unwrap();
+                ra.asm
+                    .vcmpps(tmp, result, result, cmp::UNORDERED_Q)
+                    .unwrap();
             } else {
                 ra.asm.vfnmadd231pd(result, operand1, operand2).unwrap();
-                ra.asm.vcmppd(tmp, result, result, 3).unwrap();
+                ra.asm
+                    .vcmppd(tmp, result, result, cmp::UNORDERED_Q)
+                    .unwrap();
             }
             ra.asm.vptest(tmp, tmp).unwrap();
             ra.asm.jnz(&fallback, JmpType::Near).unwrap();
@@ -1305,13 +1314,8 @@ fn emit_fp_vector_round_int(
     if esize != 16 && ctx.has_host_feature(HostFeature::SSE41) && rounding != 4 && !exact {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.use_scratch_xmm(&mut args[0]);
-        let round_imm = match rounding {
-            0 => 0b00,
-            1 => 0b10,
-            2 => 0b01,
-            3 => 0b11,
-            _ => unreachable!(),
-        };
+        let round_imm = convert_rounding_mode_to_x64_immediate(rounding_mode(rounding))
+            .expect("hardware FP rounding mode") as u8;
         if esize == 32 {
             ra.asm.roundps(result, result, round_imm).unwrap();
         } else {
@@ -1575,21 +1579,16 @@ fn emit_fp_vector_to_fixed_native(
         }
     }
 
-    let round_imm = match rounding {
-        0 => 0b00,
-        1 => 0b10,
-        2 => 0b01,
-        3 => 0b11,
-        _ => unreachable!(),
-    };
+    let round_imm = convert_rounding_mode_to_x64_immediate(rounding_mode(rounding))
+        .expect("hardware FP rounding mode") as u8;
     if esize == 32 {
         ra.asm.roundps(src, src, round_imm).unwrap();
         ra.asm.movaps(XMM0, src).unwrap();
-        ra.asm.cmpps(XMM0, XMM0, 7).unwrap();
+        ra.asm.cmpps(XMM0, XMM0, cmp::ORDERED_Q).unwrap();
     } else {
         ra.asm.roundpd(src, src, round_imm).unwrap();
         ra.asm.movaps(XMM0, src).unwrap();
-        ra.asm.cmppd(XMM0, XMM0, 7).unwrap();
+        ra.asm.cmppd(XMM0, XMM0, cmp::ORDERED_Q).unwrap();
     }
     ra.asm.andps(src, XMM0).unwrap();
 
@@ -1608,9 +1607,9 @@ fn emit_fp_vector_to_fixed_native(
 
         ra.asm.xorps(XMM0, XMM0).unwrap();
         if esize == 32 {
-            ra.asm.cmpps(XMM0, src, 2).unwrap();
+            ra.asm.cmpps(XMM0, src, cmp::LESS_EQUAL_OS).unwrap();
         } else {
-            ra.asm.cmppd(XMM0, src, 2).unwrap();
+            ra.asm.cmppd(XMM0, src, cmp::LESS_EQUAL_OS).unwrap();
         }
         ra.asm.andps(src, XMM0).unwrap();
 
@@ -1620,9 +1619,13 @@ fn emit_fp_vector_to_fixed_native(
             .movaps(exceed_unsigned, xmmword_ptr(unsigned_limit))
             .unwrap();
         if esize == 32 {
-            ra.asm.cmpps(exceed_unsigned, src, 2).unwrap();
+            ra.asm
+                .cmpps(exceed_unsigned, src, cmp::LESS_EQUAL_OS)
+                .unwrap();
         } else {
-            ra.asm.cmppd(exceed_unsigned, src, 2).unwrap();
+            ra.asm
+                .cmppd(exceed_unsigned, src, cmp::LESS_EQUAL_OS)
+                .unwrap();
         }
 
         let tmp = ra.scratch_xmm();
@@ -1630,11 +1633,11 @@ fn emit_fp_vector_to_fixed_native(
         ra.asm.movaps(tmp, xmmword_ptr(signed_limit)).unwrap();
         ra.asm.movaps(XMM0, tmp).unwrap();
         if esize == 32 {
-            ra.asm.cmpps(XMM0, src, 2).unwrap();
+            ra.asm.cmpps(XMM0, src, cmp::LESS_EQUAL_OS).unwrap();
             ra.asm.andps(tmp, XMM0).unwrap();
             ra.asm.subps(src, tmp).unwrap();
         } else {
-            ra.asm.cmppd(XMM0, src, 2).unwrap();
+            ra.asm.cmppd(XMM0, src, cmp::LESS_EQUAL_OS).unwrap();
             ra.asm.andpd(tmp, XMM0).unwrap();
             ra.asm.subpd(src, tmp).unwrap();
         }
@@ -1654,9 +1657,9 @@ fn emit_fp_vector_to_fixed_native(
         let signed_limit = vector_constant(ra, esize, signed_upper);
         ra.asm.movaps(XMM0, xmmword_ptr(signed_limit)).unwrap();
         if esize == 32 {
-            ra.asm.cmpps(XMM0, src, 2).unwrap();
+            ra.asm.cmpps(XMM0, src, cmp::LESS_EQUAL_OS).unwrap();
         } else {
-            ra.asm.cmppd(XMM0, src, 2).unwrap();
+            ra.asm.cmppd(XMM0, src, cmp::LESS_EQUAL_OS).unwrap();
         }
         convert_vector_to_signed_host(ra, src, esize);
 
@@ -1934,13 +1937,8 @@ pub fn emit_fp_vector_to_half32(
         if ctx.fpcr(fpcr_controlled).dn() {
             force_to_default_nan_vector(ra, result, 32);
         }
-        let round_imm = match rounding {
-            0 => 0b00,
-            1 => 0b10,
-            2 => 0b01,
-            3 => 0b11,
-            _ => unreachable!(),
-        };
+        let round_imm = convert_rounding_mode_to_x64_immediate(rounding_mode(rounding))
+            .expect("hardware FP conversion rounding mode") as u8;
         ra.asm.vcvtps2ph(result, result, round_imm).unwrap();
         ra.define_value(inst_ref, result);
         return;

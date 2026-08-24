@@ -10932,3 +10932,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: the AArch64 test build checks the `[u64; 2]` callback vector boundary; this test-only
   configuration migration does not alter emitted instruction encodings or guest data layouts.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a64_address_space.rs` vs Eden `backend/arm64/a64_address_space.{h,cpp}` and `interface/A64/config.h` (test configuration ownership)
+
+### Intentional differences
+- Rust callback-thunk tests retain observable fields for memory and system events; Eden implements
+  the corresponding production trampolines through devirtualized C++ member-function pointers.
+
+### Unintentional differences (to fix)
+- Fixed: the address-space fixture implemented both the merged callback API and A64 callback API,
+  forwarding every method through an adapter. It now implements only A64 `UserCallbacks`, with the
+  upstream vector, typed system-event, exclusive-write, SVC, and counter signatures.
+- Fixed: its configuration was constructed as merged `JitConfig` and converted afterward. It now
+  starts from A64 `UserConfig` and changes only cache size, cycle counting, and optimizations.
+- Fixed: the thunk regression invoked exception and cache-operation callbacks with out-of-range raw
+  integers that the typed A64 boundary correctly rejects. It now uses valid upstream enum ordinals.
+
+### Missing items
+- Shared ARM64 memory-emitter tests still construct the merged configuration and are handled in a
+  later file-owned slice.
+
+### Binary layout verification
+- PASS: the AArch64 test build enforces the 16-byte `[u64; 2]` vector callback boundary; existing
+  `Pair128` thunk assertions continue to verify low/high word ordering.

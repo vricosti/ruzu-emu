@@ -817,8 +817,6 @@ fn ranges_overlap_u64(start: u64, end: u64, range: &RangeInclusive<u64>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::common::emit_context::MemoryEmitConfig;
-    use crate::jit_config::{JitConfig, UserCallbacks};
 
     struct TestCallbacks {
         code: Vec<u32>,
@@ -865,10 +863,10 @@ mod tests {
             u64::from_le_bytes(self.read_le(vaddr))
         }
 
-        fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
+        fn memory_read_128(&self, vaddr: u64) -> [u64; 2] {
             let lo = u64::from_le_bytes(self.read_le(vaddr));
             let hi = u64::from_le_bytes(self.read_le(vaddr + 8));
-            (lo, hi)
+            [lo, hi]
         }
 
         fn memory_write_8(&mut self, vaddr: u64, value: u8) {
@@ -887,12 +885,12 @@ mod tests {
             self.write_le(vaddr, value.to_le_bytes());
         }
 
-        fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-            self.write_le(vaddr, value_lo.to_le_bytes());
-            self.write_le(vaddr + 8, value_hi.to_le_bytes());
+        fn memory_write_128(&mut self, vaddr: u64, value: [u64; 2]) {
+            self.write_le(vaddr, value[0].to_le_bytes());
+            self.write_le(vaddr + 8, value[1].to_le_bytes());
         }
 
-        fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
             if self.memory_read_8(vaddr) == expected {
                 self.memory_write_8(vaddr, value);
                 true
@@ -901,7 +899,7 @@ mod tests {
             }
         }
 
-        fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
             if self.memory_read_16(vaddr) == expected {
                 self.memory_write_16(vaddr, value);
                 true
@@ -910,7 +908,7 @@ mod tests {
             }
         }
 
-        fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
             if self.memory_read_32(vaddr) == expected {
                 self.memory_write_32(vaddr, value);
                 true
@@ -919,7 +917,7 @@ mod tests {
             }
         }
 
-        fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
             if self.memory_read_64(vaddr) == expected {
                 self.memory_write_64(vaddr, value);
                 true
@@ -928,36 +926,38 @@ mod tests {
             }
         }
 
-        fn exclusive_write_128(
+        fn memory_write_exclusive_128(
             &mut self,
             vaddr: u64,
-            value_lo: u64,
-            value_hi: u64,
-            expected_lo: u64,
-            expected_hi: u64,
+            value: [u64; 2],
+            expected: [u64; 2],
         ) -> bool {
-            if self.memory_read_128(vaddr) == (expected_lo, expected_hi) {
-                self.memory_write_128(vaddr, value_lo, value_hi);
+            if self.memory_read_128(vaddr) == expected {
+                self.memory_write_128(vaddr, value);
                 true
             } else {
                 false
             }
         }
 
-        fn call_supervisor(&mut self, svc_num: u32) {
+        fn call_svc(&mut self, svc_num: u32) {
             self.svc_num = svc_num;
         }
 
-        fn exception_raised(&mut self, pc: u64, exception: u64) {
-            self.exception = (pc, exception);
+        fn exception_raised(&mut self, pc: u64, exception: Exception) {
+            self.exception = (pc, exception as u32 as u64);
         }
 
-        fn data_cache_operation(&mut self, op: u64, vaddr: u64) {
-            self.data_cache_op = (op, vaddr);
+        fn data_cache_operation_raised(&mut self, op: DataCacheOperation, value: u64) {
+            self.data_cache_op = (op as u32 as u64, value);
         }
 
-        fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {
-            self.instruction_cache_op = (op, vaddr);
+        fn instruction_cache_operation_raised(
+            &mut self,
+            op: InstructionCacheOperation,
+            value: u64,
+        ) {
+            self.instruction_cache_op = (op as u32 as u64, value);
         }
 
         fn get_cntpct(&self) -> u64 {
@@ -973,152 +973,22 @@ mod tests {
         }
     }
 
-    impl crate::interface::a64::config::UserCallbacks for TestCallbacks {
-        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-            UserCallbacks::memory_read_code(self, vaddr)
-        }
-
-        fn memory_read_8(&self, vaddr: u64) -> u8 {
-            UserCallbacks::memory_read_8(self, vaddr)
-        }
-
-        fn memory_read_16(&self, vaddr: u64) -> u16 {
-            UserCallbacks::memory_read_16(self, vaddr)
-        }
-
-        fn memory_read_32(&self, vaddr: u64) -> u32 {
-            UserCallbacks::memory_read_32(self, vaddr)
-        }
-
-        fn memory_read_64(&self, vaddr: u64) -> u64 {
-            UserCallbacks::memory_read_64(self, vaddr)
-        }
-
-        fn memory_read_128(&self, vaddr: u64) -> [u64; 2] {
-            let (lo, hi) = UserCallbacks::memory_read_128(self, vaddr);
-            [lo, hi]
-        }
-
-        fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-            UserCallbacks::memory_write_8(self, vaddr, value);
-        }
-
-        fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-            UserCallbacks::memory_write_16(self, vaddr, value);
-        }
-
-        fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-            UserCallbacks::memory_write_32(self, vaddr, value);
-        }
-
-        fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-            UserCallbacks::memory_write_64(self, vaddr, value);
-        }
-
-        fn memory_write_128(&mut self, vaddr: u64, value: [u64; 2]) {
-            UserCallbacks::memory_write_128(self, vaddr, value[0], value[1]);
-        }
-
-        fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
-            UserCallbacks::exclusive_write_8(self, vaddr, value, expected)
-        }
-
-        fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
-            UserCallbacks::exclusive_write_16(self, vaddr, value, expected)
-        }
-
-        fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
-            UserCallbacks::exclusive_write_32(self, vaddr, value, expected)
-        }
-
-        fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
-            UserCallbacks::exclusive_write_64(self, vaddr, value, expected)
-        }
-
-        fn memory_write_exclusive_128(
-            &mut self,
-            vaddr: u64,
-            value: [u64; 2],
-            expected: [u64; 2],
-        ) -> bool {
-            UserCallbacks::exclusive_write_128(
-                self,
-                vaddr,
-                value[0],
-                value[1],
-                expected[0],
-                expected[1],
-            )
-        }
-
-        fn call_svc(&mut self, swi: u32) {
-            UserCallbacks::call_supervisor(self, swi);
-        }
-
-        fn exception_raised(&mut self, pc: u64, exception: Exception) {
-            UserCallbacks::exception_raised(self, pc, exception as u32 as u64);
-        }
-
-        fn data_cache_operation_raised(&mut self, op: DataCacheOperation, value: u64) {
-            UserCallbacks::data_cache_operation(self, op as u32 as u64, value);
-        }
-
-        fn instruction_cache_operation_raised(
-            &mut self,
-            op: InstructionCacheOperation,
-            value: u64,
-        ) {
-            UserCallbacks::instruction_cache_operation(self, op as u32 as u64, value);
-        }
-
-        fn add_ticks(&mut self, ticks: u64) {
-            UserCallbacks::add_ticks(self, ticks);
-        }
-
-        fn get_ticks_remaining(&self) -> u64 {
-            UserCallbacks::get_ticks_remaining(self)
-        }
-
-        fn get_cntpct(&self) -> u64 {
-            UserCallbacks::get_cntpct(self)
-        }
-    }
-
     fn config(code: Vec<u32>) -> UserConfig {
-        JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
-            callbacks: Box::new(TestCallbacks {
-                code,
-                memory: [0; 64],
-                svc_num: 0,
-                exception: (0, 0),
-                data_cache_op: (0, 0),
-                instruction_cache_op: (0, 0),
-                ticks_added: 0,
-                cntpct: 0xfeed_beef,
-            }),
-            enable_cycle_counting: false,
-            code_cache_size: 4096,
-            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
-            unsafe_optimizations: false,
-            global_monitor: None,
-            fastmem_pointer: None,
-            page_table_pointer: None,
-            define_unpredictable_behaviour: false,
-            arch_version: crate::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: 0,
-            wall_clock_cntpct: false,
-            cntfrq_el0: 600_000_000,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            memory: MemoryEmitConfig::default(),
-        }
-        .into_a64_user_config()
+        let callbacks = TestCallbacks {
+            code,
+            memory: [0; 64],
+            svc_num: 0,
+            exception: (0, 0),
+            data_cache_op: (0, 0),
+            instruction_cache_op: (0, 0),
+            ticks_added: 0,
+            cntpct: 0xfeed_beef,
+        };
+        let mut config = UserConfig::new(Box::new(callbacks));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 4096;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config
     }
 
     extern "C" fn dummy_callback() {}
@@ -1272,8 +1142,7 @@ mod tests {
         UserCallbacks::memory_write_128(
             &mut callbacks,
             16,
-            0x0011_2233_4455_6677,
-            0x8899_aabb_ccdd_eeff,
+            [0x0011_2233_4455_6677, 0x8899_aabb_ccdd_eeff],
         );
         let a64_callbacks: &mut dyn crate::interface::a64::config::UserCallbacks = &mut callbacks;
         let callbacks_ptr = a64_callbacks as *mut dyn crate::interface::a64::config::UserCallbacks;
@@ -1359,17 +1228,37 @@ mod tests {
         );
 
         call_svc(&mut context, 0x42);
-        exception_raised(&mut context, 0x1000, 0x2000);
-        data_cache_op(&mut context, 0x11, 0x22);
-        instruction_cache_op(&mut context, 0x33, 0x44);
+        exception_raised(&mut context, 0x1000, Exception::Breakpoint as u32 as u64);
+        data_cache_op(
+            &mut context,
+            DataCacheOperation::ZeroByVa as u32 as u64,
+            0x22,
+        );
+        instruction_cache_op(
+            &mut context,
+            InstructionCacheOperation::InvalidateAllToPoU as u32 as u64,
+            0x44,
+        );
         add_ticks(&mut context, 9);
         assert_eq!(get_cntpct(&mut context), 0x5678);
         assert_eq!(get_ticks_remaining(&mut context), 0x1234);
 
         assert_eq!(callbacks.svc_num, 0x42);
-        assert_eq!(callbacks.exception, (0x1000, 0x2000));
-        assert_eq!(callbacks.data_cache_op, (0x11, 0x22));
-        assert_eq!(callbacks.instruction_cache_op, (0x33, 0x44));
+        assert_eq!(
+            callbacks.exception,
+            (0x1000, Exception::Breakpoint as u32 as u64)
+        );
+        assert_eq!(
+            callbacks.data_cache_op,
+            (DataCacheOperation::ZeroByVa as u32 as u64, 0x22)
+        );
+        assert_eq!(
+            callbacks.instruction_cache_op,
+            (
+                InstructionCacheOperation::InvalidateAllToPoU as u32 as u64,
+                0x44
+            )
+        );
         assert_eq!(callbacks.ticks_added, 9);
     }
 }

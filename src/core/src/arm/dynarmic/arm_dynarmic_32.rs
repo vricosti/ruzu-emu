@@ -17,7 +17,11 @@ use crate::memory::memory::Memory;
 use common::page_table::PageInfo;
 use common::settings_enums::CpuAccuracy;
 
-use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
+use rdynarmic::interface::a32::config::{
+    empty_coprocessors, Exception as A32Exception, UserCallbacks as A32UserCallbacks,
+    UserConfig as A32UserConfig,
+};
+use rdynarmic::interface::optimization_flags::OptimizationFlag;
 
 use super::dynarmic_cp15::DynarmicCP15;
 
@@ -1900,8 +1904,8 @@ fn a32_callback_diagnostics_enabled() -> bool {
 /// Corresponds to upstream `DynarmicCallbacks32`.
 ///
 /// Upstream fields: `m_parent`, `m_memory`, `m_process`, `m_debugger_enabled`,
-/// `m_check_memory_access`. All other state (svc_swi, core_timing, exclusive_monitor,
-/// core_index, etc.) is accessed through `m_parent`.
+/// `m_check_memory_access`. The SVC and timing state is accessed through `m_parent`;
+/// the exclusive monitor and core index are owned by the A32 JIT configuration.
 ///
 /// In Rust, `parent` is a raw pointer set post-construction via `set_parent_ptr()`,
 /// matching upstream's reference-based `m_parent`. The pointer is null during JIT
@@ -2068,8 +2072,9 @@ impl DynarmicCallbacks32 {
     }
 }
 
-impl UserCallbacks for DynarmicCallbacks32 {
-    fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+impl A32UserCallbacks for DynarmicCallbacks32 {
+    fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
+        let vaddr = vaddr as u64;
         // Upstream returns nullopt when instruction fetch targets an invalid
         // virtual range. Do not use fastmem here: an invalid guest PC must end
         // translation, not turn into a host SIGSEGV while reading code bytes.
@@ -2090,7 +2095,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
-    fn memory_read_8(&self, vaddr: u64) -> u8 {
+    fn memory_read_8(&self, vaddr: u32) -> u8 {
+        let vaddr = vaddr as u64;
         self.check_memory_access(vaddr, 1, DebugWatchpointType::READ);
         trace_unmapped_guest_read_regs(self, vaddr, 1);
         let value = self.mem().read_8(vaddr);
@@ -2098,7 +2104,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         value
     }
 
-    fn memory_read_16(&self, vaddr: u64) -> u16 {
+    fn memory_read_16(&self, vaddr: u32) -> u16 {
+        let vaddr = vaddr as u64;
         self.check_memory_access(vaddr, 2, DebugWatchpointType::READ);
         trace_unmapped_guest_read_regs(self, vaddr, 2);
         let v = self.mem().read_16(vaddr);
@@ -2106,7 +2113,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         v
     }
 
-    fn memory_read_32(&self, vaddr: u64) -> u32 {
+    fn memory_read_32(&self, vaddr: u32) -> u32 {
+        let vaddr = vaddr as u64;
         self.check_memory_access(vaddr, 4, DebugWatchpointType::READ);
         trace_unmapped_guest_read_regs(self, vaddr, 4);
         let v = self.mem().read_32(vaddr);
@@ -2114,7 +2122,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         v
     }
 
-    fn memory_read_64(&self, vaddr: u64) -> u64 {
+    fn memory_read_64(&self, vaddr: u32) -> u64 {
+        let vaddr = vaddr as u64;
         self.check_memory_access(vaddr, 8, DebugWatchpointType::READ);
         trace_unmapped_guest_read_regs(self, vaddr, 8);
         let v = self.mem().read_64(vaddr);
@@ -2122,14 +2131,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         v
     }
 
-    fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-        self.check_memory_access(vaddr, 16, DebugWatchpointType::READ);
-        trace_unmapped_guest_read_regs(self, vaddr, 16);
-        let m = self.mem();
-        (m.read_64(vaddr), m.read_64(vaddr + 8))
-    }
-
-    fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+    fn memory_write_8(&mut self, vaddr: u32, value: u8) {
+        let vaddr = vaddr as u64;
         maybe_trace_mem_callback_8(self, true, vaddr, value);
         watch_write(self, vaddr, 1, value as u128);
         if self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE) {
@@ -2138,7 +2141,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
-    fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+    fn memory_write_16(&mut self, vaddr: u32, value: u16) {
+        let vaddr = vaddr as u64;
         watch_write(self, vaddr, 2, value as u128);
         if self.check_memory_access(vaddr, 2, DebugWatchpointType::WRITE) {
             trace_unmapped_write(self, vaddr, 2, value as u128);
@@ -2146,7 +2150,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
-    fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+    fn memory_write_32(&mut self, vaddr: u32, value: u32) {
+        let vaddr = vaddr as u64;
         watch_write(self, vaddr, 4, value as u128);
         if self.check_memory_access(vaddr, 4, DebugWatchpointType::WRITE) {
             trace_unmapped_write(self, vaddr, 4, value as u128);
@@ -2154,7 +2159,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
-    fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+    fn memory_write_64(&mut self, vaddr: u32, value: u64) {
+        let vaddr = vaddr as u64;
         watch_write(self, vaddr, 8, value as u128);
         if self.check_memory_access(vaddr, 8, DebugWatchpointType::WRITE) {
             trace_unmapped_write(self, vaddr, 8, value as u128);
@@ -2162,21 +2168,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
-    fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-        watch_write(
-            self,
-            vaddr,
-            16,
-            ((value_hi as u128) << 64) | (value_lo as u128),
-        );
-        if self.check_memory_access(vaddr, 16, DebugWatchpointType::WRITE) {
-            let m = self.mem();
-            m.write_64(vaddr, value_lo);
-            m.write_64(vaddr + 8, value_hi);
-        }
-    }
-
-    fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+    fn memory_write_exclusive_8(&mut self, vaddr: u32, value: u8, expected: u8) -> bool {
+        let vaddr = vaddr as u64;
         if !self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE) {
             return false;
         }
@@ -2187,7 +2180,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         self.mem().write_exclusive_8(vaddr, value, expected)
     }
 
-    fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+    fn memory_write_exclusive_16(&mut self, vaddr: u32, value: u16, expected: u16) -> bool {
+        let vaddr = vaddr as u64;
         if !self.check_memory_access(vaddr, 2, DebugWatchpointType::WRITE) {
             return false;
         }
@@ -2198,7 +2192,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         self.mem().write_exclusive_16(vaddr, value, expected)
     }
 
-    fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+    fn memory_write_exclusive_32(&mut self, vaddr: u32, value: u32, expected: u32) -> bool {
+        let vaddr = vaddr as u64;
         if !self.check_memory_access(vaddr, 4, DebugWatchpointType::WRITE) {
             return false;
         }
@@ -2233,7 +2228,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         ok
     }
 
-    fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+    fn memory_write_exclusive_64(&mut self, vaddr: u32, value: u64, expected: u64) -> bool {
+        let vaddr = vaddr as u64;
         if !self.check_memory_access(vaddr, 8, DebugWatchpointType::WRITE) {
             return false;
         }
@@ -2244,61 +2240,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
         self.mem().write_exclusive_64(vaddr, value, expected)
     }
 
-    fn exclusive_write_128(
-        &mut self,
-        vaddr: u64,
-        value_lo: u64,
-        value_hi: u64,
-        expected_lo: u64,
-        expected_hi: u64,
-    ) -> bool {
-        if !self.check_memory_access(vaddr, 16, DebugWatchpointType::WRITE) {
-            return false;
-        }
-        if !a32_callback_diagnostics_enabled() {
-            return self.mem().write_exclusive_128(
-                vaddr,
-                value_lo,
-                value_hi,
-                expected_lo,
-                expected_hi,
-            );
-        }
-        maybe_trace_w_at_vaddr(
-            self,
-            vaddr,
-            16,
-            ((value_hi as u128) << 64) | (value_lo as u128),
-        );
-        self.mem()
-            .write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
-    }
-
-    fn is_read_only_memory(&self, vaddr: u32) -> bool {
-        // Query the process page table to determine if the address is in a
-        // read-only (non-writable) mapped region. This enables the
-        // A32ConstantMemoryReads optimization to fold literal pool loads
-        // into compile-time constants.
-        //
-        // Upstream does NOT override this (returns false), but for the Switch
-        // we can safely identify RX code pages since NRO/NSO .text sections
-        // are mapped USER_READ_EXECUTE.
-        if self.process.is_null() {
-            return false;
-        }
-        let process = unsafe { &*self.process };
-        if let Some(info) = process.page_table.query_info(vaddr as usize) {
-            let perm = info.get_permission();
-            // Read-only = has read permission but NOT write permission
-            use crate::hle::kernel::k_memory_block::KMemoryPermission;
-            perm.contains(KMemoryPermission::USER_READ)
-                && !perm.contains(KMemoryPermission::USER_WRITE)
-        } else {
-            false
-        }
-    }
-
-    fn call_supervisor(&mut self, svc_num: u32) {
+    fn call_svc(&mut self, svc_num: u32) {
         // Upstream: m_parent.m_svc_swi = swi;
         //           m_parent.m_jit->HaltExecution(SupervisorCall);
         self.parent().svc_swi.store(svc_num, Ordering::Relaxed);
@@ -2309,9 +2251,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
         self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
     }
 
-    fn exception_raised(&mut self, pc: u64, exception: u64) {
-        use rdynarmic::frontend::a32::types::Exception;
-
+    fn exception_raised(&mut self, pc: u32, exception: A32Exception) {
         // Port of upstream ExceptionRaised (arm_dynarmic_32.cpp:92-109).
         //
         // Upstream behavior:
@@ -2320,21 +2260,18 @@ impl UserCallbacks for DynarmicCallbacks32 {
         //                   else -> LogBacktrace + LOG_CRITICAL (NO halt, continues)
         //   Hints (SEV/WFI/WFE/Yield): handled by IR as no-ops, never reach here
         match exception {
-            x if x == Exception::NoExecuteFault.as_u32() as u64 => {
+            A32Exception::NoExecuteFault => {
                 log::error!("Cannot execute instruction at unmapped address {:#08x}", pc);
                 // Upstream: ReturnException(pc, PrefetchAbort)
                 // Store the exception address so the parent can retrieve it.
                 self.parent()
                     .last_exception_address
-                    .store(pc, Ordering::Relaxed);
+                    .store(pc as u64, Ordering::Relaxed);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
                 if self.debugger_enabled {
-                    self.return_exception(
-                        pc as u32,
-                        rdynarmic::halt_reason::HaltReason::BREAKPOINT,
-                    );
+                    self.return_exception(pc, rdynarmic::halt_reason::HaltReason::BREAKPOINT);
                     return;
                 }
 
@@ -2344,17 +2281,17 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 let process = unsafe { &*self.process };
                 log::error!(
                     "ExceptionRaised(pre-logbacktrace, exception = {}, pc = {:08X}, thumb = {})",
-                    exception,
-                    pc as u32,
+                    exception as i32,
+                    pc,
                     self.parent().is_in_thumb_mode()
                 );
                 self.parent().base.log_backtrace(process, &ctx);
 
-                let code = self.mem().read_32(pc);
+                let code = self.mem().read_32(pc as u64);
                 log::error!(
                     "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, thumb = {})",
-                    exception,
-                    pc as u32,
+                    exception as i32,
+                    pc,
                     code,
                     self.parent().is_in_thumb_mode()
                 );
@@ -2391,44 +2328,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
         std::cmp::max(self.parent().core_timing.get_downcount(), 0) as u64
     }
 
-    /// Matches upstream `DynarmicCallbacks32::GetCNTPCT`.
-    /// Returns the current system counter value from CoreTiming.
-    fn get_cntpct(&self) -> u64 {
-        let v = self.parent().core_timing.get_clock_ticks();
-        static TRACE_CNTPCT_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        static TRACE_CNTPCT_COUNT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let limit = *TRACE_CNTPCT_LIMIT.get_or_init(|| {
-            std::env::var("RUZU_TRACE_CNTPCT_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-        });
-        if limit != 0 {
-            let index = TRACE_CNTPCT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if index < limit {
-                let pc = self
-                    .jit_pc_ptr
-                    .map(|p| unsafe { p.read_volatile() })
-                    .unwrap_or(0);
-                eprintln!(
-                    "[TRACE_CNTPCT_LIMITED] index={} pc=0x{:08X} value=0x{:016X}",
-                    index, pc, v
-                );
-            }
-        }
-        // PC-window hook: log every CNTPCT read while RUZU_TRACE_PC_WINDOW is
-        // active. Matched by zuyu's CNTPCT hook to compare clock-branch paths.
-        if rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-            let pc = self
-                .jit_pc_ptr
-                .map(|p| unsafe { p.read_volatile() })
-                .unwrap_or(0);
-            eprintln!("[TRACE_CNTPCT] pc=0x{:08X} value=0x{:016X}", pc, v);
-        }
-        v
-    }
-
     fn set_pc_ptr(&mut self, ptr: *const u32) {
         self.jit_pc_ptr = Some(ptr);
     }
@@ -2444,11 +2343,6 @@ pub struct ArmDynarmic32 {
     // Settings, etc. Currently these are passed individually (core_timing, uses_wall_clock)
     // to avoid circular dependency with System which owns the ARM backends.
     // When System stabilizes, this can be replaced with a reference.
-    /// Upstream: `DynarmicExclusiveMonitor& m_exclusive_monitor`.
-    /// Passed to JitConfig::global_monitor for cross-core LDXR/STXR synchronization.
-    exclusive_monitor:
-        *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
-
     /// Core index for this CPU.
     /// Upstream: `m_core_index`.
     core_index: usize,
@@ -2595,8 +2489,7 @@ impl ArmDynarmic32 {
         } else {
             512 * 1024 * 1024
         };
-        let mut fastmem_exclusive_access =
-            fastmem_pointer.is_some() && !exclusive_monitor.is_null();
+        let mut fastmem_exclusive_access = fastmem_pointer.is_some();
         let mut recompile_on_exclusive_fastmem_failure = true;
         let mut only_detect_misalignment_via_page_table_on_page_boundary = true;
 
@@ -2626,67 +2519,44 @@ impl ArmDynarmic32 {
             || (*settings.cpu_debug_mode.get_value()
                 && !*settings.cpuopt_ignore_memory_aborts.get_value());
 
-        let mut coprocessors = JitConfig::default_coprocessors();
+        let mut coprocessors = empty_coprocessors();
         coprocessors[15] = Some(cp15.clone());
-        let config = JitConfig {
-            coprocessors,
+        let config = A32UserConfig {
             callbacks: Box::new(callbacks),
-            enable_cycle_counting: !uses_wall_clock,
-            code_cache_size,
-            optimizations,
-            unsafe_optimizations,
             global_monitor: if exclusive_monitor.is_null() {
                 None
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
+            page_table: page_table_pointer
+                .map(|pointer| pointer as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]),
+            coprocessors,
             fastmem_pointer,
-            page_table_pointer,
-            // Upstream: config.define_unpredictable_behaviour = true
-            define_unpredictable_behaviour: true,
+            optimizations,
+            code_cache_size: code_cache_size
+                .try_into()
+                .expect("A32 code cache size must fit u32"),
+            page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS
+                .try_into()
+                .expect("A32 page-table pointer mask must fit i32"),
+            page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
             arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            // Upstream: config.processor_id = m_core_index
-            processor_id: core_index as usize,
-            // Upstream: config.wall_clock_cntpct = m_uses_wall_clock
-            wall_clock_cntpct: uses_wall_clock,
-            cntfrq_el0: common::wall_clock::CNTFRQ as u32,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            hook_data_cache_operations: false,
+            processor_id: core_index.try_into().expect("A32 processor id must fit u8"),
+            detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
+            unsafe_optimizations,
+            absolute_offset_page_table: true,
+            only_detect_misalignment_via_page_table_on_page_boundary,
+            recompile_on_fastmem_failure: true,
+            fastmem_exclusive_access,
+            recompile_on_exclusive_fastmem_failure,
             hook_isb: false,
-            tpidrro_el0: None,
-            tpidr_el0: None,
-            // Upstream `ArmDynarmic32::MakeJit` configures A32 with the
-            // process page table and 32-bit fastmem. rdynarmic uses the page
-            // table to reject free/debug pages before falling back to memory
-            // callbacks, avoiding silent writes through the sparse fastmem
-            // arena.
-            //
-            // `silently_mirror_{fastmem,page_table}` are hardcoded to true for
-            // A32 in upstream `A32AddressSpace::GetEmitConfig`: the 32-bit
-            // guest address is masked into the fastmem/page-table address space
-            // (`*_address_space_bits = 32`) so out-of-range addresses wrap
-            // instead of faulting. This is independent of the free/debug page
-            // rejection above (that stays driven by `page_table_pointer_mask_bits`
-            // + `recompile_on_fastmem_failure`).
-            memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
-                fastmem_address_space_bits: 32,
-                silently_mirror_fastmem: true,
-                fastmem_exclusive_access,
-                recompile_on_exclusive_fastmem_failure,
-                recompile_on_fastmem_failure: true,
-                page_table_present: page_table_pointer.is_some(),
-                page_table_address_space_bits: 32,
-                silently_mirror_page_table: true,
-                absolute_offset_page_table: true,
-                page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
-                page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
-                detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
-                only_detect_misalignment_via_page_table_on_page_boundary,
-                check_halt_on_memory_access,
-                processor_id: core_index as usize,
-            },
+            hook_hint_instructions: false,
+            define_unpredictable_behaviour: true,
+            wall_clock_cntpct: uses_wall_clock,
+            check_halt_on_memory_access,
+            enable_cycle_counting: !uses_wall_clock,
+            always_little_endian: false,
+            very_verbose_debugging_output: false,
         };
 
         if std::env::var_os("RUZU_TRACE_A32_JIT_CONFIG").is_some() {
@@ -2751,7 +2621,6 @@ impl ArmDynarmic32 {
 
         let result = Self {
             base,
-            exclusive_monitor,
             core_index,
             svc_swi,
             core_timing,
@@ -2835,8 +2704,7 @@ impl ArmDynarmic32 {
     }
 }
 
-// SAFETY: ArmDynarmic32 holds raw pointers to long-lived objects
-// (exclusive_monitor, watchpoints) that are valid for the lifetime of the process.
+// SAFETY: ArmDynarmic32 holds raw pointers to long-lived process/watchpoint state.
 // The JIT is single-threaded per core — only one thread runs each ArmDynarmic32.
 unsafe impl Send for ArmDynarmic32 {}
 
@@ -3193,6 +3061,13 @@ mod tests {
     use std::sync::RwLock;
 
     #[test]
+    fn callbacks_implement_the_architecture_owned_a32_interface() {
+        fn assert_a32_callbacks<T: A32UserCallbacks>() {}
+
+        assert_a32_callbacks::<DynarmicCallbacks32>();
+    }
+
+    #[test]
     fn page_table_stride_matches_exposed_page_info_buffer() {
         assert_eq!(
             1usize << PAGE_TABLE_LOG2_STRIDE,
@@ -3216,7 +3091,7 @@ mod tests {
         );
 
         assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
-        assert_eq!(callbacks.memory_read_code(0x805A2D08), None);
+        assert_eq!(callbacks.memory_read_code(0), None);
     }
 
     #[test]

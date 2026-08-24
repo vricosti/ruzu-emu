@@ -18,7 +18,11 @@ use common::page_table::PageInfo;
 use common::settings_enums::CpuAccuracy;
 
 use rdynarmic::backend::x64::jit_state::A64JitState;
-use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
+use rdynarmic::interface::a64::config::{
+    Exception as A64Exception, InstructionCacheOperation, UserCallbacks as A64UserCallbacks,
+    UserConfig as A64UserConfig, Vector as A64Vector,
+};
+use rdynarmic::interface::optimization_flags::OptimizationFlag;
 
 // Eden indexes `PageEntryData` records (32 bytes); ruzu's split page-table
 // storage exposes the contiguous `PageInfo` buffer directly. Keep the same
@@ -757,9 +761,6 @@ struct DynarmicCallbacks64 {
     last_exception_address: Arc<AtomicU64>,
     /// Saved guest context for upstream-style `ReturnException(pc, hr)`.
     breakpoint_context: Arc<Mutex<ThreadContext>>,
-    /// Shared exclusive monitor backing Dynarmic's global monitor state.
-    exclusive_monitor:
-        *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
     /// CPU core index associated with this callback/JIT instance.
     core_index: usize,
     /// Upstream: `const bool m_debugger_enabled`.
@@ -778,7 +779,7 @@ struct DynarmicCallbacks64 {
     jit_pc_ptr: Option<*const u64>,
 }
 
-// Safety: exclusive_monitor points to process-owned state that outlives the callback/JIT.
+// Safety: the installed JIT state pointers remain valid for the callback/JIT lifetime.
 // Each callback is still used by only one JIT/core.
 unsafe impl Send for DynarmicCallbacks64 {}
 
@@ -791,7 +792,6 @@ impl DynarmicCallbacks64 {
         core_timing: Arc<crate::core_timing::CoreTiming>,
         last_exception_address: Arc<AtomicU64>,
         breakpoint_context: Arc<Mutex<ThreadContext>>,
-        exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
         debugger_enabled: bool,
         watchpoints: SharedWatchpointArray,
@@ -805,7 +805,6 @@ impl DynarmicCallbacks64 {
             core_timing,
             last_exception_address,
             breakpoint_context,
-            exclusive_monitor,
             core_index,
             debugger_enabled,
             check_memory_access: debugger_enabled
@@ -924,7 +923,7 @@ impl DynarmicCallbacks64 {
     }
 }
 
-impl UserCallbacks for DynarmicCallbacks64 {
+impl A64UserCallbacks for DynarmicCallbacks64 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         if vaddr == 0
             && trace_a64_null_fetch_enabled()
@@ -1321,7 +1320,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
         value
     }
 
-    fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
+    fn memory_read_128(&self, vaddr: u64) -> A64Vector {
         self.check_memory_access(vaddr, 16, DebugWatchpointType::READ);
         // RUZU_DUMP_VEC_AT_PC=PC[,PC,...] — for vectorized strchr/strpbrk
         // scans, dump V17/V18/X3/X5 at LD1 entry. The reduction state
@@ -1370,23 +1369,23 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         }
         let value = if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
-            (m.read_64(vaddr), m.read_64(vaddr + 8))
+            [m.read_64(vaddr), m.read_64(vaddr + 8)]
         } else {
             let mem = self.memory.read().unwrap();
-            (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+            [mem.read_64(vaddr), mem.read_64(vaddr + 8)]
         };
         watch_read_64(
             self,
             vaddr,
             16,
-            ((value.1 as u128) << 64) | (value.0 as u128),
+            ((value[1] as u128) << 64) | (value[0] as u128),
         );
         trace_a64_access_64(
             self,
             "READ",
             vaddr,
             16,
-            ((value.1 as u128) << 64) | (value.0 as u128),
+            ((value[1] as u128) << 64) | (value[0] as u128),
         );
         value
     }
@@ -1731,7 +1730,8 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         }
     }
 
-    fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
+    fn memory_write_128(&mut self, vaddr: u64, value: A64Vector) {
+        let [value_lo, value_hi] = value;
         // Capture xmm1's and xmm15's hardware state at the very first
         // opportunity. xmm15 acts as a "fallback fired" marker (set to
         // all-FFs by the fastmem fallback when RUZU_FALLBACK_MARK_XMM15=1).
@@ -1880,7 +1880,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
         }
     }
 
-    fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+    fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
         self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock().unwrap().write_exclusive_8(vaddr, value, expected)
@@ -1890,7 +1890,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
             }
     }
 
-    fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+    fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
         self.check_memory_access(vaddr, 2, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock()
@@ -1902,7 +1902,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
             }
     }
 
-    fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+    fn memory_write_exclusive_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
         // RUZU_TRACE_CAS32_PC=1 — log the JIT PC + key registers on the
         // FIRST few exclusive-write-32 calls. Used to identify the guest
         // code that emits a tight CAS spinloop (e.g. STK's atomic CAS on
@@ -2008,7 +2008,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         success
     }
 
-    fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+    fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
         self.check_memory_access(vaddr, 8, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock()
@@ -2020,14 +2020,14 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             }
     }
 
-    fn exclusive_write_128(
+    fn memory_write_exclusive_128(
         &mut self,
         vaddr: u64,
-        value_lo: u64,
-        value_hi: u64,
-        expected_lo: u64,
-        expected_hi: u64,
+        value: A64Vector,
+        expected: A64Vector,
     ) -> bool {
+        let [value_lo, value_hi] = value;
+        let [expected_lo, expected_hi] = expected;
         self.check_memory_access(vaddr, 16, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock().unwrap().write_exclusive_128(
@@ -2038,53 +2038,43 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                     expected_hi,
                 )
             } else {
-                self.memory_write_128(vaddr, value_lo, value_hi);
+                self.memory_write_128(vaddr, value);
                 true
             }
     }
 
-    fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {
-        // Upstream IC operations:
-        // 0 = InvalidateByVAToPoU (IC IVAU) — invalidate cache line at vaddr
-        // 1 = InvalidateAllToPoU (IC IALLU) — invalidate entire icache
+    fn instruction_cache_operation_raised(&mut self, op: InstructionCacheOperation, vaddr: u64) {
         match op {
-            0 => {
+            InstructionCacheOperation::InvalidateByVaToPoU => {
                 log::trace!(
                     "IC IVAU @ {:#x} (no-op, cache invalidation handled at JIT level)",
                     vaddr
                 );
             }
-            1 => {
+            InstructionCacheOperation::InvalidateAllToPoU => {
                 log::trace!("IC IALLU (no-op, cache invalidation handled at JIT level)");
             }
-            _ => {
-                log::warn!(
-                    "Unknown instruction_cache_operation op={} vaddr={:#x}",
-                    op,
-                    vaddr
-                );
+            InstructionCacheOperation::InvalidateAllToPoUInnerSharable => {
+                log::debug!("Unprocessed instruction cache operation: {op:?}");
             }
         }
     }
 
-    fn call_supervisor(&mut self, svc_num: u32) {
+    fn call_svc(&mut self, svc_num: u32) {
         self.svc.store(svc_num, Ordering::Relaxed);
         self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
     }
 
-    fn exception_raised(&mut self, pc: u64, exception: u64) {
-        use rdynarmic::frontend::a64::types::Exception;
-
+    fn exception_raised(&mut self, pc: u64, exception: A64Exception) {
         match exception {
-            x if x == Exception::WaitForInterrupt as u64
-                || x == Exception::WaitForEvent as u64
-                || x == Exception::SendEvent as u64
-                || x == Exception::SendEventLocal as u64
-                || x == Exception::Yield as u64 =>
-            {
+            A64Exception::WaitForInterrupt
+            | A64Exception::WaitForEvent
+            | A64Exception::SendEvent
+            | A64Exception::SendEventLocal
+            | A64Exception::Yield => {
                 return;
             }
-            x if x == Exception::NoExecuteFault as u64 => {
+            A64Exception::NoExecuteFault => {
                 self.last_exception_address.store(pc, Ordering::Relaxed);
                 self.snapshot_context(pc);
                 log::error!(
@@ -2094,7 +2084,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT);
                 return;
             }
-            x if x == Exception::Breakpoint as u64 => {
+            A64Exception::Breakpoint => {
                 self.last_exception_address.store(pc, Ordering::Relaxed);
                 self.snapshot_context(pc);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::BREAKPOINT);
@@ -2106,7 +2096,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         self.last_exception_address.store(pc, Ordering::Relaxed);
         self.snapshot_context(pc);
         log::error!(
-            "DynarmicCallbacks64::exception_raised(pc={:#x}, exception={:#x})",
+            "DynarmicCallbacks64::exception_raised(pc={:#x}, exception={:?})",
             pc,
             exception
         );
@@ -2268,7 +2258,6 @@ impl ArmDynarmic64 {
             core_timing,
             last_exception_address.clone(),
             breakpoint_context.clone(),
-            exclusive_monitor,
             core_index,
             debugger_enabled,
             base.shared_watchpoint_array(),
@@ -2416,60 +2405,54 @@ impl ArmDynarmic64 {
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
-        let config = JitConfig {
-            coprocessors: JitConfig::default_coprocessors(),
+        let config = A64UserConfig {
+            fastmem_pointer,
             callbacks: Box::new(callbacks),
-            enable_cycle_counting: !uses_wall_clock,
-            code_cache_size: if cfg!(target_arch = "aarch64") {
-                128 * 1024 * 1024
-            } else {
-                512 * 1024 * 1024
-            },
-            optimizations,
-            unsafe_optimizations,
             global_monitor: if exclusive_monitor.is_null() {
                 None
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
-            fastmem_pointer,
-            page_table_pointer,
-            define_unpredictable_behaviour: true,
-            arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
-            hook_hint_instructions: false,
-            processor_id: core_index as usize,
-            wall_clock_cntpct: uses_wall_clock,
+            tpidrro_el0: Some(tpidrro_el0_ptr),
+            tpidr_el0: Some(tpidr_el0_ptr),
+            page_table: page_table_pointer.map(|pointer| pointer as *mut *mut std::ffi::c_void),
+            optimizations,
+            page_table_address_space_bits: address_space_bits
+                .try_into()
+                .expect("A64 address-space width must fit u32"),
+            page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS
+                .try_into()
+                .expect("A64 page-table pointer mask must fit i32"),
+            page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
             cntfrq_el0: common::wall_clock::CNTFRQ as u32,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
+            fastmem_address_space_bits: fastmem_address_space_bits
+                .try_into()
+                .expect("A64 fastmem address-space width must fit u32"),
+            code_cache_size: if cfg!(target_arch = "aarch64") {
+                128 * 1024 * 1024
+            } else {
+                512 * 1024 * 1024
+            },
+            detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
+            processor_id: core_index.try_into().expect("A64 processor id must fit u8"),
+            unsafe_optimizations,
             hook_data_cache_operations: false,
             hook_isb: false,
-            tpidrro_el0: Some(tpidrro_el0_ptr),
-            tpidr_el0: Some(tpidr_el0_ptr),
-            // Memory emit options matching upstream zuyu's
-            // `ArmDynarmic64::MakeJit` setup
-            // (zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp:225-248).
-            // Both widths come from the process page table, as in Eden's
-            // `MakeJit(page_table, page_table.GetAddressSpaceWidth())`.
-            // Auto/unsafe-fastmem-check may widen only the fastmem side to
-            // 64 bits below, matching the upstream accuracy switch.
-            memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
-                fastmem_address_space_bits,
-                silently_mirror_fastmem: false,
-                fastmem_exclusive_access,
-                recompile_on_exclusive_fastmem_failure,
-                recompile_on_fastmem_failure: true,
-                page_table_present: page_table_pointer.is_some(),
-                page_table_address_space_bits: address_space_bits,
-                silently_mirror_page_table: false,
-                absolute_offset_page_table: true,
-                page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
-                page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
-                detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
-                only_detect_misalignment_via_page_table_on_page_boundary,
-                check_halt_on_memory_access,
-                processor_id: core_index as usize,
-            },
+            hook_hint_instructions: false,
+            silently_mirror_page_table: false,
+            absolute_offset_page_table: true,
+            only_detect_misalignment_via_page_table_on_page_boundary,
+            recompile_on_fastmem_failure: true,
+            silently_mirror_fastmem: false,
+            fastmem_exclusive_access,
+            recompile_on_exclusive_fastmem_failure,
+            define_unpredictable_behaviour: true,
+            wall_clock_cntpct: uses_wall_clock,
+            check_halt_on_memory_access,
+            enable_cycle_counting: !uses_wall_clock,
+            very_verbose_debugging_output: false,
         };
 
         // Create the JIT
@@ -2800,9 +2783,17 @@ mod tests {
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use common::settings_enums::CpuAccuracy;
     use rdynarmic::backend::x64::jit_state::A64JitState;
-    use rdynarmic::jit_config::{OptimizationFlag, UserCallbacks};
+    use rdynarmic::interface::a64::config::UserCallbacks;
+    use rdynarmic::interface::optimization_flags::OptimizationFlag;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+
+    #[test]
+    fn callbacks_implement_the_architecture_owned_a64_interface() {
+        fn assert_a64_callbacks<T: UserCallbacks>() {}
+
+        assert_a64_callbacks::<DynarmicCallbacks64>();
+    }
 
     #[test]
     fn page_table_stride_matches_exposed_page_info_buffer() {
@@ -2940,7 +2931,6 @@ mod tests {
             Arc::new(CoreTiming::new()),
             Arc::new(AtomicU64::new(0)),
             Arc::new(Mutex::new(Default::default())),
-            std::ptr::null_mut(),
             0,
             true,
             interface.shared_watchpoint_array(),

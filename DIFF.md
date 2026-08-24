@@ -4522,7 +4522,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `ArmDynarmic64` passes the exclusive monitor and core index directly into its owned callback and
   JIT configuration instead of retaining an additional parent-level copy after construction.
   Eden retains both members because `MakeJit` reads them; Ruzu builds its JIT inline and the active
-  callback copies remain alive with the JIT.
+  global-monitor pointer and processor ID remain owned by the architecture-specific JIT
+  configuration.
 - AArch64 TPIDR storage uses stable `Box<u64>` allocations owned by `ArmDynarmic64`, because the
   Rust JIT owns its callback object and cannot safely point back into that moving object during
   construction. The unused callback-local TPIDR duplicates were removed; context transfer and the
@@ -10743,3 +10744,51 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: A64 exception and cache-operation enums remain four-byte values with upstream ordinal
   order, and `Vector = [u64; 2]` remains 16 bytes. Round-trip enum tests and typed callback tests
   cover the values crossing generated-code trampolines.
+
+## 2026-08-24 — `src/core/src/arm/dynarmic/arm_dynarmic_{32,64}.rs` vs Eden `core/arm/dynarmic/arm_dynarmic_{32,64}.{h,cpp}` (architecture configuration ownership)
+
+### Intentional differences
+- Ruzu owns the callback object in `A64UserConfig` and installs stable halt/PC pointers after JIT
+  allocation; Eden passes a non-owning `DynarmicCallbacks64*` whose parent already owns the JIT.
+- A32 installs its parent pointer only after the Rust owner reaches a stable address; this is the
+  lifecycle-safe equivalent of Eden's callback reference to `ArmDynarmic32`.
+- Ruzu's split page table passes the contiguous `PageInfo` buffer and its derived stride, as
+  recorded in the preceding page-table layout audit, instead of Eden's interleaved
+  `PageEntryData` buffer.
+- Ruzu reads instruction words directly and therefore does not need Eden's cached-code-page reset
+  in `InstructionSynchronizationBarrierRaised`.
+
+### Unintentional differences (to fix)
+- Fixed: the production A64 core owner constructed the legacy architecture-merged `JitConfig`,
+  which converted its callbacks and configuration through `LegacyA64Callbacks`. It now implements
+  `interface/a64/config.rs::UserCallbacks` and constructs that owner's `UserConfig` directly,
+  preserving typed vectors, exceptions, cache operations, widths, processor ID, system registers,
+  memory policy, optimization mask, and timing fields.
+- Fixed: `DynarmicCallbacks64` retained an unread copy of the exclusive-monitor pointer even though
+  Eden's callback does not own that state. The pointer now exists only in the A64 JIT configuration,
+  matching its actual consumer and removing the dead field.
+- Fixed: the production A32 core owner also constructed the merged `JitConfig`. It now implements
+  the A32-owned callback surface with 32-bit guest addresses, removes the unreachable A64-only
+  128-bit/cache-counter callbacks, and constructs `A32UserConfig` directly with its coprocessor,
+  page-table, optimization, endianness, processor, timing, and memory-policy fields.
+- Fixed: A32 enabled fastmem exclusives only when both fastmem and the global-monitor pointer were
+  present. Eden derives this option solely from `fastmem_pointer`; Ruzu now does the same while the
+  monitor remains an independently optional configuration field.
+- Fixed: A32 overrode Eden's conservative default `IsReadOnlyMemory` callback with a page-permission
+  query. Removing the override restores the upstream optimization contract instead of folding
+  reads under a Ruzu-specific policy.
+- Fixed: `ArmDynarmic32` retained an unread exclusive-monitor field after construction. The pointer
+  now lives only in the A32 configuration that consumes it.
+
+### Missing items
+- `InstructionCacheOperationRaised` still logs operations instead of invoking the owning JIT's
+  range/all-cache invalidation methods and requesting `CacheInvalidation` like Eden. Restoring this
+  requires a shared invalidation request owned across the Rust callback/JIT lifetime boundary.
+- Other remaining production and test callers still use the temporary shared `JitConfig`; this
+  slice removes the compatibility boundary from both production CPU owners.
+
+### Binary layout verification
+- N/A: the changed configuration and callback ownership are host-side. The architecture-owned
+  exception, vector, and cache-operation layouts are verified in the two interface configuration
+  modules; core compile-time regression tests require each callback owner to implement its exact
+  architecture trait.

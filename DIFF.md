@@ -10955,3 +10955,25 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: the AArch64 test build enforces the 16-byte `[u64; 2]` vector callback boundary; existing
   `Pair128` thunk assertions continue to verify low/high word ordering.
+
+## 2026-08-24 — `src/core/src/cpu_manager.rs` vs Eden `core/cpu_manager.{h,cpp}` and `core/hle/kernel/physical_core.cpp` (ordinary JIT halt path)
+
+### Intentional differences
+- Explicit `RUZU_SPIN_TRACE` requests may still capture a halt context, and the Rust-only null-PC
+  `BreakLoop` workaround captures one context to classify that known bridge failure. Neither path
+  runs for an ordinary zero-reason cycle-budget expiration.
+
+### Unintentional differences (to fix)
+- Fixed: every Rust `Halted` event, including `Halted(0)` at each budget expiration, called
+  `get_context()` and published PC/LR/SP plus 29 registers through release atomics. Eden simply
+  continues after an ordinary halt and performs no equivalent diagnostic work.
+- Fixed: thread 17 performed another unconditional context copy for its first 500 halts even when
+  trace logging was disabled. The obsolete investigation probe and counter were removed.
+
+### Missing items
+- The larger Rust cooperative run-loop structure still differs from Eden's direct
+  `PhysicalCore::RunThread`; this change is limited to removing non-upstream work from its hot
+  ordinary-halt path.
+
+### Binary layout verification
+- N/A: this change affects host-side scheduling and diagnostic snapshots only.

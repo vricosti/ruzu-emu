@@ -55,9 +55,6 @@ const DEFAULT_CRITICAL_MEMORY: u64 = 1024 * 1024 * 1024;
 /// Target memory threshold (4 GiB).
 const TARGET_THRESHOLD: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Debug flag: when true, GPU->CPU downloads are disabled.
-const DISABLE_DOWNLOADS: bool = true;
-
 /// Number of page-table entries: covers 2^34 bytes / CACHING_PAGESIZE.
 const PAGE_TABLE_SIZE: usize = (1u64 << 34) as usize >> CACHING_PAGEBITS;
 
@@ -3529,6 +3526,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DownloadBufferMemory(Buffer&, DAddr, u64)`
     fn download_buffer_memory_range(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u64) {
+        let trace_zero_memory = std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+            && (size == 0x50 || size == 0x1000);
+        if trace_zero_memory {
+            eprintln!(
+                "[BUFFER_DOWNLOAD_BEGIN] device=0x{device_addr:X} size=0x{size:X} buffer_id={:?} buffer_base=0x{:X}",
+                buffer_id,
+                self.slot_buffers[buffer_id].cpu_addr(),
+            );
+        }
         // Collect the ranges that need to be downloaded via memory_tracker.
         // We split the logic into two phases to avoid the borrow conflict:
         // Phase 1: collect download ranges from memory_tracker (borrows memory_tracker).
@@ -3571,16 +3577,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 largest_copy = largest_copy.max(new_size);
             }
 
+            if trace_zero_memory {
+                eprintln!(
+                    "[BUFFER_DOWNLOAD_RANGE] requested=0x{device_addr_out:X}+0x{range_size:X} copies={copies:?}"
+                );
+            }
+
             self.clear_download(device_addr_out, range_size);
             self.gpu_modified_ranges
                 .subtract(device_addr_out, range_size as usize);
         }
 
         if total_size_bytes == 0 {
-            return;
-        }
-
-        if DISABLE_DOWNLOADS {
+            if trace_zero_memory {
+                eprintln!("[BUFFER_DOWNLOAD_EMPTY]");
+            }
             return;
         }
 
@@ -3604,6 +3615,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             self.runtime.finish();
             if let Some(ref dm) = self.device_memory {
                 let mapped_memory = download_staging.mapped_span();
+                if trace_zero_memory {
+                    eprintln!(
+                        "[BUFFER_DOWNLOAD_STAGING] total=0x{total_size_bytes:X} head={:02X?}",
+                        &mapped_memory[..mapped_memory.len().min(32)],
+                    );
+                }
                 for (i, copy) in adjusted_copies.iter().enumerate() {
                     let copy_device_addr =
                         self.slot_buffers[buffer_id].cpu_addr() + copies[i].src_offset;
@@ -4474,6 +4491,48 @@ mod tests {
 
         let memory = bytes.lock();
         assert_eq!(&memory[dst..dst + amount], &memory[src..src + amount]);
+    }
+
+    #[test]
+    fn download_memory_copies_gpu_modified_buffer_data_to_device_memory() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+
+        let buffer_address = 0x1_0000u64;
+        let download_offset = 0x180u64;
+        let download_size = 0x80usize;
+        let bytes = std::sync::Arc::new(parking_lot::Mutex::new(vec![0xcc; 0x3_0000]));
+        cache.set_device_memory(Box::new(SharedDeviceMemory {
+            bytes: std::sync::Arc::clone(&bytes),
+        }));
+
+        let buffer_id = cache.create_buffer(buffer_address, 0x1000);
+        assert!(!cache.synchronize_buffer(buffer_id, buffer_address, 0x1000));
+        let expected: Vec<u8> = (0..download_size)
+            .map(|index| (index as u8).wrapping_mul(3).wrapping_add(1))
+            .collect();
+        let cached_offset =
+            buffer_address + download_offset - cache.slot_buffers[buffer_id].cpu_addr();
+        cache.slot_buffers[buffer_id].immediate_upload(cached_offset, &expected);
+        cache.mark_written_buffer(
+            buffer_id,
+            buffer_address + download_offset,
+            download_size as u32,
+        );
+        assert!(cache
+            .memory_tracker
+            .is_region_gpu_modified(buffer_address + download_offset, download_size as u64,));
+        assert!(cache.is_region_gpu_modified(buffer_address + download_offset, download_size,));
+
+        cache.download_memory(buffer_address + download_offset, download_size as u64);
+
+        let memory = bytes.lock();
+        let start = (buffer_address + download_offset) as usize;
+        assert_eq!(&memory[start..start + download_size], expected.as_slice());
     }
 
     #[test]

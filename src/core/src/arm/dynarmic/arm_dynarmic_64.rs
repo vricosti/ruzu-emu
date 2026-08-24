@@ -2514,9 +2514,7 @@ impl ArmInterface for ArmDynarmic64 {
 
         jit.clear_exclusive_state();
         let rdynarmic_hr = jit.run();
-        if trace_a64_svc_regs_enabled()
-            && rdynarmic_hr.contains(rdynarmic::HaltReason::SVC)
-        {
+        if trace_a64_svc_regs_enabled() && rdynarmic_hr.contains(rdynarmic::HaltReason::SVC) {
             eprintln!(
                 "[A64_SVC_HALT] svc=0x{:x} pc=0x{:016x} lr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x2=0x{:016x} x3=0x{:016x} x4=0x{:016x} x5=0x{:016x} x6=0x{:016x} x7=0x{:016x} x21=0x{:016x} x22=0x{:016x} x24=0x{:016x} x25=0x{:016x}",
                 self.svc.load(Ordering::Relaxed),
@@ -2552,9 +2550,7 @@ impl ArmInterface for ArmDynarmic64 {
 
         jit.clear_exclusive_state();
         let rdynarmic_hr = jit.step();
-        if trace_a64_svc_regs_enabled()
-            && rdynarmic_hr.contains(rdynarmic::HaltReason::SVC)
-        {
+        if trace_a64_svc_regs_enabled() && rdynarmic_hr.contains(rdynarmic::HaltReason::SVC) {
             eprintln!(
                 "[A64_SVC_STEP] svc=0x{:x} pc=0x{:016x} lr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x2=0x{:016x} x3=0x{:016x} x4=0x{:016x} x5=0x{:016x} x6=0x{:016x} x7=0x{:016x} x21=0x{:016x} x22=0x{:016x} x24=0x{:016x} x25=0x{:016x}",
                 self.svc.load(Ordering::Relaxed),
@@ -2902,8 +2898,7 @@ mod tests {
 
     #[test]
     fn translate_halt_reason_ignores_legacy_exception_raised_bit() {
-        let translated =
-            translate_halt_reason(rdynarmic::HaltReason::EXCEPTION_RAISED);
+        let translated = translate_halt_reason(rdynarmic::HaltReason::EXCEPTION_RAISED);
         assert!(translated.is_empty());
     }
 
@@ -2950,8 +2945,7 @@ mod tests {
             Some(0x1100)
         );
         assert_ne!(
-            halt_reason.load(Ordering::SeqCst)
-                & rdynarmic::HaltReason::MEMORY_ABORT.bits(),
+            halt_reason.load(Ordering::SeqCst) & rdynarmic::HaltReason::MEMORY_ABORT.bits(),
             0
         );
     }

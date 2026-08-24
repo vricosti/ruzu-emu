@@ -4,7 +4,6 @@
 //! Port of zuyu/src/core/crypto/ctr_encryption_layer.h and ctr_encryption_layer.cpp
 //! Sits on top of a VirtualFile and provides CTR-mode AES decryption.
 
-
 use parking_lot::Mutex;
 
 use super::aes_util::{AesCipher, Mode, Op};

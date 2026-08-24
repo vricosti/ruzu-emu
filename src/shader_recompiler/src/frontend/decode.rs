@@ -12,7 +12,22 @@ use super::maxwell_opcodes::{decode_opcode, MaxwellOpcode};
 
 /// Decode a Maxwell instruction into its opcode.
 ///
-/// Returns `None` for unrecognized instructions.
-pub fn decode(insn: u64) -> Option<MaxwellOpcode> {
-    decode_opcode(insn)
+/// Like Eden's release `Decode`, an unrecognized word continues as NOP.
+///
+/// Eden's `ASSERT_MSG` is compiled out of release builds. Logging every word
+/// here is observably different: a malformed/unbounded shader can contain
+/// hundreds of thousands of zero words and spend most of its compilation time
+/// formatting the same diagnostic.
+pub fn decode(insn: u64) -> MaxwellOpcode {
+    decode_opcode(insn).unwrap_or(MaxwellOpcode::NOP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_instruction_uses_upstream_soft_assert_fallback() {
+        assert_eq!(decode(0), MaxwellOpcode::NOP);
+    }
 }

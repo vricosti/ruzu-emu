@@ -165,7 +165,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         gpu_memory
             .lock()
             .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
-
         let copies = if flags.contains(ImageFlagBits::CONVERTED) {
             self.unswizzle_data_buffer.resize(unswizzled_size_bytes, 0);
             let mut copies = unswizzle_image(
@@ -658,12 +657,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     }
 
     pub fn set_channel_gpu_memory(&mut self, gpu_memory: Arc<ParkingMutex<MemoryManager>>) {
-        self.channel_gpu_memory = Some(gpu_memory);
+        self.update_channel_gpu_memory(Some(gpu_memory));
         self.rebase_virtual_invalid_images();
     }
 
     pub fn clear_channel_gpu_memory(&mut self) {
-        self.channel_gpu_memory = None;
+        self.update_channel_gpu_memory(None);
     }
 
     fn translated_cpu_addr(&self, gpu_addr: GPUVAddr, size: u64) -> Option<u64> {
@@ -970,23 +969,27 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         copies: &[BufferImageCopy],
         staging: &[u8],
     ) -> bool {
-        if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
-            if let Some(gpu_memory) = gpu_memory.try_lock() {
-                super::util::swizzle_image(
-                    &|gpu_addr, output| {
-                        let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
-                    },
-                    &|gpu_addr, data| {
-                        let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
-                    },
-                    image.gpu_addr,
-                    &image.info,
-                    copies,
-                    staging,
-                    &mut self.swizzle_data_buffer,
-                );
-                return true;
-            }
+        if let Some(gpu_memory) = self.channel_gpu_memory_handle {
+            // SAFETY: `set_channel_gpu_memory` retains the owning Arc and the
+            // renderer/channel graph serializes this callback. This path is
+            // specifically entered from a channel MemoryManager read, so its
+            // mutex can already be held; upstream uses the same stored raw
+            // pointer without attempting a recursive lock.
+            let gpu_memory = unsafe { gpu_memory.as_ref() };
+            super::util::swizzle_image(
+                &|gpu_addr, output| {
+                    let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
+                },
+                &|gpu_addr, data| {
+                    let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
+                },
+                image.gpu_addr,
+                &image.info,
+                copies,
+                staging,
+                &mut self.swizzle_data_buffer,
+            );
+            return true;
         }
 
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
@@ -1030,6 +1033,19 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             cpu_addr,
             size,
             |image_id, image, slot_map_views| {
+                if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
+                    && image.flags.contains(ImageFlagBits::GPU_MODIFIED)
+                    && !image.flags.contains(ImageFlagBits::CPU_MODIFIED)
+                {
+                    eprintln!(
+                        "[TEXTURE_CPU_WRITE_OVERLAP] write=0x{cpu_addr:X}+0x{size:X} image={:?} cpu=0x{:X}+0x{:X} gpu=0x{:X} flags={:?}",
+                        image_id,
+                        image.cpu_addr,
+                        image.guest_size_bytes,
+                        image.gpu_addr,
+                        image.flags
+                    );
+                }
                 if image.flags.contains(ImageFlagBits::CPU_MODIFIED) {
                     return false;
                 }
@@ -2452,6 +2468,16 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         mut cpu_addr: u64,
     ) -> ImageId {
         let mut new_info = info.clone();
+        let trace_join = std::env::var_os("RUZU_TRACE_TEXTURE_JOIN").is_some()
+            && info.size.width == 512
+            && info.size.height == 512
+            && info.format == crate::texture_cache::format_lookup_table::PixelFormat::D16Unorm;
+        if trace_join {
+            eprintln!(
+                "[TEXTURE_JOIN_BEGIN] gpu=0x{gpu_addr:X} cpu=0x{cpu_addr:X} resources={:?} stride=0x{:X}",
+                info.resources, info.layer_stride
+            );
+        }
         let size_bytes = super::util::calculate_guest_size_in_bytes(&new_info) as usize;
         let broken_views = self.has_broken_texture_view_formats;
         let native_bgr = self.has_native_bgr;
@@ -2508,6 +2534,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     broken_views,
                     native_bgr,
                 ) {
+                    if trace_join {
+                        eprintln!(
+                            "[TEXTURE_JOIN_RESOLVE] input_gpu=0x{gpu_addr:X} input_cpu=0x{cpu_addr:X} overlap_id={} overlap_gpu=0x{:X} overlap_cpu=0x{:X} overlap_resources={:?} result_gpu=0x{:X} result_cpu=0x{:X} result_resources={:?}",
+                            overlap_id.index,
+                            overlap.gpu_addr,
+                            overlap.cpu_addr,
+                            overlap.info.resources,
+                            solution.gpu_addr,
+                            solution.cpu_addr,
+                            solution.resources
+                        );
+                    }
                     gpu_addr = solution.gpu_addr;
                     cpu_addr = solution.cpu_addr;
                     new_info.resources = solution.resources;
@@ -2604,6 +2642,17 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         let new_image_id =
             self.insert_typed_image(ImageBase::new(new_info.clone(), gpu_addr, cpu_addr));
+        if trace_join {
+            let image = &self.slot_images[new_image_id];
+            eprintln!(
+                "[TEXTURE_JOIN_RESULT] id={} gpu=0x{:X} cpu=0x{:X} end=0x{:X} resources={:?}",
+                new_image_id.index,
+                image.gpu_addr,
+                image.cpu_addr,
+                image.cpu_addr_end,
+                image.info.resources
+            );
+        }
         if new_info.is_sparse {
             let gpu_memory = self
                 .channel_gpu_memory
@@ -2996,6 +3045,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         let registered = image.flags.contains(ImageFlagBits::REGISTERED);
         let cpu_addr = image.cpu_addr;
         let guest_size_bytes = image.guest_size_bytes;
+        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some() && guest_size_bytes >= 0x10_0000 {
+            let first = self.device_memory.smmu_cpu_backing_for_address(cpu_addr);
+            let last = self.device_memory.smmu_cpu_backing_for_address(
+                cpu_addr.saturating_add(u64::from(guest_size_bytes.saturating_sub(1))),
+            );
+            eprintln!(
+                "[TEXTURE_TRACK_LARGE] image={:?} cpu=0x{cpu_addr:X}+0x{guest_size_bytes:X} gpu=0x{:X} flags={:?} first={first:?} last={last:?}",
+                image_id,
+                image.gpu_addr,
+                image.flags
+            );
+        }
         if !is_sparse {
             // Upstream guard: skip the "kernel" sentinel range
             // (`cpu_addr >= ~(1ULL << 40)`).
@@ -4658,7 +4719,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_passes_guest_size_for_range_translation() {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
@@ -4695,7 +4755,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_forwards_raw_msaa_mode_to_image_info() {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.anti_alias_samples_mode = 3;
@@ -4831,7 +4890,6 @@ mod tests {
     #[test]
     fn update_render_targets_from_snapshot_with_clean_render_targets_preserves_state_like_upstream()
     {
-
         let mut cache = test_cache();
         cache.render_targets.draw_buffers = [7, 6, 5, 4, 3, 2, 1, 0];
         cache.render_targets.size = Extent2D {
@@ -4880,7 +4938,6 @@ mod tests {
     #[test]
     fn update_render_targets_from_snapshot_uses_virtual_invalid_fallback_for_color_translation_miss(
     ) {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
@@ -4912,7 +4969,6 @@ mod tests {
     #[test]
     fn update_render_targets_from_snapshot_uses_virtual_invalid_fallback_for_zeta_translation_miss()
     {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
@@ -4972,7 +5028,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_ignores_slots_past_rt_control_count() {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
@@ -5021,7 +5076,6 @@ mod tests {
 
     #[test]
     fn update_render_targets_from_snapshot_dirty_flags_preserve_clean_color_slot() {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
@@ -5072,7 +5126,6 @@ mod tests {
 
     #[test]
     fn bind_same_preemptive_render_target_view_has_no_download() {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
@@ -5161,7 +5214,6 @@ mod tests {
 
     #[test]
     fn try_find_framebuffer_image_view_unknown_format_uses_upstream_default() {
-
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
@@ -5283,7 +5335,6 @@ mod tests {
 
     #[test]
     fn is_region_gpu_modified_checks_registered_overlapping_images() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -5309,7 +5360,6 @@ mod tests {
 
     #[test]
     fn mark_modification_preserves_cpu_modified_like_upstream() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -5335,7 +5385,6 @@ mod tests {
 
     #[test]
     fn write_memory_marks_registered_image_cpu_modified_and_untracks() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -5405,7 +5454,6 @@ mod tests {
 
     #[test]
     fn insert_image_uses_virtual_invalid_cpu_space_when_untranslated() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -5597,7 +5645,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_reuses_stable_virtual_invalid_range_for_unmapped_gpu_address() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -5874,10 +5921,10 @@ mod tests {
     }
 
     #[test]
-    fn write_downloaded_image_uses_guest_writer_when_channel_memory_is_locked() {
+    fn write_downloaded_image_uses_gpu_virtual_mapping_when_owner_is_already_borrowed() {
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
@@ -5887,15 +5934,13 @@ mod tests {
             16,
             12,
         )));
+        {
+            let mut memory = gpu_memory.lock();
+            memory.map(0x4000, 0x8000, 0x1000, 0, false);
+        }
         cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
-
-        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        let writes_for_callback = Arc::clone(&writes);
-        cache.set_guest_memory_writer(Arc::new(move |addr, data| {
-            writes_for_callback
-                .lock()
-                .unwrap()
-                .push((addr, data.to_vec()));
+        cache.set_guest_memory_writer(Arc::new(|_, _| {
+            panic!("download writeback must retain the GPU virtual mapping")
         }));
 
         let _held_channel_lock = gpu_memory.lock();
@@ -5928,14 +5973,10 @@ mod tests {
         };
 
         assert!(cache.write_downloaded_image(&image, &[copy], &[1, 2, 3, 4]));
-        let writes = writes.lock().unwrap();
-        assert!(!writes.is_empty());
-        assert_eq!(writes[0].0, 0x8000);
     }
 
     #[test]
     fn register_image_updates_gpu_page_table_and_unregister_clears_it() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -6396,7 +6437,6 @@ mod tests {
 
     #[test]
     fn unmap_memory_unregisters_untracks_and_deletes_image() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -6427,7 +6467,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_reuses_cpu_region_view_compatible_image() {
-
         let mut cache = test_cache();
         let first = ImageInfo {
             format: surface::PixelFormat::A2B10G10R10Unorm,
@@ -6457,7 +6496,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_reuses_existing_image_like_upstream() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -6492,7 +6530,6 @@ mod tests {
 
     #[test]
     fn join_images_registers_common_cache_immediately_like_upstream() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -6536,7 +6573,6 @@ mod tests {
 
     #[test]
     fn direct_find_or_insert_returns_fully_registered_image() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -6561,7 +6597,6 @@ mod tests {
 
     #[test]
     fn explicit_find_or_insert_result_path_returns_registered_image() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -6725,7 +6760,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot perform upstream Fermi2D image preparation")]
     fn common_blit_image_rejects_backendless_path() {
-
         let mut cache = test_cache();
         let _ = cache.blit_image(&(), &(), &());
     }
@@ -6784,7 +6818,6 @@ mod tests {
 
     #[test]
     fn find_or_insert_does_not_reuse_cpu_region_incompatible_samples_or_layers() {
-
         let mut cache = test_cache();
         let existing = ImageInfo {
             format: surface::PixelFormat::B10G11R11Float,
@@ -7063,7 +7096,6 @@ mod tests {
 
     #[test]
     fn insert_image_registers_and_delete_removes_image_alloc_entry() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -7090,7 +7122,6 @@ mod tests {
 
     #[test]
     fn join_images_records_incompatible_overlaps() {
-
         let mut cache = test_cache();
         let first = ImageInfo {
             format: surface::PixelFormat::B10G11R11Float,
@@ -7127,7 +7158,6 @@ mod tests {
 
     #[test]
     fn join_images_applies_bad_overlap_relations_before_return() {
-
         let mut cache = test_cache();
         let first = ImageInfo {
             format: surface::PixelFormat::B10G11R11Float,
@@ -7167,7 +7197,6 @@ mod tests {
 
     #[test]
     fn join_images_applies_alias_relations_before_return() {
-
         let mut cache = test_cache();
         let mut full = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -7216,7 +7245,6 @@ mod tests {
 
     #[test]
     fn join_images_preserves_gpu_modified_alias_source_and_registers_result() {
-
         let mut cache = test_cache();
         let mut full = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -7304,7 +7332,6 @@ mod tests {
 
     #[test]
     fn join_images_registers_result_after_gpu_modified_overlap_classification() {
-
         let mut cache = test_cache();
         let mut full = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -7353,7 +7380,6 @@ mod tests {
 
     #[test]
     fn create_image_view_uses_try_find_base_layer() {
-
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
         let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
@@ -7369,7 +7395,6 @@ mod tests {
 
     #[test]
     fn create_image_view_with_gpu_to_cpu_uses_virtual_invalid_fallback_like_upstream_insert() {
-
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
         let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
@@ -7385,7 +7410,6 @@ mod tests {
 
     #[test]
     fn typed_create_image_view_uses_virtual_invalid_fallback_like_upstream_insert() {
-
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
         let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
@@ -7459,7 +7483,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "TextureCache::FindRenderTargetView TryFindBase failed")]
     fn find_render_target_view_panics_when_try_find_base_fails_like_upstream() {
-
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -7507,7 +7530,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_skips_color_target_alias_like_upstream() {
-
         let mut cache = test_cache();
         let image_id = insert_test_image(&mut cache, 0x6000_0000);
         let sampled_view_id = insert_test_view(&mut cache, image_id);
@@ -7530,7 +7552,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_detects_depth_target_alias() {
-
         let mut cache = test_cache();
         let image_id = insert_test_image(&mut cache, 0x6100_0000);
         let sampled_view_id = insert_test_view(&mut cache, image_id);
@@ -7552,7 +7573,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_ignores_unrelated_and_null_views() {
-
         let mut cache = test_cache();
         let sampled_image_id = insert_test_image(&mut cache, 0x6200_0000);
         let target_image_id = insert_test_image(&mut cache, 0x6300_0000);
@@ -7581,7 +7601,6 @@ mod tests {
 
     #[test]
     fn check_feedback_loop_cache_is_invalidated_by_texture_binding_serial() {
-
         let mut cache = test_cache();
         let depth_image_id = insert_test_image(&mut cache, 0x6400_0000);
         let unrelated_image_id = insert_test_image(&mut cache, 0x6500_0000);

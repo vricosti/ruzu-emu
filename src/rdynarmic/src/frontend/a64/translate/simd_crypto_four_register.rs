@@ -57,7 +57,7 @@ impl<'a> TranslatorVisitor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontend::a64::decoder::{A64InstructionName, decode};
+    use crate::frontend::a64::decoder::{decode, A64InstructionName};
     use crate::frontend::a64::translate::TranslationOptions;
     use crate::ir::block::Block;
     use crate::ir::location::A64LocationDescriptor;

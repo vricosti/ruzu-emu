@@ -9,9 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{
-    HLERequestContext, SessionRequestHandler,
-};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 

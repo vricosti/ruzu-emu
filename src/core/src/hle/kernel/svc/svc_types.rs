@@ -4,7 +4,6 @@
 //!
 //! SVC types, enums, and constants used by the kernel SVC handlers.
 
-
 /// Memory state enumeration.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

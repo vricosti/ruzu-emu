@@ -51,6 +51,12 @@ const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
 /// Upstream: `GenericEnvironment::TryFindSize` line 252.
 const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
 
+/// Maxwell EXIT instruction used by open-source guest drivers to terminate a
+/// shader without the proprietary driver's self-branch sentinel.
+///
+/// Upstream: `GenericEnvironment::TryFindSize` in `shader_environment.cpp`.
+const EXIT_VALUE: u64 = 0xE30000000007000F;
+
 /// GPU-memory reader callback shape: read `bytes.len()` bytes starting at the
 /// given GPU virtual address.
 ///
@@ -263,6 +269,12 @@ impl GenericEnvironment {
         self
     }
 
+    #[cfg(test)]
+    pub fn with_proprietary_driver(mut self, is_proprietary_driver: bool) -> Self {
+        self.is_proprietary_driver = is_proprietary_driver;
+        self
+    }
+
     /// Store the closest available upstream owner replacement for
     /// `Tegra::MemoryManager*`.
     pub fn with_gpu_memory(mut self, gpu_memory: Arc<ParkingLotMutex<MemoryManager>>) -> Self {
@@ -433,6 +445,9 @@ impl GenericEnvironment {
                         );
                     }
                     return Some((offset + index) as u64);
+                }
+                if !self.is_proprietary_driver && inst == EXIT_VALUE {
+                    return Some((offset + index + INST_SIZE) as u64);
                 }
             }
 
@@ -671,6 +686,14 @@ impl GraphicsEnvironment {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_generic_environment_for_test(base: GenericEnvironment) -> Self {
+        Self {
+            base,
+            ..Self::new()
+        }
+    }
+
     /// Port of `GraphicsEnvironment::GraphicsEnvironment(...)`.
     pub fn from_maxwell3d(
         maxwell3d: &Maxwell3D,
@@ -741,6 +764,15 @@ impl GraphicsEnvironment {
             }
             env.base.local_memory_size = env.base.sph.local_memory_size() as u32
                 + env.base.sph.shader_local_memory_crs_size();
+            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+                eprintln!(
+                    "[SHADER_HEADER] stage={:?} address=0x{:X} raw={:08X?} local=0x{:X}",
+                    env.base.stage,
+                    program_base + start_address as u64,
+                    &env.base.sph.raw[..5],
+                    env.base.local_memory_size,
+                );
+            }
         }
         env
     }
@@ -2300,6 +2332,46 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn try_find_size_stops_after_exit_for_non_proprietary_driver() {
+        let program_base: u64 = 0x2_1000_0000;
+        let exit_offset = 0x98;
+        let (reader, log) = make_mock_gpu_with_sentinel(program_base, exit_offset, EXIT_VALUE);
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        let size = env.try_find_size().expect("EXIT must terminate the shader");
+        assert_eq!(size as usize, exit_offset + INST_SIZE);
+        assert_eq!(log.lock().unwrap().as_slice(), &[(program_base, 0x1000)]);
+    }
+
+    #[test]
+    fn try_find_size_ignores_exit_for_proprietary_driver() {
+        let program_base: u64 = 0x2_2000_0000;
+        let exit_offset = 0x80;
+        let sentinel_offset = 0x180;
+        let mut backing = vec![0u8; TRY_FIND_SIZE_BLOCK_BYTES];
+        backing[exit_offset..exit_offset + INST_SIZE].copy_from_slice(&EXIT_VALUE.to_le_bytes());
+        backing[sentinel_offset..sentinel_offset + INST_SIZE]
+            .copy_from_slice(&SELF_BRANCH_A.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            let offset = (gpu_addr - program_base) as usize;
+            dst.copy_from_slice(&backing[offset..offset + dst.len()]);
+        });
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+        env.is_proprietary_driver = true;
+
+        assert_eq!(
+            env.try_find_size()
+                .expect("self branch must terminate the shader") as usize,
+            sentinel_offset
+        );
     }
 
     #[test]

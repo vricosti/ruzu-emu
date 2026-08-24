@@ -1060,568 +1060,1782 @@ impl Opcode {
         match self {
             // Core
             Void => OpcodeInfo { ret: V, args: &[] },
-            Identity => OpcodeInfo { ret: OPQ, args: &[OPQ] },
+            Identity => OpcodeInfo {
+                ret: OPQ,
+                args: &[OPQ],
+            },
             Breakpoint => OpcodeInfo { ret: V, args: &[] },
-            CallHostFunction => OpcodeInfo { ret: V, args: &[U64, OPQ, OPQ, OPQ] },
+            CallHostFunction => OpcodeInfo {
+                ret: V,
+                args: &[U64, OPQ, OPQ, OPQ],
+            },
 
             // A64 context
-            A64SetCheckBit => OpcodeInfo { ret: V, args: &[U1] },
+            A64SetCheckBit => OpcodeInfo {
+                ret: V,
+                args: &[U1],
+            },
             A64GetCFlag => OpcodeInfo { ret: U1, args: &[] },
-            A64GetNZCVRaw => OpcodeInfo { ret: U32, args: &[] },
-            A64SetNZCVRaw => OpcodeInfo { ret: V, args: &[U32] },
-            A64SetNZCV => OpcodeInfo { ret: V, args: &[NZCV] },
-            A64GetW => OpcodeInfo { ret: U32, args: &[A64R] },
-            A64GetX => OpcodeInfo { ret: U64, args: &[A64R] },
-            A64GetS => OpcodeInfo { ret: U128, args: &[A64V] },
-            A64GetD => OpcodeInfo { ret: U128, args: &[A64V] },
-            A64GetQ => OpcodeInfo { ret: U128, args: &[A64V] },
-            A64GetSP => OpcodeInfo { ret: U64, args: &[] },
-            A64GetFPCR => OpcodeInfo { ret: U32, args: &[] },
-            A64GetFPSR => OpcodeInfo { ret: U32, args: &[] },
-            A64SetW => OpcodeInfo { ret: V, args: &[A64R, U32] },
-            A64SetX => OpcodeInfo { ret: V, args: &[A64R, U64] },
-            A64SetS => OpcodeInfo { ret: V, args: &[A64V, U128] },
-            A64SetD => OpcodeInfo { ret: V, args: &[A64V, U128] },
-            A64SetQ => OpcodeInfo { ret: V, args: &[A64V, U128] },
-            A64SetSP => OpcodeInfo { ret: V, args: &[U64] },
-            A64SetPC => OpcodeInfo { ret: V, args: &[U64] },
-            A64SetFPCR => OpcodeInfo { ret: V, args: &[U32] },
-            A64SetFPSR => OpcodeInfo { ret: V, args: &[U32] },
-            A64CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
-            A64ExceptionRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
-            A64DataCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64, U64] },
-            A64InstructionCacheOperationRaised => OpcodeInfo { ret: V, args: &[U64, U64] },
+            A64GetNZCVRaw => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A64SetNZCVRaw => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A64SetNZCV => OpcodeInfo {
+                ret: V,
+                args: &[NZCV],
+            },
+            A64GetW => OpcodeInfo {
+                ret: U32,
+                args: &[A64R],
+            },
+            A64GetX => OpcodeInfo {
+                ret: U64,
+                args: &[A64R],
+            },
+            A64GetS => OpcodeInfo {
+                ret: U128,
+                args: &[A64V],
+            },
+            A64GetD => OpcodeInfo {
+                ret: U128,
+                args: &[A64V],
+            },
+            A64GetQ => OpcodeInfo {
+                ret: U128,
+                args: &[A64V],
+            },
+            A64GetSP => OpcodeInfo {
+                ret: U64,
+                args: &[],
+            },
+            A64GetFPCR => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A64GetFPSR => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A64SetW => OpcodeInfo {
+                ret: V,
+                args: &[A64R, U32],
+            },
+            A64SetX => OpcodeInfo {
+                ret: V,
+                args: &[A64R, U64],
+            },
+            A64SetS => OpcodeInfo {
+                ret: V,
+                args: &[A64V, U128],
+            },
+            A64SetD => OpcodeInfo {
+                ret: V,
+                args: &[A64V, U128],
+            },
+            A64SetQ => OpcodeInfo {
+                ret: V,
+                args: &[A64V, U128],
+            },
+            A64SetSP => OpcodeInfo {
+                ret: V,
+                args: &[U64],
+            },
+            A64SetPC => OpcodeInfo {
+                ret: V,
+                args: &[U64],
+            },
+            A64SetFPCR => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A64SetFPSR => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A64CallSupervisor => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A64ExceptionRaised => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64],
+            },
+            A64DataCacheOperationRaised => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64, U64],
+            },
+            A64InstructionCacheOperationRaised => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64],
+            },
             A64DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
             A64DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },
             A64InstructionSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
-            A64GetCNTFRQ => OpcodeInfo { ret: U32, args: &[] },
-            A64GetCNTPCT => OpcodeInfo { ret: U64, args: &[] },
-            A64GetCTR => OpcodeInfo { ret: U32, args: &[] },
-            A64GetDCZID => OpcodeInfo { ret: U32, args: &[] },
-            A64GetTPIDR => OpcodeInfo { ret: U64, args: &[] },
-            A64SetTPIDR => OpcodeInfo { ret: V, args: &[U64] },
-            A64GetTPIDRRO => OpcodeInfo { ret: U64, args: &[] },
+            A64GetCNTFRQ => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A64GetCNTPCT => OpcodeInfo {
+                ret: U64,
+                args: &[],
+            },
+            A64GetCTR => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A64GetDCZID => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A64GetTPIDR => OpcodeInfo {
+                ret: U64,
+                args: &[],
+            },
+            A64SetTPIDR => OpcodeInfo {
+                ret: V,
+                args: &[U64],
+            },
+            A64GetTPIDRRO => OpcodeInfo {
+                ret: U64,
+                args: &[],
+            },
 
             // RSB
-            PushRSB => OpcodeInfo { ret: V, args: &[U64] },
+            PushRSB => OpcodeInfo {
+                ret: V,
+                args: &[U64],
+            },
 
             // Flags
-            GetCarryFromOp => OpcodeInfo { ret: U1, args: &[OPQ] },
-            GetOverflowFromOp => OpcodeInfo { ret: U1, args: &[OPQ] },
-            GetGEFromOp => OpcodeInfo { ret: U32, args: &[OPQ] },
-            GetNZCVFromOp => OpcodeInfo { ret: NZCV, args: &[OPQ] },
-            GetNZFromOp => OpcodeInfo { ret: NZCV, args: &[OPQ] },
-            GetUpperFromOp => OpcodeInfo { ret: U128, args: &[OPQ] },
-            GetLowerFromOp => OpcodeInfo { ret: U128, args: &[OPQ] },
-            GetCFlagFromNZCV => OpcodeInfo { ret: U1, args: &[NZCV] },
-            NZCVFromPackedFlags => OpcodeInfo { ret: NZCV, args: &[U32] },
+            GetCarryFromOp => OpcodeInfo {
+                ret: U1,
+                args: &[OPQ],
+            },
+            GetOverflowFromOp => OpcodeInfo {
+                ret: U1,
+                args: &[OPQ],
+            },
+            GetGEFromOp => OpcodeInfo {
+                ret: U32,
+                args: &[OPQ],
+            },
+            GetNZCVFromOp => OpcodeInfo {
+                ret: NZCV,
+                args: &[OPQ],
+            },
+            GetNZFromOp => OpcodeInfo {
+                ret: NZCV,
+                args: &[OPQ],
+            },
+            GetUpperFromOp => OpcodeInfo {
+                ret: U128,
+                args: &[OPQ],
+            },
+            GetLowerFromOp => OpcodeInfo {
+                ret: U128,
+                args: &[OPQ],
+            },
+            GetCFlagFromNZCV => OpcodeInfo {
+                ret: U1,
+                args: &[NZCV],
+            },
+            NZCVFromPackedFlags => OpcodeInfo {
+                ret: NZCV,
+                args: &[U32],
+            },
 
             // Pack/extract
-            Pack2x32To1x64 => OpcodeInfo { ret: U64, args: &[U32, U32] },
-            Pack2x64To1x128 => OpcodeInfo { ret: U128, args: &[U64, U64] },
-            LeastSignificantWord => OpcodeInfo { ret: U32, args: &[U64] },
-            MostSignificantWord => OpcodeInfo { ret: U32, args: &[U64] },
-            LeastSignificantHalf => OpcodeInfo { ret: U16, args: &[U32] },
-            LeastSignificantByte => OpcodeInfo { ret: U8, args: &[U32] },
-            MostSignificantBit => OpcodeInfo { ret: U1, args: &[U32] },
-            IsZero32 => OpcodeInfo { ret: U1, args: &[U32] },
-            IsZero64 => OpcodeInfo { ret: U1, args: &[U64] },
-            TestBit => OpcodeInfo { ret: U1, args: &[U64, U8] },
-            ConditionalSelect32 => OpcodeInfo { ret: U32, args: &[COND, U32, U32] },
-            ConditionalSelect64 => OpcodeInfo { ret: U64, args: &[COND, U64, U64] },
-            ConditionalSelectNZCV => OpcodeInfo { ret: NZCV, args: &[COND, NZCV, NZCV] },
+            Pack2x32To1x64 => OpcodeInfo {
+                ret: U64,
+                args: &[U32, U32],
+            },
+            Pack2x64To1x128 => OpcodeInfo {
+                ret: U128,
+                args: &[U64, U64],
+            },
+            LeastSignificantWord => OpcodeInfo {
+                ret: U32,
+                args: &[U64],
+            },
+            MostSignificantWord => OpcodeInfo {
+                ret: U32,
+                args: &[U64],
+            },
+            LeastSignificantHalf => OpcodeInfo {
+                ret: U16,
+                args: &[U32],
+            },
+            LeastSignificantByte => OpcodeInfo {
+                ret: U8,
+                args: &[U32],
+            },
+            MostSignificantBit => OpcodeInfo {
+                ret: U1,
+                args: &[U32],
+            },
+            IsZero32 => OpcodeInfo {
+                ret: U1,
+                args: &[U32],
+            },
+            IsZero64 => OpcodeInfo {
+                ret: U1,
+                args: &[U64],
+            },
+            TestBit => OpcodeInfo {
+                ret: U1,
+                args: &[U64, U8],
+            },
+            ConditionalSelect32 => OpcodeInfo {
+                ret: U32,
+                args: &[COND, U32, U32],
+            },
+            ConditionalSelect64 => OpcodeInfo {
+                ret: U64,
+                args: &[COND, U64, U64],
+            },
+            ConditionalSelectNZCV => OpcodeInfo {
+                ret: NZCV,
+                args: &[COND, NZCV, NZCV],
+            },
 
             // Shifts
-            LogicalShiftLeft32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            LogicalShiftLeft64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
-            LogicalShiftRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            LogicalShiftRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
-            ArithmeticShiftRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            ArithmeticShiftRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
-            BitRotateRight32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            BitRotateRight64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
-            RotateRightExtended => OpcodeInfo { ret: U32, args: &[U32, U1] },
-            LogicalShiftLeftMasked32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            LogicalShiftLeftMasked64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            LogicalShiftRightMasked32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            LogicalShiftRightMasked64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            ArithmeticShiftRightMasked32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            ArithmeticShiftRightMasked64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            RotateRightMasked32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            RotateRightMasked64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
+            LogicalShiftLeft32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U1],
+            },
+            LogicalShiftLeft64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8],
+            },
+            LogicalShiftRight32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U1],
+            },
+            LogicalShiftRight64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8],
+            },
+            ArithmeticShiftRight32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U1],
+            },
+            ArithmeticShiftRight64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8],
+            },
+            BitRotateRight32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U1],
+            },
+            BitRotateRight64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8],
+            },
+            RotateRightExtended => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U1],
+            },
+            LogicalShiftLeftMasked32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            LogicalShiftLeftMasked64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            LogicalShiftRightMasked32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            LogicalShiftRightMasked64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            ArithmeticShiftRightMasked32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            ArithmeticShiftRightMasked64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            RotateRightMasked32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            RotateRightMasked64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
 
             // ALU 32/64
-            Add32 => OpcodeInfo { ret: U32, args: &[U32, U32, U1] },
-            Add64 => OpcodeInfo { ret: U64, args: &[U64, U64, U1] },
-            Sub32 => OpcodeInfo { ret: U32, args: &[U32, U32, U1] },
-            Sub64 => OpcodeInfo { ret: U64, args: &[U64, U64, U1] },
-            Mul32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            Mul64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            SignedMultiplyHigh64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            UnsignedMultiplyHigh64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            UnsignedDiv32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            UnsignedDiv64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            SignedDiv32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            SignedDiv64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            And32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            And64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            AndNot32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            AndNot64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            Eor32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            Eor64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            Or32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            Or64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            Not32 => OpcodeInfo { ret: U32, args: &[U32] },
-            Not64 => OpcodeInfo { ret: U64, args: &[U64] },
+            Add32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32, U1],
+            },
+            Add64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, U1],
+            },
+            Sub32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32, U1],
+            },
+            Sub64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, U1],
+            },
+            Mul32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            Mul64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            SignedMultiplyHigh64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            UnsignedMultiplyHigh64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            UnsignedDiv32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            UnsignedDiv64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            SignedDiv32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            SignedDiv64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            And32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            And64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            AndNot32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            AndNot64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            Eor32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            Eor64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            Or32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            Or64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            Not32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            Not64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
 
             // Extensions
-            SignExtendByteToWord => OpcodeInfo { ret: U32, args: &[U8] },
-            SignExtendHalfToWord => OpcodeInfo { ret: U32, args: &[U16] },
-            SignExtendByteToLong => OpcodeInfo { ret: U64, args: &[U8] },
-            SignExtendHalfToLong => OpcodeInfo { ret: U64, args: &[U16] },
-            SignExtendWordToLong => OpcodeInfo { ret: U64, args: &[U32] },
-            ZeroExtendByteToWord => OpcodeInfo { ret: U32, args: &[U8] },
-            ZeroExtendHalfToWord => OpcodeInfo { ret: U32, args: &[U16] },
-            ZeroExtendByteToLong => OpcodeInfo { ret: U64, args: &[U8] },
-            ZeroExtendHalfToLong => OpcodeInfo { ret: U64, args: &[U16] },
-            ZeroExtendWordToLong => OpcodeInfo { ret: U64, args: &[U32] },
-            ZeroExtendLongToQuad => OpcodeInfo { ret: U128, args: &[U64] },
+            SignExtendByteToWord => OpcodeInfo {
+                ret: U32,
+                args: &[U8],
+            },
+            SignExtendHalfToWord => OpcodeInfo {
+                ret: U32,
+                args: &[U16],
+            },
+            SignExtendByteToLong => OpcodeInfo {
+                ret: U64,
+                args: &[U8],
+            },
+            SignExtendHalfToLong => OpcodeInfo {
+                ret: U64,
+                args: &[U16],
+            },
+            SignExtendWordToLong => OpcodeInfo {
+                ret: U64,
+                args: &[U32],
+            },
+            ZeroExtendByteToWord => OpcodeInfo {
+                ret: U32,
+                args: &[U8],
+            },
+            ZeroExtendHalfToWord => OpcodeInfo {
+                ret: U32,
+                args: &[U16],
+            },
+            ZeroExtendByteToLong => OpcodeInfo {
+                ret: U64,
+                args: &[U8],
+            },
+            ZeroExtendHalfToLong => OpcodeInfo {
+                ret: U64,
+                args: &[U16],
+            },
+            ZeroExtendWordToLong => OpcodeInfo {
+                ret: U64,
+                args: &[U32],
+            },
+            ZeroExtendLongToQuad => OpcodeInfo {
+                ret: U128,
+                args: &[U64],
+            },
 
             // Byte reverse
-            ByteReverseWord => OpcodeInfo { ret: U32, args: &[U32] },
-            ByteReverseHalf => OpcodeInfo { ret: U16, args: &[U16] },
-            ByteReverseDual => OpcodeInfo { ret: U64, args: &[U64] },
+            ByteReverseWord => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            ByteReverseHalf => OpcodeInfo {
+                ret: U16,
+                args: &[U16],
+            },
+            ByteReverseDual => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
 
             // Count/Extract
-            CountLeadingZeros32 => OpcodeInfo { ret: U32, args: &[U32] },
-            CountLeadingZeros64 => OpcodeInfo { ret: U64, args: &[U64] },
-            ExtractRegister32 => OpcodeInfo { ret: U32, args: &[U32, U32, U8] },
-            ExtractRegister64 => OpcodeInfo { ret: U64, args: &[U64, U64, U8] },
-            ReplicateBit32 => OpcodeInfo { ret: U32, args: &[U32, U8] },
-            ReplicateBit64 => OpcodeInfo { ret: U64, args: &[U64, U8] },
+            CountLeadingZeros32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            CountLeadingZeros64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
+            ExtractRegister32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32, U8],
+            },
+            ExtractRegister64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, U8],
+            },
+            ReplicateBit32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8],
+            },
+            ReplicateBit64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8],
+            },
 
             // Min/Max
-            MaxSigned32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            MaxSigned64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            MaxUnsigned32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            MaxUnsigned64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            MinSigned32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            MinSigned64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            MinUnsigned32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            MinUnsigned64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
+            MaxSigned32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            MaxSigned64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            MaxUnsigned32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            MaxUnsigned64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            MinSigned32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            MinSigned64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            MinUnsigned32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            MinUnsigned64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
 
             // Saturated arithmetic
-            SignedSaturatedAddWithFlag32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            SignedSaturatedSubWithFlag32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            SignedSaturatedAdd8 => OpcodeInfo { ret: U8, args: &[U8, U8] },
-            SignedSaturatedAdd16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            SignedSaturatedAdd32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            SignedSaturatedAdd64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            SignedSaturatedDoublingMultiplyReturnHigh16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            SignedSaturatedDoublingMultiplyReturnHigh32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            SignedSaturatedSub8 => OpcodeInfo { ret: U8, args: &[U8, U8] },
-            SignedSaturatedSub16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            SignedSaturatedSub32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            SignedSaturatedSub64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            SignedSaturation => OpcodeInfo { ret: U32, args: &[U32, U8] },
-            UnsignedSaturatedAdd8 => OpcodeInfo { ret: U8, args: &[U8, U8] },
-            UnsignedSaturatedAdd16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            UnsignedSaturatedAdd32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            UnsignedSaturatedAdd64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            UnsignedSaturatedSub8 => OpcodeInfo { ret: U8, args: &[U8, U8] },
-            UnsignedSaturatedSub16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            UnsignedSaturatedSub32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            UnsignedSaturatedSub64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            UnsignedSaturation => OpcodeInfo { ret: U32, args: &[U32, U8] },
+            SignedSaturatedAddWithFlag32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            SignedSaturatedSubWithFlag32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            SignedSaturatedAdd8 => OpcodeInfo {
+                ret: U8,
+                args: &[U8, U8],
+            },
+            SignedSaturatedAdd16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            SignedSaturatedAdd32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            SignedSaturatedAdd64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            SignedSaturatedDoublingMultiplyReturnHigh16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            SignedSaturatedDoublingMultiplyReturnHigh32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            SignedSaturatedSub8 => OpcodeInfo {
+                ret: U8,
+                args: &[U8, U8],
+            },
+            SignedSaturatedSub16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            SignedSaturatedSub32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            SignedSaturatedSub64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            SignedSaturation => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8],
+            },
+            UnsignedSaturatedAdd8 => OpcodeInfo {
+                ret: U8,
+                args: &[U8, U8],
+            },
+            UnsignedSaturatedAdd16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            UnsignedSaturatedAdd32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            UnsignedSaturatedAdd64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            UnsignedSaturatedSub8 => OpcodeInfo {
+                ret: U8,
+                args: &[U8, U8],
+            },
+            UnsignedSaturatedSub16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            UnsignedSaturatedSub32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            UnsignedSaturatedSub64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            UnsignedSaturation => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8],
+            },
 
             // Packed operations (all U32->U32 pairs for ARM packed SIMD)
-            PackedAddU8 | PackedAddS8 | PackedAddU16 | PackedAddS16 |
-            PackedSubU8 | PackedSubS8 | PackedSubU16 | PackedSubS16 |
-            PackedAddSubU16 | PackedAddSubS16 | PackedSubAddU16 | PackedSubAddS16 |
-            PackedHalvingAddU8 | PackedHalvingAddS8 | PackedHalvingAddU16 | PackedHalvingAddS16 |
-            PackedHalvingSubU8 | PackedHalvingSubS8 | PackedHalvingSubU16 | PackedHalvingSubS16 |
-            PackedHalvingAddSubU16 | PackedHalvingAddSubS16 | PackedHalvingSubAddU16 | PackedHalvingSubAddS16 |
-            PackedSaturatedAddU8 | PackedSaturatedAddS8 | PackedSaturatedSubU8 | PackedSaturatedSubS8 |
-            PackedSaturatedAddU16 | PackedSaturatedAddS16 | PackedSaturatedSubU16 | PackedSaturatedSubS16
-                => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            PackedAbsDiffSumU8 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            PackedSelect => OpcodeInfo { ret: U32, args: &[U32, U32, U32] },
+            PackedAddU8
+            | PackedAddS8
+            | PackedAddU16
+            | PackedAddS16
+            | PackedSubU8
+            | PackedSubS8
+            | PackedSubU16
+            | PackedSubS16
+            | PackedAddSubU16
+            | PackedAddSubS16
+            | PackedSubAddU16
+            | PackedSubAddS16
+            | PackedHalvingAddU8
+            | PackedHalvingAddS8
+            | PackedHalvingAddU16
+            | PackedHalvingAddS16
+            | PackedHalvingSubU8
+            | PackedHalvingSubS8
+            | PackedHalvingSubU16
+            | PackedHalvingSubS16
+            | PackedHalvingAddSubU16
+            | PackedHalvingAddSubS16
+            | PackedHalvingSubAddU16
+            | PackedHalvingSubAddS16
+            | PackedSaturatedAddU8
+            | PackedSaturatedAddS8
+            | PackedSaturatedSubU8
+            | PackedSaturatedSubS8
+            | PackedSaturatedAddU16
+            | PackedSaturatedAddS16
+            | PackedSaturatedSubU16
+            | PackedSaturatedSubS16 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            PackedAbsDiffSumU8 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            PackedSelect => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32, U32],
+            },
 
             // CRC32
-            CRC32Castagnoli8 | CRC32Castagnoli16 | CRC32Castagnoli32 |
-            CRC32ISO8 | CRC32ISO16 | CRC32ISO32
-                => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            CRC32Castagnoli64 | CRC32ISO64 => OpcodeInfo { ret: U32, args: &[U32, U64] },
+            CRC32Castagnoli8 | CRC32Castagnoli16 | CRC32Castagnoli32 | CRC32ISO8 | CRC32ISO16
+            | CRC32ISO32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            CRC32Castagnoli64 | CRC32ISO64 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U64],
+            },
 
             // AES
-            AESDecryptSingleRound | AESEncryptSingleRound |
-            AESInverseMixColumns | AESMixColumns
-                => OpcodeInfo { ret: U128, args: &[U128] },
+            AESDecryptSingleRound
+            | AESEncryptSingleRound
+            | AESInverseMixColumns
+            | AESMixColumns => OpcodeInfo {
+                ret: U128,
+                args: &[U128],
+            },
 
             // SHA
-            SM4AccessSubstitutionBox => OpcodeInfo { ret: U8, args: &[U8] },
-            SHA256Hash => OpcodeInfo { ret: U128, args: &[U128, U128, U128, U1] },
-            SHA256MessageSchedule0 => OpcodeInfo { ret: U128, args: &[U128, U128] },
-            SHA256MessageSchedule1 => OpcodeInfo { ret: U128, args: &[U128, U128, U128] },
+            SM4AccessSubstitutionBox => OpcodeInfo {
+                ret: U8,
+                args: &[U8],
+            },
+            SHA256Hash => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128, U128, U1],
+            },
+            SHA256MessageSchedule0 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128],
+            },
+            SHA256MessageSchedule1 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128, U128],
+            },
 
             // Vector get/set element
-            VectorGetElement8 => OpcodeInfo { ret: U8, args: &[U128, U8] },
-            VectorGetElement16 => OpcodeInfo { ret: U16, args: &[U128, U8] },
-            VectorGetElement32 => OpcodeInfo { ret: U32, args: &[U128, U8] },
-            VectorGetElement64 => OpcodeInfo { ret: U64, args: &[U128, U8] },
-            VectorSetElement8 => OpcodeInfo { ret: U128, args: &[U128, U8, U8] },
-            VectorSetElement16 => OpcodeInfo { ret: U128, args: &[U128, U8, U16] },
-            VectorSetElement32 => OpcodeInfo { ret: U128, args: &[U128, U8, U32] },
-            VectorSetElement64 => OpcodeInfo { ret: U128, args: &[U128, U8, U64] },
+            VectorGetElement8 => OpcodeInfo {
+                ret: U8,
+                args: &[U128, U8],
+            },
+            VectorGetElement16 => OpcodeInfo {
+                ret: U16,
+                args: &[U128, U8],
+            },
+            VectorGetElement32 => OpcodeInfo {
+                ret: U32,
+                args: &[U128, U8],
+            },
+            VectorGetElement64 => OpcodeInfo {
+                ret: U64,
+                args: &[U128, U8],
+            },
+            VectorSetElement8 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U8],
+            },
+            VectorSetElement16 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U16],
+            },
+            VectorSetElement32 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U32],
+            },
+            VectorSetElement64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U64],
+            },
 
             // Unary vector -> vector ops
-            VectorAbs8 | VectorAbs16 | VectorAbs32 | VectorAbs64 |
-            VectorNarrow16 | VectorNarrow32 | VectorNarrow64 |
-            VectorNot |
-            VectorCountLeadingZeros8 | VectorCountLeadingZeros16 | VectorCountLeadingZeros32 |
-            VectorPopulationCount | VectorReverseBits |
-            VectorReverseElementsInHalfGroups8 |
-            VectorReverseElementsInWordGroups8 | VectorReverseElementsInWordGroups16 |
-            VectorReverseElementsInLongGroups8 | VectorReverseElementsInLongGroups16 | VectorReverseElementsInLongGroups32 |
-            VectorReduceAdd8 | VectorReduceAdd16 | VectorReduceAdd32 | VectorReduceAdd64 |
-            VectorPairedAddSignedWiden8 | VectorPairedAddSignedWiden16 | VectorPairedAddSignedWiden32 |
-            VectorPairedAddUnsignedWiden8 | VectorPairedAddUnsignedWiden16 | VectorPairedAddUnsignedWiden32 |
-            VectorSignExtend8 | VectorSignExtend16 | VectorSignExtend32 | VectorSignExtend64 |
-            VectorZeroExtend8 | VectorZeroExtend16 | VectorZeroExtend32 | VectorZeroExtend64 |
-            VectorZeroUpper |
-            VectorUnsignedRecipEstimate | VectorUnsignedRecipSqrtEstimate |
-            VectorSignedSaturatedAbs8 | VectorSignedSaturatedAbs16 | VectorSignedSaturatedAbs32 | VectorSignedSaturatedAbs64 |
-            VectorSignedSaturatedNeg8 | VectorSignedSaturatedNeg16 | VectorSignedSaturatedNeg32 | VectorSignedSaturatedNeg64 |
-            VectorSignedSaturatedNarrowToSigned16 | VectorSignedSaturatedNarrowToSigned32 | VectorSignedSaturatedNarrowToSigned64 |
-            VectorSignedSaturatedNarrowToUnsigned16 | VectorSignedSaturatedNarrowToUnsigned32 | VectorSignedSaturatedNarrowToUnsigned64 |
-            VectorUnsignedSaturatedNarrow16 | VectorUnsignedSaturatedNarrow32 | VectorUnsignedSaturatedNarrow64
-                => OpcodeInfo { ret: U128, args: &[U128] },
+            VectorAbs8
+            | VectorAbs16
+            | VectorAbs32
+            | VectorAbs64
+            | VectorNarrow16
+            | VectorNarrow32
+            | VectorNarrow64
+            | VectorNot
+            | VectorCountLeadingZeros8
+            | VectorCountLeadingZeros16
+            | VectorCountLeadingZeros32
+            | VectorPopulationCount
+            | VectorReverseBits
+            | VectorReverseElementsInHalfGroups8
+            | VectorReverseElementsInWordGroups8
+            | VectorReverseElementsInWordGroups16
+            | VectorReverseElementsInLongGroups8
+            | VectorReverseElementsInLongGroups16
+            | VectorReverseElementsInLongGroups32
+            | VectorReduceAdd8
+            | VectorReduceAdd16
+            | VectorReduceAdd32
+            | VectorReduceAdd64
+            | VectorPairedAddSignedWiden8
+            | VectorPairedAddSignedWiden16
+            | VectorPairedAddSignedWiden32
+            | VectorPairedAddUnsignedWiden8
+            | VectorPairedAddUnsignedWiden16
+            | VectorPairedAddUnsignedWiden32
+            | VectorSignExtend8
+            | VectorSignExtend16
+            | VectorSignExtend32
+            | VectorSignExtend64
+            | VectorZeroExtend8
+            | VectorZeroExtend16
+            | VectorZeroExtend32
+            | VectorZeroExtend64
+            | VectorZeroUpper
+            | VectorUnsignedRecipEstimate
+            | VectorUnsignedRecipSqrtEstimate
+            | VectorSignedSaturatedAbs8
+            | VectorSignedSaturatedAbs16
+            | VectorSignedSaturatedAbs32
+            | VectorSignedSaturatedAbs64
+            | VectorSignedSaturatedNeg8
+            | VectorSignedSaturatedNeg16
+            | VectorSignedSaturatedNeg32
+            | VectorSignedSaturatedNeg64
+            | VectorSignedSaturatedNarrowToSigned16
+            | VectorSignedSaturatedNarrowToSigned32
+            | VectorSignedSaturatedNarrowToSigned64
+            | VectorSignedSaturatedNarrowToUnsigned16
+            | VectorSignedSaturatedNarrowToUnsigned32
+            | VectorSignedSaturatedNarrowToUnsigned64
+            | VectorUnsignedSaturatedNarrow16
+            | VectorUnsignedSaturatedNarrow32
+            | VectorUnsignedSaturatedNarrow64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128],
+            },
 
-            ZeroVector => OpcodeInfo { ret: U128, args: &[] },
+            ZeroVector => OpcodeInfo {
+                ret: U128,
+                args: &[],
+            },
 
-            VectorSignedMultiply16 | VectorSignedMultiply32 |
-            VectorUnsignedMultiply16 | VectorUnsignedMultiply32
-                => OpcodeInfo { ret: V, args: &[U128, U128] },
+            VectorSignedMultiply16
+            | VectorSignedMultiply32
+            | VectorUnsignedMultiply16
+            | VectorUnsignedMultiply32 => OpcodeInfo {
+                ret: V,
+                args: &[U128, U128],
+            },
 
             // Binary vector -> vector ops
-            VectorAdd8 | VectorAdd16 | VectorAdd32 | VectorAdd64 |
-            VectorSub8 | VectorSub16 | VectorSub32 | VectorSub64 |
-            VectorMultiply8 | VectorMultiply16 | VectorMultiply32 | VectorMultiply64 |
-            VectorMultiplySignedWiden8 | VectorMultiplySignedWiden16 | VectorMultiplySignedWiden32 |
-            VectorMultiplyUnsignedWiden8 | VectorMultiplyUnsignedWiden16 | VectorMultiplyUnsignedWiden32 |
-            VectorAnd | VectorAndNot | VectorEor | VectorOr |
-            VectorEqual8 | VectorEqual16 | VectorEqual32 | VectorEqual64 | VectorEqual128 |
-            VectorGreaterS8 | VectorGreaterS16 | VectorGreaterS32 | VectorGreaterS64 |
-            VectorHalvingAddS8 | VectorHalvingAddS16 | VectorHalvingAddS32 |
-            VectorHalvingAddU8 | VectorHalvingAddU16 | VectorHalvingAddU32 |
-            VectorHalvingSubS8 | VectorHalvingSubS16 | VectorHalvingSubS32 |
-            VectorHalvingSubU8 | VectorHalvingSubU16 | VectorHalvingSubU32 |
-            VectorMaxS8 | VectorMaxS16 | VectorMaxS32 | VectorMaxS64 |
-            VectorMaxU8 | VectorMaxU16 | VectorMaxU32 | VectorMaxU64 |
-            VectorMinS8 | VectorMinS16 | VectorMinS32 | VectorMinS64 |
-            VectorMinU8 | VectorMinU16 | VectorMinU32 | VectorMinU64 |
-            VectorPairedAdd8 | VectorPairedAdd16 | VectorPairedAdd32 | VectorPairedAdd64 |
-            VectorPairedAddLower8 | VectorPairedAddLower16 | VectorPairedAddLower32 |
-            VectorPairedMaxS8 | VectorPairedMaxS16 | VectorPairedMaxS32 |
-            VectorPairedMaxU8 | VectorPairedMaxU16 | VectorPairedMaxU32 |
-            VectorPairedMaxLowerS8 | VectorPairedMaxLowerS16 | VectorPairedMaxLowerS32 |
-            VectorPairedMaxLowerU8 | VectorPairedMaxLowerU16 | VectorPairedMaxLowerU32 |
-            VectorPairedMinS8 | VectorPairedMinS16 | VectorPairedMinS32 |
-            VectorPairedMinU8 | VectorPairedMinU16 | VectorPairedMinU32 |
-            VectorPairedMinLowerS8 | VectorPairedMinLowerS16 | VectorPairedMinLowerS32 |
-            VectorPairedMinLowerU8 | VectorPairedMinLowerU16 | VectorPairedMinLowerU32 |
-            VectorPolynomialMultiply8 | VectorPolynomialMultiplyLong8 | VectorPolynomialMultiplyLong64 |
-            VectorRoundingHalvingAddS8 | VectorRoundingHalvingAddS16 | VectorRoundingHalvingAddS32 |
-            VectorRoundingHalvingAddU8 | VectorRoundingHalvingAddU16 | VectorRoundingHalvingAddU32 |
-            VectorRoundingShiftLeftS8 | VectorRoundingShiftLeftS16 | VectorRoundingShiftLeftS32 | VectorRoundingShiftLeftS64 |
-            VectorRoundingShiftLeftU8 | VectorRoundingShiftLeftU16 | VectorRoundingShiftLeftU32 | VectorRoundingShiftLeftU64 |
-            VectorSignedAbsoluteDifference8 | VectorSignedAbsoluteDifference16 | VectorSignedAbsoluteDifference32 |
-            VectorUnsignedAbsoluteDifference8 | VectorUnsignedAbsoluteDifference16 | VectorUnsignedAbsoluteDifference32
-                => OpcodeInfo { ret: U128, args: &[U128, U128] },
+            VectorAdd8
+            | VectorAdd16
+            | VectorAdd32
+            | VectorAdd64
+            | VectorSub8
+            | VectorSub16
+            | VectorSub32
+            | VectorSub64
+            | VectorMultiply8
+            | VectorMultiply16
+            | VectorMultiply32
+            | VectorMultiply64
+            | VectorMultiplySignedWiden8
+            | VectorMultiplySignedWiden16
+            | VectorMultiplySignedWiden32
+            | VectorMultiplyUnsignedWiden8
+            | VectorMultiplyUnsignedWiden16
+            | VectorMultiplyUnsignedWiden32
+            | VectorAnd
+            | VectorAndNot
+            | VectorEor
+            | VectorOr
+            | VectorEqual8
+            | VectorEqual16
+            | VectorEqual32
+            | VectorEqual64
+            | VectorEqual128
+            | VectorGreaterS8
+            | VectorGreaterS16
+            | VectorGreaterS32
+            | VectorGreaterS64
+            | VectorHalvingAddS8
+            | VectorHalvingAddS16
+            | VectorHalvingAddS32
+            | VectorHalvingAddU8
+            | VectorHalvingAddU16
+            | VectorHalvingAddU32
+            | VectorHalvingSubS8
+            | VectorHalvingSubS16
+            | VectorHalvingSubS32
+            | VectorHalvingSubU8
+            | VectorHalvingSubU16
+            | VectorHalvingSubU32
+            | VectorMaxS8
+            | VectorMaxS16
+            | VectorMaxS32
+            | VectorMaxS64
+            | VectorMaxU8
+            | VectorMaxU16
+            | VectorMaxU32
+            | VectorMaxU64
+            | VectorMinS8
+            | VectorMinS16
+            | VectorMinS32
+            | VectorMinS64
+            | VectorMinU8
+            | VectorMinU16
+            | VectorMinU32
+            | VectorMinU64
+            | VectorPairedAdd8
+            | VectorPairedAdd16
+            | VectorPairedAdd32
+            | VectorPairedAdd64
+            | VectorPairedAddLower8
+            | VectorPairedAddLower16
+            | VectorPairedAddLower32
+            | VectorPairedMaxS8
+            | VectorPairedMaxS16
+            | VectorPairedMaxS32
+            | VectorPairedMaxU8
+            | VectorPairedMaxU16
+            | VectorPairedMaxU32
+            | VectorPairedMaxLowerS8
+            | VectorPairedMaxLowerS16
+            | VectorPairedMaxLowerS32
+            | VectorPairedMaxLowerU8
+            | VectorPairedMaxLowerU16
+            | VectorPairedMaxLowerU32
+            | VectorPairedMinS8
+            | VectorPairedMinS16
+            | VectorPairedMinS32
+            | VectorPairedMinU8
+            | VectorPairedMinU16
+            | VectorPairedMinU32
+            | VectorPairedMinLowerS8
+            | VectorPairedMinLowerS16
+            | VectorPairedMinLowerS32
+            | VectorPairedMinLowerU8
+            | VectorPairedMinLowerU16
+            | VectorPairedMinLowerU32
+            | VectorPolynomialMultiply8
+            | VectorPolynomialMultiplyLong8
+            | VectorPolynomialMultiplyLong64
+            | VectorRoundingHalvingAddS8
+            | VectorRoundingHalvingAddS16
+            | VectorRoundingHalvingAddS32
+            | VectorRoundingHalvingAddU8
+            | VectorRoundingHalvingAddU16
+            | VectorRoundingHalvingAddU32
+            | VectorRoundingShiftLeftS8
+            | VectorRoundingShiftLeftS16
+            | VectorRoundingShiftLeftS32
+            | VectorRoundingShiftLeftS64
+            | VectorRoundingShiftLeftU8
+            | VectorRoundingShiftLeftU16
+            | VectorRoundingShiftLeftU32
+            | VectorRoundingShiftLeftU64
+            | VectorSignedAbsoluteDifference8
+            | VectorSignedAbsoluteDifference16
+            | VectorSignedAbsoluteDifference32
+            | VectorUnsignedAbsoluteDifference8
+            | VectorUnsignedAbsoluteDifference16
+            | VectorUnsignedAbsoluteDifference32 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128],
+            },
 
             // Vector shifts: the non-V (scalar) forms take an immediate U8
             // shift amount. Upstream `opcodes.inc` signature:
             // `OPCODE(VectorLogicalShiftLeft32, U128, U128, U8)`.
-            VectorArithmeticShiftRight8 | VectorArithmeticShiftRight16 | VectorArithmeticShiftRight32 | VectorArithmeticShiftRight64 |
-            VectorLogicalShiftLeft8 | VectorLogicalShiftLeft16 | VectorLogicalShiftLeft32 | VectorLogicalShiftLeft64 |
-            VectorLogicalShiftRight8 | VectorLogicalShiftRight16 | VectorLogicalShiftRight32 | VectorLogicalShiftRight64 |
-            VectorSignedSaturatedShiftLeftUnsigned8 | VectorSignedSaturatedShiftLeftUnsigned16 | VectorSignedSaturatedShiftLeftUnsigned32 | VectorSignedSaturatedShiftLeftUnsigned64
-                => OpcodeInfo { ret: U128, args: &[U128, U8] },
+            VectorArithmeticShiftRight8
+            | VectorArithmeticShiftRight16
+            | VectorArithmeticShiftRight32
+            | VectorArithmeticShiftRight64
+            | VectorLogicalShiftLeft8
+            | VectorLogicalShiftLeft16
+            | VectorLogicalShiftLeft32
+            | VectorLogicalShiftLeft64
+            | VectorLogicalShiftRight8
+            | VectorLogicalShiftRight16
+            | VectorLogicalShiftRight32
+            | VectorLogicalShiftRight64
+            | VectorSignedSaturatedShiftLeftUnsigned8
+            | VectorSignedSaturatedShiftLeftUnsigned16
+            | VectorSignedSaturatedShiftLeftUnsigned32
+            | VectorSignedSaturatedShiftLeftUnsigned64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8],
+            },
 
             // Vector-by-vector ops (both operands are U128 lanes). Upstream's
             // VShift variants + the vector-by-vector saturating / rounding
             // shifts all carry `U128, U128` operands.
-            VectorArithmeticVShift8 | VectorArithmeticVShift16 | VectorArithmeticVShift32 | VectorArithmeticVShift64 |
-            VectorLogicalVShift8 | VectorLogicalVShift16 | VectorLogicalVShift32 | VectorLogicalVShift64 |
-            VectorSignedSaturatedAccumulateUnsigned8 | VectorSignedSaturatedAccumulateUnsigned16 |
-            VectorSignedSaturatedAccumulateUnsigned32 | VectorSignedSaturatedAccumulateUnsigned64 |
-            VectorSignedSaturatedAdd8 | VectorSignedSaturatedAdd16 | VectorSignedSaturatedAdd32 | VectorSignedSaturatedAdd64 |
-            VectorSignedSaturatedDoublingMultiplyHigh16 | VectorSignedSaturatedDoublingMultiplyHigh32 |
-            VectorSignedSaturatedDoublingMultiplyHighRounding16 | VectorSignedSaturatedDoublingMultiplyHighRounding32 |
-            VectorSignedSaturatedDoublingMultiplyLong16 | VectorSignedSaturatedDoublingMultiplyLong32 |
-            VectorSignedSaturatedShiftLeft8 | VectorSignedSaturatedShiftLeft16 | VectorSignedSaturatedShiftLeft32 | VectorSignedSaturatedShiftLeft64 |
-            VectorSignedSaturatedSub8 | VectorSignedSaturatedSub16 | VectorSignedSaturatedSub32 | VectorSignedSaturatedSub64 |
-            VectorUnsignedSaturatedAccumulateSigned8 | VectorUnsignedSaturatedAccumulateSigned16 |
-            VectorUnsignedSaturatedAccumulateSigned32 | VectorUnsignedSaturatedAccumulateSigned64 |
-            VectorUnsignedSaturatedAdd8 | VectorUnsignedSaturatedAdd16 | VectorUnsignedSaturatedAdd32 | VectorUnsignedSaturatedAdd64 |
-            VectorUnsignedSaturatedShiftLeft8 | VectorUnsignedSaturatedShiftLeft16 | VectorUnsignedSaturatedShiftLeft32 | VectorUnsignedSaturatedShiftLeft64 |
-            VectorUnsignedSaturatedSub8 | VectorUnsignedSaturatedSub16 | VectorUnsignedSaturatedSub32 | VectorUnsignedSaturatedSub64 |
-            VectorInterleaveLower8 | VectorInterleaveLower16 | VectorInterleaveLower32 | VectorInterleaveLower64 |
-            VectorInterleaveUpper8 | VectorInterleaveUpper16 | VectorInterleaveUpper32 | VectorInterleaveUpper64 |
-            VectorDeinterleaveEven8 | VectorDeinterleaveEven16 | VectorDeinterleaveEven32 | VectorDeinterleaveEven64 |
-            VectorDeinterleaveEvenLower8 | VectorDeinterleaveEvenLower16 | VectorDeinterleaveEvenLower32 |
-            VectorDeinterleaveOdd8 | VectorDeinterleaveOdd16 | VectorDeinterleaveOdd32 | VectorDeinterleaveOdd64 |
-            VectorDeinterleaveOddLower8 | VectorDeinterleaveOddLower16 | VectorDeinterleaveOddLower32
-                => OpcodeInfo { ret: U128, args: &[U128, U128] },
+            VectorArithmeticVShift8
+            | VectorArithmeticVShift16
+            | VectorArithmeticVShift32
+            | VectorArithmeticVShift64
+            | VectorLogicalVShift8
+            | VectorLogicalVShift16
+            | VectorLogicalVShift32
+            | VectorLogicalVShift64
+            | VectorSignedSaturatedAccumulateUnsigned8
+            | VectorSignedSaturatedAccumulateUnsigned16
+            | VectorSignedSaturatedAccumulateUnsigned32
+            | VectorSignedSaturatedAccumulateUnsigned64
+            | VectorSignedSaturatedAdd8
+            | VectorSignedSaturatedAdd16
+            | VectorSignedSaturatedAdd32
+            | VectorSignedSaturatedAdd64
+            | VectorSignedSaturatedDoublingMultiplyHigh16
+            | VectorSignedSaturatedDoublingMultiplyHigh32
+            | VectorSignedSaturatedDoublingMultiplyHighRounding16
+            | VectorSignedSaturatedDoublingMultiplyHighRounding32
+            | VectorSignedSaturatedDoublingMultiplyLong16
+            | VectorSignedSaturatedDoublingMultiplyLong32
+            | VectorSignedSaturatedShiftLeft8
+            | VectorSignedSaturatedShiftLeft16
+            | VectorSignedSaturatedShiftLeft32
+            | VectorSignedSaturatedShiftLeft64
+            | VectorSignedSaturatedSub8
+            | VectorSignedSaturatedSub16
+            | VectorSignedSaturatedSub32
+            | VectorSignedSaturatedSub64
+            | VectorUnsignedSaturatedAccumulateSigned8
+            | VectorUnsignedSaturatedAccumulateSigned16
+            | VectorUnsignedSaturatedAccumulateSigned32
+            | VectorUnsignedSaturatedAccumulateSigned64
+            | VectorUnsignedSaturatedAdd8
+            | VectorUnsignedSaturatedAdd16
+            | VectorUnsignedSaturatedAdd32
+            | VectorUnsignedSaturatedAdd64
+            | VectorUnsignedSaturatedShiftLeft8
+            | VectorUnsignedSaturatedShiftLeft16
+            | VectorUnsignedSaturatedShiftLeft32
+            | VectorUnsignedSaturatedShiftLeft64
+            | VectorUnsignedSaturatedSub8
+            | VectorUnsignedSaturatedSub16
+            | VectorUnsignedSaturatedSub32
+            | VectorUnsignedSaturatedSub64
+            | VectorInterleaveLower8
+            | VectorInterleaveLower16
+            | VectorInterleaveLower32
+            | VectorInterleaveLower64
+            | VectorInterleaveUpper8
+            | VectorInterleaveUpper16
+            | VectorInterleaveUpper32
+            | VectorInterleaveUpper64
+            | VectorDeinterleaveEven8
+            | VectorDeinterleaveEven16
+            | VectorDeinterleaveEven32
+            | VectorDeinterleaveEven64
+            | VectorDeinterleaveEvenLower8
+            | VectorDeinterleaveEvenLower16
+            | VectorDeinterleaveEvenLower32
+            | VectorDeinterleaveOdd8
+            | VectorDeinterleaveOdd16
+            | VectorDeinterleaveOdd32
+            | VectorDeinterleaveOdd64
+            | VectorDeinterleaveOddLower8
+            | VectorDeinterleaveOddLower16
+            | VectorDeinterleaveOddLower32 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128],
+            },
             // VectorTranspose: upstream takes (U128, U128, U1) where U1 selects even/odd part
-            VectorTranspose8 | VectorTranspose16 | VectorTranspose32 | VectorTranspose64
-                => OpcodeInfo { ret: U128, args: &[U128, U128, U1] },
+            VectorTranspose8 | VectorTranspose16 | VectorTranspose32 | VectorTranspose64 => {
+                OpcodeInfo {
+                    ret: U128,
+                    args: &[U128, U128, U1],
+                }
+            }
 
             // Vector broadcast: each takes the scalar type matching its element size.
             // Upstream: VectorBroadcast8 takes U8, VectorBroadcast16 takes U16, etc.
-            VectorBroadcastLower8 | VectorBroadcast8
-                => OpcodeInfo { ret: U128, args: &[U8] },
-            VectorBroadcastLower16 | VectorBroadcast16
-                => OpcodeInfo { ret: U128, args: &[U16] },
-            VectorBroadcastLower32 | VectorBroadcast32
-                => OpcodeInfo { ret: U128, args: &[U32] },
-            VectorBroadcast64
-                => OpcodeInfo { ret: U128, args: &[U64] },
-            VectorBroadcastElementLower8 | VectorBroadcastElementLower16 |
-            VectorBroadcastElementLower32 | VectorBroadcastElement8 |
-            VectorBroadcastElement16 | VectorBroadcastElement32 |
-            VectorBroadcastElement64
-                => OpcodeInfo { ret: U128, args: &[U128, U8] },
+            VectorBroadcastLower8 | VectorBroadcast8 => OpcodeInfo {
+                ret: U128,
+                args: &[U8],
+            },
+            VectorBroadcastLower16 | VectorBroadcast16 => OpcodeInfo {
+                ret: U128,
+                args: &[U16],
+            },
+            VectorBroadcastLower32 | VectorBroadcast32 => OpcodeInfo {
+                ret: U128,
+                args: &[U32],
+            },
+            VectorBroadcast64 => OpcodeInfo {
+                ret: U128,
+                args: &[U64],
+            },
+            VectorBroadcastElementLower8
+            | VectorBroadcastElementLower16
+            | VectorBroadcastElementLower32
+            | VectorBroadcastElement8
+            | VectorBroadcastElement16
+            | VectorBroadcastElement32
+            | VectorBroadcastElement64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8],
+            },
 
             // Vector extract
-            VectorExtract => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
-            VectorExtractLower => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
-            VectorRotateWholeVectorRight => OpcodeInfo { ret: U128, args: &[U128, U8] },
+            VectorExtract => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128, U8],
+            },
+            VectorExtractLower => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128, U8],
+            },
+            VectorRotateWholeVectorRight => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8],
+            },
 
             // Vector table lookup
-            VectorTable => OpcodeInfo { ret: Type::Table, args: &[OPQ, OPQ, OPQ, OPQ] },
-            VectorTableLookup64 => OpcodeInfo { ret: U64, args: &[U64, Type::Table, U64] },
-            VectorTableLookup128 => OpcodeInfo { ret: U128, args: &[U128, Type::Table, U128] },
+            VectorTable => OpcodeInfo {
+                ret: Type::Table,
+                args: &[OPQ, OPQ, OPQ, OPQ],
+            },
+            VectorTableLookup64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, Type::Table, U64],
+            },
+            VectorTableLookup128 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, Type::Table, U128],
+            },
 
             // FP scalar - unary
-            FPAbs16 => OpcodeInfo { ret: U16, args: &[U16] },
-            FPAbs32 => OpcodeInfo { ret: U32, args: &[U32] },
-            FPAbs64 => OpcodeInfo { ret: U64, args: &[U64] },
-            FPNeg16 => OpcodeInfo { ret: U16, args: &[U16] },
-            FPNeg32 => OpcodeInfo { ret: U32, args: &[U32] },
-            FPNeg64 => OpcodeInfo { ret: U64, args: &[U64] },
-            FPSqrt32 => OpcodeInfo { ret: U32, args: &[U32] },
-            FPSqrt64 => OpcodeInfo { ret: U64, args: &[U64] },
-            FPRecipEstimate16 => OpcodeInfo { ret: U16, args: &[U16] },
-            FPRecipEstimate32 => OpcodeInfo { ret: U32, args: &[U32] },
-            FPRecipEstimate64 => OpcodeInfo { ret: U64, args: &[U64] },
-            FPRecipExponent16 => OpcodeInfo { ret: U16, args: &[U16] },
-            FPRecipExponent32 => OpcodeInfo { ret: U32, args: &[U32] },
-            FPRecipExponent64 => OpcodeInfo { ret: U64, args: &[U64] },
-            FPRSqrtEstimate16 => OpcodeInfo { ret: U16, args: &[U16] },
-            FPRSqrtEstimate32 => OpcodeInfo { ret: U32, args: &[U32] },
-            FPRSqrtEstimate64 => OpcodeInfo { ret: U64, args: &[U64] },
+            FPAbs16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16],
+            },
+            FPAbs32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            FPAbs64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
+            FPNeg16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16],
+            },
+            FPNeg32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            FPNeg64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
+            FPSqrt32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            FPSqrt64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
+            FPRecipEstimate16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16],
+            },
+            FPRecipEstimate32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            FPRecipEstimate64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
+            FPRecipExponent16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16],
+            },
+            FPRecipExponent32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            FPRecipExponent64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
+            FPRSqrtEstimate16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16],
+            },
+            FPRSqrtEstimate32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32],
+            },
+            FPRSqrtEstimate64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64],
+            },
 
             // FP scalar - binary
-            FPAdd32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPAdd64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPDiv32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPDiv64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPMax32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPMax64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPMaxNumeric32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPMaxNumeric64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPMin32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPMin64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPMinNumeric32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPMinNumeric64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPMul32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPMul64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPMulX32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPMulX64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPSub32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPSub64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPRecipStepFused16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            FPRecipStepFused32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPRecipStepFused64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
-            FPRSqrtStepFused16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
-            FPRSqrtStepFused32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
-            FPRSqrtStepFused64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
+            FPAdd32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPAdd64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPDiv32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPDiv64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPMax32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPMax64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPMaxNumeric32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPMaxNumeric64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPMin32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPMin64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPMinNumeric32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPMinNumeric64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPMul32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPMul64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPMulX32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPMulX64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPSub32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPSub64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPRecipStepFused16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            FPRecipStepFused32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPRecipStepFused64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
+            FPRSqrtStepFused16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16],
+            },
+            FPRSqrtStepFused32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32],
+            },
+            FPRSqrtStepFused64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64],
+            },
 
             // FP compare (returns NZCV)
-            FPCompare32 => OpcodeInfo { ret: NZCV, args: &[U32, U32, U1] },
-            FPCompare64 => OpcodeInfo { ret: NZCV, args: &[U64, U64, U1] },
+            FPCompare32 => OpcodeInfo {
+                ret: NZCV,
+                args: &[U32, U32, U1],
+            },
+            FPCompare64 => OpcodeInfo {
+                ret: NZCV,
+                args: &[U64, U64, U1],
+            },
 
             // FP ternary (fused multiply-add/sub)
-            FPMulAdd16 => OpcodeInfo { ret: U16, args: &[U16, U16, U16] },
-            FPMulAdd32 => OpcodeInfo { ret: U32, args: &[U32, U32, U32] },
-            FPMulAdd64 => OpcodeInfo { ret: U64, args: &[U64, U64, U64] },
-            FPMulSub16 => OpcodeInfo { ret: U16, args: &[U16, U16, U16] },
-            FPMulSub32 => OpcodeInfo { ret: U32, args: &[U32, U32, U32] },
-            FPMulSub64 => OpcodeInfo { ret: U64, args: &[U64, U64, U64] },
+            FPMulAdd16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16, U16],
+            },
+            FPMulAdd32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32, U32],
+            },
+            FPMulAdd64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, U64],
+            },
+            FPMulSub16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U16, U16],
+            },
+            FPMulSub32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U32, U32],
+            },
+            FPMulSub64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, U64],
+            },
 
             // FP rounding
-            FPRoundInt16 => OpcodeInfo { ret: U16, args: &[U16, U8, U1] },
-            FPRoundInt32 => OpcodeInfo { ret: U32, args: &[U32, U8, U1] },
-            FPRoundInt64 => OpcodeInfo { ret: U64, args: &[U64, U8, U1] },
+            FPRoundInt16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U8, U1],
+            },
+            FPRoundInt32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U1],
+            },
+            FPRoundInt64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8, U1],
+            },
 
             // FP conversions (2 args: value + rounding)
-            FPHalfToDouble => OpcodeInfo { ret: U64, args: &[U16, U8] },
-            FPHalfToSingle => OpcodeInfo { ret: U32, args: &[U16, U8] },
-            FPSingleToDouble => OpcodeInfo { ret: U64, args: &[U32, U8] },
-            FPSingleToHalf => OpcodeInfo { ret: U16, args: &[U32, U8] },
-            FPDoubleToHalf => OpcodeInfo { ret: U16, args: &[U64, U8] },
-            FPDoubleToSingle => OpcodeInfo { ret: U32, args: &[U64, U8] },
+            FPHalfToDouble => OpcodeInfo {
+                ret: U64,
+                args: &[U16, U8],
+            },
+            FPHalfToSingle => OpcodeInfo {
+                ret: U32,
+                args: &[U16, U8],
+            },
+            FPSingleToDouble => OpcodeInfo {
+                ret: U64,
+                args: &[U32, U8],
+            },
+            FPSingleToHalf => OpcodeInfo {
+                ret: U16,
+                args: &[U32, U8],
+            },
+            FPDoubleToHalf => OpcodeInfo {
+                ret: U16,
+                args: &[U64, U8],
+            },
+            FPDoubleToSingle => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U8],
+            },
 
             // FP to fixed-point (3 args: value, fbits, rounding)
-            FPDoubleToFixedS16 | FPDoubleToFixedU16 => OpcodeInfo { ret: U16, args: &[U64, U8, U8] },
-            FPDoubleToFixedS32 | FPDoubleToFixedU32 => OpcodeInfo { ret: U32, args: &[U64, U8, U8] },
-            FPDoubleToFixedS64 | FPDoubleToFixedU64 => OpcodeInfo { ret: U64, args: &[U64, U8, U8] },
-            FPHalfToFixedS16 | FPHalfToFixedU16 => OpcodeInfo { ret: U16, args: &[U16, U8, U8] },
-            FPHalfToFixedS32 | FPHalfToFixedU32 => OpcodeInfo { ret: U32, args: &[U16, U8, U8] },
-            FPHalfToFixedS64 | FPHalfToFixedU64 => OpcodeInfo { ret: U64, args: &[U16, U8, U8] },
-            FPSingleToFixedS16 | FPSingleToFixedU16 => OpcodeInfo { ret: U16, args: &[U32, U8, U8] },
-            FPSingleToFixedS32 | FPSingleToFixedU32 => OpcodeInfo { ret: U32, args: &[U32, U8, U8] },
-            FPSingleToFixedS64 | FPSingleToFixedU64 => OpcodeInfo { ret: U64, args: &[U32, U8, U8] },
+            FPDoubleToFixedS16 | FPDoubleToFixedU16 => OpcodeInfo {
+                ret: U16,
+                args: &[U64, U8, U8],
+            },
+            FPDoubleToFixedS32 | FPDoubleToFixedU32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U8, U8],
+            },
+            FPDoubleToFixedS64 | FPDoubleToFixedU64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8, U8],
+            },
+            FPHalfToFixedS16 | FPHalfToFixedU16 => OpcodeInfo {
+                ret: U16,
+                args: &[U16, U8, U8],
+            },
+            FPHalfToFixedS32 | FPHalfToFixedU32 => OpcodeInfo {
+                ret: U32,
+                args: &[U16, U8, U8],
+            },
+            FPHalfToFixedS64 | FPHalfToFixedU64 => OpcodeInfo {
+                ret: U64,
+                args: &[U16, U8, U8],
+            },
+            FPSingleToFixedS16 | FPSingleToFixedU16 => OpcodeInfo {
+                ret: U16,
+                args: &[U32, U8, U8],
+            },
+            FPSingleToFixedS32 | FPSingleToFixedU32 => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U8],
+            },
+            FPSingleToFixedS64 | FPSingleToFixedU64 => OpcodeInfo {
+                ret: U64,
+                args: &[U32, U8, U8],
+            },
 
             // Fixed-point to FP
-            FPFixedU16ToSingle | FPFixedS16ToSingle => OpcodeInfo { ret: U32, args: &[U16, U8, U8] },
-            FPFixedU16ToDouble | FPFixedS16ToDouble => OpcodeInfo { ret: U64, args: &[U16, U8, U8] },
-            FPFixedU32ToSingle | FPFixedS32ToSingle => OpcodeInfo { ret: U32, args: &[U32, U8, U8] },
-            FPFixedU32ToDouble | FPFixedS32ToDouble => OpcodeInfo { ret: U64, args: &[U32, U8, U8] },
-            FPFixedU64ToDouble | FPFixedS64ToDouble => OpcodeInfo { ret: U64, args: &[U64, U8, U8] },
-            FPFixedU64ToSingle | FPFixedS64ToSingle => OpcodeInfo { ret: U32, args: &[U64, U8, U8] },
+            FPFixedU16ToSingle | FPFixedS16ToSingle => OpcodeInfo {
+                ret: U32,
+                args: &[U16, U8, U8],
+            },
+            FPFixedU16ToDouble | FPFixedS16ToDouble => OpcodeInfo {
+                ret: U64,
+                args: &[U16, U8, U8],
+            },
+            FPFixedU32ToSingle | FPFixedS32ToSingle => OpcodeInfo {
+                ret: U32,
+                args: &[U32, U8, U8],
+            },
+            FPFixedU32ToDouble | FPFixedS32ToDouble => OpcodeInfo {
+                ret: U64,
+                args: &[U32, U8, U8],
+            },
+            FPFixedU64ToDouble | FPFixedS64ToDouble => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U8, U8],
+            },
+            FPFixedU64ToSingle | FPFixedS64ToSingle => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U8, U8],
+            },
 
             // FP vector unary
-            FPVectorAbs16 | FPVectorAbs32 | FPVectorAbs64 |
-            FPVectorNeg16 | FPVectorNeg32 | FPVectorNeg64
-                => OpcodeInfo { ret: U128, args: &[U128] },
+            FPVectorAbs16 | FPVectorAbs32 | FPVectorAbs64 | FPVectorNeg16 | FPVectorNeg32
+            | FPVectorNeg64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128],
+            },
 
             // FP vector binary (with fpcr_controlled flag)
-            FPVectorAdd32 | FPVectorAdd64 |
-            FPVectorDiv32 | FPVectorDiv64 |
-            FPVectorEqual16 | FPVectorEqual32 | FPVectorEqual64 |
-            FPVectorGreater32 | FPVectorGreater64 |
-            FPVectorGreaterEqual32 | FPVectorGreaterEqual64 |
-            FPVectorMax32 | FPVectorMax64 |
-            FPVectorMaxNumeric32 | FPVectorMaxNumeric64 |
-            FPVectorMin32 | FPVectorMin64 |
-            FPVectorMinNumeric32 | FPVectorMinNumeric64 |
-            FPVectorMul32 | FPVectorMul64 |
-            FPVectorMulX32 | FPVectorMulX64 |
-            FPVectorPairedAdd32 | FPVectorPairedAdd64 |
-            FPVectorPairedAddLower32 | FPVectorPairedAddLower64 |
-            FPVectorRecipStepFused16 | FPVectorRecipStepFused32 | FPVectorRecipStepFused64 |
-            FPVectorRSqrtStepFused16 | FPVectorRSqrtStepFused32 | FPVectorRSqrtStepFused64 |
-            FPVectorSub32 | FPVectorSub64
-                => OpcodeInfo { ret: U128, args: &[U128, U128, U1] },
+            FPVectorAdd32
+            | FPVectorAdd64
+            | FPVectorDiv32
+            | FPVectorDiv64
+            | FPVectorEqual16
+            | FPVectorEqual32
+            | FPVectorEqual64
+            | FPVectorGreater32
+            | FPVectorGreater64
+            | FPVectorGreaterEqual32
+            | FPVectorGreaterEqual64
+            | FPVectorMax32
+            | FPVectorMax64
+            | FPVectorMaxNumeric32
+            | FPVectorMaxNumeric64
+            | FPVectorMin32
+            | FPVectorMin64
+            | FPVectorMinNumeric32
+            | FPVectorMinNumeric64
+            | FPVectorMul32
+            | FPVectorMul64
+            | FPVectorMulX32
+            | FPVectorMulX64
+            | FPVectorPairedAdd32
+            | FPVectorPairedAdd64
+            | FPVectorPairedAddLower32
+            | FPVectorPairedAddLower64
+            | FPVectorRecipStepFused16
+            | FPVectorRecipStepFused32
+            | FPVectorRecipStepFused64
+            | FPVectorRSqrtStepFused16
+            | FPVectorRSqrtStepFused32
+            | FPVectorRSqrtStepFused64
+            | FPVectorSub32
+            | FPVectorSub64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128, U1],
+            },
 
-            FPVectorSqrt32 | FPVectorSqrt64 |
-            FPVectorRecipEstimate16 | FPVectorRecipEstimate32 | FPVectorRecipEstimate64 |
-            FPVectorRSqrtEstimate16 | FPVectorRSqrtEstimate32 | FPVectorRSqrtEstimate64
-                => OpcodeInfo { ret: U128, args: &[U128, U1] },
+            FPVectorSqrt32
+            | FPVectorSqrt64
+            | FPVectorRecipEstimate16
+            | FPVectorRecipEstimate32
+            | FPVectorRecipEstimate64
+            | FPVectorRSqrtEstimate16
+            | FPVectorRSqrtEstimate32
+            | FPVectorRSqrtEstimate64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U1],
+            },
 
             // FP vector conversion
-            FPVectorFromHalf32 | FPVectorToHalf32
-                => OpcodeInfo { ret: U128, args: &[U128, U8, U1] },
+            FPVectorFromHalf32 | FPVectorToHalf32 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U1],
+            },
 
-            FPVectorFromSignedFixed32 | FPVectorFromSignedFixed64 |
-            FPVectorFromUnsignedFixed32 | FPVectorFromUnsignedFixed64 |
-            FPVectorToSignedFixed16 | FPVectorToSignedFixed32 | FPVectorToSignedFixed64 |
-            FPVectorToUnsignedFixed16 | FPVectorToUnsignedFixed32 | FPVectorToUnsignedFixed64
-                => OpcodeInfo { ret: U128, args: &[U128, U8, U8, U1] },
+            FPVectorFromSignedFixed32
+            | FPVectorFromSignedFixed64
+            | FPVectorFromUnsignedFixed32
+            | FPVectorFromUnsignedFixed64
+            | FPVectorToSignedFixed16
+            | FPVectorToSignedFixed32
+            | FPVectorToSignedFixed64
+            | FPVectorToUnsignedFixed16
+            | FPVectorToUnsignedFixed32
+            | FPVectorToUnsignedFixed64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U8, U1],
+            },
 
-            FPVectorRoundInt16 | FPVectorRoundInt32 | FPVectorRoundInt64
-                => OpcodeInfo { ret: U128, args: &[U128, U8, U1, U1] },
+            FPVectorRoundInt16 | FPVectorRoundInt32 | FPVectorRoundInt64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U8, U1, U1],
+            },
 
             // FP vector fused multiply-add
-            FPVectorMulAdd16 | FPVectorMulAdd32 | FPVectorMulAdd64
-                => OpcodeInfo { ret: U128, args: &[U128, U128, U128, U1] },
+            FPVectorMulAdd16 | FPVectorMulAdd32 | FPVectorMulAdd64 => OpcodeInfo {
+                ret: U128,
+                args: &[U128, U128, U128, U1],
+            },
 
             // A64 Memory
             A64ClearExclusive => OpcodeInfo { ret: V, args: &[] },
-            A64ReadMemory8 => OpcodeInfo { ret: U8, args: &[U64, U64, ACC] },
-            A64ReadMemory16 => OpcodeInfo { ret: U16, args: &[U64, U64, ACC] },
-            A64ReadMemory32 => OpcodeInfo { ret: U32, args: &[U64, U64, ACC] },
-            A64ReadMemory64 => OpcodeInfo { ret: U64, args: &[U64, U64, ACC] },
-            A64ReadMemory128 => OpcodeInfo { ret: U128, args: &[U64, U64, ACC] },
-            A64ExclusiveReadMemory8 => OpcodeInfo { ret: U8, args: &[U64, U64, ACC] },
-            A64ExclusiveReadMemory16 => OpcodeInfo { ret: U16, args: &[U64, U64, ACC] },
-            A64ExclusiveReadMemory32 => OpcodeInfo { ret: U32, args: &[U64, U64, ACC] },
-            A64ExclusiveReadMemory64 => OpcodeInfo { ret: U64, args: &[U64, U64, ACC] },
-            A64ExclusiveReadMemory128 => OpcodeInfo { ret: U128, args: &[U64, U64, ACC] },
-            A64WriteMemory8 => OpcodeInfo { ret: V, args: &[U64, U64, U8, ACC] },
-            A64WriteMemory16 => OpcodeInfo { ret: V, args: &[U64, U64, U16, ACC] },
-            A64WriteMemory32 => OpcodeInfo { ret: V, args: &[U64, U64, U32, ACC] },
-            A64WriteMemory64 => OpcodeInfo { ret: V, args: &[U64, U64, U64, ACC] },
-            A64WriteMemory128 => OpcodeInfo { ret: V, args: &[U64, U64, U128, ACC] },
-            A64ExclusiveWriteMemory8 => OpcodeInfo { ret: U32, args: &[U64, U64, U8, ACC] },
-            A64ExclusiveWriteMemory16 => OpcodeInfo { ret: U32, args: &[U64, U64, U16, ACC] },
-            A64ExclusiveWriteMemory32 => OpcodeInfo { ret: U32, args: &[U64, U64, U32, ACC] },
-            A64ExclusiveWriteMemory64 => OpcodeInfo { ret: U32, args: &[U64, U64, U64, ACC] },
-            A64ExclusiveWriteMemory128 => OpcodeInfo { ret: U32, args: &[U64, U64, U128, ACC] },
+            A64ReadMemory8 => OpcodeInfo {
+                ret: U8,
+                args: &[U64, U64, ACC],
+            },
+            A64ReadMemory16 => OpcodeInfo {
+                ret: U16,
+                args: &[U64, U64, ACC],
+            },
+            A64ReadMemory32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, ACC],
+            },
+            A64ReadMemory64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, ACC],
+            },
+            A64ReadMemory128 => OpcodeInfo {
+                ret: U128,
+                args: &[U64, U64, ACC],
+            },
+            A64ExclusiveReadMemory8 => OpcodeInfo {
+                ret: U8,
+                args: &[U64, U64, ACC],
+            },
+            A64ExclusiveReadMemory16 => OpcodeInfo {
+                ret: U16,
+                args: &[U64, U64, ACC],
+            },
+            A64ExclusiveReadMemory32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, ACC],
+            },
+            A64ExclusiveReadMemory64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U64, ACC],
+            },
+            A64ExclusiveReadMemory128 => OpcodeInfo {
+                ret: U128,
+                args: &[U64, U64, ACC],
+            },
+            A64WriteMemory8 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64, U8, ACC],
+            },
+            A64WriteMemory16 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64, U16, ACC],
+            },
+            A64WriteMemory32 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64, U32, ACC],
+            },
+            A64WriteMemory64 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64, U64, ACC],
+            },
+            A64WriteMemory128 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U64, U128, ACC],
+            },
+            A64ExclusiveWriteMemory8 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, U8, ACC],
+            },
+            A64ExclusiveWriteMemory16 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, U16, ACC],
+            },
+            A64ExclusiveWriteMemory32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, U32, ACC],
+            },
+            A64ExclusiveWriteMemory64 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, U64, ACC],
+            },
+            A64ExclusiveWriteMemory128 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U64, U128, ACC],
+            },
 
             // A32 context
-            A32SetCheckBit => OpcodeInfo { ret: V, args: &[U1] },
+            A32SetCheckBit => OpcodeInfo {
+                ret: V,
+                args: &[U1],
+            },
             A32GetCFlag => OpcodeInfo { ret: U1, args: &[] },
-            A32GetRegister => OpcodeInfo { ret: U32, args: &[A32R] },
-            A32SetRegister => OpcodeInfo { ret: V, args: &[A32R, U32] },
-            A32GetExtendedRegister32 => OpcodeInfo { ret: U32, args: &[A32E] },
-            A32GetExtendedRegister64 => OpcodeInfo { ret: U64, args: &[A32E] },
-            A32SetExtendedRegister32 => OpcodeInfo { ret: V, args: &[A32E, U32] },
-            A32SetExtendedRegister64 => OpcodeInfo { ret: V, args: &[A32E, U64] },
-            A32GetVector => OpcodeInfo { ret: U128, args: &[A32E] },
-            A32SetVector => OpcodeInfo { ret: V, args: &[A32E, U128] },
-            A32GetCpsr => OpcodeInfo { ret: U32, args: &[] },
-            A32SetCpsr => OpcodeInfo { ret: V, args: &[U32] },
-            A32SetCpsrNZCVRaw => OpcodeInfo { ret: V, args: &[U32] },
-            A32SetCpsrNZCV => OpcodeInfo { ret: V, args: &[NZCV] },
-            A32SetCpsrNZCVQ => OpcodeInfo { ret: V, args: &[U32] },
-            A32SetCpsrNZ => OpcodeInfo { ret: V, args: &[NZCV] },
-            A32SetCpsrNZC => OpcodeInfo { ret: V, args: &[NZCV, U1] },
-            A32OrQFlag => OpcodeInfo { ret: V, args: &[U1] },
-            A32GetGEFlags => OpcodeInfo { ret: U32, args: &[] },
-            A32SetGEFlags => OpcodeInfo { ret: V, args: &[U32] },
-            A32SetGEFlagsCompressed => OpcodeInfo { ret: V, args: &[U32] },
-            A32BXWritePC => OpcodeInfo { ret: V, args: &[U32] },
+            A32GetRegister => OpcodeInfo {
+                ret: U32,
+                args: &[A32R],
+            },
+            A32SetRegister => OpcodeInfo {
+                ret: V,
+                args: &[A32R, U32],
+            },
+            A32GetExtendedRegister32 => OpcodeInfo {
+                ret: U32,
+                args: &[A32E],
+            },
+            A32GetExtendedRegister64 => OpcodeInfo {
+                ret: U64,
+                args: &[A32E],
+            },
+            A32SetExtendedRegister32 => OpcodeInfo {
+                ret: V,
+                args: &[A32E, U32],
+            },
+            A32SetExtendedRegister64 => OpcodeInfo {
+                ret: V,
+                args: &[A32E, U64],
+            },
+            A32GetVector => OpcodeInfo {
+                ret: U128,
+                args: &[A32E],
+            },
+            A32SetVector => OpcodeInfo {
+                ret: V,
+                args: &[A32E, U128],
+            },
+            A32GetCpsr => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A32SetCpsr => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32SetCpsrNZCVRaw => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32SetCpsrNZCV => OpcodeInfo {
+                ret: V,
+                args: &[NZCV],
+            },
+            A32SetCpsrNZCVQ => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32SetCpsrNZ => OpcodeInfo {
+                ret: V,
+                args: &[NZCV],
+            },
+            A32SetCpsrNZC => OpcodeInfo {
+                ret: V,
+                args: &[NZCV, U1],
+            },
+            A32OrQFlag => OpcodeInfo {
+                ret: V,
+                args: &[U1],
+            },
+            A32GetGEFlags => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A32SetGEFlags => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32SetGEFlagsCompressed => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32BXWritePC => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
             A32UpdateUpperLocationDescriptor => OpcodeInfo { ret: V, args: &[] },
-            A32CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
-            A32ExceptionRaised => OpcodeInfo { ret: V, args: &[U32, U64] },
+            A32CallSupervisor => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32ExceptionRaised => OpcodeInfo {
+                ret: V,
+                args: &[U32, U64],
+            },
             A32DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
             A32DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },
             A32InstructionSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
-            A32GetFpscr => OpcodeInfo { ret: U32, args: &[] },
-            A32SetFpscr => OpcodeInfo { ret: V, args: &[U32] },
-            A32GetFpscrNZCV => OpcodeInfo { ret: U32, args: &[] },
-            A32SetFpscrNZCV => OpcodeInfo { ret: V, args: &[NZCV] },
+            A32GetFpscr => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A32SetFpscr => OpcodeInfo {
+                ret: V,
+                args: &[U32],
+            },
+            A32GetFpscrNZCV => OpcodeInfo {
+                ret: U32,
+                args: &[],
+            },
+            A32SetFpscrNZCV => OpcodeInfo {
+                ret: V,
+                args: &[NZCV],
+            },
 
             // A32 Memory (location_descriptor passed as first arg)
             A32ClearExclusive => OpcodeInfo { ret: V, args: &[] },
-            A32ReadMemory8 => OpcodeInfo { ret: U8, args: &[U64, U32, ACC] },
-            A32ReadMemory16 => OpcodeInfo { ret: U16, args: &[U64, U32, ACC] },
-            A32ReadMemory32 => OpcodeInfo { ret: U32, args: &[U64, U32, ACC] },
-            A32ReadMemory64 => OpcodeInfo { ret: U64, args: &[U64, U32, ACC] },
-            A32ExclusiveReadMemory8 => OpcodeInfo { ret: U8, args: &[U64, U32, ACC] },
-            A32ExclusiveReadMemory16 => OpcodeInfo { ret: U16, args: &[U64, U32, ACC] },
-            A32ExclusiveReadMemory32 => OpcodeInfo { ret: U32, args: &[U64, U32, ACC] },
-            A32ExclusiveReadMemory64 => OpcodeInfo { ret: U64, args: &[U64, U32, ACC] },
-            A32WriteMemory8 => OpcodeInfo { ret: V, args: &[U64, U32, U8, ACC] },
-            A32WriteMemory16 => OpcodeInfo { ret: V, args: &[U64, U32, U16, ACC] },
-            A32WriteMemory32 => OpcodeInfo { ret: V, args: &[U64, U32, U32, ACC] },
-            A32WriteMemory64 => OpcodeInfo { ret: V, args: &[U64, U32, U64, ACC] },
-            A32ExclusiveWriteMemory8 => OpcodeInfo { ret: U32, args: &[U64, U32, U8, ACC] },
-            A32ExclusiveWriteMemory16 => OpcodeInfo { ret: U32, args: &[U64, U32, U16, ACC] },
-            A32ExclusiveWriteMemory32 => OpcodeInfo { ret: U32, args: &[U64, U32, U32, ACC] },
-            A32ExclusiveWriteMemory64 => OpcodeInfo { ret: U32, args: &[U64, U32, U64, ACC] },
+            A32ReadMemory8 => OpcodeInfo {
+                ret: U8,
+                args: &[U64, U32, ACC],
+            },
+            A32ReadMemory16 => OpcodeInfo {
+                ret: U16,
+                args: &[U64, U32, ACC],
+            },
+            A32ReadMemory32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U32, ACC],
+            },
+            A32ReadMemory64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U32, ACC],
+            },
+            A32ExclusiveReadMemory8 => OpcodeInfo {
+                ret: U8,
+                args: &[U64, U32, ACC],
+            },
+            A32ExclusiveReadMemory16 => OpcodeInfo {
+                ret: U16,
+                args: &[U64, U32, ACC],
+            },
+            A32ExclusiveReadMemory32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U32, ACC],
+            },
+            A32ExclusiveReadMemory64 => OpcodeInfo {
+                ret: U64,
+                args: &[U64, U32, ACC],
+            },
+            A32WriteMemory8 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U32, U8, ACC],
+            },
+            A32WriteMemory16 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U32, U16, ACC],
+            },
+            A32WriteMemory32 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U32, U32, ACC],
+            },
+            A32WriteMemory64 => OpcodeInfo {
+                ret: V,
+                args: &[U64, U32, U64, ACC],
+            },
+            A32ExclusiveWriteMemory8 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U32, U8, ACC],
+            },
+            A32ExclusiveWriteMemory16 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U32, U16, ACC],
+            },
+            A32ExclusiveWriteMemory32 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U32, U32, ACC],
+            },
+            A32ExclusiveWriteMemory64 => OpcodeInfo {
+                ret: U32,
+                args: &[U64, U32, U64, ACC],
+            },
 
             // A32 Coprocessor
-            A32CoprocInternalOperation => OpcodeInfo { ret: V, args: &[COPROC] },
-            A32CoprocSendOneWord => OpcodeInfo { ret: V, args: &[COPROC, U32] },
-            A32CoprocSendTwoWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U32] },
-            A32CoprocGetOneWord => OpcodeInfo { ret: U32, args: &[COPROC] },
-            A32CoprocGetTwoWords => OpcodeInfo { ret: U64, args: &[COPROC] },
-            A32CoprocLoadWords => OpcodeInfo { ret: V, args: &[COPROC, U32] },
-            A32CoprocStoreWords => OpcodeInfo { ret: V, args: &[COPROC, U32] },
+            A32CoprocInternalOperation => OpcodeInfo {
+                ret: V,
+                args: &[COPROC],
+            },
+            A32CoprocSendOneWord => OpcodeInfo {
+                ret: V,
+                args: &[COPROC, U32],
+            },
+            A32CoprocSendTwoWords => OpcodeInfo {
+                ret: V,
+                args: &[COPROC, U32, U32],
+            },
+            A32CoprocGetOneWord => OpcodeInfo {
+                ret: U32,
+                args: &[COPROC],
+            },
+            A32CoprocGetTwoWords => OpcodeInfo {
+                ret: U64,
+                args: &[COPROC],
+            },
+            A32CoprocLoadWords => OpcodeInfo {
+                ret: V,
+                args: &[COPROC, U32],
+            },
+            A32CoprocStoreWords => OpcodeInfo {
+                ret: V,
+                args: &[COPROC, U32],
+            },
         }
     }
 }

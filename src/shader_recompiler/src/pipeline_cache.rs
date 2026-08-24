@@ -77,9 +77,11 @@ pub struct PipelineCache {
 
 fn translate_cfg_to_program(
     code: &[u64],
+    base_offset: u32,
     stage: ShaderStage,
     cfg_blocks: &[control_flow::CfgBlock],
     sph: Option<&ProgramHeader>,
+    env: Option<&dyn Environment>,
 ) -> Program {
     let mut structured = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
         linear_structured_syntax(cfg_blocks)
@@ -96,7 +98,15 @@ fn translate_cfg_to_program(
     // Upstream `GenerateBlocks` assigns `Block::order` while traversing the
     // abstract syntax list, not from the block owner's allocation index.
     crate::frontend::translate_program::regenerate_block_order_from_syntax(&mut program);
-    materialize_structured_actions(&mut program, &structured.actions, cfg_blocks, code, sph);
+    materialize_structured_actions(
+        &mut program,
+        &structured.actions,
+        cfg_blocks,
+        code,
+        base_offset,
+        sph,
+        env,
+    );
     rebuild_syntax_successors(&mut program);
 
     if !program.blocks.is_empty() {
@@ -177,7 +187,9 @@ fn materialize_structured_actions(
     actions: &[StructuredAction],
     cfg_blocks: &[control_flow::CfgBlock],
     code: &[u64],
+    base_offset: u32,
     sph: Option<&ProgramHeader>,
+    env: Option<&dyn Environment>,
 ) {
     for action in actions {
         match action {
@@ -185,12 +197,16 @@ fn materialize_structured_actions(
                 let Some(cfg_block) = cfg_blocks.get(*cfg_block) else {
                     continue;
                 };
-                let mut tv = TranslatorVisitor::new_with_sph(program, *block, sph.cloned());
+                let mut tv = if let Some(env) = env {
+                    TranslatorVisitor::new_with_env(program, *block, env)
+                } else {
+                    TranslatorVisitor::new_with_sph(program, *block, sph.cloned())
+                };
                 for i in cfg_block.begin as usize..cfg_block.end as usize {
                     if i >= code.len() {
                         break;
                     }
-                    if is_sched_control_word(i) {
+                    if is_sched_control_word(i, base_offset) {
                         continue;
                     }
                     tv.translate_instruction(code[i]);
@@ -399,8 +415,8 @@ fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
     })
 }
 
-fn is_sched_control_word(word_index: usize) -> bool {
-    word_index % 4 == 0
+fn is_sched_control_word(word_index: usize, base_offset: u32) -> bool {
+    base_offset.wrapping_add((word_index as u32).wrapping_mul(8)) % 32 == 0
 }
 
 impl PipelineCache {
@@ -488,7 +504,7 @@ pub fn compile_shader(
 
     // Step 2/3: Convert flat CFG to structured control flow and translate
     // Maxwell instructions into matching IR blocks.
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None, None);
     log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
@@ -556,8 +572,42 @@ pub fn translate_program_from_env_with_host_info(
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
+    if std::env::var_os("RUZU_TRACE_SHADER_CFG").is_some() {
+        let mut translated_words = 0usize;
+        let mut invalid_words = 0usize;
+        let mut first_invalid = Vec::new();
+        for block in &cfg_blocks {
+            for word_index in block.begin as usize..block.end as usize {
+                if word_index >= code.len() || is_sched_control_word(word_index, base_offset) {
+                    continue;
+                }
+                translated_words += 1;
+                if super::frontend::maxwell_opcodes::decode_opcode(code[word_index]).is_none() {
+                    invalid_words += 1;
+                    if first_invalid.len() < 8 {
+                        first_invalid.push((word_index, code[word_index]));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[SHADER_CFG] stage={:?} base=0x{base_offset:X} code_words={} blocks={} translated={} invalid={} first_invalid={first_invalid:?}",
+            env.shader_stage(),
+            code.len(),
+            cfg_blocks.len(),
+            translated_words,
+            invalid_words,
+        );
+    }
     let sph = env.sph().clone();
-    let mut program = translate_cfg_to_program(code, env.shader_stage(), &cfg_blocks, Some(&sph));
+    let mut program = translate_cfg_to_program(
+        code,
+        base_offset,
+        env.shader_stage(),
+        &cfg_blocks,
+        Some(&sph),
+        Some(&*env),
+    );
     apply_environment_program_metadata(&mut program, env, &normalized_host_info);
     optimize_program_with_env(env, &mut program, &normalized_host_info, Some(&sph));
     collect_interpolation_info(&sph, &mut program);
@@ -597,7 +647,7 @@ pub fn compile_shader_glsl(
     );
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None, None);
 
     optimize_program_without_env(
         &mut program,
@@ -872,7 +922,7 @@ fn emit_glsl_program_at_offset(
         base_offset
     );
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, sph);
+    let mut program = translate_cfg_to_program(code, base_offset, stage, &cfg_blocks, sph, None);
 
     optimize_program_without_env(&mut program, host_info, sph, texture_bound_buffer);
 
@@ -1030,7 +1080,7 @@ fn translate_and_optimize_with_host_info(
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None, None);
     optimize_program_without_env(&mut program, &normalized_host_info, None, None);
     program
 }
@@ -1248,8 +1298,10 @@ mod tests {
 
         let program = translate_cfg_to_program(
             &[0, 0x50B0_0000_0000_0000],
+            0,
             ShaderStage::VertexB,
             cfg_blocks.as_slice(),
+            None,
             None,
         );
 
@@ -1280,7 +1332,8 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, &cfg_blocks, None);
+        let program =
+            translate_cfg_to_program(&[0], 0, ShaderStage::VertexB, &cfg_blocks, None, None);
         let entry_block = match program.syntax_list.first() {
             Some(SyntaxNode::Block(block)) => *block,
             _ => panic!("translation must start with an entry block"),
@@ -1313,7 +1366,8 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], ShaderStage::Fragment, &cfg_blocks, None);
+        let program =
+            translate_cfg_to_program(&[0], 0, ShaderStage::Fragment, &cfg_blocks, None, None);
 
         assert!(program.blocks.iter().any(|block| {
             block
@@ -1369,8 +1423,10 @@ mod tests {
 
         let program = translate_cfg_to_program(
             &[0, 0x50B0_0000_0000_0000, 0x50B0_0000_0000_0000],
+            0,
             ShaderStage::VertexB,
             cfg_blocks.as_slice(),
+            None,
             None,
         );
 
@@ -1407,16 +1463,14 @@ mod tests {
     }
 
     #[test]
-    fn sched_control_skip_is_anchored_at_code_start() {
-        // The sched grid is anchored at the start of the code slice
-        // (`code[0]` is always a sched word), regardless of the code's
-        // absolute alignment.
-        assert!(is_sched_control_word(0));
-        assert!(!is_sched_control_word(1));
-        assert!(!is_sched_control_word(2));
-        assert!(!is_sched_control_word(3));
-        assert!(is_sched_control_word(4));
-        assert!(is_sched_control_word(8));
+    fn sched_control_skip_uses_the_absolute_location() {
+        assert!(!is_sched_control_word(0, 0x50));
+        assert!(!is_sched_control_word(1, 0x50));
+        assert!(is_sched_control_word(2, 0x50));
+        assert!(!is_sched_control_word(3, 0x50));
+        assert!(!is_sched_control_word(4, 0x50));
+        assert!(!is_sched_control_word(5, 0x50));
+        assert!(is_sched_control_word(6, 0x50));
     }
 
     const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;
@@ -1534,6 +1588,31 @@ mod tests {
         assert_eq!(program.shared_memory_size, 0x180);
         assert_eq!(program.workgroup_size, [8, 4, 2]);
         assert!(!program.blocks.is_empty());
+    }
+
+    #[test]
+    fn runtime_translator_uses_compute_environment_local_memory_for_stl_bounds() {
+        let env = DummyEnvironment::compute();
+        assert_eq!(env.sph.local_memory_size(), 0);
+        assert_eq!(env.local_memory_size(), 0x240);
+
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        // STL.B32 R2, [RZ + 0x20]. The immediate is within the compute
+        // environment allocation, but outside the zero-valued graphics SPH.
+        let stl = 0xEF50_0000_0000_0000u64
+            | (4u64 << 48)
+            | (0x20u64 << 20)
+            | (255u64 << 8)
+            | 2;
+        {
+            let mut visitor = TranslatorVisitor::new_with_env(&mut program, 0, &env);
+            crate::frontend::translate::load_store_local_shared::stl(&mut visitor, stl);
+        }
+
+        assert!(program.blocks[0]
+            .iter()
+            .any(|inst| inst.opcode == Opcode::WriteLocal));
     }
 
     #[test]

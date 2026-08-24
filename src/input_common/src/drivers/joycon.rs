@@ -379,7 +379,6 @@ impl Joycons {
             _ => ButtonNames::Undefined,
         }
     }
-
 }
 
 impl Drop for Joycons {

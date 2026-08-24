@@ -750,10 +750,10 @@ mod tests {
         create_resource_limit_for_process, LimitableResource,
     };
     use crate::hle::kernel::k_thread::ThreadState;
-    use std::sync::Mutex;
     use crate::hle::kernel::k_thread_local_page::KThreadLocalPage;
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
+    use std::sync::Mutex;
 
     fn test_system() -> System {
         let mut system = System::new_for_test();
@@ -767,9 +767,7 @@ mod tests {
         process
             .thread_local_pages
             .push(KThreadLocalPage::new(KProcessAddress::new(0x240000)));
-        process.resource_limit = Some(Arc::new(create_resource_limit_for_process(
-            0x1_0000_0000,
-        )));
+        process.resource_limit = Some(Arc::new(create_resource_limit_for_process(0x1_0000_0000)));
 
         let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));

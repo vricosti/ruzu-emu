@@ -87,6 +87,11 @@ impl<'a> TranslatorVisitor<'a> {
         panic!("Instruction CCTLL not implemented (upstream throws NotImplementedException)");
     }
 
+    /// CCTLT — Not implemented in upstream.
+    pub fn translate_cctlt(&mut self, _insn: u64) {
+        panic!("Instruction CCTLT not implemented (upstream throws NotImplementedException)");
+    }
+
     pub fn translate_cont(&mut self, _insn: u64) {
         panic!("Instruction CONT not implemented (upstream throws NotImplementedException)");
     }

@@ -5,7 +5,7 @@
 //!
 //! Shader binary caching and invalidation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -17,9 +17,9 @@ use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::{Maxwell3D, ShaderStageType};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::shader_environment::{ComputeEnvironment, GenericEnvironment, GraphicsEnvironment};
-use shader_recompiler::frontend::instruction::{Instruction as MaxwellInstruction, Predicate};
-use shader_recompiler::frontend::maxwell_opcodes::{decode_opcode, MaxwellOpcode};
-use shader_recompiler::ir::flow_test::FlowTest;
+use shader_recompiler::environment::Environment;
+use shader_recompiler::frontend::control_flow::FlowCfg;
+use shader_recompiler::frontend::location::Location;
 
 /// Virtual address type.
 pub type VAddr = u64;
@@ -27,7 +27,6 @@ pub type VAddr = u64;
 const YUZU_PAGEBITS: u64 = 14;
 const YUZU_PAGESIZE: u64 = 1 << YUZU_PAGEBITS;
 pub const NUM_PROGRAMS: usize = 6;
-const SHADER_INSTRUCTION_SIZE: u32 = 8;
 
 static REFRESH_STAGES_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
 static REFRESH_STAGES_COUNTS: [AtomicU64; 16] = [
@@ -97,11 +96,6 @@ fn profile_shader_register_enabled() -> bool {
 fn trace_shader_words_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     cached_env_flag(&ENABLED, "RUZU_TRACE_SHADER_WORDS")
-}
-
-fn trace_shader_analyze_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    cached_env_flag(&ENABLED, "RUZU_TRACE_SHADER_ANALYZE")
 }
 
 fn record_refresh_stages_stage(stage: usize) {
@@ -239,40 +233,41 @@ pub fn dump_shader_register_stall_profile() {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum FlowStackToken {
-    Ssy,
-    Pbk,
-    Pexit,
-    Pret,
-    Pcnt,
-    Plongjmp,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct FlowStackEntry {
-    token: FlowStackToken,
-    target: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PendingShaderFlow {
-    pc: u32,
-    stack: Vec<FlowStackEntry>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BranchDisposition {
-    AlwaysTaken,
-    NeverTaken,
-    Conditional,
-}
-
 /// Information about a compiled shader.
 #[derive(Debug, Default)]
 pub struct ShaderInfo {
     pub unique_hash: u64,
     pub size_bytes: usize,
+}
+
+/// Rust adaptation of the virtual `GenericEnvironment` base used by
+/// `ShaderCache::MakeShaderInfo`. The upstream slow path receives the live
+/// derived environment, so its CFG can still dispatch `ReadCbufValue` for an
+/// indirect branch while the cache metadata remains owned by the generic
+/// base.
+trait ShaderCacheEnvironment: Environment {
+    fn generic_environment(&self) -> &GenericEnvironment;
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment;
+}
+
+impl ShaderCacheEnvironment for GraphicsEnvironment {
+    fn generic_environment(&self) -> &GenericEnvironment {
+        GraphicsEnvironment::generic_environment(self)
+    }
+
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        GraphicsEnvironment::generic_environment_mut(self)
+    }
+}
+
+impl ShaderCacheEnvironment for ComputeEnvironment {
+    fn generic_environment(&self) -> &GenericEnvironment {
+        ComputeEnvironment::generic_environment(self)
+    }
+
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        ComputeEnvironment::generic_environment_mut(self)
+    }
 }
 
 /// An entry in the shader lookup cache.
@@ -503,9 +498,23 @@ impl ShaderCache {
                     base_addr,
                     stage_info.offset,
                 );
+                if std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+                    && env
+                        .generic_environment()
+                        .sph()
+                        .raw
+                        .iter()
+                        .all(|word| *word == 0)
+                {
+                    eprintln!(
+                        "[SHADER_ZERO_HEADER_REJECTED] index={} program={:?} gpu=0x{:X} offset=0x{:X}",
+                        index, program_type, shader_addr, stage_info.offset,
+                    );
+                    self.last_shaders_valid = false;
+                    return false;
+                }
                 record_refresh_stages_stage(12);
-                self.make_shader_info(env.generic_environment_mut(), cpu_shader_addr)
-                    as *const ShaderInfo
+                self.make_shader_info(&mut env, cpu_shader_addr) as *const ShaderInfo
             };
             record_refresh_stages_stage(13);
 
@@ -546,7 +555,7 @@ impl ShaderCache {
 
         let mut env =
             ComputeEnvironment::from_kepler_compute(kepler_compute, Arc::clone(&gpu_memory));
-        Some(self.make_shader_info(env.generic_environment_mut(), cpu_shader_addr))
+        Some(self.make_shader_info(&mut env, cpu_shader_addr))
     }
 
     /// Port of `ShaderCache::GetGraphicsEnvironments`.
@@ -770,26 +779,27 @@ impl ShaderCache {
     }
 
     /// Port of `ShaderCache::MakeShaderInfo`.
-    pub fn make_shader_info(
+    fn make_shader_info<E: ShaderCacheEnvironment>(
         &mut self,
-        env: &mut GenericEnvironment,
+        env: &mut E,
         cpu_addr: VAddr,
     ) -> &ShaderInfo {
         record_make_shader_info_stage(0);
         let mut info = Box::new(ShaderInfo::default());
         record_make_shader_info_stage(1);
-        if let Some(cached_hash) = env.analyze() {
+        if let Some(cached_hash) = env.generic_environment_mut().analyze() {
             record_make_shader_info_stage(2);
             info.unique_hash = cached_hash;
-            info.size_bytes = env.cached_size_bytes();
+            info.size_bytes = env.generic_environment().cached_size_bytes();
         } else {
             record_make_shader_info_stage(2);
             record_make_shader_info_stage(3);
-            self.walk_shader_control_flow(env);
+            let start_address = env.start_address();
+            let _cfg = FlowCfg::new(env, Location::new(start_address), false);
             record_make_shader_info_stage(4);
-            info.unique_hash = env.calculate_hash();
+            info.unique_hash = env.generic_environment().calculate_hash();
             record_make_shader_info_stage(5);
-            info.size_bytes = env.read_size_bytes();
+            info.size_bytes = env.generic_environment().read_size_bytes();
             record_make_shader_info_stage(6);
         }
         let size_bytes = info.size_bytes;
@@ -830,308 +840,6 @@ impl ShaderCache {
             .gpu_memory
             .as_ref()
             .map(Arc::clone)
-    }
-
-    fn walk_shader_control_flow(&self, env: &mut GenericEnvironment) {
-        let mut pending = vec![PendingShaderFlow {
-            pc: env.start_address(),
-            stack: Vec::new(),
-        }];
-        let mut visited = HashSet::new();
-        let trace = trace_shader_analyze_enabled();
-        let mut steps = 0usize;
-
-        while let Some(mut state) = pending.pop() {
-            loop {
-                if !visited.insert(state.clone()) {
-                    break;
-                }
-                steps += 1;
-                if trace && steps.is_power_of_two() {
-                    log::warn!(
-                        "[SHADER_ANALYZE] slow_walk_progress steps={} visited={} pending={} pc=0x{:X} stack_depth={}",
-                        steps,
-                        visited.len(),
-                        pending.len(),
-                        state.pc,
-                        state.stack.len(),
-                    );
-                }
-
-                let pc = state.pc;
-                let insn_raw = env.read_instruction(pc);
-                let insn = MaxwellInstruction::new(insn_raw);
-                let opcode = decode_opcode(insn_raw);
-                let disposition =
-                    Self::branch_disposition(opcode, insn.pred(), insn.branch_flow_test());
-                let next_pc = pc.wrapping_add(SHADER_INSTRUCTION_SIZE);
-
-                match opcode {
-                    Some(MaxwellOpcode::SSY) => {
-                        state.stack.push(FlowStackEntry {
-                            token: FlowStackToken::Ssy,
-                            target: Self::relative_branch_target(pc, insn),
-                        });
-                        state.pc = next_pc;
-                    }
-                    Some(MaxwellOpcode::PBK) => {
-                        state.stack.push(FlowStackEntry {
-                            token: FlowStackToken::Pbk,
-                            target: Self::relative_branch_target(pc, insn),
-                        });
-                        state.pc = next_pc;
-                    }
-                    Some(MaxwellOpcode::PCNT) => {
-                        state.stack.push(FlowStackEntry {
-                            token: FlowStackToken::Pcnt,
-                            target: Self::relative_branch_target(pc, insn),
-                        });
-                        state.pc = next_pc;
-                    }
-                    Some(MaxwellOpcode::CAL) => {
-                        let mut callee_stack = state.stack.clone();
-                        callee_stack.push(FlowStackEntry {
-                            token: FlowStackToken::Pret,
-                            target: next_pc,
-                        });
-                        pending.push(PendingShaderFlow {
-                            pc: Self::relative_branch_target(pc, insn),
-                            stack: callee_stack,
-                        });
-                        state.pc = next_pc;
-                    }
-                    Some(MaxwellOpcode::JCAL) => {
-                        let mut callee_stack = state.stack.clone();
-                        callee_stack.push(FlowStackEntry {
-                            token: FlowStackToken::Pret,
-                            target: next_pc,
-                        });
-                        pending.push(PendingShaderFlow {
-                            pc: insn.branch_absolute(),
-                            stack: callee_stack,
-                        });
-                        state.pc = next_pc;
-                    }
-                    Some(MaxwellOpcode::BRA) => {
-                        let target = Self::relative_branch_target(pc, insn);
-                        if disposition != BranchDisposition::AlwaysTaken {
-                            pending.push(PendingShaderFlow {
-                                pc: next_pc,
-                                stack: state.stack.clone(),
-                            });
-                        }
-                        if disposition == BranchDisposition::NeverTaken {
-                            state.pc = next_pc;
-                        } else {
-                            state.pc = target;
-                        }
-                    }
-                    Some(MaxwellOpcode::JMP) => {
-                        let target = insn.branch_absolute();
-                        if disposition != BranchDisposition::AlwaysTaken {
-                            pending.push(PendingShaderFlow {
-                                pc: next_pc,
-                                stack: state.stack.clone(),
-                            });
-                        }
-                        if disposition == BranchDisposition::NeverTaken {
-                            state.pc = next_pc;
-                        } else {
-                            state.pc = target;
-                        }
-                    }
-                    Some(MaxwellOpcode::SYNC) => {
-                        if !Self::continue_from_stack_target(
-                            &mut pending,
-                            &mut state,
-                            next_pc,
-                            FlowStackToken::Ssy,
-                            disposition,
-                        ) {
-                            break;
-                        }
-                    }
-                    Some(MaxwellOpcode::BRK) => {
-                        if !Self::continue_from_stack_target(
-                            &mut pending,
-                            &mut state,
-                            next_pc,
-                            FlowStackToken::Pbk,
-                            disposition,
-                        ) {
-                            break;
-                        }
-                    }
-                    Some(MaxwellOpcode::CONT) => {
-                        if !Self::continue_from_stack_target(
-                            &mut pending,
-                            &mut state,
-                            next_pc,
-                            FlowStackToken::Pcnt,
-                            disposition,
-                        ) {
-                            break;
-                        }
-                    }
-                    Some(MaxwellOpcode::RET) | Some(MaxwellOpcode::PRET) => {
-                        if !Self::continue_from_stack_target(
-                            &mut pending,
-                            &mut state,
-                            next_pc,
-                            FlowStackToken::Pret,
-                            disposition,
-                        ) {
-                            break;
-                        }
-                    }
-                    Some(MaxwellOpcode::EXIT) | Some(MaxwellOpcode::PEXIT) => {
-                        if !Self::continue_from_stack_target(
-                            &mut pending,
-                            &mut state,
-                            next_pc,
-                            FlowStackToken::Pexit,
-                            disposition,
-                        ) {
-                            break;
-                        }
-                    }
-                    Some(MaxwellOpcode::LONGJMP) | Some(MaxwellOpcode::PLONGJMP) => {
-                        if !Self::continue_from_stack_target(
-                            &mut pending,
-                            &mut state,
-                            next_pc,
-                            FlowStackToken::Plongjmp,
-                            disposition,
-                        ) {
-                            break;
-                        }
-                    }
-                    Some(MaxwellOpcode::KIL)
-                    | Some(MaxwellOpcode::BRX)
-                    | Some(MaxwellOpcode::JMX) => {
-                        if disposition != BranchDisposition::AlwaysTaken {
-                            pending.push(PendingShaderFlow {
-                                pc: next_pc,
-                                stack: state.stack.clone(),
-                            });
-                        }
-                        break;
-                    }
-                    _ => {
-                        state.pc = next_pc;
-                    }
-                }
-            }
-        }
-        if trace {
-            log::warn!(
-                "[SHADER_ANALYZE] slow_walk_done steps={} visited={} read_size=0x{:X}",
-                steps,
-                visited.len(),
-                env.read_size_bytes(),
-            );
-        }
-    }
-
-    fn relative_branch_target(pc: u32, insn: MaxwellInstruction) -> u32 {
-        pc.wrapping_add_signed(insn.branch_offset())
-            .wrapping_add(SHADER_INSTRUCTION_SIZE)
-    }
-
-    fn branch_disposition(
-        opcode: Option<MaxwellOpcode>,
-        pred: Predicate,
-        flow_test: Option<FlowTest>,
-    ) -> BranchDisposition {
-        let predicate_state = if pred.index == 7 {
-            if pred.negated {
-                BranchDisposition::NeverTaken
-            } else {
-                BranchDisposition::AlwaysTaken
-            }
-        } else {
-            BranchDisposition::Conditional
-        };
-
-        let Some(opcode) = opcode else {
-            return predicate_state;
-        };
-        let flow_state = if Self::opcode_has_flow_test(opcode) {
-            match flow_test {
-                Some(FlowTest::T) => BranchDisposition::AlwaysTaken,
-                Some(FlowTest::F) => BranchDisposition::NeverTaken,
-                Some(_) | None => BranchDisposition::Conditional,
-            }
-        } else {
-            BranchDisposition::AlwaysTaken
-        };
-
-        match (predicate_state, flow_state) {
-            (BranchDisposition::NeverTaken, _) | (_, BranchDisposition::NeverTaken) => {
-                BranchDisposition::NeverTaken
-            }
-            (BranchDisposition::AlwaysTaken, BranchDisposition::AlwaysTaken) => {
-                BranchDisposition::AlwaysTaken
-            }
-            _ => BranchDisposition::Conditional,
-        }
-    }
-
-    fn opcode_has_flow_test(opcode: MaxwellOpcode) -> bool {
-        matches!(
-            opcode,
-            MaxwellOpcode::BRA
-                | MaxwellOpcode::BRX
-                | MaxwellOpcode::EXIT
-                | MaxwellOpcode::JMP
-                | MaxwellOpcode::JMX
-                | MaxwellOpcode::KIL
-                | MaxwellOpcode::BRK
-                | MaxwellOpcode::CONT
-                | MaxwellOpcode::LONGJMP
-                | MaxwellOpcode::PRET
-                | MaxwellOpcode::RET
-                | MaxwellOpcode::SYNC
-        )
-    }
-
-    fn continue_from_stack_target(
-        pending: &mut Vec<PendingShaderFlow>,
-        state: &mut PendingShaderFlow,
-        next_pc: u32,
-        token: FlowStackToken,
-        disposition: BranchDisposition,
-    ) -> bool {
-        if disposition != BranchDisposition::AlwaysTaken {
-            pending.push(PendingShaderFlow {
-                pc: next_pc,
-                stack: state.stack.clone(),
-            });
-        }
-
-        if disposition == BranchDisposition::NeverTaken {
-            state.pc = next_pc;
-            return true;
-        }
-
-        if let Some((target, new_stack)) = Self::pop_flow_stack_target(&state.stack, token) {
-            state.pc = target;
-            state.stack = new_stack;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn pop_flow_stack_target(
-        stack: &[FlowStackEntry],
-        token: FlowStackToken,
-    ) -> Option<(u32, Vec<FlowStackEntry>)> {
-        let index = stack.iter().rposition(|entry| entry.token == token)?;
-        let mut new_stack = Vec::with_capacity(stack.len().saturating_sub(1));
-        new_stack.extend_from_slice(&stack[..index]);
-        new_stack.extend_from_slice(&stack[index + 1..]);
-        Some((stack[index].target, new_stack))
     }
 }
 
@@ -1312,10 +1020,11 @@ mod tests {
             dst[..count].copy_from_slice(&backing[offset..offset + count]);
         });
 
-        let mut env = GenericEnvironment::new()
+        let base = GenericEnvironment::new()
             .with_gpu_read(reader)
             .with_program(program_base, 0);
-        let _ = env.read_instruction(0);
+        let mut env = GraphicsEnvironment::from_generic_environment_for_test(base);
+        let _ = env.generic_environment_mut().read_instruction(0);
         let mut cache = ShaderCache::default();
 
         let shader = cache.make_shader_info(&mut env, 0x9000);
@@ -1340,8 +1049,9 @@ mod tests {
         let mut backing = vec![0u8; 0x80];
         let bra = encode_control_flow(0xE240, 0x18);
         let exit = encode_control_flow(0xE300, 0);
-        backing[0x00..0x08].copy_from_slice(&bra.to_le_bytes());
-        backing[0x20..0x28].copy_from_slice(&exit.to_le_bytes());
+        // Location(0) skips the scheduling word at 0 and starts at 8.
+        backing[0x08..0x10].copy_from_slice(&bra.to_le_bytes());
+        backing[0x28..0x30].copy_from_slice(&exit.to_le_bytes());
         let backing = Arc::new(backing);
         let reader = Arc::new(move |gpu_addr: u64, dst: &mut [u8]| {
             dst.fill(0);
@@ -1354,9 +1064,11 @@ mod tests {
             dst[..count].copy_from_slice(&backing[offset..offset + count]);
         });
 
-        let mut env = GenericEnvironment::new()
+        let base = GenericEnvironment::new()
             .with_gpu_read(reader)
-            .with_program(program_base, 0);
+            .with_program(program_base, 0)
+            .with_proprietary_driver(true);
+        let mut env = GraphicsEnvironment::from_generic_environment_for_test(base);
         let mut cache = ShaderCache::default();
 
         let shader = cache.make_shader_info(&mut env, 0xA000);

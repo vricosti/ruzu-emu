@@ -21,6 +21,40 @@ use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+/// Non-owning memory-manager pointer matching upstream's stored
+/// `Tegra::MemoryManager*` relationships.
+///
+/// The owning `Arc<Mutex<MemoryManager>>` remains responsible for lifetime.
+/// This handle exists for callbacks entered from `MemoryManager::ReadBlock`,
+/// where locking that same mutex again would recurse. Upstream directly uses
+/// its already-borrowed pointer in that situation.
+#[derive(Clone, Copy)]
+pub struct MemoryManagerHandle {
+    ptr: *const MemoryManager,
+}
+
+// Safety: this handle adds neither ownership nor synchronization. The channel
+// and renderer lifetime graph must keep the pointed manager alive and serialize
+// access, exactly like upstream's raw `Tegra::MemoryManager*`.
+unsafe impl Send for MemoryManagerHandle {}
+unsafe impl Sync for MemoryManagerHandle {}
+
+impl MemoryManagerHandle {
+    pub fn from_ref(memory_manager: &MemoryManager) -> Self {
+        Self {
+            ptr: memory_manager as *const MemoryManager,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure the pointed manager is alive and that access is
+    /// serialized by the renderer/channel owner graph.
+    pub unsafe fn as_ref<'a>(self) -> &'a MemoryManager {
+        unsafe { &*self.ptr }
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────────────────
 
 /// CPU page bits — upstream `cpu_page_bits = 12`.
@@ -461,6 +495,14 @@ impl GpuMemoryManager {
         kind: PteKind,
         is_big_pages: bool,
     ) -> u64 {
+        if std::env::var_os("RUZU_TRACE_GMMU").is_some()
+            && ((0x4000_0000_0..0x5200_0000_0).contains(&gpu_addr)
+                || (0xA000_0000..0xB000_0000).contains(&dev_addr))
+        {
+            eprintln!(
+                "[GMMU_MAP] gpu=0x{gpu_addr:X} dev=0x{dev_addr:X} size=0x{size:X} kind={kind:?} big={is_big_pages}"
+            );
+        }
         log::trace!(
             "gpu_mm: map GPU {:#x}..{:#x} -> DEV {:#x} kind={:?} big={}",
             gpu_addr,
@@ -512,6 +554,14 @@ impl GpuMemoryManager {
         }
         log::trace!("gpu_mm: unmap GPU {:#x}..{:#x}", gpu_addr, gpu_addr + size);
         let ranges = self.get_submapped_device_ranges(gpu_addr, size);
+        if std::env::var_os("RUZU_TRACE_GMMU").is_some()
+            && ((0x4000_0000_0..0x5200_0000_0).contains(&gpu_addr)
+                || ranges
+                    .iter()
+                    .any(|&(addr, _)| (0xA000_0000..0xB000_0000).contains(&addr)))
+        {
+            eprintln!("[GMMU_UNMAP] gpu=0x{gpu_addr:X} size=0x{size:X} ranges={ranges:X?}");
+        }
         if let Some(buf) = self.deferred_rasterizer_ops.as_mut() {
             for (map_addr, map_size) in ranges {
                 buf.push(DeferredRasterizerOp::UnmapMemory {
@@ -680,6 +730,14 @@ impl GpuMemoryManager {
         // C++ pointer relationship.
         unsafe {
             handle.with_mut(|rasterizer| {
+                if std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+                    && (size == 0x50 || size == 0x1000)
+                {
+                    eprintln!(
+                        "[GPU_MEMORY_FLUSH] device=0x{dev_addr:X} size=0x{size:X} modified={}",
+                        rasterizer.must_flush_region(dev_addr, size as u64, which),
+                    );
+                }
                 rasterizer.flush_region(dev_addr, size as u64, which);
             });
         }
@@ -1144,9 +1202,42 @@ impl GpuMemoryManager {
         output: &mut [u8],
         which: CacheType,
     ) -> bool {
+        let trace_before_flush = if std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+            && (output.len() == 0x50 || output.len() == 0x1000)
+        {
+            self.gpu_to_cpu_address(gpu_src).map(|device_addr| {
+                let mut before = vec![0u8; output.len()];
+                self.device_memory
+                    .smmu_read_block_unsafe(device_addr, &mut before);
+                (device_addr, before)
+            })
+        } else {
+            None
+        };
         self.read_block_impl_safe(gpu_src, output, which, &|addr, output| {
             self.device_memory.smmu_read_block_unsafe(addr, output);
         });
+        if let Some((device_addr, before)) = trace_before_flush.as_ref() {
+            if before != output {
+                eprintln!(
+                    "[GPU_MEMORY_CHANGED_BY_FLUSH] gpu=0x{gpu_src:X} device=0x{device_addr:X} size=0x{:X} before={:02X?} after={:02X?}",
+                    output.len(),
+                    &before[..before.len().min(32)],
+                    &output[..output.len().min(32)],
+                );
+            }
+        }
+        if std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+            && (output.len() == 0x50 || output.len() == 0x1000)
+            && output.iter().all(|byte| *byte == 0)
+        {
+            eprintln!(
+                "[GPU_MEMORY_ZERO_AFTER_FLUSH] gpu=0x{gpu_src:X} device={:?} size=0x{:X}",
+                self.gpu_to_cpu_address(gpu_src)
+                    .map(|address| format!("0x{address:X}")),
+                output.len(),
+            );
+        }
         true
     }
 

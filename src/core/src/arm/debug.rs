@@ -516,11 +516,9 @@ mod tests {
     #[test]
     fn main_module_entrypoint_falls_back_to_code_region_start() {
         let mut process = KProcess::new();
-        process.page_table.configure_address_space(
-            KProcessAddress::new(0),
-            0x1_0000_0000,
-            32,
-        );
+        process
+            .page_table
+            .configure_address_space(KProcessAddress::new(0), 0x1_0000_0000, 32);
         process
             .page_table
             .set_code_region(KProcessAddress::new(0x60_0000), 0x10_000);

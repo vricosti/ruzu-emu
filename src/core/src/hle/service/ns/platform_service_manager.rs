@@ -3,7 +3,6 @@
 
 //! Port of zuyu/src/core/hle/service/ns/platform_service_manager.cpp/.h
 
-use std::collections::BTreeMap;
 use crate::core::SystemRef;
 use crate::file_sys::system_archive::data::{
     font_chinese_simplified, font_chinese_traditional, font_extended_chinese_simplified,
@@ -14,6 +13,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]

@@ -370,7 +370,7 @@ impl FlowCfg {
             }
             MaxwellOpcode::CAL | MaxwellOpcode::JCAL => {
                 let cal_pc = if is_absolute_jump(opcode) {
-                    pc.with_offset(inst.branch_absolute())
+                    Location::new(inst.branch_absolute())
                 } else {
                     branch_offset(pc, inst)
                 };
@@ -495,7 +495,7 @@ impl FlowCfg {
         is_absolute: bool,
     ) {
         let target = if is_absolute {
-            pc.with_offset(inst.branch_absolute())
+            Location::new(inst.branch_absolute())
         } else {
             branch_offset(pc, inst)
         };
@@ -547,7 +547,7 @@ impl FlowCfg {
             let branch = self.add_label(
                 block,
                 self.blocks[block].stack.clone(),
-                pc.with_offset(target),
+                Location::new(target),
                 function_id,
             );
             self.blocks[block].indirect_branches.push(IndirectBranch {
@@ -776,7 +776,7 @@ pub fn build_cfg_from_env(
     base_offset: u32,
     _code_words: usize,
 ) -> Vec<CfgBlock> {
-    let cfg = FlowCfg::new(env, Location::new_code_start(base_offset), false);
+    let cfg = FlowCfg::new(env, Location::new(base_offset), false);
     cfg.to_cfg_blocks(base_offset)
 }
 
@@ -822,7 +822,7 @@ fn has_flow_test(opcode: MaxwellOpcode) -> bool {
 }
 
 fn branch_offset(pc: Location, inst: Instruction) -> Location {
-    pc.with_offset(
+    Location::new(
         pc.offset()
             .wrapping_add(inst.branch_offset() as u32)
             .wrapping_add(8),
@@ -1308,7 +1308,7 @@ mod tests {
         );
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            FlowCfg::new(&mut env, Location::new_code_start(0), false)
+            FlowCfg::new(&mut env, Location::new(0), false)
         }));
         let payload = match result {
             Ok(_) => panic!("PRET flow analysis must fail like upstream"),

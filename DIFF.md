@@ -12018,3 +12018,175 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: this slice creates and transfers IPC service objects; it does not introduce a raw-memory
   payload. The focused test verifies that command 7996 returns the application-manager owner with
   its current command table.
+
+## 2026-08-24 — `src/shader_recompiler/src/frontend/translate/load_store_local_shared.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/load_store_local_shared.cpp`
+
+### Intentional differences
+- Rust uses the existing `IR::Reg` counterpart and converts its index only at the legacy
+  `TranslatorVisitor::x`/`set_x` boundary. Register ownership, alignment checks, and arithmetic stay
+  in the translating module as in Eden.
+
+### Unintentional differences (to fix)
+- Fixed: the local/shared translator previously treated register fields as raw integers. This made
+  `RZ` fail wide-register alignment (`255 % 2 != 0`) and made `RZ + n` wrap through the legacy `u8`
+  conversion instead of remaining `RZ`, unlike Eden's `IR::IsAligned` and `Reg::operator+`.
+
+### Missing items
+- None in the register decoding, alignment, or consecutive-register behavior of LDL, LDS, STL, and
+  STS.
+
+### Binary layout verification
+- N/A: the change only affects shader IR construction and does not alter a serialized structure.
+
+## 2026-08-24 — `src/shader_recompiler/src/frontend/{decode.rs,translate/mod.rs}` vs Eden `src/shader_recompiler/frontend/maxwell/{decode.cpp,translate/translate.cpp}`
+
+### Intentional differences
+- Rust keeps the generated mask-table lookup returning `Option`, while the upstream-owned
+  `decode.rs::decode` wrapper converts an unmatched word to `NOP`. This preserves Eden's public
+  `Decode` contract without rebuilding the generated table API.
+- Eden's failed soft assertion is represented by an error log because Ruzu has no process-wide
+  `AssertFailSoftImpl` setting in this crate.
+
+### Unintentional differences (to fix)
+- Fixed: `TranslatorVisitor::translate_instruction` previously used the optional table helper
+  directly and issued an ordinary Rust panic for an unmatched word. Eden reports the soft assert,
+  returns `Opcode::NOP`, and continues translation when debug assertions are disabled.
+
+### Missing items
+- Other CFG/branch-tracking callers still consume the optional low-level decoder directly. Their
+  current unmatched-word behavior is equivalent to NOP for control-flow analysis, but they do not
+  emit Eden's soft diagnostic.
+
+### Binary layout verification
+- N/A: decoder return behavior changes only shader control flow; instruction words and IR layouts
+  are unchanged.
+
+## 2026-08-24 — `src/shader_recompiler/src/frontend/{location.rs,control_flow.rs}` vs Eden `src/shader_recompiler/frontend/maxwell/{location.h,control_flow.cpp}`
+
+### Intentional differences
+- Rust spells Eden's implicit `u32`-to-`Location` construction as explicit `Location::new` calls
+  for absolute, relative, and indirect branch targets.
+
+### Unintentional differences (to fix)
+- Fixed: Ruzu stored a shader-relative scheduling-grid phase in every `Location`. Eden always
+  classifies scheduling words with the absolute byte offset modulo 32. At the `0x50` end of a
+  Maxwell program header, the relative grid skipped the first instruction and later decoded an
+  absolute scheduling word as an instruction, corrupting shader control flow.
+
+### Missing items
+- None in `Location` construction, alignment, stepping, backing, virtual locations, or the CFG's
+  construction of branch targets.
+
+### Binary layout verification
+- N/A: `Location` is internal shader-frontend state and is not serialized. Focused tests verify
+  Eden's absolute scheduling grid at the `0x50` program-header boundary and at an aligned
+  scheduling word.
+
+## 2026-08-24 — `src/shader_recompiler/src/pipeline_cache.rs` translation driver vs Eden `src/shader_recompiler/frontend/maxwell/{translate/translate.cpp,translate_program.cpp}`
+
+### Intentional differences
+- Rust materializes structured actions from a cached instruction slice and flat word indices.
+  Eden iterates absolute `Location` values and reads each instruction through `Environment`.
+  The Rust slice driver therefore converts each word index back to its absolute byte offset before
+  applying Eden's scheduling-word rule.
+
+### Unintentional differences (to fix)
+- Fixed: the slice driver previously classified every `code[4n]` as a scheduling word regardless
+  of the slice's absolute base address. A graphics shader body beginning at the `0x50` end of its
+  program header consequently skipped `code[0]` and translated `code[2]` at absolute `0x60`, the
+  opposite of Eden's `Location` iteration.
+
+### Missing items
+- The compatibility driver still represents instruction ranges as slice-local word indices rather
+  than retaining Eden's absolute `Location` values through structured translation.
+
+### Binary layout verification
+- N/A: this correction changes instruction selection only. The focused regression test verifies
+  scheduling-word classification for a slice beginning at absolute byte offset `0x50`.
+
+## 2026-08-24 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/buffer_cache/buffer_cache.h`
+
+### Intentional differences
+- Rust collects tracker callbacks before mutating `gpu_modified_ranges` to satisfy exclusive
+  borrowing, then performs Eden's range construction and clearing in the same order.
+- Device memory is optional during Ruzu's cache setup lifecycle, so the final writes are guarded
+  until the memory manager has been attached.
+
+### Unintentional differences (to fix)
+- Fixed: a Ruzu-only `DISABLE_DOWNLOADS = true` debug constant returned after clearing the dirty
+  ranges but before either download path. GPU-written buffers therefore remained stale in guest
+  memory; in particular, CPU shader recompilation could read zeroed dynamically generated shaders.
+
+### Missing items
+- None in the verified synchronous `DownloadBufferMemory` staging and immediate-download paths.
+
+### Binary layout verification
+- N/A: the correction transfers existing buffer bytes and changes no raw-memory payload layout.
+  The focused regression test verifies a GPU-modified cache range is copied back byte-for-byte.
+
+## 2026-08-24 — `src/video_core/src/engines/maxwell_3d.rs::hle_bind_shader` vs Eden `src/video_core/macro.cpp::HLE_BindShader::Execute`
+
+### Intentional differences
+- Rust addresses the flattened Maxwell register array through the corresponding register constants;
+  Eden accesses the typed `Regs` members directly.
+
+### Unintentional differences (to fix)
+- Fixed: Ruzu reset `const_buffer.offset` to zero while binding a shader. Eden updates only the
+  constant-buffer size and address and deliberately preserves the current offset before
+  `ProcessCBBind`.
+
+### Missing items
+- None in the verified pipeline-offset, shader-dirty, scratch-register, constant-buffer, and bind
+  group updates performed by `HLE_BindShader`.
+
+### Binary layout verification
+- N/A: the change preserves one existing register value and does not alter register layout. The
+  focused regression test initializes a nonzero offset and verifies it survives the bind.
+
+## 2026-08-24 — `src/shader_recompiler/src/frontend/translate/{mod.rs,load_store_local_shared.rs}` and `src/shader_recompiler/src/pipeline_cache.rs` vs Eden `src/shader_recompiler/frontend/maxwell/{translate/impl/impl.h,translate/impl/load_store_local_shared.cpp,translate/translate.cpp,translate_program.cpp}`
+
+### Intentional differences
+- Runtime translation now retains a shared Rust reference to `Environment`, corresponding to
+  Eden's `TranslatorVisitor::env`. Reduced instruction-level fixtures may still construct a
+  visitor without an environment and use their explicit program-header/program metadata.
+- Rust retains its cached instruction slice while materializing structured actions; Eden reads
+  each instruction through `Environment`. The active environment is nevertheless passed to every
+  runtime `TranslatorVisitor`, preserving the state ownership required by instruction handlers.
+
+### Unintentional differences (to fix)
+- Fixed: local-memory bounds checks previously used the cloned graphics program header whenever
+  one was present. Compute environments have their allocation in `Environment::LocalMemorySize`,
+  so a zero-valued header caused every immediate `STL` to be discarded. Both `LDL` bounds checks
+  and `STL` rejection now query the active environment exactly like Eden.
+
+### Missing items
+- None in the verified local-memory size lookup, immediate `STL` bounds decision, or runtime
+  visitor/environment ownership path.
+
+### Binary layout verification
+- N/A: this changes IR instruction retention and no serialized or raw-memory structure. The
+  focused compute regression uses a zero-sized SPH plus a nonzero environment allocation and
+  verifies that an in-bounds `STL.B32` produces `WriteLocal`.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/present_manager.rs` vs Eden `src/video_core/renderer_vulkan/vk_present_manager.{h,cpp}`
+
+### Intentional differences
+- Rust exposes Eden's function-local two-element wait-stage constant through a private helper so
+  the production synchronization contract can be covered by a focused unit test.
+- Rust owns Vulkan images and memory explicitly rather than through Eden's memory-allocator
+  wrappers; this does not change the verified barrier or semaphore ordering.
+
+### Unintentional differences (to fix)
+- Fixed: Ruzu waited for swapchain acquisition at `COLOR_ATTACHMENT_OUTPUT`, after the first
+  transfer command was already allowed to run. Eden waits for both the acquisition semaphore and
+  `render_ready` at `TRANSFER`, before the final copy or blit touches either image.
+- Fixed: the pre-copy image barrier used `ALL_COMMANDS`; it now uses Eden's
+  `PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER` mask before transitioning to `TRANSFER`.
+
+### Missing items
+- Eden's optional storage-image presentation path and frame-generation integration are not ported;
+  they are independent of the verified ordinary composite-to-swapchain synchronization path.
+
+### Binary layout verification
+- N/A: the change affects Vulkan stage masks only. The focused regression test verifies the exact
+  two-element transfer-stage wait array used by the production submit.

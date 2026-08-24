@@ -2797,9 +2797,7 @@ impl ArmInterface for ArmDynarmic32 {
                             );
                         } else {
                             last_hr = jit.step();
-                            if !last_hr.is_empty()
-                                && last_hr != rdynarmic::HaltReason::STEP
-                            {
+                            if !last_hr.is_empty() && last_hr != rdynarmic::HaltReason::STEP {
                                 if !quiet_search {
                                     log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
                                 }

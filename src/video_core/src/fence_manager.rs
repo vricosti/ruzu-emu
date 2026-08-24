@@ -400,7 +400,6 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     pub(crate) fn queued_fence_count(&self) -> usize {
         self.shared.state.lock().unwrap().fences.len()
     }
-
 }
 
 impl<F: FenceBase + Send + 'static> Drop for FenceManager<F> {

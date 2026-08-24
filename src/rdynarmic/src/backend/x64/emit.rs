@@ -1747,18 +1747,10 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::A32ClearExclusive => {
                 a32_memory::emit_a32_clear_exclusive(ctx, ra, inst_ref, inst)
             }
-            Opcode::A32ReadMemory8 => {
-                a32_memory::emit_a32_read_memory_8(ctx, ra, inst_ref, inst)
-            }
-            Opcode::A32ReadMemory16 => {
-                a32_memory::emit_a32_read_memory_16(ctx, ra, inst_ref, inst)
-            }
-            Opcode::A32ReadMemory32 => {
-                a32_memory::emit_a32_read_memory_32(ctx, ra, inst_ref, inst)
-            }
-            Opcode::A32ReadMemory64 => {
-                a32_memory::emit_a32_read_memory_64(ctx, ra, inst_ref, inst)
-            }
+            Opcode::A32ReadMemory8 => a32_memory::emit_a32_read_memory_8(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory16 => a32_memory::emit_a32_read_memory_16(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory32 => a32_memory::emit_a32_read_memory_32(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory64 => a32_memory::emit_a32_read_memory_64(ctx, ra, inst_ref, inst),
             Opcode::A32ExclusiveReadMemory8 => {
                 a32_memory::emit_a32_exclusive_read_memory_8(ctx, ra, inst_ref, inst)
             }
@@ -1771,9 +1763,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::A32ExclusiveReadMemory64 => {
                 a32_memory::emit_a32_exclusive_read_memory_64(ctx, ra, inst_ref, inst)
             }
-            Opcode::A32WriteMemory8 => {
-                a32_memory::emit_a32_write_memory_8(ctx, ra, inst_ref, inst)
-            }
+            Opcode::A32WriteMemory8 => a32_memory::emit_a32_write_memory_8(ctx, ra, inst_ref, inst),
             Opcode::A32WriteMemory16 => {
                 a32_memory::emit_a32_write_memory_16(ctx, ra, inst_ref, inst)
             }

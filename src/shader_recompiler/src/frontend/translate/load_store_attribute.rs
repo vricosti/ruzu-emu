@@ -149,8 +149,7 @@ pub fn ipa(tv: &mut TranslatorVisitor, insn: u64) {
                 .into_iter()
                 .find(|component| *component != PixelImap::Unused)
                 .unwrap_or(PixelImap::Unused);
-            is_perspective =
-                matches!(effective_imap, PixelImap::Perspective | PixelImap::Unused);
+            is_perspective = matches!(effective_imap, PixelImap::Perspective | PixelImap::Unused);
         }
         if is_perspective {
             let position_w = tv.ir.get_attribute(Attribute::POSITION_W, Value::ImmU32(0));

@@ -1,4 +1,5 @@
 use crate::frontend::a64::types::{Exception, Reg, Vec};
+use crate::interface::a64::config::{DataCacheOperation, InstructionCacheOperation};
 use crate::ir::acc_type::AccType;
 use crate::ir::block::Block;
 use crate::ir::emitter::IREmitter;
@@ -7,7 +8,6 @@ use crate::ir::opcode::Opcode;
 use crate::ir::terminal::Terminal;
 use crate::ir::types::Type;
 use crate::ir::value::Value;
-use crate::interface::a64::config::{DataCacheOperation, InstructionCacheOperation};
 
 /// A64-specific IR emitter. Extends IREmitter with A64 register/memory/system operations.
 pub struct A64IREmitter<'a> {

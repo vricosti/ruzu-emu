@@ -377,6 +377,15 @@ impl MaxwellDMA {
     /// This is the explicit Rust counterpart of the cached-write
     /// `GpuGuestMemoryScoped` destructor used by upstream DMA fallbacks.
     fn invalidate_gpu_region(&self, gpu_addr: u64, size: u64) {
+        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
+            && gpu_addr < 0x4040_0000_0
+            && gpu_addr.saturating_add(size) > 0x4030_0000_0
+        {
+            let device_addr = self.memory_manager.lock().gpu_to_cpu_address(gpu_addr);
+            eprintln!(
+                "[MAXWELL_DMA_INVALIDATE_SHADER_RANGE] gpu=0x{gpu_addr:X} size=0x{size:X} device={device_addr:?}"
+            );
+        }
         self.memory_manager.lock().invalidate_region(gpu_addr, size);
     }
 
@@ -822,6 +831,18 @@ impl MaxwellDMA {
 
         let memory_manager = self.memory_manager.lock();
         for write in writes {
+            if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
+                && write.gpu_va < 0x4040_0000_0
+                && write.gpu_va.saturating_add(write.data.len() as u64) > 0x4030_0000_0
+            {
+                let device_addr = memory_manager.gpu_to_cpu_address(write.gpu_va);
+                eprintln!(
+                    "[MAXWELL_DMA_WRITE_SHADER_RANGE] gpu=0x{:X} size=0x{:X} device={device_addr:?} head={:02X?}",
+                    write.gpu_va,
+                    write.data.len(),
+                    &write.data[..write.data.len().min(16)]
+                );
+            }
             let _ = memory_manager.write_block_unsafe(write.gpu_va, &write.data);
         }
     }

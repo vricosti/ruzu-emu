@@ -1330,7 +1330,7 @@ fn resolve_overlap_right_address_3d(
     if !is_block_linear_size_compatible(new_info, info, base.level as u32, 0, strict_size) {
         return None;
     }
-    let mip_depth = 1u32.max(new_info.size.depth << base.level as u32);
+    let mip_depth = adjust_mip_size(new_info.size.depth, base.level as u32);
     if mip_depth < info.size.depth + base.layer as u32 {
         return None;
     }
@@ -1662,6 +1662,59 @@ mod tests {
                 0,
             ],
         }
+    }
+
+    #[test]
+    fn right_address_3d_overlap_uses_mip_reduced_depth() {
+        let gpu_addr = 0x5000_0000;
+        let new_info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E3D,
+            resources: SubresourceExtent {
+                levels: 3,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 8,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 2,
+                depth: 2,
+            }),
+            ..ImageInfo::default()
+        };
+        let slice_offsets = calculate_slice_offsets(&new_info);
+        let subresources = calculate_slice_subresources(&new_info);
+        let level_one_slice_zero = subresources
+            .iter()
+            .position(|base| base.level == 1 && base.layer == 0)
+            .expect("3D mip one must have a first slice");
+        let overlap_info = ImageInfo {
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 32,
+                height: 32,
+                depth: 5,
+            },
+            tiling: TilingMode::BlockLinear(mip_block_size(&new_info, 1)),
+            ..new_info.clone()
+        };
+        let overlap = ImageBase::new(
+            overlap_info,
+            gpu_addr + u64::from(slice_offsets[level_one_slice_zero]),
+            0x9000_0000,
+        );
+
+        assert_eq!(
+            resolve_overlap_right_address_3d(&new_info, gpu_addr, &overlap, true),
+            None,
+        );
     }
 
     #[test]

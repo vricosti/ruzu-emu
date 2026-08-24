@@ -16,6 +16,7 @@ use super::scheduler::Scheduler;
 use super::swapchain::Swapchain;
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_surface;
+use crate::vulkan_common::vulkan_wrapper::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER;
 
 // ---------------------------------------------------------------------------
 // Helper functions (port of anonymous namespace)
@@ -86,6 +87,12 @@ fn make_image_copy(
             depth: 1,
         },
     }
+}
+
+/// Upstream `PresentManager::CopyToSwapchainImpl` waits for both the acquired
+/// swapchain image and the completed composite at the first transfer command.
+fn present_wait_stage_masks() -> [vk::PipelineStageFlags; 2] {
+    [vk::PipelineStageFlags::TRANSFER; 2]
 }
 
 // ---------------------------------------------------------------------------
@@ -827,7 +834,7 @@ impl PresentThreadContext {
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cmdbuf,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -885,10 +892,7 @@ impl PresentThreadContext {
 
         // Submit
         let wait_semaphores = [present_semaphore, frame.render_ready];
-        let wait_stages = [
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-        ];
+        let wait_stages = present_wait_stage_masks();
         let cmdbufs = [cmdbuf];
         let signal_semaphores = [render_semaphore];
 
@@ -966,4 +970,17 @@ fn find_memory_type(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_waits_before_the_swapchain_transfer() {
+        assert_eq!(
+            present_wait_stage_masks(),
+            [vk::PipelineStageFlags::TRANSFER; 2]
+        );
+    }
 }

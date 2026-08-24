@@ -55,7 +55,6 @@ pub fn get_available_network_interfaces() -> Vec<NetworkInterface> {
 fn get_available_network_interfaces_linux() -> Vec<NetworkInterface> {
     use std::ffi::CStr;
 
-
     let mut result = Vec::new();
 
     unsafe {

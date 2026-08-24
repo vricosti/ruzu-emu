@@ -4127,6 +4127,19 @@ impl Maxwell3D {
             return;
         }
 
+        if std::env::var_os("RUZU_TRACE_SHADER_BIND").is_some()
+            && (method == PROGRAM_REGION_HIGH
+                || method == PROGRAM_REGION_LOW
+                || (method >= PIPELINE_BASE
+                    && method < PIPELINE_BASE + 6 * PIPELINE_STRIDE
+                    && (method - PIPELINE_BASE) % PIPELINE_STRIDE <= 1))
+        {
+            eprintln!(
+                "[SHADER_REG_WRITE] method=0x{method:X} old=0x{:08X} new=0x{argument:08X}",
+                self.regs[idx]
+            );
+        }
+
         self.regs[idx] = argument;
 
         for table in &self.dirty.tables {
@@ -4452,7 +4465,13 @@ impl Maxwell3D {
     }
 
     pub(crate) fn hle_bind_shader(&mut self, parameters: &mut [u32]) {
+        if std::env::var_os("RUZU_TRACE_SHADER_BIND").is_some() {
+            eprintln!("[HLE_BIND_SHADER_BEFORE_REFRESH] parameters={parameters:08X?}");
+        }
         self.refresh_parameters_impl(parameters);
+        if std::env::var_os("RUZU_TRACE_SHADER_BIND").is_some() {
+            eprintln!("[HLE_BIND_SHADER_AFTER_REFRESH] parameters={parameters:08X?}");
+        }
         if parameters.len() < 5 {
             return;
         }
@@ -4473,6 +4492,19 @@ impl Maxwell3D {
         }
 
         let pipeline_base = (PIPELINE_BASE + ((index as u32) & 0xF) * PIPELINE_STRIDE) as usize;
+        if std::env::var_os("RUZU_TRACE_SHADER_BIND").is_some() {
+            eprintln!(
+                "[HLE_BIND_SHADER_APPLY] index={} pipeline_slot={} old_offset=0x{:08X} new_offset=0x{:08X} token_old=0x{:08X} token_new=0x{:08X} cb_address=0x{:08X} bind_group={}",
+                index,
+                index & 0xF,
+                self.regs[pipeline_base + 1],
+                parameters[2],
+                self.regs[SHADOW_SCRATCH_BASE as usize + 28 + index],
+                parameters[1],
+                parameters[4],
+                parameters[3] & 0x7F,
+            );
+        }
         self.regs[pipeline_base + 1] = parameters[2];
         self.dirty.flags[dirty_flags::flags::SHADERS as usize] = true;
         self.regs[SHADOW_SCRATCH_BASE as usize + 28 + index] = parameters[1];
@@ -4482,7 +4514,6 @@ impl Maxwell3D {
         self.regs[CB_CONFIG_BASE as usize] = 0x10000;
         self.regs[CB_CONFIG_BASE as usize + 1] = (address >> 24) & 0xFF;
         self.regs[CB_CONFIG_BASE as usize + 2] = address << 8;
-        self.regs[CB_CONFIG_BASE as usize + 3] = 0;
 
         let bind_group_id = (parameters[3] & 0x7F) as usize;
         if bind_group_id >= NUM_SHADER_STAGES {
@@ -8280,9 +8311,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hle_bind_shader_sets_pipeline_offset_and_cb_bind() {
+    fn test_hle_bind_shader_sets_pipeline_and_preserves_cb_offset() {
         let mut engine = Maxwell3D::new();
         engine.dirty.flags.fill(false);
+        engine.regs[(CB_CONFIG_BASE + 3) as usize] = 0x80;
 
         engine.hle_bind_shader(&mut [1, 0xAAAA, 0x240, 0, 0x1234_5600]);
 
@@ -8294,7 +8326,7 @@ mod tests {
         assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x10000);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0x3456_0000);
-        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x80);
         assert_eq!(engine.regs[(CB_BIND_BASE + 4) as usize], 0x11);
         assert!(engine.cb_bindings[0][1].enabled);
         assert_eq!(engine.cb_bindings[0][1].address, 0x12_3456_0000);

@@ -366,6 +366,22 @@ impl ImageInfo {
     ///
     /// Port of `ImageInfo::ImageInfo(const Zeta&, const ZetaSize&, MsaaMode)`.
     pub fn from_zeta_info(config: &crate::engines::maxwell_3d::ZetaInfo, msaa_mode: u32) -> Self {
+        if std::env::var_os("RUZU_TRACE_ZETA").is_some()
+            && config.width == 512
+            && config.height == 512
+        {
+            eprintln!(
+                "[RUZU_ZETA] address={:016x} format={:08x} tile={:08x} pitch={:08x} size={:08x},{:08x},{:08x} msaa={:08x}",
+                config.address,
+                config.format,
+                config.tile_mode,
+                config.array_pitch,
+                config.width,
+                config.height,
+                config.depth,
+                msaa_mode
+            );
+        }
         let format = crate::surface::pixel_format_from_depth_format(config.format);
         let is_pitch_linear = (config.tile_mode & (1 << 12)) != 0;
         let forced_flushed = force_pitch_flush(is_pitch_linear);

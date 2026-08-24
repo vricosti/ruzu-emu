@@ -3556,6 +3556,22 @@ impl RasterizerInterface for RasterizerVulkan {
         if addr == 0 || size == 0 {
             return;
         }
+        if std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+            && (size == 0x50 || size == 0x1000)
+        {
+            let buffer_modified = which.contains(CacheType::BUFFER_CACHE)
+                && self
+                    .common_buffer_cache
+                    .is_region_gpu_modified(addr, size as usize);
+            let texture_modified = which.contains(CacheType::TEXTURE_CACHE)
+                && self
+                    .texture_cache
+                    .base
+                    .is_region_gpu_modified(addr, size as usize);
+            eprintln!(
+                "[VULKAN_FLUSH_OWNERS] device=0x{addr:X} size=0x{size:X} buffer={buffer_modified} texture={texture_modified}"
+            );
+        }
         if which.contains(CacheType::TEXTURE_CACHE) {
             unsafe {
                 let texture_mutex: *const _ = &self.texture_cache.base.mutex;

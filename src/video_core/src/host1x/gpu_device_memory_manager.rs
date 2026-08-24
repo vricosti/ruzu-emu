@@ -1317,6 +1317,15 @@ impl MaxwellDeviceMemoryManager {
             .gather_device_pages_for_apply(compressed_physical - 1, scratch);
 
         if let Some(device_page) = single_page {
+            if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
+                && (0xA6C01..0xA7C01).contains(&device_page)
+            {
+                eprintln!(
+                    "[SMMU_CPU_WRITE_ALIAS] host=0x{host_address:X} physical_page=0x{:X} device=0x{:X}",
+                    compressed_physical - 1,
+                    (u64::from(device_page) << SMMU_PAGE_BITS) + subbits
+                );
+            }
             operation((u64::from(device_page) << SMMU_PAGE_BITS) + subbits);
             return 1;
         }
@@ -1585,6 +1594,12 @@ impl MaxwellDeviceMemoryManager {
 
     /// Forward `DeviceMemoryManager::InvalidateRegion` to its bound device interface.
     pub fn smmu_invalidate_region(&self, d_address: DAddr, size: usize) {
+        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
+            && d_address < 0xA7C0_1000
+            && d_address.saturating_add(size as u64) > 0xA6C0_1000
+        {
+            eprintln!("[SMMU_DEVICE_WRITE_INVALIDATE] device=0x{d_address:X} size=0x{size:X}");
+        }
         let invalidate_region = self.invalidate_region.lock().unwrap().clone();
         if let Some(callback) = invalidate_region {
             callback(d_address, size);
@@ -1713,6 +1728,20 @@ impl MaxwellDeviceMemoryManager {
 
         let page_begin = addr >> PAGE_BITS;
         let page_end = (addr + size as u64 + PAGE_SIZE - 1) >> PAGE_BITS;
+        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
+            && addr < 0xA7C0_1000
+            && addr.saturating_add(size as u64) > 0xA6C0_1000
+        {
+            let first = self.smmu_extract_cpu_backing(page_begin);
+            let target = self.smmu_extract_cpu_backing(0xA77D_7000 >> PAGE_BITS);
+            eprintln!(
+                "[SMMU_TRACK_ALIAS] device=0x{addr:X} size=0x{size:X} delta={delta} first_asid={} first_vpage=0x{:X} target_asid={} target_vpage=0x{:X}",
+                first.asid,
+                first.virtual_page,
+                target.asid,
+                target.virtual_page
+            );
+        }
 
         // Pending-batch tracking for grouped MarkRegionCaching calls.
         // `uncache_*` accumulates pages that just transitioned to count==0.

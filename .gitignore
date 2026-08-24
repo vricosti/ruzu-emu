@@ -3,6 +3,7 @@
 /target-clean-head/
 
 screenshots/
+bugs/
 
 # Rust package manager
 Cargo.lock

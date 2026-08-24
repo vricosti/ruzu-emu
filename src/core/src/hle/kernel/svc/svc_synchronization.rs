@@ -436,9 +436,7 @@ mod tests {
         process.capabilities.priority_mask = u64::MAX;
         process.flags = 0;
         process.initialize_handle_table();
-        process.resource_limit = Some(Arc::new(create_resource_limit_for_process(
-            0x4000_0000,
-        )));
+        process.resource_limit = Some(Arc::new(create_resource_limit_for_process(0x4000_0000)));
         process.create_memory(&system);
         process.allocate_code_memory(0x200000, 0x1000);
         set_current_page_table_for_test(&mut process);
@@ -693,13 +691,9 @@ mod tests {
         {
             let process_arc = system.current_process_arc();
             let process = process_arc.lock().unwrap();
-            let current = process
-                .resource_limit
-                .as_ref()
-                .unwrap()
-                .get_current_value(
-                    crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
-                );
+            let current = process.resource_limit.as_ref().unwrap().get_current_value(
+                crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+            );
             assert_eq!(current, 1);
         }
 
@@ -707,13 +701,9 @@ mod tests {
 
         let process_arc = system.current_process_arc();
         let process = process_arc.lock().unwrap();
-        let current = process
-            .resource_limit
-            .as_ref()
-            .unwrap()
-            .get_current_value(
-                crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
-            );
+        let current = process.resource_limit.as_ref().unwrap().get_current_value(
+            crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+        );
         assert_eq!(current, 0);
     }
 

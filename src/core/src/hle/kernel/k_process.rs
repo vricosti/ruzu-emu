@@ -2088,9 +2088,9 @@ impl KProcess {
             _ => 0x2C600000,                                   // ~710 MiB (System)
         };
 
-        let res_limit = Arc::new(
-            super::k_resource_limit::create_resource_limit_for_process(physical_memory_size),
-        );
+        let res_limit = Arc::new(super::k_resource_limit::create_resource_limit_for_process(
+            physical_memory_size,
+        ));
 
         // Declare flags (upstream lines 1200-1202).
         let mut flags = CreateProcessFlag::empty();
@@ -3558,9 +3558,8 @@ mod tests {
             process_guard.bind_self_reference(&process);
             process_guard.attach_scheduler(&scheduler);
             process_guard.initialize_thread_local_region_allocation(0x1c0000);
-            process_guard.resource_limit = Some(Arc::new(
-                create_resource_limit_for_process(0x1_0000_0000),
-            ));
+            process_guard.resource_limit =
+                Some(Arc::new(create_resource_limit_for_process(0x1_0000_0000)));
         }
 
         let (main_thread, main_thread_handle, stack_base, stack_top) = process
@@ -3641,9 +3640,8 @@ mod tests {
             process_guard.bind_self_reference(&process);
             process_guard.attach_scheduler(&scheduler);
             process_guard.initialize_thread_local_region_allocation(0x1c0000);
-            process_guard.resource_limit = Some(Arc::new(
-                create_resource_limit_for_process(0x1_0000_0000),
-            ));
+            process_guard.resource_limit =
+                Some(Arc::new(create_resource_limit_for_process(0x1_0000_0000)));
             process_guard
                 .process_memory
                 .write()

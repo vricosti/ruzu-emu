@@ -33,7 +33,7 @@ use crate::delayed_destruction_ring::DelayedDestructionRing;
 use crate::dirty_flags;
 use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::maxwell_3d::Maxwell3D;
-use crate::memory_manager::MemoryManager;
+use crate::memory_manager::{MemoryManager, MemoryManagerHandle};
 use crate::renderer_base::GuestMemoryWriter;
 use crate::textures::workers::ThreadWorker;
 
@@ -804,6 +804,10 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     /// texture registration needs it for `GetSubmappedRange` and
     /// `GpuToCpuAddress`.
     pub channel_gpu_memory: Option<Arc<ParkingMutex<MemoryManager>>>,
+    /// Non-owning counterpart of upstream's `Tegra::MemoryManager*`.
+    /// Used when a memory read enters the rasterizer while the channel mutex
+    /// is already held.
+    pub channel_gpu_memory_handle: Option<MemoryManagerHandle>,
 
     /// Shared `MaxwellDeviceMemoryManager` reference. Mirrors upstream
     /// `MaxwellDeviceMemoryManager& device_memory` member used by
@@ -900,19 +904,34 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     pub fn bind_to_channel(&mut self, channel_id: i32) {
         self.channel_caches.bind_to_channel(channel_id);
-        self.channel_gpu_memory = self
+        let gpu_memory = self
             .channel_caches
             .current_channel_state()
             .and_then(|channel| channel.channel_info.gpu_memory.as_ref().map(Arc::clone));
+        self.update_channel_gpu_memory(gpu_memory);
         self.rebase_virtual_invalid_images();
     }
 
     pub fn erase_channel(&mut self, channel_id: i32) {
         self.channel_caches.erase_channel(channel_id);
-        self.channel_gpu_memory = self
+        let gpu_memory = self
             .channel_caches
             .current_channel_state()
             .and_then(|channel| channel.channel_info.gpu_memory.as_ref().map(Arc::clone));
+        self.update_channel_gpu_memory(gpu_memory);
+    }
+
+    /// Keep the owning Rust channel reference and upstream-equivalent raw
+    /// `Tegra::MemoryManager*` synchronized across channel switches.
+    pub(crate) fn update_channel_gpu_memory(
+        &mut self,
+        gpu_memory: Option<Arc<ParkingMutex<MemoryManager>>>,
+    ) {
+        self.channel_gpu_memory_handle = gpu_memory.as_ref().map(|gpu_memory| {
+            let gpu_memory_ref = gpu_memory.lock();
+            MemoryManagerHandle::from_ref(&gpu_memory_ref)
+        });
+        self.channel_gpu_memory = gpu_memory;
     }
 
     pub(crate) fn current_channel_state(&self) -> &TextureCacheChannelInfo {
@@ -1089,6 +1108,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             image_downloader: None,
             guest_memory_writer: None,
             channel_gpu_memory: None,
+            channel_gpu_memory_handle: None,
             device_memory,
             gpu_page_table_storage: vec![
                 TextureCacheGPUMap::default(),

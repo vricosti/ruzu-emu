@@ -356,13 +356,10 @@ impl Mouse {
             return;
         }
 
-        let length =
-            (self.last_mouse_change.0.powi(2) + self.last_mouse_change.1.powi(2)).sqrt();
+        let length = (self.last_mouse_change.0.powi(2) + self.last_mouse_change.1.powi(2)).sqrt();
         if length > MAXIMUM_STICK_RANGE {
-            self.last_mouse_change.0 =
-                self.last_mouse_change.0 / length * MAXIMUM_STICK_RANGE;
-            self.last_mouse_change.1 =
-                self.last_mouse_change.1 / length * MAXIMUM_STICK_RANGE;
+            self.last_mouse_change.0 = self.last_mouse_change.0 / length * MAXIMUM_STICK_RANGE;
+            self.last_mouse_change.1 = self.last_mouse_change.1 / length * MAXIMUM_STICK_RANGE;
         }
 
         let pending = {

@@ -4082,10 +4082,29 @@ impl TextureCache {
             return;
         }
 
+        let trace_zero_memory = std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
+            && (size == 0x50 || size == 0x1000);
+
         let mut images = SmallVec::<[ImageId; 16]>::new();
         self.base
             .for_each_image_in_region(cpu_addr, size, |image_id, image| {
+                if trace_zero_memory {
+                    eprintln!(
+                        "[TEXTURE_DOWNLOAD_CANDIDATE] requested=0x{cpu_addr:X}+0x{size:X} image_id={image_id:?} gpu=0x{:X} cpu=0x{:X} end=0x{:X} flags={:?} safe={} info={:?}",
+                        image.gpu_addr,
+                        image.cpu_addr,
+                        image.cpu_addr_end,
+                        image.flags,
+                        image.is_safe_download(),
+                        image.info,
+                    );
+                }
                 if !image.is_safe_download() {
+                    return false;
+                }
+                if std::env::var_os("RUZU_SKIP_BAD_OVERLAP_DOWNLOAD").is_some()
+                    && image.flags.contains(ImageFlagBits::BAD_OVERLAP)
+                {
                     return false;
                 }
                 image.flags.remove(ImageFlagBits::GPU_MODIFIED);
@@ -4099,12 +4118,29 @@ impl TextureCache {
 
         for image_id in images {
             let Some((image_base, staging)) = self.download_image_to_host_staging(image_id) else {
+                if trace_zero_memory {
+                    eprintln!("[TEXTURE_DOWNLOAD_FAILED] image_id={image_id:?}");
+                }
                 continue;
             };
+            if trace_zero_memory {
+                eprintln!(
+                    "[TEXTURE_DOWNLOAD_STAGING] image_id={image_id:?} len=0x{:X} head={:02X?}",
+                    staging.len(),
+                    &staging[..staging.len().min(32)],
+                );
+            }
             let copies = full_download_copies(&image_base.info);
-            let _ = self
+            let wrote = self
                 .base
                 .write_downloaded_image(&image_base, &copies, &staging);
+            if trace_zero_memory {
+                eprintln!(
+                    "[TEXTURE_DOWNLOAD_WRITTEN] image_id={image_id:?} wrote={wrote} gpu=0x{:X} cpu=0x{:X}",
+                    image_base.gpu_addr,
+                    image_base.cpu_addr,
+                );
+            }
         }
     }
 

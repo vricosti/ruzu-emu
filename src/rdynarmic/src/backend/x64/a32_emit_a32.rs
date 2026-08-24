@@ -6,6 +6,7 @@
 use rxbyak::{byte_ptr, dword_ptr, qword_ptr, xmmword_ptr};
 use rxbyak::{RegExp, R15, RAX, RSP};
 
+use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::abi;
 use crate::backend::x64::block_of_code::{
     emit_switch_mxcsr_on_entry, emit_switch_mxcsr_on_exit, STACK_LAYOUT_RSP_OFFSET,
@@ -13,16 +14,15 @@ use crate::backend::x64::block_of_code::{
 use crate::backend::x64::callback::{Callback as X64Callback, SimpleCallback};
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::host_feature::HostFeature;
-use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::nzcv_util;
 use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
 use crate::backend::x64::stack_layout::StackLayout;
-use crate::ir::inst::Inst;
-use crate::ir::value::InstRef;
 use crate::interface::a32::coprocessor::{
     Callback as CoprocessorCallback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords,
 };
 use crate::interface::a32::coprocessor_util::CoprocReg;
+use crate::ir::inst::Inst;
+use crate::ir::value::InstRef;
 
 // ---------------------------------------------------------------------------
 // Conditional block prelude
@@ -1221,7 +1221,6 @@ pub fn emit_a32_isb(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _i
         .unwrap();
 }
 
-
 // ---------------------------------------------------------------------------
 // Coprocessor operations
 // ---------------------------------------------------------------------------
@@ -1241,10 +1240,7 @@ fn call_coproc_callback(
 
     if let Some(user_arg) = callback.user_arg {
         ra.asm
-            .mov(
-                abi::ABI_PARAMS[0].to_reg64(),
-                user_arg as usize as i64,
-            )
+            .mov(abi::ABI_PARAMS[0].to_reg64(), user_arg as usize as i64)
             .unwrap();
     }
 
@@ -1397,14 +1393,9 @@ pub fn emit_a32_coproc_get_one_word(
         CallbackOrAccessOneWord::Memory(source_ptr) => {
             let word = ra.scratch_gpr();
             let source_addr = ra.scratch_gpr();
+            ra.asm.mov(source_addr, source_ptr as usize as i64).unwrap();
             ra.asm
-                .mov(source_addr, source_ptr as usize as i64)
-                .unwrap();
-            ra.asm
-                .mov(
-                    word.cvt32().unwrap(),
-                    dword_ptr(RegExp::from(source_addr)),
-                )
+                .mov(word.cvt32().unwrap(), dword_ptr(RegExp::from(source_addr)))
                 .unwrap();
             ra.define_value(inst_ref, word);
         }
@@ -1517,6 +1508,11 @@ mod tests {
     use crate::frontend::a32::fpscr::FPSCR;
     use crate::frontend::a32::psr::PSR;
     use crate::frontend::a32::types::Reg;
+    use crate::interface::a32::coprocessor::{
+        Callback as CoprocessorCallback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords,
+        Coprocessor,
+    };
+    use crate::interface::a32::coprocessor_util::CoprocReg;
     use crate::ir::acc_type::AccType;
     use crate::ir::block::Block;
     use crate::ir::inst::Inst;
@@ -1525,11 +1521,6 @@ mod tests {
     use crate::ir::terminal::Terminal;
     use crate::ir::types::Type;
     use crate::ir::value::{InstRef, Value};
-    use crate::interface::a32::coprocessor::{
-        Callback as CoprocessorCallback, CallbackOrAccessOneWord, CallbackOrAccessTwoWords,
-        Coprocessor,
-    };
-    use crate::interface::a32::coprocessor_util::CoprocReg;
     use std::cell::UnsafeCell;
     use std::sync::{Arc, Mutex};
 
@@ -1730,10 +1721,7 @@ mod tests {
             send_one_word: Mutex::new(None),
         });
         let destination = coprocessor.destination.get() as usize as u64;
-        let code = emit_send_one_word(
-            coproc_info(15, true, 6, 7, 10, 5),
-            coprocessor.clone(),
-        );
+        let code = emit_send_one_word(coproc_info(15, true, 6, 7, 10, 5), coprocessor.clone());
 
         assert_eq!(
             *coprocessor.send_one_word.lock().unwrap(),
@@ -1786,12 +1774,11 @@ mod tests {
             .collect();
 
         let mut asm = rxbyak::CodeAssembler::new(2 * 1024 * 1024).unwrap();
-        let fastmem_fallbacks =
-            crate::backend::x64::a32_emit_x64_memory::gen_fastmem_fallbacks(
-                &mut asm,
-                &config.callbacks,
-                None,
-            );
+        let fastmem_fallbacks = crate::backend::x64::a32_emit_x64_memory::gen_fastmem_fallbacks(
+            &mut asm,
+            &config.callbacks,
+            None,
+        );
         let mut gpr_order = ANY_GPR.to_vec();
         gpr_order.retain(|&loc| loc != HOST_R13);
         let mut ra = RegAlloc::new(&mut asm, gpr_order, ANY_XMM.to_vec(), inst_info);

@@ -15,12 +15,12 @@ use common::elf::{
     elf64_rel_type, Elf64Dyn, Elf64Rela, Elf64Relr, ELF_AARCH64_RELATIVE, ELF_DT_NULL, ELF_DT_RELA,
     ELF_DT_RELASZ, ELF_DT_RELR, ELF_DT_RELRSZ,
 };
-use rdynarmic::HaltReason;
 use rdynarmic::interface::a64::config::{
     Exception as A64Exception, UserCallbacks as A64UserCallbacks, UserConfig as A64UserConfig,
     Vector as A64Vector,
 };
 use rdynarmic::A64Jit;
+use rdynarmic::HaltReason;
 
 use crate::memory::memory::Memory;
 

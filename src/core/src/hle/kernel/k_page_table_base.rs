@@ -494,10 +494,9 @@ impl KPageTableBase {
                         .unmap(addr, size, false);
                 }
 
-                let mut page_group =
-                    super::k_page_group::KPageGroup::with_block_info_manager(
-                        self.m_block_info_manager.clone(),
-                    );
+                let mut page_group = super::k_page_group::KPageGroup::with_block_info_manager(
+                    self.m_block_info_manager.clone(),
+                );
                 let _ = self.make_page_group(&mut page_group, addr, size / PAGE_SIZE);
                 page_group.close_and_reset();
             });
@@ -1401,10 +1400,9 @@ impl KPageTableBase {
         match operation {
             OperationType::Unmap | OperationType::UnmapPhysical => {
                 let separate_heap = matches!(operation, OperationType::UnmapPhysical);
-                let mut pages_to_close =
-                    super::k_page_group::KPageGroup::with_block_info_manager(
-                        self.m_block_info_manager.clone(),
-                    );
+                let mut pages_to_close = super::k_page_group::KPageGroup::with_block_info_manager(
+                    self.m_block_info_manager.clone(),
+                );
                 let close_pages = self.make_page_group(&mut pages_to_close, virt_addr, num_pages);
                 if close_pages != 0 {
                     return close_pages;
@@ -1693,9 +1691,7 @@ impl KPageTableBase {
         let slab = match self.m_memory_block_slab_manager.clone() {
             Some(s) => s,
             None => {
-                log::error!(
-                    "make_block_update_allocator: page table has no block slab manager"
-                );
+                log::error!("make_block_update_allocator: page table has no block slab manager");
                 return Err(svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value());
             }
         };
@@ -1726,8 +1722,7 @@ impl KPageTableBase {
     /// Current Eden only drains this list; freeing page-table entries remains
     /// commented out until guest-memory page-table allocation is enabled.
     pub fn finalize_update(&mut self, page_list: &mut PageLinkedList) {
-        while page_list.pop().is_some() {
-        }
+        while page_list.pop().is_some() {}
     }
 
     // -- FindFreeArea --
@@ -1924,8 +1919,7 @@ impl KPageTableBase {
                 }
 
                 if let Some(ref resource_limit) = self.m_resource_limit {
-                    resource_limit
-                        .release(LimitableResource::PhysicalMemoryMax, free_size as i64);
+                    resource_limit.release(LimitableResource::PhysicalMemoryMax, free_size as i64);
                 }
 
                 self.m_memory_block_manager.update_with_allocator(
@@ -6678,8 +6672,7 @@ impl KPageTableBase {
         let unmapped_size = aligned_size.saturating_sub(mapping_size);
         if unmapped_size > 0 {
             if let Some(resource_limit) = &self.m_resource_limit {
-                resource_limit
-                    .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
+                resource_limit.release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
             }
             self.m_mapped_ipc_server_memory = self
                 .m_mapped_ipc_server_memory
@@ -9178,9 +9171,7 @@ mod tests {
         dst.m_address_space_end = 0x1002_0000;
         dst.m_alias_region_start = 0x1000_0000;
         dst.m_alias_region_end = 0x1002_0000;
-        dst.m_resource_limit = Some(Arc::new(create_resource_limit_for_process(
-            0x10_0000,
-        )));
+        dst.m_resource_limit = Some(Arc::new(create_resource_limit_for_process(0x10_0000)));
         dst.m_memory = Some(page_table_memory.memory.clone());
         dst.initialize_impl();
         assert!(dst
@@ -9294,9 +9285,7 @@ mod tests {
         dst.m_address_space_end = 0x1002_0000;
         dst.m_alias_region_start = 0x1000_0000;
         dst.m_alias_region_end = 0x1002_0000;
-        dst.m_resource_limit = Some(Arc::new(create_resource_limit_for_process(
-            0x10_0000,
-        )));
+        dst.m_resource_limit = Some(Arc::new(create_resource_limit_for_process(0x10_0000)));
         dst.m_memory = Some(page_table_memory.memory.clone());
         dst.initialize_impl();
         assert!(dst

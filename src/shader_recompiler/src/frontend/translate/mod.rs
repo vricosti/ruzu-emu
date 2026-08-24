@@ -98,7 +98,8 @@ pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
 
-use crate::frontend::maxwell_opcodes::{self, MaxwellOpcode, SrcType};
+use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
+use crate::environment::Environment;
 use crate::ir::emitter::Emitter;
 use crate::ir::program::Program;
 use crate::ir::types::ShaderStage;
@@ -131,6 +132,9 @@ pub struct TranslatorVisitor<'a> {
     pub ir: Emitter<'a>,
     pub stage: ShaderStage,
     pub sph: Option<ProgramHeader>,
+    /// Upstream `TranslatorVisitor::env` owner. Runtime translation always
+    /// supplies this; reduced instruction tests may omit it.
+    pub env: Option<&'a dyn Environment>,
 }
 
 impl<'a> TranslatorVisitor<'a> {
@@ -144,6 +148,23 @@ impl<'a> TranslatorVisitor<'a> {
             ir: Emitter::new(program, block),
             stage,
             sph,
+            env: None,
+        }
+    }
+
+    /// Construct the runtime visitor with the same environment ownership as
+    /// upstream `TranslatorVisitor(Environment&, IR::Block&)`.
+    pub fn new_with_env(
+        program: &'a mut Program,
+        block: u32,
+        env: &'a dyn Environment,
+    ) -> Self {
+        let stage = env.shader_stage();
+        Self {
+            ir: Emitter::new(program, block),
+            stage,
+            sph: Some(env.sph().clone()),
+            env: Some(env),
         }
     }
 
@@ -460,10 +481,7 @@ impl<'a> TranslatorVisitor<'a> {
     ///
     /// Corresponds to the dispatch table in upstream `impl.cpp`.
     pub fn translate_instruction(&mut self, insn: u64) {
-        let opcode = match maxwell_opcodes::decode_opcode(insn) {
-            Some(op) => op,
-            None => panic!("Invalid Maxwell opcode 0x{insn:016X}"),
-        };
+        let opcode = super::decode::decode(insn);
 
         match opcode {
             // FP32 arithmetic — floating_point_add.cpp
@@ -962,6 +980,7 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::BPT => self.translate_bpt(insn),
             MaxwellOpcode::CCTL => self.translate_cctl(insn),
             MaxwellOpcode::CCTLL => self.translate_cctll(insn),
+            MaxwellOpcode::CCTLT => self.translate_cctlt(insn),
             MaxwellOpcode::CS2R => self.translate_cs2r(insn),
             MaxwellOpcode::FCHK_reg => self.translate_fchk_reg(insn),
             MaxwellOpcode::FCHK_cbuf => self.translate_fchk_cbuf(insn),
@@ -1266,11 +1285,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid Maxwell opcode")]
-    fn invalid_opcode_is_not_silently_ignored() {
+    fn invalid_opcode_uses_upstream_nop_fallback() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);
         tv.translate_instruction(0);
+
+        assert!(tv.ir.program.blocks[0].is_empty());
     }
 }

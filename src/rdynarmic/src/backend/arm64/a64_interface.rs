@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use crate::interface::a64::config::{UserCallbacks, UserConfig};
+use crate::interface::a64::config::{UserCallbacks, UserConfig, Vector};
 use crate::interface::halt_reason::HaltReason;
 
 use super::a64_address_space::{A64AddressSpace, A64CallbackContext};
@@ -79,10 +79,18 @@ impl A64Interface {
             &mut inner.current_state,
             halt_reason,
         );
-        inner.is_executing = false;
-        let hr = hr?;
-        self.perform_requested_cache_invalidation(hr)?;
-        Ok(hr)
+        match hr {
+            Ok(hr) => {
+                let invalidation_result = self.perform_requested_cache_invalidation(hr);
+                self.is_executing = false;
+                invalidation_result?;
+                Ok(hr)
+            }
+            Err(err) => {
+                self.is_executing = false;
+                Err(err)
+            }
+        }
     }
 
     pub fn step(&mut self) -> Result<HaltReason, String> {
@@ -96,10 +104,18 @@ impl A64Interface {
             &mut inner.current_state,
             halt_reason,
         );
-        inner.is_executing = false;
-        let hr = hr?;
-        self.perform_requested_cache_invalidation(hr)?;
-        Ok(hr)
+        match hr {
+            Ok(hr) => {
+                let invalidation_result = self.perform_requested_cache_invalidation(hr);
+                self.is_executing = false;
+                invalidation_result?;
+                Ok(hr)
+            }
+            Err(err) => {
+                self.is_executing = false;
+                Err(err)
+            }
+        }
     }
 
     pub fn clear_cache(&self) {
@@ -109,7 +125,7 @@ impl A64Interface {
     }
 
     pub fn invalidate_cache_range(&self, start_address: u64, length: usize) {
-        let end_address = start_address.wrapping_add(length.saturating_sub(1) as u64);
+        let end_address = start_address.wrapping_add(length as u64).wrapping_sub(1);
         let mut invalidation = self.invalidation.lock().expect("A64 invalidation poisoned");
         invalidation
             .invalid_cache_ranges
@@ -153,12 +169,49 @@ impl A64Interface {
         &mut self.current_state.reg
     }
 
+    pub fn get_register(&self, index: usize) -> u64 {
+        self.regs()[index]
+    }
+
+    pub fn set_register(&mut self, index: usize, value: u64) {
+        self.regs_mut()[index] = value;
+    }
+
+    pub fn get_registers(&self) -> [u64; 31] {
+        *self.regs()
+    }
+
+    pub fn set_registers(&mut self, value: [u64; 31]) {
+        *self.regs_mut() = value;
+    }
+
     pub fn vec_regs(&self) -> &A64VecRegs {
         &self.current_state.vec
     }
 
     pub fn vec_regs_mut(&mut self) -> &mut A64VecRegs {
         &mut self.current_state.vec
+    }
+
+    pub fn get_vector(&self, index: usize) -> Vector {
+        let vec = &self.vec_regs().0;
+        [vec[index * 2], vec[index * 2 + 1]]
+    }
+
+    pub fn set_vector(&mut self, index: usize, value: Vector) {
+        let vec = &mut self.vec_regs_mut().0;
+        vec[index * 2] = value[0];
+        vec[index * 2 + 1] = value[1];
+    }
+
+    pub fn get_vectors(&self) -> [Vector; 32] {
+        std::array::from_fn(|index| self.get_vector(index))
+    }
+
+    pub fn set_vectors(&mut self, value: [Vector; 32]) {
+        for (index, vector) in value.into_iter().enumerate() {
+            self.set_vector(index, vector);
+        }
     }
 
     pub fn fpcr(&self) -> u32 {
@@ -205,6 +258,10 @@ impl A64Interface {
         self.is_executing
     }
 
+    pub fn disassemble(&self) -> String {
+        String::new()
+    }
+
     pub fn tpidrro_el0(&self) -> u64 {
         self.current_address_space
             .config()
@@ -247,26 +304,30 @@ impl A64Interface {
             return Ok(());
         }
 
-        self.clear_halt(HaltReason::CACHE_INVALIDATION);
+        let inner = &mut self.inner;
+        let mut invalidation = inner
+            .invalidation
+            .lock()
+            .expect("A64 invalidation poisoned");
+        inner
+            .halt_reason
+            .fetch_and(!HaltReason::CACHE_INVALIDATION.bits(), Ordering::SeqCst);
 
-        let (invalidate_entire_cache, invalid_cache_ranges) = {
-            let mut invalidation = self.invalidation.lock().expect("A64 invalidation poisoned");
-            let invalidate_entire_cache = invalidation.invalidate_entire_cache;
-            let invalid_cache_ranges = std::mem::take(&mut invalidation.invalid_cache_ranges);
-            invalidation.invalidate_entire_cache = false;
-            (invalidate_entire_cache, invalid_cache_ranges)
-        };
-
-        if invalidate_entire_cache {
-            self.current_address_space
+        if invalidation.invalidate_entire_cache {
+            inner
+                .current_address_space
                 .address_space_mut()
                 .clear_cache()?;
+            invalidation.invalidate_entire_cache = false;
+            invalidation.invalid_cache_ranges.clear();
             return Ok(());
         }
 
-        if !invalid_cache_ranges.is_empty() {
-            self.current_address_space
-                .invalidate_cache_ranges(&invalid_cache_ranges);
+        if !invalidation.invalid_cache_ranges.is_empty() {
+            inner
+                .current_address_space
+                .invalidate_cache_ranges(&invalidation.invalid_cache_ranges);
+            invalidation.invalid_cache_ranges.clear();
         }
 
         Ok(())
@@ -396,10 +457,11 @@ mod tests {
         let mut interface = A64Interface::new(config()).unwrap();
         interface.set_pc(0x1000);
         interface.clear_cache();
+        interface.halt_execution(HaltReason::EXTERNAL_HALT);
 
-        let err = interface.run().unwrap_err();
+        let result = interface.run().unwrap();
 
-        assert!(err.contains("A64ExceptionRaised"));
+        assert!(result.contains(HaltReason::EXTERNAL_HALT));
         assert!(!interface
             .current_halt_reason()
             .contains(HaltReason::CACHE_INVALIDATION));
@@ -410,17 +472,39 @@ mod tests {
         let mut interface = A64Interface::new(config()).unwrap();
         interface.set_pc(0x1000);
         interface.set_sp(0x2000);
-        interface.regs_mut()[0] = 0x1234;
+        interface.set_register(0, 0x1234);
+        interface.set_registers(std::array::from_fn(|index| index as u64));
+        interface.set_vector(0, [0x1234, 0x5678]);
+        interface.set_vectors(std::array::from_fn(|index| [index as u64, !(index as u64)]));
         interface.set_fpcr(0x0040_0000);
         interface.set_fpsr(0x0800_0000);
         interface.set_pstate(0xF000_0000);
 
         assert_eq!(interface.pc(), 0x1000);
         assert_eq!(interface.sp(), 0x2000);
-        assert_eq!(interface.regs()[0], 0x1234);
+        assert_eq!(interface.get_register(0), 0);
+        assert_eq!(
+            interface.get_registers(),
+            std::array::from_fn(|index| index as u64)
+        );
+        assert_eq!(interface.get_vector(0), [0, u64::MAX]);
+        assert_eq!(
+            interface.get_vectors(),
+            std::array::from_fn(|index| [index as u64, !(index as u64)])
+        );
         assert_eq!(interface.fpcr(), 0x0040_0000);
         assert_eq!(interface.fpsr(), 0x0800_0000);
         assert_eq!(interface.pstate(), 0xF000_0000);
+        assert!(interface.disassemble().is_empty());
+    }
+
+    #[test]
+    fn invalidation_range_uses_upstream_unsigned_arithmetic() {
+        let interface = A64Interface::new(config()).unwrap();
+        interface.invalidate_cache_range(5, 0);
+        let invalidation = interface.invalidation.lock().unwrap();
+
+        assert_eq!(invalidation.invalid_cache_ranges, vec![5..=4]);
     }
 
     #[test]

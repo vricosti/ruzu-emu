@@ -980,7 +980,11 @@ impl A32EmitX64 {
     pub fn invalidate_range(&mut self, start: u64, length: u64) {
         let start = start as u32;
         let end = start.wrapping_add(length as u32).wrapping_sub(1);
-        for location in self.block_ranges.invalidate_ranges(&[start..=end]) {
+        self.invalidate_ranges(&[start..=end]);
+    }
+
+    pub fn invalidate_ranges(&mut self, ranges: &[std::ops::RangeInclusive<u32>]) {
+        for location in self.block_ranges.invalidate_ranges(ranges) {
             self.invalidate_basic_block(location);
         }
     }

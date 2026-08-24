@@ -2577,7 +2577,7 @@ impl ArmInterface for ArmDynarmic64 {
 
     fn invalidate_cache_range(&mut self, addr: u64, size: usize) {
         if let Some(jit) = self.jit.as_mut() {
-            jit.invalidate_cache_range(addr, size as u64);
+            jit.invalidate_cache_range(addr, size);
         }
     }
 
@@ -2607,7 +2607,7 @@ impl ArmInterface for ArmDynarmic64 {
 
         // Vector registers
         for i in 0..32 {
-            let (lo, hi) = jit.get_vector(i);
+            let (lo, hi) = jit.get_vector_parts(i);
             ctx.v[i] = (lo as u128) | ((hi as u128) << 64);
         }
 
@@ -2640,7 +2640,7 @@ impl ArmInterface for ArmDynarmic64 {
         for i in 0..32 {
             let lo = ctx.v[i] as u64;
             let hi = (ctx.v[i] >> 64) as u64;
-            jit.set_vector(i, lo, hi);
+            jit.set_vector_parts(i, lo, hi);
         }
 
         jit.set_fpcr(ctx.fpcr);

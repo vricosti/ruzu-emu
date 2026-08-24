@@ -2894,7 +2894,7 @@ impl ArmInterface for ArmDynarmic32 {
     fn invalidate_cache_range(&mut self, addr: u64, size: usize) {
         if let Some(jit) = self.jit.as_mut() {
             // Upstream casts addr to u32 for A32
-            jit.invalidate_cache_range(addr, size as u64);
+            jit.invalidate_cache_range(addr as u32, size);
         }
     }
 

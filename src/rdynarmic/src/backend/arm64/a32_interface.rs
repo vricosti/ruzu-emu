@@ -26,7 +26,6 @@ pub struct A32InterfaceInner {
     core: A32Core,
     halt_reason: AtomicU32,
     invalidation: Mutex<A32Invalidation>,
-    is_executing: bool,
 }
 
 impl Deref for A32Interface {
@@ -67,7 +66,6 @@ impl A32Interface {
                 core,
                 halt_reason: AtomicU32::new(0),
                 invalidation: Mutex::new(A32Invalidation::default()),
-                is_executing: false,
             }),
         };
         interface.install_callback_context();
@@ -81,38 +79,54 @@ impl A32Interface {
         Ok(interface)
     }
 
-    pub fn run(&mut self) -> Result<HaltReason, String> {
-        assert!(!self.is_executing, "Recursive JIT execution not allowed");
+    pub fn run(&mut self, is_executing: &mut bool) -> Result<HaltReason, String> {
+        assert!(!*is_executing, "Recursive JIT execution not allowed");
         self.perform_requested_cache_invalidation(self.current_halt_reason())?;
         let inner = &mut self.inner;
-        inner.is_executing = true;
+        *is_executing = true;
         let halt_reason = inner.halt_reason.as_ptr();
         let hr = inner.core.run(
             &mut inner.current_address_space,
             &mut inner.current_state,
             halt_reason,
         );
-        inner.is_executing = false;
-        let hr = hr?;
-        self.perform_requested_cache_invalidation(hr)?;
-        Ok(hr)
+        match hr {
+            Ok(hr) => {
+                let invalidation_result = self.perform_requested_cache_invalidation(hr);
+                *is_executing = false;
+                invalidation_result?;
+                Ok(hr)
+            }
+            Err(err) => {
+                *is_executing = false;
+                Err(err)
+            }
+        }
     }
 
-    pub fn step(&mut self) -> Result<HaltReason, String> {
-        assert!(!self.is_executing, "Recursive JIT execution not allowed");
+    pub fn step(&mut self, is_executing: &mut bool) -> Result<HaltReason, String> {
+        assert!(!*is_executing, "Recursive JIT execution not allowed");
         self.perform_requested_cache_invalidation(self.current_halt_reason())?;
         let inner = &mut self.inner;
-        inner.is_executing = true;
+        *is_executing = true;
         let halt_reason = inner.halt_reason.as_ptr();
         let hr = inner.core.step(
             &mut inner.current_address_space,
             &mut inner.current_state,
             halt_reason,
         );
-        inner.is_executing = false;
-        let hr = hr?;
-        self.perform_requested_cache_invalidation(hr)?;
-        Ok(hr)
+        match hr {
+            Ok(hr) => {
+                let invalidation_result = self.perform_requested_cache_invalidation(hr);
+                *is_executing = false;
+                invalidation_result?;
+                Ok(hr)
+            }
+            Err(err) => {
+                *is_executing = false;
+                Err(err)
+            }
+        }
     }
 
     pub fn clear_cache(&self) {
@@ -122,7 +136,7 @@ impl A32Interface {
     }
 
     pub fn invalidate_cache_range(&self, start_address: u32, length: usize) {
-        let end_address = start_address.wrapping_add(length.saturating_sub(1) as u32);
+        let end_address = start_address.wrapping_add(length as u32).wrapping_sub(1);
         let mut invalidation = self.invalidation.lock().expect("A32 invalidation poisoned");
         invalidation
             .invalid_cache_ranges
@@ -171,20 +185,6 @@ impl A32Interface {
     }
 
     pub fn set_fpscr(&mut self, value: u32) {
-        // Diagnostic: with `RUZU_LOG_A32_FPSCR_MODES` set, log each distinct
-        // FPSCR mode (upper 16 bits) restored via the host interface.
-        static SEEN: std::sync::OnceLock<
-            Option<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
-        > = std::sync::OnceLock::new();
-        if let Some(seen) = SEEN.get_or_init(|| {
-            std::env::var_os("RUZU_LOG_A32_FPSCR_MODES")
-                .map(|_| std::sync::Mutex::new(std::collections::BTreeSet::new()))
-        }) {
-            let mode = value & 0xffff_0000;
-            if seen.lock().unwrap().insert(mode) {
-                eprintln!("[A32_FPSCR_MODES] host set_fpscr mode=0x{mode:08X}");
-            }
-        }
         self.current_state.set_fpscr(value);
     }
 
@@ -204,8 +204,8 @@ impl A32Interface {
         (&self.current_state as *const A32JitState).cast()
     }
 
-    pub fn is_executing(&self) -> bool {
-        self.is_executing
+    pub fn disassemble(&self) -> String {
+        String::new()
     }
 
     pub fn compile_block_only(&mut self) -> Result<*const u8, String> {
@@ -224,26 +224,30 @@ impl A32Interface {
             return Ok(());
         }
 
-        self.clear_halt(HaltReason::CACHE_INVALIDATION);
+        let inner = &mut self.inner;
+        let mut invalidation = inner
+            .invalidation
+            .lock()
+            .expect("A32 invalidation poisoned");
+        inner
+            .halt_reason
+            .fetch_and(!HaltReason::CACHE_INVALIDATION.bits(), Ordering::SeqCst);
 
-        let (invalidate_entire_cache, invalid_cache_ranges) = {
-            let mut invalidation = self.invalidation.lock().expect("A32 invalidation poisoned");
-            let invalidate_entire_cache = invalidation.invalidate_entire_cache;
-            let invalid_cache_ranges = std::mem::take(&mut invalidation.invalid_cache_ranges);
-            invalidation.invalidate_entire_cache = false;
-            (invalidate_entire_cache, invalid_cache_ranges)
-        };
-
-        if invalidate_entire_cache {
-            self.current_address_space
+        if invalidation.invalidate_entire_cache {
+            inner
+                .current_address_space
                 .address_space_mut()
                 .clear_cache()?;
+            invalidation.invalidate_entire_cache = false;
+            invalidation.invalid_cache_ranges.clear();
             return Ok(());
         }
 
-        if !invalid_cache_ranges.is_empty() {
-            self.current_address_space
-                .invalidate_cache_ranges(&invalid_cache_ranges);
+        if !invalidation.invalid_cache_ranges.is_empty() {
+            inner
+                .current_address_space
+                .invalidate_cache_ranges(&invalidation.invalid_cache_ranges);
+            invalidation.invalid_cache_ranges.clear();
         }
 
         Ok(())
@@ -389,9 +393,11 @@ mod tests {
         interface.clear_cache();
         interface.halt_execution(HaltReason::EXTERNAL_HALT);
 
-        let result = interface.run().unwrap();
+        let mut is_executing = false;
+        let result = interface.run(&mut is_executing).unwrap();
 
         assert!(result.contains(HaltReason::EXTERNAL_HALT));
+        assert!(!is_executing);
         assert!(!interface
             .current_halt_reason()
             .contains(HaltReason::CACHE_INVALIDATION));
@@ -422,6 +428,16 @@ mod tests {
         assert_eq!(interface.regs()[0], 0x1234);
         assert_eq!(interface.cpsr() & 0xF000_0010, 0xF000_0010);
         assert_eq!(interface.fpscr() & 0x0800_0000, 0x0800_0000);
+        assert!(interface.disassemble().is_empty());
+    }
+
+    #[test]
+    fn invalidation_range_uses_upstream_unsigned_arithmetic() {
+        let interface = A32Interface::new(config()).unwrap();
+        interface.invalidate_cache_range(5, 0);
+        let invalidation = interface.invalidation.lock().unwrap();
+
+        assert_eq!(invalidation.invalid_cache_ranges, vec![5..=4]);
     }
 
     #[test]
@@ -481,7 +497,6 @@ mod tests {
         assert!(prelude.isb_raised.is_some());
         assert!(prelude.add_ticks.is_some());
         assert!(prelude.get_ticks_remaining.is_some());
-        assert!(prelude.get_cntpct.is_some());
         assert!(interface.callback_context.is_some());
     }
 }

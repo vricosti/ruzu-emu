@@ -11904,3 +11904,34 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: Windows generated accessors use exact 16-byte value/expected payloads after the 32-byte
   shadow space; System V transfers two 64-bit lanes per value. Linux execution covers direct and
   faulting fastmem `LDR/STR Q`, while Windows and AArch64 cross-target test builds pass.
+
+## 2026-08-24 — `src/rdynarmic/src/tests_a32_fuzz.rs` and `tools/a32_oracle.cpp` vs Eden A32 JIT differential-test behavior
+
+### Intentional differences
+- Test-only runners retain one Rust JIT and one Eden oracle process per test thread. Between cases
+  they reset CPU state, clear the complete code cache, replace code memory, clear data memory,
+  restore the 200-tick budget, and use the same optimization configuration as the former
+  one-process/one-JIT-per-case path; the first case starts from the equivalent fresh state.
+- The local oracle adds a `BATCH` protocol around Eden's public A32 JIT interface. This is tooling
+  only; the one-shot and existing `INIT` protocols remain compatible.
+
+### Unintentional differences (to fix)
+- Fixed: the differential harness rebuilt both JITs and spawned an Eden process for every case,
+  making the full-coverage fuzz tests appear blocked for minutes. Persistent runners now preserve
+  case isolation while removing initialization overhead.
+- Fixed during verification: calling `ClearCache` before `Reset` lost Eden's pending
+  `CacheInvalidation` halt bit because `Reset` zeroes the JIT state. Both runners now perform
+  `Reset` before `ClearCache`, so the following `Run` consumes the invalidation exactly as Eden's
+  A32 interface requires.
+- Fixed: the Eden oracle left `UserConfig::global_monitor` null even though the generated Thumb32
+  corpus includes exclusive loads and stores. Those cases terminated the oracle with SIGSEGV and
+  were silently skipped; all oracle modes now own a one-core `ExclusiveMonitor`, matching the Rust
+  runner and restoring the missing comparisons.
+
+### Missing items
+- None for the reviewed differential-test lifecycle. An older externally configured oracle falls
+  back to the original one-shot protocol, and a failed batch session also falls back safely.
+
+### Binary layout verification
+- PASS: the text protocol still transfers exactly 15 input GPRs, an instruction count, the code
+  words, 16 output GPRs, and CPSR. No production or guest-visible binary structure changed.

@@ -3978,6 +3978,35 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - N/A: the tools exchange no raw callback or configuration payload. Focused compile-time tests
   require both environments to implement the architecture-owned A32 callback trait.
 
+## 2026-08-24 — `src/rdynarmic/src/{tests_a32.rs,tests_a32_fuzz.rs}` callback/configuration ownership vs Eden `src/dynarmic/src/dynarmic/interface/A32/config.h` and `tests/A32/testenv.h`
+
+### Intentional differences
+
+- Rust keeps deterministic and differential cases in crate-local test modules rather than Eden's
+  Catch2 translation units. `Box<dyn A32UserCallbacks>` owns each environment for the Rust JIT,
+  replacing Eden's non-owning callback pointer.
+- Sparse test memory uses Rust maps and mutexes while preserving Eden's A32 `u32` guest-address
+  domain and little-endian byte assembly.
+
+### Unintentional differences (to fix)
+
+- Fixed: the A32 test environments implemented the merged legacy interface, carried A64-only
+  128-bit/cache callbacks, and widened guest addresses to `u64`. They now implement the exact A32
+  callback inventory with typed exceptions and wrapping `u32` address arithmetic.
+- Fixed: test JIT builders now construct `A32UserConfig` directly and mutate only the code-cache,
+  optimization, cycle-counting, and coprocessor fields exercised by the corresponding test.
+
+### Missing items
+
+- None in the callback/configuration ownership covered by this slice. Differential tests still
+  require their separately built Eden oracle executable at runtime.
+
+### Binary layout verification
+
+- N/A: callback/configuration objects are host-side state. Existing instruction tests cover the
+  memory and coprocessor paths; a focused local fuzz-environment regression constructs and runs an
+  A32 JIT without relying on the external oracle.
+
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/{decoder.rs,decoder_thumb32.rs,translate/thumb32.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/{decoder,translate/impl}`
 
 ### Intentional differences

@@ -10684,6 +10684,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   a poisoned second word and verifies that the JIT loads the first-word pointer; arm64 emission
   tests verify the configured `LSL #4` and unscaled indexed `LDR` sequence.
 
+## 2026-08-24 — `src/core/src/arm/dynarmic/arm_dynarmic_{32,64}.rs` vs Eden `core/arm/dynarmic/arm_dynarmic_{32,64}.{h,cpp}` (`page_table_log2_stride`)
+
+### Intentional differences
+- Eden indexes its interleaved 32-byte `Common::PageTable::PageEntryData` records and therefore
+  uses a log2 stride of five. Ruzu exposes its separate contiguous `PageInfo` pointer buffer to
+  rdynarmic, so both JIT owners derive the stride from `size_of::<PageInfo>()` (eight bytes and a
+  log2 stride of three on the supported 64-bit hosts). A compile-time assertion preserves the
+  required power-of-two layout contract.
+
+### Unintentional differences (to fix)
+- Fixed: after rdynarmic gained the upstream `page_table_log2_stride` option, the two explicit
+  core `MemoryEmitConfig` initializers did not forward their concrete page-table entry stride and
+  no longer compiled.
+- Fixed: `DynarmicCallbacks64` still implemented the removed, non-upstream
+  `interpreter_fallback` compatibility callback after the A64 interface migration. The unreachable
+  callback and its private trace helper are removed; unsupported instructions continue through
+  the translator/JIT exception path owned by rdynarmic, matching Eden.
+
+### Missing items
+- None for this configuration field.
+
+### Binary layout verification
+- PASS: each core owner derives the emitted index stride from the exact `PageInfo` element type
+  backing the pointer passed to rdynarmic and statically rejects a non-power-of-two entry size.
+
 ## 2026-08-24 — `src/rdynarmic/src/{interface/a64/config.rs,jit.rs,jit_config.rs,backend/arm64/a64_{address_space,core,interface}.rs,backend/arm64/emit_arm64.rs}` vs Eden `interface/A64/config.h` and `backend/{x64,arm64}/a64_{interface,address_space}.*`
 
 ### Intentional differences

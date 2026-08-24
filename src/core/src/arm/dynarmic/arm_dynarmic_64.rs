@@ -20,6 +20,15 @@ use common::settings_enums::CpuAccuracy;
 use rdynarmic::backend::x64::jit_state::A64JitState;
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
+// Eden indexes `PageEntryData` records (32 bytes); ruzu's split page-table
+// storage exposes the contiguous `PageInfo` buffer directly. Keep the same
+// log2-stride contract while deriving it from the actual Rust entry layout.
+const PAGE_TABLE_LOG2_STRIDE: usize = std::mem::size_of::<PageInfo>().trailing_zeros() as usize;
+const _: () = assert!(
+    1usize << PAGE_TABLE_LOG2_STRIDE == std::mem::size_of::<PageInfo>(),
+    "PageInfo size must be a power of two"
+);
+
 fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
     let mut flags = OptimizationFlag::NO_OPTIMIZATIONS;
 
@@ -868,37 +877,6 @@ impl DynarmicCallbacks64 {
         let jit_state = unsafe { &*jit_state_ptr };
         let mut ctx = self.breakpoint_context.lock().unwrap();
         *ctx = thread_context_from_jit_state(jit_state, pc);
-    }
-
-    fn trace_interpreter_fallback(&self, pc: u64, instr: u32, num_instructions: usize) {
-        if !common::trace::is_enabled(common::trace::cat::A64_EXCEPTION_CTX) {
-            return;
-        }
-        let Some(pc_ptr) = self.jit_pc_ptr else {
-            return;
-        };
-        let jit_state_ptr =
-            unsafe { (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState };
-        let jit_state = unsafe { &*jit_state_ptr };
-        common::trace::emit_raw(
-            common::trace::cat::A64_EXCEPTION_CTX,
-            &[
-                4,
-                self.core_index as u64,
-                pc,
-                instr as u64,
-                num_instructions as u64,
-                jit_state.pc,
-                jit_state.reg[30],
-                jit_state.sp,
-                jit_state.reg[0],
-                jit_state.reg[8],
-                jit_state.reg[19],
-                jit_state.reg[20],
-                jit_state.reg[21],
-                jit_state.reg[23],
-            ],
-        );
     }
 
     /// Matches upstream `DynarmicCallbacks64::CheckMemoryAccess`.
@@ -2094,34 +2072,6 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
     }
 
-    fn interpreter_fallback(&mut self, pc: u64, num_instructions: usize) {
-        self.last_exception_address.store(pc, Ordering::Relaxed);
-        self.snapshot_context(pc);
-        let instr = if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
-            if m.is_valid_virtual_address_range(pc, 4) {
-                m.read_32(pc)
-            } else {
-                0
-            }
-        } else {
-            let mem = self.memory.read().unwrap();
-            if mem.is_valid_range(pc, 4) {
-                mem.read_32(pc)
-            } else {
-                0
-            }
-        };
-        self.trace_interpreter_fallback(pc, instr, num_instructions);
-        log::error!(
-            "Unimplemented instruction @ 0x{:X} for {} instructions (instr = {:08X})",
-            pc,
-            num_instructions,
-            instr
-        );
-        self.halt_execution(rdynarmic::halt_reason::HaltReason::PREFETCH_ABORT);
-    }
-
     fn exception_raised(&mut self, pc: u64, exception: u64) {
         use rdynarmic::frontend::a64::types::Exception;
 
@@ -2514,6 +2464,7 @@ impl ArmDynarmic64 {
                 silently_mirror_page_table: false,
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
+                page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
                 detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
                 only_detect_misalignment_via_page_table_on_page_boundary,
                 check_halt_on_memory_access,
@@ -2839,6 +2790,7 @@ mod tests {
     use super::{
         parse_optimization_mask_env, parse_watch_ranges, thread_context_from_jit_state,
         translate_halt_reason, upstream_optimization_config, DynarmicCallbacks64,
+        PAGE_TABLE_LOG2_STRIDE,
     };
     use crate::arm::arm_interface::{
         ArmInterfaceBase, DebugWatchpoint, DebugWatchpointType, HaltReason,
@@ -2851,6 +2803,14 @@ mod tests {
     use rdynarmic::jit_config::{OptimizationFlag, UserCallbacks};
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+
+    #[test]
+    fn page_table_stride_matches_exposed_page_info_buffer() {
+        assert_eq!(
+            1usize << PAGE_TABLE_LOG2_STRIDE,
+            std::mem::size_of::<common::page_table::PageInfo>()
+        );
+    }
 
     #[test]
     fn parse_watch_ranges_accepts_hex_and_default_size() {

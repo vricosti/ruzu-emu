@@ -21,6 +21,15 @@ use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 use super::dynarmic_cp15::DynarmicCP15;
 
+// Eden indexes `PageEntryData` records (32 bytes); ruzu's split page-table
+// storage exposes the contiguous `PageInfo` buffer directly. Keep the same
+// log2-stride contract while deriving it from the actual Rust entry layout.
+const PAGE_TABLE_LOG2_STRIDE: usize = std::mem::size_of::<PageInfo>().trailing_zeros() as usize;
+const _: () = assert!(
+    1usize << PAGE_TABLE_LOG2_STRIDE == std::mem::size_of::<PageInfo>(),
+    "PageInfo size must be a power of two"
+);
+
 static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Debug hook used to start the bounded A32 single-step tracer from a precise
@@ -2672,6 +2681,7 @@ impl ArmDynarmic32 {
                 silently_mirror_page_table: true,
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
+                page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
                 detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
                 only_detect_misalignment_via_page_table_on_page_boundary,
                 check_halt_on_memory_access,
@@ -3181,6 +3191,14 @@ mod tests {
     use super::*;
     use crate::hle::kernel::k_process::ProcessMemoryData;
     use std::sync::RwLock;
+
+    #[test]
+    fn page_table_stride_matches_exposed_page_info_buffer() {
+        assert_eq!(
+            1usize << PAGE_TABLE_LOG2_STRIDE,
+            std::mem::size_of::<PageInfo>()
+        );
+    }
 
     #[test]
     fn memory_read_code_returns_none_for_invalid_fetch() {

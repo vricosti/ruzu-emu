@@ -158,6 +158,13 @@ impl ArchConfig {
         }
     }
 
+    pub fn fpsr_qc_offset(self) -> usize {
+        match self {
+            Self::A64 => A64JitState::offset_of_fpsr_qc(),
+            Self::A32 => A32JitState::offset_of_fpsr_qc(),
+        }
+    }
+
     pub fn guest_mxcsr_offset(self) -> usize {
         match self {
             Self::A64 => A64JitState::offset_of_guest_mxcsr(),
@@ -508,5 +515,21 @@ mod tests {
         };
         assert_eq!(desc.entrypoint_offset, 0x100);
         assert_eq!(desc.size, 64);
+    }
+
+    #[test]
+    fn architecture_selects_its_own_saturation_flag_offset() {
+        assert_eq!(
+            ArchConfig::A64.fpsr_qc_offset(),
+            A64JitState::offset_of_fpsr_qc()
+        );
+        assert_eq!(
+            ArchConfig::A32.fpsr_qc_offset(),
+            A32JitState::offset_of_fpsr_qc()
+        );
+        assert_ne!(
+            ArchConfig::A64.fpsr_qc_offset(),
+            ArchConfig::A32.fpsr_qc_offset()
+        );
     }
 }

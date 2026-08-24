@@ -10854,6 +10854,25 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn test_a64_sqshlu_v0_4s_applies_immediate_to_every_lane() {
+        let code: &[u32] = &[
+            0x6F23_6420, // sqshlu v0.4s, v1.4s, #3
+            0xD400_0001, // svc #0
+        ];
+        let jit = run_a64_alu(code, |j| {
+            // Signed words: [1, 2, 0x20000000, -1].
+            j.set_vector(1, 0x0000_0002_0000_0001, 0xFFFF_FFFF_2000_0000);
+        });
+
+        assert_eq!(
+            jit.get_vector(0),
+            (0x0000_0010_0000_0008, 0x0000_0000_FFFF_FFFF)
+        );
+        assert_ne!(jit.get_fpsr() & (1 << 27), 0, "SQSHLU must set FPSR.QC");
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn test_a64_frintn_v30_4s_rounds_to_nearest_tie_even() {
         let code: &[u32] = &[
             0x4E21_8BDE, // frintn v30.4s, v30.4s

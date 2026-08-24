@@ -11222,3 +11222,48 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: focused tests verify that the accessors address the monitor's four-byte lock storage,
   processor count, reservation-address slots, and 128-bit value slots.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{emit_context.rs,emit_vector_helpers.rs,emit_vector_saturated.rs}` vs Eden `backend/x64/{emit_x64_vector.cpp,jitstate_info.h}` (SQSHLU/VQSHLU immediate fallback)
+
+### Intentional differences
+- Rust passes `ArchConfig` through `EmitContext` to select the A32/A64 `fpsr_qc` offset; Eden
+  obtains the same architecture-specific offset from `BlockOfCode::GetJitStateInfo()`.
+- Rust implements the element loop with fixed-size arrays instead of Eden's `VectorArray<T>`
+  template. The signed input, unsigned result, saturation result and sticky QC behavior match.
+
+### Unintentional differences (to fix)
+- Fixed: the x64 fallback previously materialized Eden's scalar `Imm8` shift as an XMM value and
+  read a different byte for every lane. Its ABI now takes one scalar `u8`, matching
+  `EmitTwoArgumentFallbackWithSaturationAndImmediate`, and applies it to every lane.
+- Fixed: the shared saturated fallbacks previously hard-coded `A64JitState::fpsr_qc`; A32 SIMD
+  saturation could therefore write QC at the wrong state offset. All three shared helpers now use
+  the active architecture's offset and Eden's byte-sized sticky OR.
+
+### Missing items
+- Eden's AVX2-specialized 32-bit SQSHLU emitter is not ported; Rust uses the behaviorally
+  equivalent corrected scalar fallback for 8-, 16-, 32- and 64-bit lanes.
+
+### Binary layout verification
+- PASS: the fallback ABI is `(result pointer, input pointer, u8 immediate) -> u32`, with two
+  16-byte stack slots plus the platform shadow space, matching Eden on System V and Windows x64.
+  A focused full-JIT four-lane test verifies positive results, unsigned saturation,
+  negative-to-zero and QC.
+
+## 2026-08-24 — `src/rdynarmic/{build.rs,a64_decoder_parser.rs}` vs Eden `frontend/A64/decoder/{a64.h,a64.inc}` (closing `INST` delimiter)
+
+### Intentional differences
+- Eden expands `a64.inc` with the C++ preprocessor. Rust's build script must parse the same three
+  macro fields to generate its decoder, so the parser is isolated in a build-support module that
+  can also be compiled by the regression test.
+
+### Unintentional differences (to fix)
+- Fixed: `rfind(')')` could select a parenthesis from a trailing comment and silently omit an active
+  decoder entry. The parser now selects the first closing parenthesis outside quoted fields, so
+  parentheses in display names remain valid and trailing comments cannot pollute the bit string.
+
+### Missing items
+- None in the reviewed active-entry parsing path.
+
+### Binary layout verification
+- N/A: this code generates decoder metadata and does not serialize or raw-copy a payload. The
+  regression fixture covers parentheses in both the quoted display name and trailing comment.

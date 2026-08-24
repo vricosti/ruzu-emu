@@ -107,7 +107,7 @@ mod tests {
     ) -> A32Jit {
         let mut config = A32UserConfig::new(Box::new(env));
         config.coprocessors = coprocessors;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         A32Jit::new(config).expect("JIT creation should succeed")
     }
@@ -286,7 +286,10 @@ mod tests {
 
     fn make_jit_with_optimizations(env: SharedEnv, optimizations: OptimizationFlag) -> A32Jit {
         let mut config = A32UserConfig::new(Box::new(env));
-        config.code_cache_size = 4 * 1024 * 1024;
+        // The complete upstream A32 fallback-table prelude occupies several
+        // MiB. Keep at least the 1 MiB compilation reserve after that prelude,
+        // otherwise every cache miss immediately invalidates the cache again.
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = optimizations;
         A32Jit::new(config).expect("JIT creation should succeed")
     }
@@ -326,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn arm64_loop_back_edge_links_directly() {
+    fn x64_loop_back_edge_links_directly() {
         // Warm up JIT compilation, then measure a large tick budget.
         let _ = time_counted_loop(OptimizationFlag::ALL_SAFE_OPTIMIZATIONS, 10_000);
         let linked = time_counted_loop(OptimizationFlag::ALL_SAFE_OPTIMIZATIONS, 4_000_000);
@@ -1545,7 +1548,7 @@ mod tests {
     fn make_jit_no_cycles(env: TestEnv) -> A32Jit {
         let mut config = A32UserConfig::new(Box::new(env));
         config.enable_cycle_counting = false;
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
         A32Jit::new(config).expect("JIT creation should succeed")
     }

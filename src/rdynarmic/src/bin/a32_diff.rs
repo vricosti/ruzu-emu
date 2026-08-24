@@ -20,7 +20,14 @@ use rdynarmic::interface::a32::config::{
 use rdynarmic::interface::optimization_flags::OptimizationFlag;
 use rdynarmic::jit::A32Jit;
 
-const ORACLE: &str = "/home/vricosti/Dev/emulators/zuyu/build/a32_oracle";
+fn oracle_path() -> std::path::PathBuf {
+    std::env::var_os("RDYNARMIC_A32_ORACLE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/eden-oracle/a32_oracle")
+        })
+}
 
 // ---------------------------------------------------------------------------
 // Shared memory environment for rdynarmic
@@ -174,7 +181,7 @@ struct Oracle {
 
 impl Oracle {
     fn start(cpsr: u32, regs: &[u32; 15]) -> Self {
-        let mut child = Command::new(ORACLE)
+        let mut child = Command::new(oracle_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

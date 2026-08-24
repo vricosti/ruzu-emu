@@ -11764,3 +11764,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: no `A32JitState` field or offset changed. Memory-abort tests verify the embedded A32 resume
   PC, upper descriptor, halt-reason offset, and disabled no-op path; the fallback inventory test
   verifies exactly `2 * 14 * 14 * 4` entries per scalar table and rejects 128-bit A32 entries.
+
+## 2026-08-24 — `src/rdynarmic/src/backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.rs` vs Eden `backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.{h,cpp}` (prelude lifecycle)
+
+### Intentional differences
+- Rust's `gen_run_code` returns byte-offset dispatcher labels to the owning emitter, whereas Eden's
+  `BlockOfCode` stores native function pointers. Both now leave the prelude open until the
+  architecture emitter explicitly completes it.
+- `rxbyak` reserves the complete executable buffer up front, so there is no Linux operation
+  corresponding to Eden's Windows-only incremental `EnsureMemoryCommitted` implementation.
+
+### Unintentional differences (to fix)
+- Fixed: `gen_run_code` completed the prelude before architecture fallback tables and terminal
+  handlers were emitted. Cache clearing therefore rewound into permanent code and could overwrite
+  it. A32 now emits fallbacks, terminal handlers, then completes the prelude exactly in Eden's
+  constructor order; A64 does the same for its currently ported permanent stubs.
+- Fixed: A64 generated terminal handlers before fallback tables and regenerated both after every
+  cache clear. Permanent stubs now remain below `code_begin` and `clear_cache` only rewinds dynamic
+  blocks, as Eden's `EmitX64::ClearCache` does.
+- Fixed: both architecture emitters performed their own low-space cache clear in addition to the
+  interface-owned capacity check. Capacity invalidation remains solely in the matching A32/A64
+  interface owner.
+- Fixed: x64 execution tests configured 4 MiB caches despite Eden documenting an approximately
+  8 MiB minimum. The complete A32 prelude left less than the mandatory 1 MiB compilation reserve,
+  causing perpetual clear/recompile dispatch. Test configurations now use 16 MiB.
+
+### Missing items
+- A64's upstream `GenMemory128Accessors` permanent-prelude owner remains absent; it is recorded in
+  the active rdynarmic port state for a separate structural slice.
+
+### Binary layout verification
+- N/A: this changes generated-code lifecycle and test cache capacity, not either architecture's
+  JIT-state layout. The executing x64 back-edge regression verifies bounded linked and unlinked
+  dispatch after the corrected prelude boundary.

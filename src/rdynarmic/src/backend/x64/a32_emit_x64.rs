@@ -36,9 +36,6 @@ use crate::ir::opcode::Opcode;
 use crate::ir::opt;
 use crate::ir::types::Type;
 
-/// Minimum space remaining in the code buffer before triggering a cache clear.
-const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
-
 /// Fast dispatch table entry (same layout as A64).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -161,6 +158,7 @@ impl A32EmitX64 {
             emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
         );
         emitter.gen_terminal_handlers()?;
+        emitter.code.prelude_complete();
 
         // Publish the callback whenever fastmem was configured. Eden does this
         // independently of whether platform-handler installation succeeded.
@@ -244,11 +242,6 @@ impl A32EmitX64 {
         // Check cache first
         if let Some(cached) = self.cache.get(&location) {
             return cached.entrypoint;
-        }
-
-        // Check space remaining
-        if self.code.space_remaining() < MIN_SPACE_REMAINING {
-            self.clear_cache();
         }
 
         // Translate: ARM32/Thumb → IR (A32 frontend)

@@ -517,8 +517,10 @@ impl BlockOfCode {
     /// Generate the dispatcher prelude: run_code entry point and
     /// return_from_run_code exit stubs.
     ///
-    /// This must be called before any user blocks are emitted.
-    /// After this, `prelude_complete()` is called automatically.
+    /// This must be called before the architecture emitter generates its
+    /// fallback tables and terminal handlers. The emitter calls
+    /// `prelude_complete()` only after all of those permanent stubs have been
+    /// emitted, matching the upstream constructor ordering.
     ///
     /// Calling convention:
     ///   System V (Linux/macOS): RDI = *mut A64JitState, RSI = *const u8
@@ -766,9 +768,6 @@ impl BlockOfCode {
             step_code_offset,
         };
 
-        // Mark prelude as complete
-        self.prelude_complete();
-
         Ok(labels)
     }
 }
@@ -864,6 +863,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         assert!(boc.prelude_complete);
         assert!(boc.code_begin_offset > 0);
         assert!(labels.run_code_offset == 0);
@@ -885,6 +885,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         assert!(boc.prelude_complete);
         // With cycle counting, the prelude should be larger
         assert!(boc.code_begin_offset > 50);
@@ -930,6 +931,7 @@ mod tests {
             page_table_pointer: None,
         };
         boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         let prelude_size = boc.code_begin_offset;
 
         // Emit some dummy code after prelude
@@ -955,6 +957,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         let code = unsafe { std::slice::from_raw_parts(boc.code_base_ptr(), boc.code_size()) };
         // Search for xchg opcode (0x87) in the return path
         // It should appear after the return_from_run_code[FORCE_RETURN|MXCSR] offset
@@ -1004,6 +1007,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         assert_ne!(
             labels.step_code_offset, labels.run_code_offset,
             "step_code should have its own entry point"
@@ -1027,6 +1031,7 @@ mod tests {
             page_table_pointer: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
+        boc.prelude_complete();
         let code = unsafe { std::slice::from_raw_parts(boc.code_base_ptr(), boc.code_size()) };
         // Search for LOCK prefix (0xF0) in the step_code region
         let step_region = &code[labels.step_code_offset..];

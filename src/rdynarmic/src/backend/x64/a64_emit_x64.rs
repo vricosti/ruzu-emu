@@ -27,9 +27,6 @@ use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::types::Type;
 
-/// Minimum space remaining in the code buffer before triggering a cache clear.
-const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
-
 fn allocation_gpr_order(page_table_present: bool, fastmem_enabled: bool) -> Vec<HostLoc> {
     let mut gprs = ANY_GPR.to_vec();
     if page_table_present {
@@ -167,9 +164,6 @@ impl A64EmitX64 {
             processor_id: 0,
         };
 
-        // Generate prelude handlers for RSB and fast dispatch.
-        emitter.gen_terminal_handlers()?;
-
         // Pre-generate the fastmem fallback-stub table. Mirrors
         // upstream `A64EmitX64::GenFastmemFallbacks` invocation in the
         // `A64EmitX64` constructor.
@@ -178,6 +172,11 @@ impl A64EmitX64 {
             &emitter.emit_config.callbacks,
             emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
         );
+
+        // Match upstream constructor ordering: permanent fallback tables and
+        // terminal handlers are part of the prelude retained by ClearCache.
+        emitter.gen_terminal_handlers()?;
+        emitter.code.prelude_complete();
 
         // Publish the fastmem callback whenever a fastmem pointer was supplied,
         // matching upstream even when handler installation disabled fastmem.
@@ -251,11 +250,6 @@ impl A64EmitX64 {
         // Check cache first
         if let Some(cached) = self.cache.get(&location) {
             return cached.entrypoint;
-        }
-
-        // Check space remaining — clear cache if low
-        if self.code.space_remaining() < MIN_SPACE_REMAINING {
-            self.clear_cache();
         }
 
         // Translate: ARM64 → IR
@@ -875,14 +869,8 @@ impl A64EmitX64 {
         Ok(marker_count)
     }
 
-    /// Clear all cached blocks and reset the code buffer.
-    ///
-    /// `BlockOfCode::clear_cache` resets the assembler cursor to
-    /// `code_begin_offset` (right after the dispatcher prelude). That
-    /// wipes the terminal handlers AND the fastmem fallback stubs that
-    /// were generated post-prelude. Re-emit them from scratch and
-    /// invalidate the stale fastmem patch table — old RIPs no longer
-    /// point at valid stubs.
+    /// Clear all cached blocks and reset the code buffer after the permanent
+    /// prelude, preserving the fallback tables and terminal handlers.
     pub fn clear_cache(&mut self) {
         self.patch_table.clear();
         self.clear_fast_dispatch_table();
@@ -891,19 +879,6 @@ impl A64EmitX64 {
         self.fastmem_patches.clear();
         crate::backend::x64::perf_map::clear();
         self.code.clear_cache();
-        // Re-emit terminal handlers and fastmem fallbacks. Their
-        // offsets in the code buffer change, but the SIGSEGV-handler
-        // registration's `code_begin..code_end` range is the WHOLE
-        // buffer so it stays valid.
-        self.terminal_handler_pop_rsb_hint = None;
-        self.terminal_handler_fast_dispatch_hint = None;
-        self.gen_terminal_handlers()
-            .expect("re-generating terminal handlers after clear_cache failed");
-        self.fastmem_fallbacks = gen_fastmem_fallbacks(
-            &mut self.code.asm,
-            &self.emit_config.callbacks,
-            self.emit_config.raw_exclusive_write_callbacks.as_ref(),
-        );
     }
 
     /// Invalidate cached blocks whose PC falls within a memory range.
@@ -1038,12 +1013,12 @@ mod tests {
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
-        let emitter = A64EmitX64::new(
+        let mut emitter = A64EmitX64::new(
             emit_config,
             run_callbacks,
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            4 * 1024 * 1024,
+            16 * 1024 * 1024,
         )
         .unwrap();
 
@@ -1063,6 +1038,27 @@ mod tests {
             fd_off > rsb_off,
             "Fast dispatch handler should come after RSB"
         );
+
+        let prelude_end = emitter.code.code_size();
+        let fallback_offset = *emitter
+            .fastmem_fallbacks
+            .read
+            .values()
+            .next()
+            .expect("A64 prelude should contain read fallbacks");
+        assert!(fallback_offset < rsb_off);
+        assert!(fd_off < prelude_end);
+
+        emitter.code.asm.ret().unwrap();
+        assert!(emitter.code.code_size() > prelude_end);
+        emitter.clear_cache();
+        assert_eq!(emitter.code.code_size(), prelude_end);
+        assert_eq!(
+            emitter.fastmem_fallbacks.read.values().next().copied(),
+            Some(fallback_offset)
+        );
+        assert_eq!(emitter.terminal_handler_pop_rsb_hint, Some(rsb_off));
+        assert_eq!(emitter.terminal_handler_fast_dispatch_hint, Some(fd_off));
     }
 
     #[test]
@@ -1119,7 +1115,7 @@ mod tests {
             run_callbacks,
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            4 * 1024 * 1024,
+            16 * 1024 * 1024,
         )
         .unwrap();
 

@@ -1,6 +1,7 @@
 //! Differential fuzzer: generates random ARM32 programs, runs them in both
 //! rdynarmic and upstream C++ dynarmic, and compares register results.
-//! The upstream oracle binary must be at /home/vricosti/Dev/emulators/zuyu/build/a32_oracle.
+//! Set `RDYNARMIC_A32_ORACLE` to an oracle built against Eden, or run
+//! `tools/build_a32_oracle.sh` to create the workspace-local default.
 
 #[cfg(test)]
 mod tests {
@@ -90,7 +91,26 @@ mod tests {
         }
     }
 
-    const ORACLE: &str = "/home/vricosti/Dev/emulators/zuyu/build/a32_oracle";
+    fn oracle_path() -> std::path::PathBuf {
+        std::env::var_os("RDYNARMIC_A32_ORACLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/eden-oracle/a32_oracle")
+            })
+    }
+
+    fn skip_when_oracle_is_unavailable() -> bool {
+        let path = oracle_path();
+        if path.is_file() {
+            return false;
+        }
+        eprintln!(
+            "skipping Eden differential test: build {} with tools/build_a32_oracle.sh or set RDYNARMIC_A32_ORACLE",
+            path.display()
+        );
+        true
+    }
 
     fn next_rand(rng: &mut u64) -> u32 {
         *rng ^= *rng << 13;
@@ -659,7 +679,7 @@ mod tests {
 
         let env = FuzzEnv::new(code_with_loop);
         let mut config = A32UserConfig::new(Box::new(env));
-        config.code_cache_size = 4 * 1024 * 1024;
+        config.code_cache_size = 16 * 1024 * 1024;
         config.optimizations = optimizations;
         let mut jit = A32Jit::new(config).expect("JIT creation failed");
 
@@ -704,7 +724,7 @@ mod tests {
         }
         input += "\n";
 
-        let mut child = Command::new(ORACLE)
+        let mut child = Command::new(oracle_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1522,6 +1542,9 @@ mod tests {
     /// Two distinct base registers pointing at the same address.
     #[test]
     fn repro_thumb32_str_then_ldr_aliased_bases() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         let mut regs = [0u32; 15];
         regs[1] = 0xDEAD_BEEF;
         regs[13] = 0x8000;
@@ -1548,6 +1571,9 @@ mod tests {
     /// Pattern B: STR.W R1,[R0] ; LDR.W R3,[R0]  (same base reg for both).
     #[test]
     fn repro_thumb32_str_then_ldr_same_base() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         let mut regs = [0u32; 15];
         regs[1] = 0xCAFE_F00D;
         regs[13] = 0x8000;
@@ -1573,6 +1599,9 @@ mod tests {
     /// Pattern C: STRD T1 ; LDRD T1  (suspected Atomic 64-bit store→load).
     #[test]
     fn repro_thumb32_strd_then_ldrd_same_base() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         let mut regs = [0u32; 15];
         regs[1] = 0x1111_2222;
         regs[2] = 0x3333_4444;
@@ -1602,6 +1631,9 @@ mod tests {
     /// Both Rn and Rm point at FUZZ_DATA_BASE. Store then read back.
     #[test]
     fn repro_thumb32_stm_then_ldm_aliased() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         let mut regs = [0u32; 15];
         regs[1] = 0xAAAA_0001;
         regs[2] = 0xBBBB_0002;
@@ -1917,6 +1949,9 @@ mod tests {
 
     #[test]
     fn fuzz_vfp_conversions_with_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         const INT_INPUTS: [u32; 7] = [
             0,
             1,
@@ -1975,6 +2010,9 @@ mod tests {
 
     #[test]
     fn scalar_lane_conversion_multiply_chain_matches_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         const VCVT_F32_U32_S12_S15: u32 = 0xEEB8_6A67;
         const VMUL_F32_S4_S12_S13: u32 = 0xEE26_2A26;
         const VMUL_F32_S0_S10_S4: u32 = 0xEE25_0A02;
@@ -2015,6 +2053,9 @@ mod tests {
 
     #[test]
     fn fuzz_vfp_explicit_rounding_with_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         const INPUTS: [u32; 18] = [
             0x0000_0000, // +0.0
             0x8000_0000, // -0.0
@@ -2073,6 +2114,9 @@ mod tests {
 
     #[test]
     fn fuzz_vmov_i32_lanes_with_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         let inputs = [
             [0x0123_4567, 0x89AB_CDEF, 0xA5A5_5A5A],
             [0x0000_0000, 0xFFFF_FFFF, 0x8000_0000],
@@ -2112,6 +2156,9 @@ mod tests {
 
     #[test]
     fn fuzz_vfp_compare_and_select_with_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         const VALUES: [u32; 8] = [
             0x0000_0000,
             0x8000_0000,
@@ -2342,6 +2389,9 @@ mod tests {
 
     #[test]
     fn fuzz_neon_zip_unzip_transpose_with_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         const VTRN: u32 = 0xF3B2_0080;
         const VUZP: u32 = 0xF3B2_0100;
         const VZIP: u32 = 0xF3B2_0180;
@@ -2407,6 +2457,9 @@ mod tests {
 
     #[test]
     fn fuzz_neon_reciprocal_estimates_with_upstream() {
+        if skip_when_oracle_is_unavailable() {
+            return;
+        }
         const VRECPE: u32 = 0xF3B3_0400;
         const VRSQRTE: u32 = 0xF3B3_0480;
         let inputs = [

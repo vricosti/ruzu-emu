@@ -434,36 +434,18 @@ impl SamplesStreamer {
 
     /// Port of `SamplesStreamer::ReserveBank`.
     fn reserve_bank(&mut self, scheduler: &mut Scheduler) -> Result<(), vk::Result> {
-        // `BankPool::reserve_bank` recycles a dead bank when it can and calls
-        // the builder otherwise. Creating a query pool can fail and the builder
-        // cannot, so build the replacement up front only when no dead bank is
-        // available to recycle.
-        let prepared = if self.bank_pool.can_recycle_front() {
-            None
-        } else {
-            Some(SamplesQueryBank::new(
-                self.device.clone(),
-                Arc::clone(scheduler.get_master_semaphore()),
+        let device = self.device.clone();
+        let master_semaphore = Arc::clone(scheduler.get_master_semaphore());
+        let host_query_reset_supported = self.host_query_reset_supported;
+        let new_bank_id = self.bank_pool.reserve_bank(|queue, _index| {
+            queue.push_back(SamplesQueryBank::new(
+                device,
+                master_semaphore,
                 scheduler,
-                self.host_query_reset_supported,
-            )?)
-        };
-        // INVARIANT: nothing between the `can_recycle_front` test above and the
-        // `reserve_bank` call below may reserve a bank, or `prepared` no longer
-        // matches what the pool is about to decide and the `expect` fires.
-        //
-        // It holds today because the only re-entrant path here is
-        // `SamplesQueryBank::new` -> `record_pool_reset` ->
-        // `request_outside_render_pass_operation_context` (taken only when the device lacks host
-        // query reset) -> `Scheduler::end_render_pass`, which calls
-        // `counter_close`, `counter_enable(.., false)` and `notify_segment`.
-        // All three only pause counters; none reserves a slot, so neither the
-        // pool nor `current_bank` can change under us. A future call on that
-        // path that does reserve would turn this into a panic, not silent
-        // corruption.
-        let new_bank_id = self.bank_pool.reserve_bank(move |queue, _index| {
-            queue.push_back(prepared.expect("bank pre-built when none can be recycled"));
-        });
+                host_query_reset_supported,
+            )?);
+            Ok(())
+        })?;
         let new_bank = Arc::clone(self.bank_pool.get_bank(new_bank_id));
         new_bank.flush_pending_pool_reset(scheduler, self.host_query_reset_supported);
         self.current_bank = Some(new_bank);

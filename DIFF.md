@@ -786,8 +786,8 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- `BankPool::can_recycle_front` exposes the exact predicate used by `ReserveBank` so the Vulkan
-  caller can construct fallible resources before entering Rust's infallible builder closure.
+- `BankPool::ReserveBank` returns `Result` so a fallible Rust resource constructor can replace a
+  C++ builder that propagates allocation failures through exceptions.
 - The file was normalized from CRLF to LF while formatting the new implementation and tests.
 
 ### Unintentional differences (to fix)
@@ -12812,3 +12812,47 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: ASTC helper structures are internal algorithm state and are not raw-copied or serialized.
   Eden-oracle corpus tests instead verify the HDR mode 7/mode 11 arithmetic and all finite
   nonnegative half-float conversions bit-for-bit.
+
+## 2026-08-26 — `src/video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
+
+### Intentional differences
+
+- C++ template constraints are represented by the local `BankLike` trait. A fallible builder
+  returns `Result`, the Rust equivalent of an exception escaping Eden's `ReserveBank`.
+- C++ default arguments for reference counts remain explicit arguments at Rust call sites.
+
+### Unintentional differences (to fix)
+
+- None after removing the invented `can_recycle_front` preflight and unused immutable accessor.
+  The fallible builder now runs inside the exact non-recycling branch before the index is queued.
+- None after matching the implicit sequentially-consistent atomic store/load used by Eden's
+  `references = 0` and `references == 0`; explicit add/close operations remain relaxed.
+
+### Missing items
+
+- None for `BankBase` or `BankPool`.
+
+### Binary layout verification
+
+- N/A: the banks and pool are host-only types and are neither raw-copied nor serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/query_cache.rs` bank reservation integration vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
+
+### Intentional differences
+
+- Vulkan construction failures propagate as `vk::Result`; Eden propagates wrapper exceptions.
+  Samples banks remain `Arc`-owned as documented by the broader query-cache audit.
+
+### Unintentional differences (to fix)
+
+- None after constructing a new samples bank directly from `BankPool::reserve_bank`'s builder,
+  matching Eden's branch and eliminating the separate preflight/panic invariant.
+
+### Missing items
+
+- None in the bank-reservation integration changed by this slice. Broader samples-streamer debt
+  remains tracked in its existing query-cache audit entry.
+
+### Binary layout verification
+
+- N/A: this slice changes host ownership and error propagation only.

@@ -12684,3 +12684,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the integration passes host Vulkan handles and field-wise snapshots; no payload in this
   slice is raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/accelerated_swizzle.rs` vs Eden `src/video_core/texture_cache/accelerated_swizzle.{h,cpp}`
+
+### Intentional differences
+
+- The implicit padding introduced by C++ `alignas(16)` members is represented by explicit,
+  zero-initialized Rust fields so the full compute-shader payload is deterministic.
+- `Common::AlignUpLog2` accepts the tile width through its Rust `u64` API and converts the result
+  back to the upstream `u32` payload type.
+
+### Unintentional differences (to fix)
+
+- Fixed: the module duplicated `GOB_SIZE_*` constants owned by `textures/decoders`; it now imports
+  the matching constants just as Eden imports them from `textures/decoders.h`.
+- Fixed: local copies of `AlignUpLog2`, `DivCeilLog2`, and `BytesPerBlock` wrappers have been
+  removed in favor of the same owning modules used by Eden.
+
+### Missing items
+
+- None: both parameter payloads and both 2D/3D parameter constructors are present.
+
+### Binary layout verification
+
+- PASS: focused tests verify every field offset, alignment, and total size (64 bytes/alignment 16
+  for the 2D payload; 56 bytes/alignment 4 for the 3D payload), plus representative 2D and 3D
+  formulas against Eden's expected values.

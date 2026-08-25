@@ -6,7 +6,11 @@
 //! GPU-accelerated block-linear swizzle parameter generation for 2D and 3D
 //! textures.
 
+use common::alignment::align_up_log2;
+use common::div_ceil::div_ceil_log2_u32;
+
 use crate::surface::bytes_per_block;
+use crate::textures::decoders::{GOB_SIZE_SHIFT, GOB_SIZE_X, GOB_SIZE_X_SHIFT, GOB_SIZE_Y_SHIFT};
 
 use super::image_info::ImageInfo;
 use super::types::*;
@@ -49,13 +53,6 @@ pub struct BlockLinearSwizzle3DParams {
     pub block_depth_mask: u32,
 }
 
-// ── GOB constants ──────────────────────────────────────────────────────
-// Upstream: Tegra::Texture::GOB_SIZE_* in textures/decoders.h
-
-const GOB_SIZE_SHIFT: u32 = 9; // 512 bytes per GOB
-const GOB_SIZE_X_SHIFT: u32 = 6; // 64 bytes wide
-const GOB_SIZE_Y_SHIFT: u32 = 3; // 8 rows tall
-
 // ── Public functions ───────────────────────────────────────────────────
 
 /// Build parameters for a 2D block-linear swizzle.
@@ -67,11 +64,11 @@ pub fn make_block_linear_swizzle_2d_params(
 ) -> BlockLinearSwizzle2DParams {
     let block = swizzle.block;
     let num_tiles = swizzle.num_tiles;
-    let bytes_per_block = bytes_per_block_for_format(info.format);
+    let bytes_per_block = bytes_per_block(info.format);
     let stride_alignment =
         super::util::calculate_level_stride_alignment(info, swizzle.level as u32);
-    let stride = align_up_log2(num_tiles.width, stride_alignment) * bytes_per_block;
-    let gobs_in_x = div_ceil_log2(stride, GOB_SIZE_X_SHIFT);
+    let stride = align_up_log2(num_tiles.width.into(), stride_alignment) as u32 * bytes_per_block;
+    let gobs_in_x = div_ceil_log2_u32(stride, GOB_SIZE_X_SHIFT);
     BlockLinearSwizzle2DParams {
         origin: [0, 0, 0],
         _pad0: 0,
@@ -95,15 +92,15 @@ pub fn make_block_linear_swizzle_3d_params(
 ) -> BlockLinearSwizzle3DParams {
     let block = swizzle.block;
     let num_tiles = swizzle.num_tiles;
-    let bytes_per_block = bytes_per_block_for_format(info.format);
+    let bytes_per_block = bytes_per_block(info.format);
     let stride_alignment =
         super::util::calculate_level_stride_alignment(info, swizzle.level as u32);
-    let stride = align_up_log2(num_tiles.width, stride_alignment) * bytes_per_block;
+    let stride = align_up_log2(num_tiles.width.into(), stride_alignment) as u32 * bytes_per_block;
 
-    let gob_size_x: u32 = 1 << GOB_SIZE_X_SHIFT;
-    let gobs_in_x = (stride + gob_size_x - 1) >> GOB_SIZE_X_SHIFT;
+    let gobs_in_x = (stride + GOB_SIZE_X - 1) >> GOB_SIZE_X_SHIFT;
     let block_size = gobs_in_x << (GOB_SIZE_SHIFT + block.height + block.depth);
-    let slice_size = div_ceil_log2(num_tiles.height, block.height + GOB_SIZE_Y_SHIFT) * block_size;
+    let slice_size =
+        div_ceil_log2_u32(num_tiles.height, block.height + GOB_SIZE_Y_SHIFT) * block_size;
 
     BlockLinearSwizzle3DParams {
         origin: [0, 0, 0],
@@ -119,20 +116,134 @@ pub fn make_block_linear_swizzle_3d_params(
     }
 }
 
-// ── Internal helpers ───────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use std::mem::{align_of, offset_of, size_of};
 
-/// Bytes per block for a given pixel format.
-///
-/// Delegates to `VideoCore::Surface::BytesPerBlock` (ported in `surface.rs`).
-fn bytes_per_block_for_format(format: super::format_lookup_table::PixelFormat) -> u32 {
-    bytes_per_block(format)
-}
+    use super::*;
+    use crate::surface::PixelFormat;
+    use crate::texture_cache::image_info::TilingMode;
 
-fn align_up_log2(value: u32, alignment_log2: u32) -> u32 {
-    let mask = (1u32 << alignment_log2) - 1;
-    (value + mask) & !mask
-}
+    fn image_info(block: Extent3D, size: Extent3D, layer_stride: u32) -> ImageInfo {
+        ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size,
+            tiling: TilingMode::BlockLinear(block),
+            layer_stride,
+            ..ImageInfo::default()
+        }
+    }
 
-fn div_ceil_log2(value: u32, shift: u32) -> u32 {
-    (value + (1u32 << shift) - 1) >> shift
+    #[test]
+    fn block_linear_parameter_layouts_match_upstream() {
+        assert_eq!(size_of::<BlockLinearSwizzle2DParams>(), 64);
+        assert_eq!(align_of::<BlockLinearSwizzle2DParams>(), 16);
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, origin), 0);
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, destination), 16);
+        assert_eq!(
+            offset_of!(BlockLinearSwizzle2DParams, bytes_per_block_log2),
+            32
+        );
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, layer_stride), 36);
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, block_size), 40);
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, x_shift), 44);
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, block_height), 48);
+        assert_eq!(
+            offset_of!(BlockLinearSwizzle2DParams, block_height_mask),
+            52
+        );
+
+        assert_eq!(size_of::<BlockLinearSwizzle3DParams>(), 56);
+        assert_eq!(align_of::<BlockLinearSwizzle3DParams>(), 4);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, origin), 0);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, destination), 12);
+        assert_eq!(
+            offset_of!(BlockLinearSwizzle3DParams, bytes_per_block_log2),
+            24
+        );
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, slice_size), 28);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, block_size), 32);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, x_shift), 36);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, block_height), 40);
+        assert_eq!(
+            offset_of!(BlockLinearSwizzle3DParams, block_height_mask),
+            44
+        );
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, block_depth), 48);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, block_depth_mask), 52);
+    }
+
+    #[test]
+    fn two_dimensional_parameters_match_upstream_formula() {
+        let block = Extent3D {
+            width: 0,
+            height: 1,
+            depth: 0,
+        };
+        let num_tiles = Extent3D {
+            width: 64,
+            height: 32,
+            depth: 1,
+        };
+        let info = image_info(block, num_tiles, 0x20_000);
+        let params = make_block_linear_swizzle_2d_params(
+            &SwizzleParameters {
+                num_tiles,
+                block,
+                buffer_offset: 0,
+                level: 0,
+            },
+            &info,
+        );
+
+        assert_eq!(params.origin, [0, 0, 0]);
+        assert_eq!(params.destination, [0, 0, 0]);
+        assert_eq!(params.bytes_per_block_log2, 2);
+        assert_eq!(params.layer_stride, 0x20_000);
+        assert_eq!(params.block_size, 4096);
+        assert_eq!(params.x_shift, 10);
+        assert_eq!(params.block_height, 1);
+        assert_eq!(params.block_height_mask, 1);
+    }
+
+    #[test]
+    fn three_dimensional_parameters_match_upstream_formula() {
+        let block = Extent3D {
+            width: 0,
+            height: 1,
+            depth: 1,
+        };
+        let num_tiles = Extent3D {
+            width: 64,
+            height: 32,
+            depth: 4,
+        };
+        let mut info = image_info(block, num_tiles, 0);
+        info.image_type = ImageType::E3D;
+        let params = make_block_linear_swizzle_3d_params(
+            &SwizzleParameters {
+                num_tiles,
+                block,
+                buffer_offset: 0,
+                level: 0,
+            },
+            &info,
+        );
+
+        assert_eq!(params.origin, [0, 0, 0]);
+        assert_eq!(params.destination, [0, 0, 0]);
+        assert_eq!(params.bytes_per_block_log2, 2);
+        assert_eq!(params.slice_size, 16_384);
+        assert_eq!(params.block_size, 8192);
+        assert_eq!(params.x_shift, 11);
+        assert_eq!(params.block_height, 1);
+        assert_eq!(params.block_height_mask, 1);
+        assert_eq!(params.block_depth, 1);
+        assert_eq!(params.block_depth_mask, 1);
+    }
 }

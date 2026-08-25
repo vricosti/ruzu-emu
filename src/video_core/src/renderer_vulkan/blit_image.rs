@@ -819,8 +819,7 @@ impl BlitImageHelper {
         &self,
         allocator: &DescriptorAllocator,
     ) -> Result<vk::DescriptorSet, vk::Result> {
-        let scheduler = unsafe { self.scheduler.as_ref() };
-        allocator.commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
+        allocator.commit()
     }
 
     pub fn shader_stencil_export_supported(&self) -> bool {

@@ -12,6 +12,7 @@ use ash::vk;
 use log::debug;
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
+use super::master_semaphore::MasterSemaphore;
 use super::resource_pool::ResourcePool;
 use super::scheduler::Scheduler;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
@@ -169,6 +170,7 @@ pub struct DescriptorAllocator {
 impl DescriptorAllocator {
     fn new(
         device: &Device,
+        master_semaphore: Arc<MasterSemaphore>,
         bank: Arc<Mutex<DescriptorBank>>,
         layout: vk::DescriptorSetLayout,
     ) -> Self {
@@ -177,18 +179,14 @@ impl DescriptorAllocator {
             bank,
             layout,
             state: Arc::new(Mutex::new(DescriptorAllocatorState {
-                resource_pool: ResourcePool::new_with_external_ticks(SETS_GROW_RATE),
+                resource_pool: ResourcePool::new(master_semaphore, SETS_GROW_RATE),
                 sets: Vec::new(),
             })),
         }
     }
 
     /// Port of `DescriptorAllocator::Commit`.
-    pub fn commit(
-        &self,
-        known_gpu_tick: u64,
-        current_tick: u64,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
+    pub fn commit(&self) -> Result<vk::DescriptorSet, vk::Result> {
         let mut state = self.state.lock().unwrap();
         let device = self.device;
         let bank = Arc::clone(&self.bank);
@@ -206,11 +204,7 @@ impl DescriptorAllocator {
             )?);
             Ok(())
         };
-        let index = resource_pool.try_commit_resource_with_ticks(
-            known_gpu_tick,
-            current_tick,
-            &mut allocate,
-        )?;
+        let index = resource_pool.try_commit_resource(&mut allocate)?;
         Ok(sets[index / SETS_GROW_RATE][index % SETS_GROW_RATE])
     }
 
@@ -255,6 +249,7 @@ pub struct DescriptorPool {
     // Upstream's bank pools are RAII wrappers. Reden stores raw ash handles,
     // so their owner retains this lightweight reference for destruction.
     device: DeviceReference,
+    master_semaphore: Arc<MasterSemaphore>,
     banks_lock: RwLock<BanksState>,
 }
 
@@ -265,9 +260,10 @@ struct BanksState {
 
 impl DescriptorPool {
     /// Port of `DescriptorPool::DescriptorPool`.
-    pub fn new(device: &Device, _scheduler: &mut Scheduler) -> Self {
+    pub fn new(device: &Device, scheduler: &mut Scheduler) -> Self {
         DescriptorPool {
             device: DeviceReference::new(device),
+            master_semaphore: Arc::clone(scheduler.get_master_semaphore()),
             banks_lock: RwLock::new(BanksState {
                 bank_infos: Vec::new(),
                 banks: Vec::new(),
@@ -282,7 +278,12 @@ impl DescriptorPool {
         info: &DescriptorBankInfo,
     ) -> Result<DescriptorAllocator, vk::Result> {
         let bank = self.bank(info)?;
-        Ok(DescriptorAllocator::new(self.device.get(), bank, layout))
+        Ok(DescriptorAllocator::new(
+            self.device.get(),
+            Arc::clone(&self.master_semaphore),
+            bank,
+            layout,
+        ))
     }
 
     /// Port of `DescriptorPool::Allocator(..., span<const Shader::Info>)`.

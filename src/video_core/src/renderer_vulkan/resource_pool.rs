@@ -54,60 +54,33 @@ impl ResourcePool {
         }
     }
 
-    /// Construct a pool whose tick source is supplied by its owner.
-    ///
-    /// The Rust scheduler currently owns the upstream `MasterSemaphore`
-    /// equivalent directly. This keeps the upstream resource-pool algorithm
-    /// while allowing that scheduler-owned timeline to drive reuse.
-    pub fn new_with_external_ticks(grow_step: usize) -> Self {
-        ResourcePool {
-            master_semaphore: None,
-            grow_step,
-            hint_iterator: 0,
-            ticks: Vec::new(),
-        }
-    }
-
     /// Port of `ResourcePool::CommitResource`.
     ///
     /// Finds and returns the index of a free resource slot, growing
     /// the pool if necessary. Calls `allocate_fn(begin, end)` when new
     /// resources must be created.
     pub fn commit_resource(&mut self, allocate_fn: &mut dyn FnMut(usize, usize)) -> usize {
-        let ms = Arc::clone(
-            self.master_semaphore
-                .as_ref()
-                .expect("ResourcePool: master_semaphore not set"),
-        );
-        let found = self
-            .find_free(ms.known_gpu_tick(), ms.current_tick())
-            .or_else(|| {
+        let found = {
+            let ms = self
+                .master_semaphore
+                .as_deref()
+                .expect("ResourcePool: master_semaphore not set");
+            let found =
+                Self::find_free(&mut self.ticks, self.hint_iterator, ms.known_gpu_tick(), ms);
+            found.or_else(|| {
                 ms.refresh();
-                self.find_free(ms.known_gpu_tick(), ms.current_tick())
-            });
+                Self::find_free(&mut self.ticks, self.hint_iterator, ms.known_gpu_tick(), ms)
+            })
+        };
         let found = found.unwrap_or_else(|| {
             let free_resource = self.manage_overflow(allocate_fn);
-            self.ticks[free_resource] = ms.current_tick();
+            self.ticks[free_resource] = self
+                .master_semaphore
+                .as_deref()
+                .expect("ResourcePool: master_semaphore not set")
+                .current_tick();
             free_resource
         });
-        self.hint_iterator = (found + 1) % self.ticks.len();
-        found
-    }
-
-    /// `CommitResource` using ticks supplied by the owning scheduler.
-    pub fn commit_resource_with_ticks(
-        &mut self,
-        gpu_tick: u64,
-        current_tick: u64,
-        allocate_fn: &mut dyn FnMut(usize, usize),
-    ) -> usize {
-        let found = self.find_free(gpu_tick, current_tick).unwrap_or_else(|| {
-            let free_resource = self.manage_overflow(allocate_fn);
-            self.ticks[free_resource] = current_tick;
-            free_resource
-        });
-
-        // Free iterator is hinted to the resource after the one that's been committed.
         self.hint_iterator = (found + 1) % self.ticks.len();
         found
     }
@@ -117,35 +90,33 @@ impl ResourcePool {
     /// Upstream propagates allocation failures through exceptions from the
     /// virtual `Allocate` call. Rust callers that allocate Vulkan resources
     /// need the same behavior through `Result`.
-    pub fn try_commit_resource_with_ticks<E>(
+    pub fn try_commit_resource<E>(
         &mut self,
-        gpu_tick: u64,
-        current_tick: u64,
         allocate_fn: &mut dyn FnMut(usize, usize) -> Result<(), E>,
     ) -> Result<usize, E> {
-        let search = |ticks: &mut [u64], begin: usize, end: usize| -> Option<usize> {
-            for iterator in begin..end {
-                if gpu_tick >= ticks[iterator] {
-                    ticks[iterator] = current_tick;
-                    return Some(iterator);
-                }
-            }
-            None
+        let found = {
+            let ms = self
+                .master_semaphore
+                .as_deref()
+                .expect("ResourcePool: master_semaphore not set");
+            let found =
+                Self::find_free(&mut self.ticks, self.hint_iterator, ms.known_gpu_tick(), ms);
+            found.or_else(|| {
+                ms.refresh();
+                Self::find_free(&mut self.ticks, self.hint_iterator, ms.known_gpu_tick(), ms)
+            })
         };
-
-        let ticks_len = self.ticks.len();
-        let hint = self.hint_iterator;
-        let found =
-            search(&mut self.ticks, hint, ticks_len).or_else(|| search(&mut self.ticks, 0, hint));
-        let found = if let Some(found) = found {
-            found
-        } else {
-            let old_capacity = self.ticks.len();
-            let new_capacity = old_capacity + self.grow_step;
-            allocate_fn(old_capacity, new_capacity)?;
-            self.ticks.resize(new_capacity, 0);
-            self.ticks[old_capacity] = current_tick;
-            old_capacity
+        let found = match found {
+            Some(found) => found,
+            None => {
+                let free_resource = self.try_manage_overflow(allocate_fn)?;
+                self.ticks[free_resource] = self
+                    .master_semaphore
+                    .as_deref()
+                    .expect("ResourcePool: master_semaphore not set")
+                    .current_tick();
+                free_resource
+            }
         };
 
         self.hint_iterator = (found + 1) % self.ticks.len();
@@ -154,19 +125,23 @@ impl ResourcePool {
 
     // --- Private ---
 
-    fn find_free(&mut self, gpu_tick: u64, current_tick: u64) -> Option<usize> {
+    fn find_free(
+        ticks: &mut [u64],
+        hint_iterator: usize,
+        gpu_tick: u64,
+        master_semaphore: &MasterSemaphore,
+    ) -> Option<usize> {
         let search = |ticks: &mut [u64], begin: usize, end: usize| -> Option<usize> {
             for iterator in begin..end {
                 if gpu_tick >= ticks[iterator] {
-                    ticks[iterator] = current_tick;
+                    ticks[iterator] = master_semaphore.current_tick();
                     return Some(iterator);
                 }
             }
             None
         };
-        let ticks_len = self.ticks.len();
-        let hint = self.hint_iterator;
-        search(&mut self.ticks, hint, ticks_len).or_else(|| search(&mut self.ticks, 0, hint))
+        let ticks_len = ticks.len();
+        search(ticks, hint_iterator, ticks_len).or_else(|| search(ticks, 0, hint_iterator))
     }
 
     /// Port of `ResourcePool::ManageOverflow`.
@@ -179,11 +154,31 @@ impl ResourcePool {
         old_capacity
     }
 
+    /// Fallible Rust adaptation of `ResourcePool::ManageOverflow`.
+    fn try_manage_overflow<E>(
+        &mut self,
+        allocate_fn: &mut dyn FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let old_capacity = self.ticks.len();
+        self.try_grow(allocate_fn)?;
+        Ok(old_capacity)
+    }
+
     /// Port of `ResourcePool::Grow`.
     fn grow(&mut self, allocate_fn: &mut dyn FnMut(usize, usize)) {
         let old_capacity = self.ticks.len();
         self.ticks.resize(old_capacity + self.grow_step, 0);
         allocate_fn(old_capacity, old_capacity + self.grow_step);
+    }
+
+    /// Fallible Rust adaptation of `ResourcePool::Grow`.
+    fn try_grow<E>(
+        &mut self,
+        allocate_fn: &mut dyn FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let old_capacity = self.ticks.len();
+        self.ticks.resize(old_capacity + self.grow_step, 0);
+        allocate_fn(old_capacity, old_capacity + self.grow_step)
     }
 }
 
@@ -200,38 +195,11 @@ mod tests {
     }
 
     #[test]
-    fn external_ticks_reuse_only_completed_resources() {
-        let mut pool = ResourcePool::new_with_external_ticks(2);
-        let mut allocations = Vec::new();
-        {
-            let mut allocate = |begin, end| allocations.push((begin, end));
-            assert_eq!(pool.commit_resource_with_ticks(0, 1, &mut allocate), 0);
-            assert_eq!(pool.commit_resource_with_ticks(0, 1, &mut allocate), 1);
-            assert_eq!(pool.commit_resource_with_ticks(0, 2, &mut allocate), 2);
-            assert_eq!(pool.commit_resource_with_ticks(0, 2, &mut allocate), 3);
-        }
-        assert_eq!(allocations, [(0, 2), (2, 4)]);
-
-        {
-            let mut allocate = |begin, end| allocations.push((begin, end));
-            assert_eq!(pool.commit_resource_with_ticks(1, 3, &mut allocate), 0);
-        }
-        assert_eq!(allocations, [(0, 2), (2, 4)]);
-    }
-
-    #[test]
-    fn failed_growth_does_not_publish_resource_slots() {
-        let mut pool = ResourcePool::new_with_external_ticks(2);
-        let error = pool
-            .try_commit_resource_with_ticks(0, 1, &mut |_, _| Err::<(), _>("allocation failed"))
-            .unwrap_err();
-        assert_eq!(error, "allocation failed");
-        assert!(pool.ticks.is_empty());
-
-        let index = pool
-            .try_commit_resource_with_ticks(0, 1, &mut |_, _| Ok::<(), &str>(()))
-            .unwrap();
-        assert_eq!(index, 0);
+    fn fallible_growth_resizes_ticks_before_allocating() {
+        let mut pool = ResourcePool::new_default();
+        pool.grow_step = 2;
+        let result = pool.try_grow(&mut |_, _| Err::<(), _>("allocation failed"));
+        assert_eq!(result, Err("allocation failed"));
         assert_eq!(pool.ticks.len(), 2);
     }
 }

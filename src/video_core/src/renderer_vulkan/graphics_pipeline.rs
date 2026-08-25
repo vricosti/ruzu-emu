@@ -1301,8 +1301,6 @@ impl GraphicsPipeline {
         let descriptor_set_layout = self.descriptor_set_layout;
         let descriptor_update_template = self.descriptor_update_template;
         let descriptor_allocator = self.descriptor_allocator.clone();
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
         let uses_push_descriptor = self.uses_push_descriptor;
         let uses_descriptor_buffer = self.uses_descriptor_buffer;
         let descriptor_buffer_binding = bind_descriptor_buffer.then(|| {
@@ -1388,7 +1386,7 @@ impl GraphicsPipeline {
                 let descriptor_set = descriptor_allocator
                     .as_ref()
                     .expect("descriptor-set pipeline requires an initialized allocator")
-                    .commit(known_gpu_tick, pending_tick)
+                    .commit()
                     .expect("failed to commit graphics descriptor set");
                 logical.update_descriptor_set_with_template(
                     descriptor_set,

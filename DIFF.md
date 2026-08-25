@@ -12352,3 +12352,50 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `MasterSemaphore` owns host Vulkan synchronization objects and exposes no serialized or
   guest-visible raw-memory payload.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/resource_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_resource_pool.{h,cpp}`
+
+### Intentional differences
+
+- `MasterSemaphore&` is retained as `Arc<MasterSemaphore>` so cloned Rust descriptor allocators can
+  safely share the scheduler-owned timeline without a self-referential lifetime.
+- `try_commit_resource` is the `Result` counterpart of Eden's exception-propagating
+  `CommitResource`; its fallible grow path preserves Eden's resize-before-`Allocate` ordering.
+
+### Unintentional differences (to fix)
+
+- None after removing the external-tick variants and restoring Eden's failed-search sequence:
+  query `KnownGpuTick`, call `Refresh`, query `KnownGpuTick` again, and only then grow the pool.
+- None in search order, committed-tick assignment, overflow growth, or hint advancement.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the pool stores host-only resource indices and timeline ticks. A focused test verifies that
+  the fallible Rust grow path publishes the resized tick range before invoking allocation, as
+  Eden's `Grow` does.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` and descriptor-commit call sites vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.{h,cpp}` (`ResourcePool` prerequisite)
+
+### Intentional differences
+
+- `DescriptorPool` retains an `Arc` to the scheduler's `MasterSemaphore` and passes it to each
+  allocator. Eden passes the same stable semaphore reference through every `Allocator` overload.
+- Vulkan allocation failures use `Result<_, vk::Result>` instead of C++ exceptions.
+
+### Unintentional differences (to fix)
+
+- None in descriptor resource retirement after this prerequisite: `DescriptorAllocator::commit`
+  now delegates tick acquisition and refresh to `ResourcePool`, matching Eden instead of using a
+  stale pair of ticks captured by individual draw-recording call sites.
+
+### Missing items
+
+- Broader descriptor-pool findings remain owned by its dedicated `bugs/eden-parity` report.
+
+### Binary layout verification
+
+- N/A: this prerequisite changes host ownership and resource-retirement timing only.

@@ -385,8 +385,6 @@ impl Uint8Pass {
             DescriptorData(queue.update_data())
         };
         let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
         scheduler.request_outside_render_pass_operation_context();
         let device = self.base.device.clone();
@@ -395,7 +393,7 @@ impl Uint8Pass {
         let layout = self.base.layout;
         scheduler.record(move |cmdbuf| unsafe {
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("Uint8Pass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
@@ -510,8 +508,6 @@ impl QuadIndexedPass {
         };
         let push_constants: [u32; 3] = [base_vertex, index_shift, if is_strip { 1 } else { 0 }];
         let num_workgroups = (num_tri_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
         scheduler.request_outside_render_pass_operation_context();
         let device = self.base.device.clone();
@@ -520,7 +516,7 @@ impl QuadIndexedPass {
         let layout = self.base.layout;
         scheduler.record(move |cmdbuf| unsafe {
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("QuadIndexedPass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
@@ -633,8 +629,6 @@ impl ConditionalRenderingResolvePass {
             queue.add_buffer(dst_buffer, 0, std::mem::size_of::<u32>() as u64);
             DescriptorData(queue.update_data())
         };
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
         scheduler.request_outside_render_pass_operation_context();
         let device = self.base.device.clone();
@@ -646,7 +640,7 @@ impl ConditionalRenderingResolvePass {
         };
         scheduler.record(move |cmdbuf| unsafe {
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("conditional rendering descriptor allocation failed");
             let read_barrier = vk::MemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
@@ -793,8 +787,6 @@ impl QueriesPrefixScanPass {
                 queue.add_buffer(accumulation_buffer, 0, std::mem::size_of::<u64>() as u64);
                 DescriptorData(queue.update_data())
             };
-            let known_gpu_tick = scheduler.known_gpu_tick();
-            let pending_tick = scheduler.pending_tick();
             let descriptor_allocator = self.base.descriptor_allocator.clone();
             scheduler.request_outside_render_pass_operation_context();
             let device = self.base.device.clone();
@@ -804,7 +796,7 @@ impl QueriesPrefixScanPass {
             let conditional_rendering_supported = self.conditional_rendering_supported;
             scheduler.record(move |cmdbuf| unsafe {
                 let descriptor_set = descriptor_allocator
-                    .commit(known_gpu_tick, pending_tick)
+                    .commit()
                     .expect("query prefix-scan descriptor allocation failed");
                 let read_barrier = vk::MemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1049,11 +1041,7 @@ impl AstcDecoderPass {
             }
 
             let descriptor_set = {
-                match self
-                    .base
-                    .descriptor_allocator
-                    .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
-                {
+                match self.base.descriptor_allocator.commit() {
                     Ok(set) => set,
                     Err(err) => {
                         log::warn!(
@@ -1329,8 +1317,6 @@ impl BlockLinearUnswizzle3DPass {
         let barrier_size =
             u64::from(blocks_x) * u64::from(blocks_y) * bytes_per_block * u64::from(z_count);
         let is_first_chunk = z_start == 0;
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
         let device = self.base.device.clone();
         let descriptor_template = self.base.descriptor_template;
@@ -1341,7 +1327,7 @@ impl BlockLinearUnswizzle3DPass {
                 return;
             }
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("BlockLinearUnswizzle3DPass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,

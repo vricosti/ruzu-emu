@@ -12231,3 +12231,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: dirty flags are internal boolean lookup arrays rather than serialized payloads. Focused
   tests verify the 133-bit invalidation mask and both surface-clip table entries.
+
+## 2026-08-25 — `src/common/src/thread.rs` vs Eden `src/common/thread.{h,cpp}` (`SetCurrentThreadPriority` prerequisite)
+
+### Intentional differences
+
+- Rust reports a failed Linux/Android `setpriority` call through `std::io::Error`; Eden formats the
+  same operating-system error through `GetLastErrorMsg`.
+- Unsupported non-Unix/non-Windows targets retain a no-op fallback. Eden has a dedicated Haiku
+  priority mapping which is not a supported Ruzu build target.
+
+### Unintentional differences (to fix)
+
+- None in the Linux, Windows, or generic POSIX priority mapping covered by this prerequisite.
+
+### Missing items
+
+- Android's topology-policy registration (`RememberCurrentThreadNice`) and the related
+  performance/efficiency-core policy subsystem are not ported. They are outside the Linux worker
+  priority prerequisite and depend on Eden's Android-only topology/ADPF infrastructure.
+- Pre-existing thread-name, Event, Barrier, and topology-policy differences are outside this
+  focused prerequisite review.
+
+### Binary layout verification
+
+- N/A: thread-priority selection has no serialized or guest-visible structure.

@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::engines::engine_interface::EngineTypes;
 use crate::engines::fermi_2d::Fermi2D;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::kepler_memory::KeplerMemory;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::MaxwellDMA;
+use crate::engines::nv01_timer::Nv01Timer;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 
@@ -39,6 +41,8 @@ pub struct ChannelState {
     pub maxwell_dma: Option<Box<MaxwellDMA>>,
     /// Inline memory engine
     pub kepler_memory: Option<Box<KeplerMemory>>,
+    /// NV01 timer engine
+    pub nv01_timer: Option<Box<Nv01Timer>>,
 
     pub memory_manager: Option<Arc<Mutex<MemoryManager>>>,
 
@@ -60,6 +64,7 @@ impl ChannelState {
             kepler_compute: None,
             maxwell_dma: None,
             kepler_memory: None,
+            nv01_timer: None,
             memory_manager: None,
             dma_pusher: None,
             initialized: false,
@@ -81,18 +86,7 @@ impl ChannelState {
         );
         self.program_id = program_id;
 
-        // Upstream creates DmaPusher first, then the engine set.
-        self.dma_pusher = Some(Box::new(crate::dma_pusher::DmaPusher::new(
-            _gpu as *const crate::gpu::Gpu,
-            _gpu.system_ref(),
-            Arc::clone(self.memory_manager.as_ref().unwrap()),
-            self as *mut ChannelState,
-        )));
-        self.dma_pusher
-            .as_mut()
-            .expect("DmaPusher must exist immediately after construction")
-            .install_self_reference();
-
+        // Match Eden's Payload member construction order: engines first, then DmaPusher.
         let mut maxwell_3d = Box::new(Maxwell3D::new_with_memory_manager(Arc::clone(
             self.memory_manager.as_ref().unwrap(),
         )));
@@ -125,12 +119,83 @@ impl ChannelState {
             self.memory_manager.as_ref().unwrap(),
         )));
         self.kepler_memory = Some(kepler_memory);
+        self.nv01_timer = Some(Box::new(Nv01Timer::new(Arc::clone(
+            self.memory_manager.as_ref().unwrap(),
+        ))));
+        self.dma_pusher = Some(Box::new(crate::dma_pusher::DmaPusher::new(
+            _gpu as *const crate::gpu::Gpu,
+            _gpu.system_ref(),
+            Arc::clone(self.memory_manager.as_ref().unwrap()),
+            self as *mut ChannelState,
+        )));
+        self.dma_pusher
+            .as_mut()
+            .expect("DmaPusher must exist immediately after construction")
+            .install_self_reference();
+
+        self.bind_nvk_default_subchannels();
 
         self.initialized = true;
         log::debug!(
             "ChannelState::init bind_id={} program_id={:016x}",
             self.bind_id,
             self.program_id
+        );
+    }
+
+    /// Match NVK/Nouveau's initial pushbuffer subchannel layout.
+    ///
+    /// Corresponds to Eden's anonymous `BindNvkDefaultSubchannels` helper in
+    /// `channel_state.cpp`.
+    fn bind_nvk_default_subchannels(&mut self) {
+        const NVK_3D_SUBCHANNEL: u32 = 0;
+        const NVK_COMPUTE_SUBCHANNEL: u32 = 1;
+        const NVK_2D_SUBCHANNEL: u32 = 3;
+        const NVK_COPY_SUBCHANNEL: u32 = 4;
+
+        let Self {
+            dma_pusher,
+            maxwell_3d,
+            kepler_compute,
+            fermi_2d,
+            maxwell_dma,
+            ..
+        } = self;
+        let dma_pusher = dma_pusher
+            .as_mut()
+            .expect("DmaPusher must exist before binding NVK subchannels");
+        dma_pusher.bind_subchannel(
+            maxwell_3d
+                .as_mut()
+                .expect("Maxwell3D must exist before NVK binding")
+                .as_mut(),
+            NVK_3D_SUBCHANNEL,
+            EngineTypes::Maxwell3D,
+        );
+        dma_pusher.bind_subchannel(
+            kepler_compute
+                .as_mut()
+                .expect("KeplerCompute must exist before NVK binding")
+                .as_mut(),
+            NVK_COMPUTE_SUBCHANNEL,
+            EngineTypes::KeplerCompute,
+        );
+        // Subchannel 2 is M2MF; Eden does not expose a 0x9039 engine yet.
+        dma_pusher.bind_subchannel(
+            fermi_2d
+                .as_mut()
+                .expect("Fermi2D must exist before NVK binding")
+                .as_mut(),
+            NVK_2D_SUBCHANNEL,
+            EngineTypes::Fermi2D,
+        );
+        dma_pusher.bind_subchannel(
+            maxwell_dma
+                .as_mut()
+                .expect("MaxwellDMA must exist before NVK binding")
+                .as_mut(),
+            NVK_COPY_SUBCHANNEL,
+            EngineTypes::MaxwellDMA,
         );
     }
 
@@ -186,5 +251,33 @@ mod tests {
         assert!(!cs.initialized);
         assert!(cs.maxwell_3d.is_none());
         assert!(cs.memory_manager.is_none());
+    }
+
+    #[test]
+    fn init_binds_the_nvk_default_subchannels() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let mut cs = ChannelState::new(7);
+        cs.memory_manager = Some(Arc::new(Mutex::new(MemoryManager::new(1))));
+
+        cs.init(&gpu, 0x1234);
+
+        let dma = cs.dma_pusher.as_ref().unwrap();
+        assert_eq!(
+            dma.subchannel_binding_for_test(0),
+            (true, EngineTypes::Maxwell3D)
+        );
+        assert_eq!(
+            dma.subchannel_binding_for_test(1),
+            (true, EngineTypes::KeplerCompute)
+        );
+        assert_eq!(dma.subchannel_binding_for_test(2).0, false);
+        assert_eq!(
+            dma.subchannel_binding_for_test(3),
+            (true, EngineTypes::Fermi2D)
+        );
+        assert_eq!(
+            dma.subchannel_binding_for_test(4),
+            (true, EngineTypes::MaxwellDMA)
+        );
     }
 }

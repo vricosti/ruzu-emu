@@ -16,6 +16,7 @@ pub mod kepler_compute;
 pub mod kepler_memory;
 pub mod maxwell_3d;
 pub mod maxwell_dma;
+pub mod nv01_timer;
 pub mod puller;
 pub mod sw_blitter;
 

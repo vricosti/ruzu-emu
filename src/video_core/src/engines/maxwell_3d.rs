@@ -5233,6 +5233,10 @@ impl EngineInterface for Maxwell3D {
         self.consume_sink_inner();
     }
 
+    fn has_pending_methods(&self) -> bool {
+        !self.interface_state.method_sink.is_empty()
+    }
+
     fn execution_mask(&self) -> &[bool] {
         &self.interface_state.execution_mask
     }

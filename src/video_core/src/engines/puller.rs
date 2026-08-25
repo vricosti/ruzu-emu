@@ -31,6 +31,7 @@ pub struct EngineID(u32);
 
 #[allow(non_upper_case_globals)]
 impl EngineID {
+    pub const Nv01Timer: Self = Self(0x0004);
     pub const FermiTwodA: Self = Self(0x902D);
     pub const MaxwellB: Self = Self(0xB197);
     pub const KeplerComputeB: Self = Self(0xB1C0);
@@ -60,6 +61,7 @@ impl Default for EngineID {
 impl std::fmt::Debug for EngineID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
+            Self::Nv01Timer => f.write_str("Nv01Timer"),
             Self::FermiTwodA => f.write_str("FermiTwodA"),
             Self::MaxwellB => f.write_str("MaxwellB"),
             Self::KeplerComputeB => f.write_str("KeplerComputeB"),
@@ -614,6 +616,16 @@ impl Puller {
                     );
                 }
             }
+            EngineID::Nv01Timer => {
+                let channel_state = unsafe { &mut *self.channel_state };
+                if let Some(engine) = channel_state.nv01_timer.as_mut() {
+                    engine.call_method(
+                        method_call.method,
+                        method_call.argument,
+                        method_call.is_last_call(),
+                    );
+                }
+            }
             _ => {
                 self.log_unimplemented_engine(
                     "Puller::CallEngineMethod",
@@ -672,6 +684,12 @@ impl Puller {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
+            EngineID::Nv01Timer => {
+                let channel_state = unsafe { &mut *self.channel_state };
+                if let Some(engine) = channel_state.nv01_timer.as_mut() {
+                    engine.call_multi_method(method, base_start, amount, methods_pending);
+                }
+            }
             _ => {
                 self.log_unimplemented_engine(
                     "Puller::CallEngineMultiMethod",
@@ -708,7 +726,8 @@ impl Puller {
             | EngineID::MaxwellB
             | EngineID::KeplerComputeB
             | EngineID::KeplerInlineToMemoryB
-            | EngineID::MaxwellDmaCopyA => {
+            | EngineID::MaxwellDmaCopyA
+            | EngineID::Nv01Timer => {
                 let channel_state = unsafe { &mut *self.channel_state };
                 let dma_pusher = unsafe { self.dma_pusher.as_mut() };
                 if let Some(dma_pusher) = dma_pusher {
@@ -755,6 +774,15 @@ impl Puller {
                                     engine.as_mut(),
                                     method_call.subchannel,
                                     EngineTypes::MaxwellDMA,
+                                );
+                            }
+                        }
+                        EngineID::Nv01Timer => {
+                            if let Some(engine) = channel_state.nv01_timer.as_mut() {
+                                dma_pusher.bind_subchannel(
+                                    engine.as_mut(),
+                                    method_call.subchannel,
+                                    EngineTypes::Nv01Timer,
                                 );
                             }
                         }
@@ -811,34 +839,33 @@ impl Puller {
                 )
             });
         } else {
-            loop {
-                let word = self.read_gpu_u32(self.regs.semaphore_address());
-                let acquire_value = self.regs.semaphore_sequence();
-                self.regs.set_acquire_source(1);
-                self.regs.set_acquire_value(acquire_value);
-                let mut retry = false;
-                match op {
-                    x if x == GpuSemaphoreOperation::AcquireEqual as u32 => {
-                        self.regs.set_acquire_active(1);
-                        self.regs.set_acquire_mode(0);
-                        retry = word != acquire_value;
-                    }
-                    x if x == GpuSemaphoreOperation::AcquireGequal as u32 => {
-                        self.regs.set_acquire_active(1);
-                        self.regs.set_acquire_mode(1);
-                        retry = word < acquire_value;
-                    }
-                    x if x == GpuSemaphoreOperation::AcquireMask as u32 => {
-                        retry = word != 0 && acquire_value == 0;
-                    }
-                    _ => {
-                        log::error!("Invalid semaphore operation {}", op);
+            let word = self.read_gpu_u32(self.regs.semaphore_address());
+            let acquire_value = self.regs.semaphore_sequence();
+            self.regs.set_acquire_source(1);
+            self.regs.set_acquire_value(acquire_value);
+            match op {
+                x if x == GpuSemaphoreOperation::AcquireEqual as u32 => {
+                    self.regs.set_acquire_active(1);
+                    self.regs.set_acquire_mode(0);
+                    if word != acquire_value {
+                        self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
                     }
                 }
-                if !retry {
-                    break;
+                x if x == GpuSemaphoreOperation::AcquireGequal as u32 => {
+                    self.regs.set_acquire_active(1);
+                    self.regs.set_acquire_mode(1);
+                    if word < acquire_value {
+                        self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
+                    }
                 }
-                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
+                x if x == GpuSemaphoreOperation::AcquireMask as u32 => {
+                    if word != 0 && acquire_value == 0 {
+                        self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
+                    }
+                }
+                _ => {
+                    log::error!("Invalid semaphore operation {}", op);
+                }
             }
         }
     }
@@ -908,6 +935,12 @@ mod tests {
     use super::*;
     use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    #[test]
+    fn register_file_and_timer_engine_id_match_eden() {
+        assert_eq!(std::mem::size_of::<PullerRegs>(), 0x800 * 4);
+        assert_eq!(EngineID::Nv01Timer.raw(), 0x0004);
+    }
 
     #[derive(Default)]
     struct FakeRasterizer {
@@ -1095,6 +1128,25 @@ mod tests {
         assert_eq!(calls[0].1, QueryType::Payload as u32);
         assert_eq!(calls[0].2, QueryPropertiesFlags::IS_A_FENCE);
         assert_eq!(calls[0].3, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn semaphore_trigger_acquire_mismatch_releases_fences_once_and_returns() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let releases = fake.release_fence_calls.clone();
+        let raw: *const dyn RasterizerInterface = Box::leak(fake);
+        puller.bind_rasterizer(unsafe { &*raw });
+        puller.regs.reg_array[0x06] = 1;
+        puller.regs.reg_array[0x07] = GpuSemaphoreOperation::AcquireEqual as u32;
+
+        puller.process_semaphore_trigger_method();
+
+        assert_eq!(*releases.lock().unwrap(), vec![true]);
+        assert_eq!(puller.regs.acquire_source(), 1);
+        assert_eq!(puller.regs.acquire_active(), 1);
+        assert_eq!(puller.regs.acquire_mode(), 0);
+        assert_eq!(puller.regs.acquire_value(), 1);
     }
 
     #[test]

@@ -12129,3 +12129,80 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: the streamer state is internal and is not serialized or copied as a raw payload.
   The focused regression test verifies both directions of the dependency relationship.
+
+## 2026-08-25 — `src/video_core/src/engines/puller.rs` vs Eden `src/video_core/engines/puller.{h,cpp}`
+
+### Intentional differences
+- Rust passes `true` to `RasterizerInterface::release_fences` because the Rust interface exposes
+  the force argument explicitly; Eden's puller calls its argument-less wrapper.
+- Raw engine identifiers are represented by the transparent `EngineID` newtype so unsupported
+  values retain Eden's `static_cast<EngineID>` bit pattern.
+
+### Unintentional differences (to fix)
+- None in the corrected semaphore-trigger path. An unsatisfied `AcquireEqual`, `AcquireGequal`, or
+  `AcquireMask` now releases fences once and returns, matching Eden's single-pass
+  `do { ... } while (false)` control flow instead of busy-waiting in the puller thread.
+
+### Missing items
+- None in the reviewed bind, dispatch, fence, and semaphore paths. `NV01_TIMER` now binds and
+  dispatches through its matching engine counterpart.
+
+### Binary layout verification
+- PASS: `PullerRegs` remains a 0x800-word register array and all typed accessors retain Eden's
+  asserted word offsets. The focused regression test verifies the one-pass acquire state changes.
+
+## 2026-08-25 — `src/video_core/src/engines/engine_interface.rs` vs Eden `src/video_core/engines/engine_interface.h`
+
+### Intentional differences
+- Rust extracts the inherited fields into `EngineInterfaceState` and exposes
+  `has_pending_methods` to preserve Eden's guarded `ConsumeSink` behavior across trait objects.
+- `EngineHandle` retains Eden's non-owning engine-pointer semantics for Rust fat pointers.
+
+### Unintentional differences (to fix)
+- None. Restored `Nv01Timer = 0` and the exact discriminants of all following `EngineTypes`.
+- None. `consume_sink` now calls `consume_sink_impl` only when the method sink is non-empty, as
+  Eden does.
+
+### Missing items
+- None in the reviewed interface and shared state.
+
+### Binary layout verification
+- N/A: this interface state is not serialized or copied as a raw payload. A focused test verifies
+  every `EngineTypes` discriminant.
+
+## 2026-08-25 — `src/video_core/src/engines/nv01_timer.rs` vs Eden `src/video_core/engines/nv01_timer.h`
+
+### Intentional differences
+- The ignored `MemoryManager&` constructor argument is accepted as an `Arc<Mutex<MemoryManager>>`
+  to match the existing Rust engine construction boundary; neither implementation stores it.
+- Inherited `EngineInterface` fields live in `EngineInterfaceState` because Rust has no field
+  inheritance.
+
+### Unintentional differences (to fix)
+- None. Single and multi-method calls only log their arguments, and `consume_sink_impl` remains an
+  intentional no-op exactly like Eden.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- PASS: `Regs` is exactly 0x48 bytes and is deterministically zero-initialized. A focused layout
+  test verifies its size.
+
+## 2026-08-25 — `src/video_core/src/control/channel_state.rs` vs Eden `src/video_core/control/channel_state.{h,cpp}`
+
+### Intentional differences
+- Eden's optional `Payload` is represented by individually boxed optional engines and a boxed DMA
+  pusher so their addresses remain stable for non-owning engine handles.
+- Maxwell3D guest-memory and tick callbacks are Rust adapters required by the flattened owner.
+
+### Unintentional differences (to fix)
+- None. `init` now creates the NV01 timer and calls the file-owned NVK default-subchannel helper,
+  binding 3D/compute/2D/copy to subchannels 0/1/3/4 in Eden's order.
+
+### Missing items
+- None in the reviewed payload construction, default binding, and rasterizer-binding lifecycle.
+
+### Binary layout verification
+- N/A: `ChannelState` is an internal owner and is not serialized or copied as an upstream C++
+  payload. A focused test verifies every NVK default binding and the deliberately empty M2MF slot.

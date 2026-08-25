@@ -309,6 +309,14 @@ impl DmaPusher {
         self.subchannel_type[subchannel_id as usize] = engine_type;
     }
 
+    #[cfg(test)]
+    pub(crate) fn subchannel_binding_for_test(&self, subchannel_id: usize) -> (bool, EngineTypes) {
+        (
+            self.subchannels[subchannel_id].is_some(),
+            self.subchannel_type[subchannel_id],
+        )
+    }
+
     /// Push a command list into the DMA pushbuffer queue.
     pub fn push(&mut self, entries: CommandList) {
         self.dma_pushbuffer.push_back(entries);

@@ -12481,3 +12481,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this host-only generic container is not raw-copied or serialized. Focused tests verify the
   const-generic outer size and destruction after exactly one complete ring traversal.
+
+## 2026-08-25 — `src/video_core/src/fence_manager.rs` vs Eden `src/video_core/fence_manager.h`
+
+### Intentional differences
+
+- Rust represents Eden's derived fence-manager virtual methods with call-site closures. The async
+  release thread therefore stores `PopAsyncFlushes` as a pre-operation and obtains host waiting
+  through `FenceBase::wait_for_fence`; both execute at the same points as Eden's virtual calls.
+- The fence queue, pending operations, and uncommitted operations share an `Arc<Mutex<_>>` so the
+  worker can own them safely. The async signal path keeps this mutex locked for Eden's complete
+  `guard.lock()` interval, from moving uncommitted operations through queuing, publication, and
+  the optional command flush.
+
+### Unintentional differences (to fix)
+
+- Fixed the async guard interval: no worker can observe or consume a fence between extraction of
+  its operations and publication of the matching queue entry.
+- Fixed synchronous release ordering: pending operations are moved and run while the fence stays
+  at the queue front; the fence is removed only after the operations complete.
+- Removed the Rust-only boolean return values from `signal_reference`, `signal_fence`, and
+  `signal_sync_point`; Eden's methods return `void` and no caller consumed those values.
+
+### Missing items
+
+- Eden calls `SetCurrentThreadToPerformanceCores` in the async worker. It is a no-op on the current
+  Linux target, while its Android behavior depends on the still-unported topology/ADPF subsystem
+  already recorded in the `common/thread.rs` audit entry.
+
+### Binary layout verification
+
+- N/A: fence-manager queues and callbacks are host-only and are neither raw-copied nor serialized.
+  Focused tests verify the async guard interval and synchronous queue lifetime.

@@ -130,8 +130,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
-    ) -> bool
-    where
+    ) where
         FC: FnMut(bool) -> F,
         FQ: FnMut(&mut F),
         FSW: FnMut() -> bool,
@@ -175,8 +174,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         mut commit_async_flushes: FCAF,
         mut flush_commands: FFL,
         mut invalidate_gpu_cache: FINV,
-    ) -> bool
-    where
+    ) where
         FC: FnMut(bool) -> F,
         FQ: FnMut(&mut F),
         FSW: FnMut() -> bool,
@@ -217,7 +215,12 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
 
         let mut new_fence = create_fence(!should_flush_now);
         let mut maybe_func = Some(func);
-        let operations = {
+        let mut pre_operations = VecDeque::new();
+        if self.has_async_check {
+            pre_operations.push_back(Box::new(move || pop_async_flushes()) as Operation);
+        }
+
+        if self.has_async_check {
             let mut state = self.shared.state.lock().unwrap();
             if delay_fence {
                 state.uncommitted_operations.push_back(
@@ -226,16 +229,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                         .expect("fence callback must be consumed once"),
                 );
             }
-            std::mem::take(&mut state.uncommitted_operations)
-        };
-
-        let mut pre_operations = VecDeque::new();
-        if self.has_async_check {
-            pre_operations.push_back(Box::new(move || pop_async_flushes()) as Operation);
-        }
-
-        if self.has_async_check {
-            let mut state = self.shared.state.lock().unwrap();
+            let operations = std::mem::take(&mut state.uncommitted_operations);
             queue_fence(&mut new_fence);
             if !delay_fence {
                 maybe_func
@@ -251,6 +245,17 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                 flush_commands();
             }
         } else {
+            let operations = {
+                let mut state = self.shared.state.lock().unwrap();
+                if delay_fence {
+                    state.uncommitted_operations.push_back(
+                        maybe_func
+                            .take()
+                            .expect("fence callback must be consumed once"),
+                    );
+                }
+                std::mem::take(&mut state.uncommitted_operations)
+            };
             queue_fence(&mut new_fence);
             if !delay_fence {
                 maybe_func
@@ -275,8 +280,6 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             self.shared.cv.notify_all();
         }
         invalidate_gpu_cache();
-
-        should_flush_now
     }
 
     /// Port of `FenceManager::SignalSyncPoint()`.
@@ -294,8 +297,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
-    ) -> bool
-    where
+    ) where
         FG: FnMut(u32),
         FH: FnMut(u32) + Send + 'static,
         FC: FnMut(bool) -> F,
@@ -320,7 +322,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
-        )
+        );
     }
 
     /// Port of `FenceManager::WaitPendingFences()`.
@@ -400,7 +402,6 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     pub(crate) fn queued_fence_count(&self) -> usize {
         self.shared.state.lock().unwrap().fences.len()
     }
-
 }
 
 impl<F: FenceBase + Send + 'static> Drop for FenceManager<F> {
@@ -430,19 +431,31 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                 return;
             }
 
-            let pending_fence = {
+            let (pre_operations, operations) = {
                 let mut state = self.shared.state.lock().unwrap();
-                state
+                let pending_fence = state
                     .fences
-                    .pop_front()
-                    .expect("pending fence must exist while releasing")
+                    .front_mut()
+                    .expect("pending fence must exist while releasing");
+                (
+                    std::mem::take(&mut pending_fence.pre_operations),
+                    std::mem::take(&mut pending_fence.operations),
+                )
             };
-            for operation in pending_fence.pre_operations {
+            for operation in pre_operations {
                 operation();
             }
-            for operation in pending_fence.operations {
+            for operation in operations {
                 operation();
             }
+            let pending_fence = self
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .fences
+                .pop_front()
+                .expect("pending fence must exist after releasing its operations");
             let mut ring = self.shared.ring_guard.lock().unwrap();
             ring.push(pending_fence.fence);
         }
@@ -512,6 +525,7 @@ fn release_thread_func<F: FenceBase + Send + 'static>(shared: Arc<FenceManagerSh
 mod tests {
     use super::*;
     use common::settings_enums::GpuAccuracy;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -647,6 +661,59 @@ mod tests {
         assert!(flushed.load(Ordering::Relaxed));
         assert!(invalidated.load(Ordering::Relaxed));
         assert_eq!(manager.queued_fence_count(), 1);
+    }
+
+    #[test]
+    fn async_signal_holds_guard_from_queue_through_publication() {
+        let _gpu_accuracy = crate::test_support::GpuAccuracyGuard::set(GpuAccuracy::Low);
+
+        let mut manager = FenceManager::<TestFence>::new(true);
+        let shared = Arc::clone(&manager.shared);
+
+        manager.signal_fence(
+            Box::new(|| {}),
+            |is_stubbed| TestFence {
+                stubbed: is_stubbed,
+            },
+            move |_| {
+                assert!(
+                    shared.state.try_lock().is_err(),
+                    "Eden holds guard while QueueFence publishes the fence"
+                );
+            },
+            || false,
+            |_| true,
+            || {},
+            || false,
+            || {},
+            || {},
+            || {},
+        );
+    }
+
+    #[test]
+    fn non_async_release_keeps_fence_queued_until_operations_complete() {
+        let mut manager = FenceManager::<TestFence>::new(false);
+        manager
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .fences
+            .push_back(PendingFence {
+                fence: TestFence { stubbed: false },
+                pre_operations: VecDeque::new(),
+                operations: VecDeque::from([Box::new(|| panic!("operation failed")) as Operation]),
+            });
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            manager.signal_ordering(|| false, |_| true, || {}, || {});
+        }));
+
+        assert!(result.is_err());
+        let state = manager.shared.state.lock().unwrap();
+        assert_eq!(state.fences.len(), 1);
+        assert!(state.fences.front().unwrap().operations.is_empty());
     }
 
     #[test]

@@ -182,8 +182,7 @@ impl FenceManagerOpenGL {
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
-    ) -> bool
-    where
+    ) where
         FSW: FnMut() -> bool,
         FPF: FnMut() + Send + 'static,
         FSHF: FnMut() -> bool,
@@ -202,7 +201,7 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
-        )
+        );
     }
 
     pub fn signal_fence<FSW, FPF, FSHF, FCAF, FFL, FINV>(
@@ -214,8 +213,7 @@ impl FenceManagerOpenGL {
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
-    ) -> bool
-    where
+    ) where
         FSW: FnMut() -> bool,
         FPF: FnMut() + Send + 'static,
         FSHF: FnMut() -> bool,
@@ -235,7 +233,7 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
-        )
+        );
     }
 
     pub fn signal_sync_point<FG, FH, FSW, FPF, FSHF, FCAF, FFL, FINV>(
@@ -249,8 +247,7 @@ impl FenceManagerOpenGL {
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
-    ) -> bool
-    where
+    ) where
         FG: FnMut(u32),
         FH: FnMut(u32) + Send + 'static,
         FSW: FnMut() -> bool,
@@ -274,7 +271,7 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
-        )
+        );
     }
 
     pub fn wait_pending_fences<FSW, FPF, FSHF, FCAF, FFL, FINV>(

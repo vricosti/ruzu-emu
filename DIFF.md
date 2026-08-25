@@ -12457,3 +12457,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: bank metadata is consumed field-wise and Vulkan descriptor structures are built through ash,
   not serialized by raw memory copy. Focused tests cover all-field superset comparison,
   multi-shader accumulation, and unsigned wrapping.
+
+## 2026-08-25 — `src/video_core/src/delayed_destruction_ring.rs` vs Eden `src/video_core/delayed_destruction_ring.h`
+
+### Intentional differences
+
+- `new`/`Default` explicitly construct the array through `std::array::from_fn`; Eden obtains the
+  same zero-indexed empty vectors from C++ default member construction.
+- Rust consumes `T` in `push`, matching Eden's rvalue-reference plus `std::move` contract.
+
+### Unintentional differences (to fix)
+
+- Replaced the heap-allocated outer `Vec<Vec<T>>` with `[Vec<T>; TICKS_TO_DESTROY]`, directly
+  matching Eden's `std::array<std::vector<T>, TICKS_TO_DESTROY>` storage and allocation behavior.
+- Restored conditional copy support with `Clone`, corresponding to the implicitly copyable C++
+  template whenever `T` itself is copyable.
+
+### Missing items
+
+- None in construction, tick advancement, slot clearing, move-push, or copy behavior.
+
+### Binary layout verification
+
+- N/A: this host-only generic container is not raw-copied or serialized. Focused tests verify the
+  const-generic outer size and destruction after exactly one complete ring traversal.

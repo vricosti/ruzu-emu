@@ -230,7 +230,7 @@ impl Sgsr {
         let pipeline_layout = self.pipeline_layout;
         let stage_pipeline = self.stage_pipeline;
         let extent = self.extent;
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             util::transition_image_layout(
                 &device,

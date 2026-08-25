@@ -150,7 +150,7 @@ impl SamplesQueryBank {
                     .reset_query_pool(self.query_pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
             }
         } else {
-            scheduler.request_outside_renderpass();
+            scheduler.request_outside_render_pass_operation_context();
             let device = self.device.clone();
             let query_pool = self.query_pool;
             scheduler.record(move |cmdbuf| unsafe {
@@ -454,7 +454,7 @@ impl SamplesStreamer {
         //
         // It holds today because the only re-entrant path here is
         // `SamplesQueryBank::new` -> `record_pool_reset` ->
-        // `request_outside_renderpass` (taken only when the device lacks host
+        // `request_outside_render_pass_operation_context` (taken only when the device lacks host
         // query reset) -> `Scheduler::end_render_pass`, which calls
         // `counter_close`, `counter_enable(.., false)` and `notify_segment`.
         // All three only pause counters; none reserves a slot, so neither the
@@ -638,7 +638,7 @@ impl SamplesStreamer {
         let device = self.device.clone();
         let queries = report.slots();
 
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             device.cmd_fill_buffer(cmdbuf, accumulation_buffer, 0, SAMPLES_QUERY_SIZE as u64, 0);
             for (index, &(pool, slot)) in queries.iter().enumerate() {
@@ -1309,7 +1309,7 @@ impl TfbCounterState {
     }
 
     pub(crate) fn close_counter(&mut self, scheduler: &mut Scheduler) {
-        if self.has_flushed_end_pending && scheduler.is_inside_renderpass() {
+        if self.has_flushed_end_pending && scheduler.is_render_pass_active() {
             self.flush_end_tfb(scheduler);
         }
         if !self.transform_feedback_enabled() {
@@ -1424,7 +1424,7 @@ impl TfbCounterStreamer {
         {
             return None;
         }
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         self.close_counter(scheduler);
         let report = match self.reserve(scheduler) {
             Ok(report) => report,
@@ -1781,7 +1781,7 @@ fn sync_guest_values(backend: &mut QueryRuntimeBackend, values: &[SyncValuesStru
     let src_buffer = staging.buffer;
     let device = backend.device.clone();
     let scheduler = unsafe { backend.scheduler.as_mut() };
-    scheduler.request_outside_renderpass();
+    scheduler.request_outside_render_pass_operation_context();
     scheduler.record(move |cmdbuf| unsafe {
         for (index, &(dst_buffer, _)) in destination_buffers.iter().enumerate() {
             device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &copies[index]);
@@ -1914,7 +1914,7 @@ impl QueryCacheRuntime {
             return;
         };
         let scheduler = unsafe { backend.scheduler.as_mut() };
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = backend.device.clone();
         scheduler.record(move |cmdbuf| unsafe {
             let (src_stage, dst_stage, barrier) = if is_prebarrier {

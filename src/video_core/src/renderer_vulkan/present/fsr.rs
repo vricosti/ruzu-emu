@@ -381,7 +381,7 @@ impl Fsr {
         self.upload_images(scheduler);
         self.update_descriptor_sets(source_image_view, image_index);
 
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = self.device.clone();
         scheduler.record(move |cmdbuf| unsafe {
             util::transition_image_layout(

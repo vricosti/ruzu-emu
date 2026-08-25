@@ -154,7 +154,7 @@ pub fn upload_image(
         })
         .build();
 
-    scheduler.request_outside_renderpass();
+    scheduler.request_outside_render_pass_operation_context();
     let device = device.clone();
     let upload_buffer_handle = upload_buffer.buffer();
     scheduler.record(move |cmdbuf| unsafe {

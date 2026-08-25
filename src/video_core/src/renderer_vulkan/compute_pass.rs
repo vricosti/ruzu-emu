@@ -388,7 +388,7 @@ impl Uint8Pass {
         let known_gpu_tick = scheduler.known_gpu_tick();
         let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = self.base.device.clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
@@ -513,7 +513,7 @@ impl QuadIndexedPass {
         let known_gpu_tick = scheduler.known_gpu_tick();
         let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = self.base.device.clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
@@ -636,7 +636,7 @@ impl ConditionalRenderingResolvePass {
         let known_gpu_tick = scheduler.known_gpu_tick();
         let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = self.base.device.clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
@@ -796,7 +796,7 @@ impl QueriesPrefixScanPass {
             let known_gpu_tick = scheduler.known_gpu_tick();
             let pending_tick = scheduler.pending_tick();
             let descriptor_allocator = self.base.descriptor_allocator.clone();
-            scheduler.request_outside_renderpass();
+            scheduler.request_outside_render_pass_operation_context();
             let device = self.base.device.clone();
             let descriptor_template = self.base.descriptor_template;
             let pipeline = self.base.pipeline;
@@ -973,7 +973,7 @@ impl AstcDecoderPass {
         ];
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = device_handle.clone();
         scheduler.record(move |cmdbuf| unsafe {
             let image_barrier = vk::ImageMemoryBarrier::builder()
@@ -1251,7 +1251,7 @@ impl BlockLinearUnswizzle3DPass {
         let blocks_y = info.size.height.div_ceil(4);
 
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         for z_offset in (0..z_count).step_by(max_batch_slices as usize) {
             let current_chunk_slices = max_batch_slices.min(z_count - z_offset);
             let current_z_start = z_start + z_offset;

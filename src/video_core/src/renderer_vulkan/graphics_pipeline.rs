@@ -498,6 +498,11 @@ impl Drop for GraphicsPipeline {
 }
 
 impl GraphicsPipeline {
+    /// Port of upstream `GraphicsPipeline::UsesExtendedDynamicState`.
+    pub fn uses_extended_dynamic_state(&self) -> bool {
+        self.key.fixed_state.extended_dynamic_state()
+    }
+
     fn create_descriptor_layout(
         device: &Device,
         key: &GraphicsPipelineKey,
@@ -1078,7 +1083,7 @@ impl GraphicsPipeline {
         }
 
         if draw.transform_feedback_enabled() {
-            scheduler.request_outside_renderpass();
+            scheduler.request_outside_render_pass_operation_context();
         }
         buffer_cache.update_graphics_buffers(is_indexed);
         buffer_cache.bind_host_geometry_buffers(is_indexed);
@@ -1249,7 +1254,7 @@ impl GraphicsPipeline {
                 return false;
             }
         };
-        scheduler.request_framebuffer(&target);
+        scheduler.request_renderpass(&target);
 
         let is_built = self.is_built.load(Ordering::Relaxed);
         if !is_built {
@@ -1266,16 +1271,7 @@ impl GraphicsPipeline {
         let is_rescaling = texture_cache.base.is_rescaling;
         let update_rescaling = scheduler.update_rescaling(is_rescaling);
         let pipeline = Arc::clone(&self.pipeline);
-        let bind_pipeline = if is_built {
-            let pipeline_handle = *pipeline.lock().unwrap();
-            scheduler.update_graphics_pipeline(pipeline_handle)
-        } else {
-            // The eventual Vulkan handle is not available yet. Clear the
-            // handle cache and force this draw's post-wait bind; the next draw
-            // will bind once more, then resume normal handle-based elision.
-            let _ = scheduler.update_graphics_pipeline(vk::Pipeline::null());
-            true
-        };
+        let bind_pipeline = scheduler.update_graphics_pipeline(Some(self));
         let bind_descriptor_buffer = self.descriptor_set_layout != vk::DescriptorSetLayout::null()
             && self.uses_descriptor_buffer
             && scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);

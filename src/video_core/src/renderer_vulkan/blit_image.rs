@@ -878,7 +878,7 @@ impl BlitImageHelper {
         let dst_region = *dst_region;
         let src_region = *src_region;
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_renderpass(
+        scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
             render_area,
@@ -950,7 +950,7 @@ impl BlitImageHelper {
         let src_size = *src_size;
         let device = self.device.clone();
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             let access = vk::AccessFlags::COLOR_ATTACHMENT_READ
                 | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
@@ -1075,7 +1075,7 @@ impl BlitImageHelper {
         let dst_region = *dst_region;
         let src_region = *src_region;
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_renderpass(
+        scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
             render_area,
@@ -1355,7 +1355,7 @@ impl BlitImageHelper {
         let device = self.device.clone();
         let dst_region = *dst_region;
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_renderpass(
+        scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
             render_area,
@@ -1428,7 +1428,7 @@ impl BlitImageHelper {
         let device = self.device.clone();
         let dst_region = *dst_region;
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_renderpass(
+        scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
             render_area,
@@ -1492,7 +1492,7 @@ impl BlitImageHelper {
         };
         let device = self.device.clone();
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_renderpass(
+        scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
             render_area,
@@ -1578,7 +1578,7 @@ impl BlitImageHelper {
         };
         let device = self.device.clone();
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_renderpass(
+        scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
             render_area,
@@ -1787,7 +1787,7 @@ impl BlitImageHelper {
             };
             let device = self.device.clone();
             let layout = self.msaa_copy_pipeline_layout;
-            unsafe { self.scheduler.as_mut() }.request_outside_renderpass();
+            unsafe { self.scheduler.as_mut() }.request_outside_render_pass_operation_context();
             unsafe { self.scheduler.as_mut() }.record(move |cmdbuf| unsafe {
                 let color_range = vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,

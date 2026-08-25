@@ -307,7 +307,7 @@ impl Layer {
         self.refresh_resources(framebuffer);
         self.set_anti_alias_pass();
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         if let Some(tick) = self.resource_ticks.get(image_index).copied() {
             scheduler.wait(tick);
         }

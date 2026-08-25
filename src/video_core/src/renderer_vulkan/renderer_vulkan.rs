@@ -506,7 +506,7 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
-        self.scheduler.request_outside_renderpass();
+        self.scheduler.request_outside_render_pass_operation_context();
         self.blit_swapchain.draw_to_present_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -542,7 +542,7 @@ impl RendererVulkan {
 
         let dst_buffer =
             self.create_download_buffer(crate::capture::tiled_size() as vk::DeviceSize);
-        self.scheduler.request_outside_renderpass();
+        self.scheduler.request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();
         let image = self.applet_frame.image;
         let buffer = dst_buffer.buffer();
@@ -648,7 +648,7 @@ impl RendererVulkan {
             format,
         );
 
-        self.scheduler.request_outside_renderpass();
+        self.scheduler.request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();
         let image = frame.image;
         let buffer = dst_buffer.buffer();

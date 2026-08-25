@@ -3,7 +3,7 @@
 
 //! Vulkan command scheduler with command chunk batching.
 //!
-//! Ref: zuyu `vk_scheduler.h/.cpp` — batches Vulkan commands into chunks,
+//! Ref: Eden `video_core/renderer_vulkan/vk_scheduler.{h,cpp}` — batches commands into chunks,
 //! manages render pass state, and submits to the GPU queue.
 
 use ash::vk;
@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::command_pool::CommandPool;
+use super::graphics_pipeline::GraphicsPipeline;
 use super::master_semaphore::MasterSemaphore;
 use super::query_cache::{QueryRuntimeState, SamplesQueryState, TfbCounterState};
 use super::state_tracker::StateTracker;
@@ -40,7 +41,7 @@ struct CommandHeader {
 #[repr(C, align(64))]
 struct CommandStorage([MaybeUninit<u8>; COMMAND_CHUNK_CAPACITY]);
 
-/// Batch of recorded Vulkan commands (zuyu: CommandChunk, 32KB arena).
+/// Batch of recorded Vulkan commands (Eden: `CommandChunk`, 32 KiB arena).
 struct CommandChunk {
     storage: Box<CommandStorage>,
     first: usize,
@@ -195,29 +196,21 @@ unsafe fn drop_command<T>(payload: *mut u8) {
 }
 
 struct SubmitRequest {
-    signal_semaphores: Vec<vk::Semaphore>,
+    signal_semaphore: vk::Semaphore,
+    wait_semaphore: vk::Semaphore,
     tick: u64,
 }
 
-/// Current render pass state tracked by the scheduler.
-#[derive(Default)]
-struct RenderPassState {
-    renderpass: vk::RenderPass,
-    framebuffer: vk::Framebuffer,
-    render_area: vk::Rect2D,
-    inside_renderpass: bool,
-    num_images: usize,
-    images: [vk::Image; NUM_RT + 1],
-    image_ranges: [vk::ImageSubresourceRange; NUM_RT + 1],
-}
-
-/// Port of upstream `Scheduler::State` fields that are independent from the
-/// command-buffer render pass state.
+/// Port of upstream `Scheduler::State`.
 #[derive(Default)]
 struct SchedulerState {
-    graphics_pipeline: vk::Pipeline,
+    renderpass: vk::RenderPass,
+    framebuffer: vk::Framebuffer,
+    render_area: vk::Extent2D,
+    graphics_pipeline: Option<NonNull<GraphicsPipeline>>,
     is_rescaling: bool,
     rescaling_defined: bool,
+    needs_state_enable_refresh: bool,
     descriptor_buffer_chunk: u32,
     descriptor_buffer_bound: bool,
 }
@@ -245,7 +238,7 @@ impl Default for DeferredClear {
 
 /// Command buffer scheduler with submission tracking.
 ///
-/// Ref: zuyu Scheduler — batches commands, tracks render pass state,
+/// Ref: Eden `Scheduler` — batches commands, tracks render pass state,
 /// and submits to the GPU queue with tick-based synchronization.
 pub struct Scheduler {
     device: ash::Device,
@@ -257,11 +250,14 @@ pub struct Scheduler {
     /// Current chunk being recorded to.
     current_chunk: CommandChunk,
 
-    /// Render pass state.
-    rp_state: RenderPassState,
-    /// Upstream scheduler-local state invalidated by helper draws.
+    /// Upstream scheduler-local command-buffer state.
     state: SchedulerState,
     deferred_clear: DeferredClear,
+
+    /// Port of upstream render-pass attachment tracking fields.
+    num_renderpass_images: usize,
+    renderpass_images: [vk::Image; NUM_RT + 1],
+    renderpass_image_ranges: [vk::ImageSubresourceRange; NUM_RT + 1],
 
     /// Port of upstream `Scheduler::submit_mutex`.
     submit_mutex: Arc<Mutex<()>>,
@@ -388,6 +384,7 @@ impl SchedulerWorker {
     }
 
     fn run(&self, mut context: WorkerContext) {
+        common::thread::set_current_thread_priority(common::thread::ThreadPriority::Critical);
         loop {
             let chunk = {
                 let mut state = self.state.lock().unwrap();
@@ -412,12 +409,17 @@ impl SchedulerWorker {
                         "Vulkan worker failed to submit tick {}: {error:?}",
                         submit.tick
                     );
+                    // Eden's `vk::Check` throws out of the worker entry point,
+                    // which terminates the process. Do not continue recording
+                    // against a failed queue submission.
+                    std::process::abort();
                 }
                 if let Err(error) = context.allocate_worker_command_buffer() {
                     log::error!(
                         "Vulkan worker failed to rotate command buffers after tick {}: {error:?}",
                         submit.tick
                     );
+                    std::process::abort();
                 }
             }
 
@@ -538,22 +540,18 @@ impl WorkerContext {
             callback();
         }
 
-        let signal_semaphore = submit
-            .signal_semaphores
-            .first()
-            .copied()
-            .unwrap_or(vk::Semaphore::null());
         let _submit_lock = self.submit_mutex.lock().unwrap();
         let result = self.master_semaphore.submit_queue(
             self.current_cmdbuf,
             self.upload_cmdbuf,
-            signal_semaphore,
-            vk::Semaphore::null(),
+            submit.signal_semaphore,
+            submit.wait_semaphore,
             submit.tick,
         );
         drop(_submit_lock);
         if result == vk::Result::ERROR_DEVICE_LOST {
             self.report_device_fault();
+            crate::vulkan_common::vulkan_device::report_device_loss();
         }
         if result == vk::Result::SUCCESS {
             Ok(())
@@ -618,9 +616,11 @@ impl Scheduler {
             transform_feedback_supported,
             master_semaphore,
             current_chunk: CommandChunk::new(),
-            rp_state: RenderPassState::default(),
             state: SchedulerState::default(),
             deferred_clear: DeferredClear::default(),
+            num_renderpass_images: 0,
+            renderpass_images: [vk::Image::null(); NUM_RT + 1],
+            renderpass_image_ranges: [vk::ImageSubresourceRange::default(); NUM_RT + 1],
             submit_mutex,
             on_submit,
             state_tracker: None,
@@ -684,11 +684,11 @@ impl Scheduler {
 
     /// Record a command that only needs the render command buffer.
     pub fn record(&mut self, cmd: impl FnOnce(vk::CommandBuffer) + Send + 'static) {
-        self.record_with_upload(move |render_cmd, _upload_cmd| cmd(render_cmd));
+        self.record_with_upload_buffer(move |render_cmd, _upload_cmd| cmd(render_cmd));
     }
 
     /// Record a command that needs both render and upload command buffers.
-    pub fn record_with_upload(
+    pub fn record_with_upload_buffer(
         &mut self,
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
@@ -704,7 +704,7 @@ impl Scheduler {
 
     /// Begin a render pass if not already inside one with matching parameters.
     /// Port of `Scheduler::RequestRenderpass(const Framebuffer*)`.
-    pub fn request_framebuffer(&mut self, framebuffer: &RenderTargetFramebuffer) {
+    pub fn request_renderpass(&mut self, framebuffer: &RenderTargetFramebuffer) {
         if self
             .deferred_clear
             .framebuffer
@@ -718,10 +718,10 @@ impl Scheduler {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: framebuffer.render_area(),
         };
-        if self.rp_state.renderpass == framebuffer.render_pass()
-            && self.rp_state.framebuffer == framebuffer.handle()
-            && self.rp_state.render_area.extent.width == render_area.extent.width
-            && self.rp_state.render_area.extent.height == render_area.extent.height
+        if self.state.renderpass == framebuffer.render_pass()
+            && self.state.framebuffer == framebuffer.handle()
+            && self.state.render_area.width == render_area.extent.width
+            && self.state.render_area.height == render_area.extent.height
         {
             return;
         }
@@ -745,7 +745,7 @@ impl Scheduler {
         rt_slot: u32,
         value: vk::ClearValue,
     ) -> bool {
-        if self.is_inside_renderpass() {
+        if self.is_render_pass_active() {
             return false;
         }
         if self
@@ -769,7 +769,7 @@ impl Scheduler {
         framebuffer: &RenderTargetFramebuffer,
         value: vk::ClearValue,
     ) -> bool {
-        if self.is_inside_renderpass() {
+        if self.is_render_pass_active() {
             return false;
         }
         if self
@@ -833,7 +833,7 @@ impl Scheduler {
         );
     }
 
-    pub fn request_renderpass(
+    pub fn request_renderpass_raw(
         &mut self,
         framebuffer: vk::Framebuffer,
         renderpass: vk::RenderPass,
@@ -842,10 +842,10 @@ impl Scheduler {
         images: &[vk::Image],
         image_ranges: &[vk::ImageSubresourceRange],
     ) {
-        if self.rp_state.renderpass == renderpass
-            && self.rp_state.framebuffer == framebuffer
-            && self.rp_state.render_area.extent.width == render_area.extent.width
-            && self.rp_state.render_area.extent.height == render_area.extent.height
+        if self.state.renderpass == renderpass
+            && self.state.framebuffer == framebuffer
+            && self.state.render_area.width == render_area.extent.width
+            && self.state.render_area.height == render_area.extent.height
         {
             return;
         }
@@ -881,6 +881,12 @@ impl Scheduler {
         let mut values = [vk::ClearValue::default(); NUM_RT + 1];
         values[..clear_values.len()].copy_from_slice(clear_values);
         let clear_value_count = clear_values.len();
+
+        // Match upstream ordering: publish the active render pass before
+        // recording its begin command, then populate the attachment arrays.
+        self.state.renderpass = renderpass;
+        self.state.framebuffer = framebuffer;
+        self.state.render_area = render_area.extent;
         self.record(move |cmdbuf| unsafe {
             let rp_begin = vk::RenderPassBeginInfo::builder()
                 .render_pass(renderpass)
@@ -895,25 +901,19 @@ impl Scheduler {
         let mut renderpass_image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
         renderpass_images[..num_images].copy_from_slice(&images[..num_images]);
         renderpass_image_ranges[..num_images].copy_from_slice(&image_ranges[..num_images]);
-        self.rp_state = RenderPassState {
-            renderpass,
-            framebuffer,
-            render_area,
-            inside_renderpass: true,
-            num_images,
-            images: renderpass_images,
-            image_ranges: renderpass_image_ranges,
-        };
+        self.num_renderpass_images = num_images;
+        self.renderpass_images = renderpass_images;
+        self.renderpass_image_ranges = renderpass_image_ranges;
     }
 
     /// End the current render pass if inside one.
-    pub fn request_outside_renderpass(&mut self) {
+    pub fn request_outside_render_pass_operation_context(&mut self) {
         self.end_render_pass();
     }
 
     fn end_render_pass(&mut self) {
         self.realize_deferred_clear();
-        if !self.rp_state.inside_renderpass {
+        if self.state.renderpass == vk::RenderPass::null() {
             return;
         }
 
@@ -934,9 +934,9 @@ impl Scheduler {
                 });
             }
         }
-        let num_images = self.rp_state.num_images;
-        let images = self.rp_state.images;
-        let image_ranges = self.rp_state.image_ranges;
+        let num_images = self.num_renderpass_images;
+        let images = self.renderpass_images;
+        let image_ranges = self.renderpass_image_ranges;
         let transform_feedback_supported = self.transform_feedback_supported;
         let device = self.device.clone();
         self.record(move |cmdbuf| unsafe {
@@ -1003,20 +1003,66 @@ impl Scheduler {
                 );
             }
         });
-        self.rp_state = RenderPassState::default();
+        self.state.renderpass = vk::RenderPass::null();
+        self.num_renderpass_images = 0;
     }
 
     /// Whether we are currently inside a render pass.
-    pub fn is_inside_renderpass(&self) -> bool {
-        self.rp_state.inside_renderpass
+    pub fn is_render_pass_active(&self) -> bool {
+        self.state.renderpass != vk::RenderPass::null()
     }
 
     /// Port of upstream `Scheduler::UpdateGraphicsPipeline`.
-    pub fn update_graphics_pipeline(&mut self, pipeline: vk::Pipeline) -> bool {
-        if self.state.graphics_pipeline == pipeline {
+    pub fn update_graphics_pipeline(&mut self, pipeline: Option<&GraphicsPipeline>) -> bool {
+        let uses_extended_dynamic_state = pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.uses_extended_dynamic_state());
+        let pipeline = pipeline.map(NonNull::from);
+        Self::update_graphics_pipeline_state(
+            &mut self.state,
+            self.state_tracker,
+            pipeline,
+            uses_extended_dynamic_state,
+        )
+    }
+
+    fn update_graphics_pipeline_state(
+        state: &mut SchedulerState,
+        mut state_tracker: Option<NonNull<StateTracker>>,
+        pipeline: Option<NonNull<GraphicsPipeline>>,
+        uses_extended_dynamic_state: bool,
+    ) -> bool {
+        let pipeline_is_present = pipeline.is_some();
+        if state.graphics_pipeline == pipeline {
+            if pipeline_is_present
+                && uses_extended_dynamic_state
+                && state.needs_state_enable_refresh
+            {
+                if let Some(state_tracker) = state_tracker.as_mut() {
+                    unsafe {
+                        state_tracker.as_mut().invalidate_state_enable_flag();
+                    }
+                }
+                state.needs_state_enable_refresh = false;
+            }
             return false;
         }
-        self.state.graphics_pipeline = pipeline;
+        state.graphics_pipeline = pipeline;
+
+        if !pipeline_is_present {
+            return true;
+        }
+
+        if !uses_extended_dynamic_state {
+            state.needs_state_enable_refresh = true;
+        } else if state.needs_state_enable_refresh {
+            if let Some(state_tracker) = state_tracker.as_mut() {
+                unsafe {
+                    state_tracker.as_mut().invalidate_state_enable_flag();
+                }
+            }
+            state.needs_state_enable_refresh = false;
+        }
         true
     }
 
@@ -1044,7 +1090,7 @@ impl Scheduler {
 
     /// Port of upstream `Scheduler::InvalidateState`.
     pub fn invalidate_state(&mut self) {
-        self.state.graphics_pipeline = vk::Pipeline::null();
+        self.state.graphics_pipeline = None;
         self.state.rescaling_defined = false;
         self.state.descriptor_buffer_bound = false;
         if let Some(mut state_tracker) = self.state_tracker {
@@ -1077,50 +1123,70 @@ impl Scheduler {
 
     /// Flush — end render pass, dispatch remaining work, submit to GPU, return tick.
     pub fn flush(&mut self) -> u64 {
-        self.flush_impl(&[])
+        self.flush_with_semaphores(vk::Semaphore::null(), vk::Semaphore::null())
     }
 
     /// Port of upstream `Scheduler::Flush(vk::Semaphore signal_semaphore)`.
     pub fn flush_with_signal(&mut self, signal_semaphore: vk::Semaphore) -> u64 {
-        if signal_semaphore == vk::Semaphore::null() {
-            self.flush()
-        } else {
-            self.flush_impl(&[signal_semaphore])
-        }
+        self.flush_with_semaphores(signal_semaphore, vk::Semaphore::null())
     }
 
-    fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
+    /// Full port of upstream `Scheduler::Flush(signal_semaphore, wait_semaphore)`.
+    pub fn flush_with_semaphores(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) -> u64 {
+        let tick = self.submit_execution(signal_semaphore, wait_semaphore);
+        self.allocate_new_context();
+        debug!("Scheduler: flushed at tick {}", tick);
+        tick
+    }
+
+    /// Port of upstream `Scheduler::SubmitExecution`.
+    fn submit_execution(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) -> u64 {
         self.end_pending_operations();
         self.invalidate_state();
         let tick = self.master_semaphore.next_tick();
         self.current_chunk.submit = Some(SubmitRequest {
-            signal_semaphores: signal_semaphores.to_vec(),
+            signal_semaphore,
+            wait_semaphore,
             tick,
         });
         self.dispatch_work();
-        if !signal_semaphores.is_empty() {
-            self.worker
-                .as_ref()
-                .expect("scheduler worker must exist")
-                .wait_drained();
-        }
-        debug!("Scheduler: flushed at tick {}", tick);
-        self.rp_state = RenderPassState::default();
         tick
     }
+
+    /// Port of upstream's currently empty `Scheduler::AllocateNewContext`.
+    fn allocate_new_context(&mut self) {}
 
     /// Port of upstream `Scheduler::EndPendingOperations`.
     fn end_pending_operations(&mut self) {
         if let Some(state) = self.samples_query_state.as_ref().cloned() {
             state.lock().reset_counter(self);
         }
-        self.request_outside_renderpass();
+        self.request_outside_render_pass_operation_context();
     }
 
     /// Flush + wait for GPU completion.
     pub fn finish(&mut self) {
-        let tick = self.flush();
-        self.wait(tick);
+        self.finish_with_semaphores(vk::Semaphore::null(), vk::Semaphore::null());
+    }
+
+    /// Full port of upstream `Scheduler::Finish(signal_semaphore, wait_semaphore)`.
+    pub fn finish_with_semaphores(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) {
+        let presubmit_tick = self.current_tick();
+        self.submit_execution(signal_semaphore, wait_semaphore);
+        self.wait(presubmit_tick);
+        self.allocate_new_context();
     }
 
     /// Get the current tick value.
@@ -1184,7 +1250,7 @@ impl Scheduler {
                 self.start_time + self.frame_interval.mul_f64(self.frame_counter as f64);
             if target_time >= now {
                 let sleep_time = target_time.duration_since(now);
-                if sleep_time > Duration::from_millis(15) {
+                if sleep_time > Duration::from_millis(2) {
                     std::thread::sleep(sleep_time - Duration::from_millis(1));
                 }
                 while Instant::now() < target_time {
@@ -1214,6 +1280,7 @@ impl Drop for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle;
     use std::sync::atomic::AtomicU64;
 
     #[test]
@@ -1223,17 +1290,15 @@ mod tests {
     }
 
     #[test]
-    fn test_render_pass_state_default() {
-        let state = RenderPassState::default();
-        assert!(!state.inside_renderpass);
+    fn scheduler_state_defaults_match_upstream() {
+        let state = SchedulerState::default();
         assert_eq!(state.renderpass, vk::RenderPass::null());
         assert_eq!(state.framebuffer, vk::Framebuffer::null());
-        assert_eq!(state.num_images, 0);
-        assert_eq!(state.images, [vk::Image::null(); NUM_RT + 1]);
-        assert!(state
-            .image_ranges
-            .iter()
-            .all(|range| range.aspect_mask.is_empty()));
+        assert_eq!(state.render_area, vk::Extent2D::default());
+        assert!(state.graphics_pipeline.is_none());
+        assert!(!state.rescaling_defined);
+        assert!(!state.needs_state_enable_refresh);
+        assert!(!state.descriptor_buffer_bound);
     }
 
     #[test]
@@ -1331,12 +1396,14 @@ mod tests {
     fn worker_queue_pops_chunks_fifo_and_tracks_in_flight() {
         let mut first = CommandChunk::new();
         first.submit = Some(SubmitRequest {
-            signal_semaphores: Vec::new(),
+            signal_semaphore: vk::Semaphore::null(),
+            wait_semaphore: vk::Semaphore::null(),
             tick: 7,
         });
         let mut second = CommandChunk::new();
         second.submit = Some(SubmitRequest {
-            signal_semaphores: Vec::new(),
+            signal_semaphore: vk::Semaphore::null(),
+            wait_semaphore: vk::Semaphore::null(),
             tick: 8,
         });
         let mut state = SchedulerWorkerState {
@@ -1351,6 +1418,79 @@ mod tests {
         let second = state.pop_front().unwrap();
         assert_eq!(second.submit.as_ref().unwrap().tick, 8);
         assert_eq!(state.in_flight, 2);
+    }
+
+    #[test]
+    fn submit_request_preserves_both_external_semaphores() {
+        let signal = vk::Semaphore::from_raw(0x51);
+        let wait = vk::Semaphore::from_raw(0x72);
+        let mut chunk = CommandChunk::new();
+        chunk.submit = Some(SubmitRequest {
+            signal_semaphore: signal,
+            wait_semaphore: wait,
+            tick: 9,
+        });
+
+        let submit = chunk
+            .execute_all(vk::CommandBuffer::null(), vk::CommandBuffer::null())
+            .unwrap();
+
+        assert_eq!(submit.signal_semaphore, signal);
+        assert_eq!(submit.wait_semaphore, wait);
+        assert_eq!(submit.tick, 9);
+    }
+
+    #[test]
+    fn graphics_pipeline_transitions_refresh_state_enable_like_upstream() {
+        let mut static_storage = MaybeUninit::<GraphicsPipeline>::uninit();
+        let mut dynamic_storage = MaybeUninit::<GraphicsPipeline>::uninit();
+        let static_pipeline = NonNull::new(static_storage.as_mut_ptr()).unwrap();
+        let dynamic_pipeline = NonNull::new(dynamic_storage.as_mut_ptr()).unwrap();
+        let mut state = SchedulerState::default();
+        let mut state_tracker = StateTracker::new();
+        let tracker = Some(NonNull::from(&mut state_tracker));
+
+        assert!(Scheduler::update_graphics_pipeline_state(
+            &mut state,
+            tracker,
+            Some(static_pipeline),
+            false,
+        ));
+        assert!(state.needs_state_enable_refresh);
+        assert!(!state_tracker.touch_state_enable());
+
+        assert!(!Scheduler::update_graphics_pipeline_state(
+            &mut state,
+            tracker,
+            Some(static_pipeline),
+            false,
+        ));
+        assert!(state.needs_state_enable_refresh);
+
+        assert!(Scheduler::update_graphics_pipeline_state(
+            &mut state,
+            tracker,
+            Some(dynamic_pipeline),
+            true,
+        ));
+        assert!(!state.needs_state_enable_refresh);
+        assert!(state_tracker.touch_state_enable());
+
+        state.needs_state_enable_refresh = true;
+        assert!(!Scheduler::update_graphics_pipeline_state(
+            &mut state,
+            tracker,
+            Some(dynamic_pipeline),
+            true,
+        ));
+        assert!(!state.needs_state_enable_refresh);
+        assert!(state_tracker.touch_state_enable());
+
+        state.needs_state_enable_refresh = true;
+        assert!(Scheduler::update_graphics_pipeline_state(
+            &mut state, tracker, None, false,
+        ));
+        assert!(state.needs_state_enable_refresh);
     }
 
     #[test]

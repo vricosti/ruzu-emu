@@ -776,7 +776,7 @@ impl Image {
             let temp_handle = temp_image.handle();
             let vk_copies = transform_buffer_image_copies(copies, staging_offset, aspect);
             let device = runtime.device().clone();
-            runtime.scheduler().request_outside_renderpass();
+            runtime.scheduler().request_outside_render_pass_operation_context();
             runtime.scheduler().record(move |cmd| {
                 copy_buffer_to_image(
                     &device,
@@ -826,7 +826,7 @@ impl Image {
 
         let device = runtime.device().clone();
         let scheduler = runtime.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| {
             copy_buffer_to_image(
                 &device,
@@ -874,7 +874,7 @@ impl Image {
 
         let device = runtime.device().clone();
         let scheduler = runtime.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
             let read_barrier = vk::ImageMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -1948,7 +1948,7 @@ impl TextureCacheRuntime {
         let aspect_mask = image.aspect_mask();
         let device = self.device.clone();
         let scheduler = self.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
             let barrier = vk::ImageMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::empty())
@@ -1980,7 +1980,7 @@ impl TextureCacheRuntime {
     }
 
     fn barrier_feedback_loop(&mut self) {
-        self.scheduler().request_outside_renderpass();
+        self.scheduler().request_outside_render_pass_operation_context();
     }
 
     fn accelerate_image_upload(
@@ -2262,7 +2262,7 @@ impl TextureCacheRuntime {
         let src_image = src.handle();
         let device = self.device.clone();
         let scheduler = self.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
             let mut dst_range = RangedBarrierRange::default();
             let mut src_range = RangedBarrierRange::default();
@@ -2431,7 +2431,7 @@ impl TextureCacheRuntime {
         let src_image = src.handle();
         let device = self.device.clone();
         let scheduler = self.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
             let barriers = make_copy_image_barriers(src_image, dst_image, aspect, &vk_copies);
             device.cmd_pipeline_barrier(
@@ -2542,7 +2542,7 @@ impl TextureCacheRuntime {
         let is_resolve = is_src_msaa && !is_dst_msaa;
         let device = self.device.clone();
         let scheduler = self.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
             let full_range = vk::ImageSubresourceRange {
                 aspect_mask,
@@ -2904,7 +2904,7 @@ impl TextureCacheRuntime {
                 };
                 let device = self.device.clone();
                 let scheduler = self.scheduler();
-                scheduler.request_outside_renderpass();
+                scheduler.request_outside_render_pass_operation_context();
                 scheduler.record(move |cmd| unsafe {
                     let full_color_range = vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -3048,7 +3048,7 @@ impl TextureCacheRuntime {
         let resolution = self.resolution.clone();
         let device = self.device.clone();
         let scheduler = self.scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
             let src_size = vk::Offset2D {
                 x: if up_scaling {
@@ -6051,7 +6051,7 @@ impl TextureCache {
     ) {
         let device = self.base.runtime_mut().device().clone();
         let scheduler = self.base.runtime_mut().scheduler();
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             cmd_transition_layout(&device, cmdbuf, image, old_layout, new_layout, aspect);
         });

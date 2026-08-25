@@ -12256,3 +12256,68 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: thread-priority selection has no serialized or guest-visible structure.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
+
+### Intentional differences
+
+- Rust implements Eden's polymorphic in-place `TypedCommand` list as a typed header plus `FnOnce`
+  payload in the same 0x8000-byte arena. Payload alignment, FIFO execution, destruction, arena
+  reuse, overflow dispatch, and submission marking retain the upstream contracts.
+- The worker queue uses `Arc`, mutexes and condition variables with an explicit in-flight count
+  instead of C++ `jthread` stop tokens and an execution mutex. `wait_worker` still waits for both an
+  empty queue and completion of the executing chunk; `Drop` drains work before requesting stop.
+- Query-cache interactions use independently locked shared states rather than Eden's non-owning
+  `QueryCache*`, preserving `CounterReset`, streaming-counter close, sample pause and conditional
+  rendering order without creating aliased mutable Rust references.
+- `StateTracker` is installed after fallible renderer construction and is therefore held as an
+  optional non-owning pointer. Runtime construction installs it before scheduler recording begins.
+- `request_renderpass_raw` is a Rust-only adapter for helper-owned Vulkan framebuffers which do not
+  have an upstream texture-cache `Framebuffer` object. The ordinary `request_renderpass` path owns
+  Eden's deferred-clear behavior.
+- Rust exposes separate convenience methods for C++ default arguments (`flush`,
+  `flush_with_signal`, `flush_with_semaphores`, `finish`, `finish_with_semaphores`). All forward to
+  the same signal/wait semaphore ordering as Eden.
+- Command buffers are explicitly reset before `vkBeginCommandBuffer`; Eden relies on Vulkan's
+  implicit reset when beginning an executable command buffer from a resettable pool.
+
+### Unintentional differences (to fix)
+
+- None in scheduler state ownership, render-pass state lifetime, deferred clears, pipeline-state
+  transitions, worker submission, signal/wait semaphore forwarding, flush/finish ordering, or
+  frame pacing after this correction.
+
+### Missing items
+
+- Eden's optional GPU-call logger hooks for render-pass begin/end and successful queue submission
+  are absent because Ruzu does not yet port the `video_core/gpu_logging` subsystem.
+- Android performance-core placement remains part of the unported topology/ADPF prerequisite
+  recorded in the `common/thread.rs` entry above. It is a no-op in Eden on Linux, Windows and macOS.
+
+### Binary layout verification
+
+- N/A: scheduler state and command chunks are host-only and are never serialized or exposed to the
+  guest. Focused tests verify the 0x8000-byte arena limit, command alignment/order/destruction,
+  semaphore payloads, exact `Scheduler::State` defaults, and extended-dynamic-state transitions.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` (`UsesExtendedDynamicState` prerequisite)
+
+### Intentional differences
+
+- The recorded bind closure loads the eventual Vulkan pipeline handle from Rust's shared async
+  build cell after its build wait. Eden captures `this` and reads its `vk::Pipeline` member at the
+  same execution point.
+
+### Unintentional differences (to fix)
+
+- None in `UsesExtendedDynamicState` or the `ConfigureDraw` scheduler identity update: Rust now
+  passes the stable `GraphicsPipeline` object even while its Vulkan handle is still being built.
+
+### Missing items
+
+- Broader `graphics_pipeline.rs` parity findings are handled by its dedicated
+  `bugs/eden-parity/graphics_pipeline.md` review rather than this scheduler prerequisite.
+
+### Binary layout verification
+
+- N/A: no serialized pipeline-key or guest-visible structure changed in this prerequisite.

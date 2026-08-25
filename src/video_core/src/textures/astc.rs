@@ -10,7 +10,8 @@
 //! This module decodes ASTC-encoded texture data into RGBA8 output.
 
 use super::workers::get_thread_workers;
-use std::sync::Arc;
+use common::alignment::divide_up;
+use smallvec::SmallVec;
 
 // ── Bit stream helpers ───────────────────────────────────────────────────────
 
@@ -28,7 +29,7 @@ impl<'a> InputBitStream<'a> {
     fn new(data: &'a [u8], start_offset: usize) -> Self {
         Self {
             data,
-            byte_pos: start_offset / 8,
+            byte_pos: 0,
             next_bit: start_offset % 8,
             bits_read: 0,
         }
@@ -76,7 +77,7 @@ impl<'a> OutputBitStream<'a> {
     fn new(data: &'a mut [u8], num_bits: usize, start_offset: usize) -> Self {
         Self {
             data,
-            byte_pos: start_offset / 8,
+            byte_pos: 0,
             num_bits,
             bits_written: 0,
             next_bit: start_offset % 8,
@@ -244,9 +245,8 @@ const ASTC_ENCODINGS_VALUES: [IntegerEncodedValue; 256] = {
 
 // ── Integer sequence decoding ────────────────────────────────────────────────
 
-/// Maximum number of decoded integer values (used as capacity for the vector).
-/// Port of `IntegerEncodedVector` from `astc.cpp` (boost::static_vector<..., 256>).
-type IntegerEncodedVector = Vec<IntegerEncodedValue>;
+/// Inline storage matching upstream's `boost::static_vector<..., 256>`.
+type IntegerEncodedVector = SmallVec<[IntegerEncodedValue; 256]>;
 
 /// Port of `DecodeTritBlock` from `astc.cpp`.
 /// Implements the algorithm in ASTC spec section C.2.12.
@@ -543,6 +543,13 @@ impl Pixel {
         }
     }
 
+    /// Port of `Pixel::ConvertChannelToFloat` from `astc.cpp`.
+    #[allow(dead_code)]
+    fn convert_channel_to_float(channel: i16, bit_depth: u8) -> f32 {
+        let denominator = ((1u32 << bit_depth) - 1) as f32;
+        f32::from(channel) / denominator
+    }
+
     fn a(&self) -> i16 {
         self.color[0]
     }
@@ -592,9 +599,19 @@ impl Pixel {
             val
         } else if old_depth == 0 {
             (1i16 << 8) - 1
-        } else {
+        } else if 8 > old_depth {
             fast_replicate_to_8(val as u32, old_depth as u32) as i16
+        } else {
+            let bits_wasted = old_depth - 8;
+            let value = ((val as u16) + (1 << (bits_wasted - 1))) >> bits_wasted;
+            value.clamp(0, (1 << 8) - 1) as i16
         }
+    }
+
+    /// Port of `Pixel::GetBitDepth` from `astc.cpp`.
+    #[allow(dead_code)]
+    fn get_bit_depth(&self) -> [u8; 4] {
+        self.bit_depth
     }
 
     /// Port of `Pixel::Pack()`.
@@ -1288,6 +1305,239 @@ fn select_2d_partition(seed: i32, x: i32, y: i32, partition_count: i32, small_bl
 
 // ── Endpoint computation ─────────────────────────────────────────────────────
 
+/// Port of `IsHDRColorEndpointMode` from `astc.cpp`.
+const fn is_hdr_color_endpoint_mode(cem: u32) -> bool {
+    matches!(cem, 2 | 3 | 7 | 11 | 14 | 15)
+}
+
+/// Port of `SignExtend` from `astc.cpp`.
+const fn sign_extend(value: i32, nbits: u32) -> i32 {
+    let sign_bit = 1 << (nbits - 1);
+    (value ^ sign_bit) - sign_bit
+}
+
+/// Port of `HDREndpointRGB` from `astc.cpp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HdrEndpointRgb {
+    r0: i32,
+    g0: i32,
+    b0: i32,
+    r1: i32,
+    g1: i32,
+    b1: i32,
+}
+
+/// Port of `DecodeHDREndpointMode7` from `astc.cpp`.
+fn decode_hdr_endpoint_mode_7(v0: u32, v1: u32, v2: u32, v3: u32) -> HdrEndpointRgb {
+    let modeval = ((v0 & 0xC0) >> 6) | ((v1 & 0x80) >> 5) | ((v2 & 0x80) >> 4);
+
+    let (majcomp, mode) = if (modeval & 0xC) != 0xC {
+        (modeval >> 2, modeval & 3)
+    } else if modeval != 0xF {
+        (modeval & 3, 4)
+    } else {
+        (0, 5)
+    };
+
+    let mut red = (v0 & 0x3F) as i32;
+    let mut green = (v1 & 0x1F) as i32;
+    let mut blue = (v2 & 0x1F) as i32;
+    let mut scale = (v3 & 0x1F) as i32;
+
+    let x0 = (v1 >> 6) & 1;
+    let x1 = (v1 >> 5) & 1;
+    let x2 = (v2 >> 6) & 1;
+    let x3 = (v2 >> 5) & 1;
+    let x4 = (v3 >> 7) & 1;
+    let x5 = (v3 >> 6) & 1;
+    let x6 = (v3 >> 5) & 1;
+
+    let ohm = 1u32 << mode;
+    if ohm & 0x30 != 0 {
+        green |= (x0 << 6) as i32;
+    }
+    if ohm & 0x3A != 0 {
+        green |= (x1 << 5) as i32;
+    }
+    if ohm & 0x30 != 0 {
+        blue |= (x2 << 6) as i32;
+    }
+    if ohm & 0x3A != 0 {
+        blue |= (x3 << 5) as i32;
+    }
+    if ohm & 0x3D != 0 {
+        scale |= (x6 << 5) as i32;
+    }
+    if ohm & 0x2D != 0 {
+        scale |= (x5 << 6) as i32;
+    }
+    if ohm & 0x04 != 0 {
+        scale |= (x4 << 7) as i32;
+    }
+    if ohm & 0x3B != 0 {
+        red |= (x4 << 6) as i32;
+    }
+    if ohm & 0x04 != 0 {
+        red |= (x3 << 6) as i32;
+    }
+    if ohm & 0x10 != 0 {
+        red |= (x5 << 7) as i32;
+    }
+    if ohm & 0x0F != 0 {
+        red |= (x2 << 7) as i32;
+    }
+    if ohm & 0x05 != 0 {
+        red |= (x1 << 8) as i32;
+    }
+    if ohm & 0x0A != 0 {
+        red |= (x0 << 8) as i32;
+    }
+    if ohm & 0x05 != 0 {
+        red |= (x0 << 9) as i32;
+    }
+    if ohm & 0x02 != 0 {
+        red |= (x6 << 9) as i32;
+    }
+    if ohm & 0x01 != 0 {
+        red |= (x3 << 10) as i32;
+    }
+    if ohm & 0x02 != 0 {
+        red |= (x5 << 10) as i32;
+    }
+
+    const SHAMTS: [u32; 6] = [1, 1, 2, 3, 4, 5];
+    let shamt = SHAMTS[mode as usize];
+    red <<= shamt;
+    green <<= shamt;
+    blue <<= shamt;
+    scale <<= shamt;
+
+    if mode != 5 {
+        green = red - green;
+        blue = red - blue;
+    }
+
+    if majcomp == 1 {
+        std::mem::swap(&mut red, &mut green);
+    }
+    if majcomp == 2 {
+        std::mem::swap(&mut red, &mut blue);
+    }
+
+    HdrEndpointRgb {
+        r0: (red - scale).clamp(0, 0xFFF),
+        g0: (green - scale).clamp(0, 0xFFF),
+        b0: (blue - scale).clamp(0, 0xFFF),
+        r1: red.clamp(0, 0xFFF),
+        g1: green.clamp(0, 0xFFF),
+        b1: blue.clamp(0, 0xFFF),
+    }
+}
+
+/// Port of `DecodeHDREndpointMode11` from `astc.cpp`.
+fn decode_hdr_endpoint_mode_11(
+    v0: u32,
+    v1: u32,
+    v2: u32,
+    v3: u32,
+    v4: u32,
+    v5: u32,
+) -> HdrEndpointRgb {
+    let majcomp = ((v4 & 0x80) >> 7) | ((v5 & 0x80) >> 6);
+    if majcomp == 3 {
+        return HdrEndpointRgb {
+            r0: (v0 << 4) as i32,
+            g0: (v2 << 4) as i32,
+            b0: ((v4 & 0x7F) << 5) as i32,
+            r1: (v1 << 4) as i32,
+            g1: (v3 << 4) as i32,
+            b1: ((v5 & 0x7F) << 5) as i32,
+        };
+    }
+
+    let mode = ((v1 & 0x80) >> 7) | ((v2 & 0x80) >> 6) | ((v3 & 0x80) >> 5);
+    let mut va = (v0 | ((v1 & 0x40) << 2)) as i32;
+    let mut vb0 = (v2 & 0x3F) as i32;
+    let mut vb1 = (v3 & 0x3F) as i32;
+    let mut vc = (v1 & 0x3F) as i32;
+    let mut vd0 = (v4 & 0x7F) as i32;
+    let mut vd1 = (v5 & 0x7F) as i32;
+
+    const DBITSTAB: [u32; 8] = [7, 6, 7, 6, 5, 6, 5, 6];
+    vd0 = sign_extend(vd0, DBITSTAB[mode as usize]);
+    vd1 = sign_extend(vd1, DBITSTAB[mode as usize]);
+
+    let x0 = (v2 >> 6) & 1;
+    let x1 = (v3 >> 6) & 1;
+    let x2 = (v4 >> 6) & 1;
+    let x3 = (v5 >> 6) & 1;
+    let x4 = (v4 >> 5) & 1;
+    let x5 = (v5 >> 5) & 1;
+
+    let ohm = 1u32 << mode;
+    if ohm & 0xA4 != 0 {
+        va |= (x0 << 9) as i32;
+    }
+    if ohm & 0x08 != 0 {
+        va |= (x2 << 9) as i32;
+    }
+    if ohm & 0x50 != 0 {
+        va |= (x4 << 9) as i32;
+    }
+    if ohm & 0x50 != 0 {
+        va |= (x5 << 10) as i32;
+    }
+    if ohm & 0xA0 != 0 {
+        va |= (x1 << 10) as i32;
+    }
+    if ohm & 0xC0 != 0 {
+        va |= (x2 << 11) as i32;
+    }
+    if ohm & 0x04 != 0 {
+        vc |= (x1 << 6) as i32;
+    }
+    if ohm & 0xE8 != 0 {
+        vc |= (x3 << 6) as i32;
+    }
+    if ohm & 0x20 != 0 {
+        vc |= (x2 << 7) as i32;
+    }
+    if ohm & 0x5B != 0 {
+        vb0 |= (x0 << 6) as i32;
+        vb1 |= (x1 << 6) as i32;
+    }
+    if ohm & 0x12 != 0 {
+        vb0 |= (x2 << 7) as i32;
+        vb1 |= (x3 << 7) as i32;
+    }
+
+    let shamt = (mode as i32 >> 1) ^ 3;
+    va <<= shamt;
+    vb0 <<= shamt;
+    vb1 <<= shamt;
+    vc <<= shamt;
+    vd0 <<= shamt;
+    vd1 <<= shamt;
+
+    let mut result = HdrEndpointRgb {
+        r0: (va - vc).clamp(0, 0xFFF),
+        g0: (va - vb0 - vc - vd0).clamp(0, 0xFFF),
+        b0: (va - vb1 - vc - vd1).clamp(0, 0xFFF),
+        r1: va.clamp(0, 0xFFF),
+        g1: (va - vb0).clamp(0, 0xFFF),
+        b1: (va - vb1).clamp(0, 0xFFF),
+    };
+
+    if majcomp == 1 {
+        std::mem::swap(&mut result.r0, &mut result.g0);
+        std::mem::swap(&mut result.r1, &mut result.g1);
+    } else if majcomp == 2 {
+        std::mem::swap(&mut result.r0, &mut result.b0);
+        std::mem::swap(&mut result.r1, &mut result.b1);
+    }
+    result
+}
+
 /// Port of `ComputeEndpoints` from `astc.cpp` (C.2.14).
 /// Returns (ep1, ep2) to avoid double-mutable-borrow issues with Rust's borrow checker.
 fn compute_endpoints(
@@ -1436,8 +1686,74 @@ fn compute_endpoints(
             ep1.clamp_byte();
             ep2.clamp_byte();
         }
+        2 => {
+            let v = read_uint_values!(2);
+            let (y0, y1) = if v[1] >= v[0] {
+                (v[0] << 4, v[1] << 4)
+            } else {
+                ((v[1] << 4) + 8, (v[0] << 4) - 8)
+            };
+            ep1 = Pixel::new(0x780, y0 as i32, y0 as i32, y0 as i32);
+            ep2 = Pixel::new(0x780, y1 as i32, y1 as i32, y1 as i32);
+        }
+        3 => {
+            let v = read_uint_values!(2);
+            let (y0, d) = if v[0] & 0x80 != 0 {
+                (
+                    ((v[1] & 0xE0) << 4) | ((v[0] & 0x7F) << 2),
+                    (v[1] & 0x1F) << 2,
+                )
+            } else {
+                (
+                    ((v[1] & 0xF0) << 4) | ((v[0] & 0x7F) << 1),
+                    (v[1] & 0x0F) << 1,
+                )
+            };
+            let y1 = (y0 + d).min(0xFFF);
+            ep1 = Pixel::new(0x780, y0 as i32, y0 as i32, y0 as i32);
+            ep2 = Pixel::new(0x780, y1 as i32, y1 as i32, y1 as i32);
+        }
+        7 => {
+            let v = read_uint_values!(4);
+            let rgb = decode_hdr_endpoint_mode_7(v[0], v[1], v[2], v[3]);
+            ep1 = Pixel::new(0x780, rgb.r0, rgb.g0, rgb.b0);
+            ep2 = Pixel::new(0x780, rgb.r1, rgb.g1, rgb.b1);
+        }
+        11 => {
+            let v = read_uint_values!(6);
+            let rgb = decode_hdr_endpoint_mode_11(v[0], v[1], v[2], v[3], v[4], v[5]);
+            ep1 = Pixel::new(0x780, rgb.r0, rgb.g0, rgb.b0);
+            ep2 = Pixel::new(0x780, rgb.r1, rgb.g1, rgb.b1);
+        }
+        14 => {
+            let v = read_uint_values!(8);
+            let rgb = decode_hdr_endpoint_mode_11(v[0], v[1], v[2], v[3], v[4], v[5]);
+            ep1 = Pixel::new(v[6] as i32, rgb.r0, rgb.g0, rgb.b0);
+            ep2 = Pixel::new(v[7] as i32, rgb.r1, rgb.g1, rgb.b1);
+        }
+        15 => {
+            let v = read_uint_values!(8);
+            let rgb = decode_hdr_endpoint_mode_11(v[0], v[1], v[2], v[3], v[4], v[5]);
+            let mode = ((v[6] >> 7) & 1) | ((v[7] >> 6) & 2);
+            let mut a6 = (v[6] & 0x7F) as i32;
+            let mut a7 = (v[7] & 0x7F) as i32;
+            let (alpha0, alpha1) = if mode == 3 {
+                (a6 << 5, a7 << 5)
+            } else {
+                a6 |= (a7 << (mode + 1)) & 0x780;
+                a7 &= 0x3F >> mode;
+                a7 ^= 0x20 >> mode;
+                a7 -= 0x20 >> mode;
+                a6 <<= 4 - mode;
+                a7 <<= 4 - mode;
+                a7 += a6;
+                (a6, a7.clamp(0, 0xFFF))
+            };
+            ep1 = Pixel::new(alpha0, rgb.r0, rgb.g0, rgb.b0);
+            ep2 = Pixel::new(alpha1, rgb.r1, rgb.g1, rgb.b1);
+        }
         _ => {
-            debug_assert!(false, "Unsupported color endpoint mode (is it HDR?)");
+            debug_assert!(false, "Unsupported color endpoint mode");
         }
     }
 
@@ -1474,6 +1790,38 @@ fn fill_void_extent_ldr(
             out_buf[(j * block_width + i) as usize] = rgba;
         }
     }
+}
+
+/// Port of `HalfToFloat` from `astc.cpp`.
+fn half_to_float(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = (h & 0x7C00) >> 10;
+    let mut mant = u32::from(h & 0x03FF);
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut e = 127 - 15 + 1;
+            while mant & 0x400 == 0 {
+                mant <<= 1;
+                e -= 1;
+            }
+            mant &= 0x3FF;
+            sign | ((e as u32) << 23) | (mant << 13)
+        }
+    } else if exp == 0x1F {
+        sign | 0x7F80_0000 | (mant << 13)
+    } else {
+        sign | ((u32::from(exp) + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Port of `HalfToClampedByte` from `astc.cpp`.
+fn half_to_clamped_byte(half_bits: u16) -> u16 {
+    let value = half_to_float(half_bits);
+    let clamped = value.clamp(0.0, 1.0);
+    (clamped * 255.0 + 0.5) as u16
 }
 
 /// Port of `FillError` from `astc.cpp`.
@@ -1537,6 +1885,12 @@ fn decompress_block(
         return;
     }
 
+    if weight_params.get_num_weight_values() > 64 {
+        debug_assert!(false, "Too many weights in the weight grid");
+        fill_error(out_buf, block_width, block_height);
+        return;
+    }
+
     // Read num partitions
     let n_partitions = strm.read_bits(2) + 1;
     debug_assert!(n_partitions <= 4);
@@ -1568,6 +1922,11 @@ fn decompress_block(
 
     // Remaining bits are color endpoint data...
     let n_weight_bits = weight_params.get_packed_bit_size();
+    if !(24..=96).contains(&n_weight_bits) {
+        debug_assert!(false, "Invalid weight bit count");
+        fill_error(out_buf, block_width, block_height);
+        return;
+    }
     let mut remaining_bits = 128i32 - n_weight_bits as i32 - strm.bits_read() as i32;
 
     // Consider extra bits prior to texel data...
@@ -1717,10 +2076,8 @@ fn decompress_block(
 
             let mut p = Pixel::new_default();
             for c in 0..4usize {
-                let c0 =
-                    replicate_byte_to_16(endpoints[partition as usize][0].component(c) as usize);
-                let c1 =
-                    replicate_byte_to_16(endpoints[partition as usize][1].component(c) as usize);
+                let mut c0 = endpoints[partition as usize][0].component(c) as u32;
+                let mut c1 = endpoints[partition as usize][1].component(c) as u32;
 
                 let mut plane = 0usize;
                 if weight_params.dual_plane && (((plane_idx + 1) & 3) == c as u32) {
@@ -1728,12 +2085,40 @@ fn decompress_block(
                 }
 
                 let weight = weights[plane][(j * block_width + i) as usize];
-                let interp = (c0 * (64 - weight) + c1 * weight + 32) / 64;
-                if interp == 65535 {
-                    p.set_component(c, 255);
+
+                let is_hdr = is_hdr_color_endpoint_mode(color_endpoint_mode[partition as usize])
+                    && !(color_endpoint_mode[partition as usize] == 14 && c == 0);
+
+                if is_hdr {
+                    c0 <<= 4;
+                    c1 <<= 4;
+                    let value = (c0 * (64 - weight) + c1 * weight + 32) / 64;
+                    let exponent = (value & 0xF800) >> 11;
+                    let mantissa = value & 0x7FF;
+                    let transformed_mantissa = if mantissa < 512 {
+                        3 * mantissa
+                    } else if mantissa >= 1536 {
+                        5 * mantissa - 2048
+                    } else {
+                        4 * mantissa - 512
+                    };
+                    let converted = (exponent << 10) + (transformed_mantissa >> 3);
+                    let half_bits = if converted >= 0x7C00 {
+                        0x7BFF
+                    } else {
+                        converted as u16
+                    };
+                    p.set_component(c, half_to_clamped_byte(half_bits) as i16);
                 } else {
-                    let cf = interp as f64;
-                    p.set_component(c, (255.0 * (cf / 65536.0) + 0.5) as i16);
+                    c0 = replicate_byte_to_16(c0 as usize);
+                    c1 = replicate_byte_to_16(c1 as usize);
+                    let value = (c0 * (64 - weight) + c1 * weight + 32) / 64;
+                    if value == 65535 {
+                        p.set_component(c, 255);
+                    } else {
+                        let converted = value as f64;
+                        p.set_component(c, (255.0 * (converted / 65536.0) + 0.5) as i16);
+                    }
                 }
             }
 
@@ -1743,11 +2128,6 @@ fn decompress_block(
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
-
-/// Helper: divide and round up.
-fn divide_up(x: u32, y: u32) -> u32 {
-    (x + y - 1) / y
-}
 
 /// Decompress ASTC-encoded texture data into RGBA8 output.
 ///
@@ -1767,31 +2147,44 @@ pub fn decompress(
     block_height: u32,
     output: &mut [u8],
 ) {
-    let rows = divide_up(height, block_height);
-    let cols = divide_up(width, block_width);
+    let rows = divide_up(u64::from(height), u64::from(block_height)) as u32;
+    let cols = divide_up(u64::from(width), u64::from(block_width)) as u32;
 
     let workers = get_thread_workers();
 
-    // We need to use Arc for the shared data since closures sent to worker threads
-    // must be 'static + Send.
-    let data: Arc<[u8]> = Arc::from(data);
-    let output_ptr = output.as_mut_ptr();
-    let output_len = output.len();
-
-    // SAFETY: We ensure that each worker writes to non-overlapping regions of the
-    // output buffer, and we wait for all workers before returning.
+    // The queued work is completed before this function returns, matching the
+    // spans captured by value in Eden's worker closures.
+    #[derive(Clone, Copy)]
+    struct SendConstPtr(*const u8);
+    unsafe impl Send for SendConstPtr {}
+    unsafe impl Sync for SendConstPtr {}
+    impl SendConstPtr {
+        unsafe fn as_slice<'a>(self, len: usize) -> &'a [u8] {
+            std::slice::from_raw_parts(self.0, len)
+        }
+    }
+    #[derive(Clone, Copy)]
     struct SendPtr(*mut u8);
     unsafe impl Send for SendPtr {}
     unsafe impl Sync for SendPtr {}
-    let send_output = Arc::new(SendPtr(output_ptr));
+    impl SendPtr {
+        unsafe fn add(self, offset: usize) -> *mut u8 {
+            self.0.add(offset)
+        }
+    }
+
+    let send_data = SendConstPtr(data.as_ptr());
+    let data_len = data.len();
+    let send_output = SendPtr(output.as_mut_ptr());
+    let output_len = output.len();
 
     for z in 0..depth {
         let depth_offset = z * height * width * 4;
         for y_index in 0..rows {
-            let data = Arc::clone(&data);
-            let send_output = Arc::clone(&send_output);
-
             workers.queue_work(move || {
+                // SAFETY: `decompress` waits for every queued request before its
+                // borrowed input slice can cease to be valid.
+                let data = unsafe { send_data.as_slice(data_len) };
                 let y = y_index * block_height;
                 for x_index in 0..cols {
                     let block_index = (z * rows * cols) + (y_index * cols) + x_index;
@@ -1822,7 +2215,7 @@ pub fn decompress(
                             // SAFETY: non-overlapping writes, synchronized via wait_for_requests
                             unsafe {
                                 let src = uncomp_data[src_offset..].as_ptr() as *const u8;
-                                let dst = send_output.0.add(out_offset);
+                                let dst = send_output.add(out_offset);
                                 std::ptr::copy_nonoverlapping(src, dst, copy_bytes);
                             }
                         }
@@ -1847,6 +2240,19 @@ mod tests {
         assert!(!stream.read_bit()); // bit 1
         assert!(stream.read_bit()); // bit 2
         assert_eq!(stream.bits_read(), 3);
+    }
+
+    #[test]
+    fn bit_stream_start_offset_matches_upstream_first_byte_semantics() {
+        let data = [0b1011_0100u8, 0b1100_1010u8];
+        let mut input = InputBitStream::new(&data, 9);
+        assert!(!input.read_bit());
+        assert!(input.read_bit());
+
+        let mut output_data = [0u8; 2];
+        let mut output = OutputBitStream::new(&mut output_data, 16, 9);
+        output.write_bits(0b11, 2);
+        assert_eq!(output_data, [0b0000_0110, 0]);
     }
 
     #[test]
@@ -1957,6 +2363,142 @@ mod tests {
         assert_eq!(result[1].bit_value, 3);
         assert_eq!(result[2].bit_value, 7);
         assert_eq!(result[3].bit_value, 1);
+        assert!(!result.spilled());
+    }
+
+    #[test]
+    fn hdr_endpoint_helpers_match_eden_oracle() {
+        let mode_7_cases = [
+            ([0x12, 0x34, 0x56, 0x78], [564, 524, 520, 804, 764, 760]),
+            ([0xC3, 0xA5, 0xE7, 0x69], [0, 0, 0, 96, 1184, 3296]),
+            (
+                [0x80, 0x40, 0x20, 0x10],
+                [2240, 2240, 2240, 2304, 2304, 2304],
+            ),
+            ([0xFF, 0xFF, 0xFF, 0xFF], [0, 0, 0, 4064, 4064, 4064]),
+        ];
+        for (input, expected) in mode_7_cases {
+            let result = decode_hdr_endpoint_mode_7(input[0], input[1], input[2], input[3]);
+            assert_eq!(
+                [result.r0, result.g0, result.b0, result.r1, result.g1, result.b1],
+                expected
+            );
+        }
+
+        let mode_11_cases = [
+            (
+                [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+                [288, 1376, 832, 832, 1920, 1920],
+            ),
+            (
+                [0xFF, 0x80, 0xC0, 0xA0, 0x7F, 0x01],
+                [2815, 2752, 2782, 2815, 2815, 2783],
+            ),
+            (
+                [0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0],
+                [512, 1536, 1024, 1024, 2048, 2048],
+            ),
+            (
+                [0x11, 0x22, 0x33, 0x44, 0x80, 0x80],
+                [272, 816, 0, 544, 1088, 0],
+            ),
+        ];
+        for (input, expected) in mode_11_cases {
+            let result = decode_hdr_endpoint_mode_11(
+                input[0], input[1], input[2], input[3], input[4], input[5],
+            );
+            assert_eq!(
+                [result.r0, result.g0, result.b0, result.r1, result.g1, result.b1],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn hdr_compute_endpoints_match_eden_oracle() {
+        let values = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let cases = [
+            (2, [1920, 288, 288, 288, 1920, 832, 832, 832]),
+            (3, [1920, 804, 804, 804, 1920, 812, 812, 812]),
+            (7, [1920, 564, 524, 520, 1920, 804, 764, 760]),
+            (11, [1920, 288, 1376, 832, 1920, 832, 1920, 1920]),
+            (14, [222, 288, 1376, 832, 240, 832, 1920, 1920]),
+            (15, [3008, 288, 1376, 832, 3584, 832, 1920, 1920]),
+        ];
+        for (mode, expected) in cases {
+            let mut index = 0;
+            let (ep1, ep2) = compute_endpoints(&values, &mut index, mode);
+            assert_eq!(
+                [
+                    ep1.a(),
+                    ep1.r(),
+                    ep1.g(),
+                    ep1.b(),
+                    ep2.a(),
+                    ep2.r(),
+                    ep2.g(),
+                    ep2.b()
+                ],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn half_conversion_matches_eden_oracle() {
+        let cases = [
+            (0x0000, 0.0, 0),
+            (0x0001, 5.960_464_5e-8, 0),
+            (0x03FF, 6.097_555e-5, 0),
+            (0x0400, 6.103_515_6e-5, 0),
+            (0x3800, 0.5, 128),
+            (0x3C00, 1.0, 255),
+            (0x4000, 2.0, 255),
+            (0x7BFF, 65_504.0, 255),
+            (0x8000, -0.0, 0),
+            (0xBC00, -1.0, 0),
+        ];
+        for (bits, expected_float, expected_byte) in cases {
+            assert_eq!(half_to_float(bits), expected_float);
+            assert_eq!(half_to_clamped_byte(bits), expected_byte);
+        }
+    }
+
+    #[test]
+    fn hdr_decoder_corpus_matches_eden_oracle() {
+        fn mix(hash: u64, value: u32) -> u64 {
+            (hash ^ u64::from(value)).wrapping_mul(1_099_511_628_211)
+        }
+
+        let mut state = 0xC001_D00Du32;
+        let mut mode_7_hash = 1_469_598_103_934_665_603u64;
+        let mut mode_11_hash = 1_469_598_103_934_665_603u64;
+        for _ in 0..4096 {
+            let mut next = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state >> 24
+            };
+            let (v0, v1, v2, v3, v4, v5) = (next(), next(), next(), next(), next(), next());
+            let rgb_7 = decode_hdr_endpoint_mode_7(v0, v1, v2, v3);
+            for value in [rgb_7.r0, rgb_7.g0, rgb_7.b0, rgb_7.r1, rgb_7.g1, rgb_7.b1] {
+                mode_7_hash = mix(mode_7_hash, value as u32);
+            }
+            let rgb_11 = decode_hdr_endpoint_mode_11(v0, v1, v2, v3, v4, v5);
+            for value in [
+                rgb_11.r0, rgb_11.g0, rgb_11.b0, rgb_11.r1, rgb_11.g1, rgb_11.b1,
+            ] {
+                mode_11_hash = mix(mode_11_hash, value as u32);
+            }
+        }
+        assert_eq!(mode_7_hash, 0x56E5_2F08_EA64_D705);
+        assert_eq!(mode_11_hash, 0xF531_20EC_B67D_A1D9);
+
+        let mut half_hash = 1_469_598_103_934_665_603u64;
+        for bits in 0u16..=0x7BFF {
+            half_hash = mix(half_hash, half_to_float(bits).to_bits());
+            half_hash = mix(half_hash, u32::from(half_to_clamped_byte(bits)));
+        }
+        assert_eq!(half_hash, 0xCEF4_5129_7017_B6FC);
     }
 
     #[test]
@@ -2024,6 +2566,31 @@ mod tests {
         assert!(params.void_extent_ldr);
         assert!(!params.void_extent_hdr);
         assert!(!params.error);
+    }
+
+    #[test]
+    fn decompress_void_extent_uses_borrowed_worker_buffers() {
+        let mut block = [0u8; 16];
+        let mut stream = OutputBitStream::new(&mut block, 128, 0);
+        stream.write_bits(0x5FC, 11);
+        stream.write_bits(1, 1);
+        for _ in 0..4 {
+            stream.write_bits(0, 13);
+        }
+        stream.write_bits(0x1234, 16);
+        stream.write_bits(0x5678, 16);
+        stream.write_bits(0x9ABC, 16);
+        stream.write_bits(0xDEF0, 16);
+        assert_eq!(stream.bits_written(), 128);
+
+        let mut data = [0u8; 32];
+        data[..16].copy_from_slice(&block);
+        data[16..].copy_from_slice(&block);
+        let mut output = [0u8; 4 * 4 * 4 * 2];
+        decompress(&data, 4, 4, 2, 4, 4, &mut output);
+        for pixel in output.chunks_exact(4) {
+            assert_eq!(pixel, [0x12, 0x56, 0x9A, 0xDE]);
+        }
     }
     // Reden decodes ASTC through two independent implementations: this CPU
     // decoder, and `host_shaders/astc_decoder.comp` on the GPU (the path

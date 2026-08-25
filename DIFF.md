@@ -12776,3 +12776,39 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the variants are host-only owners and are neither raw-copied nor serialized.
+
+## 2026-08-26 — `src/video_core/src/textures/astc.rs` vs Eden `src/video_core/textures/astc.{h,cpp}`
+
+### Intentional differences
+
+- `IntegerEncodedValue` stores the mutually exclusive trit/quint payload in one Rust field rather
+  than a C++ union. `IntegerEncodedVector` uses 256 inline `SmallVec` entries; valid blocks remain
+  inline and are limited to at most 64 weight values and 32 color values before decoding.
+- Borrow-checker adaptations return endpoint pairs and transferred signed values rather than
+  mutating two aliased output references. The formulas and update order remain unchanged.
+- `OutputBitStream` advances `bits_written`, making Eden's declared bit-capacity guard effective.
+  Eden currently never increments that member; none of its callers reads it, and all valid writes
+  fit in the same 128-bit endpoint buffer.
+- Worker closures carry checked `Send` pointer wrappers because the shared Rust worker queue owns
+  `'static` jobs. `decompress` waits after every depth slice, so the input/output borrows remain
+  alive exactly as long as Eden's captured spans and no input copy is made.
+- Rust skips undersized compressed input blocks and out-of-range output rows rather than allowing
+  `span::subspan`/`memcpy` to access invalid memory. Valid texture buffers take the identical path.
+
+### Unintentional differences (to fix)
+
+- None after restoring all six HDR endpoint modes, HDR interpolation and half-float conversion,
+  the 64-weight and 24..96 packed-bit validations, first-byte start-offset semantics, the missing
+  `Pixel` methods and depth-reduction branch, common `divide_up` ownership, and inline integer
+  sequence storage.
+
+### Missing items
+
+- None in `astc.h`/`astc.cpp`: every class, structure, table, helper, endpoint mode, validation,
+  block decoder path, and public decompression entry point has a Rust counterpart.
+
+### Binary layout verification
+
+- N/A: ASTC helper structures are internal algorithm state and are not raw-copied or serialized.
+  Eden-oracle corpus tests instead verify the HDR mode 7/mode 11 arithmetic and all finite
+  nonnegative half-float conversions bit-for-bit.

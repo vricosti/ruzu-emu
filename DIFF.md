@@ -12206,3 +12206,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: `ChannelState` is an internal owner and is not serialized or copied as an upstream C++
   payload. A focused test verifies every NVK default binding and the deliberately empty M2MF slot.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/state_tracker.rs` vs Eden `src/video_core/renderer_vulkan/vk_state_tracker.{h,cpp}`
+
+### Intentional differences
+- Rust stores the bound channel's live dirty-flag array through `NonNull` and keeps an owned
+  fallback array, preserving Eden's non-owning `Flags*` lifecycle.
+- `apply_command_buffer_invalidation` applies Eden's mask to the draw-scoped Rust flag mirror when
+  pipeline configuration rotates the command buffer.
+
+### Unintentional differences (to fix)
+- Fixed `SetupDirtyViewports`: both `surface_clip` words in table 1 now map to `Viewports`.
+- Fixed `MakeInvalidationFlags`: command-buffer invalidation now contains exactly Eden's 37 named
+  flags plus all 32 vertex-buffer, vertex-attribute, and vertex-binding flags; render targets,
+  rescale flags, global depth bias, and viewport swizzles remain untouched.
+- Fixed constructor state: the fallback flags now start clear like Eden's `default_flags{}` instead
+  of starting with every known flag dirty.
+- Restored the header-owned `invalidate_state_enable_flag` operation for scheduler pipeline-state
+  transitions.
+
+### Missing items
+- None in the reviewed table setup, invalidation mask, channel binding, and touch/check methods.
+
+### Binary layout verification
+- N/A: dirty flags are internal boolean lookup arrays rather than serialized payloads. Focused
+  tests verify the 133-bit invalidation mask and both surface-clip table entries.

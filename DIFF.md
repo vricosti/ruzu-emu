@@ -12615,3 +12615,72 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: each Rust GLSL source is byte-for-byte identical to Eden's source, and the focused test
   verifies that all three generated modules begin with the SPIR-V magic word.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/blit_image.rs` vs Eden `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
+
+### Intentional differences
+
+- `BlitImageView` and `BlitFramebufferInfo` are copyable snapshots of the exact `ImageView` and
+  `Framebuffer` fields captured by Eden's deferred scheduler lambdas. This keeps the Rust closures
+  owned and `'static` without moving image or framebuffer owners.
+- Vulkan wrapper exceptions are represented by `Result`/boolean failure propagation. Raw ash
+  handles are destroyed explicitly in `Drop`, in the reverse dependency order supplied by Eden's
+  RAII members.
+- Eden's fail-soft assertions optionally trap a debugger. Rust logs the same condition and panics
+  when `use_debug_asserts` is enabled.
+
+### Unintentional differences (to fix)
+
+- None after restoring `BlitColorMSAA`, `ResolveDepthStencil`, both matching pipeline builders,
+  their keys/caches/shader modules, and the exact source-image shader-read barrier.
+- None after restoring MoltenVK primitive-restart state, stencil-export-dependent module creation,
+  depth/stencil pipeline state, empty color attachment state for depth targets, and the original
+  conversion-pipeline method ownership.
+- None after moving descriptor allocation/update into the recorded command, using
+  `SHADER_READ_ONLY_OPTIMAL` for the explicit-image transition, and retaining `CurrentTick` for
+  deferred MSAA resources.
+- None after fixing MSAA resource destruction to release the framebuffer before its attachment
+  views, matching reverse C++ field destruction and Vulkan lifetime requirements.
+
+### Missing items
+
+- None in the class interface, file-owned helpers, pipeline keys, shader modules, pipeline caches,
+  conversion paths, clear paths, or MSAA copy/resolve paths.
+
+### Binary layout verification
+
+- PASS: focused tests verify `PushConstants` is 16 bytes with fields at offsets 0 and 8, and
+  `MSAACopyPushConstants` is 24 bytes with fields at offsets 0, 8, and 16. Pipeline keys are
+  host-only field-wise cache keys and are not raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` blit integration vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust's existing scale-helper implementation separates color and depth/stencil bodies while both
+  remain owned by `texture_cache.rs`; their selection, regions, sample scaling, framebuffer state,
+  and blit calls now follow Eden's single `Image::BlitScaleHelper` method.
+- Scheduler-facing calls pass `BlitImageView`/`BlitFramebufferInfo` snapshots rather than C++
+  references, preserving the same handles, formats, ranges, extents, sample count, and stencil
+  capability across deferred recording.
+
+### Unintentional differences (to fix)
+
+- None after wiring the restored color-MSAA and depth/stencil-resolve branches in Eden's order and
+  applying the same `SamplesLog2` adjustment to scale-helper regions and framebuffer extents.
+- None after restoring `ImageView::{depth_view,stencil_view,color_view}` as the owners of lazy
+  auxiliary-view creation; helper blits no longer receive null depth/stencil handles.
+- None after restoring Eden's fail-soft validation flow and exact
+  graphics/compute/transfer pipeline-stage masks in `TextureCacheRuntime::BlitImage`.
+- None after making every multisampled color image use the scale helper and clearing `Rescaled`
+  when no supported depth/stencil helper path exists.
+
+### Missing items
+
+- None in the `BlitImage`, `BlitScaleHelper`, `NeedsScaleHelper`, or lazy auxiliary-view slice
+  exercised by `BlitImageHelper`.
+
+### Binary layout verification
+
+- N/A: the integration passes host Vulkan handles and field-wise snapshots; no payload in this
+  slice is raw-copied or serialized.

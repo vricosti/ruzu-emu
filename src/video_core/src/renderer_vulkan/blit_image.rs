@@ -14,13 +14,14 @@ use std::ptr::NonNull;
 
 use crate::engines::fermi_2d::{Filter, Operation};
 use crate::host_shaders::spirv_shaders::{
-    BLIT_COLOR_FLOAT_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV, CONVERT_ABGR8_TO_D32F_FRAG_SPV,
-    CONVERT_D24S8_TO_ABGR8_FRAG_SPV, CONVERT_D32F_TO_ABGR8_FRAG_SPV,
-    CONVERT_DEPTH_TO_FLOAT_FRAG_SPV, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV,
-    CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV, CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV,
-    CONVERT_S8D24_TO_ABGR8_FRAG_SPV, FULL_SCREEN_TRIANGLE_VERT_SPV,
-    VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV, VULKAN_COLOR_CLEAR_VERT_SPV,
-    VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
+    BLIT_COLOR_FLOAT_FRAG_SPV, BLIT_COLOR_MSAA_FRAG_SPV, BLIT_DEPTH_MSAA_FRAG_SPV,
+    BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV,
+    CONVERT_ABGR8_TO_D32F_FRAG_SPV, CONVERT_D24S8_TO_ABGR8_FRAG_SPV,
+    CONVERT_D32F_TO_ABGR8_FRAG_SPV, CONVERT_DEPTH_TO_FLOAT_FRAG_SPV,
+    CONVERT_FLOAT_TO_DEPTH_FRAG_SPV, CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV,
+    CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV, CONVERT_S8D24_TO_ABGR8_FRAG_SPV,
+    FULL_SCREEN_TRIANGLE_VERT_SPV, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV,
+    VULKAN_COLOR_CLEAR_VERT_SPV, VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
 };
 use crate::renderer_vulkan::descriptor_pool::{
     DescriptorAllocator, DescriptorBankInfo, DescriptorPool,
@@ -28,9 +29,10 @@ use crate::renderer_vulkan::descriptor_pool::{
 use crate::renderer_vulkan::render_pass_cache::{RenderPassCache, RenderPassKey};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
-use crate::surface::PixelFormat;
+use crate::renderer_vulkan::state_tracker::StateTracker;
+use crate::surface::{PixelFormat, SurfaceType};
 use crate::texture_cache::samples_helper::samples_log2;
-use crate::texture_cache::types::{ImageCopy, NUM_RT};
+use crate::texture_cache::types::{ImageCopy, SubresourceRange, NUM_RT};
 use crate::vulkan_common::vulkan_device::{Device, FormatType};
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,13 @@ struct MsaaCopyPipelineKey {
     msaa_to_non_msaa: bool,
 }
 
+/// Port of `BlitMSAAPipelineKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BlitMsaaPipelineKey {
+    renderpass: vk::RenderPass,
+    samples: vk::SampleCountFlags,
+}
+
 /// Resources referenced by an asynchronously recorded MSAA copy.
 ///
 /// Port of `BlitImageHelper::MSAACopyResources`.
@@ -103,11 +112,15 @@ pub struct BlitFramebufferInfo {
     pub images: [vk::Image; NUM_RT + 1],
     pub image_ranges: [vk::ImageSubresourceRange; NUM_RT + 1],
     pub num_images: usize,
+    pub samples: vk::SampleCountFlags,
+    pub has_stencil: bool,
 }
 
-/// Source view data consumed by upstream `BlitImageHelper::Convert*`.
+/// Snapshot of the upstream `ImageView` data consumed by `BlitImageHelper`.
 #[derive(Debug, Clone, Copy)]
-pub struct ConversionImageView {
+pub struct BlitImageView {
+    pub image: vk::Image,
+    pub subresource_range: vk::ImageSubresourceRange,
     pub color_view: vk::ImageView,
     pub depth_view: vk::ImageView,
     pub stencil_view: vk::ImageView,
@@ -141,32 +154,53 @@ pub struct Extent3D {
     pub depth: u32,
 }
 
+/// Port of anonymous `SubresourceRangeFromView` and its
+/// `AspectMaskFromFormat` helper.
+pub(crate) fn subresource_range_from_view(
+    format: PixelFormat,
+    mut range: SubresourceRange,
+    is_slice: bool,
+) -> vk::ImageSubresourceRange {
+    if is_slice {
+        range.base.layer = 0;
+        range.extent.layers = 1;
+    }
+    let aspect_mask = match crate::surface::get_format_type(format) {
+        SurfaceType::ColorTexture => vk::ImageAspectFlags::COLOR,
+        SurfaceType::Depth => vk::ImageAspectFlags::DEPTH,
+        SurfaceType::Stencil => vk::ImageAspectFlags::STENCIL,
+        SurfaceType::DepthStencil => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        SurfaceType::Invalid => vk::ImageAspectFlags::COLOR,
+    };
+    vk::ImageSubresourceRange {
+        aspect_mask,
+        base_mip_level: range.base.level as u32,
+        level_count: range.extent.levels as u32,
+        base_array_layer: range.base.layer as u32,
+        layer_count: range.extent.layers as u32,
+    }
+}
+
+fn assert_fail_soft(condition: bool, message: &str) {
+    if condition {
+        return;
+    }
+    log::error!("BlitImageHelper: {message}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("BlitImageHelper: {message}");
+    }
+}
+
 fn update_one_texture_descriptor_set(
     device: &ash::Device,
     descriptor_set: vk::DescriptorSet,
     sampler: vk::Sampler,
     image_view: vk::ImageView,
 ) {
-    update_one_texture_descriptor_set_with_layout(
-        device,
-        descriptor_set,
-        sampler,
-        image_view,
-        vk::ImageLayout::GENERAL,
-    );
-}
-
-fn update_one_texture_descriptor_set_with_layout(
-    device: &ash::Device,
-    descriptor_set: vk::DescriptorSet,
-    sampler: vk::Sampler,
-    image_view: vk::ImageView,
-    image_layout: vk::ImageLayout,
-) {
     let image_info = vk::DescriptorImageInfo {
         sampler,
         image_view,
-        image_layout,
+        image_layout: vk::ImageLayout::GENERAL,
     };
     let write = vk::WriteDescriptorSet::builder()
         .dst_set(descriptor_set)
@@ -294,7 +328,7 @@ fn bind_clear_state(device: &ash::Device, cmdbuf: vk::CommandBuffer, dst_region:
     }
 }
 
-fn conversion_extent(src: ConversionImageView) -> vk::Extent2D {
+fn conversion_extent(src: BlitImageView) -> vk::Extent2D {
     let resolution = common::settings::values().resolution_info.clone();
     vk::Extent2D {
         width: if src.is_rescaled {
@@ -308,6 +342,86 @@ fn conversion_extent(src: ConversionImageView) -> vk::Extent2D {
             src.size.height
         },
     }
+}
+
+/// Port of anonymous `RecordShaderReadBarrier`.
+fn record_shader_read_barrier(
+    device: &ash::Device,
+    scheduler: &mut Scheduler,
+    src_image_view: BlitImageView,
+) {
+    let device = device.clone();
+    scheduler.request_outside_render_pass_operation_context();
+    scheduler.record(move |cmdbuf| unsafe {
+        let barrier = vk::ImageMemoryBarrier::builder()
+            .src_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src_image_view.image)
+            .subresource_range(src_image_view.subresource_range)
+            .build();
+        device.cmd_pipeline_barrier(
+            cmdbuf,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::FRAGMENT_SHADER
+                | vk::PipelineStageFlags::TRANSFER
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    });
+}
+
+/// Port of anonymous `GetPipelineInputAssemblyStateCreateInfo`.
+fn pipeline_input_assembly_state(device: &Device) -> vk::PipelineInputAssemblyStateCreateInfo {
+    vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(device.is_molten_vk())
+        .build()
+}
+
+fn pipeline_depth_stencil_state() -> vk::PipelineDepthStencilStateCreateInfo {
+    let stencil = vk::StencilOpState {
+        fail_op: vk::StencilOp::REPLACE,
+        pass_op: vk::StencilOp::REPLACE,
+        depth_fail_op: vk::StencilOp::KEEP,
+        compare_op: vk::CompareOp::ALWAYS,
+        compare_mask: 0,
+        write_mask: u32::MAX,
+        reference: 0,
+    };
+    vk::PipelineDepthStencilStateCreateInfo::builder()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::ALWAYS)
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(true)
+        .front(stencil)
+        .back(stencil)
+        .build()
+}
+
+fn pipeline_depth_only_state() -> vk::PipelineDepthStencilStateCreateInfo {
+    vk::PipelineDepthStencilStateCreateInfo::builder()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::ALWAYS)
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(false)
+        .build()
 }
 
 fn sample_count_flag(num_samples: u32) -> vk::SampleCountFlags {
@@ -347,120 +461,6 @@ fn make_msaa_copy_view(
     unsafe { device.create_image_view(&create_info, None) }
 }
 
-fn ensure_conversion_pipeline(
-    device: &ash::Device,
-    pipeline: &mut vk::Pipeline,
-    render_pass: vk::RenderPass,
-    vertex_shader: vk::ShaderModule,
-    fragment_shader: vk::ShaderModule,
-    layout: vk::PipelineLayout,
-    is_target_depth: bool,
-    empty_color_blend: bool,
-) -> Result<vk::Pipeline, vk::Result> {
-    if *pipeline != vk::Pipeline::null() {
-        return Ok(*pipeline);
-    }
-
-    let main = CString::new("main").unwrap();
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::builder()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vertex_shader)
-            .name(&main)
-            .build(),
-        vk::PipelineShaderStageCreateInfo::builder()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(fragment_shader)
-            .name(&main)
-            .build(),
-    ];
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-        .primitive_restart_enable(false)
-        .build();
-    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-        .viewport_count(1)
-        .scissor_count(1)
-        .build();
-    let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
-        .depth_clamp_enable(false)
-        .rasterizer_discard_enable(false)
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::CLOCKWISE)
-        .depth_bias_enable(false)
-        .line_width(1.0)
-        .build();
-    let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-        .sample_shading_enable(false)
-        .build();
-    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::ALWAYS)
-        .depth_bounds_test_enable(false)
-        .stencil_test_enable(false)
-        .build();
-    let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
-        .blend_enable(false)
-        .src_color_blend_factor(vk::BlendFactor::ZERO)
-        .dst_color_blend_factor(vk::BlendFactor::ZERO)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .alpha_blend_op(vk::BlendOp::ADD)
-        .color_write_mask(
-            vk::ColorComponentFlags::R
-                | vk::ColorComponentFlags::G
-                | vk::ColorComponentFlags::B
-                | vk::ColorComponentFlags::A,
-        )
-        .build();
-    let color_attachments = if empty_color_blend {
-        &[][..]
-    } else {
-        std::slice::from_ref(&blend_attachment)
-    };
-    let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
-        .logic_op_enable(false)
-        .logic_op(vk::LogicOp::CLEAR)
-        .attachments(color_attachments)
-        .build();
-    let dynamic_states = [
-        vk::DynamicState::VIEWPORT,
-        vk::DynamicState::SCISSOR,
-        vk::DynamicState::BLEND_CONSTANTS,
-    ];
-    let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-        .dynamic_states(&dynamic_states)
-        .build();
-    let mut pipeline_info_builder = vk::GraphicsPipelineCreateInfo::builder()
-        .stages(&stages)
-        .vertex_input_state(&vertex_input)
-        .input_assembly_state(&input_assembly)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&rasterization)
-        .multisample_state(&multisample)
-        .color_blend_state(&color_blend)
-        .dynamic_state(&dynamic_state)
-        .layout(layout)
-        .render_pass(render_pass)
-        .subpass(0);
-    if is_target_depth {
-        pipeline_info_builder = pipeline_info_builder.depth_stencil_state(&depth_stencil);
-    }
-    let pipeline_info = pipeline_info_builder.build();
-    let created = unsafe {
-        device
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-            .map_err(|(_, err)| err)?[0]
-    };
-    *pipeline = created;
-    Ok(created)
-}
-
 // ---------------------------------------------------------------------------
 // BlitImageHelper
 // ---------------------------------------------------------------------------
@@ -473,6 +473,7 @@ pub struct BlitImageHelper {
     device: ash::Device,
     device_owner: NonNull<Device>,
     scheduler: NonNull<Scheduler>,
+    _state_tracker: NonNull<StateTracker>,
     shader_stencil_export_supported: bool,
 
     // Descriptor layouts
@@ -490,7 +491,10 @@ pub struct BlitImageHelper {
     // Shader modules
     full_screen_vert: vk::ShaderModule,
     blit_color_to_color_frag: vk::ShaderModule,
+    blit_color_msaa_frag: vk::ShaderModule,
     blit_depth_stencil_frag: vk::ShaderModule,
+    blit_depth_msaa_frag: vk::ShaderModule,
+    blit_depth_stencil_msaa_frag: vk::ShaderModule,
     clear_color_vert: vk::ShaderModule,
     clear_color_frag: vk::ShaderModule,
     clear_stencil_frag: vk::ShaderModule,
@@ -519,6 +523,12 @@ pub struct BlitImageHelper {
     clear_stencil_pipelines: Vec<vk::Pipeline>,
     msaa_copy_keys: Vec<MsaaCopyPipelineKey>,
     msaa_copy_pipelines: Vec<vk::Pipeline>,
+    blit_msaa_color_keys: Vec<BlitMsaaPipelineKey>,
+    blit_msaa_color_pipelines: Vec<vk::Pipeline>,
+    resolve_depth_keys: Vec<vk::RenderPass>,
+    resolve_depth_pipelines: Vec<vk::Pipeline>,
+    resolve_depth_stencil_keys: Vec<vk::RenderPass>,
+    resolve_depth_stencil_pipelines: Vec<vk::Pipeline>,
     msaa_copy_resources: VecDeque<MsaaCopyResources>,
 
     // Conversion pipelines (lazily created)
@@ -558,10 +568,12 @@ impl BlitImageHelper {
     pub fn new(
         vulkan_device: &Device,
         scheduler: &mut Scheduler,
+        state_tracker: &mut StateTracker,
         descriptor_pool: &mut DescriptorPool,
-        shader_stencil_export_supported: bool,
     ) -> Self {
         let device = vulkan_device.get_logical().clone();
+        let shader_stencil_export_supported =
+            vulkan_device.is_ext_shader_stencil_export_supported();
         // Create one-texture descriptor set layout (1 combined image sampler)
         let one_tex_binding = vk::DescriptorSetLayoutBinding {
             binding: 0,
@@ -604,6 +616,12 @@ impl BlitImageHelper {
                 .create_descriptor_set_layout(&two_tex_layout_ci, None)
                 .expect("Failed to create two-textures set layout")
         };
+        let one_texture_descriptor_allocator = descriptor_pool
+            .allocator(one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
+            .expect("Failed to create one-texture descriptor allocator");
+        let two_textures_descriptor_allocator = descriptor_pool
+            .allocator(two_textures_set_layout, &Self::TWO_TEXTURES_BANK_INFO)
+            .expect("Failed to create two-texture descriptor allocator");
 
         // Create one-texture pipeline layout with push constants
         let push_range = vk::PushConstantRange {
@@ -664,6 +682,57 @@ impl BlitImageHelper {
                 .expect("Failed to create MSAA copy pipeline layout")
         };
 
+        let full_screen_vert = build_shader(&device, FULL_SCREEN_TRIANGLE_VERT_SPV)
+            .expect("Failed to build full_screen_triangle.vert");
+        let blit_color_to_color_frag = build_shader(&device, BLIT_COLOR_FLOAT_FRAG_SPV)
+            .expect("Failed to build blit_color_float.frag");
+        let blit_color_msaa_frag = build_shader(&device, BLIT_COLOR_MSAA_FRAG_SPV)
+            .expect("Failed to build blit_color_msaa.frag");
+        let blit_depth_stencil_frag = if shader_stencil_export_supported {
+            build_shader(&device, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV)
+                .expect("Failed to build vulkan_blit_depth_stencil.frag")
+        } else {
+            vk::ShaderModule::null()
+        };
+        let blit_depth_msaa_frag = build_shader(&device, BLIT_DEPTH_MSAA_FRAG_SPV)
+            .expect("Failed to build blit_depth_msaa.frag");
+        let blit_depth_stencil_msaa_frag = if shader_stencil_export_supported {
+            build_shader(&device, BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV)
+                .expect("Failed to build blit_depth_stencil_msaa.frag")
+        } else {
+            vk::ShaderModule::null()
+        };
+        let clear_color_vert = build_shader(&device, VULKAN_COLOR_CLEAR_VERT_SPV)
+            .expect("Failed to build vulkan_color_clear.vert");
+        let clear_color_frag = build_shader(&device, VULKAN_COLOR_CLEAR_FRAG_SPV)
+            .expect("Failed to build vulkan_color_clear.frag");
+        let clear_stencil_frag = build_shader(&device, VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV)
+            .expect("Failed to build vulkan_depthstencil_clear.frag");
+        let convert_depth_to_float_frag = build_shader(&device, CONVERT_DEPTH_TO_FLOAT_FRAG_SPV)
+            .expect("Failed to build convert_depth_to_float.frag");
+        let convert_float_to_depth_frag = build_shader(&device, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV)
+            .expect("Failed to build convert_float_to_depth.frag");
+        let convert_abgr8_to_d24s8_frag = if shader_stencil_export_supported {
+            build_shader(&device, CONVERT_ABGR8_TO_D24S8_FRAG_SPV)
+                .expect("Failed to build convert_abgr8_to_d24s8.frag")
+        } else {
+            vk::ShaderModule::null()
+        };
+        let convert_abgr8_to_d32f_frag = build_shader(&device, CONVERT_ABGR8_TO_D32F_FRAG_SPV)
+            .expect("Failed to build convert_abgr8_to_d32f.frag");
+        let convert_d32f_to_abgr8_frag = build_shader(&device, CONVERT_D32F_TO_ABGR8_FRAG_SPV)
+            .expect("Failed to build convert_d32f_to_abgr8.frag");
+        let convert_d24s8_to_abgr8_frag = build_shader(&device, CONVERT_D24S8_TO_ABGR8_FRAG_SPV)
+            .expect("Failed to build convert_d24s8_to_abgr8.frag");
+        let convert_s8d24_to_abgr8_frag = build_shader(&device, CONVERT_S8D24_TO_ABGR8_FRAG_SPV)
+            .expect("Failed to build convert_s8d24_to_abgr8.frag");
+        let convert_msaa_to_non_msaa_frag =
+            build_shader(&device, CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV)
+                .expect("Failed to build convert_msaa_to_non_msaa.frag");
+        let convert_non_msaa_to_msaa_frag =
+            build_shader(&device, CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV)
+                .expect("Failed to build convert_non_msaa_to_msaa.frag");
+
         // Create samplers
         let linear_sampler_ci = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::LINEAR)
@@ -699,49 +768,11 @@ impl BlitImageHelper {
                 .expect("Failed to create nearest sampler")
         };
 
-        let full_screen_vert = build_shader(&device, FULL_SCREEN_TRIANGLE_VERT_SPV)
-            .expect("Failed to build full_screen_triangle.vert");
-        let blit_color_to_color_frag = build_shader(&device, BLIT_COLOR_FLOAT_FRAG_SPV)
-            .expect("Failed to build blit_color_float.frag");
-        let blit_depth_stencil_frag = build_shader(&device, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV)
-            .expect("Failed to build vulkan_blit_depth_stencil.frag");
-        let clear_color_vert = build_shader(&device, VULKAN_COLOR_CLEAR_VERT_SPV)
-            .expect("Failed to build vulkan_color_clear.vert");
-        let clear_color_frag = build_shader(&device, VULKAN_COLOR_CLEAR_FRAG_SPV)
-            .expect("Failed to build vulkan_color_clear.frag");
-        let clear_stencil_frag = build_shader(&device, VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV)
-            .expect("Failed to build vulkan_depthstencil_clear.frag");
-        let convert_depth_to_float_frag = build_shader(&device, CONVERT_DEPTH_TO_FLOAT_FRAG_SPV)
-            .expect("Failed to build convert_depth_to_float.frag");
-        let convert_float_to_depth_frag = build_shader(&device, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV)
-            .expect("Failed to build convert_float_to_depth.frag");
-        let convert_abgr8_to_d24s8_frag = build_shader(&device, CONVERT_ABGR8_TO_D24S8_FRAG_SPV)
-            .expect("Failed to build convert_abgr8_to_d24s8.frag");
-        let convert_abgr8_to_d32f_frag = build_shader(&device, CONVERT_ABGR8_TO_D32F_FRAG_SPV)
-            .expect("Failed to build convert_abgr8_to_d32f.frag");
-        let convert_d32f_to_abgr8_frag = build_shader(&device, CONVERT_D32F_TO_ABGR8_FRAG_SPV)
-            .expect("Failed to build convert_d32f_to_abgr8.frag");
-        let convert_d24s8_to_abgr8_frag = build_shader(&device, CONVERT_D24S8_TO_ABGR8_FRAG_SPV)
-            .expect("Failed to build convert_d24s8_to_abgr8.frag");
-        let convert_s8d24_to_abgr8_frag = build_shader(&device, CONVERT_S8D24_TO_ABGR8_FRAG_SPV)
-            .expect("Failed to build convert_s8d24_to_abgr8.frag");
-        let convert_msaa_to_non_msaa_frag =
-            build_shader(&device, CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV)
-                .expect("Failed to build convert_msaa_to_non_msaa.frag");
-        let convert_non_msaa_to_msaa_frag =
-            build_shader(&device, CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV)
-                .expect("Failed to build convert_non_msaa_to_msaa.frag");
-        let one_texture_descriptor_allocator = descriptor_pool
-            .allocator(one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
-            .expect("Failed to create one-texture descriptor allocator");
-        let two_textures_descriptor_allocator = descriptor_pool
-            .allocator(two_textures_set_layout, &Self::TWO_TEXTURES_BANK_INFO)
-            .expect("Failed to create two-texture descriptor allocator");
-
         BlitImageHelper {
             device,
             device_owner: NonNull::from(vulkan_device),
             scheduler: NonNull::from(scheduler),
+            _state_tracker: NonNull::from(state_tracker),
             shader_stencil_export_supported,
             one_texture_set_layout,
             two_textures_set_layout,
@@ -753,7 +784,10 @@ impl BlitImageHelper {
             msaa_copy_pipeline_layout,
             full_screen_vert,
             blit_color_to_color_frag,
+            blit_color_msaa_frag,
             blit_depth_stencil_frag,
+            blit_depth_msaa_frag,
+            blit_depth_stencil_msaa_frag,
             clear_color_vert,
             clear_color_frag,
             clear_stencil_frag,
@@ -778,6 +812,12 @@ impl BlitImageHelper {
             clear_stencil_pipelines: Vec::new(),
             msaa_copy_keys: Vec::new(),
             msaa_copy_pipelines: Vec::new(),
+            blit_msaa_color_keys: Vec::new(),
+            blit_msaa_color_pipelines: Vec::new(),
+            resolve_depth_keys: Vec::new(),
+            resolve_depth_pipelines: Vec::new(),
+            resolve_depth_stencil_keys: Vec::new(),
+            resolve_depth_stencil_pipelines: Vec::new(),
             msaa_copy_resources: VecDeque::new(),
             convert_d32_to_r32_pipeline: vk::Pipeline::null(),
             convert_r32_to_d32_pipeline: vk::Pipeline::null(),
@@ -791,13 +831,6 @@ impl BlitImageHelper {
         }
     }
 
-    fn commit_descriptor(
-        &self,
-        allocator: &DescriptorAllocator,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
-        allocator.commit()
-    }
-
     pub fn shader_stencil_export_supported(&self) -> bool {
         self.shader_stencil_export_supported
     }
@@ -809,7 +842,7 @@ impl BlitImageHelper {
     pub fn blit_color(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: vk::ImageView,
+        src_image_view: BlitImageView,
         dst_region: &Region2D,
         src_region: &Region2D,
         filter: Filter,
@@ -832,19 +865,8 @@ impl BlitImageHelper {
         } else {
             self.nearest_sampler
         };
-        let descriptor_set = {
-            match self.commit_descriptor(&self.one_texture_descriptor_allocator) {
-                Ok(set) => set,
-                Err(err) => {
-                    log::warn!(
-                        "BlitImageHelper: failed to allocate color blit descriptor set: {err:?}"
-                    );
-                    return false;
-                }
-            }
-        };
-        update_one_texture_descriptor_set(&self.device, descriptor_set, sampler, src_image_view);
-
+        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+        let src_view = src_image_view.color_view;
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: dst_framebuffer.render_area,
@@ -853,6 +875,7 @@ impl BlitImageHelper {
         let dst_region = *dst_region;
         let src_region = *src_region;
         let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
         scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
@@ -862,6 +885,10 @@ impl BlitImageHelper {
             &dst_framebuffer.image_ranges[..dst_framebuffer.num_images],
         );
         scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate color blit descriptor set");
+            update_one_texture_descriptor_set(&device, descriptor_set, sampler, src_view);
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 cmdbuf,
@@ -871,6 +898,154 @@ impl BlitImageHelper {
                 &[descriptor_set],
                 &[],
             );
+            bind_blit_state(&device, cmdbuf, layout, dst_region, src_region, None);
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+        });
+        scheduler.invalidate_state();
+        true
+    }
+
+    /// Port of `BlitImageHelper::BlitColorMSAA`.
+    pub fn blit_color_msaa(
+        &mut self,
+        dst_framebuffer: BlitFramebufferInfo,
+        src_image_view: BlitImageView,
+        dst_region: &Region2D,
+        src_region: &Region2D,
+    ) -> bool {
+        let key = BlitMsaaPipelineKey {
+            renderpass: dst_framebuffer.render_pass,
+            samples: dst_framebuffer.samples,
+        };
+        let pipeline = match self.find_or_emplace_blit_color_msaa_pipeline(&key) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::warn!("BlitImageHelper: failed to create MSAA color blit pipeline: {err:?}");
+                return false;
+            }
+        };
+        let layout = self.one_texture_pipeline_layout;
+        let sampler = self.nearest_sampler;
+        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+        let src_view = src_image_view.color_view;
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: dst_framebuffer.render_area,
+        };
+        let device = self.device.clone();
+        let dst_region = *dst_region;
+        let src_region = *src_region;
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
+        scheduler.request_renderpass_raw(
+            dst_framebuffer.framebuffer,
+            dst_framebuffer.render_pass,
+            render_area,
+            &[],
+            &dst_framebuffer.images[..dst_framebuffer.num_images],
+            &dst_framebuffer.image_ranges[..dst_framebuffer.num_images],
+        );
+        scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate MSAA color blit descriptor set");
+            update_one_texture_descriptor_set(&device, descriptor_set, sampler, src_view);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            bind_blit_state(&device, cmdbuf, layout, dst_region, src_region, None);
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+        });
+        scheduler.invalidate_state();
+        true
+    }
+
+    /// Port of `BlitImageHelper::ResolveDepthStencil`.
+    pub fn resolve_depth_stencil(
+        &mut self,
+        dst_framebuffer: BlitFramebufferInfo,
+        src_image_view: BlitImageView,
+        dst_region: &Region2D,
+        src_region: &Region2D,
+    ) -> bool {
+        let resolve_stencil = dst_framebuffer.has_stencil && self.shader_stencil_export_supported;
+        let pipeline = match self.find_or_emplace_resolve_depth_stencil_pipeline(
+            dst_framebuffer.render_pass,
+            resolve_stencil,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::warn!(
+                    "BlitImageHelper: failed to create depth/stencil resolve pipeline: {err:?}"
+                );
+                return false;
+            }
+        };
+        let layout = if resolve_stencil {
+            self.two_textures_pipeline_layout
+        } else {
+            self.one_texture_pipeline_layout
+        };
+        let sampler = self.nearest_sampler;
+        let descriptor_allocator = if resolve_stencil {
+            self.two_textures_descriptor_allocator.clone()
+        } else {
+            self.one_texture_descriptor_allocator.clone()
+        };
+        let src_depth_view = src_image_view.depth_view;
+        let src_stencil_view = if resolve_stencil {
+            src_image_view.stencil_view
+        } else {
+            vk::ImageView::null()
+        };
+
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: dst_framebuffer.render_area,
+        };
+        let device = self.device.clone();
+        let dst_region = *dst_region;
+        let src_region = *src_region;
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
+        scheduler.request_renderpass_raw(
+            dst_framebuffer.framebuffer,
+            dst_framebuffer.render_pass,
+            render_area,
+            &[],
+            &dst_framebuffer.images[..dst_framebuffer.num_images],
+            &dst_framebuffer.image_ranges[..dst_framebuffer.num_images],
+        );
+        scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate depth/stencil resolve descriptor set");
+            if resolve_stencil {
+                update_two_textures_descriptor_set(
+                    &device,
+                    descriptor_set,
+                    sampler,
+                    src_depth_view,
+                    src_stencil_view,
+                );
+            } else {
+                update_one_texture_descriptor_set(&device, descriptor_set, sampler, src_depth_view);
+            }
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             bind_blit_state(&device, cmdbuf, layout, dst_region, src_region, None);
             device.cmd_draw(cmdbuf, 3, 1, 0, 0);
         });
@@ -900,25 +1075,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
-        let descriptor_set = {
-            match self.commit_descriptor(&self.one_texture_descriptor_allocator) {
-                Ok(set) => set,
-                Err(err) => {
-                    log::warn!(
-                        "BlitImageHelper: failed to allocate draw-texture descriptor set: {err:?}"
-                    );
-                    return false;
-                }
-            }
-        };
-        update_one_texture_descriptor_set_with_layout(
-            &self.device,
-            descriptor_set,
-            src_sampler,
-            src_image_view,
-            vk::ImageLayout::READ_ONLY_OPTIMAL,
-        );
-
+        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
         let layout = self.one_texture_pipeline_layout;
         let dst_region = *dst_region;
         let src_region = *src_region;
@@ -934,7 +1091,7 @@ impl BlitImageHelper {
                 .src_access_mask(access)
                 .dst_access_mask(access)
                 .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(src_image)
@@ -948,8 +1105,8 @@ impl BlitImageHelper {
                 .build();
             device.cmd_pipeline_barrier(
                 cmdbuf,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -965,6 +1122,10 @@ impl BlitImageHelper {
                 })
                 .build();
             device.cmd_begin_render_pass(cmdbuf, &begin, vk::SubpassContents::INLINE);
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate draw-texture descriptor set");
+            update_one_texture_descriptor_set(&device, descriptor_set, src_sampler, src_image_view);
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 cmdbuf,
@@ -992,8 +1153,7 @@ impl BlitImageHelper {
     pub fn blit_depth_stencil(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_depth_view: vk::ImageView,
-        src_stencil_view: vk::ImageView,
+        src_image_view: BlitImageView,
         dst_region: &Region2D,
         src_region: &Region2D,
         filter: Filter,
@@ -1002,12 +1162,14 @@ impl BlitImageHelper {
         if !self.shader_stencil_export_supported {
             return false;
         }
-        if filter != Filter::Point || operation != Operation::SrcCopy {
-            log::warn!(
-                "BlitImageHelper: unsupported depth/stencil blit filter={filter:?} operation={operation:?}"
-            );
-            return false;
-        }
+        assert_fail_soft(
+            filter == Filter::Point,
+            "depth/stencil blit requires point filtering",
+        );
+        assert_fail_soft(
+            operation == Operation::SrcCopy,
+            "depth/stencil blit requires SrcCopy",
+        );
         let key = BlitImagePipelineKey {
             renderpass: dst_framebuffer.render_pass,
             operation,
@@ -1023,25 +1185,9 @@ impl BlitImageHelper {
         };
         let layout = self.two_textures_pipeline_layout;
         let sampler = self.nearest_sampler;
-        let descriptor_set = {
-            match self.commit_descriptor(&self.two_textures_descriptor_allocator) {
-                Ok(set) => set,
-                Err(err) => {
-                    log::warn!(
-                        "BlitImageHelper: failed to allocate depth/stencil blit descriptor set: {err:?}"
-                    );
-                    return false;
-                }
-            }
-        };
-        update_two_textures_descriptor_set(
-            &self.device,
-            descriptor_set,
-            sampler,
-            src_depth_view,
-            src_stencil_view,
-        );
-
+        let descriptor_allocator = self.two_textures_descriptor_allocator.clone();
+        let src_depth_view = src_image_view.depth_view;
+        let src_stencil_view = src_image_view.stencil_view;
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: dst_framebuffer.render_area,
@@ -1050,6 +1196,7 @@ impl BlitImageHelper {
         let dst_region = *dst_region;
         let src_region = *src_region;
         let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
         scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
@@ -1059,6 +1206,16 @@ impl BlitImageHelper {
             &dst_framebuffer.image_ranges[..dst_framebuffer.num_images],
         );
         scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate depth/stencil blit descriptor set");
+            update_two_textures_descriptor_set(
+                &device,
+                descriptor_set,
+                sampler,
+                src_depth_view,
+                src_stencil_view,
+            );
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 cmdbuf,
@@ -1079,17 +1236,11 @@ impl BlitImageHelper {
     pub fn convert_d32_to_r32(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_d32_to_r32_pipeline,
+        let pipeline = match self.convert_depth_to_color_pipeline(
+            self.convert_d32_to_r32_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
-            self.convert_depth_to_float_frag,
-            self.one_texture_pipeline_layout,
-            false,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1097,6 +1248,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_d32_to_r32_pipeline = pipeline;
         self.convert(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1104,17 +1256,11 @@ impl BlitImageHelper {
     pub fn convert_r32_to_d32(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_r32_to_d32_pipeline,
+        let pipeline = match self.convert_color_to_depth_pipeline(
+            self.convert_r32_to_d32_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
-            self.convert_float_to_depth_frag,
-            self.one_texture_pipeline_layout,
-            true,
-            true,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1122,6 +1268,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_r32_to_d32_pipeline = pipeline;
         self.convert(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1129,17 +1276,11 @@ impl BlitImageHelper {
     pub fn convert_d16_to_r16(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_d16_to_r16_pipeline,
+        let pipeline = match self.convert_depth_to_color_pipeline(
+            self.convert_d16_to_r16_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
-            self.convert_depth_to_float_frag,
-            self.one_texture_pipeline_layout,
-            false,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1147,6 +1288,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_d16_to_r16_pipeline = pipeline;
         self.convert(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1154,17 +1296,11 @@ impl BlitImageHelper {
     pub fn convert_r16_to_d16(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_r16_to_d16_pipeline,
+        let pipeline = match self.convert_color_to_depth_pipeline(
+            self.convert_r16_to_d16_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
-            self.convert_float_to_depth_frag,
-            self.one_texture_pipeline_layout,
-            true,
-            true,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1172,6 +1308,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_r16_to_d16_pipeline = pipeline;
         self.convert(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1179,17 +1316,18 @@ impl BlitImageHelper {
     pub fn convert_abgr8_to_d24s8(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_abgr8_to_d24s8_pipeline,
+        if !self.shader_stencil_export_supported {
+            log::warn!(
+                "BlitImageHelper: ConvertABGR8ToD24S8 requires shader_stencil_export, skipping"
+            );
+            return false;
+        }
+        let pipeline = match self.convert_pipeline_depth_target_ex(
+            self.convert_abgr8_to_d24s8_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
             self.convert_abgr8_to_d24s8_frag,
-            self.one_texture_pipeline_layout,
-            true,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1197,6 +1335,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_abgr8_to_d24s8_pipeline = pipeline;
         self.convert(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1204,17 +1343,12 @@ impl BlitImageHelper {
     pub fn convert_abgr8_to_d32f(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_abgr8_to_d32f_pipeline,
+        let pipeline = match self.convert_pipeline_depth_target_ex(
+            self.convert_abgr8_to_d32f_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
             self.convert_abgr8_to_d32f_frag,
-            self.one_texture_pipeline_layout,
-            true,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1222,6 +1356,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_abgr8_to_d32f_pipeline = pipeline;
         self.convert(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1229,17 +1364,12 @@ impl BlitImageHelper {
     pub fn convert_d32f_to_abgr8(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_d32f_to_abgr8_pipeline,
+        let pipeline = match self.convert_pipeline_color_target_ex(
+            self.convert_d32f_to_abgr8_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
             self.convert_d32f_to_abgr8_frag,
-            self.two_textures_pipeline_layout,
-            false,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1247,6 +1377,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_d32f_to_abgr8_pipeline = pipeline;
         self.convert_depth_stencil(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1254,17 +1385,12 @@ impl BlitImageHelper {
     pub fn convert_d24s8_to_abgr8(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_d24s8_to_abgr8_pipeline,
+        let pipeline = match self.convert_pipeline_color_target_ex(
+            self.convert_d24s8_to_abgr8_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
             self.convert_d24s8_to_abgr8_frag,
-            self.two_textures_pipeline_layout,
-            false,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1272,6 +1398,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_d24s8_to_abgr8_pipeline = pipeline;
         self.convert_depth_stencil(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1279,17 +1406,12 @@ impl BlitImageHelper {
     pub fn convert_s8d24_to_abgr8(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
-        let pipeline = match ensure_conversion_pipeline(
-            &self.device,
-            &mut self.convert_s8d24_to_abgr8_pipeline,
+        let pipeline = match self.convert_pipeline_color_target_ex(
+            self.convert_s8d24_to_abgr8_pipeline,
             dst_framebuffer.render_pass,
-            self.full_screen_vert,
             self.convert_s8d24_to_abgr8_frag,
-            self.two_textures_pipeline_layout,
-            false,
-            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -1297,6 +1419,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
+        self.convert_s8d24_to_abgr8_pipeline = pipeline;
         self.convert_depth_stencil(pipeline, dst_framebuffer, src_image_view)
     }
 
@@ -1439,34 +1562,20 @@ impl BlitImageHelper {
         &mut self,
         pipeline: vk::Pipeline,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
         let layout = self.one_texture_pipeline_layout;
         let sampler = self.nearest_sampler;
         let src_view = src_image_view.color_view;
-        if src_view == vk::ImageView::null() {
-            return false;
-        }
         let extent = conversion_extent(src_image_view);
-        let descriptor_set = {
-            match self.commit_descriptor(&self.one_texture_descriptor_allocator) {
-                Ok(set) => set,
-                Err(err) => {
-                    log::warn!(
-                        "BlitImageHelper: failed to allocate convert descriptor set: {err:?}"
-                    );
-                    return false;
-                }
-            }
-        };
-        update_one_texture_descriptor_set(&self.device, descriptor_set, sampler, src_view);
-
+        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: dst_framebuffer.render_area,
         };
         let device = self.device.clone();
         let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
         scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
@@ -1496,6 +1605,10 @@ impl BlitImageHelper {
                 (&push_constants as *const PushConstants).cast::<u8>(),
                 std::mem::size_of::<PushConstants>(),
             );
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate convert descriptor set");
+            update_one_texture_descriptor_set(&device, descriptor_set, sampler, src_view);
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 cmdbuf,
@@ -1518,41 +1631,21 @@ impl BlitImageHelper {
         &mut self,
         pipeline: vk::Pipeline,
         dst_framebuffer: BlitFramebufferInfo,
-        src_image_view: ConversionImageView,
+        src_image_view: BlitImageView,
     ) -> bool {
         let layout = self.two_textures_pipeline_layout;
         let sampler = self.nearest_sampler;
-        if src_image_view.depth_view == vk::ImageView::null()
-            || src_image_view.stencil_view == vk::ImageView::null()
-        {
-            return false;
-        }
         let extent = conversion_extent(src_image_view);
-        let descriptor_set = {
-            match self.commit_descriptor(&self.two_textures_descriptor_allocator) {
-                Ok(set) => set,
-                Err(err) => {
-                    log::warn!(
-                        "BlitImageHelper: failed to allocate depth/stencil convert descriptor set: {err:?}"
-                    );
-                    return false;
-                }
-            }
-        };
-        update_two_textures_descriptor_set(
-            &self.device,
-            descriptor_set,
-            sampler,
-            src_image_view.depth_view,
-            src_image_view.stencil_view,
-        );
-
+        let descriptor_allocator = self.two_textures_descriptor_allocator.clone();
+        let src_depth_view = src_image_view.depth_view;
+        let src_stencil_view = src_image_view.stencil_view;
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: dst_framebuffer.render_area,
         };
         let device = self.device.clone();
         let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
         scheduler.request_renderpass_raw(
             dst_framebuffer.framebuffer,
             dst_framebuffer.render_pass,
@@ -1581,6 +1674,16 @@ impl BlitImageHelper {
             let push_bytes = std::slice::from_raw_parts(
                 (&push_constants as *const PushConstants).cast::<u8>(),
                 std::mem::size_of::<PushConstants>(),
+            );
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate depth/stencil convert descriptor set");
+            update_two_textures_descriptor_set(
+                &device,
+                descriptor_set,
+                sampler,
+                src_depth_view,
+                src_stencil_view,
             );
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
@@ -1619,9 +1722,9 @@ impl BlitImageHelper {
         {
             let resource = self.msaa_copy_resources.pop_front().unwrap();
             unsafe {
-                self.device.destroy_image_view(resource.src_view, None);
-                self.device.destroy_image_view(resource.dst_view, None);
                 self.device.destroy_framebuffer(resource.framebuffer, None);
+                self.device.destroy_image_view(resource.dst_view, None);
+                self.device.destroy_image_view(resource.src_view, None);
             }
         }
 
@@ -1674,10 +1777,22 @@ impl BlitImageHelper {
         .format;
 
         for copy in copies {
-            assert_eq!(copy.src_subresource.base_layer, 0);
-            assert_eq!(copy.src_subresource.num_layers, 1);
-            assert_eq!(copy.dst_subresource.base_layer, 0);
-            assert_eq!(copy.dst_subresource.num_layers, 1);
+            assert_fail_soft(
+                copy.src_subresource.base_layer == 0,
+                "MSAA copy source base layer must be zero",
+            );
+            assert_fail_soft(
+                copy.src_subresource.num_layers == 1,
+                "MSAA copy source must have one layer",
+            );
+            assert_fail_soft(
+                copy.dst_subresource.base_layer == 0,
+                "MSAA copy destination base layer must be zero",
+            );
+            assert_fail_soft(
+                copy.dst_subresource.num_layers == 1,
+                "MSAA copy destination must have one layer",
+            );
 
             let src_view = match make_msaa_copy_view(
                 &self.device,
@@ -1718,8 +1833,8 @@ impl BlitImageHelper {
             let framebuffer_info = vk::FramebufferCreateInfo::builder()
                 .render_pass(renderpass)
                 .attachments(&attachments)
-                .width((copy.dst_offset.x as u32) + copy.extent.width)
-                .height((copy.dst_offset.y as u32) + copy.extent.height)
+                .width((copy.dst_offset.x as u32).wrapping_add(copy.extent.width))
+                .height((copy.dst_offset.y as u32).wrapping_add(copy.extent.height))
                 .layers(1)
                 .build();
             let framebuffer = match unsafe {
@@ -1735,26 +1850,6 @@ impl BlitImageHelper {
                     return false;
                 }
             };
-            let descriptor_set = match self
-                .commit_descriptor(&self.one_texture_descriptor_allocator)
-            {
-                Ok(descriptor_set) => descriptor_set,
-                Err(err) => {
-                    unsafe {
-                        self.device.destroy_framebuffer(framebuffer, None);
-                        self.device.destroy_image_view(src_view, None);
-                        self.device.destroy_image_view(dst_view, None);
-                    }
-                    log::warn!("BlitImageHelper::CopyMSAA descriptor allocation failed: {err:?}");
-                    return false;
-                }
-            };
-            update_one_texture_descriptor_set(
-                &self.device,
-                descriptor_set,
-                self.nearest_sampler,
-                src_view,
-            );
             let push_constants = MsaaCopyPushConstants {
                 dst_offset: [copy.dst_offset.x, copy.dst_offset.y],
                 src_offset: [copy.src_offset.x, copy.src_offset.y],
@@ -1762,6 +1857,8 @@ impl BlitImageHelper {
             };
             let device = self.device.clone();
             let layout = self.msaa_copy_pipeline_layout;
+            let sampler = self.nearest_sampler;
+            let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
             unsafe { self.scheduler.as_mut() }.request_outside_render_pass_operation_context();
             unsafe { self.scheduler.as_mut() }.record(move |cmdbuf| unsafe {
                 let color_range = vk::ImageSubresourceRange {
@@ -1823,6 +1920,10 @@ impl BlitImageHelper {
                     .render_area(render_area)
                     .build();
                 device.cmd_begin_render_pass(cmdbuf, &begin_info, vk::SubpassContents::INLINE);
+                let descriptor_set = descriptor_allocator
+                    .commit()
+                    .expect("Failed to allocate MSAA copy descriptor set");
+                update_one_texture_descriptor_set(&device, descriptor_set, sampler, src_view);
                 device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 device.cmd_bind_descriptor_sets(
                     cmdbuf,
@@ -1878,7 +1979,7 @@ impl BlitImageHelper {
                 );
             });
             self.msaa_copy_resources.push_back(MsaaCopyResources {
-                tick: unsafe { self.scheduler.as_ref() }.pending_tick(),
+                tick: unsafe { self.scheduler.as_ref() }.current_tick(),
                 src_view,
                 dst_view,
                 framebuffer,
@@ -1886,6 +1987,186 @@ impl BlitImageHelper {
         }
         unsafe { self.scheduler.as_mut() }.invalidate_state();
         true
+    }
+
+    /// Port of `BlitImageHelper::FindOrEmplaceBlitColorMSAAPipeline`.
+    fn find_or_emplace_blit_color_msaa_pipeline(
+        &mut self,
+        key: &BlitMsaaPipelineKey,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        if let Some(index) = self
+            .blit_msaa_color_keys
+            .iter()
+            .position(|cached| cached == key)
+        {
+            return Ok(self.blit_msaa_color_pipelines[index]);
+        }
+        let main = CString::new("main").unwrap();
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.full_screen_vert)
+                .name(&main)
+                .build(),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(self.blit_color_msaa_frag)
+                .name(&main)
+                .build(),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1)
+            .build();
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0)
+            .build();
+        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(key.samples)
+            .sample_shading_enable(true)
+            .min_sample_shading(1.0)
+            .build();
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+            .attachments(std::slice::from_ref(&blend_attachment))
+            .build();
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dynamic_states)
+            .build();
+        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(self.one_texture_pipeline_layout)
+            .render_pass(key.renderpass)
+            .subpass(0)
+            .build();
+        let pipeline = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .map_err(|(_, err)| err)?[0]
+        };
+        self.blit_msaa_color_keys.push(*key);
+        self.blit_msaa_color_pipelines.push(pipeline);
+        Ok(pipeline)
+    }
+
+    /// Port of `BlitImageHelper::FindOrEmplaceResolveDepthStencilPipeline`.
+    fn find_or_emplace_resolve_depth_stencil_pipeline(
+        &mut self,
+        renderpass: vk::RenderPass,
+        resolve_stencil: bool,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        let (keys, pipelines) = if resolve_stencil {
+            (
+                &mut self.resolve_depth_stencil_keys,
+                &mut self.resolve_depth_stencil_pipelines,
+            )
+        } else {
+            (
+                &mut self.resolve_depth_keys,
+                &mut self.resolve_depth_pipelines,
+            )
+        };
+        if let Some(index) = keys.iter().position(|&cached| cached == renderpass) {
+            return Ok(pipelines[index]);
+        }
+        let main = CString::new("main").unwrap();
+        let fragment_shader = if resolve_stencil {
+            self.blit_depth_stencil_msaa_frag
+        } else {
+            self.blit_depth_msaa_frag
+        };
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.full_screen_vert)
+                .name(&main)
+                .build(),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_shader)
+                .name(&main)
+                .build(),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1)
+            .build();
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0)
+            .build();
+        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .build();
+        let depth_stencil = if resolve_stencil {
+            pipeline_depth_stencil_state()
+        } else {
+            pipeline_depth_only_state()
+        };
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dynamic_states)
+            .build();
+        let layout = if resolve_stencil {
+            self.two_textures_pipeline_layout
+        } else {
+            self.one_texture_pipeline_layout
+        };
+        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .render_pass(renderpass)
+            .subpass(0)
+            .build();
+        let pipeline = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .map_err(|(_, err)| err)?[0]
+        };
+        keys.push(renderpass);
+        pipelines.push(pipeline);
+        Ok(pipeline)
     }
 
     fn find_or_emplace_msaa_copy_pipeline(
@@ -1914,9 +2195,7 @@ impl BlitImageHelper {
                 .build(),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(1)
             .scissor_count(1)
@@ -1995,10 +2274,7 @@ impl BlitImageHelper {
                 .build(),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false)
-            .build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(1)
             .scissor_count(1)
@@ -2089,10 +2365,7 @@ impl BlitImageHelper {
                 .build(),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false)
-            .build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(1)
             .scissor_count(1)
@@ -2110,33 +2383,8 @@ impl BlitImageHelper {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
             .sample_shading_enable(false)
             .build();
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::ALWAYS)
-            .depth_bounds_test_enable(false)
-            .stencil_test_enable(false)
-            .build();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
-            .blend_enable(false)
-            .src_color_blend_factor(vk::BlendFactor::ZERO)
-            .dst_color_blend_factor(vk::BlendFactor::ZERO)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(
-                vk::ColorComponentFlags::R
-                    | vk::ColorComponentFlags::G
-                    | vk::ColorComponentFlags::B
-                    | vk::ColorComponentFlags::A,
-            )
-            .build();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
-            .logic_op_enable(false)
-            .logic_op(vk::LogicOp::CLEAR)
-            .attachments(std::slice::from_ref(&blend_attachment))
-            .build();
+        let depth_stencil = pipeline_depth_stencil_state();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
@@ -2191,10 +2439,7 @@ impl BlitImageHelper {
                 .build(),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false)
-            .build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(1)
             .scissor_count(1)
@@ -2212,13 +2457,7 @@ impl BlitImageHelper {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
             .sample_shading_enable(false)
             .build();
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::ALWAYS)
-            .depth_bounds_test_enable(false)
-            .stencil_test_enable(false)
-            .build();
+        let depth_stencil = pipeline_depth_stencil_state();
         let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
             .blend_enable(true)
             .src_color_blend_factor(vk::BlendFactor::CONSTANT_COLOR)
@@ -2302,10 +2541,7 @@ impl BlitImageHelper {
             reference: key.stencil_ref,
         };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false)
-            .build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(1)
             .scissor_count(1)
@@ -2383,23 +2619,269 @@ impl BlitImageHelper {
         self.clear_stencil_pipelines.push(pipeline);
         Ok(pipeline)
     }
+
+    /// Port of `BlitImageHelper::ConvertDepthToColorPipeline`.
+    fn convert_depth_to_color_pipeline(
+        &self,
+        pipeline: vk::Pipeline,
+        renderpass: vk::RenderPass,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        self.convert_pipeline(pipeline, renderpass, false)
+    }
+
+    /// Port of `BlitImageHelper::ConvertColorToDepthPipeline`.
+    fn convert_color_to_depth_pipeline(
+        &self,
+        pipeline: vk::Pipeline,
+        renderpass: vk::RenderPass,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        self.convert_pipeline(pipeline, renderpass, true)
+    }
+
+    /// Port of `BlitImageHelper::ConvertPipelineEx`.
+    fn convert_pipeline_ex(
+        &self,
+        pipeline: vk::Pipeline,
+        renderpass: vk::RenderPass,
+        module: vk::ShaderModule,
+        single_texture: bool,
+        is_target_depth: bool,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        if pipeline != vk::Pipeline::null() {
+            return Ok(pipeline);
+        }
+        let main = CString::new("main").unwrap();
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.full_screen_vert)
+                .name(&main)
+                .build(),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(&main)
+                .build(),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1)
+            .build();
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0)
+            .build();
+        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .build();
+        let depth_stencil = pipeline_depth_stencil_state();
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .build();
+        let color_blend = if is_target_depth {
+            vk::PipelineColorBlendStateCreateInfo::builder().build()
+        } else {
+            vk::PipelineColorBlendStateCreateInfo::builder()
+                .attachments(std::slice::from_ref(&blend_attachment))
+                .build()
+        };
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dynamic_states)
+            .build();
+        let layout = if single_texture {
+            self.one_texture_pipeline_layout
+        } else {
+            self.two_textures_pipeline_layout
+        };
+        let mut create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .render_pass(renderpass)
+            .subpass(0);
+        if is_target_depth {
+            create_info = create_info.depth_stencil_state(&depth_stencil);
+        }
+        let create_info = create_info.build();
+        unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .map_err(|(_, err)| err)
+                .map(|pipelines| pipelines[0])
+        }
+    }
+
+    /// Port of `BlitImageHelper::ConvertPipelineColorTargetEx`.
+    fn convert_pipeline_color_target_ex(
+        &self,
+        pipeline: vk::Pipeline,
+        renderpass: vk::RenderPass,
+        module: vk::ShaderModule,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        self.convert_pipeline_ex(pipeline, renderpass, module, false, false)
+    }
+
+    /// Port of `BlitImageHelper::ConvertPipelineDepthTargetEx`.
+    fn convert_pipeline_depth_target_ex(
+        &self,
+        pipeline: vk::Pipeline,
+        renderpass: vk::RenderPass,
+        module: vk::ShaderModule,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        self.convert_pipeline_ex(pipeline, renderpass, module, true, true)
+    }
+
+    /// Port of `BlitImageHelper::ConvertPipeline`.
+    fn convert_pipeline(
+        &self,
+        pipeline: vk::Pipeline,
+        renderpass: vk::RenderPass,
+        is_target_depth: bool,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        if pipeline != vk::Pipeline::null() {
+            return Ok(pipeline);
+        }
+        let fragment_shader = if is_target_depth {
+            self.convert_float_to_depth_frag
+        } else {
+            self.convert_depth_to_float_frag
+        };
+        let main = CString::new("main").unwrap();
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.full_screen_vert)
+                .name(&main)
+                .build(),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_shader)
+                .name(&main)
+                .build(),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1)
+            .build();
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0)
+            .build();
+        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .build();
+        let depth_stencil = pipeline_depth_stencil_state();
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .build();
+        let color_blend = if is_target_depth {
+            vk::PipelineColorBlendStateCreateInfo::builder().build()
+        } else {
+            vk::PipelineColorBlendStateCreateInfo::builder()
+                .attachments(std::slice::from_ref(&blend_attachment))
+                .build()
+        };
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dynamic_states)
+            .build();
+        let mut create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(self.one_texture_pipeline_layout)
+            .render_pass(renderpass)
+            .subpass(0);
+        if is_target_depth {
+            create_info = create_info.depth_stencil_state(&depth_stencil);
+        }
+        let create_info = create_info.build();
+        unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .map_err(|(_, err)| err)
+                .map(|pipelines| pipelines[0])
+        }
+    }
 }
 
 impl Drop for BlitImageHelper {
     fn drop(&mut self) {
         unsafe {
-            for resource in self.msaa_copy_resources.drain(..) {
-                self.device.destroy_image_view(resource.src_view, None);
-                self.device.destroy_image_view(resource.dst_view, None);
-                self.device.destroy_framebuffer(resource.framebuffer, None);
+            // Match the reverse member-destruction order of Eden's defaulted
+            // destructor: conversion pipelines, retained MSAA resources,
+            // cached pipelines, samplers, shaders, then layouts.
+            for pipeline in [
+                &mut self.convert_s8d24_to_abgr8_pipeline,
+                &mut self.convert_d24s8_to_abgr8_pipeline,
+                &mut self.convert_d32f_to_abgr8_pipeline,
+                &mut self.convert_abgr8_to_d32f_pipeline,
+                &mut self.convert_abgr8_to_d24s8_pipeline,
+                &mut self.convert_r16_to_d16_pipeline,
+                &mut self.convert_d16_to_r16_pipeline,
+                &mut self.convert_r32_to_d32_pipeline,
+                &mut self.convert_d32_to_r32_pipeline,
+            ] {
+                if *pipeline != vk::Pipeline::null() {
+                    self.device.destroy_pipeline(*pipeline, None);
+                    *pipeline = vk::Pipeline::null();
+                }
             }
+
+            for resource in self.msaa_copy_resources.drain(..) {
+                self.device.destroy_framebuffer(resource.framebuffer, None);
+                self.device.destroy_image_view(resource.dst_view, None);
+                self.device.destroy_image_view(resource.src_view, None);
+            }
+
             for pipeline in self
-                .blit_color_pipelines
+                .resolve_depth_stencil_pipelines
                 .iter_mut()
-                .chain(self.blit_depth_stencil_pipelines.iter_mut())
-                .chain(self.clear_color_pipelines.iter_mut())
-                .chain(self.clear_stencil_pipelines.iter_mut())
+                .chain(self.resolve_depth_pipelines.iter_mut())
+                .chain(self.blit_msaa_color_pipelines.iter_mut())
                 .chain(self.msaa_copy_pipelines.iter_mut())
+                .chain(self.clear_stencil_pipelines.iter_mut())
+                .chain(self.clear_color_pipelines.iter_mut())
+                .chain(self.blit_depth_stencil_pipelines.iter_mut())
+                .chain(self.blit_color_pipelines.iter_mut())
             {
                 if *pipeline != vk::Pipeline::null() {
                     self.device.destroy_pipeline(*pipeline, None);
@@ -2407,39 +2889,34 @@ impl Drop for BlitImageHelper {
                 }
             }
 
-            for pipeline in [
-                &mut self.convert_d32_to_r32_pipeline,
-                &mut self.convert_r32_to_d32_pipeline,
-                &mut self.convert_d16_to_r16_pipeline,
-                &mut self.convert_r16_to_d16_pipeline,
-                &mut self.convert_abgr8_to_d24s8_pipeline,
-                &mut self.convert_abgr8_to_d32f_pipeline,
-                &mut self.convert_d32f_to_abgr8_pipeline,
-                &mut self.convert_d24s8_to_abgr8_pipeline,
-                &mut self.convert_s8d24_to_abgr8_pipeline,
-            ] {
-                if *pipeline != vk::Pipeline::null() {
-                    self.device.destroy_pipeline(*pipeline, None);
-                    *pipeline = vk::Pipeline::null();
-                }
+            if self.nearest_sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.nearest_sampler, None);
+                self.nearest_sampler = vk::Sampler::null();
+            }
+            if self.linear_sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.linear_sampler, None);
+                self.linear_sampler = vk::Sampler::null();
             }
 
             for shader in [
-                &mut self.full_screen_vert,
-                &mut self.blit_color_to_color_frag,
-                &mut self.blit_depth_stencil_frag,
-                &mut self.clear_color_vert,
-                &mut self.clear_color_frag,
-                &mut self.clear_stencil_frag,
-                &mut self.convert_depth_to_float_frag,
-                &mut self.convert_float_to_depth_frag,
-                &mut self.convert_abgr8_to_d24s8_frag,
-                &mut self.convert_abgr8_to_d32f_frag,
-                &mut self.convert_d32f_to_abgr8_frag,
-                &mut self.convert_d24s8_to_abgr8_frag,
-                &mut self.convert_s8d24_to_abgr8_frag,
-                &mut self.convert_msaa_to_non_msaa_frag,
                 &mut self.convert_non_msaa_to_msaa_frag,
+                &mut self.convert_msaa_to_non_msaa_frag,
+                &mut self.convert_s8d24_to_abgr8_frag,
+                &mut self.convert_d24s8_to_abgr8_frag,
+                &mut self.convert_d32f_to_abgr8_frag,
+                &mut self.convert_abgr8_to_d32f_frag,
+                &mut self.convert_abgr8_to_d24s8_frag,
+                &mut self.convert_float_to_depth_frag,
+                &mut self.convert_depth_to_float_frag,
+                &mut self.clear_stencil_frag,
+                &mut self.clear_color_frag,
+                &mut self.clear_color_vert,
+                &mut self.blit_depth_stencil_msaa_frag,
+                &mut self.blit_depth_msaa_frag,
+                &mut self.blit_depth_stencil_frag,
+                &mut self.blit_color_msaa_frag,
+                &mut self.blit_color_to_color_frag,
+                &mut self.full_screen_vert,
             ] {
                 if *shader != vk::ShaderModule::null() {
                     self.device.destroy_shader_module(*shader, None);
@@ -2447,23 +2924,15 @@ impl Drop for BlitImageHelper {
                 }
             }
 
-            if self.linear_sampler != vk::Sampler::null() {
-                self.device.destroy_sampler(self.linear_sampler, None);
-                self.linear_sampler = vk::Sampler::null();
-            }
-            if self.nearest_sampler != vk::Sampler::null() {
-                self.device.destroy_sampler(self.nearest_sampler, None);
-                self.nearest_sampler = vk::Sampler::null();
+            if self.msaa_copy_pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.msaa_copy_pipeline_layout, None);
+                self.msaa_copy_pipeline_layout = vk::PipelineLayout::null();
             }
             if self.clear_color_pipeline_layout != vk::PipelineLayout::null() {
                 self.device
                     .destroy_pipeline_layout(self.clear_color_pipeline_layout, None);
                 self.clear_color_pipeline_layout = vk::PipelineLayout::null();
-            }
-            if self.msaa_copy_pipeline_layout != vk::PipelineLayout::null() {
-                self.device
-                    .destroy_pipeline_layout(self.msaa_copy_pipeline_layout, None);
-                self.msaa_copy_pipeline_layout = vk::PipelineLayout::null();
             }
             if self.two_textures_pipeline_layout != vk::PipelineLayout::null() {
                 self.device
@@ -2494,11 +2963,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn push_constants_match_upstream_layout() {
+        assert_eq!(std::mem::size_of::<PushConstants>(), 16);
+        assert_eq!(std::mem::align_of::<PushConstants>(), 4);
+        assert_eq!(std::mem::offset_of!(PushConstants, tex_scale), 0);
+        assert_eq!(std::mem::offset_of!(PushConstants, tex_offset), 8);
+    }
+
+    #[test]
     fn msaa_copy_push_constants_match_upstream_layout() {
         assert_eq!(std::mem::size_of::<MsaaCopyPushConstants>(), 24);
         assert_eq!(std::mem::align_of::<MsaaCopyPushConstants>(), 4);
         assert_eq!(std::mem::offset_of!(MsaaCopyPushConstants, dst_offset), 0);
         assert_eq!(std::mem::offset_of!(MsaaCopyPushConstants, src_offset), 8);
         assert_eq!(std::mem::offset_of!(MsaaCopyPushConstants, scale), 16);
+    }
+
+    #[test]
+    fn subresource_range_matches_upstream_format_aspects_and_slice_rule() {
+        let range = SubresourceRange {
+            base: crate::texture_cache::types::SubresourceBase { level: 2, layer: 3 },
+            extent: crate::texture_cache::types::SubresourceExtent {
+                levels: 4,
+                layers: 5,
+            },
+        };
+        for (format, aspect_mask) in [
+            (PixelFormat::A8B8G8R8Unorm, vk::ImageAspectFlags::COLOR),
+            (PixelFormat::D32Float, vk::ImageAspectFlags::DEPTH),
+            (PixelFormat::S8Uint, vk::ImageAspectFlags::STENCIL),
+            (
+                PixelFormat::D24UnormS8Uint,
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            ),
+            (PixelFormat::Invalid, vk::ImageAspectFlags::COLOR),
+        ] {
+            let actual = subresource_range_from_view(format, range, false);
+            assert_eq!(actual.aspect_mask, aspect_mask);
+            assert_eq!(actual.base_mip_level, 2);
+            assert_eq!(actual.level_count, 4);
+            assert_eq!(actual.base_array_layer, 3);
+            assert_eq!(actual.layer_count, 5);
+        }
+
+        let slice = subresource_range_from_view(PixelFormat::D32Float, range, true);
+        assert_eq!(slice.base_array_layer, 0);
+        assert_eq!(slice.layer_count, 1);
+    }
+
+    #[test]
+    fn depth_stencil_pipeline_state_matches_upstream_stencil_export_contract() {
+        let state = pipeline_depth_stencil_state();
+        assert_eq!(state.depth_test_enable, vk::TRUE);
+        assert_eq!(state.depth_write_enable, vk::TRUE);
+        assert_eq!(state.depth_compare_op, vk::CompareOp::ALWAYS);
+        assert_eq!(state.stencil_test_enable, vk::TRUE);
+        for stencil in [state.front, state.back] {
+            assert_eq!(stencil.fail_op, vk::StencilOp::REPLACE);
+            assert_eq!(stencil.pass_op, vk::StencilOp::REPLACE);
+            assert_eq!(stencil.depth_fail_op, vk::StencilOp::KEEP);
+            assert_eq!(stencil.compare_op, vk::CompareOp::ALWAYS);
+            assert_eq!(stencil.compare_mask, 0);
+            assert_eq!(stencil.write_mask, u32::MAX);
+            assert_eq!(stencil.reference, 0);
+        }
     }
 }

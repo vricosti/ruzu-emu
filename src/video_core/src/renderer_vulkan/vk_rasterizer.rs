@@ -819,7 +819,6 @@ impl RasterizerVulkan {
         must_emulate_scaled_formats: bool,
         must_emulate_bgr565: bool,
         ext_4444_formats_supported: bool,
-        shader_stencil_export_supported: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
@@ -872,8 +871,8 @@ impl RasterizerVulkan {
         let mut blit_image = Box::new(BlitImageHelper::new(
             vulkan_device,
             scheduler,
+            state_tracker,
             descriptor_pool.as_mut(),
-            shader_stencil_export_supported,
         ));
 
         let (fallback_uniform_buffer, fallback_uniform_memory, fallback_uniform_mapped) =

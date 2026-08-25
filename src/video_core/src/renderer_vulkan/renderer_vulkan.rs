@@ -410,7 +410,6 @@ impl RendererVulkan {
             device.must_emulate_scaled_formats(),
             device.must_emulate_bgr565(),
             device.is_ext_4444_formats_supported(),
-            device.is_ext_shader_stencil_export_supported(),
             device.is_khr_image_format_list_supported(),
             device.is_optimal_astc_supported(),
             device.is_ext_custom_border_color_supported(),

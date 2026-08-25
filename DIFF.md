@@ -12280,6 +12280,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the same signal/wait semaphore ordering as Eden.
 - Command buffers are explicitly reset before `vkBeginCommandBuffer`; Eden relies on Vulkan's
   implicit reset when beginning an executable command buffer from a resettable pool.
+- `Scheduler::new` propagates `MasterSemaphore` construction failures as `vk::Result`; Eden
+  propagates the equivalent Vulkan wrapper exception from its constructor.
 
 ### Unintentional differences (to fix)
 
@@ -12321,3 +12323,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: no serialized pipeline-key or guest-visible structure changed in this prerequisite.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/master_semaphore.rs` vs Eden `src/video_core/renderer_vulkan/vk_master_semaphore.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the fence-thread state in `Arc` and replaces `atomic::wait/notify_one` with a
+  condition variable paired with the same free-fence mutex. The GPU tick is stored while holding
+  that mutex, so the predicate check and notification cannot lose progress.
+- Core Vulkan 1.3 and `VK_KHR_synchronization2` have distinct ash dispatch paths; Eden's device
+  wrapper selects the corresponding core or extension function behind `Submit2`.
+- Construction returns `Result<Self, vk::Result>` instead of throwing. Partial timeline semaphore
+  and fence allocations are explicitly destroyed before returning an error, matching C++ RAII.
+- Rust gives its two helper threads diagnostic names; Eden leaves these particular thread names to
+  the operating system.
+
+### Unintentional differences (to fix)
+
+- None after restoring fixed-size synchronization2 submit arrays, fatal handling for non-timeout
+  debug/fence wait failures, and destruction of a checked-out fence when queue submission fails.
+
+### Missing items
+
+- The focused unit test verifies file-owned constants. Timeline and fence submissions require a
+  real Vulkan device and remain covered only by renderer integration/runtime validation.
+
+### Binary layout verification
+
+- N/A: `MasterSemaphore` owns host Vulkan synchronization objects and exposes no serialized or
+  guest-visible raw-memory payload.

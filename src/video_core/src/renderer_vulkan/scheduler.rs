@@ -585,7 +585,7 @@ impl Scheduler {
             timeline_semaphore_supported,
             synchronization2_core,
             synchronization2_khr,
-        ));
+        )?);
         let submit_mutex = Arc::new(Mutex::new(()));
         let on_submit = Arc::new(Mutex::new(None));
         let worker = Arc::new(SchedulerWorker::new());

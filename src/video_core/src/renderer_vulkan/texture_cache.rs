@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::Maxwell3DAccess;
+use crate::engines::fermi_2d::{Filter as BlitFilter, Operation as BlitOperation};
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::dma;
 use crate::framebuffer_config::FramebufferConfig;
@@ -46,8 +47,7 @@ use shader_recompiler::shader_info::{ImageFormat, TextureType};
 
 use super::blit_image::{
     BlitFramebufferInfo, BlitImageHelper, ConversionImageView, Extent3D as BlitExtent3D,
-    Filter as BlitFilter, Offset2D as BlitOffset2D, Operation as BlitOperation,
-    Region2D as BlitRegion2D,
+    Offset2D as BlitOffset2D, Region2D as BlitRegion2D,
 };
 use super::compute_pass::{AstcDecoderPass, BlockLinearUnswizzle3DPass};
 use super::descriptor_pool::DescriptorPool;
@@ -442,7 +442,7 @@ impl Image {
         let filter = if !crate::surface::is_pixel_format_integer(self.base().info.format) {
             BlitFilter::Bilinear
         } else {
-            BlitFilter::PointSample
+            BlitFilter::Point
         };
         runtime.blit_image_helper().blit_color(
             framebuffer,
@@ -630,7 +630,7 @@ impl Image {
             stencil_view,
             &dst_region,
             &src_region,
-            BlitFilter::PointSample,
+            BlitFilter::Point,
             BlitOperation::SrcCopy,
         )
     }
@@ -2678,7 +2678,7 @@ impl TextureCacheRuntime {
                 src_view.color_view,
                 &region,
                 &region,
-                BlitFilter::PointSample,
+                BlitFilter::Point,
                 BlitOperation::SrcCopy,
             );
         }
@@ -5312,27 +5312,14 @@ impl TextureCache {
         if is_dst_rescaled {
             scale_region(&mut dst_region);
         }
-        let filter = match copy.filter {
-            crate::engines::fermi_2d::Filter::Point => BlitFilter::PointSample,
-            crate::engines::fermi_2d::Filter::Bilinear => BlitFilter::Bilinear,
-        };
-        let operation = match copy.operation {
-            crate::engines::fermi_2d::Operation::SrcCopyAnd => BlitOperation::SrcCopyAnd,
-            crate::engines::fermi_2d::Operation::RopAnd => BlitOperation::RopAnd,
-            crate::engines::fermi_2d::Operation::Blend => BlitOperation::Blend,
-            crate::engines::fermi_2d::Operation::SrcCopy => BlitOperation::SrcCopy,
-            crate::engines::fermi_2d::Operation::Rop => BlitOperation::Rop,
-            crate::engines::fermi_2d::Operation::SrcCopyPremult => BlitOperation::SrcCopyPremult,
-            crate::engines::fermi_2d::Operation::BlendPremult => BlitOperation::BlendPremult,
-        };
         let copied = self.base.runtime_mut().blit_image(
             dst_framebuffer,
             &dst_view,
             &src_view,
             dst_region,
             src_region,
-            filter,
-            operation,
+            copy.filter,
+            copy.operation,
         );
         self.base.slot_image_views[src_view_id].backend = Some(src_view);
         self.base.slot_image_views[dst_view_id].backend = Some(dst_view);

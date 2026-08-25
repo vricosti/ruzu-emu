@@ -204,7 +204,7 @@ impl SoftwareBlitEngine {
     }
 
     fn get_surface_size(surface: &Surface, bytes_per_pixel: u32) -> usize {
-        if surface.linear == MemoryLayout::BlockLinear {
+        if surface.linear == MemoryLayout::BlockLinear as u32 {
             decoders::calculate_size(
                 true,
                 bytes_per_pixel,
@@ -262,23 +262,10 @@ impl SoftwareBlitEngine {
             return false;
         };
 
-        let src_bytes_per_pixel = if src.format == RenderTargetFormat::None {
-            0
-        } else {
-            surface::bytes_per_block(surface::pixel_format_from_render_target_format(
-                src.format as u32,
-            ))
-        };
-        let dst_bytes_per_pixel = if dst.format == RenderTargetFormat::None {
-            0
-        } else {
-            surface::bytes_per_block(surface::pixel_format_from_render_target_format(
-                dst.format as u32,
-            ))
-        };
-        if src_bytes_per_pixel == 0 || dst_bytes_per_pixel == 0 {
-            return false;
-        }
+        let src_bytes_per_pixel =
+            surface::bytes_per_block(surface::pixel_format_from_render_target_format(src.format));
+        let dst_bytes_per_pixel =
+            surface::bytes_per_block(surface::pixel_format_from_render_target_format(dst.format));
 
         let src_size = Self::get_surface_size(src, src_bytes_per_pixel);
         self.imp.tmp_buffer.resize(src_size, 0);
@@ -299,7 +286,7 @@ impl SoftwareBlitEngine {
             || src_extent_x != dst_extent_x
             || src_extent_y != dst_extent_y;
 
-        if src.linear == MemoryLayout::BlockLinear {
+        if src.linear == MemoryLayout::BlockLinear as u32 {
             decoders::unswizzle_subrect(
                 &mut self.imp.src_buffer,
                 &self.imp.tmp_buffer,
@@ -331,10 +318,7 @@ impl SoftwareBlitEngine {
 
         if no_passthrough {
             if src.format != dst.format || config.filter == Filter::Bilinear {
-                let input_converter = self
-                    .imp
-                    .converter_factory
-                    .get_format_converter(src.format as u32);
+                let input_converter = self.imp.converter_factory.get_format_converter(src.format);
                 self.imp.intermediate_src.resize(
                     (src_copy_size / src_bytes_per_pixel as usize) * IR_COMPONENTS,
                     0.0,
@@ -365,10 +349,7 @@ impl SoftwareBlitEngine {
                     );
                 }
 
-                let output_converter = self
-                    .imp
-                    .converter_factory
-                    .get_format_converter(dst.format as u32);
+                let output_converter = self.imp.converter_factory.get_format_converter(dst.format);
                 output_converter.convert_from(&self.imp.intermediate_dst, &mut self.imp.dst_buffer);
             } else {
                 nearest_neighbor(
@@ -395,7 +376,7 @@ impl SoftwareBlitEngine {
             return false;
         }
 
-        if dst.linear == MemoryLayout::BlockLinear {
+        if dst.linear == MemoryLayout::BlockLinear as u32 {
             decoders::swizzle_subrect(
                 &mut self.imp.tmp_buffer,
                 &self.imp.dst_buffer,
@@ -481,8 +462,8 @@ mod tests {
     fn blit_writes_pitch_linear_surface_through_memory_manager() {
         let mut blitter = SoftwareBlitEngine::default();
         let src = Surface {
-            format: RenderTargetFormat::A8B8G8R8Unorm,
-            linear: MemoryLayout::Pitch,
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::Pitch as u32,
             block_dimensions: 0,
             depth: 1,
             layer: 0,
@@ -493,8 +474,8 @@ mod tests {
             addr_lower: 0x1000,
         };
         let dst = Surface {
-            format: RenderTargetFormat::A8B8G8R8Unorm,
-            linear: MemoryLayout::Pitch,
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::Pitch as u32,
             block_dimensions: 0,
             depth: 1,
             layer: 0,

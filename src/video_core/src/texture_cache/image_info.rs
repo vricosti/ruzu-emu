@@ -442,11 +442,15 @@ impl ImageInfo {
     /// Port of `ImageInfo::ImageInfo(const Fermi2D::Surface& config)`.
     pub fn from_fermi2d_surface(config: &crate::engines::fermi_2d::Surface) -> Self {
         if config.layer != 0 {
-            panic!("ImageInfo::from_fermi2d_surface: surface layer is not zero");
+            log::error!("ImageInfo::from_fermi2d_surface: surface layer is not zero");
+            if *common::settings::values().use_debug_asserts.get_value() {
+                panic!("ImageInfo::from_fermi2d_surface: surface layer is not zero");
+            }
         }
-        let format = crate::surface::pixel_format_from_render_target_format(config.format as u32);
-        let forced_flushed =
-            force_pitch_flush(config.linear == crate::engines::fermi_2d::MemoryLayout::Pitch);
+        let format = crate::surface::pixel_format_from_render_target_format(config.format);
+        let forced_flushed = force_pitch_flush(
+            config.linear == crate::engines::fermi_2d::MemoryLayout::Pitch as u32,
+        );
         let mut info = Self {
             format,
             image_type: ImageType::E2D,
@@ -471,7 +475,7 @@ impl ImageInfo {
             is_sparse: false,
         };
 
-        if config.linear == crate::engines::fermi_2d::MemoryLayout::Pitch {
+        if config.linear == crate::engines::fermi_2d::MemoryLayout::Pitch as u32 {
             info.image_type = ImageType::Linear;
             info.size.width = config.pitch / crate::surface::bytes_per_block(format);
             info.tiling = TilingMode::PitchLinear(config.pitch);
@@ -1044,8 +1048,8 @@ mod tests {
     #[test]
     fn fermi2d_block_linear_sets_rescale_flags_like_upstream() {
         let info = ImageInfo::from_fermi2d_surface(&Surface {
-            format: RenderTargetFormat::A8B8G8R8Unorm,
-            linear: MemoryLayout::BlockLinear,
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::BlockLinear as u32,
             block_dimensions: 2 | (3 << 4),
             depth: 1,
             layer: 0,
@@ -1068,8 +1072,8 @@ mod tests {
     #[test]
     fn fermi2d_3d_block_linear_is_not_rescaleable() {
         let info = ImageInfo::from_fermi2d_surface(&Surface {
-            format: RenderTargetFormat::A8B8G8R8Unorm,
-            linear: MemoryLayout::BlockLinear,
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::BlockLinear as u32,
             block_dimensions: 2 | (3 << 4) | (1 << 8),
             depth: 4,
             layer: 0,
@@ -1088,11 +1092,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "surface layer is not zero")]
-    fn fermi2d_surface_nonzero_layer_is_fatal_like_upstream() {
-        let _ = ImageInfo::from_fermi2d_surface(&Surface {
-            format: RenderTargetFormat::A8B8G8R8Unorm,
-            linear: MemoryLayout::BlockLinear,
+    fn fermi2d_surface_nonzero_layer_is_fail_soft_like_upstream() {
+        let info = ImageInfo::from_fermi2d_surface(&Surface {
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::BlockLinear as u32,
             block_dimensions: 0,
             depth: 1,
             layer: 1,
@@ -1102,6 +1105,7 @@ mod tests {
             addr_upper: 0,
             addr_lower: 0,
         });
+        assert_eq!(info.size.depth, 1);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ptr::NonNull;
 
+use crate::engines::fermi_2d::{Filter, Operation};
 use crate::host_shaders::spirv_shaders::{
     BLIT_COLOR_FLOAT_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV, CONVERT_ABGR8_TO_D32F_FRAG_SPV,
     CONVERT_D24S8_TO_ABGR8_FRAG_SPV, CONVERT_D32F_TO_ABGR8_FRAG_SPV,
@@ -61,7 +62,7 @@ struct MsaaCopyPushConstants {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlitImagePipelineKey {
     pub renderpass: vk::RenderPass,
-    pub operation: u32, // Fermi2D::Operation
+    pub operation: Operation,
 }
 
 /// Port of `BlitDepthStencilPipelineKey`.
@@ -138,31 +139,6 @@ pub struct Extent3D {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-}
-
-// ---------------------------------------------------------------------------
-// Fermi2D Operation / Filter (matching upstream enums)
-// ---------------------------------------------------------------------------
-
-/// Port of `Tegra::Engines::Fermi2D::Operation`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Operation {
-    SrcCopyAnd = 0,
-    RopAnd = 1,
-    Blend = 2,
-    SrcCopy = 3,
-    Rop = 4,
-    SrcCopyPremult = 5,
-    BlendPremult = 6,
-}
-
-/// Port of `Tegra::Engines::Fermi2D::Filter`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Filter {
-    PointSample = 0,
-    Bilinear = 1,
 }
 
 fn update_one_texture_descriptor_set(
@@ -841,7 +817,7 @@ impl BlitImageHelper {
     ) -> bool {
         let key = BlitImagePipelineKey {
             renderpass: dst_framebuffer.render_pass,
-            operation: operation as u32,
+            operation,
         };
         let pipeline = match self.find_or_emplace_color_pipeline(&key) {
             Ok(pipeline) => pipeline,
@@ -915,7 +891,7 @@ impl BlitImageHelper {
     ) -> bool {
         let key = BlitImagePipelineKey {
             renderpass: dst_framebuffer.render_pass,
-            operation: Operation::SrcCopy as u32,
+            operation: Operation::SrcCopy,
         };
         let pipeline = match self.find_or_emplace_color_pipeline(&key) {
             Ok(pipeline) => pipeline,
@@ -1026,7 +1002,7 @@ impl BlitImageHelper {
         if !self.shader_stencil_export_supported {
             return false;
         }
-        if filter != Filter::PointSample || operation != Operation::SrcCopy {
+        if filter != Filter::Point || operation != Operation::SrcCopy {
             log::warn!(
                 "BlitImageHelper: unsupported depth/stencil blit filter={filter:?} operation={operation:?}"
             );
@@ -1034,7 +1010,7 @@ impl BlitImageHelper {
         }
         let key = BlitImagePipelineKey {
             renderpass: dst_framebuffer.render_pass,
-            operation: operation as u32,
+            operation,
         };
         let pipeline = match self.find_or_emplace_depth_stencil_pipeline(&key) {
             Ok(pipeline) => pipeline,
@@ -1337,7 +1313,7 @@ impl BlitImageHelper {
     ) -> bool {
         let key = BlitImagePipelineKey {
             renderpass: dst_framebuffer.render_pass,
-            operation: Operation::BlendPremult as u32,
+            operation: Operation::BlendPremult,
         };
         let pipeline = match self.find_or_emplace_clear_color_pipeline(&key) {
             Ok(pipeline) => pipeline,

@@ -6845,6 +6845,51 @@ vs Eden `display_list.h` and `layer_list.h`
   begins after `NUM_REGS_WORDS`, the total size is `ENGINE_REG_COUNT * 4`, and the word view spans
   both regions contiguously.
 
+## 2026-08-26 — Fermi2D raw-register and blit parity
+
+Rust files:
+- `src/video_core/src/engines/fermi_2d.rs`
+- `src/video_core/src/engines/sw_blitter/blitter.rs`
+- `src/video_core/src/texture_cache/image_info.rs`
+- `src/video_core/src/renderer_vulkan/blit_image.rs`
+- `src/video_core/src/renderer_vulkan/texture_cache.rs`
+
+Eden files:
+- `src/video_core/engines/fermi_2d.{h,cpp}`
+- `src/video_core/engines/sw_blitter/blitter.cpp`
+- `src/video_core/texture_cache/image_info.cpp`
+- `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
+- `src/video_core/renderer_vulkan/vk_texture_cache.cpp`
+
+### Intentional differences
+- `Surface::format` and `Surface::linear` use raw `u32` storage, and `Operation` is a transparent
+  `u32` newtype. C++ enums can retain arbitrary register bit patterns; constructing an invalid Rust
+  enum discriminant would be undefined behavior. The raw Rust representations preserve every bit,
+  keep the same four-byte ABI, and expose the upstream named values as constants.
+- Rust checks the length of the slice passed to `call_multi_method`; Eden receives an unchecked
+  pointer whose caller contract guarantees `amount` readable words.
+- A missing rasterizer falls back to the software blitter. Eden dereferences its non-owning pointer
+  unconditionally after the renderer has bound it; the Rust guard keeps partially constructed test
+  engines memory-safe without changing the bound runtime path.
+- The Rust-wide `Engine` adapter requires an `execute_pending` method. Fermi2D implements it as a
+  no-op because Eden executes `Blit` synchronously from `CallMethod`.
+
+### Unintentional differences (to fix)
+- None after this correction. Unknown surface formats, memory layouts, and operations are no longer
+  normalized; all five `UNIMPLEMENTED_IF_MSG` checks now use Eden's fail-soft policy; the complete
+  blit calculation uses the same wraparound bit patterns and ordering; and the spurious deferred
+  `pending_blit` state has been removed.
+
+### Missing items
+- None in the Fermi2D register/blit slice.
+
+### Binary layout verification
+- PASS: `Operation` is 4 bytes, `Surface` is `0x28`, `Config` is `0x2c`, `ActiveRegsRaw` is `0x6e0`,
+  the upstream register union is `0x960`, and tests verify every asserted register offset plus the
+  contiguous Rust engine tail.
+- PASS: Vulkan's `BlitImagePipelineKey` now owns the upstream Fermi2D `Operation` type rather than a
+  duplicate renderer-local enum; the representation remains one 32-bit word.
+
 ## 2026-08-22 — `src/video_core/build.rs` vs Eden root `CMakeLists.txt`
 
 ### Intentional differences

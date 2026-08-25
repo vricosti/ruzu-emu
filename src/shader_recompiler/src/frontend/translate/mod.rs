@@ -462,7 +462,14 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn translate_instruction(&mut self, insn: u64) {
         let opcode = match maxwell_opcodes::decode_opcode(insn) {
             Some(op) => op,
-            None => panic!("Invalid Maxwell opcode 0x{insn:016X}"),
+            None => {
+                // Eden's `Decode` emits a soft assertion and returns NOP for
+                // unknown encodings. Keep the GPU thread alive and preserve
+                // that no-op fallback when debug assertions are disabled.
+                log::error!("Invalid Maxwell opcode 0x{insn:016X}; treating it as NOP");
+                self.translate_nop(insn);
+                return;
+            }
         };
 
         match opcode {
@@ -962,6 +969,7 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::BPT => self.translate_bpt(insn),
             MaxwellOpcode::CCTL => self.translate_cctl(insn),
             MaxwellOpcode::CCTLL => self.translate_cctll(insn),
+            MaxwellOpcode::CCTLT => self.translate_cctlt(insn),
             MaxwellOpcode::CS2R => self.translate_cs2r(insn),
             MaxwellOpcode::FCHK_reg => self.translate_fchk_reg(insn),
             MaxwellOpcode::FCHK_cbuf => self.translate_fchk_cbuf(insn),
@@ -1066,6 +1074,17 @@ mod tests {
             .collect();
         assert!(!opcodes.contains(&Opcode::DemoteToHelperInvocation));
         assert!(!tv.ir.program.info.uses_demote_to_helper_invocation);
+    }
+
+    #[test]
+    fn invalid_encoding_falls_back_to_nop_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0);
+
+        assert!(tv.ir.program.blocks[0].is_empty());
     }
 
     #[test]
@@ -1265,12 +1284,4 @@ mod tests {
         assert!(!opcodes.contains(&Opcode::BoundImageQueryDimensions));
     }
 
-    #[test]
-    #[should_panic(expected = "Invalid Maxwell opcode")]
-    fn invalid_opcode_is_not_silently_ignored() {
-        let mut program = Program::new(ShaderStage::VertexB);
-        program.blocks.push(Block::new());
-        let mut tv = TranslatorVisitor::new(&mut program, 0);
-        tv.translate_instruction(0);
-    }
 }

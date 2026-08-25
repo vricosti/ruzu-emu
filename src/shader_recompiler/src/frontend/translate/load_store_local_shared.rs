@@ -6,6 +6,27 @@
 use super::{field, sfield, TranslatorVisitor};
 use crate::ir::value::Value;
 
+const RZ: u32 = 255;
+
+/// Port of `IR::IsAligned(Reg, size_t)`: the zero register is valid for every
+/// vector width even though its numeric encoding is 255.
+fn is_aligned_reg(reg: u32, alignment: u32) -> bool {
+    reg == RZ || reg % alignment == 0
+}
+
+/// Port of `IR::operator+(Reg, int)`: every component selected from RZ remains
+/// RZ instead of overflowing into the non-existent register 256 and above.
+fn reg_offset(reg: u32, offset: u32) -> u32 {
+    if reg == RZ {
+        return RZ;
+    }
+    let result = reg
+        .checked_add(offset)
+        .expect("overflow on register arithmetic");
+    assert!(result < RZ, "overflow on register arithmetic");
+    result
+}
+
 fn offset(tv: &mut TranslatorVisitor<'_>, insn: u64) -> Value {
     let offset_reg = field(insn, 8, 8);
     if offset_reg == 255 {
@@ -92,7 +113,7 @@ pub fn ldl(tv: &mut TranslatorVisitor<'_>, insn: u64) {
         }
         32 | 64 | 128 => {
             let words = bit_size / 32;
-            if dest % words != 0 {
+            if !is_aligned_reg(dest, words) {
                 panic!("Unaligned LDL destination register {dest}");
             }
             tv.set_x(dest, word);
@@ -100,7 +121,7 @@ pub fn ldl(tv: &mut TranslatorVisitor<'_>, insn: u64) {
                 let sub_word_offset = tv.ir.iadd_32(word_offset.clone(), Value::ImmU32(index));
                 let sub_offset = tv.ir.iadd_32(offset.clone(), Value::ImmU32(index * 4));
                 let value = load_local(tv, sub_word_offset, sub_offset);
-                tv.set_x(dest + index, value);
+                tv.set_x(reg_offset(dest, index), value);
             }
         }
         _ => unreachable!("validated local memory size"),
@@ -134,17 +155,17 @@ pub fn lds(tv: &mut TranslatorVisitor<'_>, insn: u64) {
             tv.set_x(dest, value);
         }
         64 => {
-            if dest % 2 != 0 {
+            if !is_aligned_reg(dest, 2) {
                 panic!("Unaligned LDS destination register {dest}");
             }
             let value = tv.ir.load_shared_u64(offset);
             for index in 0..2 {
                 let element = tv.ir.composite_extract_u32x2_idx(value.clone(), index);
-                tv.set_x(dest + index, element);
+                tv.set_x(reg_offset(dest, index), element);
             }
         }
         128 => {
-            if dest % 4 != 0 {
+            if !is_aligned_reg(dest, 4) {
                 panic!("Unaligned LDS destination register {dest}");
             }
             let value = tv.ir.load_shared_u128(offset);
@@ -152,7 +173,7 @@ pub fn lds(tv: &mut TranslatorVisitor<'_>, insn: u64) {
                 let element = tv
                     .ir
                     .composite_extract_u32x4(value.clone(), Value::ImmU32(index));
-                tv.set_x(dest + index, element);
+                tv.set_x(reg_offset(dest, index), element);
             }
         }
         _ => unreachable!("validated shared memory size"),
@@ -188,13 +209,13 @@ pub fn stl(tv: &mut TranslatorVisitor<'_>, insn: u64) {
         }
         32 | 64 | 128 => {
             let words = bit_size / 32;
-            if reg % words != 0 {
+            if !is_aligned_reg(reg, words) {
                 panic!("Unaligned STL source register {reg}");
             }
             tv.ir.write_local(word_offset.clone(), src);
             for index in 1..words {
                 let address = tv.ir.iadd_32(word_offset.clone(), Value::ImmU32(index));
-                let value = tv.x(reg + index);
+                let value = tv.x(reg_offset(reg, index));
                 tv.ir.write_local(address, value);
             }
         }
@@ -221,25 +242,47 @@ pub fn sts(tv: &mut TranslatorVisitor<'_>, insn: u64) {
             tv.ir.write_shared_u32(offset, value);
         }
         64 => {
-            if reg % 2 != 0 {
+            if !is_aligned_reg(reg, 2) {
                 panic!("Unaligned STS source register {reg}");
             }
             let lo = tv.x(reg);
-            let hi = tv.x(reg + 1);
+            let hi = tv.x(reg_offset(reg, 1));
             let value = tv.ir.composite_construct_u32x2(lo, hi);
             tv.ir.write_shared_u64(offset, value);
         }
         128 => {
-            if reg % 2 != 0 {
+            if !is_aligned_reg(reg, 2) {
                 panic!("Unaligned STS source register {reg}");
             }
             let x = tv.x(reg);
-            let y = tv.x(reg + 1);
-            let z = tv.x(reg + 2);
-            let w = tv.x(reg + 3);
+            let y = tv.x(reg_offset(reg, 1));
+            let z = tv.x(reg_offset(reg, 2));
+            let w = tv.x(reg_offset(reg, 3));
             let value = tv.ir.composite_construct_u32x4(x, y, z, w);
             tv.ir.write_shared_u128(offset, value);
         }
         _ => unreachable!("validated shared memory size"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_aligned_reg, reg_offset, RZ};
+
+    #[test]
+    fn zero_register_is_aligned_for_every_local_shared_width() {
+        for alignment in [1, 2, 4] {
+            assert!(is_aligned_reg(RZ, alignment));
+        }
+        assert!(!is_aligned_reg(3, 2));
+        assert!(is_aligned_reg(4, 4));
+    }
+
+    #[test]
+    fn zero_register_component_offsets_remain_zero_register() {
+        for offset in 0..4 {
+            assert_eq!(reg_offset(RZ, offset), RZ);
+        }
+        assert_eq!(reg_offset(4, 3), 7);
     }
 }

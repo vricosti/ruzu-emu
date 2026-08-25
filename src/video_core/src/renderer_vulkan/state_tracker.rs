@@ -400,6 +400,22 @@ impl StateTracker {
         self.stencil_reset = true;
     }
 
+    /// Applies Eden's command-buffer invalidation mask to a draw-scoped dirty
+    /// flag mirror.
+    ///
+    /// Upstream mutates the bound Maxwell dirty flags directly. The Rust draw
+    /// path temporarily mirrors those flags to avoid aliasing the register
+    /// view while a pipeline is configured. If configuration flushes the
+    /// scheduler, the new command buffer still needs the same dynamic-state
+    /// invalidation applied to that mirror before the draw is recorded.
+    pub fn apply_command_buffer_invalidation(&self, flags: &mut DirtyFlags) {
+        for (flag, &invalidate) in flags.iter_mut().zip(&self.invalidation_flags) {
+            if invalidate {
+                *flag = true;
+            }
+        }
+    }
+
     /// Port of `StateTracker::InvalidateState`.
     pub fn invalidate_state(&mut self) {
         for flag in self.active_flags_mut().iter_mut() {
@@ -770,6 +786,18 @@ mod tests {
         assert!(tracker.touch_viewports());
         assert!(tracker.touch_scissors());
         assert!(tracker.touch_depth_bias());
+    }
+
+    #[test]
+    fn command_buffer_invalidation_reaches_draw_scoped_flag_mirror() {
+        let tracker = StateTracker::new();
+        let mut flags = [false; 256];
+
+        tracker.apply_command_buffer_invalidation(&mut flags);
+
+        assert!(flags[dirty::VERTEX_INPUT as usize]);
+        assert!(flags[dirty::VIEWPORTS as usize]);
+        assert!(flags[dirty::PRIMITIVE_RESTART_ENABLE as usize]);
     }
 
     #[test]

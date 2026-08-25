@@ -1253,10 +1253,21 @@ impl RasterizerVulkan {
                 self.fallback_sampler,
             );
         }
+        let command_buffer_tick_before_configure = self.scheduler.current_tick();
         if !gp.configure(draw.is_indexed()) {
             self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
             warn!("RasterizerVulkan: draw skipped because graphics pipeline configuration failed");
             return;
+        }
+        if self.scheduler.current_tick() != command_buffer_tick_before_configure {
+            // Eden's StateTracker points directly at the live Maxwell flags,
+            // so Scheduler::InvalidateState immediately reaches the flags
+            // consumed by UpdateDynamicStates. Ruzu uses a draw-scoped mirror
+            // during Configure to avoid aliased mutable register access. Keep
+            // that mirror in step when Configure allocates/recycles resources
+            // and flushes onto a fresh command buffer.
+            self.state_tracker
+                .apply_command_buffer_invalidation(dirty_flags);
         }
         let indirect_binding = indirect_params.map(|params| {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
@@ -3677,7 +3688,7 @@ impl RasterizerInterface for RasterizerVulkan {
             let _buffer_guard = (*buffer_mutex).lock();
             self.common_buffer_cache.write_memory(addr, size);
         }
-        self.shader_cache.on_cache_invalidation(addr, size as usize);
+        self.shader_cache.invalidate_region(addr, size as usize);
     }
 
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {

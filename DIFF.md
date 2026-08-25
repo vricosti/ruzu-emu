@@ -12018,3 +12018,64 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: this slice creates and transfers IPC service objects; it does not introduce a raw-memory
   payload. The focused test verifies that command 7996 returns the application-manager owner with
   its current command table.
+
+## 2026-08-25 — `src/shader_recompiler/src/frontend/{location,control_flow,maxwell_opcodes}.rs` and `pipeline_cache.rs` vs Eden Maxwell frontend
+
+### Intentional differences
+- Rust materializes Eden's `maxwell.inc` macro table once through `OnceLock`. The 280 names,
+  encodings, source order, and first-match decode rule are identical to upstream.
+- Rust converts absolute Maxwell `Location` ranges to indices into a cached instruction slice.
+  The slice's absolute base offset is therefore carried into materialization so scheduling words
+  are skipped on Eden's absolute 32-byte grid.
+
+### Unintentional differences (to fix)
+- The code-slice-only OpenGL helpers still build their CFG with the older relative-word builder;
+  the environment-owned Vulkan path now uses the upstream absolute `Location` path.
+
+### Missing items
+- Direct ownership parity for upstream `Translate(Environment&, IR::Block*, location_begin,
+  location_end)` remains part of the wider shader translation refactor.
+
+### Binary layout verification
+- N/A: these files decode and translate instructions without defining a serialized payload.
+  Regression tests cover non-zero scheduling-grid phases and the upstream opcode collisions.
+
+## 2026-08-25 — `src/video_core/src/{shader_environment,shader_cache}.rs` vs Eden `shader_environment.{h,cpp}` and `shader_cache.{h,cpp}`
+
+### Intentional differences
+- `GenericEnvironmentOwner` represents C++ base-subobject access without erasing the concrete
+  graphics or compute environment required by virtual resource callbacks.
+
+### Unintentional differences (to fix)
+- None in the reviewed shader-size and slow cache-analysis paths.
+
+### Missing items
+- None in `TryFindSize` termination or `ShaderCache::MakeShaderInfo` CFG ownership.
+
+### Binary layout verification
+- PASS: the existing serialized environment layout is unchanged. Tests verify the non-proprietary
+  EXIT terminator and the proprietary-driver self-branch behavior separately.
+
+## 2026-08-25 — Vulkan shader/rasterizer invalidation and compute-cache parity
+
+### Intentional differences
+- Ruzu mirrors Maxwell dirty flags for a draw while Eden's state tracker points directly at live
+  flags. When pipeline configuration rotates the command buffer, Ruzu reapplies Eden's
+  invalidation mask to that draw-scoped mirror.
+- `Option<Box<ComputePipeline>>` represents Eden's stable node-owned pointer and its null negative
+  cache entry without moving successful pipelines when the Rust hash map grows.
+
+### Unintentional differences (to fix)
+- Graphics-pipeline translation and runtime-info construction remain owned by
+  `graphics_pipeline.rs` instead of the upstream `vk_pipeline_cache.cpp` counterpart.
+- Runtime graphics pipeline construction remains conditional on the asynchronous-shader setting,
+  while Eden always submits compilation to its worker pool and controls only whether the caller
+  waits.
+
+### Missing items
+- The graphics-pipeline ownership and runtime-info parity slice, including MoltenVK-only fragment
+  color types, geometry passthrough/layer emulation, geometry point size, and the device XFB guard.
+
+### Binary layout verification
+- PASS: pipeline key serialization is unchanged. Focused tests cover negative compute-cache state,
+  draw-scoped invalidation, image capability collection, and zero-register vector accesses.

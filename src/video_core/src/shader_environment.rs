@@ -51,6 +51,11 @@ const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
 /// Upstream: `GenericEnvironment::TryFindSize` line 252.
 const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
 
+/// Maxwell EXIT instruction used as the shader tail on non-proprietary
+/// drivers. Upstream deliberately ignores this marker for proprietary-driver
+/// shaders, which keep using the self-branch sentinels above.
+const EXIT_VALUE: u64 = 0xE30000000007000F;
+
 /// GPU-memory reader callback shape: read `bytes.len()` bytes starting at the
 /// given GPU virtual address.
 ///
@@ -215,6 +220,17 @@ pub struct GenericEnvironment {
     /// `gpu_memory`, matching upstream's `Tegra::MemoryManager*`.
     #[cfg(test)]
     gpu_read: Option<GpuMemoryReader>,
+}
+
+/// Rust counterpart of accessing the `GenericEnvironment` base subobject
+/// through an upstream `Shader::Environment&`.
+///
+/// The concrete owner must remain available for virtual environment reads;
+/// reducing it to `&mut GenericEnvironment` would lose the graphics/compute
+/// callbacks required by the Maxwell control-flow analyzer.
+pub trait GenericEnvironmentOwner {
+    fn generic_environment(&self) -> &GenericEnvironment;
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment;
 }
 
 impl GenericEnvironment {
@@ -433,6 +449,9 @@ impl GenericEnvironment {
                         );
                     }
                     return Some((offset + index) as u64);
+                }
+                if !self.is_proprietary_driver && inst == EXIT_VALUE {
+                    return Some((offset + index + INST_SIZE) as u64);
                 }
             }
 
@@ -1072,6 +1091,16 @@ impl shader_recompiler::environment::Environment for GraphicsEnvironment {
     }
 }
 
+impl GenericEnvironmentOwner for GraphicsEnvironment {
+    fn generic_environment(&self) -> &GenericEnvironment {
+        GraphicsEnvironment::generic_environment(self)
+    }
+
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        GraphicsEnvironment::generic_environment_mut(self)
+    }
+}
+
 /// Compute shader environment.
 pub struct ComputeEnvironment {
     base: GenericEnvironment,
@@ -1102,6 +1131,22 @@ impl ComputeEnvironment {
             kepler_compute: std::ptr::null(),
             file_backed: false,
             #[cfg(test)]
+            detached_state: ComputeEnvironmentDetachedState {
+                const_buffer_enable_mask: 0,
+                const_buffers: [ConstBufferConfig::default(); 8],
+                tic_address: 0,
+                tic_limit: 0,
+                linked_tsc: false,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_generic_environment_for_test(base: GenericEnvironment) -> Self {
+        Self {
+            base,
+            kepler_compute: std::ptr::null(),
+            file_backed: false,
             detached_state: ComputeEnvironmentDetachedState {
                 const_buffer_enable_mask: 0,
                 const_buffers: [ConstBufferConfig::default(); 8],
@@ -1378,6 +1423,16 @@ impl shader_recompiler::environment::Environment for ComputeEnvironment {
 
     fn is_proprietary_driver(&self) -> bool {
         self.base.is_proprietary_driver
+    }
+}
+
+impl GenericEnvironmentOwner for ComputeEnvironment {
+    fn generic_environment(&self) -> &GenericEnvironment {
+        ComputeEnvironment::generic_environment(self)
+    }
+
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        ComputeEnvironment::generic_environment_mut(self)
     }
 }
 
@@ -2300,6 +2355,48 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn try_find_size_stops_after_exit_on_non_proprietary_driver() {
+        let program_base: u64 = 0x2_1000_0000;
+        let exit_offset = 0x88;
+        let (reader, log) = make_mock_gpu_with_sentinel(program_base, exit_offset, EXIT_VALUE);
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        let size = env.try_find_size().expect("EXIT must terminate this shader");
+        assert_eq!(size as usize, exit_offset + INST_SIZE);
+        assert_eq!(log.lock().unwrap().as_slice(), &[(program_base, 0x1000)]);
+    }
+
+    #[test]
+    fn try_find_size_ignores_exit_on_proprietary_driver() {
+        let program_base: u64 = 0x2_2000_0000;
+        let exit_offset = 0x80;
+        let sentinel_offset = 0x100;
+        let mut backing = vec![0u8; TRY_FIND_SIZE_BLOCK_BYTES];
+        backing[exit_offset..exit_offset + INST_SIZE].copy_from_slice(&EXIT_VALUE.to_le_bytes());
+        backing[sentinel_offset..sentinel_offset + INST_SIZE]
+            .copy_from_slice(&SELF_BRANCH_A.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            let offset = (gpu_addr - program_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                dst[..end - offset].copy_from_slice(&backing[offset..end]);
+            }
+        });
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+        env.is_proprietary_driver = true;
+
+        assert_eq!(
+            env.try_find_size().expect("self branch must terminate this shader") as usize,
+            sentinel_offset
+        );
     }
 
     #[test]

@@ -776,7 +776,7 @@ pub fn build_cfg_from_env(
     base_offset: u32,
     _code_words: usize,
 ) -> Vec<CfgBlock> {
-    let cfg = FlowCfg::new(env, Location::new_code_start(base_offset), false);
+    let cfg = FlowCfg::new(env, Location::new(base_offset), false);
     cfg.to_cfg_blocks(base_offset)
 }
 
@@ -1308,7 +1308,7 @@ mod tests {
         );
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            FlowCfg::new(&mut env, Location::new_code_start(0), false)
+            FlowCfg::new(&mut env, Location::new(0), false)
         }));
         let payload = match result {
             Ok(_) => panic!("PRET flow analysis must fail like upstream"),

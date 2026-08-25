@@ -31,7 +31,6 @@ use crate::shader_environment::{
     load_pipelines, serialize_pipeline, ComputeEnvironment, FileEnvironment,
 };
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference, NvidiaArchitecture};
-use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::frontend::control_flow::FlowBlock;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::ir::basic_block::Block;
@@ -600,17 +599,7 @@ fn compile_compute_program(
         );
         program.shared_memory_size = max_shared_memory;
     }
-    shader_recompiler::frontend::translate_program::convert_legacy_to_generic(
-        &mut program,
-        &runtime_info,
-    );
-    let mut bindings = Bindings::default();
-    let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
-        &program,
-        profile,
-        &runtime_info,
-        &mut bindings,
-    );
+    let spirv_words = shader_recompiler::backend::emit_spirv(&program, profile, &runtime_info);
     shader_recompiler::CompiledShader {
         spirv_words,
         info: program.info,
@@ -811,10 +800,15 @@ pub struct PipelineCache {
     vulkan_pipeline_cache_filename: PathBuf,
     vulkan_pipeline_cache: vk::PipelineCache,
 
-    // Upstream's node-based cache keeps returned `ComputePipeline*` stable.
-    // Box each Rust value so HashMap growth cannot move the pipeline owner.
-    compute_cache:
-        HashMap<ComputePipelineCacheKey, Box<ComputePipeline>, BuildUnorderedDenseHasher>,
+    // Upstream's node-based cache keeps returned `ComputePipeline*` stable and
+    // retains a null unique_ptr after a failed build. `None` preserves that
+    // negative-cache entry; `Box` keeps successful pipelines stable across
+    // HashMap growth.
+    compute_cache: HashMap<
+        ComputePipelineCacheKey,
+        Option<Box<ComputePipeline>>,
+        BuildUnorderedDenseHasher,
+    >,
     /// Upstream `Common::ThreadWorker workers`, owned by `PipelineCache`.
     ///
     /// This is the required owner for disk-cache rebuild jobs and asynchronous
@@ -1010,6 +1004,7 @@ impl PipelineCache {
             workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
         };
         if !self.compute_cache.contains_key(&key) {
+            self.compute_cache.insert(key, None);
             let gpu_memory = shared_cache.current_gpu_memory()?;
             let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
             env.generic_environment_mut().set_cached_size(shader_size);
@@ -1023,12 +1018,16 @@ impl PipelineCache {
                     serialize_pipeline(&key_bytes, &[&generic_env], &filename, CACHE_VERSION);
                 });
             }
-            self.compute_cache.insert(key, Box::new(pipeline));
+            *self
+                .compute_cache
+                .get_mut(&key)
+                .expect("new compute cache entry disappeared") = Some(Box::new(pipeline));
         }
         self.compute_cache
             .get_mut(&key)
+            .and_then(Option::as_deref_mut)
             .map(|pipeline| CurrentComputePipeline {
-                pipeline_owner: NonNull::from(pipeline.as_mut()),
+                pipeline_owner: NonNull::from(pipeline),
             })
     }
 
@@ -1356,7 +1355,7 @@ impl PipelineCache {
                     if self.compute_cache.contains_key(&key) {
                         skipped_count += 1;
                     } else {
-                        self.compute_cache.insert(key, Box::new(pipeline));
+                        self.compute_cache.insert(key, Some(Box::new(pipeline)));
                         built += 1;
                     }
                 }
@@ -1886,6 +1885,25 @@ mod tests {
 
         let product = (key.hash_value() as u128) * 0x9e37_79b9_7f4a_7c15_u128;
         assert_eq!(hasher.finish(), (product as u64) ^ (product >> 64) as u64);
+    }
+
+    #[test]
+    fn compute_cache_can_retain_upstream_negative_entry() {
+        let key = ComputePipelineCacheKey {
+            unique_hash: 0x1234,
+            shared_memory_size: 0x20,
+            workgroup_size: [1, 2, 3],
+        };
+        let mut cache: HashMap<
+            ComputePipelineCacheKey,
+            Option<Box<ComputePipeline>>,
+            BuildUnorderedDenseHasher,
+        > = HashMap::default();
+
+        cache.insert(key, None);
+
+        assert!(cache.contains_key(&key));
+        assert!(matches!(cache.get(&key), Some(None)));
     }
 
     #[test]

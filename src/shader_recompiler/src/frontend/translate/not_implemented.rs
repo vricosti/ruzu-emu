@@ -19,6 +19,11 @@ impl<'a> TranslatorVisitor<'a> {
         panic!("Instruction ATOMS_cas not implemented (upstream throws NotImplementedException)");
     }
 
+    /// CCTLT — Not implemented in upstream.
+    pub fn translate_cctlt(&mut self, _insn: u64) {
+        panic!("Instruction CCTLT not implemented (upstream throws NotImplementedException)");
+    }
+
     /// NOP — No operation. Upstream is a no-op.
     pub fn translate_nop(&mut self, _insn: u64) {
         // NOP is No-Op.

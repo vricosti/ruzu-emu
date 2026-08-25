@@ -14,17 +14,9 @@ use std::fmt;
 /// Handles the Maxwell alignment scheme where every 32-byte group
 /// starts with an 8-byte control code, so instructions are at offsets
 /// 8, 16, 24 within each group.
-/// DIVERGENCE FROM UPSTREAM (documented): upstream `Location` assumes the
-/// sched-word grid is anchored at absolute offset 0 (`offset % 32 == 0`).
-/// THE SHADER CODE (SPH base + 0x50): the first code word is always a sched
-/// word, then every 4th word. Games whose code starts 32-byte aligned match
-/// `offset % 32 == 16`; the absolute grid then skips real instructions and
-/// decodes sched words. `phase` anchors the grid to the code start
-/// (`phase = code_start % 32`); phase 0 is exactly upstream behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Location {
     offset: u32,
-    phase: u32,
 }
 
 const VIRTUAL_BIAS: u32 = 4;
@@ -34,40 +26,25 @@ impl Location {
     ///
     /// The offset must be a multiple of 8.
     pub fn new(initial_offset: u32) -> Self {
-        Self::new_with_phase(initial_offset, 0)
-    }
-
-    /// Create the location of the first instruction of a shader whose code
-    /// begins at byte offset `code_start`: the sched grid is anchored there.
-    pub fn new_code_start(code_start: u32) -> Self {
-        Self::new_with_phase(code_start, code_start % 32)
-    }
-
-    fn new_with_phase(initial_offset: u32, phase: u32) -> Self {
         assert!(
             initial_offset % 8 == 0,
             "initial_offset={} is not a multiple of 8",
             initial_offset
         );
-        let mut loc = Self {
-            offset: initial_offset,
-            phase,
-        };
+        let mut loc = Self { offset: initial_offset };
         loc.align();
         loc
     }
 
-    /// A location at `offset` on the same sched grid as `self` (used for
-    /// branch targets, which live in the same shader).
+    /// Create a location for an absolute branch target.
     pub fn with_offset(&self, offset: u32) -> Self {
-        Self::new_with_phase(offset, self.phase)
+        Self::new(offset)
     }
 
     /// Create a virtual location (offset by VIRTUAL_BIAS).
     pub fn virtual_loc(&self) -> Self {
         Self {
             offset: self.offset - VIRTUAL_BIAS,
-            phase: self.phase,
         }
     }
 
@@ -83,7 +60,7 @@ impl Location {
 
     /// Advance to the next instruction.
     pub fn step(&mut self) {
-        self.offset += 8 + if self.grid_offset() % 32 == 24 { 8 } else { 0 };
+        self.offset += 8 + if self.offset % 32 == 24 { 8 } else { 0 };
     }
 
     /// Return the next instruction location.
@@ -94,7 +71,7 @@ impl Location {
 
     /// Go back to the previous instruction.
     pub fn back(&mut self) {
-        self.offset -= 8 + if self.grid_offset() % 32 == 8 { 8 } else { 0 };
+        self.offset -= 8 + if self.offset % 32 == 8 { 8 } else { 0 };
     }
 
     /// Return the previous instruction location.
@@ -117,12 +94,7 @@ impl Location {
     }
 
     fn align(&mut self) {
-        self.offset += if self.grid_offset() % 32 == 0 { 8 } else { 0 };
-    }
-
-    /// Offset in the sched-grid space (grid anchored at `phase`).
-    fn grid_offset(&self) -> u32 {
-        self.offset.wrapping_sub(self.phase)
+        self.offset += if self.offset % 32 == 0 { 8 } else { 0 };
     }
 }
 
@@ -130,7 +102,6 @@ impl Default for Location {
     fn default() -> Self {
         Self {
             offset: 0xcccccccc,
-            phase: 0,
         }
     }
 }
@@ -138,5 +109,25 @@ impl Default for Location {
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:04x}", self.offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduling_grid_is_anchored_at_absolute_offset_zero() {
+        let mut location = Location::new(0x850);
+        assert_eq!(location.offset(), 0x850);
+        location.step();
+        assert_eq!(location.offset(), 0x858);
+        location.step();
+        assert_eq!(location.offset(), 0x868);
+    }
+
+    #[test]
+    fn constructor_skips_an_absolute_scheduling_word() {
+        assert_eq!(Location::new(0x860).offset(), 0x868);
     }
 }

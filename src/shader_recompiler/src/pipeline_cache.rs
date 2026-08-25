@@ -77,6 +77,7 @@ pub struct PipelineCache {
 
 fn translate_cfg_to_program(
     code: &[u64],
+    code_base_offset: u32,
     stage: ShaderStage,
     cfg_blocks: &[control_flow::CfgBlock],
     sph: Option<&ProgramHeader>,
@@ -96,7 +97,14 @@ fn translate_cfg_to_program(
     // Upstream `GenerateBlocks` assigns `Block::order` while traversing the
     // abstract syntax list, not from the block owner's allocation index.
     crate::frontend::translate_program::regenerate_block_order_from_syntax(&mut program);
-    materialize_structured_actions(&mut program, &structured.actions, cfg_blocks, code, sph);
+    materialize_structured_actions(
+        &mut program,
+        &structured.actions,
+        cfg_blocks,
+        code,
+        code_base_offset,
+        sph,
+    );
     rebuild_syntax_successors(&mut program);
 
     if !program.blocks.is_empty() {
@@ -177,6 +185,7 @@ fn materialize_structured_actions(
     actions: &[StructuredAction],
     cfg_blocks: &[control_flow::CfgBlock],
     code: &[u64],
+    code_base_offset: u32,
     sph: Option<&ProgramHeader>,
 ) {
     for action in actions {
@@ -190,7 +199,7 @@ fn materialize_structured_actions(
                     if i >= code.len() {
                         break;
                     }
-                    if is_sched_control_word(i) {
+                    if is_sched_control_word(i, code_base_offset) {
                         continue;
                     }
                     tv.translate_instruction(code[i]);
@@ -399,8 +408,8 @@ fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
     })
 }
 
-fn is_sched_control_word(word_index: usize) -> bool {
-    word_index % 4 == 0
+fn is_sched_control_word(word_index: usize, code_base_offset: u32) -> bool {
+    (code_base_offset as usize + word_index * std::mem::size_of::<u64>()) % 32 == 0
 }
 
 impl PipelineCache {
@@ -488,7 +497,7 @@ pub fn compile_shader(
 
     // Step 2/3: Convert flat CFG to structured control flow and translate
     // Maxwell instructions into matching IR blocks.
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None);
     log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
@@ -557,7 +566,8 @@ pub fn translate_program_from_env_with_host_info(
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
     let sph = env.sph().clone();
-    let mut program = translate_cfg_to_program(code, env.shader_stage(), &cfg_blocks, Some(&sph));
+    let mut program =
+        translate_cfg_to_program(code, base_offset, env.shader_stage(), &cfg_blocks, Some(&sph));
     apply_environment_program_metadata(&mut program, env, &normalized_host_info);
     optimize_program_with_env(env, &mut program, &normalized_host_info, Some(&sph));
     collect_interpolation_info(&sph, &mut program);
@@ -597,7 +607,7 @@ pub fn compile_shader_glsl(
     );
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None);
 
     optimize_program_without_env(
         &mut program,
@@ -872,7 +882,7 @@ fn emit_glsl_program_at_offset(
         base_offset
     );
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, sph);
+    let mut program = translate_cfg_to_program(code, base_offset, stage, &cfg_blocks, sph);
 
     optimize_program_without_env(&mut program, host_info, sph, texture_bound_buffer);
 
@@ -1030,7 +1040,7 @@ fn translate_and_optimize_with_host_info(
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None);
     optimize_program_without_env(&mut program, &normalized_host_info, None, None);
     program
 }
@@ -1248,6 +1258,7 @@ mod tests {
 
         let program = translate_cfg_to_program(
             &[0, 0x50B0_0000_0000_0000],
+            0,
             ShaderStage::VertexB,
             cfg_blocks.as_slice(),
             None,
@@ -1280,7 +1291,7 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, &cfg_blocks, None);
+        let program = translate_cfg_to_program(&[0], 0, ShaderStage::VertexB, &cfg_blocks, None);
         let entry_block = match program.syntax_list.first() {
             Some(SyntaxNode::Block(block)) => *block,
             _ => panic!("translation must start with an entry block"),
@@ -1313,7 +1324,7 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], ShaderStage::Fragment, &cfg_blocks, None);
+        let program = translate_cfg_to_program(&[0], 0, ShaderStage::Fragment, &cfg_blocks, None);
 
         assert!(program.blocks.iter().any(|block| {
             block
@@ -1369,6 +1380,7 @@ mod tests {
 
         let program = translate_cfg_to_program(
             &[0, 0x50B0_0000_0000_0000, 0x50B0_0000_0000_0000],
+            0,
             ShaderStage::VertexB,
             cfg_blocks.as_slice(),
             None,
@@ -1407,16 +1419,19 @@ mod tests {
     }
 
     #[test]
-    fn sched_control_skip_is_anchored_at_code_start() {
-        // The sched grid is anchored at the start of the code slice
-        // (`code[0]` is always a sched word), regardless of the code's
-        // absolute alignment.
-        assert!(is_sched_control_word(0));
-        assert!(!is_sched_control_word(1));
-        assert!(!is_sched_control_word(2));
-        assert!(!is_sched_control_word(3));
-        assert!(is_sched_control_word(4));
-        assert!(is_sched_control_word(8));
+    fn sched_control_skip_uses_the_absolute_maxwell_grid() {
+        assert!(is_sched_control_word(0, 0));
+        assert!(!is_sched_control_word(1, 0));
+        assert!(!is_sched_control_word(2, 0));
+        assert!(!is_sched_control_word(3, 0));
+        assert!(is_sched_control_word(4, 0));
+
+        // A code slice beginning at absolute offset 0x10 reaches the next
+        // scheduling word at its relative word index 2, not at index 0.
+        assert!(!is_sched_control_word(0, 0x10));
+        assert!(!is_sched_control_word(1, 0x10));
+        assert!(is_sched_control_word(2, 0x10));
+        assert!(is_sched_control_word(6, 0x10));
     }
 
     const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;

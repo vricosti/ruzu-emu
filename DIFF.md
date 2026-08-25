@@ -12079,3 +12079,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: pipeline key serialization is unchanged. Focused tests cover negative compute-cache state,
   draw-scoped invalidation, image capability collection, and zero-register vector accesses.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/{pipeline_cache,graphics_pipeline}.rs` vs Eden `vk_pipeline_cache.{h,cpp}` and `vk_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+- `GraphicsPipelineBuilder` is a Rust lifetime adapter for the state captured by Eden's pipeline
+  worker jobs. Shader translation, `MakeRuntimeInfo`, SPIR-V emission, module creation, and layer
+  emulation remain owned by `pipeline_cache.rs`; Vulkan graphics-pipeline construction remains
+  owned by `graphics_pipeline.rs`.
+- Rust stores the six translated programs as `Option<Program>` because `Program` has no inert
+  default value. Eden uses a default-constructed `std::array<Program, 6>`; the same populated slots
+  participate in runtime-info construction and emission.
+- Disk environments are collected before worker submission to satisfy the Rust parser callback's
+  borrow boundaries. Existing cache entries are skipped before submission rather than by
+  `try_emplace` inside the worker; the resulting positive and negative runtime cache states are
+  unchanged.
+- GPU pipeline/shader logging remains unavailable because the project-wide Eden GPU logging
+  subsystem is not ported. Standard shader errors and pipeline hashes remain logged.
+- Android's configurable pipeline-worker count is not applicable to the currently supported
+  desktop targets; non-Android worker-count selection matches Eden.
+
+### Unintentional differences (to fix)
+- None in the reviewed runtime-info, graphics/compute translation, pipeline build scheduling, or
+  negative-cache paths.
+
+### Missing items
+- None in the ownership and behavior slice covered by the two parity reports. Project-wide GPU
+  logging remains a separate missing subsystem.
+
+### Binary layout verification
+- PASS: compute and graphics pipeline cache keys and their serialized byte encodings are unchanged.
+  The ownership move only relocates implementation logic. Focused tests cover MoltenVK-only color
+  types, geometry point size, transform-feedback capability guards, geometry passthrough state,
+  negative compute entries, and fixed-state serialization.

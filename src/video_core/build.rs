@@ -110,6 +110,12 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ),
         ("FULL_SCREEN_TRIANGLE_VERT_SPV", "full_screen_triangle.vert"),
         ("BLIT_COLOR_FLOAT_FRAG_SPV", "blit_color_float.frag"),
+        ("BLIT_COLOR_MSAA_FRAG_SPV", "blit_color_msaa.frag"),
+        ("BLIT_DEPTH_MSAA_FRAG_SPV", "blit_depth_msaa.frag"),
+        (
+            "BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV",
+            "blit_depth_stencil_msaa.frag",
+        ),
         (
             "VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV",
             "vulkan_blit_depth_stencil.frag",

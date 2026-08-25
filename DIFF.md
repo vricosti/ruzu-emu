@@ -12594,3 +12594,24 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests verify 32-bit enum sizes, sentinel discriminants 112 and 255, and all three
   112-entry property table lengths. The exhaustive source comparison verifies every table value
   and enum position against Eden's `PIXEL_FORMAT_LIST`.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/blit_{color,depth,depth_stencil}_msaa.frag` vs Eden `src/video_core/host_shaders/blit_{color,depth,depth_stencil}_msaa.frag`
+
+### Intentional differences
+
+- Rust's `build.rs` generates the SPIR-V word slices consumed by `ash`; Eden's CMake rules generate
+  C++ headers. Both invoke `glslangValidator` for the same GLSL source files and SPIR-V 1.3 target.
+
+### Unintentional differences (to fix)
+
+- None after restoring all three missing MSAA blit shader sources and registering their generated
+  modules with the Vulkan shader build and validation test.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: each Rust GLSL source is byte-for-byte identical to Eden's source, and the focused test
+  verifies that all three generated modules begin with the SPIR-V magic word.

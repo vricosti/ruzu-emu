@@ -242,7 +242,7 @@ impl ComputePipeline {
         };
         let descriptor_allocator = if !uses_descriptor_buffer && !uses_push_descriptor {
             match unsafe { runtime.descriptor_pool.as_ref() }
-                .allocator_for_infos(descriptor_set_layout, std::iter::once(&info))
+                .allocator_for_info(descriptor_set_layout, &info)
             {
                 Ok(allocator) => Some(allocator),
                 Err(_) => {

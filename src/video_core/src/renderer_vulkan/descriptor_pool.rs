@@ -9,8 +9,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use ash::vk;
-use log::debug;
-use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
+use shader_recompiler::shader_info::{HasCount, Info as ShaderInfo};
 
 use super::master_semaphore::MasterSemaphore;
 use super::resource_pool::ResourcePool;
@@ -83,6 +82,46 @@ struct DescriptorBank {
     pools: Vec<vk::DescriptorPool>,
 }
 
+/// Port of the file-local `Accumulate` helper.
+fn accumulate<T: HasCount>(descriptors: &[T]) -> u32 {
+    descriptors.iter().fold(0, |count, descriptor| {
+        count.wrapping_add(descriptor.descriptor_count())
+    })
+}
+
+/// Port of the file-local `MakeBankInfo` helper.
+fn make_bank_info<'a>(infos: impl IntoIterator<Item = &'a ShaderInfo>) -> DescriptorBankInfo {
+    let mut bank = DescriptorBankInfo::default();
+    for info in infos {
+        bank.uniform_buffers = bank
+            .uniform_buffers
+            .wrapping_add(accumulate(&info.constant_buffer_descriptors));
+        bank.storage_buffers = bank
+            .storage_buffers
+            .wrapping_add(accumulate(&info.storage_buffers_descriptors));
+        bank.texture_buffers = bank
+            .texture_buffers
+            .wrapping_add(accumulate(&info.texture_buffer_descriptors));
+        bank.image_buffers = bank
+            .image_buffers
+            .wrapping_add(accumulate(&info.image_buffer_descriptors));
+        bank.textures = bank
+            .textures
+            .wrapping_add(accumulate(&info.texture_descriptors));
+        bank.images = bank
+            .images
+            .wrapping_add(accumulate(&info.image_descriptors));
+    }
+    bank.score = bank
+        .uniform_buffers
+        .wrapping_add(bank.storage_buffers)
+        .wrapping_add(bank.texture_buffers)
+        .wrapping_add(bank.image_buffers)
+        .wrapping_add(bank.textures)
+        .wrapping_add(bank.images) as i32;
+    bank
+}
+
 // ---------------------------------------------------------------------------
 // Helper: AllocatePool
 // ---------------------------------------------------------------------------
@@ -103,7 +142,7 @@ fn allocate_pool(
         if count > 0 {
             pool_sizes.push(vk::DescriptorPoolSize {
                 ty,
-                descriptor_count: count * sets_per_pool,
+                descriptor_count: count.wrapping_mul(sets_per_pool),
             });
         }
     };
@@ -196,16 +235,28 @@ impl DescriptorAllocator {
             sets,
         } = &mut *state;
         let mut allocate = |begin: usize, end: usize| {
-            sets.push(Self::allocate_descriptors(
-                device.get(),
-                &bank,
-                layout,
-                end - begin,
-            )?);
-            Ok(())
+            Self::allocate(device.get(), &bank, layout, sets, begin, end)
         };
         let index = resource_pool.try_commit_resource(&mut allocate)?;
         Ok(sets[index / SETS_GROW_RATE][index % SETS_GROW_RATE])
+    }
+
+    /// Port of `DescriptorAllocator::Allocate`.
+    fn allocate(
+        device: &Device,
+        bank: &Arc<Mutex<DescriptorBank>>,
+        layout: vk::DescriptorSetLayout,
+        sets: &mut Vec<Vec<vk::DescriptorSet>>,
+        begin: usize,
+        end: usize,
+    ) -> Result<(), vk::Result> {
+        sets.push(Self::allocate_descriptors(
+            device,
+            bank,
+            layout,
+            end - begin,
+        )?);
+        Ok(())
     }
 
     /// Port of `DescriptorAllocator::AllocateDescriptors`.
@@ -246,7 +297,7 @@ impl DescriptorAllocator {
 /// configured for specific descriptor type requirements. Banks are reused
 /// when their descriptor counts are close enough (within SCORE_THRESHOLD).
 pub struct DescriptorPool {
-    // Upstream's bank pools are RAII wrappers. Reden stores raw ash handles,
+    // Upstream's bank pools are RAII wrappers. Ruzu stores raw ash handles,
     // so their owner retains this lightweight reference for destruction.
     device: DeviceReference,
     master_semaphore: Arc<MasterSemaphore>,
@@ -292,22 +343,17 @@ impl DescriptorPool {
         layout: vk::DescriptorSetLayout,
         infos: impl IntoIterator<Item = &'a ShaderInfo>,
     ) -> Result<DescriptorAllocator, vk::Result> {
-        let mut bank = DescriptorBankInfo::default();
-        for info in infos {
-            bank.uniform_buffers += num_descriptors(&info.constant_buffer_descriptors);
-            bank.storage_buffers += num_descriptors(&info.storage_buffers_descriptors);
-            bank.texture_buffers += num_descriptors(&info.texture_buffer_descriptors);
-            bank.image_buffers += num_descriptors(&info.image_buffer_descriptors);
-            bank.textures += num_descriptors(&info.texture_descriptors);
-            bank.images += num_descriptors(&info.image_descriptors);
-        }
-        bank.score = (bank.uniform_buffers
-            + bank.storage_buffers
-            + bank.texture_buffers
-            + bank.image_buffers
-            + bank.textures
-            + bank.images) as i32;
+        let bank = make_bank_info(infos);
         self.allocator(layout, &bank)
+    }
+
+    /// Port of `DescriptorPool::Allocator(..., const Shader::Info&)`.
+    pub fn allocator_for_info(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        info: &ShaderInfo,
+    ) -> Result<DescriptorAllocator, vk::Result> {
+        self.allocator(layout, &make_bank_info(std::iter::once(info)))
     }
 
     /// Port of `DescriptorPool::Bank`.
@@ -325,19 +371,12 @@ impl DescriptorPool {
 
         let mut state = self.banks_lock.write().unwrap();
         state.bank_infos.push(*reqs);
-        let mut bank = DescriptorBank {
+        let bank = Arc::new(Mutex::new(DescriptorBank {
             info: *reqs,
             pools: Vec::new(),
-        };
-        allocate_pool(self.device.get(), &mut bank)?;
-        let bank = Arc::new(Mutex::new(bank));
+        }));
         state.banks.push(Arc::clone(&bank));
-
-        debug!(
-            "DescriptorPool: created new bank (total: {}, score: {})",
-            state.banks.len(),
-            reqs.score
-        );
+        allocate_pool(self.device.get(), &mut bank.lock().unwrap())?;
 
         Ok(bank)
     }
@@ -362,6 +401,7 @@ impl Drop for DescriptorPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shader_recompiler::shader_info::ConstantBufferDescriptor;
 
     #[test]
     fn allocator_keeps_an_upstream_device_reference() {
@@ -419,5 +459,33 @@ mod tests {
     fn constants() {
         assert_eq!(SETS_GROW_RATE, 16);
         assert_eq!(SCORE_THRESHOLD, 3);
+    }
+
+    #[test]
+    fn make_bank_info_accumulates_all_shader_infos() {
+        let mut first = ShaderInfo::default();
+        first
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 0, count: 2 });
+        let mut second = ShaderInfo::default();
+        second
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 1, count: 3 });
+
+        let bank = make_bank_info([&first, &second]);
+        assert_eq!(bank.uniform_buffers, 5);
+        assert_eq!(bank.score, 5);
+    }
+
+    #[test]
+    fn accumulate_preserves_unsigned_wrapping() {
+        let descriptors = [
+            ConstantBufferDescriptor {
+                index: 0,
+                count: u32::MAX,
+            },
+            ConstantBufferDescriptor { index: 1, count: 2 },
+        ];
+        assert_eq!(accumulate(&descriptors), 1);
     }
 }

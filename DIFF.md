@@ -12425,3 +12425,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: command-pool entries are host Vulkan resources, not raw-copied or serialized payloads. The
   focused test verifies the empty entry state that precedes Vulkan allocation.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.{h,cpp}`
+
+### Intentional differences
+
+- Descriptor banks and allocator state use `Arc`, `Mutex`, and `RwLock` instead of non-owning C++
+  pointers plus `shared_mutex`; the read-search/write-insert critical sections and lack of a second
+  search after lock promotion remain identical.
+- Vulkan wrappers are raw ash handles owned and destroyed by `DescriptorPool::drop`; allocation
+  failures propagate as `vk::Result` rather than exceptions.
+
+### Unintentional differences (to fix)
+
+- Restored the file-owned `accumulate` and `make_bank_info` helpers and the single-`ShaderInfo`
+  allocator overload instead of flattening their logic into `allocator_for_infos`.
+- Restored `DescriptorAllocator::allocate` as the owner of set-vector growth.
+- Fixed bank publication order: `bank_infos` and `banks` are both extended before `allocate_pool`,
+  matching Eden and preserving their index invariant even when Vulkan creation fails.
+- Descriptor count accumulation and pool-size multiplication now retain Eden's unsigned wrapping
+  bit patterns in checked Rust builds.
+- Removed the Rust-only successful-bank debug log; Eden's helper returns without emitting a log.
+
+### Missing items
+
+- None in the bank-info helpers, allocator overloads, pool allocation/retry, bank selection, or
+  descriptor resource commit path.
+
+### Binary layout verification
+
+- N/A: bank metadata is consumed field-wise and Vulkan descriptor structures are built through ash,
+  not serialized by raw memory copy. Focused tests cover all-field superset comparison,
+  multi-shader accumulation, and unsigned wrapping.

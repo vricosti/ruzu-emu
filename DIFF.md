@@ -12112,3 +12112,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   The ownership move only relocates implementation logic. Focused tests cover MoltenVK-only color
   types, geometry point size, transform-feedback capability guards, geometry passthrough state,
   negative compute entries, and fixed-state serialization.
+
+## 2026-08-25 — `src/video_core/src/query_cache/query_stream.rs` vs Eden `src/video_core/query_cache/query_stream.h`
+
+### Intentional differences
+- Rust represents Eden's virtual base class as `StreamerInterfaceBase` plus the
+  `StreamerInterface` trait; both dependency masks remain owned by that base state.
+
+### Unintentional differences (to fix)
+- None. Fixed the inherited yuzu behavior where `get_dependent_mask` returned
+  `dependence_mask`; it now returns Eden's distinct `dependent_mask`.
+
+### Missing items
+- None in the reviewed streamer base and simple-streamer owner.
+
+### Binary layout verification
+- N/A: the streamer state is internal and is not serialized or copied as a raw payload.
+  The focused regression test verifies both directions of the dependency relationship.

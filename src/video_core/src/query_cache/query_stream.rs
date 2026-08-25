@@ -76,8 +76,7 @@ pub trait StreamerInterface {
     }
 
     fn get_dependent_mask(&self) -> u64 {
-        // Upstream returns dependence_mask here. Preserve the same behavior.
-        self.base().dependence_mask
+        self.base().dependent_mask
     }
 
     fn get_amend_value(&self) -> u64 {
@@ -214,14 +213,15 @@ mod tests {
     }
 
     #[test]
-    fn make_dependent_updates_masks_and_preserves_upstream_getter_bug() {
+    fn make_dependent_reports_dependence_and_dependent_masks_separately() {
         let mut a = DummyStreamer::new(3);
         let mut b = DummyStreamer::new(5);
         a.make_dependent(&mut b);
 
         assert_eq!(a.get_dependence_mask(), 1u64 << 5);
-        assert_eq!(a.get_dependent_mask(), 1u64 << 5);
-        assert_eq!(b.base().dependent_mask, 1u64 << 3);
+        assert_eq!(a.get_dependent_mask(), 0);
+        assert_eq!(b.get_dependence_mask(), 0);
+        assert_eq!(b.get_dependent_mask(), 1u64 << 3);
     }
 
     #[test]

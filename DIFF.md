@@ -12513,3 +12513,39 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: fence-manager queues and callbacks are host-only and are neither raw-copied nor serialized.
   Focused tests verify the async guard interval and synchronous queue lifetime.
+
+## 2026-08-26 — `src/video_core/src/surface.rs` vs Eden `src/video_core/surface.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses Eden's macro-generated `DefaultBlockWidth`, `DefaultBlockHeight`, and
+  `BitsPerBlock` switches as three format-indexed arrays in the same file. An exhaustive audit
+  verifies all 112 names, positions, widths, heights, and bit sizes against
+  `PIXEL_FORMAT_LIST`.
+- The three guest-format conversion functions accept raw `u32` values. This preserves Eden's
+  ability to receive an out-of-range enum bit pattern without constructing an invalid Rust enum.
+- Eden's fail-soft assertion optionally executes a debugger trap; Rust logs the same failure and
+  panics when `use_debug_asserts` is enabled because a portable Rust debugger trap is unavailable.
+- Eden's duplicate `PixelFormat` sentinel aliases are module constants in Rust because Rust enums
+  reject duplicate discriminants. They remain owned by `surface.rs` and have the same values.
+- `IsViewCompatible` and `IsCopyCompatible` remain in `compatible_formats.rs`, the counterpart of
+  Eden's owning `compatible_formats.cpp`; call sites address that owner directly because Rust
+  modules do not separately reproduce Eden's enclosing `VideoCore::Surface` namespace.
+
+### Unintentional differences (to fix)
+
+- None after restoring `PixelFormat::Invalid = 255`, 32-bit `SurfaceType`/`SurfaceTarget`
+  representation, `SurfaceTargetFromTextureType`, `HasAlpha`, fail-soft conversion and
+  `GetFormatType` handling, and ASTC recompression-aware transcoded sizes.
+- None after removing the misplaced compatibility wrappers from `surface.rs` and routing their
+  callers to the file-owning `compatible_formats.rs` module.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: focused tests verify 32-bit enum sizes, sentinel discriminants 112 and 255, and all three
+  112-entry property table lengths. The exhaustive source comparison verifies every table value
+  and enum position against Eden's `PIXEL_FORMAT_LIST`.

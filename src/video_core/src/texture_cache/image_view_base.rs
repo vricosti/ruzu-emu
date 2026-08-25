@@ -62,7 +62,12 @@ impl ImageViewBase {
         addr: GPUVAddr,
     ) -> Self {
         assert!(
-            crate::surface::is_view_compatible(image_info.format, info.format, false, true),
+            crate::compatible_formats::is_view_compatible(
+                image_info.format,
+                info.format,
+                false,
+                true,
+            ),
             "Image view format {:?} is incompatible with image format {:?}",
             info.format,
             image_info.format

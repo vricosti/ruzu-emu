@@ -1537,7 +1537,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     && existing.image_type == info.image_type
                     && existing.pitch() == info.pitch()
                     && super::util::is_pitch_linear_same_size(existing, info, strict_size)
-                    && surface::is_view_compatible(
+                    && crate::compatible_formats::is_view_compatible(
                         existing.format,
                         info.format,
                         broken_views,
@@ -3328,7 +3328,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                         && existing.image_type == info.image_type
                         && existing.pitch() == info.pitch()
                         && super::util::is_pitch_linear_same_size(existing, info, strict_size)
-                        && surface::is_view_compatible(existing.format, info.format, false, true)
+                        && crate::compatible_formats::is_view_compatible(
+                            existing.format,
+                            info.format,
+                            false,
+                            true,
+                        )
                 } else {
                     super::util::is_sub_copy(info, existing_image, gpu_addr)
                 };
@@ -5556,7 +5561,7 @@ mod tests {
             ..existing_info
         };
 
-        assert!(surface::is_view_compatible(
+        assert!(crate::compatible_formats::is_view_compatible(
             existing_info.format,
             view_compatible_info.format,
             false,

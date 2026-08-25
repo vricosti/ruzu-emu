@@ -3997,13 +3997,13 @@ impl TextureCache {
             != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
             || crate::surface::get_format_type(src_info.format)
                 != crate::surface::get_format_type(self.base.slot_images[src_id].info.format)
-            || !crate::surface::is_view_compatible(
+            || !crate::compatible_formats::is_view_compatible(
                 dst_info.format,
                 self.base.slot_images[dst_id].info.format,
                 false,
                 native_bgr,
             )
-            || !crate::surface::is_view_compatible(
+            || !crate::compatible_formats::is_view_compatible(
                 src_info.format,
                 self.base.slot_images[src_id].info.format,
                 false,

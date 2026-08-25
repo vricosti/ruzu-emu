@@ -1839,7 +1839,12 @@ impl TextureCacheRuntime {
                 // SAFETY: same contiguous enum invariant as above.
                 let view_format =
                     unsafe { std::mem::transmute::<u32, PixelFormat>(view_index as u32) };
-                if crate::surface::is_view_compatible(image_format, view_format, false, true) {
+                if crate::compatible_formats::is_view_compatible(
+                    image_format,
+                    view_format,
+                    false,
+                    true,
+                ) {
                     let format = self.surface_format_info(view_format, true).format;
                     if format != vk::Format::UNDEFINED && !formats.contains(&format) {
                         formats.push(format);
@@ -5128,13 +5133,13 @@ impl TextureCache {
             != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
             || crate::surface::get_format_type(src_info.format)
                 != crate::surface::get_format_type(self.base.slot_images[src_id].info.format)
-            || !crate::surface::is_view_compatible(
+            || !crate::compatible_formats::is_view_compatible(
                 dst_info.format,
                 self.base.slot_images[dst_id].info.format,
                 false,
                 native_bgr,
             )
-            || !crate::surface::is_view_compatible(
+            || !crate::compatible_formats::is_view_compatible(
                 src_info.format,
                 self.base.slot_images[src_id].info.format,
                 false,
@@ -6554,7 +6559,7 @@ mod tests {
 
     #[test]
     fn compatible_reinterpretation_uses_mutable_image_format_list() {
-        assert!(crate::surface::is_view_compatible(
+        assert!(crate::compatible_formats::is_view_compatible(
             PixelFormat::A2B10G10R10Unorm,
             PixelFormat::A8B8G8R8Unorm,
             false,

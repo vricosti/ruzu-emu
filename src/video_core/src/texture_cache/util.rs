@@ -1455,7 +1455,7 @@ pub fn resolve_overlap(
     if !is_layer_stride_compatible(new_info, &overlap.info) {
         return None;
     }
-    if !surface::is_view_compatible(
+    if !crate::compatible_formats::is_view_compatible(
         overlap.info.format,
         new_info.format,
         broken_views,
@@ -1512,8 +1512,12 @@ pub fn find_subresource(
             return None;
         }
     } else {
-        if !surface::is_view_compatible(existing.format, candidate.format, broken_views, native_bgr)
-        {
+        if !crate::compatible_formats::is_view_compatible(
+            existing.format,
+            candidate.format,
+            broken_views,
+            native_bgr,
+        ) {
             return None;
         }
     }

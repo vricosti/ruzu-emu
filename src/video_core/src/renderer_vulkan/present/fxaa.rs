@@ -12,6 +12,7 @@ use super::util;
 use crate::host_shaders::spirv_shaders::{FXAA_FRAG_SPV, FXAA_VERT_SPV};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
 // ---------------------------------------------------------------------------
@@ -192,7 +193,12 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::UpdateDescriptorSets`.
-    fn update_descriptor_sets(&self, image_view: vk::ImageView, image_index: usize) {
+    fn update_descriptor_sets(
+        &self,
+        device: &Device,
+        image_view: vk::ImageView,
+        image_index: usize,
+    ) {
         let image = &self.dynamic_images[image_index];
         let mut image_infos = Vec::with_capacity(2);
         let mut updates = Vec::new();
@@ -213,18 +219,18 @@ impl Fxaa {
         ));
 
         unsafe {
-            self.device.update_descriptor_sets(&updates, &[]);
+            device.get_logical().update_descriptor_sets(&updates, &[]);
         }
     }
 
     /// Port of `FXAA::UploadImages`.
-    fn upload_images(&mut self, scheduler: &mut Scheduler) {
+    fn upload_images(&mut self, device: &Device, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
 
         let images: Vec<vk::Image> = self.dynamic_images.iter().map(|img| img.image).collect();
-        let device = self.device.clone();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| {
             for image in images {
                 util::clear_color_image(&device, cmdbuf, image);
@@ -243,6 +249,7 @@ impl AntiAliasPass for Fxaa {
     /// image/view pointers to the output.
     fn draw(
         &mut self,
+        device: &Device,
         scheduler: &mut Scheduler,
         image_index: usize,
         inout_image: &mut vk::Image,
@@ -258,11 +265,11 @@ impl AntiAliasPass for Fxaa {
         let layout = self.pipeline_layout;
         let extent = self.extent;
 
-        self.upload_images(scheduler);
-        self.update_descriptor_sets(*inout_image_view, image_index);
+        self.upload_images(device, scheduler);
+        self.update_descriptor_sets(device, *inout_image_view, image_index);
 
         scheduler.request_outside_render_pass_operation_context();
-        let device = self.device.clone();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| unsafe {
             util::transition_image_layout(
                 &device,

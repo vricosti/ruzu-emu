@@ -16,9 +16,10 @@ use crate::present::{PresentFilters, ScalingFilter};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::RasterizerVulkan;
 use crate::textures::decoders;
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
 
-use super::anti_alias_pass::{AntiAliasPass, NoAa};
+use super::anti_alias_pass::AntiAliasPass;
 use super::fsr::Fsr;
 use super::fxaa::Fxaa;
 use super::present_push_constants::{
@@ -79,6 +80,13 @@ enum SuperResolutionFilter {
     Sgsr(Sgsr),
 }
 
+/// Rust counterpart of upstream's `std::variant<std::monostate, FXAA, SMAA>`.
+enum AntiAlias {
+    None,
+    Fxaa(Fxaa),
+    Smaa(Smaa),
+}
+
 /// Port of `Layer` class.
 ///
 /// Owns raw images for framebuffer upload, anti-aliasing state, FSR state,
@@ -103,7 +111,7 @@ pub struct Layer {
     pixel_format: Option<AndroidPixelFormat>,
 
     anti_alias_setting: AntiAliasingSetting,
-    anti_alias: Box<dyn AntiAliasPass>,
+    anti_alias: AntiAlias,
 
     sr_filter: SuperResolutionFilter,
     resource_ticks: Vec<u64>,
@@ -112,7 +120,7 @@ pub struct Layer {
 impl Layer {
     /// Port of `Layer::Layer`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         allocator: &MemoryAllocator,
         scheduler: &mut Scheduler,
         device_memory: &Arc<MaxwellDeviceMemoryManager>,
@@ -123,7 +131,7 @@ impl Layer {
         supports_float16: bool,
     ) -> Self {
         let mut layer = Layer {
-            device,
+            device: device.get_logical().clone(),
             memory_allocator: NonNull::from(allocator),
             scheduler: NonNull::from(&mut *scheduler),
             device_memory: Arc::clone(device_memory),
@@ -138,7 +146,7 @@ impl Layer {
             raw_height: 0,
             pixel_format: None,
             anti_alias_setting: AntiAliasingSetting::None,
-            anti_alias: Box::new(NoAa),
+            anti_alias: AntiAlias::None,
             sr_filter: SuperResolutionFilter::None,
             resource_ticks: Vec::new(),
         };
@@ -195,6 +203,7 @@ impl Layer {
     /// Applies anti-aliasing and FSR if configured.
     pub fn configure_draw(
         &mut self,
+        device: &Device,
         out_push_constants: &mut PresentPushConstants,
         out_descriptor_set: &mut vk::DescriptorSet,
         sampler: vk::Sampler,
@@ -211,12 +220,23 @@ impl Layer {
         let scheduler = unsafe { self.scheduler.as_mut() };
 
         // Apply anti-aliasing
-        self.anti_alias.draw(
-            scheduler,
-            image_index,
-            &mut current_image,
-            &mut current_view,
-        );
+        match &mut self.anti_alias {
+            AntiAlias::Fxaa(fxaa) => fxaa.draw(
+                device,
+                scheduler,
+                image_index,
+                &mut current_image,
+                &mut current_view,
+            ),
+            AntiAlias::Smaa(smaa) => smaa.draw(
+                device,
+                scheduler,
+                image_index,
+                &mut current_image,
+                &mut current_view,
+            ),
+            AntiAlias::None => {}
+        }
 
         // Apply the selected super-resolution pass, matching upstream's FSR /
         // SGSR variant. Both passes consume the guest crop and publish a full
@@ -280,6 +300,7 @@ impl Layer {
     /// raw image remains a separate `UpdateRawImage` parity step.
     pub fn configure_draw_from_framebuffer(
         &mut self,
+        device: &Device,
         out_push_constants: &mut PresentPushConstants,
         out_descriptor_set: &mut vk::DescriptorSet,
         rasterizer: &mut RasterizerVulkan,
@@ -305,7 +326,7 @@ impl Layer {
             .map_or(texture_height, |info| info.scaled_height);
 
         self.refresh_resources(framebuffer);
-        self.set_anti_alias_pass();
+        self.set_anti_alias_pass(device);
         let scheduler = unsafe { self.scheduler.as_mut() };
         scheduler.request_outside_render_pass_operation_context();
         if let Some(tick) = self.resource_ticks.get(image_index).copied() {
@@ -327,6 +348,7 @@ impl Layer {
         let crop_rect = normalize_crop(framebuffer, texture_width, texture_height);
 
         self.configure_draw(
+            device,
             out_push_constants,
             out_descriptor_set,
             sampler,
@@ -583,7 +605,7 @@ impl Layer {
         self.raw_height = framebuffer.height;
         self.pixel_format = Some(framebuffer.pixel_format);
         self.anti_alias_setting = AntiAliasingSetting::None;
-        self.anti_alias = Box::new(NoAa);
+        self.anti_alias = AntiAlias::None;
 
         self.release_raw_images();
 
@@ -633,28 +655,28 @@ impl Layer {
     }
 
     /// Port-facing subset of `Layer::SetAntiAliasPass`.
-    fn set_anti_alias_pass(&mut self) {
+    fn set_anti_alias_pass(&mut self, device: &Device) {
         let requested = match (self.filters.get_anti_aliasing)() {
             crate::present::AntiAliasing::None => AntiAliasingSetting::None,
             crate::present::AntiAliasing::Fxaa => AntiAliasingSetting::Fxaa,
             crate::present::AntiAliasing::Smaa => AntiAliasingSetting::Smaa,
         };
-        if self.anti_alias_setting == requested {
+        if !matches!(self.anti_alias, AntiAlias::None) && self.anti_alias_setting == requested {
             return;
         }
 
         let allocator = unsafe { self.memory_allocator.as_ref() };
         self.anti_alias_setting = requested;
         self.anti_alias = match requested {
-            AntiAliasingSetting::None => Box::new(NoAa),
+            AntiAliasingSetting::None => AntiAlias::None,
             AntiAliasingSetting::Fxaa => {
                 let resolution = common::settings::values().resolution_info.clone();
                 let extent = vk::Extent2D {
                     width: resolution.scale_up_u32(self.raw_width),
                     height: resolution.scale_up_u32(self.raw_height),
                 };
-                Box::new(Fxaa::new(
-                    self.device.clone(),
+                AntiAlias::Fxaa(Fxaa::new(
+                    device.get_logical().clone(),
                     allocator,
                     self.image_count,
                     extent,
@@ -666,8 +688,8 @@ impl Layer {
                     width: resolution.scale_up_u32(self.raw_width),
                     height: resolution.scale_up_u32(self.raw_height),
                 };
-                Box::new(Smaa::new(
-                    self.device.clone(),
+                AntiAlias::Smaa(Smaa::new(
+                    device.get_logical().clone(),
                     allocator,
                     self.image_count,
                     extent,

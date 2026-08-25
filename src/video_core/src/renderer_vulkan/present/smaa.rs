@@ -19,6 +19,7 @@ use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
 use crate::smaa_area_tex::{AREATEX_HEIGHT, AREATEX_WIDTH, AREA_TEX_BYTES};
 use crate::smaa_search_tex::{SEARCHTEX_HEIGHT, SEARCHTEX_WIDTH, SEARCH_TEX_BYTES};
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
 // ---------------------------------------------------------------------------
@@ -360,7 +361,12 @@ impl Smaa {
     }
 
     /// Port of `SMAA::UpdateDescriptorSets`.
-    fn update_descriptor_sets(&self, image_view: vk::ImageView, image_index: usize) {
+    fn update_descriptor_sets(
+        &self,
+        device: &Device,
+        image_view: vk::ImageView,
+        image_index: usize,
+    ) {
         let images = &self.dynamic_images[image_index];
         let mut image_infos = Vec::with_capacity(6);
         let mut updates = Vec::new();
@@ -414,12 +420,12 @@ impl Smaa {
         ));
 
         unsafe {
-            self.device.update_descriptor_sets(&updates, &[]);
+            device.get_logical().update_descriptor_sets(&updates, &[]);
         }
     }
 
     /// Port of `SMAA::UploadImages`.
-    fn upload_images(&mut self, scheduler: &mut Scheduler) {
+    fn upload_images(&mut self, device: &Device, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
@@ -429,7 +435,7 @@ impl Smaa {
         let allocator = unsafe { self.allocator.as_ref() };
 
         util::upload_image(
-            &self.device,
+            device.get_logical(),
             allocator,
             scheduler,
             area_image,
@@ -441,7 +447,7 @@ impl Smaa {
             AREA_TEX_BYTES,
         );
         util::upload_image(
-            &self.device,
+            device.get_logical(),
             allocator,
             scheduler,
             search_image,
@@ -459,7 +465,7 @@ impl Smaa {
             .map(|images| images.images)
             .collect();
 
-        let device = self.device.clone();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| {
             for images in dynamic_images {
                 for image in images {
@@ -480,6 +486,7 @@ impl AntiAliasPass for Smaa {
     /// and neighborhood blending. Swaps the image/view pointers to the output.
     fn draw(
         &mut self,
+        device: &Device,
         scheduler: &mut Scheduler,
         image_index: usize,
         inout_image: &mut vk::Image,
@@ -506,11 +513,11 @@ impl AntiAliasPass for Smaa {
         let pipeline_layouts = self.pipeline_layouts;
         let extent = self.extent;
 
-        self.upload_images(scheduler);
-        self.update_descriptor_sets(*inout_image_view, image_index);
+        self.upload_images(device, scheduler);
+        self.update_descriptor_sets(device, *inout_image_view, image_index);
 
         scheduler.request_outside_render_pass_operation_context();
-        let device = self.device.clone();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| unsafe {
             util::transition_image_layout(
                 &device,

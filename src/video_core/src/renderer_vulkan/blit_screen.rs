@@ -240,7 +240,7 @@ impl BlitScreen {
             }
             while self.layers.len() < framebuffers.len() {
                 self.layers.push(Layer::new(
-                    self.device.clone(),
+                    device,
                     allocator,
                     scheduler,
                     device_memory,
@@ -267,6 +267,7 @@ impl BlitScreen {
             for i in 0..layer_count {
                 blend_modes.push(to_window_blend_mode(framebuffers[i].blending));
                 self.layers[i].configure_draw_from_framebuffer(
+                    device,
                     &mut push_constants[i],
                     &mut descriptor_sets[i],
                     rasterizer,

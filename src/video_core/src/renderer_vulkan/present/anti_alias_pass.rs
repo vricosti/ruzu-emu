@@ -3,11 +3,12 @@
 
 //! Port of `present/anti_alias_pass.h`.
 //!
-//! Abstract anti-aliasing pass interface and no-op implementation.
+//! Abstract anti-aliasing pass interface.
 
 use ash::vk;
 
 use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::vulkan_common::vulkan_device::Device;
 
 // ---------------------------------------------------------------------------
 // AntiAliasPass trait
@@ -21,28 +22,10 @@ pub trait AntiAliasPass {
     /// Port of `AntiAliasPass::Draw`.
     fn draw(
         &mut self,
-        _scheduler: &mut Scheduler,
-        _image_index: usize,
-        _inout_image: &mut vk::Image,
-        _inout_image_view: &mut vk::ImageView,
+        device: &Device,
+        scheduler: &mut Scheduler,
+        image_index: usize,
+        inout_image: &mut vk::Image,
+        inout_image_view: &mut vk::ImageView,
     );
-}
-
-// ---------------------------------------------------------------------------
-// NoAA
-// ---------------------------------------------------------------------------
-
-/// Port of `NoAA` class — a no-op anti-aliasing pass.
-pub struct NoAa;
-
-impl AntiAliasPass for NoAa {
-    fn draw(
-        &mut self,
-        _scheduler: &mut Scheduler,
-        _image_index: usize,
-        _inout_image: &mut vk::Image,
-        _inout_image_view: &mut vk::ImageView,
-    ) {
-        // No-op, matching upstream.
-    }
 }

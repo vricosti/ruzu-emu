@@ -4503,8 +4503,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   allocator is owned by the enclosing Vulkan renderer and a lifetime borrow would make its `Layer`
   storage self-referential. The pointer is consumed only by `CreateImages` and `UploadImages`, at
   the same lifecycle points as Eden.
-- The raw `ash::Device` is retained by `Smaa` because the local `AntiAliasPass::draw` trait does not
-  receive Eden's `Device&`; resource selection and command ordering are unchanged.
+- The raw `ash::Device` is retained by `Smaa` to destroy its raw Vulkan handles in `Drop`. Runtime
+  draw/update/upload operations receive Eden's high-level `Device&` through `AntiAliasPass::draw`.
 
 ## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/layer.rs` vs `src/video_core/renderer_vulkan/present/layer.h` and `.cpp`
 
@@ -12710,3 +12710,69 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests verify every field offset, alignment, and total size (64 bytes/alignment 16
   for the 2D payload; 56 bytes/alignment 4 for the 3D payload), plus representative 2D and 3D
   formulas against Eden's expected values.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/anti_alias_pass.rs` vs Eden `src/video_core/renderer_vulkan/present/anti_alias_pass.h`
+
+### Intentional differences
+
+- Rust uses a trait for Eden's abstract base class; the single virtual `Draw` contract and mutable
+  image/view outputs remain identical.
+
+### Unintentional differences (to fix)
+
+- Fixed: `draw` now receives `&Device` before `&mut Scheduler`, matching Eden's full virtual
+  signature instead of relying on a device retained by each implementation.
+- Fixed: the invented `NoAa` implementation was removed; Eden represents a disabled pass as
+  `std::monostate`, now mirrored by the `AntiAlias::None` variant in `layer.rs`.
+
+### Missing items
+
+- None: the virtual destructor role is provided by Rust concrete-value destruction and the
+  complete `Draw` interface is present.
+
+### Binary layout verification
+
+- N/A: this is a virtual interface and does not define a copied or serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/{fxaa,smaa}.rs` Draw integration vs Eden `src/video_core/renderer_vulkan/present/{fxaa,smaa}.{h,cpp}`
+
+### Intentional differences
+
+- The passes retain a cloned raw `ash::Device` for explicit destruction of Vulkan handles; Eden's
+  wrapper members carry that destruction context through RAII.
+
+### Unintentional differences (to fix)
+
+- Fixed: `Draw`, `UpdateDescriptorSets`, and `UploadImages` now consume the high-level `Device&`
+  passed by the caller, in the same ownership and call order as Eden.
+
+### Missing items
+
+- None in the anti-alias interface integration slice.
+
+### Binary layout verification
+
+- N/A: this slice changes host references and Vulkan calls, not a raw-copied payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/layer.rs` and `renderer_vulkan/blit_screen.rs` anti-alias wiring vs Eden `src/video_core/renderer_vulkan/present/layer.{h,cpp}` and `renderer_vulkan/vk_blit_screen.cpp`
+
+### Intentional differences
+
+- Vulkan wrapper handles are still represented by raw ash handles with explicit Rust destruction.
+
+### Unintentional differences (to fix)
+
+- Fixed: `Layer` now receives and forwards Eden's high-level `Device&` from `BlitScreen` through
+  `ConfigureDraw`, `SetAntiAliasPass`, and the selected pass's `Draw` call.
+- Fixed: anti-alias storage now mirrors `std::variant<std::monostate, FXAA, SMAA>` with a concrete
+  Rust enum instead of heap-allocating a trait object and inventing a no-op pass.
+- Fixed: the unchanged-setting fast path now also requires a non-empty pass, matching Eden's
+  `!holds_alternative<std::monostate>` condition.
+
+### Missing items
+
+- None in the anti-alias selection and dispatch slice.
+
+### Binary layout verification
+
+- N/A: the variants are host-only owners and are neither raw-copied nor serialized.

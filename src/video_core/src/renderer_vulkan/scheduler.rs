@@ -498,8 +498,8 @@ impl WorkerContext {
     }
 
     fn allocate_worker_command_buffer(&mut self) -> Result<(), vk::Result> {
-        self.current_cmdbuf = self.command_pool.commit();
-        self.upload_cmdbuf = self.command_pool.commit();
+        self.current_cmdbuf = self.command_pool.commit()?;
+        self.upload_cmdbuf = self.command_pool.commit()?;
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
             .build();

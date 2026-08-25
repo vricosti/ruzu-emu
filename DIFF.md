@@ -12280,8 +12280,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the same signal/wait semaphore ordering as Eden.
 - Command buffers are explicitly reset before `vkBeginCommandBuffer`; Eden relies on Vulkan's
   implicit reset when beginning an executable command buffer from a resettable pool.
-- `Scheduler::new` propagates `MasterSemaphore` construction failures as `vk::Result`; Eden
-  propagates the equivalent Vulkan wrapper exception from its constructor.
+- `Scheduler::new` propagates `MasterSemaphore` and initial command-pool construction failures as
+  `vk::Result`; Eden propagates the equivalent Vulkan wrapper exceptions from its constructor.
 
 ### Unintentional differences (to fix)
 
@@ -12399,3 +12399,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this prerequisite changes host ownership and resource-retirement timing only.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/command_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_command_pool.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `vk::CommandPool` and `vk::CommandBuffers` wrappers are represented by an ash handle and
+  `Vec<vk::CommandBuffer>`; `Drop` explicitly destroys every successfully created pool.
+- `CommandPool::commit` returns `Result` so Vulkan wrapper exceptions propagate through
+  `Scheduler::new`; failures during worker rotation remain fatal at the scheduler worker boundary.
+
+### Unintentional differences (to fix)
+
+- Fixed partial-allocation lifetime: an empty pool entry is now published before Vulkan creation,
+  matching Eden's `pools.emplace_back()`, so a pool handle is retained and destroyed if command
+  buffer allocation fails.
+- Fixed error propagation: pool creation and command-buffer allocation no longer panic through
+  `expect`; they return the original `vk::Result` like Eden's wrapper exception.
+
+### Missing items
+
+- None in construction, allocation, commit indexing, or destruction.
+
+### Binary layout verification
+
+- N/A: command-pool entries are host Vulkan resources, not raw-copied or serialized payloads. The
+  focused test verifies the empty entry state that precedes Vulkan allocation.

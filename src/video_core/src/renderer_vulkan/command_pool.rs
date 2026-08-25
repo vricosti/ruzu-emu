@@ -29,6 +29,7 @@ const COMMAND_BUFFER_POOL_SIZE: usize = 4;
 /// Internal pool entry.
 ///
 /// Port of `CommandPool::Pool` from `vk_command_pool.cpp`.
+#[derive(Default)]
 struct Pool {
     handle: vk::CommandPool,
     cmdbufs: Vec<vk::CommandBuffer>,
@@ -63,7 +64,7 @@ impl CommandPool {
     /// Port of `CommandPool::Commit`.
     ///
     /// Returns the next available command buffer.
-    pub fn commit(&mut self) -> vk::CommandBuffer {
+    pub fn commit(&mut self) -> Result<vk::CommandBuffer, vk::Result> {
         let device = self.device.clone();
         let graphics_family = self.graphics_family;
         let pools = &mut self.pools;
@@ -71,6 +72,8 @@ impl CommandPool {
         let mut allocate = |_begin, _end| {
             // Command buffers are going to be committed, recorded, executed every
             // single usage cycle. They are also going to be reset when committed.
+            pools.push(Pool::default());
+            let pool = pools.last_mut().expect("new command pool entry is missing");
             let pool_ci = vk::CommandPoolCreateInfo::builder()
                 .flags(
                     vk::CommandPoolCreateFlags::TRANSIENT
@@ -79,39 +82,32 @@ impl CommandPool {
                 .queue_family_index(graphics_family)
                 .build();
 
-            let handle = unsafe {
-                device
-                    .create_command_pool(&pool_ci, None)
-                    .expect("Failed to create command pool")
-            };
+            pool.handle = unsafe { device.create_command_pool(&pool_ci, None)? };
 
             let alloc_info = vk::CommandBufferAllocateInfo::builder()
-                .command_pool(handle)
+                .command_pool(pool.handle)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(COMMAND_BUFFER_POOL_SIZE as u32)
                 .build();
 
-            let cmdbufs = unsafe {
-                device
-                    .allocate_command_buffers(&alloc_info)
-                    .expect("Failed to allocate command buffers")
-            };
-
-            pools.push(Pool { handle, cmdbufs });
+            pool.cmdbufs = unsafe { device.allocate_command_buffers(&alloc_info)? };
+            Ok(())
         };
-        let index = self.resource_pool.commit_resource(&mut allocate);
+        let index = self.resource_pool.try_commit_resource(&mut allocate)?;
 
         let pool_index = index / COMMAND_BUFFER_POOL_SIZE;
         let sub_index = index % COMMAND_BUFFER_POOL_SIZE;
-        self.pools[pool_index].cmdbufs[sub_index]
+        Ok(self.pools[pool_index].cmdbufs[sub_index])
     }
 }
 
 impl Drop for CommandPool {
     fn drop(&mut self) {
         for pool in &self.pools {
-            unsafe {
-                self.device.destroy_command_pool(pool.handle, None);
+            if pool.handle != vk::CommandPool::null() {
+                unsafe {
+                    self.device.destroy_command_pool(pool.handle, None);
+                }
             }
         }
     }
@@ -124,5 +120,12 @@ mod tests {
     #[test]
     fn command_buffer_pool_size() {
         assert_eq!(COMMAND_BUFFER_POOL_SIZE, 4);
+    }
+
+    #[test]
+    fn pool_entry_is_empty_before_vulkan_allocation() {
+        let pool = Pool::default();
+        assert_eq!(pool.handle, vk::CommandPool::null());
+        assert!(pool.cmdbufs.is_empty());
     }
 }

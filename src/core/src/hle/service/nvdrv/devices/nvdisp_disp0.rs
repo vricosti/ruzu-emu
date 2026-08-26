@@ -5,10 +5,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvdisp_disp0.cpp
 
 use crate::core::SystemRef;
-use crate::gpu_core::{
-    BlendMode as GpuBlendMode, BufferTransformFlags as GpuBufferTransformFlags,
-    FramebufferConfig as GpuFramebufferConfig, RectI as GpuRectI,
-};
+use crate::gpu_core::{BlendMode as GpuBlendMode, FramebufferConfig as GpuFramebufferConfig};
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::nvmap::NvMap;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
@@ -110,14 +107,9 @@ impl NvDispDisp0 {
                 width: layer.width,
                 height: layer.height,
                 stride: layer.stride,
-                pixel_format: layer.format as u32,
-                transform_flags: GpuBufferTransformFlags(layer.transform.bits()),
-                crop_rect: GpuRectI {
-                    left: layer.crop_rect.left,
-                    top: layer.crop_rect.top,
-                    right: layer.crop_rect.right,
-                    bottom: layer.crop_rect.bottom,
-                },
+                pixel_format: layer.format,
+                transform_flags: layer.transform,
+                crop_rect: layer.crop_rect,
                 blending: Self::convert_blending(layer.blending),
             });
 

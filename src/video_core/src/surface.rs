@@ -9,6 +9,8 @@
 //! As in upstream `surface.h`, this module owns the canonical `PixelFormat`
 //! enum together with its indexed property tables and utility functions.
 
+use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
+
 // Upstream defines this enum in `video_core/surface.h`; keep it here so the
 // ordering that every `PixelFormat`-indexed table depends on lives with those
 // tables.
@@ -298,14 +300,14 @@ pub fn pixel_format_from_depth_format(format: u32) -> PixelFormat {
 }
 
 /// Port of `PixelFormatFromGPUPixelFormat` from `surface.cpp`.
-pub fn pixel_format_from_gpu_pixel_format(format: u32) -> PixelFormat {
+pub fn pixel_format_from_gpu_pixel_format(format: AndroidPixelFormat) -> PixelFormat {
     match format {
-        1 | 2 => PixelFormat::A8B8G8R8Unorm,
-        4 => PixelFormat::R5G6B5Unorm,
-        5 => PixelFormat::B8G8R8A8Unorm,
+        AndroidPixelFormat::Rgba8888 | AndroidPixelFormat::Rgbx8888 => PixelFormat::A8B8G8R8Unorm,
+        AndroidPixelFormat::Rgb565 => PixelFormat::R5G6B5Unorm,
+        AndroidPixelFormat::Bgra8888 => PixelFormat::B8G8R8A8Unorm,
         _ => unimplemented_surface_format(
             "PixelFormatFromGPUPixelFormat",
-            format,
+            format as u32,
             PixelFormat::A8B8G8R8Unorm,
         ),
     }
@@ -1358,17 +1360,18 @@ mod tests {
     #[test]
     fn gpu_pixel_format_mapping_matches_upstream_surface_cpp() {
         let cases = [
-            (1, PixelFormat::A8B8G8R8Unorm),
-            (2, PixelFormat::A8B8G8R8Unorm),
-            (4, PixelFormat::R5G6B5Unorm),
-            (5, PixelFormat::B8G8R8A8Unorm),
+            (AndroidPixelFormat::Rgba8888, PixelFormat::A8B8G8R8Unorm),
+            (AndroidPixelFormat::Rgbx8888, PixelFormat::A8B8G8R8Unorm),
+            (AndroidPixelFormat::Rgb565, PixelFormat::R5G6B5Unorm),
+            (AndroidPixelFormat::Bgra8888, PixelFormat::B8G8R8A8Unorm),
         ];
 
         for (format, expected) in cases {
             assert_eq!(
                 pixel_format_from_gpu_pixel_format(format),
                 expected,
-                "GPU pixel format {format}"
+                "GPU pixel format {}",
+                format as u32
             );
         }
     }
@@ -1384,7 +1387,7 @@ mod tests {
             PixelFormat::S8UintD24Unorm
         );
         assert_eq!(
-            pixel_format_from_gpu_pixel_format(u32::MAX),
+            pixel_format_from_gpu_pixel_format(AndroidPixelFormat::NoFormat),
             PixelFormat::A8B8G8R8Unorm
         );
     }

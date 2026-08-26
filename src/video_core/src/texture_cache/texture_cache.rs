@@ -1175,9 +1175,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             }
         }
 
-        let view_format = match config.pixel_format.0 {
-            4 => PixelFormat::R5G6B5Unorm,
-            5 => PixelFormat::B8G8R8A8Unorm,
+        let view_format = match config.pixel_format {
+            ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat::Rgb565 => {
+                PixelFormat::R5G6B5Unorm
+            }
+            ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat::Bgra8888 => {
+                PixelFormat::B8G8R8A8Unorm
+            }
             _ => PixelFormat::A8B8G8R8Unorm,
         };
         let mut info = ImageViewInfo::for_render_target(
@@ -3602,9 +3606,10 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
-    use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
+    use crate::framebuffer_config::FramebufferConfig;
     use crate::texture_cache::render_targets::RenderTargets;
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry, TscEntry};
+    use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 
     static RESOLUTION_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -5141,7 +5146,7 @@ mod tests {
             width: 64,
             height: 32,
             stride: 64,
-            pixel_format: AndroidPixelFormat(5),
+            pixel_format: AndroidPixelFormat::Bgra8888,
             ..Default::default()
         };
         let view = cache
@@ -5193,7 +5198,7 @@ mod tests {
             width: 64,
             height: 32,
             stride: 64,
-            pixel_format: AndroidPixelFormat(0),
+            pixel_format: AndroidPixelFormat::NoFormat,
             ..Default::default()
         };
         let view = cache

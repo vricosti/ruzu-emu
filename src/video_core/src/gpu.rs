@@ -18,10 +18,9 @@ use crate::shader_notify::{ShaderNotify, ShaderNotifyHandle};
 use common::settings;
 use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
-    BlendMode as CoreBlendMode, BufferTransformFlags as CoreBufferTransformFlags,
-    FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle, GpuCommandList, GpuCoreInterface,
-    GpuMemoryManagerHandle, RasterizerDownloadArea as CoreRasterizerDownloadArea,
-    RectI as CoreRectI,
+    BlendMode as CoreBlendMode, FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle,
+    GpuCommandList, GpuCoreInterface, GpuMemoryManagerHandle,
+    RasterizerDownloadArea as CoreRasterizerDownloadArea,
 };
 use ruzu_core::hle::service::nvdrv::nvdata::NvFence;
 
@@ -1096,25 +1095,9 @@ impl GpuCoreInterface for Gpu {
                 width: layer.width,
                 height: layer.height,
                 stride: layer.stride,
-                pixel_format: crate::framebuffer_config::AndroidPixelFormat(layer.pixel_format),
-                transform_flags: crate::framebuffer_config::BufferTransformFlags(
-                    match layer.transform_flags {
-                        CoreBufferTransformFlags(bits) => bits,
-                    },
-                ),
-                crop_rect: match layer.crop_rect {
-                    CoreRectI {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    } => crate::framebuffer_config::RectI {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    },
-                },
+                pixel_format: layer.pixel_format,
+                transform_flags: layer.transform_flags,
+                crop_rect: layer.crop_rect,
                 blending: match layer.blending {
                     CoreBlendMode::Opaque => crate::framebuffer_config::BlendMode::Opaque,
                     CoreBlendMode::Premultiplied => {

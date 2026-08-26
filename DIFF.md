@@ -14098,3 +14098,33 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: GLSL is embedded as text; the existing build step validates and compiles every applicable
   source to SPIR-V.
+
+## 2026-08-26 — `src/video_core/src/framebuffer_config.rs` and framebuffer bridge consumers vs Eden `src/video_core/framebuffer_config.{h,cpp}`
+
+### Intentional differences
+
+- The `core`/`video_core` crate dependency direction requires a small `gpu_core::FramebufferConfig`
+  bridge. It now forwards Eden's canonical `PixelFormat`, `BufferTransformFlags`, and
+  `Rectangle<i32>` unchanged; only `BlendMode` remains mirrored across the crate boundary.
+- Rust logs unsupported residual transform bits with `warn!`, corresponding to Eden's
+  `UNIMPLEMENTED_MSG`, then continues with the same normalized coordinates.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the local pixel-format, transform-flag, and rectangle replacements. The
+  framebuffer descriptor and all OpenGL, Vulkan, null-renderer, surface, and texture-cache
+  consumers now use their canonical upstream-owned types.
+- Resolved: a crop rectangle whose width or height is zero now falls back to the framebuffer
+  dimensions even when it is not located at the origin, matching `Common::Rectangle::IsEmpty`.
+- Resolved: `PixelFormatFromGPUPixelFormat` now accepts the canonical Android `PixelFormat` instead
+  of an untyped `u32`; downstream conversions no longer unwrap and reconstruct its raw value.
+
+### Missing items
+
+- None in `FramebufferConfig` or `NormalizeCrop`.
+
+### Binary layout verification
+
+- N/A: `FramebufferConfig` is passed as a typed in-process descriptor rather than serialized by a
+  raw memory copy. Its canonical pixel-format enum remains `repr(u32)` and rectangle field order is
+  owned by `common::math_util::Rectangle`.

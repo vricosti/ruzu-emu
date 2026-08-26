@@ -7,10 +7,12 @@
 //! image suitable for composition, applying anti-aliasing and FSR as needed.
 
 use ash::vk;
+use common::math_util::Rectangle;
+use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::framebuffer_config::{normalize_crop, AndroidPixelFormat, FramebufferConfig, RectF};
+use crate::framebuffer_config::{normalize_crop, FramebufferConfig};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::present::{PresentFilters, ScalingFilter};
 use crate::renderer_vulkan::scheduler::Scheduler;
@@ -36,14 +38,9 @@ use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 /// Port of anonymous `GetBytesPerPixel` helper.
 fn get_bytes_per_pixel(pixel_format: AndroidPixelFormat) -> u32 {
-    match pixel_format.0 {
-        1 | 2 | 5 => 4,
-        4 => 2,
-        _ => {
-            log::warn!("Unknown framebuffer pixel format: {}", pixel_format.0);
-            4
-        }
-    }
+    crate::surface::bytes_per_block(crate::surface::pixel_format_from_gpu_pixel_format(
+        pixel_format,
+    ))
 }
 
 /// Port of anonymous `GetSizeInBytes` helper.
@@ -53,12 +50,14 @@ fn get_size_in_bytes(stride: u32, height: u32, pixel_format: AndroidPixelFormat)
 
 /// Port of anonymous `GetFormat` helper.
 fn get_vk_format(pixel_format: AndroidPixelFormat) -> vk::Format {
-    match pixel_format.0 {
-        1 | 2 => vk::Format::A8B8G8R8_UNORM_PACK32,
-        4 => vk::Format::R5G6B5_UNORM_PACK16,
-        5 => vk::Format::B8G8R8A8_UNORM,
+    match pixel_format {
+        AndroidPixelFormat::Rgba8888 | AndroidPixelFormat::Rgbx8888 => {
+            vk::Format::A8B8G8R8_UNORM_PACK32
+        }
+        AndroidPixelFormat::Rgb565 => vk::Format::R5G6B5_UNORM_PACK16,
+        AndroidPixelFormat::Bgra8888 => vk::Format::B8G8R8A8_UNORM,
         _ => {
-            log::warn!("Unknown framebuffer pixel format: {}", pixel_format.0);
+            log::warn!("Unknown framebuffer pixel format: {}", pixel_format as u32);
             vk::Format::A8B8G8R8_UNORM_PACK32
         }
     }
@@ -213,7 +212,7 @@ impl Layer {
         scaled_width: u32,
         scaled_height: u32,
         layout: &FramebufferLayout,
-        crop_rect: RectF,
+        crop_rect: Rectangle<f32>,
     ) {
         let mut current_image = source_image;
         let mut current_view = source_image_view;
@@ -273,7 +272,7 @@ impl Layer {
         };
         if let Some(filtered_view) = filtered_view {
             current_view = filtered_view;
-            effective_crop = RectF {
+            effective_crop = Rectangle {
                 left: 0.0,
                 top: 0.0,
                 right: 1.0,
@@ -508,7 +507,11 @@ impl Layer {
     }
 
     /// Port of `Layer::SetVertexData`.
-    fn set_vertex_data(data: &mut PresentPushConstants, layout: &FramebufferLayout, crop: &RectF) {
+    fn set_vertex_data(
+        data: &mut PresentPushConstants,
+        layout: &FramebufferLayout,
+        crop: &Rectangle<f32>,
+    ) {
         let x = layout.screen.left as f32;
         let y = layout.screen.top as f32;
         let w = layout.screen.get_width() as f32;

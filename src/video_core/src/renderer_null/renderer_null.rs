@@ -161,9 +161,10 @@ mod tests {
             width: 1280,
             height: 720,
             stride: 1280,
-            pixel_format: crate::framebuffer_config::AndroidPixelFormat(0),
-            transform_flags: crate::framebuffer_config::BufferTransformFlags(0),
-            crop_rect: crate::framebuffer_config::RectI {
+            pixel_format:
+                ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat::NoFormat,
+            transform_flags: ruzu_core::hle::service::nvnflinger::buffer_transform_flags::BufferTransformFlags::empty(),
+            crop_rect: common::math_util::Rectangle {
                 left: 0,
                 top: 0,
                 right: 1280,

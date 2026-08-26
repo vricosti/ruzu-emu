@@ -7,7 +7,11 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use common::math_util::Rectangle;
+
 use crate::hle::service::nvdrv::nvdata::NvFence;
+use crate::hle::service::nvnflinger::buffer_transform_flags::BufferTransformFlags;
+use crate::hle::service::nvnflinger::pixel_format::PixelFormat;
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -35,17 +39,6 @@ pub enum BlendMode {
     Coverage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BufferTransformFlags(pub u32);
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RectI {
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FramebufferConfig {
     pub address: u64,
@@ -53,9 +46,9 @@ pub struct FramebufferConfig {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
-    pub pixel_format: u32,
+    pub pixel_format: PixelFormat,
     pub transform_flags: BufferTransformFlags,
-    pub crop_rect: RectI,
+    pub crop_rect: Rectangle<i32>,
     pub blending: BlendMode,
 }
 

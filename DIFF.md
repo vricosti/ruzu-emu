@@ -12204,6 +12204,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: no serialized or raw-copied layout changed. The correction only moves notification
   ownership across the existing constructor boundary.
 
+## 2026-08-26 — `src/video_core/src/host1x/{host1x,nvdec}.rs` vs Eden `src/video_core/host1x/host1x.{h,cpp}` and `nvdec.cpp`
+
+### Intentional differences
+- Rust stores active Host1x devices in a `HashMap` of `CDmaPusher` owners instead of Eden's fixed
+  array of `Nvdec`/`Vic` variants. Each pusher owns the same concrete processor and dropping an
+  entry performs the corresponding device destructor lifecycle.
+- `Arc<Frame>` and a mutex-protected Rust `HashMap`/`VecDeque` replace `shared_ptr<Frame>` and the
+  mutex-protected C++ containers while preserving the per-FD `FrameDevice` boundary.
+
+### Unintentional differences (to fix)
+- None in the reviewed Host1x aggregation and frame-queue paths. Presentation and decode queues
+  are now capped at Eden's 100 and 200 entries, presentation retrieval is constant-time, NVDEC
+  destruction closes its frame device, and unsupported channel dispatch is handled only by the
+  upstream default branch.
+
+### Missing items
+- None in this Host1x aggregation slice.
+
+### Binary layout verification
+- N/A: these containers and device owners are host-only and are not raw-copied or serialized.
+
 ## 2026-08-25 — `src/video_core/src/query_cache/query_stream.rs` vs Eden `src/video_core/query_cache/query_stream.h`
 
 ### Intentional differences

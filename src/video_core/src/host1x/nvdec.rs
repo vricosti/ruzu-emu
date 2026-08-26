@@ -153,6 +153,7 @@ impl Nvdec {
 impl Drop for Nvdec {
     fn drop(&mut self) {
         info!("Destroying nvdec {}", self.id);
+        self.frame_queue.close(self.id);
     }
 }
 

@@ -14049,10 +14049,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: removed the production `Engine` dispatcher trait, which had no runtime consumer and no
   Eden counterpart. Register-write and deferred-write helpers needed by native Rust tests now live
   in their concrete engine owners under `cfg(test)`.
-- `ENGINE_REG_COUNT` and `PendingWrite` are still shared from `engines/mod.rs` by several incomplete
-  engine compatibility paths. Their ownership must be unwound while reviewing the corresponding
-  Fermi2D, Maxwell3D, MaxwellDMA, and standalone inline-to-memory reports; moving them to another
-  catch-all module here would only hide the mismatch.
+- Resolved: `engines/mod.rs` no longer owns the shared `ENGINE_REG_COUNT` or `PendingWrite`
+  compatibility payload. Maxwell3D and MaxwellDMA now own their distinct upstream register counts
+  and their local deferred-write integration payloads.
 
 ### Missing items
 - None among Eden's engine source-module declarations.
@@ -16227,3 +16226,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the change removes an API synonym and preserves the same `u64` timeline value.
+
+## 2026-08-26 — `src/video_core/src/engines/{mod,maxwell_3d,maxwell_dma}.rs`, `dirty_flags.rs`, and `macro.rs` vs Eden engine register ownership
+
+### Intentional differences
+
+- Maxwell3D and MaxwellDMA retain file-local `PendingWrite` payloads for Ruzu's deferred
+  guest-memory integration. Eden writes through engine-owned guest-memory guards instead; keeping
+  the adaptation in each concrete engine preserves the upstream ownership boundary.
+
+### Unintentional differences (to fix)
+
+- Resolved: the catch-all `engines/mod.rs` no longer owns one shared 0xE00 register count.
+  Maxwell3D owns `NUM_REGS = 0xE00`, while MaxwellDMA owns `NUM_REGS = 0x800`, exactly where and
+  with the values declared by Eden.
+- Resolved: dirty-state tables and macro register reads now refer explicitly to Maxwell3D's
+  register count instead of an engine-global constant.
+
+### Missing items
+
+- None in the reviewed register-count ownership slice.
+
+### Binary layout verification
+
+- PASS: focused tests verify that the Maxwell3D and MaxwellDMA register arrays contain 0xE00 and
+  0x800 `u32` entries respectively, matching Eden's `Regs` unions.

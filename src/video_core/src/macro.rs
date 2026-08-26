@@ -1971,7 +1971,7 @@ mod macro_jit_x64 {
             if self.optimizer.enable_asserts {
                 let pass_range_check = self.assembler.create_label();
                 self.assembler
-                    .cmp(RESULT, crate::engines::ENGINE_REG_COUNT as i32)?;
+                    .cmp(RESULT, crate::engines::maxwell_3d::NUM_REGS as i32)?;
                 self.assembler.jb(&pass_range_check, JmpType::Near)?;
                 self.assembler.int3()?;
                 self.assembler.bind(&pass_range_check)?;
@@ -2466,7 +2466,7 @@ mod macro_jit_x64 {
                 read(2, 0, 7, true),
                 add_immediate(3, 2, 1, ResultOperation::Move, false),
             ];
-            let mut registers = [0u32; crate::engines::ENGINE_REG_COUNT];
+            let mut registers = [0u32; crate::engines::maxwell_3d::NUM_REGS];
             registers[7] = 0x1234_5678;
             let mut jit = MacroJitX64Impl::new(code);
             let state = jit.run_with_register_array(std::ptr::null_mut(), &[0], registers.as_ptr());

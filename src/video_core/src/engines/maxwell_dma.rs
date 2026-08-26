@@ -10,12 +10,20 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
-use super::{PendingWrite, ENGINE_REG_COUNT};
 use crate::memory_manager::MemoryManager;
 use crate::pte_kind::{is_pitch_kind, PteKind};
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::decoders::{calculate_size, swizzle_subrect, unswizzle_subrect};
+
+/// Number of MaxwellDMA method registers (`MaxwellDMA::NUM_REGS`).
+const NUM_REGS: usize = 0x800;
+
+/// Deferred guest-memory write used by the Rust engine integration.
+pub(crate) struct PendingWrite {
+    pub gpu_va: u64,
+    pub data: Vec<u8>,
+}
 
 /// Port of upstream `Tegra::DMA` helper structs in `engines/maxwell_dma.h`.
 pub mod dma {
@@ -172,7 +180,7 @@ fn convert_linear_2_blocklinear_addr(address: u64) -> u64 {
 }
 
 pub struct MaxwellDMA {
-    regs: Box<[u32; ENGINE_REG_COUNT]>,
+    regs: Box<[u32; NUM_REGS]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
     /// Set when a DMA launch trigger is detected; consumed by tests / future logic.
@@ -187,7 +195,7 @@ impl MaxwellDMA {
     /// `System&` constructor dependency remains outside this bounded slice.
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
-            regs: Box::new([0u32; ENGINE_REG_COUNT]),
+            regs: Box::new([0u32; NUM_REGS]),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
                 state.execution_mask[LAUNCH_DMA as usize] = true;
@@ -202,7 +210,7 @@ impl MaxwellDMA {
     /// Corresponds to upstream `MaxwellDMA::CallMethod`.
     pub fn call_method(&mut self, method: u32, argument: u32, _is_last_call: bool) {
         let idx = method as usize;
-        assert!(idx < ENGINE_REG_COUNT, "Invalid MaxwellDMA register");
+        assert!(idx < NUM_REGS, "Invalid MaxwellDMA register");
         self.regs[idx] = argument;
         if method == LAUNCH_DMA {
             self.log_launch();
@@ -1081,7 +1089,7 @@ impl EngineInterface for MaxwellDMA {
         let sink = std::mem::take(&mut self.interface_state.method_sink);
         for (method, value) in sink {
             let idx = method as usize;
-            if idx < ENGINE_REG_COUNT {
+            if idx < NUM_REGS {
                 self.regs[idx] = value;
             }
         }
@@ -1124,7 +1132,7 @@ impl MaxwellDMA {
     fn write_reg(&mut self, method: u32, value: u32) {
         log::trace!("MaxwellDMA: reg[0x{:X}] = 0x{:X}", method, value);
         let idx = method as usize;
-        assert!(idx < ENGINE_REG_COUNT, "Invalid MaxwellDMA register");
+        assert!(idx < NUM_REGS, "Invalid MaxwellDMA register");
         self.regs[idx] = value;
         if method == LAUNCH_DMA {
             self.handle_deferred_launch();

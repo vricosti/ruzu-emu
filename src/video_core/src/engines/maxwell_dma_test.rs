@@ -5,6 +5,13 @@ use super::*;
 use crate::engines::draw_manager::Maxwell3DClearView;
 use crate::rasterizer_interface::RasterizerDownloadArea;
 
+#[test]
+fn register_count_matches_eden_maxwell_dma() {
+    let engine = MaxwellDMA::default();
+    assert_eq!(NUM_REGS, 0x800);
+    assert_eq!(engine.regs.len(), NUM_REGS);
+}
+
 #[derive(Default)]
 struct RasterizerCalls {
     flushes: Vec<(u64, u64)>,

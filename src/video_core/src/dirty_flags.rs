@@ -6,11 +6,10 @@
 //! Dirty flag indices and setup for Maxwell3D state tracking.
 
 use crate::engines::maxwell_3d::{
-    PIPELINE_BASE, RT_BASE, RT_CONTROL, RT_STRIDE, SURFACE_CLIP_BASE, TEX_HEADER_POOL_BASE,
-    TEX_SAMPLER_POOL_BASE, VERTEX_STREAM_BASE, VERTEX_STREAM_LIMIT_BASE, ZETA_BASE, ZETA_ENABLE,
-    ZETA_SIZE_BASE,
+    NUM_REGS, PIPELINE_BASE, RT_BASE, RT_CONTROL, RT_STRIDE, SURFACE_CLIP_BASE,
+    TEX_HEADER_POOL_BASE, TEX_SAMPLER_POOL_BASE, VERTEX_STREAM_BASE, VERTEX_STREAM_LIMIT_BASE,
+    ZETA_BASE, ZETA_ENABLE, ZETA_SIZE_BASE,
 };
-use crate::engines::ENGINE_REG_COUNT;
 
 /// Dirty flag indices matching upstream `VideoCommon::Dirty` enum.
 pub mod flags {
@@ -41,7 +40,7 @@ pub mod flags {
 }
 
 /// A dirty state table: one flag index per Maxwell3D register.
-pub type DirtyTable = [u8; ENGINE_REG_COUNT];
+pub type DirtyTable = [u8; NUM_REGS];
 
 /// Two-table set used by Maxwell3D dirty state tracking.
 /// tables[0] = per-entry flag, tables[1] = group flag.
@@ -327,7 +326,7 @@ mod tests {
 
     #[test]
     fn vertex_limit_setup_preserves_upstream_full_array_fill() {
-        let mut tables = [[flags::NULL_ENTRY; ENGINE_REG_COUNT]; 2];
+        let mut tables = [[flags::NULL_ENTRY; NUM_REGS]; 2];
         setup_dirty_flags(&mut tables);
 
         for index in 0..32usize {
@@ -350,7 +349,7 @@ mod tests {
 
     #[test]
     fn zeta_size_setup_marks_only_width_and_height() {
-        let mut tables = [[flags::NULL_ENTRY; ENGINE_REG_COUNT]; 2];
+        let mut tables = [[flags::NULL_ENTRY; NUM_REGS]; 2];
         setup_dirty_flags(&mut tables);
 
         for (table, expected) in tables
@@ -365,12 +364,12 @@ mod tests {
 
     #[test]
     fn dirty_table_has_upstream_fixed_register_count() {
-        assert_eq!(std::mem::size_of::<DirtyTable>(), ENGINE_REG_COUNT);
+        assert_eq!(std::mem::size_of::<DirtyTable>(), NUM_REGS);
     }
 
     #[test]
     fn setup_dirty_flags_marks_core_upstream_ranges() {
-        let mut tables = [[flags::NULL_ENTRY; ENGINE_REG_COUNT]; 2];
+        let mut tables = [[flags::NULL_ENTRY; NUM_REGS]; 2];
         setup_dirty_flags(&mut tables);
 
         assert_eq!(

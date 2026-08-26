@@ -5,6 +5,13 @@ use super::*;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use std::sync::{Arc, Mutex};
 
+#[test]
+fn register_count_matches_eden_maxwell_3d() {
+    let engine = Maxwell3D::default();
+    assert_eq!(NUM_REGS, 0xE00);
+    assert_eq!(engine.regs.len(), NUM_REGS);
+}
+
 fn new_descriptor_owner_backed_engine(backing: &[u8], device_addr: u64) -> Maxwell3D {
     let device_memory =
         Arc::new(crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default());

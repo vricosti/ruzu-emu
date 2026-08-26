@@ -16,7 +16,6 @@ use parking_lot::Mutex;
 use super::const_buffer_info::ConstBufferInfo;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
-use super::{PendingWrite, ENGINE_REG_COUNT};
 use crate::dirty_flags;
 use crate::engines::draw_manager as dm;
 use crate::memory_manager::MemoryManager;
@@ -28,6 +27,15 @@ use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::texture::{TicEntry, TscEntry};
 use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
 use shader_recompiler::shader_info::ReplaceConstant;
+
+/// Number of Maxwell3D method registers (`Maxwell3D::Regs::NUM_REGS`).
+pub const NUM_REGS: usize = 0xE00;
+
+/// Deferred guest-memory write used by the Rust engine integration.
+pub(crate) struct PendingWrite {
+    pub gpu_va: u64,
+    pub data: Vec<u8>,
+}
 
 #[derive(Clone, Copy)]
 struct Maxwell3DPtr(*mut Maxwell3D);
@@ -345,7 +353,7 @@ const LOAD_MME_START_ADDR_PTR: u32 = reg_index!(0x011C);
 /// Upstream byte offset 0x0120, word index 0x48.
 const LOAD_MME_START_ADDR: u32 = reg_index!(0x0120);
 /// First macro method register. Methods 0xE00..0xFFF invoke macros.
-/// Now uses word indices matching upstream (ENGINE_REG_COUNT = 0xE00).
+/// Uses word indices matching upstream (`Regs::NUM_REGS = 0xE00`).
 const MACRO_METHODS_START: u32 = reg_index!(0x3800);
 /// Exclusive end of macro method range (0x1000 * 4).
 
@@ -2259,7 +2267,7 @@ impl DirtyState {
     fn new() -> Self {
         let mut flags = [false; 256];
         flags.fill(true);
-        let tables = [[dirty_flags::flags::NULL_ENTRY; ENGINE_REG_COUNT]; 2];
+        let tables = [[dirty_flags::flags::NULL_ENTRY; NUM_REGS]; 2];
         Self { flags, tables }
     }
 }
@@ -2267,9 +2275,9 @@ impl DirtyState {
 // ── Engine struct ───────────────────────────────────────────────────────────
 
 pub struct Maxwell3D {
-    pub(crate) regs: Box<[u32; ENGINE_REG_COUNT]>,
+    pub(crate) regs: Box<[u32; NUM_REGS]>,
     /// Shadow copy of registers for shadow RAM tracking.
-    shadow_state: Box<[u32; ENGINE_REG_COUNT]>,
+    shadow_state: Box<[u32; NUM_REGS]>,
     /// Engine interface state: execution mask, method sink, dirty tracking.
     pub interface_state: EngineInterfaceState,
     /// Whether conditional rendering is active.
@@ -2480,8 +2488,8 @@ impl Maxwell3D {
         }
 
         let mut engine = Self {
-            regs: Box::new([0u32; ENGINE_REG_COUNT]),
-            shadow_state: Box::new([0u32; ENGINE_REG_COUNT]),
+            regs: Box::new([0u32; NUM_REGS]),
+            shadow_state: Box::new([0u32; NUM_REGS]),
             interface_state: EngineInterfaceState {
                 execution_mask,
                 method_sink: Vec::new(),
@@ -4242,7 +4250,7 @@ impl Maxwell3D {
     /// state dirty even when the guest re-emits the same register value.
     fn process_dirty_registers(&mut self, method: u32, argument: u32) {
         let idx = method as usize;
-        if idx >= ENGINE_REG_COUNT {
+        if idx >= NUM_REGS {
             return;
         }
 
@@ -4828,8 +4836,8 @@ impl EngineInterface for Maxwell3D {
         }
 
         assert!(
-            (method as usize) < ENGINE_REG_COUNT,
-            "Invalid Maxwell3D register 0x{:X}, increase ENGINE_REG_COUNT",
+            (method as usize) < NUM_REGS,
+            "Invalid Maxwell3D register 0x{:X}, increase Regs::NUM_REGS",
             method
         );
 

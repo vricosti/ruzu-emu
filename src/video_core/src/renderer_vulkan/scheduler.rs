@@ -1220,11 +1220,6 @@ impl Scheduler {
         self.master_semaphore.is_free(tick)
     }
 
-    /// Tick that will be signalled by the next `Flush`.
-    pub fn pending_tick(&self) -> u64 {
-        self.current_tick()
-    }
-
     /// Port of upstream `Scheduler::Wait`.
     pub fn wait(&mut self, tick: u64) {
         self.wait_with_frame_pacing(tick, 0.0);

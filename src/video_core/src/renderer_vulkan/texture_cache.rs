@@ -3437,7 +3437,7 @@ impl TextureCacheRuntime {
     }
 
     fn keep_msaa_upload_image_alive(&mut self, image: AllocatedImage) {
-        let tick = self.scheduler().pending_tick();
+        let tick = self.scheduler().current_tick();
         self.pending_msaa_images.push((tick, image));
     }
 
@@ -3843,7 +3843,7 @@ impl TextureCacheRuntime {
         // tick (the flush that will carry the currently recorded chunk).
         // Retire once the GPU (timeline counter) passes it — the submission
         // counter itself runs ahead of the GPU with pipelined submits.
-        let retire_tick = self.scheduler().pending_tick();
+        let retire_tick = self.scheduler().current_tick();
         self.sentenced_resources.push(SentencedVkResource {
             retire_tick,
             resource,

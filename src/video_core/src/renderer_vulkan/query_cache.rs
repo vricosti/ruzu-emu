@@ -1231,7 +1231,7 @@ impl TfbQueryBank {
         }
         let slot = slots.free.pop()?;
         slots.in_use += 1;
-        slots.last_used_tick = scheduler.pending_tick();
+        slots.last_used_tick = scheduler.current_tick();
         Some(slot)
     }
 

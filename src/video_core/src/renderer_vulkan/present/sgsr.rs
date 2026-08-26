@@ -307,9 +307,24 @@ impl Drop for Sgsr {
                     self.device.destroy_image_view(images.image_view, None);
                     images.image_view = vk::ImageView::null();
                 }
+                drop(std::mem::replace(&mut images.image, AllocatedImage::null()));
+                images.descriptor_sets.clear();
+            }
+            self.dynamic_images.clear();
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+            }
+            if self.renderpass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.renderpass, None);
             }
             if self.stage_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.stage_pipeline, None);
+            }
+            if self.stage_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.stage_shader, None);
+            }
+            if self.vert_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.vert_shader, None);
             }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device
@@ -322,18 +337,6 @@ impl Drop for Sgsr {
             if self.descriptor_pool != vk::DescriptorPool::null() {
                 self.device
                     .destroy_descriptor_pool(self.descriptor_pool, None);
-            }
-            if self.stage_shader != vk::ShaderModule::null() {
-                self.device.destroy_shader_module(self.stage_shader, None);
-            }
-            if self.vert_shader != vk::ShaderModule::null() {
-                self.device.destroy_shader_module(self.vert_shader, None);
-            }
-            if self.sampler != vk::Sampler::null() {
-                self.device.destroy_sampler(self.sampler, None);
-            }
-            if self.renderpass != vk::RenderPass::null() {
-                self.device.destroy_render_pass(self.renderpass, None);
             }
         }
     }

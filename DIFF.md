@@ -15179,6 +15179,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   and use its logical handle at runtime.
 - Resolved: SGSR images are owning VMA allocations and both upstream-owned `memory_allocator` and
   `edge_dir` state are retained instead of being discarded after construction.
+- Resolved: `Drop` now releases per-image framebuffers, views, allocations, and descriptor-handle
+  storage before sampler, render pass, pipeline, shaders, layouts, and descriptor pool, matching
+  the effective reverse declaration order of Eden's RAII members.
 
 ### Missing items
 
@@ -15905,3 +15908,23 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the removed type was unused host-only placeholder state.
+
+## 2026-08-26 — Vulkan scheduler tick consumers vs Eden `vk_scheduler.h`, `vk_texture_cache.cpp`, and `vk_query_cache.cpp`
+
+### Intentional differences
+
+- None for retrieval of the scheduler's current command-buffer tick.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the Rust-only `Scheduler::pending_tick` synonym. Texture lifetime tracking and
+  transform-feedback query-bank reservation now call `Scheduler::current_tick` directly, matching
+  Eden's `Scheduler::CurrentTick()` call sites and ownership.
+
+### Missing items
+
+- None for these tick consumers.
+
+### Binary layout verification
+
+- N/A: the change removes an API synonym and preserves the same `u64` timeline value.

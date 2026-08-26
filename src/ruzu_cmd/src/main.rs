@@ -645,12 +645,6 @@ fn main() {
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
     let want_gl_draw_stall_profile = std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_some();
-    let want_refresh_stages_stall_profile =
-        std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_some();
-    let want_make_shader_info_stall_profile =
-        std::env::var_os("RUZU_PROFILE_MAKE_SHADER_INFO_STALL").is_some();
-    let want_shader_register_stall_profile =
-        std::env::var_os("RUZU_PROFILE_SHADER_REGISTER_STALL").is_some();
     let want_rasterizer_mark_cached_stall_profile =
         std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_some();
     if want_ipc_profile
@@ -672,9 +666,6 @@ fn main() {
         || want_vsync_profile
         || want_submit_gpfifo_profile
         || want_gl_draw_stall_profile
-        || want_refresh_stages_stall_profile
-        || want_make_shader_info_stall_profile
-        || want_shader_register_stall_profile
         || want_rasterizer_mark_cached_stall_profile
     {
         #[cfg(unix)]
@@ -698,9 +689,6 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::diagnostics::dump("sigusr2");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
-            video_core::shader_cache::dump_refresh_stages_stall_profile();
-            video_core::shader_cache::dump_make_shader_info_stall_profile();
-            video_core::shader_cache::dump_shader_register_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
         #[cfg(unix)]
@@ -730,9 +718,6 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::diagnostics::dump("atexit");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
-            video_core::shader_cache::dump_refresh_stages_stall_profile();
-            video_core::shader_cache::dump_make_shader_info_stall_profile();
-            video_core::shader_cache::dump_shader_register_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
         unsafe {

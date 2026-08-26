@@ -370,37 +370,11 @@ impl GenericEnvironment {
     pub fn analyze(&mut self) -> Option<u64> {
         let size = match self.try_find_size() {
             Some(size) => size,
-            None => {
-                if std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some() {
-                    let first_words: Vec<String> = self
-                        .code
-                        .iter()
-                        .take(8)
-                        .map(|word| format!("{word:016X}"))
-                        .collect();
-                    eprintln!(
-                        "[SHADER_ANALYZE] try_find_size_failed program_base=0x{:X} start=0x{:X} cached_words={} first_words=[{}]",
-                        self.program_base,
-                        self.start_address,
-                        self.code.len(),
-                        first_words.join(","),
-                    );
-                }
-                return None;
-            }
+            None => return None,
         };
         self.cached_lowest = self.start_address;
         self.cached_highest = self.start_address + size as u32;
         let bytes = self.code_bytes(size as usize);
-        if std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some() {
-            eprintln!(
-                "[SHADER_ANALYZE] try_find_size_ok program_base=0x{:X} start=0x{:X} size=0x{:X} cached_size=0x{:X}",
-                self.program_base,
-                self.start_address,
-                size,
-                self.cached_size_bytes(),
-            );
-        }
         Some(common::cityhash::city_hash64(bytes))
     }
 
@@ -437,17 +411,6 @@ impl GenericEnvironment {
             for index in (0..TRY_FIND_SIZE_BLOCK_BYTES).step_by(INST_SIZE) {
                 let inst = self.code[words_offset + index / INST_SIZE];
                 if inst == SELF_BRANCH_A || inst == SELF_BRANCH_B {
-                    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-                        let matched_byte_offset = offset + index;
-                        eprintln!(
-                            "[TRY_FIND_SIZE] sentinel matched at byte_offset=0x{:X} word_index={} sentinel=0x{:016X} (start_address=0x{:X} program_base=0x{:X})",
-                            matched_byte_offset,
-                            words_offset + index / INST_SIZE,
-                            inst,
-                            self.start_address,
-                            self.program_base,
-                        );
-                    }
                     return Some((offset + index) as u64);
                 }
                 if !self.is_proprietary_driver && inst == EXIT_VALUE {
@@ -849,17 +812,6 @@ impl GraphicsEnvironment {
             "GraphicsEnvironment::read_cbuf_value: disabled cbuf {} for stage {}",
             cbuf_index, self.stage_index
         );
-        if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-            eprintln!(
-                "[SHADER_CBUF_READ] stage_index={} cbuf={} offset=0x{:X} addr=0x{:X} size=0x{:X} enabled={}",
-                self.stage_index,
-                cbuf_index,
-                cbuf_offset,
-                binding.address,
-                binding.size,
-                binding.enabled,
-            );
-        }
         let mut value = 0u32;
         if cbuf_offset < binding.size {
             value = self.base.read_u32(binding.address + cbuf_offset as u64);

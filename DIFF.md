@@ -15904,6 +15904,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   prototype and its only consumer, the unused root `rasterizer.rs` CPU-renderer prototype. Neither
   had runtime callers or an Eden counterpart; configured rendering remains owned by the mirrored
   OpenGL, Vulkan, and Null backends, and Maxwell shader translation by `shader_recompiler`.
+- Resolved: removed the unused root `swizzle.rs` CPU detiling prototype. Eden has no matching root
+  module, and Ruzu's live GOB paths remain owned by the mirrored `textures/decoders.rs` and
+  `texture_cache/accelerated_swizzle.rs` modules.
 
 ### Missing items
 
@@ -15912,6 +15915,77 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the removed types were unused host-only placeholder state.
+
+## 2026-08-26 — `src/video_core/src/shader_cache.rs` and `shader_environment.rs` vs Eden `src/video_core/shader_cache.{h,cpp}` and `shader_environment.{h,cpp}`
+
+### Intentional differences
+
+- Rust returns `Option` where Eden returns nullable pointers and uses owned `Box` values plus raw
+  stable pointers to reproduce `unique_ptr` storage ownership.
+- Rust validates missing channel owners and GPU-memory readers because these are optional during
+  isolated tests; the live renderer installs the same owners Eden keeps as references.
+
+### Unintentional differences (to fix)
+
+- Resolved: disabled and non-rasterized shader stages now clear only their unique hash and preserve
+  the cached shader-info slot, matching Eden's `RefreshStages` lifecycle.
+- Resolved: pending-removal and invalidation-page membership now enforce Eden's assertions instead
+  of silently accepting an internally inconsistent shader cache.
+- Resolved: removed the Rust-only shader-stage stall counters and shader-word/analyzer environment
+  tracing from cache refresh, registration, CFG sizing, sentinel lookup, and constant-buffer reads.
+
+### Missing items
+
+- None in the methods changed by this parity pass.
+
+### Binary layout verification
+
+- N/A: these cache entries and environments are host-owned; on-disk environment serialization was
+  not changed by this pass.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/swapchain.rs` vs Eden `src/video_core/renderer_vulkan/vk_swapchain.{h,cpp}`
+
+### Intentional differences
+
+- Eden's frame-generation override is absent because Ruzu does not port that subsystem.
+
+### Unintentional differences (to fix)
+
+- Resolved: Turbo speed mode now unlocks FIFO/FIFO-relaxed presentation and selects Mailbox or
+  Immediate when available, matching `ChooseSwapPresentMode`.
+- Resolved: unavailable Immediate mode now falls back through Mailbox before FIFO, preserving
+  Eden's ordered fallback.
+- Resolved: mutable swapchain view formats now place the selected base surface format first and
+  include the additional RGBA formats on Android.
+
+### Missing items
+
+- Frame-generation-specific presentation policy remains absent with its unported subsystem.
+
+### Binary layout verification
+
+- N/A: Vulkan create-info structures are built through `ash`; the view-format order and count now
+  match Eden on each target.
+
+## 2026-08-26 — `src/video_core/src/engines/sw_blitter/converter.rs` vs Eden `src/video_core/engines/sw_blitter/converter.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu retains the correct FP16 mantissa mask `0x03ff` when unpacking 16-bit floats. Eden uses its
+  sign mask `0x8000` a second time, which discards all ten mantissa bits; reproducing that apparent
+  copy/paste error would corrupt ordinary non-integral FP16 values.
+
+### Unintentional differences (to fix)
+
+- None identified in this focused decision.
+
+### Missing items
+
+- None introduced by retaining the correct FP16 conversion.
+
+### Binary layout verification
+
+- N/A: conversion operates on explicitly decoded scalar words rather than raw host struct copies.
 
 ## 2026-08-26 — Vulkan scheduler tick consumers vs Eden `vk_scheduler.h`, `vk_texture_cache.cpp`, and `vk_query_cache.cpp`
 

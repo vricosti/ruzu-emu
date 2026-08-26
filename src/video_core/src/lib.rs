@@ -44,7 +44,6 @@ pub mod shader_notify;
 pub mod smaa_area_tex;
 pub mod smaa_search_tex;
 pub mod surface;
-pub mod swizzle;
 pub mod syncpoint;
 pub mod texture_cache;
 pub mod textures;

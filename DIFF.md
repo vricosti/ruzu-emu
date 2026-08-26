@@ -15907,6 +15907,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: removed the unused root `swizzle.rs` CPU detiling prototype. Eden has no matching root
   module, and Ruzu's live GOB paths remain owned by the mirrored `textures/decoders.rs` and
   `texture_cache/accelerated_swizzle.rs` modules.
+- Resolved: removed the unused root `syncpoint.rs` prototype. Eden owns this functionality only in
+  `host1x/syncpoint_manager.{h,cpp}`, and every live Ruzu caller already uses the corresponding
+  `host1x/syncpoint_manager.rs` implementation.
 
 ### Missing items
 
@@ -15915,6 +15918,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the removed types were unused host-only placeholder state.
+
+## 2026-08-26 — `src/video_core/src/host1x/syncpoint_manager.rs` vs Eden `src/video_core/host1x/syncpoint_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents Eden's stable `std::list` iterators with monotonic action identifiers and returns
+  `Option<ActionHandle>` for Eden's nullable/default iterator.
+- Rust stores the action lists under the same mutex as the condition-variable guard because
+  `std::sync::Condvar` waits on a mutex guard; guest and host values remain separate atomics.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed environment-controlled syncpoint logging, stderr output, and trace events from
+  registration, increment, action dispatch, and waits. Eden performs only the synchronization and
+  callback operations in this owner.
+
+### Missing items
+
+- None in guest/host value access, action registration and deregistration, increments, readiness,
+  or blocking waits.
+
+### Binary layout verification
+
+- N/A: this is host-only synchronization state and is never copied or serialized as raw bytes.
 
 ## 2026-08-26 — `src/video_core/src/shader_cache.rs` and `shader_environment.rs` vs Eden `src/video_core/shader_cache.{h,cpp}` and `shader_environment.{h,cpp}`
 

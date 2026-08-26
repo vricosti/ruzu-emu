@@ -105,63 +105,17 @@ impl ActionStorage {
     }
 
     /// Fire all actions whose expected_value <= new_value, in order.
-    fn fire_up_to(&mut self, new_value: u32) -> usize {
-        let mut fired = 0;
+    fn fire_up_to(&mut self, new_value: u32) {
         while let Some(front) = self.entries.front() {
             if front.expected_value > new_value {
                 break;
             }
             let mut entry = self.entries.pop_front().unwrap();
             if let Some(action) = entry.action.take() {
-                if should_log_syncpoint_value(entry.expected_value) {
-                    log::info!(
-                        "Host1xSyncpointManager::fire_action expected={} new_value={}",
-                        entry.expected_value,
-                        new_value
-                    );
-                }
                 action();
-                fired += 1;
             }
         }
-        fired
     }
-}
-
-fn trace_syncpoint(
-    stage: u64,
-    is_guest: bool,
-    syncpoint_id: usize,
-    value: u32,
-    current: u32,
-    actions: usize,
-) {
-    if !common::trace::is_enabled(common::trace::cat::HOST1X_SYNCPOINT) {
-        return;
-    }
-    common::trace::emit_raw(
-        common::trace::cat::HOST1X_SYNCPOINT,
-        &[
-            stage,
-            is_guest as u64,
-            syncpoint_id as u64,
-            value as u64,
-            current as u64,
-            actions as u64,
-        ],
-    );
-}
-
-fn trace_syncpoint_after() -> Option<u32> {
-    std::env::var("RUZU_TRACE_SYNCPOINT_AFTER")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-}
-
-fn should_log_syncpoint_value(value: u32) -> bool {
-    trace_syncpoint_after()
-        .map(|threshold| value >= threshold)
-        .unwrap_or_else(|| std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some())
 }
 
 /// Manages syncpoint values and registered wait actions.
@@ -223,20 +177,6 @@ impl SyncpointManager {
         expected_value: u32,
         action: Box<dyn FnOnce() + Send>,
     ) -> Option<ActionHandle> {
-        if should_log_syncpoint_value(expected_value) {
-            log::info!(
-                "Host1xSyncpointManager::register_guest_action id={} expected={} current={}",
-                syncpoint_id,
-                expected_value,
-                self.syncpoints_guest[syncpoint_id as usize].load(Ordering::Acquire)
-            );
-            eprintln!(
-                "[HOST1X_SP] register_guest id={} expected={} current={}",
-                syncpoint_id,
-                expected_value,
-                self.syncpoints_guest[syncpoint_id as usize].load(Ordering::Acquire)
-            );
-        }
         self.register_action(
             &self.syncpoints_guest[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -252,21 +192,6 @@ impl SyncpointManager {
         expected_value: u32,
         action: Box<dyn FnOnce() + Send>,
     ) -> Option<ActionHandle> {
-        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
-            log::info!(
-                "Host1xSyncpointManager::register_host_action id={} expected={}",
-                syncpoint_id,
-                expected_value
-            );
-        }
-        if should_log_syncpoint_value(expected_value) {
-            eprintln!(
-                "[HOST1X_SP] register_host id={} expected={} current={}",
-                syncpoint_id,
-                expected_value,
-                self.syncpoints_host[syncpoint_id as usize].load(Ordering::Acquire)
-            );
-        }
         self.register_action(
             &self.syncpoints_host[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -287,20 +212,6 @@ impl SyncpointManager {
     }
 
     pub fn increment_guest(&self, syncpoint_id: u32) {
-        let before = self.syncpoints_guest[syncpoint_id as usize].load(Ordering::Acquire);
-        if should_log_syncpoint_value(before) || should_log_syncpoint_value(before + 1) {
-            log::info!(
-                "Host1xSyncpointManager::increment_guest id={} before={}",
-                syncpoint_id,
-                before
-            );
-            eprintln!(
-                "[HOST1X_SP] increment_guest id={} before={} after={}",
-                syncpoint_id,
-                before,
-                before + 1
-            );
-        }
         self.increment(
             &self.syncpoints_guest[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -309,20 +220,6 @@ impl SyncpointManager {
     }
 
     pub fn increment_host(&self, syncpoint_id: u32) {
-        let before = self.syncpoints_host[syncpoint_id as usize].load(Ordering::Acquire);
-        if should_log_syncpoint_value(before) || should_log_syncpoint_value(before + 1) {
-            log::info!(
-                "Host1xSyncpointManager::increment_host id={} before={}",
-                syncpoint_id,
-                before
-            );
-            eprintln!(
-                "[HOST1X_SP] increment_host id={} before={} after={}",
-                syncpoint_id,
-                before,
-                before + 1
-            );
-        }
         self.increment(
             &self.syncpoints_host[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -334,26 +231,14 @@ impl SyncpointManager {
         self.wait(
             &self.syncpoints_guest[syncpoint_id as usize],
             &self.wait_guest_cv,
-            syncpoint_id as usize,
-            true,
             expected_value,
         );
     }
 
     pub fn wait_host(&self, syncpoint_id: u32, expected_value: u32) {
-        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
-            log::info!(
-                "Host1xSyncpointManager::wait_host id={} expected={} current={}",
-                syncpoint_id,
-                expected_value,
-                self.syncpoints_host[syncpoint_id as usize].load(Ordering::Acquire)
-            );
-        }
         self.wait(
             &self.syncpoints_host[syncpoint_id as usize],
             &self.wait_host_cv,
-            syncpoint_id as usize,
-            false,
             expected_value,
         );
     }
@@ -379,7 +264,6 @@ impl SyncpointManager {
         // Fast path: already reached.
         let current = syncpoint.load(Ordering::Acquire);
         if current >= expected_value {
-            trace_syncpoint(2, is_guest, storage_idx, expected_value, current, 1);
             action();
             return None;
         }
@@ -389,7 +273,6 @@ impl SyncpointManager {
         // Double-check under lock (relaxed is fine here, matching upstream).
         let current = syncpoint.load(Ordering::Relaxed);
         if current >= expected_value {
-            trace_syncpoint(2, is_guest, storage_idx, expected_value, current, 1);
             action();
             return None;
         }
@@ -400,9 +283,7 @@ impl SyncpointManager {
             &mut inner.host_action_storage[storage_idx]
         };
 
-        let handle = storage.insert(expected_value, action);
-        trace_syncpoint(1, is_guest, storage_idx, expected_value, current, 0);
-        Some(handle)
+        Some(storage.insert(expected_value, action))
     }
 
     fn increment(&self, syncpoint: &AtomicU32, storage_idx: usize, is_guest: bool) {
@@ -414,8 +295,7 @@ impl SyncpointManager {
         } else {
             &mut inner.host_action_storage[storage_idx]
         };
-        let fired = storage.fire_up_to(new_value);
-        trace_syncpoint(3, is_guest, storage_idx, new_value, new_value, fired);
+        storage.fire_up_to(new_value);
 
         // Notify waiters.
         if is_guest {
@@ -429,46 +309,15 @@ impl SyncpointManager {
         &self,
         syncpoint: &AtomicU32,
         cv: &Condvar,
-        storage_idx: usize,
-        is_guest: bool,
         expected_value: u32,
     ) {
-        let current = syncpoint.load(Ordering::Acquire);
-        trace_syncpoint(4, is_guest, storage_idx, expected_value, current, 0);
-        if should_log_syncpoint_value(expected_value) || should_log_syncpoint_value(current) {
-            eprintln!(
-                "[HOST1X_SP] wait_{} id={} expected={} current={}",
-                if is_guest { "guest" } else { "host" },
-                storage_idx,
-                expected_value,
-                current
-            );
-        }
-        if current >= expected_value {
-            trace_syncpoint(5, is_guest, storage_idx, expected_value, current, 0);
+        if syncpoint.load(Ordering::Acquire) >= expected_value {
             return;
         }
 
         let mut inner = self.guard.lock().unwrap();
         while syncpoint.load(Ordering::Acquire) < expected_value {
             inner = cv.wait(inner).unwrap();
-        }
-        trace_syncpoint(
-            5,
-            is_guest,
-            storage_idx,
-            expected_value,
-            syncpoint.load(Ordering::Acquire),
-            0,
-        );
-        if should_log_syncpoint_value(expected_value) {
-            eprintln!(
-                "[HOST1X_SP] wait_{} done id={} expected={} current={}",
-                if is_guest { "guest" } else { "host" },
-                storage_idx,
-                expected_value,
-                syncpoint.load(Ordering::Acquire)
-            );
         }
     }
 }

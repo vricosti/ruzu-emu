@@ -417,43 +417,6 @@ impl Gpu {
         }
     }
 
-    /// Install a GPU VA → CPU VA translator on the renderer. The
-    /// translator uses the GPU's currently bound channel's MemoryManager
-    /// to resolve a GPU VA. Rasterizer code (e.g. RasterizerNull::query)
-    /// uses this before calling `guest_memory_writer` so the eventual
-    /// `Memory::write_block` receives a valid CPU VA.
-    ///
-    /// `gpu_ptr` is a raw `*const Gpu` provided by the caller (typically
-    /// from `Box::as_ref()`). The caller must ensure the Gpu outlives the
-    /// renderer — this matches the existing pattern in `ruzu_cmd` where a
-    /// `*const Gpu` is captured for service callbacks (see `gpu_ptr` in
-    /// `src/ruzu_cmd/src/main.rs`).
-    ///
-    /// # Safety
-    ///
-    /// `gpu_ptr` must point to a live `Gpu` that outlives all rasterizer
-    /// invocations.
-    pub unsafe fn install_gpu_to_cpu_translator(&self, gpu_ptr: *const Gpu) {
-        let gpu_ptr_usize = gpu_ptr as usize;
-        let translator: Arc<dyn Fn(u64) -> Option<u64> + Send + Sync> =
-            Arc::new(move |gpu_va: u64| -> Option<u64> {
-                let gpu = unsafe { &*(gpu_ptr_usize as *const Gpu) };
-                let bound = *gpu.bound_channel.lock().unwrap();
-                if bound < 0 {
-                    return None;
-                }
-                let channel_arc = gpu.channels.lock().unwrap().get(&bound).cloned()?;
-                let channel = channel_arc.lock();
-                let mm_arc = channel.memory_manager.as_ref()?.clone();
-                drop(channel);
-                let result = mm_arc.lock().gpu_to_cpu_address(gpu_va);
-                result
-            });
-        if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
-            renderer.set_gpu_to_cpu_translator(translator);
-        }
-    }
-
     /// Write guest memory at the given CPU/device address.
     pub fn write_guest_memory(&self, addr: u64, data: &[u8]) {
         let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() else {

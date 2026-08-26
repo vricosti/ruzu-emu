@@ -127,18 +127,6 @@ pub trait RendererBase: Send {
 
     /// Install the callback implementing upstream `gpu.InvalidateGPUCache()`.
     fn set_invalidate_gpu_cache_callback(&mut self, _callback: InvalidateGpuCacheCallback) {}
-
-    /// Install a GPU VA → CPU VA translator used by rasterizer-side
-    /// query writes. Mirrors upstream's `gpu_memory->Write<u64>(gpu_va,
-    /// ...)`: the rasterizer receives GPU VAs from the puller and must
-    /// translate to CPU VAs before passing them to `guest_memory_writer`
-    /// (which expects CPU VAs, since it ultimately calls
-    /// `Memory::write_block`).
-    fn set_gpu_to_cpu_translator(
-        &mut self,
-        _translator: std::sync::Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>,
-    ) {
-    }
 }
 
 /// Concrete base renderer data, shared by all renderer implementations.

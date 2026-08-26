@@ -134,19 +134,8 @@ impl RendererBase for RendererNull {
         callback(false);
     }
 
-    fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
-        self.rasterizer.set_guest_memory_writer(writer);
-    }
-
     fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
         self.rasterizer.set_gpu_ticks_getter(getter);
-    }
-
-    fn set_gpu_to_cpu_translator(
-        &mut self,
-        translator: std::sync::Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>,
-    ) {
-        self.rasterizer.set_gpu_to_cpu_translator(translator);
     }
 }
 

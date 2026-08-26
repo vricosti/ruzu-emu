@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_null/null_rasterizer.h and null_rasterizer.cpp
+//! Port of Eden's video_core/renderer_null/null_rasterizer.h and null_rasterizer.cpp
 //! Status: COMPLET
 //!
 //! Null rasterizer — all drawing and rendering operations are no-ops.
@@ -10,21 +10,21 @@
 
 use std::sync::Arc;
 
-use log::trace;
-
 use crate::cache_types::CacheType;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::query_cache::types::QueryPropertiesFlags;
-use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+use crate::rasterizer_interface::{
+    DiskResourceLoadCallback, DiskResourceLoadStop, RasterizerDownloadArea, RasterizerInterface,
+};
 
 // ── AccelerateDMA ──────────────────────────────────────────────────────────
 
 /// Null DMA accelerator — claims all DMA operations succeed without doing work.
 ///
-/// Corresponds to zuyu's `Null::AccelerateDMA`.
+/// Corresponds to Eden's `Null::AccelerateDMA`.
 pub struct AccelerateDMA;
 
 impl AccelerateDMA {
@@ -40,16 +40,6 @@ impl AccelerateDMA {
     /// Pretend buffer clear succeeded.
     pub fn buffer_clear(&self, _src_address: u64, _amount: u64, _value: u32) -> bool {
         true
-    }
-
-    /// Image-to-buffer copy: not accelerated in null backend.
-    pub fn image_to_buffer(&self) -> bool {
-        false
-    }
-
-    /// Buffer-to-image copy: not accelerated in null backend.
-    pub fn buffer_to_image(&self) -> bool {
-        false
     }
 }
 
@@ -91,29 +81,14 @@ impl AccelerateDMAInterface for AccelerateDMA {
 
 /// Null rasterizer — all rendering operations are no-ops.
 ///
-/// Corresponds to zuyu's `Null::RasterizerNull`.
+/// Corresponds to Eden's `Null::RasterizerNull`.
 /// Implements [`RasterizerInterface`] with stub implementations.
 /// Functional side effects (queries, fences, syncpoints) are preserved.
-/// GPU virtual address → CPU virtual address translator.
-///
-/// Calls into the active GPU channel's `MemoryManager::gpu_to_cpu_address`.
-/// Returns `None` if the GPU VA is not currently mapped in the channel's
-/// page table.
-pub type GpuToCpuTranslator = Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>;
-
 pub struct RasterizerNull {
     syncpoints: Arc<SyncpointManager>,
     accelerate_dma: AccelerateDMA,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
-    guest_memory_writer: Option<crate::renderer_base::GuestMemoryWriter>,
     gpu_ticks_getter: Option<crate::renderer_base::GpuTicksGetter>,
-    /// Translates GPU VAs to CPU VAs. Upstream's `RasterizerNull::Query`
-    /// calls `gpu_memory->Write<u64>(gpu_addr, ...)` where `gpu_memory`
-    /// is a `Tegra::MemoryManager` that handles GPU VA → CPU VA
-    /// translation internally. Ruzu's `guest_memory_writer` expects a
-    /// CPU VA, so we must translate first via this hook. Without it,
-    /// addresses (the GPU VA being passed verbatim to write_block).
-    gpu_to_cpu: Option<GpuToCpuTranslator>,
     #[cfg(test)]
     inline_upload_callback: Option<Box<dyn FnMut(u64, usize, &[u8]) + Send>>,
     #[cfg(test)]
@@ -126,9 +101,7 @@ impl RasterizerNull {
             syncpoints,
             accelerate_dma: AccelerateDMA::new(),
             channel_caches: ChannelSetupCaches::new(),
-            guest_memory_writer: None,
             gpu_ticks_getter: None,
-            gpu_to_cpu: None,
             #[cfg(test)]
             inline_upload_callback: None,
             #[cfg(test)]
@@ -139,15 +112,6 @@ impl RasterizerNull {
     /// Access the DMA accelerator.
     pub fn access_accelerate_dma(&mut self) -> &mut AccelerateDMA {
         &mut self.accelerate_dma
-    }
-
-    pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
-        self.guest_memory_writer = Some(writer);
-    }
-
-    /// Register a GPU VA → CPU VA translator. See [`GpuToCpuTranslator`].
-    pub fn set_gpu_to_cpu_translator(&mut self, translator: GpuToCpuTranslator) {
-        self.gpu_to_cpu = Some(translator);
     }
 
     pub fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
@@ -176,14 +140,12 @@ impl RasterizerInterface for RasterizerNull {
         _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
         _instance_count: u32,
     ) {
-        trace!("RasterizerNull::draw (no-op)");
     }
 
     fn draw_texture(
         &mut self,
         _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
     ) {
-        trace!("RasterizerNull::draw_texture (no-op)");
     }
 
     fn clear(
@@ -191,12 +153,9 @@ impl RasterizerInterface for RasterizerNull {
         _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
         _layer_count: u32,
     ) {
-        trace!("RasterizerNull::clear (no-op)");
     }
 
-    fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {
-        trace!("RasterizerNull::dispatch_compute (no-op)");
-    }
+    fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
 
     // ── Queries ─────────────────────────────────────────────────────────
 
@@ -204,7 +163,7 @@ impl RasterizerInterface for RasterizerNull {
 
     /// Write query result to GPU memory.
     ///
-    /// Matches zuyu: if `has_timeout` is true, writes a u64 ticks value at
+    /// Matches Eden: if `has_timeout` is true, writes a u64 ticks value at
     /// gpu_addr+8 and the payload as u64 at gpu_addr. Otherwise writes
     /// payload as u32 at gpu_addr.
     fn query(
@@ -215,47 +174,21 @@ impl RasterizerInterface for RasterizerNull {
         payload: u32,
         _subreport: u32,
     ) {
-        let Some(gpu_write) = self.guest_memory_writer.as_ref().cloned() else {
+        let Some(gpu_memory) = self.channel_caches.gpu_memory.as_ref() else {
             return;
         };
-        // Translate GPU VA → CPU VA via the channel's MemoryManager,
-        // matching upstream's `gpu_memory->Write<u64>(gpu_addr, ...)`
-        // semantics. Without translation, the puller's GPU-VA argument
-        // is passed straight to write_block (which expects CPU VA) and
-        // we get "Unmapped WriteBlock" on what looks like a high
-        // 36-bit address (the unmapped GPU VA).
-        let translate =
-            |gpu_va: u64| -> Option<u64> { self.gpu_to_cpu.as_ref().and_then(|f| f(gpu_va)) };
+        let mut gpu_memory = gpu_memory.lock();
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
-            let gpu_ticks = self
+            let gpu_ticks_getter = self
                 .gpu_ticks_getter
                 .as_ref()
-                .map(|getter| getter())
-                .unwrap_or(0);
-            if let Some(cpu) = translate(gpu_addr + 8) {
-                gpu_write(cpu, &gpu_ticks.to_le_bytes());
-            } else {
-                log::error!(
-                    "RasterizerNull::query: GPU VA 0x{:X}+8 has no CPU mapping (ticks write skipped)",
-                    gpu_addr
-                );
-            }
-            if let Some(cpu) = translate(gpu_addr) {
-                gpu_write(cpu, &(payload as u64).to_le_bytes());
-            } else {
-                log::error!(
-                    "RasterizerNull::query: GPU VA 0x{:X} has no CPU mapping (payload write skipped)",
-                    gpu_addr
-                );
-            }
-        } else if let Some(cpu) = translate(gpu_addr) {
-            gpu_write(cpu, &payload.to_le_bytes());
+                .expect("null rasterizer must be bound to its GPU tick owner");
+            let gpu_ticks = gpu_ticks_getter();
+            gpu_memory.write::<u64>(gpu_addr + 8, gpu_ticks);
+            gpu_memory.write::<u64>(gpu_addr, payload as u64);
         } else {
-            log::error!(
-                "RasterizerNull::query: GPU VA 0x{:X} has no CPU mapping (u32 payload write skipped)",
-                gpu_addr
-            );
+            gpu_memory.write::<u32>(gpu_addr, payload);
         }
     }
 
@@ -286,7 +219,7 @@ impl RasterizerInterface for RasterizerNull {
 
     /// Increment the syncpoint value.
     ///
-    /// Matches zuyu's `RasterizerNull::SignalSyncPoint()` which increments
+    /// Matches Eden's `RasterizerNull::SignalSyncPoint()` which increments
     /// both guest and host syncpoints through Host1x.
     fn signal_sync_point(&mut self, id: u32) {
         self.syncpoints.increment_guest(id);
@@ -312,7 +245,8 @@ impl RasterizerInterface for RasterizerNull {
         const DEVICE_PAGESIZE: u64 = 4096;
         RasterizerDownloadArea {
             start_address: addr & !(DEVICE_PAGESIZE - 1),
-            end_address: (addr + size + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1),
+            end_address: addr.wrapping_add(size).wrapping_add(DEVICE_PAGESIZE - 1)
+                & !(DEVICE_PAGESIZE - 1),
             preemptive: true,
         }
     }
@@ -372,6 +306,14 @@ impl RasterizerInterface for RasterizerNull {
         &mut self.accelerate_dma
     }
 
+    fn load_disk_resources(
+        &mut self,
+        _title_id: u64,
+        _stop_loading: DiskResourceLoadStop,
+        _callback: DiskResourceLoadCallback,
+    ) {
+    }
+
     // ── Channel management ──────────────────────────────────────────────
 
     fn initialize_channel(&mut self, channel: &mut ChannelState) {
@@ -390,6 +332,39 @@ impl RasterizerInterface for RasterizerNull {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bind_test_memory(rasterizer: &mut RasterizerNull) -> Vec<u8> {
+        use parking_lot::Mutex;
+
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let mut backing = vec![0u8; 0x4000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut memory = crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+            3,
+            device_memory,
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        memory.map(0x1000, 0x9000_0000, backing.len() as u64, 0, false);
+
+        let mut channel = ChannelState::new(9);
+        channel.memory_manager = Some(Arc::new(Mutex::new(memory)));
+        rasterizer.initialize_channel(&mut channel);
+        rasterizer.bind_channel(&mut channel);
+        backing
+    }
 
     #[test]
     fn test_rasterizer_null_noop() {
@@ -455,60 +430,35 @@ mod tests {
     fn test_query_without_timeout() {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
-
-        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let written_cb = Arc::clone(&written);
-        rast.set_guest_memory_writer(Arc::new(move |addr, data| {
-            written_cb.lock().unwrap().push((addr, data.to_vec()));
-        }));
-        rast.set_gpu_to_cpu_translator(Arc::new(Some));
+        let backing = bind_test_memory(&mut rast);
         rast.query(0x1000, 0, QueryPropertiesFlags::empty(), 42, 0);
 
-        let w = written.lock().unwrap();
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].0, 0x1000);
-        assert_eq!(w[0].1, 42u32.to_le_bytes().to_vec());
+        assert_eq!(&backing[..4], &42u32.to_ne_bytes());
     }
 
     #[test]
     fn test_query_with_timeout() {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
-
-        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let written_cb = Arc::clone(&written);
-        rast.set_guest_memory_writer(Arc::new(move |addr, data| {
-            written_cb.lock().unwrap().push((addr, data.to_vec()));
-        }));
-        rast.set_gpu_to_cpu_translator(Arc::new(Some));
+        let backing = bind_test_memory(&mut rast);
         rast.set_gpu_ticks_getter(Arc::new(|| 0x1234_5678_9ABC_DEF0));
         rast.query(0x2000, 0, QueryPropertiesFlags::HAS_TIMEOUT, 99, 0);
 
-        let w = written.lock().unwrap();
-        assert_eq!(w.len(), 2);
-        assert_eq!(w[0].0, 0x2008);
-        assert_eq!(w[0].1, 0x1234_5678_9ABC_DEF0u64.to_le_bytes().to_vec());
-        assert_eq!(w[1].0, 0x2000);
-        assert_eq!(w[1].1, 99u64.to_le_bytes().to_vec());
+        assert_eq!(&backing[0x1000..0x1008], &99u64.to_ne_bytes());
+        assert_eq!(
+            &backing[0x1008..0x1010],
+            &0x1234_5678_9ABC_DEF0u64.to_ne_bytes()
+        );
     }
 
     #[test]
     fn test_query_non_payload_preserves_payload() {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
-
-        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let written_cb = Arc::clone(&written);
-        rast.set_guest_memory_writer(Arc::new(move |addr, data| {
-            written_cb.lock().unwrap().push((addr, data.to_vec()));
-        }));
-        rast.set_gpu_to_cpu_translator(Arc::new(Some));
+        let backing = bind_test_memory(&mut rast);
         rast.query(0x3000, 2, QueryPropertiesFlags::empty(), 0xDEAD_BEEF, 0);
 
-        let w = written.lock().unwrap();
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].0, 0x3000);
-        assert_eq!(w[0].1, 0xDEAD_BEEFu32.to_le_bytes().to_vec());
+        assert_eq!(&backing[0x2000..0x2004], &0xDEAD_BEEFu32.to_ne_bytes());
     }
 
     #[test]
@@ -520,15 +470,26 @@ mod tests {
         assert_eq!(area.start_address, 0x1000);
         assert_eq!(area.end_address, 0x2000);
         assert!(area.preemptive);
+
+        let wrapped = rast.get_flush_area(u64::MAX - 0x100, 0x200);
+        assert_eq!(wrapped.start_address, u64::MAX & !0xfff);
+        assert_eq!(wrapped.end_address, 0x1000);
     }
 
     #[test]
     fn test_accelerate_dma() {
-        let dma = AccelerateDMA::new();
+        let mut dma = AccelerateDMA::new();
         assert!(dma.buffer_copy(0, 0x1000, 0x1000));
         assert!(dma.buffer_clear(0, 0x1000, 0));
-        assert!(!dma.image_to_buffer());
-        assert!(!dma.buffer_to_image());
+        let copy = dma::ImageCopy::default();
+        let image = dma::ImageOperand::default();
+        let buffer = dma::BufferOperand::default();
+        assert!(!AccelerateDMAInterface::image_to_buffer(
+            &mut dma, &copy, &image, &buffer
+        ));
+        assert!(!AccelerateDMAInterface::buffer_to_image(
+            &mut dma, &copy, &buffer, &image
+        ));
     }
 
     #[test]

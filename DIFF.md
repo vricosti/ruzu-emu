@@ -15479,3 +15479,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the removed marker type and trait carried no ABI payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_null/null_rasterizer.rs` vs Eden `src/video_core/renderer_null/null_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu stores the syncpoint manager and a GPU-tick callback instead of Eden's `Tegra::GPU&`,
+  following the existing Rust renderer ownership boundary while preserving the two uses of that
+  reference: `GetTicks()` and Host1x syncpoint increments.
+- Test-only inline-upload and surface-copy controls exercise callers without changing production
+  behavior; non-test builds retain Eden's no-op upload and unconditional successful surface copy.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Query` now writes through the currently bound channel's `MemoryManager`, in Eden's
+  ticks-then-payload order, instead of routing GPU addresses through a global raw-pointer
+  translation callback and the CPU-address guest-memory writer.
+- Resolved: the null draw, texture draw, clear, and compute-dispatch paths are true no-ops without
+  extra trace logging, and `LoadDiskResources` is explicitly implemented by its upstream owner.
+- Resolved: flush-area alignment uses wrapping unsigned arithmetic like C++, stale source-tree
+  references were corrected, and duplicate parameterless DMA image helpers were removed.
+
+### Missing items
+
+- None among the `AccelerateDMA` and `RasterizerNull` overrides declared by Eden.
+
+### Binary layout verification
+
+- N/A: these renderer objects and callbacks are host-only and are not raw-copied or serialized.

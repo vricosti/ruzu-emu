@@ -1384,19 +1384,6 @@ fn main() {
                 }
             }
         }));
-        // Install GPU VA → CPU VA translator on the renderer so
-        // rasterizer-side query writes (e.g. semaphore_trigger) translate
-        // GPU VAs into CPU VAs before reaching `guest_memory_writer`.
-        // addresses (the GPU VA is passed straight through).
-        //
-        // SAFETY: `gpu_ptr` points to the Box<Gpu> we're about to move
-        // into `system.set_gpu_core`. System owns the Gpu for the full
-        // emulation lifetime; the translator closure is also bound by
-        // that lifetime via the renderer. The renderer is dropped on
-        // System shutdown before the Gpu is dropped.
-        let gpu_ptr_for_translator = gpu.as_ref() as *const video_core::gpu::Gpu;
-        unsafe { gpu.install_gpu_to_cpu_translator(gpu_ptr_for_translator) };
-
         system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)

@@ -826,10 +826,6 @@ fn run_boot(
             }
         }));
 
-        // GPU VA → CPU VA translator for rasterizer-side query writes.
-        let gpu_ptr_for_translator = gpu.as_ref() as *const video_core::gpu::Gpu;
-        unsafe { gpu.install_gpu_to_cpu_translator(gpu_ptr_for_translator) };
-
         system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283).

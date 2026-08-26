@@ -13593,21 +13593,43 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None after removing the non-upstream descriptor payload early return, using the backend
+- None after restoring Eden's compute-pipeline creation and bind GPU-logging hooks, removing the
+  non-upstream descriptor payload early return, using the backend
   `ImageView::buffer_size` value instead of recomputing it, restoring the retained pipeline-cache
   member and `is_bound`, matching the relaxed build-state publication, and destroying the
   descriptor update template before its pipeline/set layouts in Eden's RAII order.
 
 ### Missing items
 
-- Eden's optional GPU logging calls for compute-pipeline creation, binding, and dispatch are not
-  present because Ruzu has not yet ported the `video_core/gpu_logging` subsystem. This does not
-  alter descriptor construction or Vulkan command emission.
+- None in `ComputePipeline`. Compute dispatch logging remains owned by the Vulkan rasterizer, as in
+  Eden, and is covered by its separate parity entry.
 
 ### Binary layout verification
 
 - N/A: `ComputePipeline` is host-only ownership/synchronization state and is never copied or
   serialized as raw bytes. Descriptor binding order remains covered by the focused test.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.h` and `.cpp`
+
+### Intentional differences
+
+- Rust calls the same process-wide GPU logger through free functions returning the singleton;
+  Eden spells the access as `GPU::Logging::GPULogger::GetInstance()`.
+
+### Unintentional differences (to fix)
+
+- None after logging successful compute-pipeline creation immediately before statistics
+  collection and logging compute-pipeline binding after the asynchronous build wait and before
+  descriptor data preparation, with Eden's exact activation and Vulkan-call setting guards.
+
+### Missing items
+
+- None in the GPU-logging hooks owned by `ComputePipeline`.
+
+### Binary layout verification
+
+- N/A: the change only adds calls around existing Vulkan pipeline lifecycle points and does not
+  alter any raw-copied or serialized structure.
 
 ## 2026-08-26 — `src/video_core/src/host_shaders/compute_shaders.rs` and compute `.comp` files vs Eden `src/video_core/host_shaders/*.comp`
 

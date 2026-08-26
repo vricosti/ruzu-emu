@@ -19,6 +19,7 @@ use shader_recompiler::shader_info::{
     TextureBufferDescriptor, TextureDescriptor,
 };
 
+use crate::gpu_logging::{get_instance, is_active};
 use crate::shader_notify::ShaderNotifyHandle;
 
 use super::buffer_cache::VulkanCommonBufferCache;
@@ -329,6 +330,9 @@ impl ComputePipeline {
                 {
                     let created = pipelines[0];
                     *pipeline.lock().unwrap() = created;
+                    if is_active() {
+                        get_instance().log_pipeline_state_change("ComputePipeline created");
+                    }
                     if let Some(statistics) = &pipeline_statistics {
                         statistics.collect(device_ref.get(), created);
                     }
@@ -512,6 +516,9 @@ impl ComputePipeline {
                     .wait_while(lock, |_| !is_built.load(Ordering::Relaxed))
                     .unwrap();
             });
+        }
+        if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+            get_instance().log_pipeline_bind(true, "compute pipeline");
         }
         let descriptor_data = descriptor_queue.update_data();
         let mut descriptor_buffer_offset = 0;

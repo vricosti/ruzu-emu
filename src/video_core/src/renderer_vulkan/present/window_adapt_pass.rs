@@ -52,30 +52,27 @@ impl WindowAdaptPass {
         sampler: vk::Sampler,
         fragment_shader: vk::ShaderModule,
     ) -> Self {
-        let descriptor_set_layout = Self::create_descriptor_set_layout(device);
-        let pipeline_layout = Self::create_pipeline_layout(device, descriptor_set_layout);
-        let vertex_shader = Self::create_vertex_shader(device);
-        let render_pass = Self::create_render_pass(device, frame_format);
-        let (opaque_pipeline, premultiplied_pipeline, coverage_pipeline) = Self::create_pipelines(
-            device,
-            render_pass,
-            pipeline_layout,
-            vertex_shader,
-            fragment_shader,
-        );
-
-        WindowAdaptPass {
+        // Construct the owner before creating its remaining handles. If any
+        // creation panics, Drop releases the already-created resources just as
+        // upstream's RAII members do while unwinding the constructor.
+        let mut pass = WindowAdaptPass {
             device: device.get_logical().clone(),
-            descriptor_set_layout,
-            pipeline_layout,
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
             sampler,
-            vertex_shader,
+            vertex_shader: vk::ShaderModule::null(),
             fragment_shader,
-            render_pass,
-            opaque_pipeline,
-            premultiplied_pipeline,
-            coverage_pipeline,
-        }
+            render_pass: vk::RenderPass::null(),
+            opaque_pipeline: vk::Pipeline::null(),
+            premultiplied_pipeline: vk::Pipeline::null(),
+            coverage_pipeline: vk::Pipeline::null(),
+        };
+        pass.descriptor_set_layout = Self::create_descriptor_set_layout(device);
+        pass.pipeline_layout = Self::create_pipeline_layout(device, pass.descriptor_set_layout);
+        pass.vertex_shader = Self::create_vertex_shader(device);
+        pass.render_pass = Self::create_render_pass(device, frame_format);
+        pass.create_pipelines(device);
+        pass
     }
 
     /// Port of `WindowAdaptPass::CreateDescriptorSetLayout`.
@@ -122,36 +119,28 @@ impl WindowAdaptPass {
     }
 
     /// Port of `WindowAdaptPass::CreatePipelines`.
-    fn create_pipelines(
-        device: &Device,
-        render_pass: vk::RenderPass,
-        pipeline_layout: vk::PipelineLayout,
-        vertex_shader: vk::ShaderModule,
-        fragment_shader: vk::ShaderModule,
-    ) -> (vk::Pipeline, vk::Pipeline, vk::Pipeline) {
-        (
-            util::create_wrapped_pipeline(
-                device,
-                render_pass,
-                pipeline_layout,
-                vertex_shader,
-                fragment_shader,
-            ),
-            util::create_wrapped_premultiplied_blending_pipeline(
-                device,
-                render_pass,
-                pipeline_layout,
-                vertex_shader,
-                fragment_shader,
-            ),
-            util::create_wrapped_coverage_blending_pipeline(
-                device,
-                render_pass,
-                pipeline_layout,
-                vertex_shader,
-                fragment_shader,
-            ),
-        )
+    fn create_pipelines(&mut self, device: &Device) {
+        self.opaque_pipeline = util::create_wrapped_pipeline(
+            device,
+            self.render_pass,
+            self.pipeline_layout,
+            self.vertex_shader,
+            self.fragment_shader,
+        );
+        self.premultiplied_pipeline = util::create_wrapped_premultiplied_blending_pipeline(
+            device,
+            self.render_pass,
+            self.pipeline_layout,
+            self.vertex_shader,
+            self.fragment_shader,
+        );
+        self.coverage_pipeline = util::create_wrapped_coverage_blending_pipeline(
+            device,
+            self.render_pass,
+            self.pipeline_layout,
+            self.vertex_shader,
+            self.fragment_shader,
+        );
     }
 
     /// Port of `WindowAdaptPass::GetDescriptorSetLayout`.

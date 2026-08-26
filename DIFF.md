@@ -17329,3 +17329,33 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: these methods forward existing Ash handles and property payloads without serialization.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/window_adapt_pass.rs` vs Eden `src/video_core/renderer_vulkan/present/window_adapt_pass.{h,cpp}`
+
+### Intentional differences
+
+- Ash raw handles plus an explicit `Drop` implementation replace Eden's move-only Vulkan wrapper
+  members. The Rust owner is established before resource creation so panic unwinding releases the
+  same successfully created resources as C++ constructor exception unwinding.
+- Rust's `LinkedList<Layer>` is the direct standard-library counterpart of Eden's
+  `std::list<Layer>` at this interface boundary.
+
+### Unintentional differences (to fix)
+
+- Resolved: construction no longer creates raw handles as unowned locals before assembling the
+  pass; every successfully created handle, including the moved sampler and fragment shader, is
+  owned and cleaned up if a later creation fails.
+- Resolved: the three presentation pipelines are assigned sequentially to the owner, so failure
+  while creating the second or third pipeline cannot leak an earlier one.
+- The report's claimed caller-side layer preconfiguration is obsolete: `draw` already owns
+  `configure_draw`, pipeline selection, command recording, and draw ordering exactly as Eden does.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `PresentPushConstants` is `repr(C)` and exactly 128 bytes (a 64-byte matrix followed by
+  four 16-byte vectors); the complete payload is passed to Vulkan with the same vertex-stage range
+  as Eden. All Vulkan create-info layouts remain owned by Ash.

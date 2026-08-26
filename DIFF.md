@@ -15699,3 +15699,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: every rasterizer backend now returns the same `RasterizerDownloadArea` owner with Eden's
   `u64`, `u64`, `bool` field order; the structure is not copied as a raw guest payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/render_pass_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_render_pass_cache.{h,cpp}`
+
+### Intentional differences
+
+- Vulkan creation failures use `Result` instead of C++ exceptions, and raw `VkRenderPass` handles
+  are destroyed explicitly by `Drop` rather than by Eden's move-only wrapper.
+- Rust uses `HashMap` and growable attachment vectors in place of
+  `ankerl::unordered_dense::map` and `boost::container::static_vector`; key equality and attachment
+  ordering are unchanged and these containers are not externally observable.
+
+### Unintentional differences (to fix)
+
+- Resolved: a render-pass key is now inserted before Vulkan creation. A failed creation leaves a
+  cached null handle, so later lookups return null without retrying, matching Eden's
+  `try_emplace`-before-`CreateRenderPass` lifecycle.
+
+### Missing items
+
+- None in render-pass keying, attachment/reference construction, resolve handling, self-dependency,
+  or cache lifecycle.
+
+### Binary layout verification
+
+- N/A: `RenderPassKey` and cached Vulkan handles are host-only and are not serialized or copied to
+  guest memory.

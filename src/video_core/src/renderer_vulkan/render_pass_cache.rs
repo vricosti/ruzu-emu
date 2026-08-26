@@ -99,7 +99,7 @@ impl Default for RenderPassKey {
 /// the render target format configuration hasn't changed.
 pub struct RenderPassCache {
     device: NonNull<Device>,
-    cache: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
+    cache: Mutex<HashMap<RenderPassKey, Option<vk::RenderPass>>>,
 }
 
 // SAFETY: the pointed-to `Device` is boxed by `RendererVulkan` and outlives
@@ -125,17 +125,18 @@ impl RenderPassCache {
     /// Get or create a VkRenderPass for the given key.
     pub fn get(&self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
         let mut cache = self.cache.lock().expect("render-pass cache mutex poisoned");
-        if let Some(&rp) = cache.get(key) {
-            return Ok(rp);
+        if let Some(render_pass) = cache.get(key) {
+            return Ok(render_pass.unwrap_or(vk::RenderPass::null()));
         }
 
-        let rp = self.create_render_pass(key)?;
-        cache.insert(key.clone(), rp);
+        cache.insert(key.clone(), None);
+        let render_pass = self.create_render_pass(key)?;
+        cache.insert(key.clone(), Some(render_pass));
         debug!(
             "RenderPassCache: created new render pass (depth={:?})",
             key.depth_format,
         );
-        Ok(rp)
+        Ok(render_pass)
     }
 
     /// Port of the anonymous-namespace `AttachmentDescription` helper in
@@ -307,9 +308,11 @@ impl Drop for RenderPassCache {
             .cache
             .get_mut()
             .expect("render-pass cache mutex poisoned");
-        for (_, rp) in cache.drain() {
-            unsafe {
-                device.destroy_render_pass(rp, None);
+        for (_, render_pass) in cache.drain() {
+            if let Some(render_pass) = render_pass {
+                unsafe {
+                    device.destroy_render_pass(render_pass, None);
+                }
             }
         }
     }
@@ -317,6 +320,8 @@ impl Drop for RenderPassCache {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::ManuallyDrop;
+
     use super::*;
 
     #[test]
@@ -332,6 +337,17 @@ mod tests {
         assert_eq!(key.color_clear_mask, 0);
         assert!(!key.depth_stencil_clear);
         assert_eq!(key.color_discard_mask, 0);
+    }
+
+    #[test]
+    fn failed_render_pass_entry_is_returned_as_null_without_retrying_creation() {
+        let key = RenderPassKey::default();
+        let cache = ManuallyDrop::new(RenderPassCache {
+            device: NonNull::dangling(),
+            cache: Mutex::new(HashMap::from([(key.clone(), None)])),
+        });
+
+        assert_eq!(cache.get(&key), Ok(vk::RenderPass::null()));
     }
 
     #[test]

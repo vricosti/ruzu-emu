@@ -4604,8 +4604,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Missing items
 
-- Eden additionally forwards validation messages to `GPU::Logging::GPULogger` when Vulkan-call
-  logging is active. Ruzu does not yet have that GPU logging subsystem.
+- Resolved by the 2026-08-26 GPU-logging parity pass recorded below: validation messages are now
+  forwarded when Vulkan-call logging is active.
 
 ## 2026-08-22 — `src/core/src/device_memory_manager.rs` vs `src/core/device_memory_manager.h` and `.inc`
 
@@ -16043,8 +16043,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Validation messages are routed to Rust's logging facade; Eden additionally forwards them to its
-  GPU logger, a subsystem Ruzu has not ported.
+- Validation messages are routed through Rust's logging facade before the GPU logger; this is the
+  Rust counterpart of Eden's standard logging macros.
 
 ### Unintentional differences (to fix)
 
@@ -16054,7 +16054,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Missing items
 
-- GPU-logger forwarding remains unavailable with the unported GPU logging subsystem.
+- Resolved by the later 2026-08-26 callback entry after the GPU logger was ported.
 
 ### Binary layout verification
 
@@ -16314,3 +16314,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this lifecycle only reads Vulkan-owned property structures field-by-field and writes
   host-side diagnostics.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` GPU logger routing vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`
+
+### Intentional differences
+
+- Vulkan strings must enter Ruzu's UTF-8 `str` logging interfaces. Invalid message text retains
+  the existing printable placeholder, while an invalid message-ID name falls back to Eden's
+  `VulkanDebug` generic name; valid Vulkan strings are forwarded unchanged.
+- Rust's ash callback flag types use `contains` in place of Eden's bitwise flag tests, preserving
+  Eden's Validation-before-Performance message-type priority and severity priority.
+
+### Unintentional differences (to fix)
+
+- None after restoring Vulkan validation forwarding, message-type prefixes, message-ID call names,
+  the `-1` error / `-2` warning / `0` other result mapping, and both runtime enablement guards.
+
+### Missing items
+
+- None in the audited debug-callback GPU-logging path.
+
+### Binary layout verification
+
+- PASS: the callback consumes ash's Vulkan ABI structure in place. No Vulkan payload is copied or
+  serialized, and the callback continues returning `VK_FALSE` on every path.

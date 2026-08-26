@@ -13801,3 +13801,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: `TicEntry` and `TscEntry` are `#[repr(C)]` wrappers over `[u64; 4]` with compile-time
   0x20-byte size assertions, matching Eden's two descriptor payloads. `DescriptorTable<T>` itself
   is host-only cache state and is not serialized or copied as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/dirty_flags.rs` vs Eden `src/video_core/dirty_flags.h` and `.cpp`
+
+### Intentional differences
+
+- Rust spells Eden's unnamed `u8` enum as module constants and the two `std::pair<u8, u8>` results
+  as `(u8, u8)` tuples.
+- Rust names the register-structure word counts explicitly because it cannot apply C++ `sizeof`
+  to the separately modeled Maxwell register fields. Each count was checked against Eden's field
+  type and static size assertions.
+
+### Unintentional differences (to fix)
+
+- None after `SetupDirtyVertexBuffers` began passing the 64-word size of the complete
+  `vertex_stream_limits` array on every iteration. This deliberately preserves Eden's overlapping
+  fills and their 62-word table-1 spill past the array instead of substituting the more plausible
+  two-word element size.
+- None after marking only `zeta_size.width` and `zeta_size.height`; the depth/dimension-control word
+  is no longer dirtied by this common setup.
+- None after porting the previously missing constexpr `GetDirtyFlagsForMethod` with Eden's literal
+  constants, branch order, boundary rules, and overlapping ranges.
+- None after restoring fixed-size `Regs::NUM_REGS` tables and removing `fill_block`'s silent
+  out-of-range truncation, which had no counterpart in Eden's fixed `std::array` implementation.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `DirtyTable` is a fixed `[u8; ENGINE_REG_COUNT]` of exactly 0xE00 bytes and `DirtyTables`
+  contains exactly two such arrays, matching Eden's `DirtyState::Table` and `Tables`. This is
+  host-only lookup state and is not serialized.

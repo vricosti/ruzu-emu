@@ -2135,8 +2135,7 @@ impl DirtyState {
     fn new() -> Self {
         let mut flags = [false; 256];
         flags.fill(true);
-        let tables =
-            std::array::from_fn(|_| vec![dirty_flags::flags::NULL_ENTRY; ENGINE_REG_COUNT]);
+        let tables = [[dirty_flags::flags::NULL_ENTRY; ENGINE_REG_COUNT]; 2];
         Self { flags, tables }
     }
 }

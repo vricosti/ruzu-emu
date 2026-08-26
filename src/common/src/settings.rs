@@ -19,9 +19,9 @@ pub use crate::settings_enums::{
     AnisotropyMode, AntiAliasing, AppletMode, AspectRatio, AstcDecodeMode, AstcRecompression,
     AudioEngine, AudioMode, Category, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend, CpuClock,
     DmaAccuracy, ExtendedDynamicState, FramePacingMode, FullscreenMode, GpuAccuracy, GpuClock,
-    GpuFenceBehavior, GpuUnswizzle, GpuUnswizzleChunk, GpuUnswizzleSize, Language, MemoryLayout,
-    NvdecEmulation, Region, RendererBackend, ResolutionSetup, ScalingFilter, SpeedMode, TimeZone,
-    VSyncMode, VramUsageMode,
+    GpuFenceBehavior, GpuLogLevel, GpuUnswizzle, GpuUnswizzleChunk, GpuUnswizzleSize, Language,
+    MemoryLayout, NvdecEmulation, Region, RendererBackend, ResolutionSetup, ScalingFilter,
+    SpeedMode, TimeZone, VSyncMode, VramUsageMode,
 };
 pub use crate::settings_input::{
     AnalogsRaw, ButtonsRaw, PlayerInput, RingconRaw, TouchFromButtonMap, TouchscreenInput,
@@ -353,6 +353,14 @@ pub struct Values {
     pub perform_vulkan_check: Setting<bool>,
     pub disable_web_applet: Setting<bool>,
 
+    // ── GPU Logging ────────────────────────────────────────────────────
+    pub gpu_log_level: Setting<GpuLogLevel>,
+    pub gpu_log_vulkan_calls: Setting<bool>,
+    pub gpu_log_shader_dumps: Setting<bool>,
+    pub gpu_log_memory_tracking: Setting<bool>,
+    pub gpu_log_driver_debug: Setting<bool>,
+    pub gpu_log_ring_buffer_size: Setting<i32>,
+
     // ── Miscellaneous ───────────────────────────────────────────────────
     pub log_filter: Setting<String>,
     pub use_dev_keys: Setting<bool>,
@@ -533,6 +541,12 @@ impl Values {
                 enable_all_controllers,
                 perform_vulkan_check,
                 disable_web_applet,
+                gpu_log_level,
+                gpu_log_vulkan_calls,
+                gpu_log_shader_dumps,
+                gpu_log_memory_tracking,
+                gpu_log_driver_debug,
+                gpu_log_ring_buffer_size,
             ),
             Category::DebuggingGraphics => visit!(
                 dump_guest_shaders,
@@ -1508,6 +1522,14 @@ impl Default for Values {
             perform_vulkan_check: Setting::new(true, "perform_vulkan_check", Debugging),
             disable_web_applet: Setting::new(true, "disable_web_applet", Debugging),
 
+            // GPU Logging
+            gpu_log_level: Setting::new(GpuLogLevel::Off, "gpu_log_level", Debugging),
+            gpu_log_vulkan_calls: Setting::new(true, "gpu_log_vulkan_calls", Debugging),
+            gpu_log_shader_dumps: Setting::new(false, "gpu_log_shader_dumps", Debugging),
+            gpu_log_memory_tracking: Setting::new(true, "gpu_log_memory_tracking", Debugging),
+            gpu_log_driver_debug: Setting::new(true, "gpu_log_driver_debug", Debugging),
+            gpu_log_ring_buffer_size: Setting::new(512, "gpu_log_ring_buffer_size", Debugging),
+
             // Miscellaneous
             log_filter: Setting::new("*:Info".to_string(), "log_filter", Miscellaneous),
             use_dev_keys: Setting::new(false, "use_dev_keys", Debugging),
@@ -2062,6 +2084,13 @@ mod tests {
             GpuUnswizzleChunk::Medium
         );
         assert!(!*values.gpu_unswizzle_enabled.get_value());
+
+        assert_eq!(*values.gpu_log_level.get_value(), GpuLogLevel::Off);
+        assert!(*values.gpu_log_vulkan_calls.get_value());
+        assert!(!*values.gpu_log_shader_dumps.get_value());
+        assert!(*values.gpu_log_memory_tracking.get_value());
+        assert!(*values.gpu_log_driver_debug.get_value());
+        assert_eq!(*values.gpu_log_ring_buffer_size.get_value(), 512);
 
         assert_eq!(
             *values.dyna_state.get_value(),

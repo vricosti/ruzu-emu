@@ -16251,3 +16251,39 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: focused tests verify that the Maxwell3D and MaxwellDMA register arrays contain 0xE00 and
   0x800 `u32` entries respectively, matching Eden's `Regs` unions.
+
+## 2026-08-26 — `src/video_core/src/gpu_logging/*.rs` and GPU-log settings vs Eden `src/video_core/gpu_logging/*.{h,cpp}` and `common/settings{,_enums}.h`
+
+### Intentional differences
+
+- Rust uses one `OnceLock<GpuLogger>` plus internal mutexes and atomics instead of Eden's leaked
+  raw singleton pointer and independently locked mutable members. Ring-buffer, memory, extension,
+  file, and captured-state ownership remain separate, matching Eden's synchronization domains.
+- Log filenames and headers use the Ruzu product name. File and directory ownership uses
+  `std::fs` and `RuzuPath` rather than Eden's `IOFile` and `EdenPath` wrappers.
+- Rust hashes its thread identifier with `DefaultHasher`; Eden uses the implementation-defined
+  `std::hash<std::thread::id>`. The value is diagnostic only and remains a `u32` in each log entry.
+- Rust locks both statistics domains while formatting `get_statistics`. Eden locks only its memory
+  mutex while also reading the Vulkan-call counter written under a different mutex; reproducing
+  that data race would be incorrect.
+- Eden declares a private `RotateLogFile` method but provides no definition or caller. Rust omits
+  that non-executable declaration and ports the actual inline rotation performed by `Initialize`.
+- Android environment setup uses Rust's process-environment API; Qualcomm remains the same
+  explicit future-integration stub as Eden.
+
+### Unintentional differences (to fix)
+
+- None after porting logger initialization/shutdown, ring-buffer ordering, memory accounting,
+  shader dumps, pipeline/extension/render-pass logging, state snapshots, crash dumps, driver
+  stubs, and all six GPU-log settings with Eden's defaults and enum discriminants.
+
+### Missing items
+
+- Runtime Vulkan call sites are wired in their corresponding file-level audit slices; this entry
+  covers the logger subsystem and its settings prerequisite only.
+
+### Binary layout verification
+
+- N/A: logger entries and snapshots are host-only diagnostic data copied field-by-field. Focused
+  tests verify enum discriminants, shader-stage names, unit formatting, snapshot section ordering,
+  and the exact settings defaults.

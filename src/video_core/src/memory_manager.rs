@@ -1714,17 +1714,14 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::FlushCaching()`.
     pub fn flush_caching(&mut self) {
-        if !self.accumulator.any_accumulated() {
-            return;
-        }
-
-        let mut gpu_ranges = Vec::new();
-        self.accumulator
-            .callback(|addr, size| gpu_ranges.push((addr, size)));
-
         let mut device_ranges = Vec::new();
-        for (addr, size) in gpu_ranges {
+        let mut accumulator = std::mem::take(&mut self.accumulator);
+        let invalidated = accumulator.invalidate_all(|addr, size| {
             device_ranges.extend(self.get_submapped_device_ranges(addr, size as u64));
+        });
+        self.accumulator = accumulator;
+        if !invalidated {
+            return;
         }
 
         let _ = self.with_rasterizer_mut(|rasterizer| {
@@ -1734,8 +1731,6 @@ impl GpuMemoryManager {
                 .collect();
             rasterizer.inner_invalidation(&sequences);
         });
-
-        self.accumulator.clear();
     }
 
     /// Check if a GPU address is within the valid address range.

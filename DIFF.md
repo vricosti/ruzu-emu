@@ -15013,3 +15013,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the removed type was test-only and was neither guest-visible nor serialized.
+
+## 2026-08-26 — `src/video_core/src/invalidation_accumulator.rs` vs Eden `src/video_core/invalidation_accumulator.h`
+
+### Intentional differences
+
+- `MemoryManager::flush_caching` temporarily moves the accumulator out of `self` so its callback
+  can inspect the remaining memory-manager state without overlapping Rust borrows. Callback order,
+  accumulator reset, and subsequent rasterizer invalidation remain identical to Eden.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the Rust-only `has_collected` and `last_collection` state. Address zero is once
+  again Eden's empty sentinel, including its loss of an invalidation range aligned to zero.
+- Resolved: restored the single `invalidate_all` operation that invokes buffered ranges, invokes
+  the current range, clears all state, and returns the upstream boolean in that exact order.
+- Resolved: range-end, alignment, and accumulated-size arithmetic now wraps as unsigned C++
+  arithmetic rather than panicking on Rust debug overflow.
+- Resolved: `MemoryManager::flush_caching` consumes the unified API instead of relying on the
+  non-upstream `any_accumulated`/`callback`/`clear` protocol.
+
+### Missing items
+
+- None for range accumulation, adjacency merging, callback ordering, reset, or return state.
+
+### Binary layout verification
+
+- N/A: the accumulator is a process-local owner and is not copied to guest memory or serialized.

@@ -21,7 +21,7 @@ use ash::vk::Handle;
 use crate::buffer_cache::buffer_cache_base::{ObtainBufferOperation, ObtainBufferSynchronize};
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::ChannelCacheAccessor;
-use crate::engines::maxwell_3d::PrimitiveTopology;
+use crate::engines::maxwell_3d::{PrimitiveTopology, NUM_TRANSFORM_FEEDBACK_BUFFERS};
 use crate::query_cache::bank_base::{BankBase, BankLike, BankPool};
 use crate::query_cache::query_cache::{
     DeviceMemoryWriter, GpuAddressTranslator, GuestStreamer, QueryCacheRuntimeHandle, StubStreamer,
@@ -1182,7 +1182,6 @@ impl HostQueryReport {
 const TFB_QUERY_BANK_SIZE: usize = 1024;
 const TFB_QUERY_SIZE: vk::DeviceSize = 4;
 const NUM_TFB_STREAMS: usize = 4;
-const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 const INVALID_TFB_SLOT: usize = NUM_TFB_STREAMS;
 
 struct TfbQueryBankSlots {

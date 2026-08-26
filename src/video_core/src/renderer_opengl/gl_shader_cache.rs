@@ -1095,18 +1095,7 @@ impl ShaderCache {
                 if !use_assembly_shaders && key.xfb_enabled() {
                     let (varyings, count) =
                         transform_feedback::make_transform_feedback_varyings(&key.xfb_state);
-                    info.xfb_varyings = varyings
-                        .iter()
-                        .map(
-                            |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
-                                buffer: varying.buffer,
-                                stream: varying.stream,
-                                stride: varying.stride,
-                                offset: varying.offset,
-                                components: varying.components,
-                            },
-                        )
-                        .collect();
+                    info.xfb_varyings = varyings;
                     info.xfb_count = count;
                 }
             }

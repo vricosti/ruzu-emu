@@ -25,11 +25,14 @@ use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::r#macro::MacroEngine;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::texture::{TicEntry, TscEntry};
-use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
+use crate::transform_feedback::{TransformFeedbackLayout, TransformFeedbackState};
 use shader_recompiler::shader_info::ReplaceConstant;
 
 /// Number of Maxwell3D method registers (`Maxwell3D::Regs::NUM_REGS`).
 pub const NUM_REGS: usize = 0xE00;
+
+/// `Maxwell3D::Regs::NumTransformFeedbackBuffers`.
+pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Deferred guest-memory write used by the Rust engine integration.
 pub(crate) struct PendingWrite {
@@ -1795,6 +1798,39 @@ pub struct TransformFeedbackBufferInfo {
     pub address: u64,
     pub size: i32,
     pub start_offset: i32,
+}
+
+/// Packed `Maxwell3D::Regs::StreamOutLayout` register.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct StreamOutLayout {
+    raw: u32,
+}
+
+impl StreamOutLayout {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self { raw }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.raw
+    }
+
+    pub const fn attribute0(self) -> u32 {
+        self.raw & 0xff
+    }
+
+    pub const fn attribute1(self) -> u32 {
+        (self.raw >> 8) & 0xff
+    }
+
+    pub const fn attribute2(self) -> u32 {
+        (self.raw >> 16) & 0xff
+    }
+
+    pub const fn attribute3(self) -> u32 {
+        (self.raw >> 24) & 0xff
+    }
 }
 
 /// Number of hardware viewports/scissors.

@@ -364,18 +364,7 @@ fn maxwell_to_compare_function(op: ComparisonOp) -> CompareFunction {
 fn fill_transform_feedback_runtime_info(info: &mut RuntimeInfo, state: &FixedPipelineState) {
     let (varyings, count) =
         crate::transform_feedback::make_transform_feedback_varyings(&state.xfb_state);
-    info.xfb_varyings = varyings
-        .iter()
-        .map(
-            |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
-                buffer: varying.buffer,
-                stream: varying.stream,
-                stride: varying.stride,
-                offset: varying.offset,
-                components: varying.components,
-            },
-        )
-        .collect();
+    info.xfb_varyings = varyings;
     info.xfb_count = count;
 }
 

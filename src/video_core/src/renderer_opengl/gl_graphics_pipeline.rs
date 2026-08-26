@@ -14,7 +14,7 @@ use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
 use crate::engines::const_buffer_info::ConstBufferInfo;
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::SurfaceClipInfo;
-use crate::engines::maxwell_3d::{Maxwell3D, MAX_CB_SLOTS};
+use crate::engines::maxwell_3d::{Maxwell3D, MAX_CB_SLOTS, NUM_TRANSFORM_FEEDBACK_BUFFERS};
 use crate::memory_manager::MemoryManager;
 use crate::renderer_opengl::gl_shader_context::Context as ShaderContext;
 use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
@@ -44,9 +44,6 @@ const MAX_IMAGES: u32 = 8;
 
 /// Number of shader stages (vertex, tess control, tess eval, geometry, fragment).
 pub const NUM_STAGES: usize = 5;
-
-/// Number of transform feedback buffers.
-const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Stride of each XFB attribute entry (token, count, attrib).
 const XFB_ENTRY_STRIDE: usize = 3;
@@ -1460,7 +1457,8 @@ fn transform_feedback_enum(location: u32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout};
+    use crate::engines::maxwell_3d::StreamOutLayout;
+    use crate::transform_feedback::TransformFeedbackLayout;
     use shader_recompiler::shader_info::StorageBufferDescriptor;
     use std::io::Write;
 
@@ -1710,7 +1708,7 @@ mod tests {
         key.xfb_state.layouts[0].varying_count = 5;
         key.xfb_state.layouts[0].stride = 0x20;
         key.xfb_state.varyings[0][0] =
-            crate::transform_feedback::StreamOutLayout::from_raw(0x0403_0201);
+            crate::engines::maxwell_3d::StreamOutLayout::from_raw(0x0403_0201);
 
         let size = key.size();
         let bytes = unsafe {
@@ -1745,7 +1743,7 @@ mod tests {
         key.xfb_state.layouts[0].varying_count = 4;
         key.xfb_state.layouts[0].stride = 16;
         key.xfb_state.varyings[0][0] =
-            crate::transform_feedback::StreamOutLayout::from_raw(0x2422_2120);
+            crate::engines::maxwell_3d::StreamOutLayout::from_raw(0x2422_2120);
 
         let mut pipeline = GraphicsPipeline::new_for_test(key, None);
         pipeline.generate_transform_feedback_state();
@@ -1761,7 +1759,7 @@ mod tests {
         key.set_xfb_enabled(true);
         key.xfb_state.layouts[0].varying_count = 1;
         key.xfb_state.layouts[0].stride = 4;
-        key.xfb_state.varyings[0][0] = crate::transform_feedback::StreamOutLayout::from_raw(0);
+        key.xfb_state.varyings[0][0] = crate::engines::maxwell_3d::StreamOutLayout::from_raw(0);
         let infos: [Option<ShaderInfo>; NUM_STAGES] = Default::default();
 
         let disabled = GraphicsPipeline::new_for_test_with_sources(

@@ -13,13 +13,14 @@ use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::draw_manager::{
     DrawMode, DrawState, IndexBuffer, Maxwell3DDrawRegisters, VertexBuffer,
 };
+use crate::engines::maxwell_3d::StreamOutLayout;
 #[cfg(test)]
 use crate::engines::maxwell_3d::VertexAttribType;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, FrontFace, PolygonMode,
     PrimitiveTopology, StencilOp,
 };
-use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
+use crate::transform_feedback::{TransformFeedbackLayout, TransformFeedbackState};
 
 // ---------------------------------------------------------------------------
 // Constants — port of anonymous namespace in fixed_pipeline_state.cpp

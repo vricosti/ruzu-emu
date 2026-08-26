@@ -1595,7 +1595,7 @@ fn runtime_hash_includes_dual_source_blend_and_xfb_stream() {
         ..Default::default()
     };
     let mut stream_zero = base.clone();
-    stream_zero.xfb_varyings = vec![varying];
+    stream_zero.xfb_varyings[0] = varying;
     stream_zero.xfb_count = 1;
     let mut stream_one = stream_zero.clone();
     stream_one.xfb_varyings[0].stream = 1;

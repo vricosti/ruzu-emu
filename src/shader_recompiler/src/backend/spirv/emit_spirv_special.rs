@@ -393,7 +393,7 @@ mod tests {
         Emitter::new(&mut program, 0).prologue();
 
         let base = Attribute::generic(0, 0).0 as usize;
-        let mut xfb_varyings = vec![TransformFeedbackVarying::default(); base + 1];
+        let mut xfb_varyings = [TransformFeedbackVarying::default(); 256];
         xfb_varyings[base].components = 1;
         let runtime_info = crate::runtime_info::RuntimeInfo {
             xfb_count: (base + 1) as u32,

@@ -1428,8 +1428,8 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- Rust stores active transform-feedback entries in a `Vec`; Eden uses a fixed 256-entry array.
-  `xfb_count` remains the authoritative bound in both implementations.
+- At the time of this review, Rust stored active transform-feedback entries in a `Vec`; this was
+  restored to Eden's fixed 256-entry array by the 2026-08-26 transform-feedback parity pass below.
 
 ### Unintentional differences (to fix)
 
@@ -16697,3 +16697,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the changed arrays and small vectors are host-side containers and are not raw-copied or
   serialized. The copy descriptor layouts remain covered by the `types.rs` layout tests; focused
   tests additionally pin Eden's compile-time layout-size oracles and the 16-entry inline capacity.
+
+## 2026-08-26 — `src/video_core/src/transform_feedback.rs`, `engines/maxwell_3d.rs`, and `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`, `engines/maxwell_3d.h`, and `src/shader_recompiler/runtime_info.h`
+
+### Intentional differences
+
+- Rust represents Eden's nested `TransformFeedbackState::Layout` as the top-level
+  `TransformFeedbackLayout` in the matching transform-feedback module because Rust has no nested
+  structure declarations.
+- Rust ignores an invalid transform-feedback attribute index instead of reproducing Eden's direct
+  out-of-bounds array access. Valid indices preserve Eden's assignment and maximum-count ordering.
+- Eden's `UNIMPLEMENTED_IF` diagnostics are represented by the project's fail-soft Rust helper:
+  violations are logged and become fatal only when debug assertions are enabled.
+
+### Unintentional differences (to fix)
+
+- None after moving `StreamOutLayout` and `NUM_TRANSFORM_FEEDBACK_BUFFERS` to the Maxwell 3D owner,
+  matching `Maxwell3D::Regs::StreamOutLayout` and `NumTransformFeedbackBuffers`.
+- None after removing the duplicate video-core varying type: `make_transform_feedback_varyings`
+  now returns the canonical shader-recompiler `TransformFeedbackVarying` array directly, as Eden
+  does, and the OpenGL/Vulkan consumers no longer perform field-by-field conversions.
+- None after restoring `RuntimeInfo::xfb_varyings` from a growable vector to Eden's fixed,
+  value-initialized 256-entry array and preserving unsigned wraparound in the generator arithmetic.
+
+### Missing items
+
+- None in the audited transform-feedback state, varying generator, Maxwell register owner, or
+  runtime transform-feedback fields.
+
+### Binary layout verification
+
+- PASS: focused tests pin the 4-byte `StreamOutLayout` register representation and its four byte
+  fields, the 12-byte `TransformFeedbackLayout` field order, the 560-byte
+  `TransformFeedbackState`, and the fixed 256-entry runtime varying extent.

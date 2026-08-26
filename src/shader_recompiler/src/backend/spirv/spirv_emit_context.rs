@@ -6721,11 +6721,7 @@ mod tests {
             offset: 4,
             components: 1,
         };
-        let mut runtime_info = RuntimeInfo {
-            xfb_varyings: vec![TransformFeedbackVarying::default(); 33],
-            xfb_count: 0,
-            ..RuntimeInfo::default()
-        };
+        let mut runtime_info = RuntimeInfo::default();
         runtime_info.xfb_varyings[32] = varying;
 
         let profile = Profile::default();
@@ -6774,7 +6770,6 @@ mod tests {
             .set(Attribute::generic(0, 0).0 as usize, true);
         let base = Attribute::generic(0, 0).0 as usize;
         let mut runtime_info = RuntimeInfo {
-            xfb_varyings: vec![TransformFeedbackVarying::default(); base + 1],
             xfb_count: (base + 1) as u32,
             ..RuntimeInfo::default()
         };

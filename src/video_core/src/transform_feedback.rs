@@ -5,8 +5,19 @@
 //!
 //! Transform feedback state and varying generation.
 
-/// Number of transform feedback buffers (matches Maxwell3D::Regs::NumTransformFeedbackBuffers).
-pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
+use crate::engines::maxwell_3d::{StreamOutLayout, NUM_TRANSFORM_FEEDBACK_BUFFERS};
+use shader_recompiler::runtime_info::TransformFeedbackVarying;
+
+fn assert_fail_soft(condition: bool, message: impl FnOnce() -> String) {
+    if condition {
+        return;
+    }
+    let message = message();
+    log::error!("{message}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("{message}");
+    }
+}
 
 /// Layout for a single transform feedback buffer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -15,36 +26,6 @@ pub struct TransformFeedbackLayout {
     pub stream: u32,
     pub varying_count: u32,
     pub stride: u32,
-}
-
-/// Stream-out layout for a single varying component.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub struct StreamOutLayout {
-    raw: u32,
-}
-
-impl StreamOutLayout {
-    pub fn from_raw(raw: u32) -> Self {
-        Self { raw }
-    }
-
-    pub fn raw(&self) -> u32 {
-        self.raw
-    }
-
-    pub fn attribute0(&self) -> u32 {
-        self.raw & 0xFF
-    }
-    pub fn attribute1(&self) -> u32 {
-        (self.raw >> 8) & 0xFF
-    }
-    pub fn attribute2(&self) -> u32 {
-        (self.raw >> 16) & 0xFF
-    }
-    pub fn attribute3(&self) -> u32 {
-        (self.raw >> 24) & 0xFF
-    }
 }
 
 /// Complete transform feedback state.
@@ -62,16 +43,6 @@ impl Default for TransformFeedbackState {
             varyings: [[StreamOutLayout::default(); 32]; NUM_TRANSFORM_FEEDBACK_BUFFERS],
         }
     }
-}
-
-/// A single transform feedback varying descriptor.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TransformFeedbackVarying {
-    pub buffer: u32,
-    pub stream: u32,
-    pub stride: u32,
-    pub offset: u32,
-    pub components: u32,
 }
 
 /// Vector attribute base offsets used for transform feedback varying mapping.
@@ -155,7 +126,7 @@ pub fn make_transform_feedback_varyings(
                 buffer: buffer as u32,
                 stream: layout.stream,
                 stride: layout.stride,
-                offset: offset * 4,
+                offset: offset.wrapping_mul(4),
                 components: 1,
             };
 
@@ -165,13 +136,13 @@ pub fn make_transform_feedback_varyings(
             // Check if this attribute is aligned to a 4-component vector
             let aligned_attr = attribute & !3;
             if VECTORS.contains(&aligned_attr) {
-                if attribute % 4 != 0 {
-                    log::warn!("Unaligned TFB {}", attribute);
-                }
+                assert_fail_soft(attribute % 4 == 0, || format!("Unaligned TFB {attribute}"));
                 let base_index = attribute / 4;
-                while offset + 1 < varying_count && base_index == get_attribute(offset + 1) / 4 {
-                    offset += 1;
-                    varying.components += 1;
+                while offset.wrapping_add(1) < varying_count
+                    && base_index == get_attribute(offset.wrapping_add(1)) / 4
+                {
+                    offset = offset.wrapping_add(1);
+                    varying.components = varying.components.wrapping_add(1);
                 }
             }
 
@@ -179,20 +150,19 @@ pub fn make_transform_feedback_varyings(
                 xfb[attribute as usize] = varying;
                 count = count.max(attribute);
             }
-            highest = highest.max((base_offset + varying.components) * 4);
-            offset += 1;
+            highest = highest.max(base_offset.wrapping_add(varying.components).wrapping_mul(4));
+            offset = offset.wrapping_add(1);
         }
 
-        if highest != layout.stride {
-            log::warn!(
-                "Transform feedback highest {} != stride {}",
-                highest,
+        assert_fail_soft(highest == layout.stride, || {
+            format!(
+                "Transform feedback highest {highest} != stride {}",
                 layout.stride
-            );
-        }
+            )
+        });
     }
 
-    (xfb, count + 1)
+    (xfb, count.wrapping_add(1))
 }
 
 #[cfg(test)]
@@ -209,7 +179,8 @@ mod tests {
         };
         state.varyings[0][0] = StreamOutLayout::from_raw(32);
 
-        let (varyings, count) = make_transform_feedback_varyings(&state);
+        let (varyings, count): ([TransformFeedbackVarying; 256], u32) =
+            make_transform_feedback_varyings(&state);
 
         assert_eq!(count, 33);
         assert_eq!(varyings[32].stream, 3);
@@ -229,5 +200,20 @@ mod tests {
 
         assert_eq!(count, 221);
         assert_eq!(varyings[220].components, 2);
+    }
+
+    #[test]
+    fn state_layout_matches_eden_header() {
+        assert_eq!(NUM_TRANSFORM_FEEDBACK_BUFFERS, 4);
+        assert_eq!(std::mem::size_of::<TransformFeedbackLayout>(), 12);
+        assert_eq!(std::mem::align_of::<TransformFeedbackLayout>(), 4);
+        assert_eq!(std::mem::offset_of!(TransformFeedbackLayout, stream), 0);
+        assert_eq!(
+            std::mem::offset_of!(TransformFeedbackLayout, varying_count),
+            4
+        );
+        assert_eq!(std::mem::offset_of!(TransformFeedbackLayout, stride), 8);
+        assert_eq!(std::mem::size_of::<TransformFeedbackState>(), 560);
+        assert_eq!(std::mem::align_of::<TransformFeedbackState>(), 4);
     }
 }

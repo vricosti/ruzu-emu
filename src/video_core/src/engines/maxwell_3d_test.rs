@@ -12,6 +12,20 @@ fn register_count_matches_eden_maxwell_3d() {
     assert_eq!(engine.regs.len(), NUM_REGS);
 }
 
+#[test]
+fn stream_out_layout_matches_eden_register_layout() {
+    let layout = StreamOutLayout::from_raw(0x4433_2211);
+
+    assert_eq!(NUM_TRANSFORM_FEEDBACK_BUFFERS, 4);
+    assert_eq!(std::mem::size_of::<StreamOutLayout>(), 4);
+    assert_eq!(std::mem::align_of::<StreamOutLayout>(), 4);
+    assert_eq!(layout.raw(), 0x4433_2211);
+    assert_eq!(layout.attribute0(), 0x11);
+    assert_eq!(layout.attribute1(), 0x22);
+    assert_eq!(layout.attribute2(), 0x33);
+    assert_eq!(layout.attribute3(), 0x44);
+}
+
 fn new_descriptor_owner_backed_engine(backing: &[u8], device_addr: u64) -> Maxwell3D {
     let device_memory =
         Arc::new(crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default());

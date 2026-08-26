@@ -838,8 +838,6 @@ mod tests {
         program.info.stores.set(Attribute::Generic0X as usize, true);
 
         let mut runtime_info = RuntimeInfo::default();
-        runtime_info.xfb_varyings =
-            vec![crate::runtime_info::TransformFeedbackVarying::default(); 256];
         runtime_info.xfb_varyings[Attribute::Generic0X as usize] =
             crate::runtime_info::TransformFeedbackVarying {
                 buffer: 1,

@@ -14067,3 +14067,34 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this file only creates text and does not define or serialize binary payloads.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/fragment_shaders.rs` and `host_shaders/*.frag` vs Eden `src/video_core/host_shaders/CMakeLists.txt` and `host_shaders/*.frag`
+
+### Intentional differences
+
+- Eden generates C++ string headers from each GLSL file with CMake. Rust uses `include_str!` on the
+  same per-shader files, while `build.rs` separately compiles the Vulkan-compatible sources to
+  SPIR-V. This preserves one authoritative source per shader without generated Rust source headers.
+- Rust exposes source constants for Vulkan-only shaders as well; Eden skips only their generated
+  string headers because its Vulkan backend consumes the generated SPIR-V headers directly.
+
+### Unintentional differences (to fix)
+
+- Resolved: replaced 37 manually copied string literals with direct file embedding. The stale
+  bicubic, Gaussian-comment, and depth/stencil-blit copies can no longer disagree with the shader
+  files compiled by the build.
+- Resolved: synchronized `present_bicubic.frag` with Eden's Catmull-Rom implementation and restored
+  the unsigned stencil sampler plus explicit integer conversion in
+  `vulkan_blit_depth_stencil.frag`.
+- Resolved: restored the four OpenGL shader files that existed only as Rust string literals and the
+  seven fragment-source constants omitted from the old module. All 44 Eden fragment shader files
+  now have one matching file and one embedded Rust constant.
+
+### Missing items
+
+- None among Eden's 44 fragment-shader source files.
+
+### Binary layout verification
+
+- N/A: GLSL is embedded as text; the existing build step validates and compiles every applicable
+  source to SPIR-V.

@@ -16476,3 +16476,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the hooks only format already-decoded host draw state. Focused tests verify indexed draw,
   indirect draw, and dispatch payloads byte-for-byte against Eden's format strings.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` border-color-swizzle prerequisite vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu retains the validated extension bit and `borderColorSwizzleFromImage` bit as Rust booleans
+  after device creation rather than retaining Eden's feature-chain aggregate. The queried ash
+  payload remains in the logical-device `pNext` chain until `vkCreateDevice` returns.
+- The suitability predicate is mechanically extracted into a file-local function so all four
+  upstream requirements can be covered by a focused regression test without a Vulkan device.
+
+### Unintentional differences (to fix)
+
+- None after restoring extension discovery, feature querying, the dependency on usable custom
+  border colors and both swizzle feature bits, Qualcomm/Turnip filtering, logical-device
+  enablement, and the two upstream accessors.
+
+### Missing items
+
+- None for `VK_EXT_border_color_swizzle` capability discovery and publication.
+
+### Binary layout verification
+
+- PASS: ash owns the Vulkan ABI definition of `VkPhysicalDeviceBorderColorSwizzleFeaturesEXT`;
+  Ruzu uses that structure directly in both the physical-device query and logical-device feature
+  chains, without copying or serializing its bytes.

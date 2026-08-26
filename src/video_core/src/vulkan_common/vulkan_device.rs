@@ -164,6 +164,20 @@ fn apply_descriptor_indexing_policy(features: &mut vk::PhysicalDeviceDescriptorI
     features.runtime_descriptor_array = vk::FALSE;
 }
 
+/// Mechanical extraction of the `VK_EXT_border_color_swizzle` suitability
+/// predicate from upstream `Device::RemoveUnsuitableExtensions`.
+fn border_color_swizzle_supported(
+    extension_available: bool,
+    custom_border_color_supported: bool,
+    border_color_swizzle: vk::Bool32,
+    border_color_swizzle_from_image: vk::Bool32,
+) -> bool {
+    extension_available
+        && custom_border_color_supported
+        && border_color_swizzle != vk::FALSE
+        && border_color_swizzle_from_image != vk::FALSE
+}
+
 macro_rules! clear_feature_preserving_chain {
     ($feature:expr) => {{
         let p_next = $feature.p_next;
@@ -330,6 +344,7 @@ pub struct DeviceExtensions {
     pub synchronization2: bool,
 
     // VK feature extensions
+    pub border_color_swizzle: bool,
     pub custom_border_color: bool,
     pub color_write_enable: bool,
     pub depth_bias_control: bool,
@@ -439,6 +454,8 @@ pub struct Device {
     pub descriptor_buffer_properties: vk::PhysicalDeviceDescriptorBufferPropertiesEXT,
     /// Raw `VkPhysicalDeviceTransformFeedbackFeaturesEXT::geometryStreams` feature bit.
     pub transform_feedback_geometry_streams_supported: bool,
+    /// Raw `VkPhysicalDeviceBorderColorSwizzleFeaturesEXT::borderColorSwizzleFromImage` bit.
+    pub border_color_swizzle_from_image_supported: bool,
 
     /// Core physical device features.
     pub device_features: vk::PhysicalDeviceFeatures,
@@ -650,6 +667,7 @@ impl Device {
         let has_vertex_input_dynamic_state =
             supported_extensions.contains("VK_EXT_vertex_input_dynamic_state");
         let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
+        let has_border_color_swizzle = supported_extensions.contains("VK_EXT_border_color_swizzle");
         let has_custom_border_color = supported_extensions.contains("VK_EXT_custom_border_color");
         let has_color_write_enable = supported_extensions.contains("VK_EXT_color_write_enable");
         let has_depth_bias_control = supported_extensions.contains("VK_EXT_depth_bias_control");
@@ -700,6 +718,8 @@ impl Device {
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
         let mut descriptor_buffer_features =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+        let mut border_color_swizzle_features =
+            vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT::default();
         let mut custom_border_color_features =
             vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut color_write_enable_features =
@@ -806,6 +826,9 @@ impl Device {
             }
             if has_depth_clip_control {
                 features2_builder = features2_builder.push_next(&mut depth_clip_control_features);
+            }
+            if has_border_color_swizzle {
+                features2_builder = features2_builder.push_next(&mut border_color_swizzle_features);
             }
             if has_custom_border_color {
                 features2_builder = features2_builder.push_next(&mut custom_border_color_features);
@@ -1034,6 +1057,12 @@ impl Device {
         let mut supports_custom_border_color = has_custom_border_color
             && custom_border_color_features.custom_border_colors != 0
             && custom_border_color_features.custom_border_color_without_format != 0;
+        let mut supports_border_color_swizzle = border_color_swizzle_supported(
+            has_border_color_swizzle,
+            supports_custom_border_color,
+            border_color_swizzle_features.border_color_swizzle,
+            border_color_swizzle_features.border_color_swizzle_from_image,
+        );
         let supports_depth_bias_control = has_depth_bias_control
             && depth_bias_control_features.depth_bias_control != 0
             && depth_bias_control_features.least_representable_value_force_unorm_representation
@@ -1144,11 +1173,15 @@ impl Device {
         if is_qualcomm || is_turnip {
             log::warn!("Qualcomm and Turnip drivers have broken VK_EXT_custom_border_color");
             supports_custom_border_color = false;
+            supports_border_color_swizzle = false;
             custom_border_color_features.custom_border_colors = vk::FALSE;
             custom_border_color_features.custom_border_color_without_format = vk::FALSE;
         }
         if is_qualcomm {
             must_emulate_scaled_formats = true;
+            log::warn!("Qualcomm drivers have broken VK_EXT_border_color_swizzle");
+            border_color_swizzle_features.border_color_swizzle = vk::FALSE;
+            border_color_swizzle_features.border_color_swizzle_from_image = vk::FALSE;
             log::warn!("Qualcomm drivers have broken VK_EXT_color_write_enable");
             supports_color_write_enable = false;
             color_write_enable_features.color_write_enable = vk::FALSE;
@@ -1458,6 +1491,11 @@ impl Device {
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
+            "VK_EXT_border_color_swizzle",
+            supports_border_color_swizzle,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
             "VK_EXT_custom_border_color",
             supports_custom_border_color,
         );
@@ -1560,6 +1598,9 @@ impl Device {
         );
         if !supports_custom_border_color {
             clear_feature_preserving_chain!(custom_border_color_features);
+        }
+        if !supports_border_color_swizzle {
+            clear_feature_preserving_chain!(border_color_swizzle_features);
         }
         if !supports_color_write_enable {
             clear_feature_preserving_chain!(color_write_enable_features);
@@ -1766,6 +1807,7 @@ impl Device {
                 buffer_device_address: supports_buffer_device_address,
                 subgroup_size_control: supports_subgroup_size_control,
                 synchronization2: supports_synchronization2,
+                border_color_swizzle: supports_border_color_swizzle,
                 custom_border_color: supports_custom_border_color,
                 color_write_enable: supports_color_write_enable,
                 depth_bias_control: supports_depth_bias_control,
@@ -1833,6 +1875,9 @@ impl Device {
             descriptor_buffer_properties,
             transform_feedback_geometry_streams_supported: transform_feedback_features
                 .geometry_streams
+                != 0,
+            border_color_swizzle_from_image_supported: border_color_swizzle_features
+                .border_color_swizzle_from_image
                 != 0,
             device_features,
             shader_float16_supported: supports_shader_float16,
@@ -2777,6 +2822,14 @@ impl Device {
         self.extensions.custom_border_color
     }
 
+    pub fn is_ext_border_color_swizzle_supported(&self) -> bool {
+        self.extensions.border_color_swizzle
+    }
+
+    pub fn is_border_color_swizzle_from_image_supported(&self) -> bool {
+        self.border_color_swizzle_from_image_supported
+    }
+
     pub fn is_ext_color_write_enable_supported(&self) -> bool {
         self.extensions.color_write_enable
     }
@@ -3235,6 +3288,7 @@ fn initial_loaded_extensions(
     enable_device_fault: bool,
 ) -> BTreeSet<String> {
     const FEATURE_EXTENSIONS: &[&str] = &[
+        "VK_EXT_border_color_swizzle",
         "VK_EXT_color_write_enable",
         "VK_EXT_custom_border_color",
         "VK_EXT_depth_bias_control",
@@ -3863,8 +3917,43 @@ mod tests {
     }
 
     #[test]
+    fn border_color_swizzle_requires_extension_custom_border_color_and_both_features() {
+        assert!(border_color_swizzle_supported(
+            true,
+            true,
+            vk::TRUE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            false,
+            true,
+            vk::TRUE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            true,
+            false,
+            vk::TRUE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            true,
+            true,
+            vk::FALSE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            true,
+            true,
+            vk::TRUE,
+            vk::FALSE
+        ));
+    }
+
+    #[test]
     fn loaded_extension_set_matches_upstream_core_promotion_rules() {
         let supported = [
+            "VK_EXT_border_color_swizzle",
             "VK_EXT_custom_border_color",
             "VK_EXT_4444_formats",
             "VK_EXT_index_type_uint8",
@@ -3905,6 +3994,7 @@ mod tests {
         assert!(!vulkan_13.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(!vulkan_13.contains("VK_EXT_subgroup_size_control"));
         assert!(vulkan_13.contains("VK_KHR_maintenance5"));
+        assert!(vulkan_13.contains("VK_EXT_border_color_swizzle"));
         assert!(vulkan_13.contains("VK_EXT_custom_border_color"));
         assert!(vulkan_13.contains("VK_EXT_4444_formats"));
         assert!(vulkan_13.contains("VK_EXT_index_type_uint8"));

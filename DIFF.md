@@ -16969,3 +16969,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this owner contains lifecycle functions and no raw or serialized payloads.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vk_enum_string_helper.rs` vs Eden `src/video_core/vulkan_common/vk_enum_string_helper.h` and Vulkan Utility Libraries `vk_enum_string_helper.h`
+
+### Intentional differences
+
+- Eden includes the complete generated Vulkan Utility Libraries header. Rust exposes the ten
+  wrappers already owned by this module and derives registry-known names from Ash; raw-value
+  overrides remain here for Vulkan 1.4 values and canonical aliases absent from Ash 1.3.251.
+- The Rust wrappers return owned `String` values instead of generated `const char*` values. This
+  preserves the exact observable text while allowing the registry-known portion to be assembled
+  from Ash's `Debug` names.
+
+### Unintentional differences (to fix)
+
+- None after restoring the `VK_*` prefixes, generated `Unhandled Vk*` fallbacks, lowercase ASTC
+  dimension separators, Vulkan 1.4 values, and the canonical names selected by Eden's generated
+  header.
+- None after routing Eden's production `string_VkResult` equivalents through this module in
+  `VulkanError`, `available_version`, image acquisition, and presentation diagnostics.
+
+### Missing items
+
+- None among the ten Rust wrappers or Eden's production call sites. Other enum helpers exposed by
+  the external generated C header have no callers in Eden's source tree and are not duplicated.
+
+### Binary layout verification
+
+- N/A: these functions convert transparent Vulkan integer enums to diagnostic strings and define
+  no serialized or guest-visible payload.

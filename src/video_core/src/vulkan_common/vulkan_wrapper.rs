@@ -16,6 +16,8 @@ use ash::vk;
 use ash::vk::Handle;
 use std::ffi::{CStr, CString};
 
+use super::vk_enum_string_helper::string_vk_result;
+
 // ---------------------------------------------------------------------------
 // Exception / error type — port of `vk::Exception`
 // ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ impl VulkanError {
 
 impl std::fmt::Display for VulkanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Vulkan error: {:?}", self.result)
+        f.write_str(&string_vk_result(self.result))
     }
 }
 
@@ -354,8 +356,8 @@ pub fn available_version(entry: &ash::Entry) -> u32 {
         Ok(None) => vk::API_VERSION_1_0,
         Err(e) => {
             log::error!(
-                "vkEnumerateInstanceVersion failed: {:?}, assuming Vulkan 1.1",
-                e
+                "vkEnumerateInstanceVersion returned {}, assuming Vulkan 1.1",
+                string_vk_result(e)
             );
             vk::API_VERSION_1_1
         }
@@ -426,8 +428,7 @@ mod tests {
     #[test]
     fn test_vulkan_error_display() {
         let err = VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED);
-        let msg = format!("{}", err);
-        assert!(msg.contains("ERROR_INITIALIZATION_FAILED"));
+        assert_eq!(err.to_string(), "VK_ERROR_INITIALIZATION_FAILED");
     }
 
     #[test]

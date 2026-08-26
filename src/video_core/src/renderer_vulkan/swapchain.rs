@@ -10,6 +10,7 @@ use ash::vk;
 use std::sync::{Arc, Mutex};
 
 use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::vulkan_common::vk_enum_string_helper::string_vk_result;
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
@@ -321,7 +322,10 @@ impl Swapchain {
                 return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
             }
             Err(result) => {
-                log::error!("vkAcquireNextImageKHR returned {:?}", result);
+                log::error!(
+                    "vkAcquireNextImageKHR returned {}",
+                    string_vk_result(result)
+                );
             }
         }
         if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
@@ -389,7 +393,7 @@ impl Swapchain {
                 return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
             }
             Err(result) => {
-                log::error!("Failed to present with error {:?}", result);
+                log::error!("Failed to present with error {}", string_vk_result(result));
             }
         }
         self.frame_index += 1;

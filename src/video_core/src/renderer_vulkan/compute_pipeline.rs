@@ -39,6 +39,7 @@ use crate::vulkan_common::vulkan_device::DeviceReference;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ComputePipelineRuntime {
+    scheduler: NonNull<Scheduler>,
     guest_descriptor_queue: NonNull<UpdateDescriptorQueue>,
     descriptor_buffer_ring: NonNull<DescriptorBufferRing>,
     descriptor_pool: NonNull<DescriptorPool>,
@@ -46,11 +47,13 @@ pub(crate) struct ComputePipelineRuntime {
 
 impl ComputePipelineRuntime {
     pub(crate) fn new(
+        scheduler: &mut Scheduler,
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
         descriptor_buffer_ring: &mut DescriptorBufferRing,
         descriptor_pool: &mut DescriptorPool,
     ) -> Self {
         Self {
+            scheduler: NonNull::from(scheduler),
             guest_descriptor_queue: NonNull::from(guest_descriptor_queue),
             descriptor_buffer_ring: NonNull::from(descriptor_buffer_ring),
             descriptor_pool: NonNull::from(descriptor_pool),
@@ -244,9 +247,12 @@ impl ComputePipeline {
             }
         };
         let descriptor_allocator = if !uses_descriptor_buffer && !uses_push_descriptor {
-            match unsafe { runtime.descriptor_pool.as_ref() }
-                .allocator_for_info(descriptor_set_layout, &info)
-            {
+            match unsafe { runtime.descriptor_pool.as_ref() }.allocator_for_info(
+                vulkan_device,
+                unsafe { runtime.scheduler.as_ref() },
+                descriptor_set_layout,
+                &info,
+            ) {
                 Ok(allocator) => Some(allocator),
                 Err(_) => {
                     unsafe {
@@ -534,7 +540,10 @@ impl ComputePipeline {
         let pipeline_layout = self.pipeline_layout;
         let descriptor_set_layout = self.descriptor_set_layout;
         let descriptor_update_template = self.descriptor_update_template;
-        let descriptor_allocator = self.descriptor_allocator.clone();
+        let descriptor_allocator = self
+            .descriptor_allocator
+            .as_ref()
+            .map(DescriptorAllocator::reference);
         let uses_push_descriptor = self.uses_push_descriptor;
         let uses_descriptor_buffer = self.uses_descriptor_buffer;
         let descriptor_buffer_binding = bind_descriptor_buffer.then(|| {

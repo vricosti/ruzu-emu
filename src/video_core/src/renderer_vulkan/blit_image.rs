@@ -617,10 +617,20 @@ impl BlitImageHelper {
                 .expect("Failed to create two-textures set layout")
         };
         let one_texture_descriptor_allocator = descriptor_pool
-            .allocator(one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
+            .allocator(
+                vulkan_device,
+                scheduler,
+                one_texture_set_layout,
+                &Self::ONE_TEXTURE_BANK_INFO,
+            )
             .expect("Failed to create one-texture descriptor allocator");
         let two_textures_descriptor_allocator = descriptor_pool
-            .allocator(two_textures_set_layout, &Self::TWO_TEXTURES_BANK_INFO)
+            .allocator(
+                vulkan_device,
+                scheduler,
+                two_textures_set_layout,
+                &Self::TWO_TEXTURES_BANK_INFO,
+            )
             .expect("Failed to create two-texture descriptor allocator");
 
         // Create one-texture pipeline layout with push constants
@@ -865,7 +875,7 @@ impl BlitImageHelper {
         } else {
             self.nearest_sampler
         };
-        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+        let descriptor_allocator = self.one_texture_descriptor_allocator.reference();
         let src_view = src_image_view.color_view;
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -926,7 +936,7 @@ impl BlitImageHelper {
         };
         let layout = self.one_texture_pipeline_layout;
         let sampler = self.nearest_sampler;
-        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+        let descriptor_allocator = self.one_texture_descriptor_allocator.reference();
         let src_view = src_image_view.color_view;
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -994,9 +1004,9 @@ impl BlitImageHelper {
         };
         let sampler = self.nearest_sampler;
         let descriptor_allocator = if resolve_stencil {
-            self.two_textures_descriptor_allocator.clone()
+            self.two_textures_descriptor_allocator.reference()
         } else {
-            self.one_texture_descriptor_allocator.clone()
+            self.one_texture_descriptor_allocator.reference()
         };
         let src_depth_view = src_image_view.depth_view;
         let src_stencil_view = if resolve_stencil {
@@ -1075,7 +1085,7 @@ impl BlitImageHelper {
                 return false;
             }
         };
-        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+        let descriptor_allocator = self.one_texture_descriptor_allocator.reference();
         let layout = self.one_texture_pipeline_layout;
         let dst_region = *dst_region;
         let src_region = *src_region;
@@ -1185,7 +1195,7 @@ impl BlitImageHelper {
         };
         let layout = self.two_textures_pipeline_layout;
         let sampler = self.nearest_sampler;
-        let descriptor_allocator = self.two_textures_descriptor_allocator.clone();
+        let descriptor_allocator = self.two_textures_descriptor_allocator.reference();
         let src_depth_view = src_image_view.depth_view;
         let src_stencil_view = src_image_view.stencil_view;
         let render_area = vk::Rect2D {
@@ -1568,7 +1578,7 @@ impl BlitImageHelper {
         let sampler = self.nearest_sampler;
         let src_view = src_image_view.color_view;
         let extent = conversion_extent(src_image_view);
-        let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+        let descriptor_allocator = self.one_texture_descriptor_allocator.reference();
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: dst_framebuffer.render_area,
@@ -1636,7 +1646,7 @@ impl BlitImageHelper {
         let layout = self.two_textures_pipeline_layout;
         let sampler = self.nearest_sampler;
         let extent = conversion_extent(src_image_view);
-        let descriptor_allocator = self.two_textures_descriptor_allocator.clone();
+        let descriptor_allocator = self.two_textures_descriptor_allocator.reference();
         let src_depth_view = src_image_view.depth_view;
         let src_stencil_view = src_image_view.stencil_view;
         let render_area = vk::Rect2D {
@@ -1858,7 +1868,7 @@ impl BlitImageHelper {
             let device = self.device.clone();
             let layout = self.msaa_copy_pipeline_layout;
             let sampler = self.nearest_sampler;
-            let descriptor_allocator = self.one_texture_descriptor_allocator.clone();
+            let descriptor_allocator = self.one_texture_descriptor_allocator.reference();
             unsafe { self.scheduler.as_mut() }.request_outside_render_pass_operation_context();
             unsafe { self.scheduler.as_mut() }.record(move |cmdbuf| unsafe {
                 let color_range = vk::ImageSubresourceRange {

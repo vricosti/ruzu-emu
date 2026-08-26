@@ -472,9 +472,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- `DescriptorAllocator` clones share allocator state through `Arc<Mutex<_>>` so Rust's `Send +
-  'static` scheduler closures can perform Eden's descriptor-set commit on the worker. The resource
-  pool, bank, layout and tick-based reuse remain shared by the same compute-pass owner.
+- Deferred `Send + 'static` scheduler closures retain a non-owning
+  `DescriptorAllocatorReference`, the Rust counterpart of Eden's captured `this`. The allocator
+  itself remains uniquely owned and move-only; its mutable resource-pool state is mutex-protected.
 - Raw descriptor payload pointers are wrapped in a `Send` newtype. The queue owns one fixed
   allocation for the renderer lifetime, and its frame ring waits for the worker before recycling a
   slice, matching Eden's recorded `const DescriptorUpdateEntry*` lifetime.
@@ -12426,8 +12426,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- `DescriptorPool` retains an `Arc` to the scheduler's `MasterSemaphore` and passes it to each
-  allocator. Eden passes the same stable semaphore reference through every `Allocator` overload.
+- `ResourcePool` retains an `Arc` to the scheduler's `MasterSemaphore` instead of Eden's raw
+  pointer. Each `DescriptorPool::allocator*` overload receives the scheduler explicitly and clones
+  that same semaphore into the newly returned allocator.
 - Vulkan allocation failures use `Result<_, vk::Result>` instead of C++ exceptions.
 
 ### Unintentional differences (to fix)
@@ -12474,9 +12475,11 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Descriptor banks and allocator state use `Arc`, `Mutex`, and `RwLock` instead of non-owning C++
-  pointers plus `shared_mutex`; the read-search/write-insert critical sections and lack of a second
-  search after lock promotion remain identical.
+- Descriptor banks use `Box` for Eden's `unique_ptr` address stability and allocators retain a
+  non-owning `NonNull` pointer. Rust adds mutexes around the bank and allocator state so deferred
+  `Send + 'static` scheduler commands can perform Eden's captured-`this` operations safely; the
+  read-search/write-insert critical sections and lack of a second search after lock promotion
+  remain identical.
 - Vulkan wrappers are raw ash handles owned and destroyed by `DescriptorPool::drop`; allocation
   failures propagate as `vk::Result` rather than exceptions.
 
@@ -12490,6 +12493,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Descriptor count accumulation and pool-size multiplication now retain Eden's unsigned wrapping
   bit patterns in checked Rust builds.
 - Removed the Rust-only successful-bank debug log; Eden's helper returns without emitting a log.
+- Restored Eden's explicit `Device` and `Scheduler` parameters on all three allocator overloads;
+  `DescriptorPool` no longer owns the master semaphore.
+- Restored move-only allocator ownership and `Box`-stable banks instead of sharing both through
+  `Arc` clones.
 
 ### Missing items
 
@@ -13454,9 +13461,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust retains Eden's `const Device&` through `DeviceReference`, whose pointee is owned in stable
   boxed renderer storage. Recorded commands clone only the logical ash dispatch table; capability
   decisions remain owned by `Device`.
-- `DescriptorPool` already retains the scheduler's master semaphore, so `ComputePass::new` keeps
-  Eden's scheduler parameter for ownership traceability but does not pass it again when creating a
-  `DescriptorAllocator`.
+- `ComputePass::new` passes Eden's explicit device and scheduler arguments through to
+  `DescriptorPool::allocator`. A shared scheduler borrow is sufficient because allocator creation
+  only obtains the scheduler's master semaphore.
 - ASTC and 3D-unswizzle entry points receive decomposed image handles/state because mutably
   borrowing the texture-cache runtime and one of its slot-map images simultaneously is not safe in
   Rust. Image initialization exchange, compute-unswizzle-buffer allocation, and storage-view lookup
@@ -13468,6 +13475,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   optional required-subgroup-size `pNext`, shader-save notification, ASTC descriptor-template
   update path, exact ASTC pipeline stage masks and buffer ranges, and assertion behavior for invalid
   ASTC/3D-unswizzle inputs.
+- None after leaving `descriptor_allocator` empty when `templates` is empty and restoring
+  constructor-failure cleanup plus reverse member-destruction order for Vulkan resources.
 
 ### Missing items
 
@@ -13483,9 +13492,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- `ComputePipelineRuntime` groups the three stable renderer-owned descriptor services that Eden
-  receives as constructor references. Rust stores them as `NonNull` because the pipeline is built
-  asynchronously and cached in stable boxed storage.
+- `ComputePipelineRuntime` groups the scheduler and three stable renderer-owned descriptor
+  services that Eden receives as constructor references. Rust stores them as `NonNull` because the
+  pipeline is built asynchronously and cached in stable boxed storage.
 - The asynchronously published Vulkan pipeline is an `Arc<Mutex<VkPipeline>>`. This lets recorded
   scheduler closures perform Eden's late `IsBound()` check without capturing a borrow of the cache
   entry; `is_bound` remains on `ComputePipeline` as the direct upstream counterpart.
@@ -13723,3 +13732,37 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `Allocation` is returned within Rust and is not copied to a Vulkan or guest-memory payload;
   its pointer, offset, chunk, and generation values correspond field-for-field to Eden.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` and descriptor-allocation call sites vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.h` and `.cpp`
+
+### Intentional differences
+
+- Eden's `vk::DescriptorPool` wrapper destroys each handle through RAII. Ruzu currently stores raw
+  ash handles, so `DescriptorPool` retains a non-owning `DeviceReference` and destroys them in
+  `Drop`.
+- Rust uses `Result<_, vk::Result>` for Vulkan failures and mutexes for state reached by deferred
+  `Send + 'static` scheduler commands. `DescriptorAllocatorReference` is the non-owning counterpart
+  of Eden's scheduler lambdas capturing `this`.
+- Allocator methods accept a shared scheduler borrow because they only call the logically const
+  `get_master_semaphore`; Eden spells the parameter as a non-const reference.
+
+### Unintentional differences (to fix)
+
+- None after restoring slice-based `make_bank_info`, explicit device/scheduler arguments on every
+  allocator overload, and the absence of a master-semaphore member on `DescriptorPool`.
+- None after making `DescriptorAllocator` uniquely owned and move-only again, storing banks in
+  address-stable boxes, and replacing owning allocator clones with non-owning deferred-command
+  references.
+- None after `ComputePass` stopped creating an allocator for an empty descriptor-template list and
+  began cleaning partially created Vulkan resources in Eden's reverse member order.
+
+### Missing items
+
+- None in descriptor counting, pool construction/retry, bank selection/publication, resource
+  commit, or the audited allocator call sites.
+
+### Binary layout verification
+
+- N/A: descriptor metadata is consumed field-wise and Vulkan structures are built through ash.
+  Focused tests cover all-field superset matching, multi-shader accumulation, unsigned wrapping,
+  and bank address stability across outer-vector growth.

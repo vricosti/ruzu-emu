@@ -509,6 +509,7 @@ impl GraphicsPipeline {
         stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES],
         descriptor_buffer_ring: &DescriptorBufferRing,
         descriptor_pool: &DescriptorPool,
+        scheduler: &Scheduler,
     ) -> Option<GraphicsDescriptorLayout> {
         let mut builder = DescriptorLayoutBuilder::new(device);
         for (stage_index, info) in stage_infos.iter().enumerate() {
@@ -585,7 +586,12 @@ impl GraphicsPipeline {
             }
         };
         let descriptor_allocator = if !uses_push_descriptor && !uses_descriptor_buffer {
-            match descriptor_pool.allocator_for_infos(descriptor_set_layout, stage_infos.iter()) {
+            match descriptor_pool.allocator_for_infos(
+                device,
+                scheduler,
+                descriptor_set_layout,
+                stage_infos,
+            ) {
                 Ok(allocator) => Some(allocator),
                 Err(error) => {
                     log::warn!("Failed to create graphics descriptor allocator: {error:?}");
@@ -636,6 +642,7 @@ impl GraphicsPipeline {
                 &stage_infos,
                 runtime.descriptor_buffer_ring.as_ref(),
                 runtime.descriptor_pool(),
+                runtime.scheduler.as_ref(),
             )?
         };
         let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
@@ -1300,7 +1307,10 @@ impl GraphicsPipeline {
         let pipeline_layout = self.pipeline_layout;
         let descriptor_set_layout = self.descriptor_set_layout;
         let descriptor_update_template = self.descriptor_update_template;
-        let descriptor_allocator = self.descriptor_allocator.clone();
+        let descriptor_allocator = self
+            .descriptor_allocator
+            .as_ref()
+            .map(DescriptorAllocator::reference);
         let uses_push_descriptor = self.uses_push_descriptor;
         let uses_descriptor_buffer = self.uses_descriptor_buffer;
         let descriptor_buffer_binding = bind_descriptor_buffer.then(|| {

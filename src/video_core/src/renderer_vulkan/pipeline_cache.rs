@@ -1586,6 +1586,7 @@ impl PipelineCache {
                 render_pass_cache,
             ),
             compute_runtime: ComputePipelineRuntime::new(
+                &mut *scheduler,
                 &mut *guest_descriptor_queue,
                 &mut *descriptor_buffer_ring,
                 &mut *descriptor_pool,

@@ -1884,7 +1884,14 @@ impl TextureCacheRuntime {
         let astc_decoder_pass = if *common::settings::values().accelerate_astc.get_value()
             == common::settings_enums::AstcDecodeMode::Gpu
         {
-            match AstcDecoderPass::new(&device, descriptor_pool, compute_pass_descriptor_queue) {
+            match AstcDecoderPass::new(
+                vulkan_device,
+                scheduler,
+                descriptor_pool,
+                staging_buffer_pool,
+                compute_pass_descriptor_queue,
+                memory_allocator,
+            ) {
                 Ok(pass) => Some(pass),
                 Err(err) => {
                     log::warn!(
@@ -1899,7 +1906,7 @@ impl TextureCacheRuntime {
         };
         let bl3d_unswizzle_pass = if *common::settings::values().gpu_unswizzle_enabled.get_value() {
             match BlockLinearUnswizzle3DPass::new(
-                &device,
+                vulkan_device,
                 scheduler,
                 descriptor_pool,
                 staging_buffer_pool,
@@ -2206,10 +2213,7 @@ impl TextureCacheRuntime {
             *slot = view;
         }
         let is_initialized = image.exchange_initialization();
-        let device = self.device.clone();
         let result = pass.assemble(
-            &device,
-            self.scheduler(),
             image.handle(),
             image.aspect_mask(),
             is_initialized,

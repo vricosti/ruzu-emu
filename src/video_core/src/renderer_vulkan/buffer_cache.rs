@@ -463,7 +463,7 @@ impl BufferCacheRuntime {
     ) -> Result<Self, vk::Result> {
         let device = vulkan_device.get_logical();
         let quad_index_pass = QuadIndexedPass::new(
-            device,
+            vulkan_device,
             scheduler,
             descriptor_pool,
             staging_pool,
@@ -471,7 +471,7 @@ impl BufferCacheRuntime {
         )?;
         let uint8_pass = if vulkan_device.supports_uint8_indices() {
             Some(Uint8Pass::new(
-                device,
+                vulkan_device,
                 scheduler,
                 descriptor_pool,
                 staging_pool,

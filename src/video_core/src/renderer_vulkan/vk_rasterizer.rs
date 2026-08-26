@@ -776,8 +776,6 @@ impl RasterizerVulkan {
         extended_dynamic_state_supported: bool,
         transform_feedback_supported: bool,
         host_query_reset_supported: bool,
-        subgroup_scan_supported: bool,
-        conditional_rendering_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_logic_op_supported: bool,
         extended_dynamic_state3_blending_supported: bool,
@@ -940,6 +938,7 @@ impl RasterizerVulkan {
 
         // Create query cache
         let query_cache = VulkanQueryCache::new(
+            vulkan_device,
             &instance,
             device.clone(),
             scheduler,
@@ -950,8 +949,6 @@ impl RasterizerVulkan {
             compute_pass_desc_queue.as_mut(),
             Arc::clone(&device_memory),
             driver_id,
-            subgroup_scan_supported,
-            conditional_rendering_supported,
             transform_feedback_supported,
             host_query_reset_supported,
         )

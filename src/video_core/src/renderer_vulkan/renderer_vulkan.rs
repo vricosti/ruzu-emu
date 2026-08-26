@@ -367,13 +367,6 @@ impl RendererVulkan {
             device.is_ext_extended_dynamic_state_supported(),
             device.is_ext_transform_feedback_supported(),
             device.is_host_query_reset_supported(),
-            device.is_subgroup_feature_supported(
-                vk::SubgroupFeatureFlags::BASIC
-                    | vk::SubgroupFeatureFlags::ARITHMETIC
-                    | vk::SubgroupFeatureFlags::SHUFFLE
-                    | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE,
-            ),
-            device.is_ext_conditional_rendering(),
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_ext_extended_dynamic_state2_extras_supported(),
             device.is_ext_extended_dynamic_state3_blending_supported(),

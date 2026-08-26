@@ -30,6 +30,7 @@ use crate::query_cache::query_cache::{
 use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase, QueryLocation};
 use crate::query_cache::query_stream::StreamerInterface;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
 
 use super::buffer_cache::VulkanCommonBufferCache;
@@ -332,22 +333,19 @@ struct SamplesStreamer {
 
 impl SamplesStreamer {
     fn new(
+        vulkan_device: &Device,
         device: ash::Device,
         scheduler: &mut Scheduler,
         memory_allocator: &MemoryAllocator,
         descriptor_pool: &DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
-        subgroup_scan_supported: bool,
-        conditional_rendering_supported: bool,
         host_query_reset_supported: bool,
     ) -> Result<Self, vk::Result> {
         let prefix_scan_pass = QueriesPrefixScanPass::new(
-            &device,
+            vulkan_device,
             scheduler,
             descriptor_pool,
             compute_pass_descriptor_queue,
-            subgroup_scan_supported,
-            conditional_rendering_supported,
         )?;
         let accumulation_buffer = memory_allocator
             .create_buffer(
@@ -1807,6 +1805,7 @@ impl QueryCacheRuntime {
 
     #[allow(clippy::too_many_arguments)]
     fn new_vulkan(
+        vulkan_device: &Device,
         instance: &ash::Instance,
         device: ash::Device,
         scheduler: &mut Scheduler,
@@ -1817,8 +1816,8 @@ impl QueryCacheRuntime {
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
         driver_id: vk::DriverId,
-        conditional_rendering_supported: bool,
     ) -> Result<Self, vk::Result> {
+        let conditional_rendering_supported = vulkan_device.is_ext_conditional_rendering();
         let conditional_rendering = conditional_rendering_supported.then(|| {
             vk::ExtConditionalRenderingFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
@@ -1826,7 +1825,7 @@ impl QueryCacheRuntime {
         });
         let conditional_resolve_pass = if conditional_rendering_supported {
             Some(ConditionalRenderingResolvePass::new(
-                &device,
+                vulkan_device,
                 scheduler,
                 descriptor_pool,
                 compute_pass_descriptor_queue,
@@ -2305,6 +2304,7 @@ impl DeviceMemoryWriter for QueryDeviceMemoryAdapter {
 
 impl QueryCache {
     pub fn new(
+        vulkan_device: &Device,
         instance: &ash::Instance,
         device: ash::Device,
         scheduler: &mut Scheduler,
@@ -2315,20 +2315,17 @@ impl QueryCache {
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
         driver_id: vk::DriverId,
-        subgroup_scan_supported: bool,
-        conditional_rendering_supported: bool,
         transform_feedback_supported: bool,
         host_query_reset_supported: bool,
     ) -> Result<Self, vk::Result> {
         let device_memory_adapter = Box::new(QueryDeviceMemoryAdapter(Arc::clone(&device_memory)));
         let samples_streamer = SamplesStreamer::new(
+            vulkan_device,
             device,
             scheduler,
             memory_allocator,
             descriptor_pool,
             compute_pass_descriptor_queue,
-            subgroup_scan_supported,
-            conditional_rendering_supported,
             host_query_reset_supported,
         )?;
         let tfb_streamer = TfbCounterStreamer::new(
@@ -2338,6 +2335,7 @@ impl QueryCache {
             transform_feedback_supported,
         )?;
         let runtime = Box::new(QueryCacheRuntime::new_vulkan(
+            vulkan_device,
             instance,
             samples_streamer.device.clone(),
             scheduler,
@@ -2348,7 +2346,6 @@ impl QueryCache {
             compute_pass_descriptor_queue,
             device_memory,
             driver_id,
-            conditional_rendering_supported,
         )?);
 
         let mut cache = QueryCache {

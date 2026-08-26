@@ -13446,3 +13446,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: only dead host-side Vulkan resources and methods were removed.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pass.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.h` and `.cpp`
+
+### Intentional differences
+
+- Rust retains Eden's `const Device&` through `DeviceReference`, whose pointee is owned in stable
+  boxed renderer storage. Recorded commands clone only the logical ash dispatch table; capability
+  decisions remain owned by `Device`.
+- `DescriptorPool` already retains the scheduler's master semaphore, so `ComputePass::new` keeps
+  Eden's scheduler parameter for ownership traceability but does not pass it again when creating a
+  `DescriptorAllocator`.
+- ASTC and 3D-unswizzle entry points receive decomposed image handles/state because mutably
+  borrowing the texture-cache runtime and one of its slot-map images simultaneously is not safe in
+  Rust. Image initialization exchange, compute-unswizzle-buffer allocation, and storage-view lookup
+  remain performed by the texture-cache owner immediately before these calls.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's local conditional-rendering extension guard, `Device` ownership,
+  optional required-subgroup-size `pNext`, shader-save notification, ASTC descriptor-template
+  update path, exact ASTC pipeline stage masks and buffer ranges, and assertion behavior for invalid
+  ASTC/3D-unswizzle inputs.
+
+### Missing items
+
+- None in the six compute passes defined by the matching upstream files.
+
+### Binary layout verification
+
+- PASS: focused tests verify the 28-byte ASTC constants, 16-byte query constants, and 76-byte
+  block-linear 3D constants including `destination` at offset 60; the subgroup-size chaining truth
+  table is also covered.

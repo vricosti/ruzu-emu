@@ -1025,7 +1025,7 @@ mod tests {
             RasterizerDownloadArea {
                 start_address: addr,
                 end_address: addr,
-                preemptive: true,
+                preemtive: true,
             }
         }
         fn invalidate_region(

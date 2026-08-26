@@ -1113,7 +1113,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 let current = area.get_or_insert(RasterizerDownloadArea {
                     start_address: cpu_addr,
                     end_address: cpu_addr.wrapping_add(size as u64),
-                    preemptive: true,
+                    preemtive: true,
                 });
                 current.start_address = current.start_address.min(image.cpu_addr);
                 current.end_address = current.end_address.max(image.cpu_addr_end);
@@ -1122,7 +1122,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                         .flags
                         .insert(ImageViewFlagBits::PREEMTIVE_DOWNLOAD);
                 }
-                current.preemptive &= image.info.forced_flushed;
+                current.preemtive &= image.info.forced_flushed;
                 image.info.forced_flushed = true;
                 false
             },
@@ -5280,7 +5280,7 @@ mod tests {
             .expect("GPU-modified image should return a flush area");
         assert_eq!(area.start_address, cache.slot_images[image_id].cpu_addr);
         assert_eq!(area.end_address, cache.slot_images[image_id].cpu_addr_end);
-        assert!(!area.preemptive);
+        assert!(!area.preemtive);
         assert!(cache.slot_images[image_id].info.forced_flushed);
         assert!(cache.slot_image_views[view_id]
             .flags
@@ -5289,7 +5289,7 @@ mod tests {
         let second = cache
             .get_flush_area(0x535B_5010, 0x10)
             .expect("forced-flushed image should still return a flush area");
-        assert!(second.preemptive);
+        assert!(second.preemtive);
 
         cache.slot_images[image_id]
             .flags

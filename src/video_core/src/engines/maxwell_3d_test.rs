@@ -176,7 +176,7 @@ impl RasterizerInterface for TestRasterizer {
         RasterizerDownloadArea {
             start_address: addr,
             end_address: addr + size,
-            preemptive: false,
+            preemtive: false,
         }
     }
     fn invalidate_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {
@@ -3780,6 +3780,30 @@ fn test_call_method_sync_point() {
     engine.call_method(SYNC_INFO, 42, true);
     assert_eq!(engine.regs[SYNC_INFO as usize], 42);
     assert_eq!(calls.lock().unwrap().signal_sync_point, vec![42]);
+}
+
+#[test]
+fn test_call_method_counter_reset_maps_clear_reports_to_query_types() {
+    let mut engine = Maxwell3D::new();
+    let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+    let rasterizer = TestRasterizer::new(calls.clone());
+    engine.bind_rasterizer(&rasterizer);
+
+    for clear_report in 0..=5 {
+        engine.call_method(CLEAR_REPORT_VALUE, clear_report, true);
+    }
+
+    assert_eq!(
+        calls.lock().unwrap().reset_counter,
+        vec![
+            QueryType::Payload as u32,
+            QueryType::ZPassPixelCount64 as u32,
+            QueryType::StreamingPrimitivesSucceeded as u32,
+            QueryType::PrimitivesGenerated as u32,
+            QueryType::VtgPrimitivesOut as u32,
+            QueryType::Payload as u32,
+        ]
+    );
 }
 
 #[test]

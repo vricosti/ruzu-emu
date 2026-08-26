@@ -15673,3 +15673,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the corrected query bookkeeping and synchronization payloads are host-only Rust structures;
   no raw guest or cache serialization layout changed.
+
+## 2026-08-26 — `src/video_core/src/rasterizer_interface.rs` vs Eden `src/video_core/rasterizer_interface.h` and `rasterizer_download_area.h`
+
+### Intentional differences
+
+- Rust passes draw, clear, indirect-draw, and compute snapshots through the trait because the
+  current backend ownership graph does not retain Eden's mutable engine pointers.
+- Query-type arguments remain raw `u32` values so every five-bit hardware report value, including
+  values without a named Rust enum variant, preserves its upstream bit pattern.
+
+### Unintentional differences (to fix)
+
+- Resolved: the rasterizer interface no longer owns a duplicate download-area structure with the
+  corrected spelling `preemptive`; it re-exports the single type owned by
+  `rasterizer_download_area.rs`, including Eden's `preemtive` field spelling.
+- Resolved: `Maxwell3D::process_counter_reset` now maps all four clear-report values to Eden's exact
+  query types instead of sending unrelated numeric counter identifiers.
+
+### Missing items
+
+- None in the rasterizer virtual surface or counter-reset mapping.
+
+### Binary layout verification
+
+- PASS: every rasterizer backend now returns the same `RasterizerDownloadArea` owner with Eden's
+  `u64`, `u64`, `bool` field order; the structure is not copied as a raw guest payload.

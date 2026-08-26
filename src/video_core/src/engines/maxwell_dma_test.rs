@@ -138,7 +138,7 @@ impl RasterizerInterface for TestRasterizer {
         RasterizerDownloadArea {
             start_address: addr,
             end_address: addr + size,
-            preemptive: false,
+            preemtive: false,
         }
     }
     fn invalidate_region(&mut self, addr: u64, size: u64, _which: crate::cache_types::CacheType) {

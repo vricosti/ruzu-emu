@@ -62,7 +62,7 @@ fn get_flush_area_uses_the_boxed_cache_objects() {
 
     assert_eq!(area.start_address, 0x4444_4000);
     assert_eq!(area.end_address, 0x4444_7000);
-    assert!(area.preemptive);
+    assert!(area.preemtive);
 }
 
 #[test]

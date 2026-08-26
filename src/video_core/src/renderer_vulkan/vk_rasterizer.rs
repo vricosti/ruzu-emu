@@ -3330,7 +3330,7 @@ impl RasterizerInterface for RasterizerVulkan {
         RasterizerDownloadArea {
             start_address: addr & !(PAGE - 1),
             end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
-            preemptive: true,
+            preemtive: true,
         }
     }
 

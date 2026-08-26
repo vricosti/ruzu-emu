@@ -22,7 +22,7 @@ use crate::engines::draw_manager as dm;
 use crate::memory_manager::MemoryManager;
 use crate::query_cache::query_cache::{RenderConditionState, RenderConditionStateSource};
 use crate::query_cache::types::ComparisonMode;
-use crate::query_cache::types::QueryPropertiesFlags;
+use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::r#macro::MacroEngine;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::texture::{TicEntry, TscEntry};
@@ -4660,11 +4660,11 @@ impl Maxwell3D {
         let clear_report = self.regs[CLEAR_REPORT_VALUE as usize];
         log::debug!("Maxwell3D: counter_reset report=0x{:X}", clear_report);
         let query_type = match clear_report {
-            1 => 2,
-            2 => 6,
-            3 => 1,
-            4 => 7,
-            _ => 0,
+            1 => QueryType::ZPassPixelCount64 as u32,
+            2 => QueryType::StreamingPrimitivesSucceeded as u32,
+            3 => QueryType::PrimitivesGenerated as u32,
+            4 => QueryType::VtgPrimitivesOut as u32,
+            _ => QueryType::Payload as u32,
         };
         let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.reset_counter(query_type));
     }

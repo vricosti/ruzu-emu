@@ -247,7 +247,7 @@ impl RasterizerInterface for RasterizerNull {
             start_address: addr & !(DEVICE_PAGESIZE - 1),
             end_address: addr.wrapping_add(size).wrapping_add(DEVICE_PAGESIZE - 1)
                 & !(DEVICE_PAGESIZE - 1),
-            preemptive: true,
+            preemtive: true,
         }
     }
 
@@ -469,7 +469,7 @@ mod tests {
         let area = rast.get_flush_area(0x1234, 0x100);
         assert_eq!(area.start_address, 0x1000);
         assert_eq!(area.end_address, 0x2000);
-        assert!(area.preemptive);
+        assert!(area.preemtive);
 
         let wrapped = rast.get_flush_area(u64::MAX - 0x100, 0x200);
         assert_eq!(wrapped.start_address, u64::MAX & !0xfff);

@@ -2998,7 +2998,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                 return RasterizerDownloadArea {
                     start_address: area.start_address,
                     end_address: area.end_address,
-                    preemptive: area.preemtive,
+                    preemtive: area.preemtive,
                 };
             }
         }
@@ -3007,7 +3007,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         RasterizerDownloadArea {
             start_address: addr & !(PAGE - 1),
             end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
-            preemptive: true,
+            preemtive: true,
         }
     }
 

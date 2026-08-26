@@ -698,12 +698,7 @@ impl Gpu {
             };
         };
 
-        let flush_area = unsafe { rasterizer.as_mut() }.get_flush_area(addr, size);
-        let mut raster_area = RasterizerDownloadArea {
-            start_address: flush_area.start_address,
-            end_address: flush_area.end_address,
-            preemtive: flush_area.preemptive,
-        };
+        let mut raster_area = unsafe { rasterizer.as_mut() }.get_flush_area(addr, size);
         if raster_area.preemtive {
             return raster_area;
         }
@@ -1243,7 +1238,7 @@ mod tests {
             RasterizerDownloadArea {
                 start_address: addr,
                 end_address: addr,
-                preemptive: true,
+                preemtive: true,
             }
         }
         fn invalidate_region(

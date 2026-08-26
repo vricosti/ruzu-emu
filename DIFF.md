@@ -14334,3 +14334,62 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `GraphicsPipelineKey` is `repr(C)`, 624 bytes, with the same 52-byte no-XFB hash prefix;
   `TransformFeedbackState` is 560 bytes and raw cache round trips cover the complete XFB key.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_rasterizer.rs` vs Eden `src/video_core/renderer_opengl/gl_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- Heap-stable cache owners and non-owning pointers replace Eden's reference members; declaration
+  order makes the DMA borrower drop before both cache owners.
+- GPU ticks, GPU-cache invalidation, and guest-memory access cross the renderer ownership boundary
+  through installed callbacks. Calls remain at Eden's corresponding rasterizer lifecycle points.
+- Draw, clear, texture-draw, and indirect-draw register access uses scoped engine snapshots so Rust
+  can release engine locks before cache operations; each snapshot contains the same state Eden reads.
+- `BeginTransformFeedback` and `EndTransformFeedback` are associated methods without a `self`
+  receiver because their snapshot arguments avoid borrowing the whole rasterizer while the shader
+  cache lends a pipeline; they remain owned by `RasterizerOpenGL` as in Eden.
+- Query-cache operations receive the current `AnyCommandQueued` value explicitly instead of storing
+  a self-reference from `QueryCache` back into `RasterizerOpenGL`.
+- `StateTracker::release_channel` clears Rust's borrowed dirty-flag pointer before its channel owner
+  can be destroyed. Eden retains a raw pointer and relies on a subsequent bind before reuse.
+
+### Unintentional differences (to fix)
+
+- Resolved: `OnCacheInvalidation` now calls `ShaderCache::invalidate_region`, including
+  `RemovePendingShaders`, instead of the deferred `on_cache_invalidation` path. This matches Eden
+  and prevents stale shader lookup entries after a cache invalidation notification.
+- Resolved: the private, currently uncalled `SyncClipEnabled` method and its
+  `last_clip_distance_mask` state are restored, including the shader-dirty gate, guest enable mask,
+  change suppression, and eight OpenGL clip-distance enables. Eden's unimplemented
+  `SyncClipCoef` placeholder also retains a same-owner diagnostic counterpart.
+
+### Missing items
+
+- None among the public rasterizer operations, OpenGL state synchronization methods, transform
+  feedback lifecycle, channel lifecycle, or DMA acceleration methods.
+
+### Binary layout verification
+
+- PASS: Eden's unused header-level `BindlessSSBO` duplicate is not materialized here. The active
+  payload owned by `gl_buffer_cache.cpp` maps to the 16-byte `gl_buffer_cache.rs::BindlessSSBO`
+  with a size regression test; no `RasterizerOpenGL` state is raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/engines/{draw_manager,maxwell_3d}.rs` support for Eden `src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+
+- Ruzu's draw-time register view uses a `Maxwell3DAccess` method and a snapshot field to expose
+  Eden's direct `maxwell3d->regs.user_clip_enable.raw` read to the renderer.
+
+### Unintentional differences (to fix)
+
+- Resolved: draw views now carry the raw user-clip enable mask required by the restored
+  `RasterizerOpenGL::SyncClipEnabled` owner.
+
+### Missing items
+
+- None for the user-clip register access required by this rasterizer parity slice.
+
+### Binary layout verification
+
+- N/A: `Maxwell3DDrawRegisters` is a typed in-process snapshot and is never raw-serialized.

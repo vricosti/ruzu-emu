@@ -306,6 +306,11 @@ pub trait Maxwell3DAccess {
         false
     }
 
+    /// Read the raw `regs.user_clip_enable` mask.
+    fn user_clip_enable_raw(&self) -> u32 {
+        0
+    }
+
     /// Read `regs.surface_clip.height`.
     fn surface_clip_height(&self) -> u32;
 
@@ -687,6 +692,7 @@ pub struct Maxwell3DDrawRegisters {
     pub viewport_scale_offset_enabled: bool,
     pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
     pub framebuffer_srgb: bool,
+    pub user_clip_enable_raw: u32,
     pub depth_mode: crate::engines::maxwell_3d::DepthMode,
     pub dirty_flags: [bool; 256],
     pub color_masks: [crate::engines::maxwell_3d::ColorMaskInfo; 8],
@@ -747,6 +753,7 @@ impl Default for Maxwell3DDrawRegisters {
             viewport_scale_offset_enabled: false,
             surface_clip: Default::default(),
             framebuffer_srgb: false,
+            user_clip_enable_raw: 0,
             depth_mode: crate::engines::maxwell_3d::DepthMode::ZeroToOne,
             dirty_flags: [false; 256],
             color_masks: Default::default(),
@@ -832,6 +839,7 @@ impl Maxwell3DDrawRegisters {
             viewport_scale_offset_enabled: maxwell3d.viewport_scale_offset_enabled(),
             surface_clip: maxwell3d.surface_clip_info(),
             framebuffer_srgb: maxwell3d.framebuffer_srgb(),
+            user_clip_enable_raw: maxwell3d.user_clip_enable_raw(),
             depth_mode: maxwell3d.depth_stencil_info().depth_mode,
             dirty_flags: *maxwell3d.dirty_flags(),
             color_masks: std::array::from_fn(|i| maxwell3d.color_mask_info(i)),
@@ -914,6 +922,7 @@ impl Maxwell3DDrawRegisters {
             viewport_scale_offset_enabled: draw.viewport_scale_offset_enabled,
             surface_clip: draw.surface_clip,
             framebuffer_srgb: false,
+            user_clip_enable_raw: 0,
             depth_mode: draw.depth_stencil.depth_mode,
             dirty_flags: draw.dirty_flags,
             color_masks: draw.color_masks,
@@ -1632,6 +1641,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.framebuffer_srgb(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.framebuffer_srgb,
+        }
+    }
+
+    pub fn user_clip_enable_raw(&self) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.user_clip_enable_raw(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.user_clip_enable_raw,
         }
     }
 

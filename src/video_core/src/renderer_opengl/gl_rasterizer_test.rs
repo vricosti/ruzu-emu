@@ -66,6 +66,46 @@ fn get_flush_area_uses_the_boxed_cache_objects() {
 }
 
 #[test]
+fn cache_invalidation_eagerly_removes_shaders_like_upstream() {
+    let syncpoints = Arc::new(SyncpointManager::new());
+    let mut rasterizer = RasterizerOpenGL::new_for_test(syncpoints);
+    rasterizer.shader_cache.register(
+        Box::new(crate::shader_cache::ShaderInfo {
+            unique_hash: 0x1234,
+            size_bytes: 0x40,
+        }),
+        0x4000,
+        0x40,
+    );
+
+    assert!(rasterizer.shader_cache.try_get(0x4000).is_some());
+
+    RasterizerInterface::on_cache_invalidation(&mut rasterizer, 0x4000, 4);
+
+    assert!(rasterizer.shader_cache.try_get(0x4000).is_none());
+}
+
+#[test]
+fn clip_enable_preserves_upstream_mask_and_dirty_order_without_a_state_change() {
+    let syncpoints = Arc::new(SyncpointManager::new());
+    let mut rasterizer = RasterizerOpenGL::new_for_test(syncpoints);
+    rasterizer.last_clip_distance_mask = 0b0101;
+
+    let draw_state = DrawState::default();
+    let mut registers = crate::engines::draw_manager::Maxwell3DDrawRegisters::default();
+    registers.user_clip_enable_raw = 0b0101;
+    registers.dirty_flags[GlDirty::CLIP_DISTANCES as usize] = true;
+    let mut view = Maxwell3DDrawView::with_register_snapshot(&draw_state, false, registers);
+
+    // The effective mask is unchanged, so Eden clears the dirty bit and
+    // returns before issuing any OpenGL call.
+    rasterizer.sync_clip_enabled(&mut view, 0b1111);
+
+    assert!(!view.dirty_flag(GlDirty::CLIP_DISTANCES));
+    assert_eq!(rasterizer.last_clip_distance_mask, 0b0101);
+}
+
+#[test]
 fn graphics_uniform_buffer_notifications_match_upstream() {
     let syncpoints = Arc::new(SyncpointManager::new());
     let mut rasterizer = RasterizerOpenGL::new_for_test(syncpoints);

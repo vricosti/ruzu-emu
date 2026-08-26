@@ -3900,6 +3900,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.regs[FRAMEBUFFER_SRGB as usize] != 0
     }
 
+    fn user_clip_enable_raw(&self) -> u32 {
+        self.regs[USER_CLIP_ENABLE as usize]
+    }
+
     fn surface_clip_height(&self) -> u32 {
         (self.regs[SURFACE_CLIP_BASE as usize + SURFACE_CLIP_HEIGHT_OFFSET] >> 16) & 0xFFFF
     }

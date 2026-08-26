@@ -1823,6 +1823,7 @@ pub struct RasterizerOpenGL {
     fence_manager: FenceManagerOpenGL,
     num_queued_commands: usize,
     has_written_global_memory: bool,
+    last_clip_distance_mask: u32,
     /// Upstream `staging_buffer_pool` owner. Rust cache runtimes retain `Arc`
     /// clones, so ownership itself is the only direct use of this field.
     #[allow(dead_code)]
@@ -1924,6 +1925,69 @@ impl RasterizerOpenGL {
     /// Port of upstream `RasterizerOpenGL::AnyCommandQueued`.
     pub fn any_command_queued(&self) -> bool {
         self.num_queued_commands != 0
+    }
+
+    /// Port of Eden's currently uncalled `RasterizerOpenGL::SyncClipEnabled`.
+    #[allow(dead_code)]
+    fn sync_clip_enabled(&mut self, draw_view: &mut Maxwell3DDrawView<'_>, mut clip_mask: u32) {
+        if !draw_view.dirty_flag(GlDirty::CLIP_DISTANCES)
+            && !draw_view.dirty_flag(crate::dirty_flags::flags::SHADERS)
+        {
+            return;
+        }
+        draw_view.clear_dirty_flag(GlDirty::CLIP_DISTANCES);
+
+        clip_mask &= draw_view.user_clip_enable_raw();
+        if clip_mask == self.last_clip_distance_mask {
+            return;
+        }
+        self.last_clip_distance_mask = clip_mask;
+
+        for index in 0..crate::engines::maxwell_3d::NUM_CLIP_DISTANCES {
+            unsafe {
+                if clip_mask & (1 << index) != 0 {
+                    gl::Enable(gl::CLIP_DISTANCE0 + index);
+                } else {
+                    gl::Disable(gl::CLIP_DISTANCE0 + index);
+                }
+            }
+        }
+    }
+
+    /// Eden keeps this private method as an `UNIMPLEMENTED()` placeholder.
+    #[allow(dead_code)]
+    fn sync_clip_coef(&self) {
+        error!("RasterizerOpenGL::SyncClipCoef is unimplemented");
+    }
+
+    /// Port of `RasterizerOpenGL::BeginTransformFeedback` using the draw snapshot
+    /// that replaces Eden's persistent `Maxwell3D*` member.
+    fn begin_transform_feedback(
+        pipeline: &crate::renderer_opengl::gl_graphics_pipeline::GraphicsPipeline,
+        transform_feedback_enabled: bool,
+        tessellation_init_enabled: bool,
+        tessellation_enabled: bool,
+        primitive_mode: u32,
+    ) {
+        if !transform_feedback_enabled {
+            return;
+        }
+        pipeline.configure_transform_feedback();
+        if tessellation_init_enabled || tessellation_enabled {
+            error!("OpenGL transform feedback with tessellation is unimplemented");
+        }
+        unsafe {
+            gl::BeginTransformFeedback(primitive_mode);
+        }
+    }
+
+    /// Port of `RasterizerOpenGL::EndTransformFeedback`.
+    fn end_transform_feedback(transform_feedback_enabled: bool) {
+        if transform_feedback_enabled {
+            unsafe {
+                gl::EndTransformFeedback();
+            }
+        }
     }
 
     fn sync_state(
@@ -2037,17 +2101,13 @@ impl RasterizerOpenGL {
         let draw_state = draw_view.draw_state();
         let primitive_mode = super::maxwell_to_gl::primitive_topology(draw_state.topology);
         let transform_feedback_active = draw_view.transform_feedback_enabled();
-        if transform_feedback_active {
-            pipeline.configure_transform_feedback();
-            if draw_view.shader_config_enabled(ShaderStageType::TessInit)
-                || draw_view.shader_config_enabled(ShaderStageType::Tessellation)
-            {
-                error!("OpenGL transform feedback with tessellation is unimplemented");
-            }
-            unsafe {
-                gl::BeginTransformFeedback(primitive_mode);
-            }
-        }
+        Self::begin_transform_feedback(
+            pipeline,
+            transform_feedback_active,
+            draw_view.shader_config_enabled(ShaderStageType::TessInit),
+            draw_view.shader_config_enabled(ShaderStageType::Tessellation),
+            primitive_mode,
+        );
 
         match command {
             PreparedDrawCommand::Direct {
@@ -2065,11 +2125,7 @@ impl RasterizerOpenGL {
             }
         }
 
-        if transform_feedback_active {
-            unsafe {
-                gl::EndTransformFeedback();
-            }
-        }
+        Self::end_transform_feedback(transform_feedback_active);
         self.num_queued_commands = self.num_queued_commands.wrapping_add(1);
         self.has_written_global_memory |= pipeline.writes_global_memory();
     }
@@ -2118,6 +2174,7 @@ impl RasterizerOpenGL {
             fence_manager: FenceManagerOpenGL::new(),
             num_queued_commands: 0,
             has_written_global_memory: false,
+            last_clip_distance_mask: 0,
             staging_buffer_pool: Arc::clone(&staging_buffer_pool),
             buffer_cache,
             device_memory: Arc::clone(&device_memory),
@@ -2176,6 +2233,7 @@ impl RasterizerOpenGL {
             fence_manager: FenceManagerOpenGL::new_for_test(),
             num_queued_commands: 0,
             has_written_global_memory: false,
+            last_clip_distance_mask: 0,
             staging_buffer_pool: Arc::clone(&staging_buffer_pool),
             buffer_cache,
             device_memory: Arc::clone(&test_device_memory),
@@ -3005,7 +3063,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             let _buffer_guard = (*buffer_mutex).lock();
             self.buffer_cache.write_memory(addr, size);
         }
-        self.shader_cache.on_cache_invalidation(addr, size as usize);
+        self.shader_cache.invalidate_region(addr, size as usize);
     }
 
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {

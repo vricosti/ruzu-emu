@@ -17089,3 +17089,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   offset assertions for `Vp9FrameDimensions`, `Segmentation`, `LoopFilter`, `Vp9EntropyProbs`,
   `PictureInfo`, and `EntropyProbs`. Regression tests cover zero-extension and flag conversion,
   every skipped fourth coefficient, Y-mode reshaping, and the complete default-table hash.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/{mod.rs,vulkan.rs}` vs Eden `src/video_core/vulkan_common/vulkan.h`
+
+### Intentional differences
+
+- Ash owns Vulkan types, opaque handles, and dynamic function dispatch, so Eden's
+  `VK_NO_PROTOTYPES`, target-specific `VK_USE_PLATFORM_*` preprocessor selection, Windows macro
+  sanitation, and `VkSurfaceKHR_T` forward declaration have no source-level Rust counterparts.
+- Rust's `mod.rs` declares the same subsystem files instead of serving as a C++ include
+  aggregator. The actual constants owned by Eden's header live in the matching `vulkan.rs` module.
+
+### Unintentional differences (to fix)
+
+- None after adding the missing `VK_KHR_maintenance7` and `VK_KHR_maintenance8` extension-name
+  fallbacks to their upstream-equivalent owner and correcting the stale `zuyu` provenance.
+
+### Missing items
+
+- None in the header's source-owned declarations. Consumption of the provisional extension names
+  belongs to the separate `vulkan_device` parity slice.
+
+### Binary layout verification
+
+- N/A: Ash owns the Vulkan ABI declarations. The two retained values are UTF-8 extension-name
+  constants, covered by a focused exact-string regression test.

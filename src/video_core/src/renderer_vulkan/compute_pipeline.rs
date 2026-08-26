@@ -13,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime;
 use ash::vk;
 use common::thread_worker::ThreadWorker;
+use shader_recompiler::backend::spirv::emit_spirv::RESCALING_LAYOUT_WORDS_OFFSET;
 use shader_recompiler::shader_info::{
     ImageBufferDescriptor, ImageDescriptor, ImageFormat, Info as ShaderInfo,
     TextureBufferDescriptor, TextureDescriptor,
@@ -26,7 +27,7 @@ use super::descriptor_pool::{DescriptorAllocator, DescriptorPool};
 use super::pipeline_helper::{
     num_descriptor_entries, pixel_format_from_image_format, push_image_descriptors,
     write_descriptor_buffer, DescriptorBufferLayout, DescriptorLayoutBuilder,
-    RescalingPushConstant, RESCALING_LAYOUT_WORDS_OFFSET,
+    RescalingPushConstant,
 };
 use super::pipeline_statistics::PipelineStatistics;
 use super::scheduler::Scheduler;

@@ -15564,3 +15564,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: `Nvdec` is a host-side polymorphic engine object and is not copied through a guest or C ABI.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/pipeline_helper.rs` vs Eden `src/video_core/renderer_vulkan/pipeline_helper.h`
+
+### Intentional differences
+
+- `DeviceReference` provides the stable non-owning device relationship represented by Eden's
+  `const Device*`, and Rust `Vec` replaces the inline-capacity `small_vector` owners.
+- A missing sampler or image-view slot falls back to the renderer's null resources because Rust's
+  typed slot API exposes lookup failure explicitly; valid descriptor paths follow Eden's handle
+  selection and cursor order.
+
+### Unintentional differences (to fix)
+
+- Resolved: rescaling/render-area constants and layouts are no longer duplicated in
+  `pipeline_helper.rs`. The helper and the graphics/compute consumers now use the definitions owned
+  by `shader_recompiler/backend/spirv/emit_spirv.rs`, matching Eden's `using` declarations.
+- Verified: descriptor type order, descriptor-buffer writes, layout/template flags, push-constant
+  range sizing, image/sampler fallback selection, modification tracking, and rescaling bit packing
+  retain the upstream order and conditions.
+
+### Missing items
+
+- None among the inline helpers, descriptor layout builder, rescaling/render-area state, or image
+  descriptor push path.
+
+### Binary layout verification
+
+- PASS: tests verify the upstream-owned `RescalingLayout` size/alignment (32/16 bytes),
+  `RenderAreaLayout` size (16 bytes), and offsets 0/24/0 used by Vulkan push constants.

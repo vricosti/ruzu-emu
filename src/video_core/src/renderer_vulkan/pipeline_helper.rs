@@ -8,6 +8,10 @@
 //! rescaling and render area data.
 
 use ash::vk;
+pub use shader_recompiler::backend::spirv::emit_spirv::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
+use shader_recompiler::backend::spirv::emit_spirv::{
+    RenderAreaLayout, RescalingLayout, NUM_TEXTURE_SCALING_WORDS,
+};
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
 use super::texture_cache::TextureCache;
@@ -33,20 +37,6 @@ pub fn pixel_format_from_image_format(
         ImageFormat::R32G32B32A32Uint => Some(PixelFormat::R32G32B32A32Uint),
     }
 }
-
-/// Number of u32 words used for texture and image scaling bit flags.
-/// Port of `NUM_TEXTURE_AND_IMAGE_SCALING_WORDS` from shader recompiler.
-pub const NUM_TEXTURE_AND_IMAGE_SCALING_WORDS: usize = 6;
-
-/// Number of u32 words for texture-only scaling.
-/// Port of `NUM_TEXTURE_SCALING_WORDS`.
-pub const NUM_TEXTURE_SCALING_WORDS: usize = 4;
-
-pub const RESCALING_LAYOUT_WORDS_OFFSET: u32 = 0;
-pub const RESCALING_LAYOUT_DOWN_FACTOR_OFFSET: u32 = 24;
-pub const RESCALING_LAYOUT_SIZE: u32 = 32;
-pub const RENDERAREA_LAYOUT_OFFSET: u32 = 0;
-pub const RENDERAREA_LAYOUT_SIZE: u32 = 16;
 
 /// Size of a single descriptor update entry (buffer info / image info).
 /// Port of `sizeof(DescriptorUpdateEntry)` used as stride.
@@ -362,11 +352,11 @@ impl DescriptorLayoutBuilder {
         &self,
         descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> Result<vk::PipelineLayout, vk::Result> {
-        // Push constant range covers rescaling layout + render area layout
-        // Rescaling layout: NUM_TEXTURE_AND_IMAGE_SCALING_WORDS * 4 bytes + optional down_factor (4 bytes for compute)
-        let size_offset: u32 = if self.is_compute { 4 } else { 0 };
-        let rescaling_size = RESCALING_LAYOUT_SIZE;
-        let render_area_size = RENDERAREA_LAYOUT_SIZE;
+        let size_offset = if self.is_compute {
+            std::mem::size_of::<u32>() as u32
+        } else {
+            0
+        };
         let range = vk::PushConstantRange {
             stage_flags: if self.is_compute {
                 vk::ShaderStageFlags::COMPUTE
@@ -374,7 +364,8 @@ impl DescriptorLayoutBuilder {
                 vk::ShaderStageFlags::ALL_GRAPHICS
             },
             offset: 0,
-            size: rescaling_size - size_offset + render_area_size,
+            size: std::mem::size_of::<RescalingLayout>() as u32 - size_offset
+                + std::mem::size_of::<RenderAreaLayout>() as u32,
         };
 
         let set_layout_count = if descriptor_set_layout == vk::DescriptorSetLayout::null() {
@@ -614,7 +605,7 @@ pub fn push_image_descriptors(
 /// Tracks per-texture and per-image rescaling flags as bit-packed words
 /// for push constant upload.
 pub struct RescalingPushConstant {
-    words: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
+    words: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
     texture_index: usize,
     texture_bit: u32,
     image_index: usize,
@@ -625,10 +616,10 @@ impl RescalingPushConstant {
     /// Port of `RescalingPushConstant::RescalingPushConstant`.
     pub fn new() -> Self {
         RescalingPushConstant {
-            words: [0u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
+            words: [0u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
             texture_index: 0,
             texture_bit: 1,
-            image_index: NUM_TEXTURE_SCALING_WORDS,
+            image_index: NUM_TEXTURE_SCALING_WORDS as usize,
             image_bit: 1,
         }
     }
@@ -658,7 +649,7 @@ impl RescalingPushConstant {
     }
 
     /// Port of `RescalingPushConstant::Data`.
-    pub fn data(&self) -> &[u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS] {
+    pub fn data(&self) -> &[u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize] {
         &self.words
     }
 }
@@ -687,9 +678,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn push_constant_layout_comes_from_the_spirv_owner() {
+        use shader_recompiler::backend::spirv::emit_spirv::{
+            RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+            RESCALING_LAYOUT_WORDS_OFFSET,
+        };
+
+        assert_eq!(std::mem::size_of::<RescalingLayout>(), 32);
+        assert_eq!(std::mem::align_of::<RescalingLayout>(), 16);
+        assert_eq!(std::mem::size_of::<RenderAreaLayout>(), 16);
+        assert_eq!(RESCALING_LAYOUT_WORDS_OFFSET, 0);
+        assert_eq!(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, 24);
+        assert_eq!(RENDERAREA_LAYOUT_OFFSET, 0);
+    }
+
+    #[test]
     fn rescaling_push_constant_default() {
         let rpc = RescalingPushConstant::new();
-        assert_eq!(rpc.words, [0; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS]);
+        assert_eq!(rpc.words, [0; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize]);
     }
 
     #[test]
@@ -707,7 +713,7 @@ mod tests {
     fn rescaling_push_image() {
         let mut rpc = RescalingPushConstant::new();
         rpc.push_image(true);
-        assert_eq!(rpc.words[NUM_TEXTURE_SCALING_WORDS], 1);
+        assert_eq!(rpc.words[NUM_TEXTURE_SCALING_WORDS as usize], 1);
     }
 
     #[test]

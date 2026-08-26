@@ -32,6 +32,9 @@ use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
 use crate::textures::texture::texture_pair;
 use crate::textures::texture::MsaaMode;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+use shader_recompiler::backend::spirv::emit_spirv::{
+    RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
+};
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 #[cfg(test)]
 use shader_recompiler::{CompiledShader, ShaderStage};
@@ -45,8 +48,7 @@ use super::maxwell_to_vk;
 use super::pipeline_helper::{
     num_descriptor_entries, pixel_format_from_image_format, push_image_descriptors,
     write_descriptor_buffer, DescriptorBufferLayout, DescriptorLayoutBuilder,
-    RescalingPushConstant, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS, RENDERAREA_LAYOUT_OFFSET,
-    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
+    RescalingPushConstant, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS,
 };
 use super::pipeline_statistics::PipelineStatistics;
 use super::render_pass_cache::{RenderPassCache, RenderPassKey};
@@ -179,7 +181,7 @@ impl GraphicsGpuMemory {
 }
 
 struct PreparedGraphicsDescriptors {
-    rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
+    rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
     render_area_data: [f32; 4],
 }
 

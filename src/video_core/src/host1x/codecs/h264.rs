@@ -291,6 +291,59 @@ mod tests {
             0x2D4
         );
     }
+
+    #[test]
+    fn h264_parameter_bitfields_match_upstream_positions_and_sign_extension() {
+        let mut params = H264ParameterSet::default();
+        let flags = 1u64
+            | (1 << 1)
+            | (1 << 2)
+            | (1 << 3)
+            | (9 << 8)
+            | (3 << 12)
+            | (2 << 14)
+            | (0b10_0001 << 16)
+            | (0b1_0001 << 22)
+            | (0b0_1111 << 27)
+            | (2 << 32)
+            | (0x55 << 34)
+            | (0xABCD << 46);
+        params.flags_raw = [flags as u32, (flags >> 32) as u32];
+
+        assert_eq!(params.mbaff_frame(), 1);
+        assert_eq!(params.direct_8x8_inference(), 1);
+        assert_eq!(params.weighted_pred(), 1);
+        assert_eq!(params.constrained_intra_pred(), 1);
+        assert_eq!(params.log2_max_frame_num_minus4(), 9);
+        assert_eq!(params.chroma_format_idc(), 3);
+        assert_eq!(params.pic_order_cnt_type(), 2);
+        assert_eq!(params.pic_init_qp_minus26(), -31);
+        assert_eq!(params.chroma_qp_index_offset(), -15);
+        assert_eq!(params.second_chroma_qp_index_offset(), 15);
+        assert_eq!(params.weighted_bipred_idc(), 2);
+        assert_eq!(params.curr_pic_idx(), 0x55);
+        assert_eq!(params.frame_number(), 0xABCD);
+    }
+
+    #[test]
+    fn h264_exp_golomb_output_matches_upstream_writer() {
+        let mut writer = H264BitWriter::new();
+        for value in 0..=3 {
+            writer.write_ue(value);
+        }
+        writer.end();
+
+        assert_eq!(writer.get_byte_array(), &[0xA6, 0x48]);
+    }
+
+    #[test]
+    fn h264_scaling_list_and_rbsp_stop_bit_match_upstream_writer() {
+        let mut writer = H264BitWriter::new();
+        writer.write_scaling_list(&[8; 16], 0, 16);
+        writer.end();
+
+        assert_eq!(writer.get_byte_array(), &[0xFF, 0xFF, 0x80]);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -345,10 +398,10 @@ impl H264BitWriter {
 
     /// Write scaling list per H.264 spec section 7.3.2.1.1.1.
     pub fn write_scaling_list(&mut self, list: &[u8], start: usize, count: usize) {
-        let scan: Vec<u8> = if count == 16 {
-            ZIG_ZAG_SCAN[..count].to_vec()
+        let scan: &[u8] = if count == 16 {
+            &ZIG_ZAG_SCAN
         } else {
-            ZIG_ZAG_DIRECT[..count].to_vec()
+            &ZIG_ZAG_DIRECT[..count]
         };
 
         let mut last_scale: u8 = 8;

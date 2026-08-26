@@ -385,7 +385,6 @@ impl RendererVulkan {
             device.is_ext_vertex_input_dynamic_state_supported(),
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
-            device.must_emulate_scaled_formats(),
             device.must_emulate_bgr565(),
             device.is_ext_4444_formats_supported(),
             device.is_khr_image_format_list_supported(),

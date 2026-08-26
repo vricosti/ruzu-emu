@@ -15364,3 +15364,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this file maps guest register values to host OpenGL enums and exposes no raw-memory payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/maxwell_to_vk.rs` vs Eden `src/video_core/renderer_vulkan/maxwell_to_vk.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses normalized typed Maxwell enums after raw register decoding; Eden's conversion
+  functions accept the corresponding C++ scoped enums directly.
+- `primitive_topology` omits Eden's unused `Device` parameter. The sampler and vertex-format paths
+  retain the device reference because it is part of their upstream ownership and behavior.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Sampler::wrap_mode` no longer sends the invalid `0xcafe` address mode on Nvidia.
+  `Clamp` selects edge for nearest filtering and border for linear filtering on every driver.
+- Resolved: `MirrorOnceClampOGL` returns mirror-clamp-to-edge without an extra warning.
+- Resolved: `vertex_format` again owns the `Device` lookup and always calls
+  `get_supported_format` with `VERTEX_BUFFER` and `FormatType::Buffer`; static and dynamic vertex
+  input creation now both pass their live device owner.
+- Resolved: the obsolete Nvidia and scaled-format snapshots were removed from the texture-cache
+  and rasterizer constructors once those decisions returned to the upstream-owned `Device` paths.
+
+### Missing items
+
+- None in the 112-entry surface-format mapping, transcoding policy, sampler conversions, vertex
+  format table, or remaining Maxwell-to-Vulkan enum conversions.
+
+### Binary layout verification
+
+- N/A: the module returns Vulkan handles/enums and does not copy its Rust structures as raw data.

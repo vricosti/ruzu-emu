@@ -1839,7 +1839,6 @@ pub struct TextureCacheRuntime {
     sampler_filter_minmax_supported: bool,
     sampler_heap_budget: Option<usize>,
     has_null_descriptor: bool,
-    is_nvidia: bool,
 }
 
 impl TextureCacheRuntime {
@@ -1872,7 +1871,6 @@ impl TextureCacheRuntime {
         sampler_filter_minmax_supported: bool,
         sampler_heap_budget: Option<usize>,
         has_null_descriptor: bool,
-        is_nvidia: bool,
     ) -> Self {
         let device_memory_info = query_device_memory_info(&instance, physical_device);
         let optimal_bcn_supported = unsafe {
@@ -1957,7 +1955,6 @@ impl TextureCacheRuntime {
             sampler_filter_minmax_supported,
             sampler_heap_budget,
             has_null_descriptor,
-            is_nvidia,
         };
         runtime.initialize_view_formats();
         runtime
@@ -4232,7 +4229,6 @@ impl TextureCache {
         sampler_filter_minmax_supported: bool,
         sampler_heap_budget: Option<usize>,
         has_null_descriptor: bool,
-        is_nvidia: bool,
     ) -> Result<Self, vk::Result> {
         let mut base = CommonTextureCache::<TextureCacheParams>::new_for_backend(device_memory);
         let mut runtime = Box::new(TextureCacheRuntime::new(
@@ -4256,7 +4252,6 @@ impl TextureCache {
             sampler_filter_minmax_supported,
             sampler_heap_budget,
             has_null_descriptor,
-            is_nvidia,
         ));
         base.configure_device_memory_budget(runtime.get_device_local_memory());
         base.set_sampler_heap_budget(runtime.get_sampler_heap_budget());
@@ -6050,17 +6045,17 @@ impl TextureCache {
                     maxwell_to_vk::sampler::mipmap_mode(mipmap_filter)
                 })
                 .address_mode_u(maxwell_to_vk::sampler::wrap_mode(
-                    runtime.is_nvidia,
+                    runtime.vulkan_device(),
                     wrap_u,
                     mag_filter,
                 ))
                 .address_mode_v(maxwell_to_vk::sampler::wrap_mode(
-                    runtime.is_nvidia,
+                    runtime.vulkan_device(),
                     wrap_v,
                     mag_filter,
                 ))
                 .address_mode_w(maxwell_to_vk::sampler::wrap_mode(
-                    runtime.is_nvidia,
+                    runtime.vulkan_device(),
                     wrap_p,
                     mag_filter,
                 ))

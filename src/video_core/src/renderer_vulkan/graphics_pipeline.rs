@@ -1457,7 +1457,7 @@ impl GraphicsPipeline {
             build_vertex_input_state_from_state(
                 fixed_state,
                 vertex_info,
-                device.must_emulate_scaled_formats(),
+                device,
                 device.get_max_vertex_input_bindings(),
             );
         assert!(vertex_attributes.len() <= device.get_max_vertex_input_attributes() as usize);
@@ -1997,11 +1997,11 @@ fn map_cull_face(face: CullFace) -> vk::CullModeFlags {
     }
 }
 
-fn build_vertex_input_state_from_state(
+fn build_vertex_input_state_from_state_with_format(
     fixed_state: &FixedPipelineState,
     vertex_info: &ShaderInfo,
-    must_emulate_scaled_formats: bool,
     max_vertex_input_bindings: u32,
+    mut resolve_vertex_format: impl FnMut(VertexAttribType, VertexAttribSize) -> vk::Format,
 ) -> (
     Vec<vk::VertexInputBindingDescription>,
     Vec<vk::VertexInputBindingDivisorDescriptionEXT>,
@@ -2046,8 +2046,7 @@ fn build_vertex_input_state_from_state(
         if !attrib.is_enabled() || !vertex_info.loads.generic_any(location) {
             continue;
         }
-        let format =
-            maxwell_to_vk::vertex_format(must_emulate_scaled_formats, attrib_type, attrib_size);
+        let format = resolve_vertex_format(attrib_type, attrib_size);
         attributes.push(vk::VertexInputAttributeDescription {
             location: location as u32,
             binding: attrib.buffer(),
@@ -2057,6 +2056,24 @@ fn build_vertex_input_state_from_state(
     }
 
     (bindings, divisors, attributes)
+}
+
+fn build_vertex_input_state_from_state(
+    fixed_state: &FixedPipelineState,
+    vertex_info: &ShaderInfo,
+    device: &Device,
+    max_vertex_input_bindings: u32,
+) -> (
+    Vec<vk::VertexInputBindingDescription>,
+    Vec<vk::VertexInputBindingDivisorDescriptionEXT>,
+    Vec<vk::VertexInputAttributeDescription>,
+) {
+    build_vertex_input_state_from_state_with_format(
+        fixed_state,
+        vertex_info,
+        max_vertex_input_bindings,
+        |attrib_type, attrib_size| maxwell_to_vk::vertex_format(device, attrib_type, attrib_size),
+    )
 }
 
 fn dynamic_states_for_fixed_state(
@@ -2511,8 +2528,12 @@ mod tests {
             stage: ShaderStage::VertexB,
         };
 
-        let (bindings, divisors, attributes) =
-            build_vertex_input_state_from_state(&fixed_state, &shader.info, false, 32);
+        let (bindings, divisors, attributes) = build_vertex_input_state_from_state_with_format(
+            &fixed_state,
+            &shader.info,
+            32,
+            |_, _| vk::Format::R32G32_SFLOAT,
+        );
 
         assert_eq!(bindings.len(), 32);
         assert_eq!(bindings[0].binding, 0);
@@ -2529,8 +2550,12 @@ mod tests {
         assert_eq!(attributes[0].binding, 1);
         assert_eq!(attributes[0].offset, 4);
 
-        let (limited_bindings, _, _) =
-            build_vertex_input_state_from_state(&fixed_state, &shader.info, false, 16);
+        let (limited_bindings, _, _) = build_vertex_input_state_from_state_with_format(
+            &fixed_state,
+            &shader.info,
+            16,
+            |_, _| vk::Format::R32G32_SFLOAT,
+        );
         assert_eq!(limited_bindings.len(), 16);
         assert_eq!(limited_bindings[15].binding, 15);
     }

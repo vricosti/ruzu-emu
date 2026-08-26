@@ -557,7 +557,6 @@ pub struct RasterizerVulkan {
     line_rasterization_supported: bool,
     smooth_lines_supported: bool,
     vertex_input_dynamic_state_supported: bool,
-    must_emulate_scaled_formats: bool,
     depth_bounds_supported: bool,
     supports_d24_depth: bool,
     depth_range_unrestricted: bool,
@@ -787,7 +786,6 @@ impl RasterizerVulkan {
         vertex_input_dynamic_state_supported: bool,
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
-        must_emulate_scaled_formats: bool,
         must_emulate_bgr565: bool,
         ext_4444_formats_supported: bool,
         image_format_list_supported: bool,
@@ -916,7 +914,6 @@ impl RasterizerVulkan {
                 sampler_filter_minmax_supported,
                 vulkan_device.get_sampler_heap_budget(),
                 has_null_descriptor,
-                driver_id == vk::DriverId::NVIDIA_PROPRIETARY,
             )
             .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?,
         );
@@ -1039,7 +1036,6 @@ impl RasterizerVulkan {
             line_rasterization_supported,
             smooth_lines_supported,
             vertex_input_dynamic_state_supported,
-            must_emulate_scaled_formats,
             depth_bounds_supported,
             supports_d24_depth: vulkan_device.supports_d24_depth_buffer(),
             depth_range_unrestricted,
@@ -1876,7 +1872,7 @@ impl RasterizerVulkan {
                     .location(index as u32)
                     .binding(binding as u32)
                     .format(maxwell_to_vk::vertex_format(
-                        self.must_emulate_scaled_formats,
+                        self.device.get(),
                         attribute.attrib_type,
                         attribute.size,
                     ))

@@ -1153,10 +1153,6 @@ impl GraphicsPipeline {
             buffer_cache.runtime.post_copy_barrier();
             buffer_cache.any_buffer_uploaded = false;
         }
-        assert_eq!(
-            guest_descriptor_queue.pending_count(),
-            expected_descriptor_count
-        );
         let surface_clip = draw.surface_clip();
         let prepared = PreparedGraphicsDescriptors {
             rescaling_data: *rescaling.data(),

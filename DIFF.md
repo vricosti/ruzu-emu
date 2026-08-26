@@ -16765,3 +16765,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this slice owns host synchronization state and Vulkan handles; it defines no guest-visible
   or raw-serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/update_descriptor.rs` and `graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_update_descriptor.{h,cpp}` and `vk_graphics_pipeline.cpp`
+
+### Intentional differences
+
+- Rust stores payload positions as indices into the queue-owned fixed allocation instead of raw
+  pointer fields. `upload_start: Option<usize>` preserves Eden's initial null pointer and produces
+  the same payload address after `acquire` without retaining self-referential Rust pointers.
+- The retained `const Device&` is represented by the existing non-owning `DeviceReference`.
+- `DescriptorUpdateEntry::default` zeroes the complete union storage. Eden activates a
+  one-byte `std::monostate`; deterministic Rust padding avoids exposing uninitialized bytes if a
+  payload is inspected before its selected union member is overwritten.
+- The private `acquire_with_wait` callback is a mechanical test seam for Eden's `WaitWorker` call;
+  the public `acquire` method still sets descriptor-buffer mode first and supplies the scheduler's
+  exact wait operation.
+
+### Unintentional differences (to fix)
+
+- None after restoring the null `update_data` result before the first acquire and the one-byte
+  empty union member matching `std::monostate`.
+- None after replacing the always-fatal reservation assertion with Eden's fail-soft assertion
+  policy and preserving unsigned wraparound for capacity and descriptor-address arithmetic.
+- None after removing the Rust-only `pending_count` method and graphics-pipeline assertion; Eden
+  reserves the known descriptor count but does not add this runtime instrumentation.
+
+### Missing items
+
+- None in the audited constants, union members, constructor, frame advance, acquisition/recycling,
+  descriptor-buffer selection, payload access, or image/buffer/texel append operations.
+
+### Binary layout verification
+
+- PASS: focused tests pin the empty member at 1 byte, `DescriptorAddress` at 24 bytes with offsets
+  0/8/16, and `DescriptorUpdateEntry` to the maximum member size and alignment used as Vulkan
+  update-template stride.

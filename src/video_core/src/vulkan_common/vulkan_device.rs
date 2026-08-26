@@ -19,7 +19,10 @@ use crate::gpu_logging::{get_instance, DriverType, LogLevel};
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
 use super::vma::VmaAllocator;
 use super::vulkan::{KHR_MAINTENANCE_7_EXTENSION_NAME, KHR_MAINTENANCE_8_EXTENSION_NAME};
-use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, VulkanError};
+use super::vulkan_wrapper::{
+    get_driver_name, get_physical_device_tool_properties, set_object_name, LogicalDevice,
+    VulkanError,
+};
 
 // ---------------------------------------------------------------------------
 // Constants — port of constants from vulkan_device.h
@@ -2283,27 +2286,14 @@ impl Device {
         if !self.has_debugging_tool_attached() {
             return;
         }
-        let Ok(name) = CString::new(name) else {
-            log::warn!("Refusing Vulkan shader-module name containing NUL");
-            return;
-        };
-        let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
-            self.instance
-                .get_device_proc_addr(self.logical.device.handle(), function_name.as_ptr())
-                .map_or(std::ptr::null(), |function| {
-                    function as *const std::ffi::c_void
-                })
-        });
-        let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
-            .object_type(vk::ObjectType::SHADER_MODULE)
-            .object_handle(module.as_raw())
-            .object_name(&name);
-        let result = unsafe {
-            (functions.set_debug_utils_object_name_ext)(self.logical.device.handle(), &*name_info)
-        };
-        if result != vk::Result::SUCCESS {
-            log::warn!("Failed to name Vulkan shader module: {result:?}");
-        }
+        set_object_name(
+            &self.instance,
+            &self.logical.device,
+            vk::ObjectType::SHADER_MODULE,
+            module.as_raw(),
+            name,
+        )
+        .expect("failed to name Vulkan shader module");
     }
 
     /// Rust counterpart of `vk::Buffer::SetObjectNameEXT` used by the
@@ -2312,37 +2302,21 @@ impl Device {
         if !self.has_debugging_tool_attached() {
             return;
         }
-        let Ok(name) = CString::new(name) else {
-            log::warn!("Refusing Vulkan buffer name containing NUL");
-            return;
-        };
-        let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
-            self.instance
-                .get_device_proc_addr(self.logical.device.handle(), function_name.as_ptr())
-                .map_or(std::ptr::null(), |function| {
-                    function as *const std::ffi::c_void
-                })
-        });
-        let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
-            .object_type(vk::ObjectType::BUFFER)
-            .object_handle(buffer.as_raw())
-            .object_name(&name);
-        let result = unsafe {
-            (functions.set_debug_utils_object_name_ext)(self.logical.device.handle(), &*name_info)
-        };
-        if result != vk::Result::SUCCESS {
-            log::warn!("Failed to name Vulkan buffer: {result:?}");
-        }
+        set_object_name(
+            &self.instance,
+            &self.logical.device,
+            vk::ObjectType::BUFFER,
+            buffer.as_raw(),
+            name,
+        )
+        .expect("failed to name Vulkan buffer");
     }
 
     /// Returns the name of the VkDriverId reported from Vulkan.
     ///
     /// Port of `Device::GetDriverName`.
     pub fn get_driver_name(&self) -> String {
-        if let Some(name) = driver_name_from_id(self.driver_properties.driver_id) {
-            return name.to_string();
-        }
-        self.get_vendor_name()
+        get_driver_name(&self.driver_properties)
     }
 
     /// Returns the vendor name reported from Vulkan.
@@ -3409,34 +3383,6 @@ pub fn query_device_memory_usage(
         return 0;
     };
     device_memory_usage_from_budget(&budget, &memory_info.valid_heap_memory)
-}
-
-fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {
-    match driver_id {
-        vk::DriverId::AMD_PROPRIETARY => Some("AMD"),
-        vk::DriverId::AMD_OPEN_SOURCE => Some("AMDVLK"),
-        vk::DriverId::MESA_RADV => Some("RADV"),
-        vk::DriverId::NVIDIA_PROPRIETARY => Some("NVIDIA"),
-        vk::DriverId::INTEL_PROPRIETARY_WINDOWS => Some("Intel"),
-        vk::DriverId::INTEL_OPEN_SOURCE_MESA => Some("ANV"),
-        vk::DriverId::IMAGINATION_PROPRIETARY => Some("PowerVR"),
-        vk::DriverId::QUALCOMM_PROPRIETARY => Some("Qualcomm"),
-        vk::DriverId::ARM_PROPRIETARY => Some("Mali"),
-        vk::DriverId::SAMSUNG_PROPRIETARY => Some("Xclipse"),
-        vk::DriverId::GOOGLE_SWIFTSHADER => Some("SwiftShader"),
-        vk::DriverId::BROADCOM_PROPRIETARY => Some("Broadcom"),
-        vk::DriverId::MESA_LLVMPIPE => Some("Lavapipe"),
-        vk::DriverId::MOLTENVK => Some("MoltenVK"),
-        vk::DriverId::VERISILICON_PROPRIETARY => Some("Vivante"),
-        vk::DriverId::MESA_TURNIP => Some("Turnip"),
-        vk::DriverId::MESA_V3DV => Some("V3DV"),
-        vk::DriverId::MESA_PANVK => Some("PanVK"),
-        vk::DriverId::MESA_VENUS => Some("Venus"),
-        vk::DriverId::MESA_DOZEN => Some("Dozen"),
-        vk::DriverId::MESA_NVK => Some("NVK"),
-        vk::DriverId::IMAGINATION_OPEN_SOURCE_MESA => Some("PVR"),
-        _ => None,
-    }
 }
 
 fn sampler_filter_minmax_supported(
@@ -4562,25 +4508,6 @@ mod tests {
             device_memory_usage_from_budget(&budget, &[0, 2]),
             5 * ONE_GIB
         );
-    }
-
-    #[test]
-    fn driver_name_from_id_matches_upstream_names() {
-        assert_eq!(
-            driver_name_from_id(vk::DriverId::AMD_PROPRIETARY),
-            Some("AMD")
-        );
-        assert_eq!(driver_name_from_id(vk::DriverId::MESA_RADV), Some("RADV"));
-        assert_eq!(
-            driver_name_from_id(vk::DriverId::NVIDIA_PROPRIETARY),
-            Some("NVIDIA")
-        );
-        assert_eq!(
-            driver_name_from_id(vk::DriverId::MOLTENVK),
-            Some("MoltenVK")
-        );
-        assert_eq!(driver_name_from_id(vk::DriverId::MESA_NVK), Some("NVK"));
-        assert_eq!(driver_name_from_id(vk::DriverId::from_raw(-1)), None);
     }
 
     #[test]

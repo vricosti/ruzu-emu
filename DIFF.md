@@ -17249,3 +17249,83 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: `ash` owns `VkXcbSurfaceCreateInfoKHR`; no locally declared or serialized payload is used.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_wrapper.rs` vs Eden `src/video_core/vulkan_common/vulkan_wrapper.{h,cpp}`
+
+### Intentional differences
+
+- Ash owns the Vulkan dispatch tables and most raw-handle method wrappers; Ruzu keeps the
+  file-owned helpers and the two top-level RAII owners that are not supplied by Ash.
+- The application and engine names use `ruzu Emulator` instead of Eden's inherited
+  `yuzu Emulator` branding. Their version fields and requested Vulkan 1.3 API now match exactly.
+- Ash 0.37 predates the HoneyKrisp and KosmicKrisp `VkDriverId` names, so the switch retains their
+  registered values 26 and 28 as named local compatibility constants.
+- Rust rejects an object name containing an interior NUL before constructing the Vulkan C string;
+  all valid names follow Eden's optional-dispatch and result-checking path.
+
+### Unintentional differences (to fix)
+
+- Resolved: object naming now loads `vkSetDebugUtilsObjectNameEXT` as a genuinely optional
+  function and returns success when absent, instead of invoking Ash's generated panic fallback.
+- Resolved: physical-device tooling properties now preserve Eden's exact two unchecked calls,
+  initial allocation length, and absence behavior rather than adding result filtering and an
+  `VK_INCOMPLETE` retry loop.
+- Resolved: `Instance::create` again owns the application-info construction and Apple portability
+  flag, pins application, engine, and API versions to 1.3.0, and rejects a created instance whose
+  `vkDestroyInstance` entry point cannot be loaded, as upstream does.
+- Resolved: `get_driver_name` is again owned by the wrapper, includes HoneyKrisp and KosmicKrisp,
+  returns Eden's exact `Nvidia` and `llvmpipe` spellings, and falls back to `driver_name`.
+
+### Missing items
+
+- None among the non-Ash helpers used by Ruzu. The upstream per-object wrapper surface is replaced
+  by Ash handles plus the renderer's typed owners rather than duplicated in this file.
+
+### Binary layout verification
+
+- PASS: Ash owns `VkApplicationInfo`, `VkInstanceCreateInfo`,
+  `VkDebugUtilsObjectNameInfoEXT`, and `VkPhysicalDeviceDriverProperties`; no replacement ABI
+  payload is declared locally.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` ownership call site vs Eden `src/video_core/vulkan_common/vulkan_instance.cpp`
+
+### Intentional differences
+
+- Extension and layer names remain owned as `CString` values until the wrapper's Vulkan call.
+
+### Unintentional differences (to fix)
+
+- Resolved: the frontend instance factory no longer owns `VkApplicationInfo` or the Apple create
+  flag; it passes Eden's `available` version argument to the matching wrapper method.
+
+### Missing items
+
+- None in the `vk::Instance::Create` call boundary.
+
+### Binary layout verification
+
+- N/A: the call site only passes borrowed name-pointer arrays and a scalar version.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` driver-name delegation vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
+
+### Intentional differences
+
+- The Rust device retains Ash's logical-device owner and delegates file-owned wrapper behavior
+  through module functions rather than C++ member wrappers.
+- Existing infallible buffer/shader naming methods use `expect` to unwind on the same Vulkan
+  failure for which Eden's wrapper throws; the framebuffer path can return `VulkanError` directly.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Device::get_driver_name` now delegates to the wrapper-owned driver-property mapping,
+  matching Eden's `Device::GetDriverName` ownership boundary.
+- Resolved: shader-module and buffer naming reuse the wrapper-owned optional dispatch helper, so a
+  missing debug-utils symbol no longer reaches Ash's panic fallback.
+
+### Missing items
+
+- None in the audited driver-name or object-name delegation paths.
+
+### Binary layout verification
+
+- N/A: these methods forward existing Ash handles and property payloads without serialization.

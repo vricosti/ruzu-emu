@@ -210,22 +210,7 @@ pub fn create_instance(
     let ext_ptrs: Vec<*const std::os::raw::c_char> =
         extensions.iter().map(|s| s.as_ptr()).collect();
 
-    let app_name = CString::new("ruzu Emulator").unwrap();
-    let engine_name = CString::new("ruzu Emulator").unwrap();
-    let app_info = vk::ApplicationInfo::builder()
-        .application_name(&app_name)
-        .application_version(vk::make_api_version(0, 0, 1, 0))
-        .engine_name(&engine_name)
-        .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(available)
-        .build();
-
-    #[cfg(target_os = "macos")]
-    let flags = vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-    #[cfg(not(target_os = "macos"))]
-    let flags = vk::InstanceCreateFlags::empty();
-
-    Instance::create(entry, &app_info, &layer_ptrs, &ext_ptrs, flags)
+    Instance::create(entry, available, &layer_ptrs, &ext_ptrs)
 }
 
 #[cfg(test)]

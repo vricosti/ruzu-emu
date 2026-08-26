@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use super::const_buffer_info::ConstBufferInfo;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
-use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use super::{PendingWrite, ENGINE_REG_COUNT};
 use crate::dirty_flags;
 use crate::engines::draw_manager as dm;
 use crate::macro_engine::macro_engine::MacroEngine;
@@ -5373,21 +5373,17 @@ impl EngineInterface for Maxwell3D {
     }
 }
 
-impl Engine for Maxwell3D {
-    fn class_id(&self) -> ClassId {
-        ClassId::Threed
-    }
-
-    fn write_reg(&mut self, method: u32, value: u32) {
+#[cfg(test)]
+impl Maxwell3D {
+    pub(crate) fn write_reg(&mut self, method: u32, value: u32) {
         <Self as EngineInterface>::call_method(self, method, value, true);
     }
 
-    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
+    pub(crate) fn execute_pending(
+        &mut self,
+        _read_gpu: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
         std::mem::take(&mut self.pending_semaphore_writes)
-    }
-
-    fn take_draw_calls(&mut self) -> Vec<DrawCall> {
-        self.take_draw_calls()
     }
 }
 
@@ -5643,12 +5639,6 @@ mod tests {
     }
 
     #[test]
-    fn test_class_id() {
-        let engine = Maxwell3D::new();
-        assert_eq!(engine.class_id(), ClassId::Threed);
-    }
-
-    #[test]
     fn test_rt_accessors() {
         let mut engine = Maxwell3D::new();
         let rt0_base = RT_BASE as usize;
@@ -5702,7 +5692,6 @@ mod tests {
         // Just ensure draw begin/end doesn't panic.
         engine.write_reg(DRAW_BEGIN, 0x0004); // Triangles
         engine.write_reg(DRAW_END, 0);
-        assert!(engine.take_framebuffer().is_none());
         assert_eq!(engine.take_draw_calls().len(), 1);
     }
 

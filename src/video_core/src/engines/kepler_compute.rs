@@ -13,7 +13,6 @@ use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
-use super::{ClassId, Engine, PendingWrite};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 #[cfg(test)]
@@ -575,20 +574,13 @@ impl EngineInterface for KeplerCompute {
     }
 }
 
-impl Engine for KeplerCompute {
-    fn class_id(&self) -> ClassId {
-        ClassId::Compute
-    }
-
+#[cfg(test)]
+impl KeplerCompute {
     fn write_reg(&mut self, method: u32, value: u32) {
         if method != LAUNCH {
             log::trace!("KeplerCompute: reg[0x{:X}] = 0x{:X}", method, value);
         }
         self.call_method(method, value, true);
-    }
-
-    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        vec![]
     }
 }
 
@@ -788,12 +780,6 @@ mod tests {
                 .borrow_mut()
                 .push((address, copy_size, memory.to_vec()));
         }
-    }
-
-    #[test]
-    fn test_class_id() {
-        let engine = new_test_engine();
-        assert_eq!(engine.class_id(), ClassId::Compute);
     }
 
     #[test]
@@ -1154,19 +1140,6 @@ mod tests {
         assert!(engine.rasterizer.is_none());
         engine.bind_rasterizer(&rasterizer);
         assert!(engine.rasterizer.is_some());
-    }
-
-    #[test]
-    fn test_no_pending_no_dispatch() {
-        let mut engine = new_test_engine();
-
-        // Call execute_pending without writing LAUNCH.
-        let writes = engine.execute_pending(&|_addr, _buf| {
-            panic!("should not read GPU memory");
-        });
-        assert!(writes.is_empty());
-
-        assert_eq!(engine.launch_description, LaunchParams::default());
     }
 
     #[test]

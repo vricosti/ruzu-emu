@@ -10,7 +10,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
-use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use super::{PendingWrite, ENGINE_REG_COUNT};
 use crate::memory_manager::MemoryManager;
 use crate::pte_kind::{is_pitch_kind, PteKind};
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
@@ -772,6 +772,7 @@ impl MaxwellDMA {
         );
     }
 
+    #[cfg(test)]
     fn handle_deferred_launch(&mut self) {
         self.log_launch();
         self.pending_launch = true;
@@ -1097,11 +1098,8 @@ impl Default for MaxwellDMA {
     }
 }
 
-impl Engine for MaxwellDMA {
-    fn class_id(&self) -> ClassId {
-        ClassId::Dma
-    }
-
+#[cfg(test)]
+impl MaxwellDMA {
     fn write_reg(&mut self, method: u32, value: u32) {
         log::trace!("MaxwellDMA: reg[0x{:X}] = 0x{:X}", method, value);
         let idx = method as usize;

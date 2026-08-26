@@ -4033,7 +4033,6 @@ mod tests {
         use crate::engines::maxwell_3d::{
             Maxwell3D, DRAW_BEGIN, DRAW_END, SCISSOR_BASE, SURFACE_CLIP_BASE, WINDOW_ORIGIN,
         };
-        use crate::engines::Engine;
 
         let mut engine = Maxwell3D::new();
         engine.write_reg(SURFACE_CLIP_BASE, 20 << 16);

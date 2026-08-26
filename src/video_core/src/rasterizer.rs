@@ -16,8 +16,15 @@ use crate::engines::maxwell_3d::{
     TextureDescriptor, TextureFilter, TextureFormat, TextureType, TicHeaderVersion,
     VertexAttribSize, VertexAttribType, WrapMode,
 };
-use crate::engines::Framebuffer;
 use crate::shader;
+
+/// Software-rasterizer framebuffer output.
+pub struct Framebuffer {
+    pub gpu_va: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
 
 /// Pre-decoded RGBA8 data for a single mip level.
 struct MipLevel {

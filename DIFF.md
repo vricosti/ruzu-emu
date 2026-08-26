@@ -13939,3 +13939,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - PASS: `Registers` and `DestRegisters` are `repr(C)` and focused tests verify their complete Eden
   sizes, alignments, and field offsets (`0x30` and `0x28` bytes respectively).
+
+## 2026-08-26 — `src/video_core/src/engines/mod.rs` vs Eden `src/video_core/engines/`
+
+### Intentional differences
+- Rust requires `mod.rs` to declare the source modules; Eden expresses the same source membership
+  through its C++ build files and includes.
+- The legacy standalone `inline_to_memory` fixture remains visible only under `cfg(test)` until its
+  dedicated parity report is reviewed; production uses Eden's `KeplerMemory` plus `Upload::State`.
+
+### Unintentional differences (to fix)
+- Resolved: removed the duplicate `ClassId` enum. The canonical class identifiers remain in
+  `puller.rs`, matching Eden's `EngineID` ownership in `puller.h`.
+- Resolved: removed the invented `SubChannel` enum. In particular, Rust no longer labels subchannel
+  2 as inline-to-memory when Eden explicitly reserves it for the unexposed M2MF engine; the NVK
+  default bindings remain owned by `control/channel_state.rs` at 0, 1, 3, and 4.
+- Resolved: removed the production `Engine` dispatcher trait, which had no runtime consumer and no
+  Eden counterpart. Register-write and deferred-write helpers needed by native Rust tests now live
+  in their concrete engine owners under `cfg(test)`.
+- `ENGINE_REG_COUNT` and `PendingWrite` are still shared from `engines/mod.rs` by several incomplete
+  engine compatibility paths. Their ownership must be unwound while reviewing the corresponding
+  Fermi2D, Maxwell3D, MaxwellDMA, and standalone inline-to-memory reports; moving them to another
+  catch-all module here would only hide the mismatch.
+
+### Missing items
+- None among Eden's engine source-module declarations.
+
+### Binary layout verification
+- N/A: `mod.rs` now owns no class-id or subchannel representation. The canonical transparent
+  `EngineID` representation and engine register layouts are verified in their owning modules.

@@ -9,7 +9,7 @@
 //! accumulated, `execute_pending()` returns a `PendingWrite` with the
 //! destination address and data.
 
-use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use super::{PendingWrite, ENGINE_REG_COUNT};
 
 // ── Register constants (method addresses) ────────────────────────────────────
 
@@ -128,11 +128,7 @@ impl Default for InlineToMemory {
     }
 }
 
-impl Engine for InlineToMemory {
-    fn class_id(&self) -> ClassId {
-        ClassId::InlineToMemory
-    }
-
+impl InlineToMemory {
     fn write_reg(&mut self, method: u32, value: u32) {
         let idx = method as usize;
         if idx < ENGINE_REG_COUNT {
@@ -355,7 +351,7 @@ mod tests {
     #[test]
     fn test_write_via_write_reg() {
         let mut eng = InlineToMemory::new();
-        // End-to-end through Engine::write_reg.
+        // End-to-end through the test engine's register-write entry point.
         eng.write_reg(DST_ADDRESS_HIGH, 0);
         eng.write_reg(DST_ADDRESS_LOW, 0x8000);
         eng.write_reg(LINE_LENGTH_IN, 8);

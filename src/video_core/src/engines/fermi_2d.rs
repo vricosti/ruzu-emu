@@ -5,7 +5,7 @@
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::sw_blitter::blitter::SoftwareBlitEngine;
-use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use super::ENGINE_REG_COUNT;
 use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
@@ -1535,18 +1535,11 @@ impl Default for Fermi2D {
     }
 }
 
-impl Engine for Fermi2D {
-    fn class_id(&self) -> ClassId {
-        ClassId::Twod
-    }
-
+#[cfg(test)]
+impl Fermi2D {
     fn write_reg(&mut self, method: u32, value: u32) {
         log::trace!("Fermi2D: reg[0x{:X}] = 0x{:X}", method, value);
         <Self as EngineInterface>::call_method(self, method, value, true);
-    }
-
-    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        vec![]
     }
 }
 

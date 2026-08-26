@@ -14919,3 +14919,73 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: the local feature payload is 24 bytes on 64-bit hosts (12 on 32-bit), and the property
   payload is 40 bytes on 64-bit hosts (32 on 32-bit), with `depthStencilSwizzleOneSupport` at the
   Vulkan ABI offset. Focused tests verify these sizes and offsets.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_view_info.rs` vs Eden `src/video_core/texture_cache/image_view_info.{h,cpp}`
+
+### Intentional differences
+
+- Rust decodes the stored swizzle byte through the canonical enum instead of C++ `static_cast`.
+  The unnamed three-bit TIC value is represented explicitly as `SwizzleSource::Invalid`, while
+  bytes outside the TIC range report Eden's fail-soft assertion and use that same invalid path.
+- The file-local `fail_soft` helper implements Eden's `ASSERT` policy through the shared
+  `use_debug_asserts` setting because Rust has no C++ assertion macro expansion.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the duplicate file-local `SwizzleSource`; `ImageViewInfo` now re-exports and
+  returns the canonical type owned by `textures/texture.rs`, matching Eden's ownership.
+- Resolved: the missing `Texture1DArray` height assertion is present, all constructor assertions
+  are fail-soft by default, and invalid texture types retain the already-initialized default view
+  type instead of panicking unconditionally.
+- Resolved: mip-count subtraction and cube-array layer multiplication preserve C++ unsigned
+  wrapping instead of overflowing under Rust debug arithmetic.
+
+### Missing items
+
+- None for constructors, swizzle access, render-target detection, or TIC type promotion.
+
+### Binary layout verification
+
+- PASS: `ImageViewInfo` is 28 bytes with alignment 4; focused tests verify field offsets 0, 4, 8,
+  24, and 27, preserving the unique object representation consumed by cache keys.
+
+## 2026-08-26 — `src/video_core/src/textures/texture.rs` swizzle prerequisite vs Eden `src/video_core/textures/texture.h`
+
+### Intentional differences
+
+- Rust names raw TIC value 1 `Invalid` so the safe enum can represent every value of Eden's
+  three-bit `SwizzleSource` bitfield. Eden leaves that value unnamed but C++ enum casts still carry
+  it to backend validation.
+
+### Unintentional differences (to fix)
+
+- Resolved: `SwizzleSource::from_raw` no longer rejects the representable raw value 1 before the
+  texture-cache and backend validation paths can reproduce Eden's behavior.
+
+### Missing items
+
+- None for `SwizzleSource` discriminants or raw decoding.
+
+### Binary layout verification
+
+- PASS: `SwizzleSource` remains `repr(u32)` and all upstream named discriminants remain unchanged.
+
+## 2026-08-26 — backend invalid-swizzle handling vs Eden `renderer_{opengl,vulkan}/{gl_texture_cache,maxwell_to_vk}.cpp`
+
+### Intentional differences
+
+- Rust spells Eden's fall-through assertion branches as explicit `SwizzleSource::Invalid` match
+  arms because exhaustive matching is required for the safe enum.
+
+### Unintentional differences (to fix)
+
+- Resolved: invalid OpenGL swizzles now report and return `GL_NONE`; invalid Vulkan swizzles report
+  and return the zero-initialized `VkComponentSwizzle`, matching Eden's fallback results.
+
+### Missing items
+
+- None for the invalid component-swizzle fallback paths touched by this prerequisite.
+
+### Binary layout verification
+
+- N/A: these functions translate an enum into backend API constants and serialize no payload.

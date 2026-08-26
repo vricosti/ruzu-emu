@@ -1104,6 +1104,13 @@ fn image_view_target(view_type: TextureType, num_samples: i32) -> u32 {
 fn swizzle(source: SwizzleSource) -> i32 {
     match source {
         SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::Invalid => {
+            log::error!("Invalid swizzle source={source:?}");
+            if *settings::values().use_debug_asserts.get_value() {
+                panic!("Invalid swizzle source={source:?}");
+            }
+            gl::NONE as i32
+        }
         SwizzleSource::R => gl::RED as i32,
         SwizzleSource::G => gl::GREEN as i32,
         SwizzleSource::B => gl::BLUE as i32,
@@ -1122,6 +1129,13 @@ fn convert_green_red(value: SwizzleSource) -> SwizzleSource {
 fn convert_a5b5g5r1_unorm(source: SwizzleSource) -> i32 {
     match source {
         SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::Invalid => {
+            log::error!("Invalid swizzle source={source:?}");
+            if *settings::values().use_debug_asserts.get_value() {
+                panic!("Invalid swizzle source={source:?}");
+            }
+            gl::NONE as i32
+        }
         SwizzleSource::R => gl::ALPHA as i32,
         SwizzleSource::G => gl::BLUE as i32,
         SwizzleSource::B => gl::GREEN as i32,
@@ -1191,6 +1205,7 @@ fn decode_swizzle(raw: [u8; 4]) -> Option<[SwizzleSource; 4]> {
     fn decode(value: u8) -> Option<SwizzleSource> {
         match value {
             0 => Some(SwizzleSource::Zero),
+            1 => Some(SwizzleSource::Invalid),
             2 => Some(SwizzleSource::R),
             3 => Some(SwizzleSource::G),
             4 => Some(SwizzleSource::B),

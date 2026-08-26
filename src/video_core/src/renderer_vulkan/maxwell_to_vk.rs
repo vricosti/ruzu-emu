@@ -973,6 +973,13 @@ pub fn polygon_mode(mode: PolygonMode) -> vk::PolygonMode {
 pub fn swizzle_source(swizzle: SwizzleSource) -> vk::ComponentSwizzle {
     match swizzle {
         SwizzleSource::Zero => vk::ComponentSwizzle::ZERO,
+        SwizzleSource::Invalid => {
+            log::error!("Unimplemented swizzle source={swizzle:?}");
+            if *common::settings::values().use_debug_asserts.get_value() {
+                panic!("Unimplemented swizzle source={swizzle:?}");
+            }
+            vk::ComponentSwizzle::default()
+        }
         SwizzleSource::R => vk::ComponentSwizzle::R,
         SwizzleSource::G => vk::ComponentSwizzle::G,
         SwizzleSource::B => vk::ComponentSwizzle::B,

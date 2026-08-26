@@ -9,22 +9,14 @@
 use super::format_lookup_table::PixelFormat;
 use super::types::*;
 use super::util::pixel_format_from_tic;
-use crate::textures::texture::{SwizzleSource as TegraSwizzleSource, TextureType, TicEntry};
+pub use crate::textures::texture::SwizzleSource;
+use crate::textures::texture::{TextureType, TicEntry};
 
-// ── SwizzleSource placeholder ──────────────────────────────────────────
-// Upstream: Tegra::Texture::SwizzleSource in textures/texture.h
-// Minimal stand-in; replace with real type once available.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum SwizzleSource {
-    Zero = 0,
-    R = 2,
-    G = 3,
-    B = 4,
-    A = 5,
-    OneInt = 6,
-    OneFloat = 7,
+fn fail_soft(message: String) {
+    log::error!("{message}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("{message}");
+    }
 }
 
 /// Sentinel value used by render-target views (no real swizzle).
@@ -82,15 +74,20 @@ impl ImageViewInfo {
                     layer: base_layer,
                 },
                 extent: SubresourceExtent {
-                    levels: (config.res_max_mip_level() - config.res_min_mip_level() + 1) as i32,
+                    levels: config
+                        .res_max_mip_level()
+                        .wrapping_sub(config.res_min_mip_level())
+                        .wrapping_add(1) as i32,
                     layers: 1,
                 },
             },
             ..Self::default()
         };
 
-        let mut texture_type =
-            TextureType::from_raw(config.texture_type()).expect("Invalid TIC texture_type");
+        let Some(mut texture_type) = TextureType::from_raw(config.texture_type()) else {
+            fail_soft(format!("Invalid texture_type={}", config.texture_type()));
+            return info;
+        };
         if config.depth() > 1 || base_layer != 0 {
             texture_type = match texture_type {
                 TextureType::Texture1D => TextureType::Texture1DArray,
@@ -102,12 +99,27 @@ impl ImageViewInfo {
 
         match texture_type {
             TextureType::Texture1D => {
-                assert_eq!(config.height(), 1);
-                assert_eq!(config.depth(), 1);
+                if config.height() != 1 {
+                    fail_soft(format!(
+                        "Texture1D height is {} instead of 1",
+                        config.height()
+                    ));
+                }
+                if config.depth() != 1 {
+                    fail_soft(format!(
+                        "Texture1D depth is {} instead of 1",
+                        config.depth()
+                    ));
+                }
                 info.view_type = ImageViewType::E1D;
             }
             TextureType::Texture2D | TextureType::Texture2DNoMipmap => {
-                assert_eq!(config.depth(), 1);
+                if config.depth() != 1 {
+                    fail_soft(format!(
+                        "Texture2D depth is {} instead of 1",
+                        config.depth()
+                    ));
+                }
                 info.view_type = if config.normalized_coords() != 0 {
                     ImageViewType::E2D
                 } else {
@@ -118,11 +130,22 @@ impl ImageViewInfo {
                 info.view_type = ImageViewType::E3D;
             }
             TextureType::TextureCubemap => {
-                assert_eq!(config.depth(), 1);
+                if config.depth() != 1 {
+                    fail_soft(format!(
+                        "TextureCubemap depth is {} instead of 1",
+                        config.depth()
+                    ));
+                }
                 info.view_type = ImageViewType::Cube;
                 info.range.extent.layers = 6;
             }
             TextureType::Texture1DArray => {
+                if config.height() != 1 {
+                    fail_soft(format!(
+                        "Texture1DArray height is {} instead of 1",
+                        config.height()
+                    ));
+                }
                 info.view_type = ImageViewType::E1DArray;
                 info.range.extent.layers = config.depth() as i32;
             }
@@ -135,7 +158,7 @@ impl ImageViewInfo {
             }
             TextureType::TextureCubeArray => {
                 info.view_type = ImageViewType::CubeArray;
-                info.range.extent.layers = (config.depth() * 6) as i32;
+                info.range.extent.layers = config.depth().wrapping_mul(6) as i32;
             }
         }
 
@@ -163,12 +186,17 @@ impl ImageViewInfo {
 
     /// Returns the swizzle sources as an array.
     pub fn swizzle(&self) -> [SwizzleSource; 4] {
+        let decode = |source| {
+            SwizzleSource::from_raw(source as u32).unwrap_or_else(|| {
+                fail_soft(format!("Invalid swizzle source={source}"));
+                SwizzleSource::Invalid
+            })
+        };
         [
-            // Safety: values are validated on construction in the full port.
-            unsafe { std::mem::transmute(self.x_source) },
-            unsafe { std::mem::transmute(self.y_source) },
-            unsafe { std::mem::transmute(self.z_source) },
-            unsafe { std::mem::transmute(self.w_source) },
+            decode(self.x_source),
+            decode(self.y_source),
+            decode(self.z_source),
+            decode(self.w_source),
         ]
     }
 
@@ -185,8 +213,11 @@ impl ImageViewInfo {
 }
 
 fn cast_swizzle(source: u32) -> u8 {
-    let source = TegraSwizzleSource::from_raw(source).expect("Invalid TIC swizzle source");
-    source as u8
+    let casted = source as u8;
+    if casted as u32 != source {
+        fail_soft(format!("Swizzle source {source} does not fit in u8"));
+    }
+    casted
 }
 
 #[cfg(test)]
@@ -207,10 +238,10 @@ mod tests {
             | ((ComponentType::Unorm as u32) << 10)
             | ((ComponentType::Unorm as u32) << 13)
             | ((ComponentType::Unorm as u32) << 16)
-            | ((TegraSwizzleSource::R as u32) << 19)
-            | ((TegraSwizzleSource::G as u32) << 22)
-            | ((TegraSwizzleSource::B as u32) << 25)
-            | ((TegraSwizzleSource::A as u32) << 28);
+            | ((SwizzleSource::R as u32) << 19)
+            | ((SwizzleSource::G as u32) << 22)
+            | ((SwizzleSource::B as u32) << 25)
+            | ((SwizzleSource::A as u32) << 28);
         let word4 = 63 | ((texture_type as u32) << 23);
         let word5 = 31 | ((depth - 1) << 16) | ((normalized_coords as u32) << 31);
         let word7 = min_mip | (max_mip << 4);
@@ -223,6 +254,17 @@ mod tests {
                 (word7 as u64) << 32,
             ],
         }
+    }
+
+    #[test]
+    fn image_view_info_layout_matches_upstream_unique_representation() {
+        assert_eq!(std::mem::size_of::<ImageViewInfo>(), 28);
+        assert_eq!(std::mem::align_of::<ImageViewInfo>(), 4);
+        assert_eq!(std::mem::offset_of!(ImageViewInfo, view_type), 0);
+        assert_eq!(std::mem::offset_of!(ImageViewInfo, format), 4);
+        assert_eq!(std::mem::offset_of!(ImageViewInfo, range), 8);
+        assert_eq!(std::mem::offset_of!(ImageViewInfo, x_source), 24);
+        assert_eq!(std::mem::offset_of!(ImageViewInfo, w_source), 27);
     }
 
     #[test]
@@ -283,5 +325,53 @@ mod tests {
         let cube_array_info = ImageViewInfo::from_tic_entry(&cube_array, 0);
         assert_eq!(cube_array_info.view_type, ImageViewType::CubeArray);
         assert_eq!(cube_array_info.range.extent.layers, 12);
+    }
+
+    #[test]
+    fn tic_assertions_are_fail_soft_and_mip_count_wraps_like_upstream() {
+        let one_d_array = tic_entry(TextureType::Texture1DArray, true, 3, 4, 2);
+        let info = ImageViewInfo::from_tic_entry(&one_d_array, 0);
+
+        assert_eq!(info.view_type, ImageViewType::E1DArray);
+        assert_eq!(info.range.extent.layers, 3);
+        assert_eq!(info.range.extent.levels, -1);
+    }
+
+    #[test]
+    fn invalid_texture_type_keeps_initialized_default_type_like_upstream() {
+        let mut tic = tic_entry(TextureType::Texture2D, true, 1, 0, 0);
+        tic.raw[2] &= !(0xfu64 << 23);
+        tic.raw[2] |= 0xfu64 << 23;
+
+        let info = ImageViewInfo::from_tic_entry(&tic, 0);
+
+        assert_eq!(info.view_type, ImageViewType::E1D);
+        assert_eq!(info.format, PixelFormat::A8B8G8R8Unorm);
+    }
+
+    #[test]
+    fn swizzle_returns_the_upstream_texture_enum() {
+        let info = ImageViewInfo::default();
+        assert_eq!(
+            info.swizzle(),
+            [
+                crate::textures::texture::SwizzleSource::R,
+                crate::textures::texture::SwizzleSource::G,
+                crate::textures::texture::SwizzleSource::B,
+                crate::textures::texture::SwizzleSource::A,
+            ]
+        );
+    }
+
+    #[test]
+    fn unnamed_tic_swizzle_value_reaches_backend_validation() {
+        let mut tic = tic_entry(TextureType::Texture2D, true, 1, 0, 0);
+        tic.raw[0] &= !(0x7u64 << 19);
+        tic.raw[0] |= 1u64 << 19;
+
+        let info = ImageViewInfo::from_tic_entry(&tic, 0);
+
+        assert_eq!(info.x_source, 1);
+        assert_eq!(info.swizzle()[0], SwizzleSource::Invalid);
     }
 }

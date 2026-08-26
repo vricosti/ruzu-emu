@@ -491,6 +491,15 @@ fn decode_swizzle_matches_upstream_sources() {
             SwizzleSource::OneFloat,
         ])
     );
+    assert_eq!(
+        decode_swizzle([1, 2, 3, 4]),
+        Some([
+            SwizzleSource::Invalid,
+            SwizzleSource::R,
+            SwizzleSource::G,
+            SwizzleSource::B,
+        ])
+    );
     assert_eq!(decode_swizzle([u8::MAX; 4]), None);
 }
 

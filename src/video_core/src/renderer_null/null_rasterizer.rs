@@ -116,6 +116,8 @@ pub struct RasterizerNull {
     gpu_to_cpu: Option<GpuToCpuTranslator>,
     #[cfg(test)]
     inline_upload_callback: Option<Box<dyn FnMut(u64, usize, &[u8]) + Send>>,
+    #[cfg(test)]
+    surface_copy_succeeds: bool,
 }
 
 impl RasterizerNull {
@@ -129,6 +131,8 @@ impl RasterizerNull {
             gpu_to_cpu: None,
             #[cfg(test)]
             inline_upload_callback: None,
+            #[cfg(test)]
+            surface_copy_succeeds: true,
         }
     }
 
@@ -156,6 +160,11 @@ impl RasterizerNull {
         callback: impl FnMut(u64, usize, &[u8]) + Send + 'static,
     ) {
         self.inline_upload_callback = Some(Box::new(callback));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_surface_copy_succeeds(&mut self, succeeds: bool) {
+        self.surface_copy_succeeds = succeeds;
     }
 }
 
@@ -345,6 +354,10 @@ impl RasterizerInterface for RasterizerNull {
         _dst: &crate::engines::fermi_2d::Surface,
         _copy_config: &crate::engines::fermi_2d::Config,
     ) -> bool {
+        #[cfg(test)]
+        return self.surface_copy_succeeds;
+
+        #[cfg(not(test))]
         true
     }
 

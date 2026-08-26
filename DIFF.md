@@ -6830,8 +6830,8 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Intentional differences
 - Eden indexes the `Regs::reg_array` union member directly. Rust derives the same word pointer
-  from the enclosing `#[repr(C)] RegsStorageRaw` address, avoiding an unsafe union-field
-  projection required by Rust 1.89 while preserving the exact offset and contiguous storage.
+  from the `#[repr(C)] RegsUnionRaw` address, avoiding an unsafe union-field projection required
+  by Rust 1.89 while preserving the exact offset, size, and contiguous storage.
 
 ### Unintentional differences (to fix)
 - None in this compiler-compatibility slice.
@@ -6840,9 +6840,8 @@ vs Eden `display_list.h` and `layer_list.h`
 - None in this compiler-compatibility slice.
 
 ### Binary layout verification
-- PASS: existing tests verify that `RegsStorageRaw::regs` is at offset zero, the runtime tail
-  begins after `NUM_REGS_WORDS`, the total size is `ENGINE_REG_COUNT * 4`, and the word view spans
-  both regions contiguously.
+- PASS: tests verify that `RegsRaw` and `RegsUnionRaw` are exactly
+  `Regs::NUM_REGS * sizeof(u32) == 0x960` bytes and that the word view spans exactly that union.
 
 ## 2026-08-26 — Fermi2D raw-register and blit parity
 
@@ -6867,25 +6866,22 @@ Eden files:
   keep the same four-byte ABI, and expose the upstream named values as constants.
 - Rust checks the length of the slice passed to `call_multi_method`; Eden receives an unchecked
   pointer whose caller contract guarantees `amount` readable words.
-- A missing rasterizer falls back to the software blitter. Eden dereferences its non-owning pointer
-  unconditionally after the renderer has bound it; the Rust guard keeps partially constructed test
-  engines memory-safe without changing the bound runtime path.
-- The Rust-wide `Engine` adapter requires an `execute_pending` method. Fermi2D implements it as a
-  no-op because Eden executes `Blit` synchronously from `CallMethod`.
 
 ### Unintentional differences (to fix)
 - None after this correction. Unknown surface formats, memory layouts, and operations are no longer
   normalized; all five `UNIMPLEMENTED_IF_MSG` checks now use Eden's fail-soft policy; the complete
   blit calculation uses the same wraparound bit patterns and ordering; and the spurious deferred
-  `pending_blit` state has been removed.
+  `pending_blit` state has been removed. The register union is no longer extended with Maxwell's
+  `0xE00`-word register count, and `Blit` now requires the rasterizer binding that Eden dereferences
+  before selecting the software fallback.
 
 ### Missing items
 - None in the Fermi2D register/blit slice.
 
 ### Binary layout verification
 - PASS: `Operation` is 4 bytes, `Surface` is `0x28`, `Config` is `0x2c`, `ActiveRegsRaw` is `0x6e0`,
-  the upstream register union is `0x960`, and tests verify every asserted register offset plus the
-  contiguous Rust engine tail.
+  the upstream register union is exactly `0x960`, and tests verify every asserted register offset
+  plus the exact union word count.
 - PASS: Vulkan's `BlitImagePipelineKey` now owns the upstream Fermi2D `Operation` type rather than a
   duplicate renderer-local enum; the representation remains one 32-bit word.
 

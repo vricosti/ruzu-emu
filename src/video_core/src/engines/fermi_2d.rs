@@ -5,7 +5,6 @@
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::sw_blitter::blitter::SoftwareBlitEngine;
-use super::ENGINE_REG_COUNT;
 use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
@@ -1146,42 +1145,6 @@ impl Default for RegsUnionRaw {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-struct RegsRuntimeTailRaw {
-    words: [u32; ENGINE_REG_COUNT - NUM_REGS_WORDS],
-}
-
-unsafe impl Zeroable for RegsRuntimeTailRaw {}
-unsafe impl Pod for RegsRuntimeTailRaw {}
-
-impl Default for RegsRuntimeTailRaw {
-    fn default() -> Self {
-        Self {
-            words: [0; ENGINE_REG_COUNT - NUM_REGS_WORDS],
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct RegsStorageRaw {
-    regs: RegsUnionRaw,
-    runtime_tail: RegsRuntimeTailRaw,
-}
-
-unsafe impl Zeroable for RegsStorageRaw {}
-unsafe impl Pod for RegsStorageRaw {}
-
-impl Default for RegsStorageRaw {
-    fn default() -> Self {
-        Self {
-            regs: RegsUnionRaw::default(),
-            runtime_tail: RegsRuntimeTailRaw::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct Config {
@@ -1199,7 +1162,7 @@ pub struct Config {
 }
 
 pub struct Fermi2D {
-    regs: RegsStorageRaw,
+    regs: RegsUnionRaw,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
     rasterizer: Option<RasterizerHandle>,
@@ -1211,7 +1174,7 @@ pub struct Fermi2D {
 impl Fermi2D {
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         let mut this = Self {
-            regs: RegsStorageRaw::default(),
+            regs: RegsUnionRaw::default(),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
                 state.execution_mask[BLIT_TRIGGER as usize] = true;
@@ -1318,24 +1281,22 @@ impl Fermi2D {
 
     fn words(&self) -> &[u32] {
         let ptr = std::ptr::from_ref(&self.regs).cast::<u32>();
-        // RegsStorageRaw is repr(C), starts with the register union, and its
-        // tested size is exactly ENGINE_REG_COUNT words.
-        unsafe { std::slice::from_raw_parts(ptr, ENGINE_REG_COUNT) }
+        // `RegsUnionRaw` is the exact Rust counterpart of Eden's `Regs` union.
+        unsafe { std::slice::from_raw_parts(ptr, NUM_REGS_WORDS) }
     }
 
     fn words_mut(&mut self) -> &mut [u32] {
         let ptr = std::ptr::from_mut(&mut self.regs).cast::<u32>();
-        // See words(): the runtime tail immediately follows the upstream
-        // register union in the same contiguous repr(C) storage.
-        unsafe { std::slice::from_raw_parts_mut(ptr, ENGINE_REG_COUNT) }
+        // See `words`: the union contains exactly `Regs::NUM_REGS` words.
+        unsafe { std::slice::from_raw_parts_mut(ptr, NUM_REGS_WORDS) }
     }
 
     fn upstream_reg_array_mut(&mut self) -> &mut [u32; NUM_REGS_WORDS] {
-        unsafe { &mut self.regs.regs.reg_array }
+        unsafe { &mut self.regs.reg_array }
     }
 
     fn regs_head(&self) -> &RegsRaw {
-        unsafe { &self.regs.regs.structured }
+        unsafe { &self.regs.structured }
     }
 
     fn clip_enable(&self) -> u32 {
@@ -1464,11 +1425,12 @@ impl Fermi2D {
         let (src_surface, dst_surface, blit_config) = self.prepare_blit();
         self.memory_manager.lock().flush_caching();
 
-        if let Some(rasterizer_handle) = self.rasterizer {
-            let rasterizer = unsafe { rasterizer_handle.as_mut() };
-            if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
-                return;
-            }
+        let rasterizer_handle = self
+            .rasterizer
+            .expect("Fermi2D rasterizer must be bound before Blit");
+        let rasterizer = unsafe { rasterizer_handle.as_mut() };
+        if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
+            return;
         }
 
         self.sw_blitter
@@ -1669,18 +1631,9 @@ mod tests {
     }
 
     #[test]
-    fn test_regs_storage_size_matches_engine_reg_count() {
+    fn test_regs_union_size_matches_upstream_num_regs() {
         assert_eq!(std::mem::size_of::<RegsRawTail0x8e0To0x960>(), 0x80);
-        assert_eq!(
-            std::mem::size_of::<RegsRuntimeTailRaw>(),
-            (ENGINE_REG_COUNT - NUM_REGS_WORDS) * 4
-        );
-        assert_eq!(std::mem::size_of::<RegsStorageRaw>(), ENGINE_REG_COUNT * 4);
-        assert_eq!(std::mem::offset_of!(RegsStorageRaw, regs), 0x0);
-        assert_eq!(
-            std::mem::offset_of!(RegsStorageRaw, runtime_tail),
-            NUM_REGS_WORDS * 4
-        );
+        assert_eq!(std::mem::size_of::<RegsUnionRaw>(), NUM_REGS_WORDS * 4);
     }
 
     #[test]
@@ -1911,14 +1864,13 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_words_cover_union_head_and_rust_tail_contiguously() {
+    fn test_register_words_cover_the_complete_upstream_union() {
         let mut eng = Fermi2D::default();
         eng.write_reg((NUM_REGS_WORDS - 1) as u32, 0xCAFE_BABE);
-        eng.words_mut()[NUM_REGS_WORDS] = 0xDEAD_BEEF;
 
         let words = eng.words();
+        assert_eq!(words.len(), NUM_REGS_WORDS);
         assert_eq!(words[NUM_REGS_WORDS - 1], 0xCAFE_BABE);
-        assert_eq!(words[NUM_REGS_WORDS], 0xDEAD_BEEF);
     }
 
     #[test]
@@ -2038,7 +1990,9 @@ mod tests {
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_LOW, 0x1111_2222);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_HIGH, 0x3333_4444);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_LOW, 0x5555_6666);
-        eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_HIGH, 0x7777_8888);
+        // This register triggers `Blit`; seed the union directly because this
+        // test only verifies the register decoding contract.
+        eng.words_mut()[PIXELS_FROM_MEMORY_SRC_Y0_HIGH as usize] = 0x7777_8888;
 
         let args = eng.pixels_from_memory();
         assert_eq!(args.block_shape(), 7 & 0x7);
@@ -2208,6 +2162,10 @@ mod tests {
     #[test]
     fn test_blit_trigger_executes_immediately() {
         let mut eng = Fermi2D::default();
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        eng.bind_rasterizer(&rasterizer);
 
         eng.write_reg(DST_ADDR_HIGH, 0);
         eng.write_reg(DST_ADDR_LOW, 0x1000);
@@ -2238,6 +2196,13 @@ mod tests {
 
         eng.call_method(BLIT_TRIGGER, 1, true);
         assert_eq!(eng.words()[BLIT_TRIGGER as usize], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Fermi2D rasterizer must be bound before Blit")]
+    fn test_blit_requires_the_upstream_rasterizer_binding() {
+        let mut eng = Fermi2D::default();
+        eng.call_method(BLIT_TRIGGER, 0, true);
     }
 
     #[test]
@@ -2313,6 +2278,11 @@ mod tests {
     #[test]
     fn test_blit_copies_pixels() {
         let mut eng = Fermi2D::default();
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let mut rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        rasterizer.set_surface_copy_succeeds(false);
+        eng.bind_rasterizer(&rasterizer);
 
         // Set up matching src/dst: 4x2, pitch=16 (4 pixels * 4 bytes).
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -2362,6 +2332,11 @@ mod tests {
     #[test]
     fn test_blit_different_pitches() {
         let mut eng = Fermi2D::default();
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let mut rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        rasterizer.set_surface_copy_succeeds(false);
+        eng.bind_rasterizer(&rasterizer);
 
         // Source: pitch=8, 2 rows.
         eng.write_reg(SRC_ADDR_HIGH, 0);

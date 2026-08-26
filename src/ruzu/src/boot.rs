@@ -555,24 +555,10 @@ fn run_boot(
         let device_memory = host1x.memory_manager().clone();
         system.set_host1x_core(Box::new(host1x));
 
-        // GPU (upstream core.cpp:278). The frontend-owned subsystem factory
-        // replaces `VideoCore::CreateGPU` in this Rust dependency graph, so it
-        // must retain that function's leading `Settings::UpdateRescalingInfo`
-        // call before any renderer observes `resolution_info`.
-        {
-            let mut values = common::settings::values_mut();
-            common::settings::update_rescaling_info(&mut values);
-        }
+        // GPU (upstream core.cpp:278). `VideoCore::CreateGPU` owns the common
+        // settings, construction, failure, and renderer-binding lifecycle;
+        // this frontend supplies only the concrete window-backed renderer.
         let system_ref = SystemRef::from_ref(&system);
-        let use_async_gpu = *common::settings::values()
-            .use_asynchronous_gpu_emulation
-            .get_value()
-            && std::env::var_os("RUZU_DISABLE_ASYNC_GPU").is_none();
-        let use_nvdec = *common::settings::values().nvdec_emulation.get_value()
-            != common::settings_enums::NvdecEmulation::Off;
-        let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, use_nvdec));
-        gpu.set_system_ref(system_ref);
-        let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
 
         // Mutex-free raw pointer to the process `Memory`, shared by the GPU-side
         // memory callbacks. They run on the GPU thread while holding rasterizer
@@ -591,7 +577,9 @@ fn run_boot(
             }) as *const ruzu_core::memory::memory::Memory
         }
 
-        let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let gpu = video_core::video_core::create_gpu(system_ref, |renderer_backend, gpu| {
+            let gpu_ptr = gpu as *const video_core::gpu::Gpu as usize;
+            let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(tas) = tas.as_ref() {
                 use hid_core::hid_types::NpadIdType;
                 use input_common::drivers::tas_input::TasAnalog;
@@ -626,12 +614,12 @@ fn run_boot(
             if !frame_displayed.swap(true, Ordering::AcqRel) {
                 frame_loading_event(LoadingEvent::FirstFrame);
             }
-        });
-        let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || unsafe {
-            let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
-            gpu_ref.renderer_frame_end_notify();
-        });
-        let renderer: Box<dyn video_core::renderer_base::RendererBase> = match renderer_backend {
+            });
+            let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || unsafe {
+                let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
+                gpu_ref.renderer_frame_end_notify();
+            });
+            let renderer: Box<dyn video_core::renderer_base::RendererBase> = match renderer_backend {
             common::settings_enums::RendererBackend::OpenGlGlsl
             | common::settings_enums::RendererBackend::OpenGlGlasm
             | common::settings_enums::RendererBackend::OpenGlSpirV => {
@@ -744,8 +732,9 @@ fn run_boot(
                     Arc::clone(&frame_end_notify),
                 ),
             ),
-        };
-        gpu.bind_renderer(renderer);
+            };
+            Ok::<_, String>(renderer)
+        })?;
 
         // GPU-side guest memory reader (SMMU → page table → DRAM-direct).
         let system_ref = SystemRef::from_ref(&system);

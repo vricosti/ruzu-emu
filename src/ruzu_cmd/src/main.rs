@@ -1016,8 +1016,6 @@ fn main() {
         EmuWindow::Null(w) => Some(w.framebuffer_layout()),
         _ => None,
     };
-    let renderer_backend_str = renderer_backend.to_string();
-
     system.set_subsystem_factory(Box::new(move |system| {
         use std::sync::Arc;
 
@@ -1032,29 +1030,10 @@ fn main() {
         let device_memory = host1x.memory_manager().clone();
         system.set_host1x_core(Box::new(host1x));
 
-        // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
-        //
-        // Upstream flow:
-        //   auto context = emu_window.CreateSharedContext();
-        //   auto scope = context->Acquire();
-        //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
-        //   gpu->BindRenderer(renderer);
-        // `VideoCore::CreateGPU` updates the derived resolution state first.
-        // This frontend-owned factory has to retain that ordering because the
-        // renderer needs the GPU while it is being constructed.
-        {
-            let mut values = common::settings::values_mut();
-            common::settings::update_rescaling_info(&mut values);
-        }
+        // GPU (upstream core.cpp:278). `VideoCore::CreateGPU` owns the common
+        // settings, construction, failure, and renderer-binding lifecycle;
+        // this frontend supplies only the concrete window-backed renderer.
         let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
-        let use_async_gpu =
-            *common::settings::values().use_asynchronous_gpu_emulation.get_value()
-                && std::env::var_os("RUZU_DISABLE_ASYNC_GPU").is_none();
-        let use_nvdec = *common::settings::values().nvdec_emulation.get_value()
-            != common::settings_enums::NvdecEmulation::Off;
-        let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, use_nvdec));
-        gpu.set_system_ref(system_ref);
-        let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
 
         // One-time capture of a raw pointer to the process `Memory`, shared
         // by the GPU-side memory callbacks below. They run on the GPU thread
@@ -1076,9 +1055,13 @@ fn main() {
             }) as *const ruzu_core::memory::memory::Memory
         }
 
-        let renderer: Box<dyn video_core::renderer_base::RendererBase> =
-            match renderer_backend_str.as_str() {
-                "opengl" => {
+        let gpu = video_core::video_core::create_gpu(system_ref, |renderer_backend, gpu| {
+            let gpu_ptr = gpu as *const video_core::gpu::Gpu as usize;
+            let renderer: Box<dyn video_core::renderer_base::RendererBase> =
+                match renderer_backend {
+                common::settings_enums::RendererBackend::OpenGlGlsl
+                | common::settings_enums::RendererBackend::OpenGlGlasm
+                | common::settings_enums::RendererBackend::OpenGlSpirV => {
                     let window_ptr = sdl_window_ptr_usize as *mut sdl3::sys::everything::SDL_Window;
                     let context = Box::new(emu_window::emu_window_sdl3_gl::SdlGlContext::new(
                         window_ptr,
@@ -1172,7 +1155,7 @@ fn main() {
                     ));
                     Box::new(renderer)
                 }
-                "vulkan" => {
+                common::settings_enums::RendererBackend::Vulkan => {
                     let Some((window_info, _drawable_size, shown_state, framebuffer_layout)) =
                         vulkan_window_info.as_ref()
                     else {
@@ -1219,7 +1202,7 @@ fn main() {
                         .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
                     )
                 }
-                _ => {
+                common::settings_enums::RendererBackend::Null => {
                     let framebuffer_layout = null_framebuffer_layout.as_ref().ok_or_else(|| {
                         "Null renderer selected without framebuffer layout".to_owned()
                     })?;
@@ -1235,8 +1218,9 @@ fn main() {
                         frame_end_notify,
                     ))
                 }
-            };
-        gpu.bind_renderer(renderer);
+                };
+            Ok::<_, String>(renderer)
+        })?;
         let memory_raw_reader = memory_raw.clone();
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
             // The address handed to us is a *device address* coming from the

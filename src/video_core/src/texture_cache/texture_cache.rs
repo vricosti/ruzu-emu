@@ -3984,8 +3984,6 @@ mod tests {
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry, TscEntry};
     use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 
-    static RESOLUTION_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn collect_images_in_region_for_test(
         cache: &mut TextureCacheBase,
         cpu_addr: u64,
@@ -5330,7 +5328,9 @@ mod tests {
     fn update_render_targets_from_snapshot_scales_render_target_size_when_rescaling() {
         use common::settings;
 
-        let _settings_guard = RESOLUTION_SETTINGS_LOCK.lock().unwrap();
+        let _settings_guard = crate::test_support::RESOLUTION_SETTINGS_MUTEX
+            .lock()
+            .unwrap();
         let previous_resolution = settings::values().resolution_info.clone();
         {
             let mut values = settings::values_mut();
@@ -5351,7 +5351,9 @@ mod tests {
     fn update_render_targets_size_uses_wrapping_scale_multiply_like_upstream() {
         use common::settings;
 
-        let _settings_guard = RESOLUTION_SETTINGS_LOCK.lock().unwrap();
+        let _settings_guard = crate::test_support::RESOLUTION_SETTINGS_MUTEX
+            .lock()
+            .unwrap();
         let previous_resolution = settings::values().resolution_info.clone();
         {
             let mut values = settings::values_mut();

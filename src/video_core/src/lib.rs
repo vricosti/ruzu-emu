@@ -58,6 +58,7 @@ pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard};
 
     static GPU_ACCURACY_MUTEX: Mutex<()> = Mutex::new(());
+    pub(crate) static RESOLUTION_SETTINGS_MUTEX: Mutex<()> = Mutex::new(());
 
     pub(crate) struct GpuAccuracyGuard {
         previous: GpuAccuracy,

@@ -16941,3 +16941,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: compile-time checks cover every raw VIC structure size; focused tests additionally pin
   `Pixel`, all `ConfigStruct` member offsets, and the byte offsets of the used VIC registers. A
   block-linear YUV regression test verifies Eden's one-byte chroma swizzle element contract.
+
+## 2026-08-26 — `src/video_core/src/video_core.rs` vs Eden `src/video_core/video_core.{h,cpp}`
+
+### Intentional differences
+
+- Rust passes a renderer factory into `create_gpu` because SDL/GTK window handles and concrete
+  graphics-context construction remain frontend-owned. The factory receives the backend selected
+  from the common settings, while `video_core.rs` owns the shared lifecycle and ordering.
+- Renderer construction failures use `Result` and propagate to the frontend loading error path;
+  dropping the still-unbound `Box<Gpu>` is the Rust equivalent of Eden's logged `gpu.reset()`.
+- `RUZU_DISABLE_ASYNC_GPU` remains a diagnostic override layered onto Eden's asynchronous-GPU
+  setting. Both frontends now receive that decision from the single `create_gpu` owner.
+
+### Unintentional differences (to fix)
+
+- None after removing the unused duplicate renderer/NVDEC enums and routing both GTK and SDL
+  subsystem factories through `video_core::create_gpu`.
+- None after restoring Eden's order: update rescaling state, read NVDEC/async settings, allocate
+  the GPU, select and construct the renderer, then bind it.
+
+### Missing items
+
+- None in the shared `CreateGPU` lifecycle. Concrete window/context construction is supplied by
+  the frontends as described above.
+
+### Binary layout verification
+
+- N/A: this owner contains lifecycle functions and no raw or serialized payloads.

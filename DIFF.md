@@ -14128,3 +14128,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: `FramebufferConfig` is passed as a typed in-process descriptor rather than serialized by a
   raw memory copy. Its canonical pixel-format enum remains `repr(u32)` and rectangle field order is
   owned by `common::math_util::Rectangle`.
+
+## 2026-08-26 — `src/video_core/src/fsr.rs` vs Eden `src/video_core/fsr.{h,cpp}`
+
+### Intentional differences
+
+- Rust fixed-size array references replace C array parameters, while preserving their four-word
+  shape and mutation order.
+- `f32::to_bits` is the direct Rust equivalent of Eden's `std::bit_cast<u32>`.
+
+### Unintentional differences (to fix)
+
+- Resolved: RCAS sharpening now uses `(-sharpness).exp2()`, the direct equivalent of Eden's
+  `std::exp2f(-sharpness)`, instead of routing the same mathematical expression through `powf`.
+
+### Missing items
+
+- None: both 512-entry half-conversion tables and all EASU/RCAS constant-generation operations
+  match Eden.
+
+### Binary layout verification
+
+- PASS: focused tests compare all sixteen EASU output words and representative RCAS/packed-half
+  words bit-for-bit against values produced by the Eden C++ expressions.

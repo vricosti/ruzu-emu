@@ -165,10 +165,44 @@ pub fn fsr_easu_con_offset(
 
 /// Generate FSR RCAS (sharpening) constants.
 pub fn fsr_rcas_con(con: &mut [u32; 4], sharpness: f32) {
-    let sharpness = 2.0f32.powf(-sharpness);
+    let sharpness = (-sharpness).exp2();
     let h_sharp = [sharpness, sharpness];
     con[0] = sharpness.to_bits();
     con[1] = au1_ah2_af2(h_sharp);
     con[2] = 0;
     con[3] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn easu_offset_constants_match_eden_oracle() {
+        let mut con0 = [0; 4];
+        let mut con1 = [0; 4];
+        let mut con2 = [0; 4];
+        let mut con3 = [0; 4];
+
+        fsr_easu_con_offset(
+            &mut con0, &mut con1, &mut con2, &mut con3, 1280.0, 720.0, 1920.0, 1080.0, 2560.0,
+            1440.0, 32.0, 16.0,
+        );
+
+        assert_eq!(con0, [0x3f00_0000, 0x3f00_0000, 0x41fe_0000, 0x417c_0000]);
+        assert_eq!(con1, [0x3a08_8889, 0x3a72_b9d6, 0x3a08_8889, 0xba72_b9d6]);
+        assert_eq!(con2, [0xba08_8889, 0x3af2_b9d6, 0x3a08_8889, 0x3af2_b9d6]);
+        assert_eq!(con3, [0, 0x3b72_b9d6, 0, 0]);
+    }
+
+    #[test]
+    fn rcas_constants_use_exp2f_and_amd_half_packing() {
+        let mut con = [0; 4];
+        fsr_rcas_con(&mut con, 1.3);
+        assert_eq!(con[0], 0x3ecf_efc6);
+        assert_eq!(con[2..], [0, 0]);
+
+        fsr_rcas_con(&mut con, 1.0);
+        assert_eq!(con, [0x3f00_0000, 0x3800_3800, 0, 0]);
+    }
 }

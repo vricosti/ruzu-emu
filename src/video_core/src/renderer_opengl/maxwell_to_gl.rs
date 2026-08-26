@@ -379,8 +379,8 @@ pub fn comparison_op(comparison: u32) -> u32 {
 /// Corresponds to `OpenGL::MaxwellToGL::FrontFace()`.
 pub fn front_face(face: u32) -> u32 {
     match face {
-        1 => gl::CW,
-        2 => gl::CCW,
+        0x900 => gl::CW,
+        0x901 => gl::CCW,
         _ => {
             log::warn!("Unimplemented front face: {}", face);
             gl::CCW
@@ -393,9 +393,9 @@ pub fn front_face(face: u32) -> u32 {
 /// Corresponds to `OpenGL::MaxwellToGL::CullFace()`.
 pub fn cull_face(face: u32) -> u32 {
     match face {
-        1 => gl::FRONT,
-        2 => gl::BACK,
-        3 => gl::FRONT_AND_BACK,
+        0x404 => gl::FRONT,
+        0x405 => gl::BACK,
+        0x408 => gl::FRONT_AND_BACK,
         _ => {
             log::warn!("Unimplemented cull face: {}", face);
             gl::BACK
@@ -602,7 +602,7 @@ pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
         },
         // Float
         7 => match size {
-            0x0F | 0x03 | 0x1B => gl::HALF_FLOAT,
+            0x03 | 0x05 | 0x0F | 0x1B => gl::HALF_FLOAT,
             0x01 | 0x02 | 0x04 | 0x12 => gl::FLOAT,
             0x31 => gl::UNSIGNED_INT_10F_11F_11F_REV,
             _ => unimplemented_vertex_format(attrib_type, size),
@@ -770,7 +770,19 @@ mod tests {
         assert_eq!(vertex_format(3, 0x03), gl::SHORT);
         assert_eq!(vertex_format(3, 0x0A), gl::BYTE);
         assert_eq!(vertex_format(7, 0x03), gl::HALF_FLOAT);
+        assert_eq!(vertex_format(7, 0x05), gl::HALF_FLOAT);
+        assert_eq!(vertex_format(7, 0x0F), gl::HALF_FLOAT);
+        assert_eq!(vertex_format(7, 0x1B), gl::HALF_FLOAT);
         assert_eq!(vertex_format(7, 0x01), gl::FLOAT);
+    }
+
+    #[test]
+    fn front_and_cull_face_use_upstream_gl_register_encodings() {
+        assert_eq!(front_face(0x900), gl::CW);
+        assert_eq!(front_face(0x901), gl::CCW);
+        assert_eq!(cull_face(0x404), gl::FRONT);
+        assert_eq!(cull_face(0x405), gl::BACK);
+        assert_eq!(cull_face(0x408), gl::FRONT_AND_BACK);
     }
 
     #[test]

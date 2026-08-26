@@ -15338,3 +15338,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: the register storage is exactly 0x800 `u32` words; every typed register base used by the
   implementation is derived from the byte offset asserted in Eden's `Regs` definition. Rust does
   not serialize a host `MaxwellDMA` object or expose its object layout to guest memory.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/maxwell_to_gl.rs` vs Eden `src/video_core/renderer_opengl/maxwell_to_gl.h`
+
+### Intentional differences
+
+- Rust conversion functions accept the raw register `u32` encodings where the C++ signatures use
+  scoped enum types; every accepted discriminant and fallback result remains the same.
+- The mirror-clamp extension path queries the current OpenGL extension list once through the loaded
+  bindings instead of reading glad's generated `GL_EXT_texture_mirror_clamp` global.
+
+### Unintentional differences (to fix)
+
+- Resolved: `front_face` now accepts Eden's `0x900`/`0x901` Maxwell encodings instead of unrelated
+  compact values.
+- Resolved: `cull_face` now accepts Eden's `0x404`/`0x405`/`0x408` Maxwell encodings.
+- Resolved: floating-point `Size_R16_G16_B16` vertex attributes (`0x05`) now map to
+  `GL_HALF_FLOAT` together with the other three 16-bit floating formats.
+
+### Missing items
+
+- None: all 102 `SURFACE_FORMAT_LIST` entries and every conversion function in the upstream header
+  were compared against the Rust counterpart.
+
+### Binary layout verification
+
+- N/A: this file maps guest register values to host OpenGL enums and exposes no raw-memory payload.

@@ -13510,3 +13510,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `ComputePipeline` is host-only ownership/synchronization state and is never copied or
   serialized as raw bytes. Descriptor binding order remains covered by the focused test.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/compute_shaders.rs` and compute `.comp` files vs Eden `src/video_core/host_shaders/*.comp`
+
+### Intentional differences
+
+- Eden's CMake build generates one C++ source-string header for each non-Vulkan-only shader and a
+  SPIR-V header for each non-OpenGL-only shader. Rust exposes runtime GLSL with `include_str!` and
+  compiles Vulkan SPIR-V in `build.rs`; both paths now read the same upstream-owned `.comp` files.
+- `block_linear_unswizzle_3d_bcn.comp` has a final newline in the Rust tree while Eden's file ends
+  immediately after the closing brace. Its GLSL token stream and behavior are identical.
+
+### Unintentional differences (to fix)
+
+- None after replacing duplicated embedded strings with the source files, restoring the missing
+  query-prefix assignment, restoring both conditional-render comparison modes, and replacing the
+  Vulkan-only 3D BCN rewrite with Eden's complete Vulkan/OpenGL source.
+
+### Missing items
+
+- None among the sixteen compute shaders audited for this module. The six OpenGL runtime sources
+  that previously existed only as duplicated Rust strings now have their matching `.comp` files.
+
+### Binary layout verification
+
+- N/A: these are text shader sources. A normalized byte comparison verifies every source against
+  Eden, and focused tests cover the three previously drifted semantic expressions.

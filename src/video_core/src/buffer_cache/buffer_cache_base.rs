@@ -335,7 +335,7 @@ impl ChannelCacheAccessor for BufferCacheChannelInfo {
         self.channel_info.kepler_compute
     }
 
-    fn gpu_memory_ref(&self) -> usize {
+    fn gpu_memory_id(&self) -> usize {
         self.channel_info.gpu_memory_index
     }
 

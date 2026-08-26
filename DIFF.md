@@ -13369,3 +13369,37 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `Method` remains four bytes, and focused tests verify all three constants plus preservation
   of an unknown raw method value.
+
+## 2026-08-26 — `src/video_core/src/control/channel_state_cache.rs` vs Eden `src/video_core/control/channel_state_cache.h`, `.cpp`, and `.inc`
+
+### Intentional differences
+
+- Rust stores each payload in a `Box` inside the deque so the active payload address remains stable
+  when `VecDeque` reallocates; Eden obtains the same stability directly from `std::deque<P>`.
+- Rust retains GPU memory through `Arc<Mutex<MemoryManager>>` where Eden stores non-owning
+  references and pointers. Engine references remain stable raw addresses because their owning
+  `ChannelState` boxes outlive registered cache entries.
+- Rust's `&mut self` mutation methods replace Eden's internal `config_mutex`; cache owners provide
+  cross-thread synchronization around the complete cache object.
+- The derived `OnGPUASRegister(map_id)` virtual call is a one-argument closure so a texture cache
+  can mutably borrow its page-table storage beside `channel_caches`. Its argument and call point
+  match Eden.
+- Reusing a free payload slot drops the previous Rust value before replacement. Eden uses placement
+  construction in the occupied deque slot; Rust cannot safely begin a second object lifetime
+  without ending the first one.
+
+### Unintentional differences (to fix)
+
+- None after restoring the actual GPU-memory owner in `AddressSpaceRef`, `GetFromID`, and the bound
+  cache state. The previous port retained and returned only `MemoryManager::get_id()`, despite Eden
+  storing and returning `MemoryManager*`.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the cache is host-only state and is neither raw-copied nor serialized. Focused tests verify
+  stable payload addresses, FIFO slot reuse bookkeeping, once-per-address-space registration, and
+  pointer identity of the retained GPU-memory owner.

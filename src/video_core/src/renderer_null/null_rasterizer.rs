@@ -512,19 +512,24 @@ mod tests {
         let memory_manager = Arc::new(Mutex::new(
             crate::memory_manager::MemoryManager::new_with_geometry(3, 32, 0x1_0000_0000, 17, 12),
         ));
-        let expected_memory_id = memory_manager.lock().get_id();
-        channel.memory_manager = Some(memory_manager);
+        channel.memory_manager = Some(Arc::clone(&memory_manager));
         channel.init(&gpu, 0x1234);
 
         rast.initialize_channel(&mut channel);
         rast.bind_channel(&mut channel);
 
         assert_eq!(rast.channel_caches.program_id, 0x1234);
-        assert_eq!(rast.channel_caches.gpu_memory, Some(expected_memory_id));
+        assert!(Arc::ptr_eq(
+            rast.channel_caches
+                .gpu_memory
+                .as_ref()
+                .expect("bound GPU memory"),
+            &memory_manager,
+        ));
 
         rast.release_channel(9);
         assert_eq!(rast.channel_caches.program_id, 0);
-        assert_eq!(rast.channel_caches.gpu_memory, None);
+        assert!(rast.channel_caches.gpu_memory.is_none());
     }
 
     #[test]

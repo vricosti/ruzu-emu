@@ -259,7 +259,7 @@ impl ChannelCacheAccessor for TextureCacheChannelInfo {
         self.channel_info.kepler_compute
     }
 
-    fn gpu_memory_ref(&self) -> usize {
+    fn gpu_memory_id(&self) -> usize {
         self.channel_info.gpu_memory_index
     }
 
@@ -869,16 +869,10 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         {
             let channel_caches = &mut self.channel_caches;
             let gpu_page_table_storage = &mut self.gpu_page_table_storage;
-            channel_caches.create_channel_with_on_gpu_as_register(
-                channel,
-                |_memory_id, storage_id| {
-                    let sparse_index = storage_id * 2 + 1;
-                    if gpu_page_table_storage.len() <= sparse_index {
-                        gpu_page_table_storage
-                            .resize_with(sparse_index + 1, TextureCacheGPUMap::default);
-                    }
-                },
-            );
+            channel_caches.create_channel_with_on_gpu_as_register(channel, |_memory_id| {
+                gpu_page_table_storage.push(TextureCacheGPUMap::default());
+                gpu_page_table_storage.push(TextureCacheGPUMap::default());
+            });
         }
         let Some(memory_manager) = channel.memory_manager.as_ref() else {
             return;

@@ -131,10 +131,8 @@ impl ImageInfo {
     /// per-dimension sizes off `TicEntry`'s bitfield accessors.
     ///
     pub fn from_tic_entry(config: &crate::textures::texture::TicEntry) -> Self {
-        // `format_lookup_table::{ComponentType,TextureFormat}` are the placeholder
-        // enums the lookup table is keyed on. They're a strict subset of the
-        // full `textures::texture::{ComponentType,TextureFormat}`, so we decode
-        // straight from the raw TIC bit fields.
+        // Decode from the raw TIC bitfields exactly once; the lookup table uses
+        // the canonical `textures::texture` enum discriminants.
         use crate::textures::texture::TextureType;
 
         let mut info = Self::default();

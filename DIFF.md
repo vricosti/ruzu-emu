@@ -14015,3 +14015,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: focused tests verify all four Vulkan enum values, structure type `1000519000`, and the
   native-pointer-width C layout of the locally declared sampler pNext payload.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/format_lookup_table.rs` and `texture_cache/util.rs` vs Eden `src/video_core/texture_cache/format_lookup_table.{h,cpp}` and `texture_cache/util.cpp`
+
+### Intentional differences
+
+- TIC accessors currently expose their packed fields as `u32`, so the raw lookup entry point keeps
+  those bit patterns until the canonical enum-based public function is reached. Both paths feed the
+  same upstream hash and fallback table.
+- Unknown tuples use an error log followed by `A8B8G8R8_UNORM`, matching Eden's
+  `UNIMPLEMENTED_MSG` plus explicit fallback without relying on C++ logging macros.
+
+### Unintentional differences (to fix)
+
+- Removed the duplicate `TextureFormat` and incomplete `ComponentType` declarations from the lookup
+  table. The function now consumes the canonical types owned by `textures/texture.rs`, matching
+  Eden's ownership in `textures/texture.h`.
+- Restored `SNORM_FORCE_FP16` and `UNORM_FORCE_FP16` flow through `PixelFormatFromTIC`: unsupported
+  tuples now reach Eden's logged `A8B8G8R8_UNORM` fallback instead of returning `Invalid` early.
+
+### Missing items
+
+- None: an automated source-table comparison found the same 111 hash-to-pixel-format entries on
+  both sides.
+
+### Binary layout verification
+
+- PASS: the canonical component and texture enums are `repr(u32)` with upstream discriminants, and
+  a focused non-uniform hash test verifies every component shift plus the sRGB bit.

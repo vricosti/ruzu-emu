@@ -12,9 +12,7 @@
 
 use crate::textures::texture::TicEntry;
 
-use super::format_lookup_table::{
-    pixel_format_from_texture_info, ComponentType, PixelFormat, TextureFormat,
-};
+use super::format_lookup_table::{pixel_format_from_texture_info_raw, PixelFormat};
 use super::image_base::{GPUVAddr, ImageBase, VAddr};
 use super::image_info::ImageInfo;
 use super::types::*;
@@ -586,28 +584,12 @@ pub fn calculate_level_stride_alignment(info: &ImageInfo, level: u32) -> u32 {
 
 /// Port of `PixelFormatFromTIC`.
 pub fn pixel_format_from_tic(config: &TicEntry) -> PixelFormat {
-    let Some(format) = TextureFormat::from_raw(config.format()) else {
-        return PixelFormat::Invalid;
-    };
-    let Some(red) = ComponentType::from_raw(config.r_type()) else {
-        return PixelFormat::Invalid;
-    };
-    let Some(green) = ComponentType::from_raw(config.g_type()) else {
-        return PixelFormat::Invalid;
-    };
-    let Some(blue) = ComponentType::from_raw(config.b_type()) else {
-        return PixelFormat::Invalid;
-    };
-    let Some(alpha) = ComponentType::from_raw(config.a_type()) else {
-        return PixelFormat::Invalid;
-    };
-
-    pixel_format_from_texture_info(
-        format,
-        red,
-        green,
-        blue,
-        alpha,
+    pixel_format_from_texture_info_raw(
+        config.format(),
+        config.r_type(),
+        config.g_type(),
+        config.b_type(),
+        config.a_type(),
         config.srgb_conversion() != 0,
     )
 }
@@ -1666,6 +1648,21 @@ mod tests {
                 0,
             ],
         }
+    }
+
+    #[test]
+    fn pixel_format_from_tic_forwards_force_fp16_components_like_upstream() {
+        let component = ComponentType::SnormForceFp16 as u32;
+        let word0 = (TextureFormat::A8B8G8R8 as u32)
+            | (component << 7)
+            | (component << 10)
+            | (component << 13)
+            | (component << 16);
+        let tic = TicEntry {
+            raw: [word0 as u64, 0, 0, 0],
+        };
+
+        assert_eq!(pixel_format_from_tic(&tic), PixelFormat::A8B8G8R8Unorm);
     }
 
     #[test]

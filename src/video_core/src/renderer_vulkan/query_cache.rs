@@ -32,7 +32,7 @@ use crate::query_cache::query_stream::StreamerInterface;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::{
-    AllocatedBuffer, MappedBuffer, MemoryAllocator, MemoryUsage,
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
 };
 
 use super::buffer_cache::VulkanCommonBufferCache;
@@ -1201,7 +1201,7 @@ struct TfbQueryBankSlots {
 struct TfbQueryBank {
     device: ash::Device,
     buffer: AllocatedBuffer,
-    readback: MappedBuffer,
+    readback: AllocatedBuffer,
     slots: parking_lot::Mutex<TfbQueryBankSlots>,
     host_access: parking_lot::Mutex<()>,
 }
@@ -1226,7 +1226,7 @@ impl TfbQueryBank {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         let readback = memory_allocator
-            .create_mapped_buffer(&readback_info, MemoryUsage::Download)
+            .create_buffer(&readback_info, MemoryUsage::Download)
             .map_err(|error| error.result)?;
         Ok(Arc::new(Self {
             device,

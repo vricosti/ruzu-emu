@@ -24,7 +24,9 @@ use crate::vulkan_common::vulkan_debug_callback::{
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_instance;
 use crate::vulkan_common::vulkan_library;
-use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
+};
 use crate::vulkan_common::vulkan_surface;
 use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
@@ -590,7 +592,7 @@ impl RendererVulkan {
         layout: &FramebufferLayout,
         format: vk::Format,
         buffer_size: vk::DeviceSize,
-    ) -> MappedBuffer {
+    ) -> AllocatedBuffer {
         let mut frame = Frame::default();
         let image = create_wrapped_image(
             self.memory_allocator.as_ref(),
@@ -742,14 +744,14 @@ impl RendererVulkan {
         );
     }
 
-    fn create_download_buffer(&self, size: vk::DeviceSize) -> MappedBuffer {
+    fn create_download_buffer(&self, size: vk::DeviceSize) -> AllocatedBuffer {
         let ci = vk::BufferCreateInfo::builder()
             .size(size.max(1))
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         self.memory_allocator
-            .create_mapped_buffer(&ci, MemoryUsage::Download)
+            .create_buffer(&ci, MemoryUsage::Download)
             .expect("Failed to create Vulkan download buffer")
     }
 

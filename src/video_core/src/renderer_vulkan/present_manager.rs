@@ -533,7 +533,7 @@ impl PresentManager {
             .build();
 
         let image = unsafe { self.memory_allocator.as_ref() }
-            .create_owned_image(&image_ci)
+            .create_image(&image_ci)
             .expect("Failed to create present frame image");
         frame.set_image_allocation(image);
 

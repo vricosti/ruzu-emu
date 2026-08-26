@@ -43,7 +43,7 @@ pub fn create_wrapped_image(
     format: vk::Format,
 ) -> AllocatedImage {
     allocator
-        .create_owned_image(&wrapped_image_create_info(dimensions, format))
+        .create_image(&wrapped_image_create_info(dimensions, format))
         .expect("Failed to create wrapped image")
 }
 

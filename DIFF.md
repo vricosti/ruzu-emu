@@ -15923,8 +15923,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Rust exposes `AllocatedBuffer` and the `MappedBuffer` alias instead of Eden's move-only
-  `vk::Buffer` wrapper; both own the VMA allocation and destroy buffer plus allocation together.
+- Rust exposes `AllocatedBuffer` instead of Eden's move-only `vk::Buffer` wrapper; it owns the VMA
+  allocation and destroys buffer plus allocation together.
 - Rust owners call `AllocatedBuffer::handle()` when ash requires a raw `VkBuffer`; the owning
   wrapper remains in the same query, texture, turbo, staging, cache, or presentation object that
   owns Eden's move-only `vk::Buffer`.
@@ -15942,6 +15942,14 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: removed the allocator-global retained-buffer registry. `MemoryAllocator::create_buffer`
   now has one canonical owning return type, and every VMA allocation is destroyed by the field that
   owns the corresponding buffer lifecycle.
+- Resolved: renamed the VMA image factory from the Rust-only `create_owned_image` spelling to the
+  direct `create_image` counterpart of Eden's `CreateImage`.
+- Resolved: removed the Rust-only `create_mapped_buffer` factory and its extra host-visible failure
+  branch. Upload and download callers now use Eden's single `CreateBuffer` allocation path; callers
+  that require mapping consume the mapped span carried by that same owning wrapper.
+- Resolved: removed the `MappedBuffer` type alias. Device-local, upload, download, and stream
+  allocations now all visibly use the same `AllocatedBuffer` type, mirroring Eden's single
+  `vk::Buffer` owner.
 - Resolved: removed the unused `MemoryPropertyFlags` and `FindType` methods; current Eden has no
   such allocator methods and its VMA paths do not call them.
 
@@ -15972,6 +15980,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden's `Image` destruction order.
 - Resolved: turbo, staging, buffer-cache, layer, and presentation utility allocations all use the
   canonical owning `MemoryAllocator::create_buffer` path.
+- Resolved: presentation, texture-cache, and present-manager image allocations use the canonical
+  owning `MemoryAllocator::create_image` path; no second Rust-only image factory remains.
 
 ### Missing items
 

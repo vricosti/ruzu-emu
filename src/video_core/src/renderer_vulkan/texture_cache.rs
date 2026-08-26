@@ -1411,7 +1411,7 @@ impl Framebuffer {
                     .build();
                 let resolve_image = runtime
                     .memory_allocator()
-                    .create_owned_image(&image_info)
+                    .create_image(&image_info)
                     .map_err(|error| error.result)?;
                 let view_info = vk::ImageViewCreateInfo::builder()
                     .image(resolve_image.handle())
@@ -2304,7 +2304,7 @@ impl TextureCacheRuntime {
             .build();
         let image = self
             .memory_allocator()
-            .create_owned_image(&image_info)
+            .create_image(&image_info)
             .map_err(|error| error.result)?;
         let view_info = vk::ImageViewCreateInfo::builder()
             .image(image.handle())
@@ -3393,7 +3393,7 @@ impl TextureCacheRuntime {
             self.image_format_list_supported,
         );
         self.memory_allocator()
-            .create_owned_image(&image_info)
+            .create_image(&image_info)
             .map_err(|err| err.result)
     }
 
@@ -3403,7 +3403,7 @@ impl TextureCacheRuntime {
         image_info.format = format_info.format;
         image_info.usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
         self.memory_allocator()
-            .create_owned_image(&image_info)
+            .create_image(&image_info)
             .map_err(|err| err.result)
     }
 
@@ -3472,7 +3472,7 @@ impl TextureCacheRuntime {
         // Upstream passes an empty view-format span for the fallback image.
         let null_image = self
             .memory_allocator()
-            .create_owned_image(&image_info)
+            .create_image(&image_info)
             .map_err(|err| err.result)?;
         let image_handle = null_image.handle();
         let mut view = ImageView {

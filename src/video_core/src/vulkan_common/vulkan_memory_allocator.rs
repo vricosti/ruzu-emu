@@ -277,10 +277,6 @@ pub struct AllocatedBuffer {
     coherent: bool,
 }
 
-/// Name retained for call sites that require a persistently mapped buffer.
-/// VMA returns the same owning buffer type for mapped and device-local usage.
-pub type MappedBuffer = AllocatedBuffer;
-
 unsafe impl Send for AllocatedBuffer {}
 unsafe impl Sync for AllocatedBuffer {}
 
@@ -533,7 +529,7 @@ impl MemoryAllocator {
     ///
     /// This is the Rust equivalent of the upstream `vk::Image` wrapper returned
     /// by `MemoryAllocator::CreateImage`.
-    pub fn create_owned_image(
+    pub fn create_image(
         &self,
         ci: &vk::ImageCreateInfo,
     ) -> Result<AllocatedImage, VulkanError> {
@@ -556,22 +552,6 @@ impl MemoryAllocator {
             image,
             allocation,
         ))
-    }
-
-    /// Creates a host-visible mapped buffer.
-    ///
-    /// Port-facing equivalent of upstream `MemoryAllocator::CreateBuffer`
-    /// when callers immediately use the returned allocation's `Mapped()`.
-    pub fn create_mapped_buffer(
-        &self,
-        ci: &vk::BufferCreateInfo,
-        usage: MemoryUsage,
-    ) -> Result<MappedBuffer, VulkanError> {
-        let buffer = self.create_buffer(ci, usage)?;
-        if !buffer.is_host_visible() {
-            return Err(VulkanError::new(vk::Result::ERROR_MEMORY_MAP_FAILED));
-        }
-        Ok(buffer)
     }
 
     /// Commits a memory region with the specified requirements.
@@ -722,12 +702,17 @@ mod tests {
     }
 
     #[test]
-    fn create_buffer_returns_the_owning_raii_wrapper() {
+    fn create_methods_return_the_owning_raii_wrappers() {
         let _: fn(
             &MemoryAllocator,
             &vk::BufferCreateInfo,
             MemoryUsage,
         ) -> Result<AllocatedBuffer, VulkanError> = MemoryAllocator::create_buffer;
+        let _: fn(
+            &MemoryAllocator,
+            &vk::ImageCreateInfo,
+        ) -> Result<AllocatedImage, VulkanError> = MemoryAllocator::create_image;
         assert!(std::mem::needs_drop::<AllocatedBuffer>());
+        assert!(std::mem::needs_drop::<AllocatedImage>());
     }
 }

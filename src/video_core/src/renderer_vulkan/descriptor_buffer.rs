@@ -8,7 +8,9 @@ use common::alignment::{align_down, align_up};
 
 use super::scheduler::Scheduler;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
-use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
+};
 use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
 const FRAMES_IN_FLIGHT: usize = 8;
@@ -27,7 +29,7 @@ pub struct DescriptorBufferRing {
     // Stored to mirror Eden's `const Device&` member and parent-owned lifetime.
     #[allow(dead_code)]
     device: DeviceReference,
-    chunks: Vec<MappedBuffer>,
+    chunks: Vec<AllocatedBuffer>,
     chunk_addresses: Vec<vk::DeviceAddress>,
     chunk_hosts: Vec<*mut u8>,
     alignment: vk::DeviceSize,
@@ -42,7 +44,7 @@ pub struct DescriptorBufferRing {
 }
 
 // The ring is owned and mutated by the GPU thread. Its mapped allocation
-// pointers remain valid for the lifetime of their owning `MappedBuffer`s.
+// pointers remain valid for the lifetime of their owning `AllocatedBuffer`s.
 unsafe impl Send for DescriptorBufferRing {}
 
 impl DescriptorBufferRing {
@@ -111,7 +113,7 @@ impl DescriptorBufferRing {
         ring.chunk_hosts.reserve(total_chunks);
         for _ in 0..total_chunks {
             let buffer =
-                memory_allocator.create_mapped_buffer(&buffer_info, MemoryUsage::Upload)?;
+                memory_allocator.create_buffer(&buffer_info, MemoryUsage::Upload)?;
             if !buffer.is_host_visible() {
                 log::debug!("Descriptor buffer is not host visible, disabling");
                 ring.chunks.clear();

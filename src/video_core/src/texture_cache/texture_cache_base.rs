@@ -464,6 +464,24 @@ pub trait TextureCacheParams {
         copies: &[ImageCopy],
     ) where
         Self: Sized;
+
+    /// Backend runtime operation selected by upstream
+    /// `TextureCache<P>::BlitImage` after the common cache has resolved the
+    /// images, views, framebuffers, scaling state and regions.
+    fn blit_image(
+        _cache: &mut TextureCacheBase<Self>,
+        _dst_framebuffer_id: FramebufferId,
+        _src_framebuffer_id: FramebufferId,
+        _dst_view_id: ImageViewId,
+        _src_view_id: ImageViewId,
+        _dst_region: Region2D,
+        _src_region: Region2D,
+        _filter: crate::engines::fermi_2d::Filter,
+        _operation: crate::engines::fermi_2d::Operation,
+    ) where
+        Self: Sized,
+    {
+    }
 }
 
 /// Rust representation of an upstream backend class inheriting `ImageBase`.
@@ -786,10 +804,9 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
 
     // Image alloc table
     pub image_allocs_table: HashMap<GPUVAddr, ImageAllocId, BuildUnorderedDenseHasher>,
-    /// Upstream `virtual_invalid_space`, used to allocate stable fake CPU
-    /// ranges for images whose GPU address cannot be translated.
+    /// Upstream `virtual_invalid_space`, used to allocate fake CPU ranges for
+    /// images whose GPU address cannot be translated.
     pub virtual_invalid_space: u64,
-    pub virtual_invalid_ranges: HashMap<(GPUVAddr, u64), u64>,
 
     // Scratch buffers
     pub swizzle_data_buffer: Vec<u8>,
@@ -1078,7 +1095,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             join_alias_indices: HashMap::default(),
             image_allocs_table: HashMap::default(),
             virtual_invalid_space: 0,
-            virtual_invalid_ranges: HashMap::new(),
             swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
             image_downloader: None,

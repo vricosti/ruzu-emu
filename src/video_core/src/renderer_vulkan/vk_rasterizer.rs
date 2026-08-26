@@ -3692,23 +3692,10 @@ impl RasterizerInterface for RasterizerVulkan {
         dst: &crate::engines::fermi_2d::Surface,
         copy_config: &crate::engines::fermi_2d::Config,
     ) -> bool {
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
-            return false;
-        };
         let texture_cache: *mut TextureCache = &mut *self.texture_cache;
         unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache).blit_image(
-                dst,
-                src,
-                copy_config,
-                |gpu_addr| mm.lock().gpu_to_cpu_address(gpu_addr),
-                |gpu_addr, out| {
-                    let guard = mm.lock();
-                    guard.read_block(gpu_addr, out);
-                    true
-                },
-            )
+            (*texture_cache).blit_image(dst, src, copy_config)
         }
     }
 

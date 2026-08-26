@@ -39,8 +39,8 @@ use crate::texture_cache::texture_cache_base::{
 use crate::texture_cache::types::SubresourceExtent;
 use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
-    Extent2D, Extent3D, FramebufferId, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D,
-    Region2D, RelaxedOptions, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID,
+    Extent2D, Extent3D, FramebufferId, ImageId, ImageType, ImageViewId, ImageViewType, Region2D,
+    SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID,
 };
 use crate::texture_cache::util::{full_download_copies, map_size_bytes};
 
@@ -2904,6 +2904,37 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         }
         texture_cache_from_base(cache).copy_image_msaa(dst_id, src_id, copies);
     }
+
+    fn blit_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_framebuffer_id: FramebufferId,
+        src_framebuffer_id: FramebufferId,
+        _dst_view_id: ImageViewId,
+        _src_view_id: ImageViewId,
+        dst_region: Region2D,
+        src_region: Region2D,
+        filter: crate::engines::fermi_2d::Filter,
+        operation: crate::engines::fermi_2d::Operation,
+    ) {
+        let (dst_handle, dst_buffer_bits) = {
+            let framebuffer = &cache.slot_framebuffers[dst_framebuffer_id];
+            (framebuffer.handle(), framebuffer.buffer_bits())
+        };
+        let (src_handle, src_buffer_bits) = {
+            let framebuffer = &cache.slot_framebuffers[src_framebuffer_id];
+            (framebuffer.handle(), framebuffer.buffer_bits())
+        };
+        cache.runtime_mut().blit_framebuffer(
+            dst_handle,
+            src_handle,
+            dst_buffer_bits,
+            src_buffer_bits,
+            dst_region,
+            src_region,
+            filter,
+            operation,
+        );
+    }
 }
 
 /// OpenGL texture cache policy instance.
@@ -3270,29 +3301,6 @@ impl TextureCache {
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
         self.base.set_guest_memory_writer(writer);
-    }
-
-    fn base_image_exists(&self, image_id: ImageId) -> bool {
-        Self::base_image_exists_in(&self.base, image_id)
-    }
-
-    fn base_image_exists_in(
-        base: &CommonTextureCache<TextureCacheParams>,
-        image_id: ImageId,
-    ) -> bool {
-        base.slot_images.contains(image_id)
-    }
-
-    fn find_or_insert_image_from_info_with_options_and_finish(
-        &mut self,
-        info: &ImageInfo,
-        gpu_addr: u64,
-        cpu_addr: u64,
-        options: RelaxedOptions,
-        _read_gpu: &mut dyn FnMut(u64, &mut [u8]) -> bool,
-    ) -> ImageId {
-        self.base
-            .find_or_insert_image_from_info_with_options(info, gpu_addr, cpu_addr, options)
     }
 
     fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
@@ -3869,395 +3877,14 @@ impl TextureCache {
         };
         (framebuffer.handle(), size.width, size.height)
     }
-    /// OpenGL-backed port of `TextureCache<P>::BlitImage` for the currently
-    /// implemented framebuffer-blit path (`TextureCacheParams::FRAMEBUFFER_BLITS`).
+    /// OpenGL wrapper for the common upstream-owned `TextureCache<P>::BlitImage`.
     pub fn blit_image(
         &mut self,
         dst: &crate::engines::fermi_2d::Surface,
         src: &crate::engines::fermi_2d::Surface,
         copy: &crate::engines::fermi_2d::Config,
-        mut gpu_to_cpu: impl FnMut(u64) -> Option<u64>,
-        mut read_gpu: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> bool {
-        let dst_addr = dst.address();
-        let src_addr = src.address();
-        let mut dst_info = ImageInfo::from_fermi2d_surface(dst);
-        let mut src_info = ImageInfo::from_fermi2d_surface(src);
-        let can_be_depth_blit = dst_info.format == src_info.format
-            && copy.filter == crate::engines::fermi_2d::Filter::Point;
-        let try_options = if can_be_depth_blit {
-            RelaxedOptions::SAMPLES | RelaxedOptions::FORMAT
-        } else {
-            RelaxedOptions::SAMPLES
-        };
-
-        let Some(src_cpu_addr) = gpu_to_cpu(src_addr) else {
-            return false;
-        };
-        let Some(dst_cpu_addr) = gpu_to_cpu(dst_addr) else {
-            return false;
-        };
-
-        let mut src_id;
-        let mut dst_id;
-        loop {
-            self.base.has_deleted_images = false;
-            src_id = self.base.find_image_in_cpu_region_with_caps(
-                &src_info,
-                src_addr,
-                src_cpu_addr,
-                try_options,
-                self.base.has_broken_texture_view_formats,
-                self.base.has_native_bgr,
-            );
-            dst_id = self.base.find_image_in_cpu_region_with_caps(
-                &dst_info,
-                dst_addr,
-                dst_cpu_addr,
-                try_options,
-                self.base.has_broken_texture_view_formats,
-                self.base.has_native_bgr,
-            );
-            if !copy.must_accelerate {
-                let src_gpu_modified = src_id
-                    .map(|id| {
-                        self.base.slot_images[id]
-                            .flags
-                            .contains(ImageFlagBits::GPU_MODIFIED)
-                    })
-                    .unwrap_or(false);
-                let dst_gpu_modified = dst_id
-                    .map(|id| {
-                        self.base.slot_images[id]
-                            .flags
-                            .contains(ImageFlagBits::GPU_MODIFIED)
-                    })
-                    .unwrap_or(false);
-                if src_id.is_none() && dst_id.is_none() {
-                    return false;
-                }
-                if !src_gpu_modified && !dst_gpu_modified {
-                    return false;
-                }
-            }
-
-            let src_image = src_id.map(|id| &self.base.slot_images[id]);
-            if src_image.is_some_and(|image| image.info.num_samples > 1) {
-                let msaa_options = RelaxedOptions::SAMPLES | RelaxedOptions::FORCE_BROKEN_VIEWS;
-                src_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &src_info,
-                    src_addr,
-                    src_cpu_addr,
-                    msaa_options,
-                    &mut read_gpu,
-                ));
-                dst_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &dst_info,
-                    dst_addr,
-                    dst_cpu_addr,
-                    msaa_options,
-                    &mut read_gpu,
-                ));
-                if self.base.has_deleted_images {
-                    continue;
-                }
-                break;
-            }
-
-            if can_be_depth_blit {
-                let src_image = src_id.map(|id| &*self.base.slot_images[id]);
-                let dst_image = dst_id.map(|id| &*self.base.slot_images[id]);
-                crate::texture_cache::util::deduce_blit_images(
-                    &mut dst_info,
-                    &mut src_info,
-                    dst_image,
-                    src_image,
-                );
-                if crate::surface::get_format_type(dst_info.format)
-                    != crate::surface::get_format_type(src_info.format)
-                {
-                    continue;
-                }
-            }
-
-            if src_id.is_none() {
-                src_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &src_info,
-                    src_addr,
-                    src_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                ));
-            }
-            if dst_id.is_none() {
-                dst_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &dst_info,
-                    dst_addr,
-                    dst_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                ));
-            }
-            if !self.base.has_deleted_images {
-                break;
-            }
-        }
-
-        let mut src_id = src_id.unwrap_or(NULL_IMAGE_ID);
-        let mut dst_id = dst_id.unwrap_or(NULL_IMAGE_ID);
-        if !src_id.is_valid() || !dst_id.is_valid() {
-            return false;
-        }
-
-        if !self.base_image_exists(src_id) || !self.base_image_exists(dst_id) {
-            return false;
-        }
-
-        let native_bgr = self.base.has_native_bgr;
-        if crate::surface::get_format_type(dst_info.format)
-            != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
-            || crate::surface::get_format_type(src_info.format)
-                != crate::surface::get_format_type(self.base.slot_images[src_id].info.format)
-            || !crate::compatible_formats::is_view_compatible(
-                dst_info.format,
-                self.base.slot_images[dst_id].info.format,
-                false,
-                native_bgr,
-            )
-            || !crate::compatible_formats::is_view_compatible(
-                src_info.format,
-                self.base.slot_images[src_id].info.format,
-                false,
-                native_bgr,
-            )
-        {
-            loop {
-                self.base.has_deleted_images = false;
-                src_id = self.find_or_insert_image_from_info_with_options_and_finish(
-                    &src_info,
-                    src_addr,
-                    src_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                );
-                dst_id = self.find_or_insert_image_from_info_with_options_and_finish(
-                    &dst_info,
-                    dst_addr,
-                    dst_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                );
-                if !self.base.has_deleted_images {
-                    break;
-                }
-            }
-            if !self.base_image_exists(src_id) || !self.base_image_exists(dst_id) {
-                return false;
-            }
-        }
-
-        self.base.prepare_image(src_id, false, false);
-        self.base.prepare_image(dst_id, true, false);
-
-        if !self.backend_image_is_ready(dst_id) || !self.backend_image_is_ready(src_id) {
-            return false;
-        }
-
-        let mut is_src_rescaled = self.base.slot_images[src_id]
-            .flags
-            .contains(ImageFlagBits::RESCALED);
-        let mut is_dst_rescaled = self.base.slot_images[dst_id]
-            .flags
-            .contains(ImageFlagBits::RESCALED);
-        let is_resolve = self.base.slot_images[src_id].info.num_samples != 1
-            && self.base.slot_images[dst_id].info.num_samples == 1;
-        if is_src_rescaled != is_dst_rescaled {
-            if self.base.image_can_rescale(src_id) {
-                self.base.scale_up(src_id);
-                is_src_rescaled = self.base.slot_images[src_id]
-                    .flags
-                    .contains(ImageFlagBits::RESCALED);
-                if is_resolve {
-                    self.base.slot_images[dst_id].info.rescaleable = true;
-                    let aliases = self.base.slot_images[dst_id].aliased_images.clone();
-                    for alias in aliases {
-                        self.base.slot_images[alias.id].info.rescaleable = true;
-                    }
-                }
-            }
-            if self.base.image_can_rescale(dst_id) {
-                self.base.scale_up(dst_id);
-                is_dst_rescaled = self.base.slot_images[dst_id]
-                    .flags
-                    .contains(ImageFlagBits::RESCALED);
-            }
-        }
-        if is_resolve && is_src_rescaled != is_dst_rescaled {
-            self.base.scale_down(src_id);
-            self.base.scale_down(dst_id);
-            is_src_rescaled = self.base.slot_images[src_id]
-                .flags
-                .contains(ImageFlagBits::RESCALED);
-            is_dst_rescaled = self.base.slot_images[dst_id]
-                .flags
-                .contains(ImageFlagBits::RESCALED);
-        }
-        let resolution = settings::values().resolution_info.clone();
-        let scale_region = |region: &mut Region2D| {
-            region.start.x = resolution.scale_up_i32(region.start.x);
-            region.start.y = resolution.scale_up_i32(region.start.y);
-            region.end.x = resolution.scale_up_i32(region.end.x);
-            region.end.y = resolution.scale_up_i32(region.end.y);
-        };
-
-        let Some(src_base) = self.base.slot_images[src_id].try_find_base(src_addr) else {
-            return false;
-        };
-        let Some(dst_base) = self.base.slot_images[dst_id].try_find_base(dst_addr) else {
-            return false;
-        };
-        let src_range = SubresourceRange {
-            base: src_base,
-            ..Default::default()
-        };
-        let dst_range = SubresourceRange {
-            base: dst_base,
-            ..Default::default()
-        };
-        let src_view_id = self.ensure_color_view_for_range(src_id, src_info.format, src_range);
-        let dst_view_id = self.ensure_color_view_for_range(dst_id, dst_info.format, dst_range);
-        let Some((src_fbo, _, _)) = self.framebuffer_for_image_view(src_view_id) else {
-            return false;
-        };
-        let Some((dst_fbo, _, _)) = self.framebuffer_for_image_view(dst_view_id) else {
-            return false;
-        };
-
-        let (src_samples_x, src_samples_y) = crate::texture_cache::samples_helper::samples_log2(
-            self.base.slot_images[src_id].info.num_samples as i32,
-        );
-        let (dst_samples_x, dst_samples_y) = crate::texture_cache::samples_helper::samples_log2(
-            self.base.slot_images[dst_id].info.num_samples as i32,
-        );
-
-        let mut src_region = Region2D {
-            start: Offset2D {
-                x: copy.src_x0 >> src_samples_x,
-                y: copy.src_y0 >> src_samples_y,
-            },
-            end: Offset2D {
-                x: copy.src_x1 >> src_samples_x,
-                y: copy.src_y1 >> src_samples_y,
-            },
-        };
-        if is_src_rescaled {
-            scale_region(&mut src_region);
-        }
-        let mut dst_region = Region2D {
-            start: Offset2D {
-                x: copy.dst_x0 >> dst_samples_x,
-                y: copy.dst_y0 >> dst_samples_y,
-            },
-            end: Offset2D {
-                x: copy.dst_x1 >> dst_samples_x,
-                y: copy.dst_y1 >> dst_samples_y,
-            },
-        };
-        if is_dst_rescaled {
-            scale_region(&mut dst_region);
-        }
-        self.base.runtime_mut().blit_framebuffer(
-            dst_fbo,
-            src_fbo,
-            gl::COLOR_BUFFER_BIT,
-            gl::COLOR_BUFFER_BIT,
-            dst_region,
-            src_region,
-            copy.filter,
-            copy.operation,
-        );
-        self.base.mark_modification_by_id(dst_id);
-
-        true
-    }
-
-    fn ensure_color_view_for_range(
-        &mut self,
-        image_id: ImageId,
-        view_format: crate::surface::PixelFormat,
-        range: SubresourceRange,
-    ) -> ImageViewId {
-        let view_info = ImageViewInfo::for_render_target(ImageViewType::E2D, view_format, range);
-        let existing = self.base.slot_images[image_id].find_view(&view_info);
-        if existing.is_valid() {
-            return existing;
-        }
-        let gpu_addr = self.base.slot_images[image_id].gpu_addr;
-        self.base
-            .find_or_emplace_image_view(image_id, view_info, gpu_addr)
-    }
-
-    fn framebuffer_for_image_view(&mut self, view_id: ImageViewId) -> Option<(u32, u32, u32)> {
-        let view_base = self
-            .base
-            .slot_image_views
-            .get(view_id)
-            .base
-            .as_ref()
-            .clone();
-        let image_id = view_base.image_id;
-        if !image_id.is_valid() {
-            return None;
-        }
-        self.ready_backend_image_mut(image_id)?;
-        let view_mismatch = {
-            let backend_image = self
-                .backend_image(image_id)
-                .expect("image inserted above must be present");
-            self.base.slot_image_views[view_id]
-                .backend
-                .as_ref()
-                .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
-        };
-        if view_mismatch {
-            self.take_backend_image_view(view_id);
-            self.remove_framebuffers_for_view(view_id);
-        }
-        if self.base.slot_image_views[view_id].backend.is_none() {
-            let base = NonNull::from(self.base.slot_image_views[view_id].base.as_mut());
-            let backend_image = self.base.slot_images[image_id]
-                .backend
-                .as_ref()
-                .expect("image inserted above must be present");
-            let view = ImageView::new_color_2d(
-                base,
-                backend_image,
-                self.base.runtime().null_image_views,
-                self.base.runtime().has_debugging_tool_attached(),
-            );
-            self.base.slot_image_views[view_id].backend = Some(view);
-        }
-        let backend_view = self.base.slot_image_views[view_id]
-            .backend
-            .as_ref()
-            .expect("image view was materialized above");
-        let attachment_texture = framebuffer_attachment_texture(&view_base, backend_view);
-        if attachment_texture == 0 {
-            return None;
-        }
-        let key = self.render_targets_key_for_image_view(view_id, &view_base);
-        let framebuffer_id = if let Some(&framebuffer_id) = self.base.framebuffers.get(&key) {
-            framebuffer_id
-        } else {
-            let framebuffer =
-                self.create_color_framebuffer_for_view(key, &view_base, attachment_texture);
-            let framebuffer_id = self.base.slot_framebuffers.insert(framebuffer);
-            self.base.framebuffers.insert(key, framebuffer_id);
-            framebuffer_id
-        };
-        let framebuffer = &self.base.slot_framebuffers[framebuffer_id];
-        let handle = framebuffer.handle();
-        (handle != 0).then_some((handle, key.size.width, key.size.height))
+        self.base.blit_image(dst, src, copy)
     }
 
     fn render_targets_key_for_image_view(

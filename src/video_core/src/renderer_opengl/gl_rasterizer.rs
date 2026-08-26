@@ -3182,25 +3182,11 @@ impl RasterizerInterface for RasterizerOpenGL {
         dst: &crate::engines::fermi_2d::Surface,
         copy_config: &crate::engines::fermi_2d::Config,
     ) -> bool {
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
-            return false;
-        };
         let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let accelerated = unsafe {
+        unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache).blit_image(
-                dst,
-                src,
-                copy_config,
-                |gpu_addr| mm.lock().gpu_to_cpu_address(gpu_addr),
-                |gpu_addr, out| {
-                    let guard = mm.lock();
-                    guard.read_block(gpu_addr, out);
-                    true
-                },
-            )
-        };
-        accelerated
+            (*texture_cache).blit_image(dst, src, copy_config)
+        }
     }
 
     fn accelerate_conditional_rendering_with_address(

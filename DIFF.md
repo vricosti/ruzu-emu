@@ -16529,3 +16529,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these hooks inspect host capability booleans and emit diagnostic strings; sampler create
   structures and guest texture descriptors are unchanged. A focused test covers both guards and
   their upstream order.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/texture_cache.rs` blit ownership vs Eden `src/video_core/texture_cache/texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses Eden's compile-time `TextureCache<P>` runtime call through a
+  `TextureCacheParams::blit_image` policy method. The common cache still owns every decision and
+  constructed object; the policy implementations only unwrap the concrete OpenGL/Vulkan objects
+  and invoke the corresponding backend runtime operation.
+- Vulkan passes copyable framebuffer state to its blit helper because Rust cannot retain Eden's
+  mutable framebuffer/view references while also borrowing the runtime. OpenGL forwards the
+  framebuffer handles and buffer masks from the common cache's typed framebuffer slots.
+- `get_framebuffer_id` is fallible for Vulkan, so common `blit_image` returns `false` if framebuffer
+  construction fails. Eden propagates the equivalent Vulkan construction failure by exception.
+
+### Unintentional differences (to fix)
+
+- None after moving `GetBlitImages`, `BlitImage`, and `RenderTargetFromImage` back into the common
+  texture-cache owner, removing the duplicated backend control flow, and making both rasterizers
+  delegate without injecting GPU-memory callbacks.
+- None after matching Eden's unmapped-address behavior: `FindImage` does not see fake CPU ranges,
+  and each failed translation followed by `InsertImage` consumes a new aligned segment of
+  `virtual_invalid_space`.
+
+### Missing items
+
+- None in the audited `GetBlitImages`, `BlitImage`, `RenderTargetFromImage`, `FindImage`, and
+  `InsertImage` slice. The rest of the large common texture-cache report remains under sequential
+  audit and is not declared complete by this entry.
+
+### Binary layout verification
+
+- N/A: the change moves host-side ownership and control flow. `Region2D`, `RenderTargets`, image
+  IDs, image-view IDs, and framebuffer IDs retain their existing layouts; no guest payload or
+  serialized cache structure changed.

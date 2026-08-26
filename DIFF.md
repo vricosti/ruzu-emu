@@ -15507,3 +15507,60 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: these renderer objects and callbacks are host-only and are not raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/nvdec_common.rs` vs Eden `src/video_core/host1x/nvdec_common.h`
+
+### Intentional differences
+
+- Rust exposes the anonymous C++ register union as one `repr(C)` `u64` array plus named constants
+  and accessors. This avoids unsafe union reads while retaining every named field's exact slot and
+  the complete raw register view used by method dispatch.
+- `VideoCodec` is a transparent `u64` newtype with upstream-named associated constants rather than
+  a Rust enum, because the guest register may contain an unnamed value that C++ preserves through
+  `static_cast`.
+
+### Unintentional differences (to fix)
+
+- Resolved: unknown codec values are no longer collapsed to `None`; their complete 64-bit pattern
+  reaches NVDEC and FFmpeg callers unchanged.
+- Resolved: `ControlParams` owns all five upstream bitfields, and constants/accessors now cover
+  every named NVDEC register, including the H.264, VP8, HVEC, and VP9 scratch-buffer fields that
+  were previously absent from the Rust surface.
+
+### Missing items
+
+- None from `VideoCodec`, `Offset`, `control_params`, or the named `NvdecRegisters` fields.
+
+### Binary layout verification
+
+- PASS: `VideoCodec`, `ControlParams`, and `Offset` are each 8 bytes; `NvdecRegisters` is 0xBC0
+  bytes with 8-byte alignment, and tests verify every named register index from 0x80 through 0x177.
+
+## 2026-08-26 — `src/video_core/src/host1x/nvdec.rs` vs Eden `src/video_core/host1x/nvdec.{h,cpp}`
+
+### Intentional differences
+
+- The Rust Host1x owner supplies `Arc` handles for the frame queue and memory manager instead of a
+  C++ `Host1x&`; `ProcessMethodHook` replaces `CDmaPusher` inheritance. Construction and `Drop`
+  still open and close the same frame-queue identifier.
+- Eden's inherited `Decoder::Decode()` is represented by the decoder-owned Rust free function
+  invoked with each concrete codec variant; the decode implementation remains owned by
+  `host1x/codecs/decoder.rs`.
+
+### Unintentional differences (to fix)
+
+- Resolved: the decoder is again a concrete H264/VP8/VP9/None sum type matching Eden's
+  `std::variant`, and `Execute` dispatches each alternative explicitly and reports the monostate.
+- Resolved: the unused `wait_needed` state and non-upstream 32 ms execution delay were removed;
+  only Eden's 8 ms delay for disabled NVDEC emulation remains.
+- Resolved: per-frame trace instrumentation absent from Eden was removed, and raw unknown codec
+  values are preserved by the corrected `nvdec_common` representation.
+
+### Missing items
+
+- None among construction/destruction, `ProcessMethod`, `CreateDecoder`, `Execute`, and
+  `GetSyncpoint`.
+
+### Binary layout verification
+
+- N/A: `Nvdec` is a host-side polymorphic engine object and is not copied through a guest or C ABI.

@@ -265,7 +265,7 @@ impl Decoder {
         let mut pix_fmt = -1;
         let supported = unsafe {
             ffi::ruzu_ffmpeg_decoder_supports_decoding_on_device(
-                self.codec as u64,
+                self.codec.raw(),
                 device_type as i32,
                 &mut pix_fmt,
             )
@@ -378,7 +378,7 @@ impl DecoderContext {
     pub fn new(decoder: &Decoder) -> Self {
         let raw = unsafe {
             ffi::ruzu_ffmpeg_decoder_create(
-                decoder.codec as u64,
+                decoder.codec.raw(),
                 i32::from(decoder.prefer_mediacodec),
             )
         };
@@ -663,7 +663,7 @@ impl DecodeApi {
             .open_context(self.decoder.as_ref().expect("decoder exists"), &[]);
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
-            &[4, 1, codec as u64, initialized as u64, 0],
+            &[4, 1, codec.raw(), initialized as u64, 0],
         );
         if !initialized {
             self.reset();

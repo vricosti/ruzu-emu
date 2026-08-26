@@ -10,5 +10,6 @@ pub mod gpu_device_memory_manager;
 pub mod host1x;
 pub mod nvdec;
 pub mod nvdec_common;
+pub mod sync_manager;
 pub mod syncpoint_manager;
 pub mod vic;

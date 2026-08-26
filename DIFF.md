@@ -14757,3 +14757,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this file consumes the raw NVDEC layouts owned and verified in `vp9_types.rs`; its encoder
   state and output vectors are process-local.
+
+## 2026-08-26 — `src/video_core/src/host1x/sync_manager.rs` vs Eden `src/video_core/host1x/sync_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses Eden's default `SyncptIncr(..., done = false)` constructor argument explicitly at
+  its two call sites and uses `Vec::drain` for the same completed-prefix erase operation.
+- The upstream `increment_lock` member is retained but intentionally remains unacquired, matching
+  the current Eden implementation rather than inventing synchronization behavior.
+
+### Unintentional differences (to fix)
+
+- Resolved: the previously missing `SyncptIncr` and `SyncptIncrManager` owners now live in the
+  corresponding `host1x/sync_manager.rs` module. Handle allocation, ordered completion, guest/host
+  increment order, and prefix erasure follow Eden literally.
+
+### Missing items
+
+- None for `SyncptIncr` or `SyncptIncrManager`.
+
+### Binary layout verification
+
+- PASS: `SyncptIncr` is `repr(C)`, size 16, alignment 4, with its four fields at offsets 0, 4, 8,
+  and 12. It is process-local and is not raw-serialized.

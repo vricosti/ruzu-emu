@@ -12,8 +12,6 @@ pub mod draw_manager;
 pub mod engine_interface;
 pub mod engine_upload;
 pub mod fermi_2d;
-#[cfg(test)]
-pub mod inline_to_memory;
 pub mod kepler_compute;
 pub mod kepler_memory;
 pub mod maxwell_3d;

@@ -14989,3 +14989,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: these functions translate an enum into backend API constants and serialize no payload.
+
+## 2026-08-26 — removed `src/video_core/src/engines/inline_to_memory.rs` vs Eden engine ownership
+
+### Intentional differences
+
+- None. Eden has no `engines/inline_to_memory.{h,cpp}` owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the test-only `InlineToMemory` engine and its module declaration. It duplicated
+  A140/P2MF state behind a Rust-only register engine, and its block-linear mode incorrectly fell
+  back to a pitched linear write.
+- Verified: runtime A140 single- and multi-method dispatch already targets `KeplerMemory`, whose
+  matching `engine_upload::State` owner performs Eden's linear rasterizer upload or block-linear
+  `swizzle_subrect` path.
+
+### Missing items
+
+- None introduced by the removal; the upstream-owned implementation remains in
+  `engines/{kepler_memory,engine_upload}.rs`.
+
+### Binary layout verification
+
+- N/A: the removed type was test-only and was neither guest-visible nor serialized.

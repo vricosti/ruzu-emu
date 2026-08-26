@@ -10,6 +10,16 @@ use std::sync::Arc;
 use super::gl_resource_manager::OGLSync;
 use crate::fence_manager::{FenceBase, FenceManager};
 
+fn assert_fail_soft(condition: bool, message: &str, debug_asserts_enabled: bool) {
+    if condition {
+        return;
+    }
+    log::error!("{message}");
+    if debug_asserts_enabled {
+        panic!("{message}");
+    }
+}
+
 /// An OpenGL sync fence.
 ///
 /// Corresponds to `OpenGL::GLInnerFence`.
@@ -38,9 +48,11 @@ impl GLInnerFence {
         if self.is_stubbed {
             return;
         }
-        if !self.sync_object.handle.is_null() {
-            log::error!("GLInnerFence::Queue assertion failed: sync object is already queued");
-        }
+        assert_fail_soft(
+            self.sync_object.handle.is_null(),
+            "GLInnerFence::Queue assertion failed: sync object is already queued",
+            *common::settings::values().use_debug_asserts.get_value(),
+        );
         self.sync_object.create();
     }
 
@@ -51,9 +63,11 @@ impl GLInnerFence {
         if self.is_stubbed {
             return true;
         }
-        if self.sync_object.handle.is_null() {
-            log::error!("GLInnerFence::IsSignaled assertion failed: sync object is not queued");
-        }
+        assert_fail_soft(
+            !self.sync_object.handle.is_null(),
+            "GLInnerFence::IsSignaled assertion failed: sync object is not queued",
+            *common::settings::values().use_debug_asserts.get_value(),
+        );
         self.sync_object.is_signaled()
     }
 
@@ -64,9 +78,11 @@ impl GLInnerFence {
         if self.is_stubbed {
             return;
         }
-        if self.sync_object.handle.is_null() {
-            log::error!("GLInnerFence::Wait assertion failed: sync object is not queued");
-        }
+        assert_fail_soft(
+            !self.sync_object.handle.is_null(),
+            "GLInnerFence::Wait assertion failed: sync object is not queued",
+            *common::settings::values().use_debug_asserts.get_value(),
+        );
         unsafe {
             gl::ClientWaitSync(self.sync_object.handle, 0, gl::TIMEOUT_IGNORED);
         }
@@ -315,7 +331,19 @@ impl FenceManagerOpenGL {
 
 #[cfg(test)]
 mod tests {
-    use super::GLInnerFence;
+    use super::{assert_fail_soft, GLInnerFence};
+
+    #[test]
+    fn fence_assertions_follow_upstream_fail_soft_policy() {
+        assert_fail_soft(false, "ignored fail-soft assertion", false);
+        assert_fail_soft(true, "satisfied assertion", true);
+    }
+
+    #[test]
+    #[should_panic(expected = "fatal fail-soft assertion")]
+    fn fence_assertions_honor_debug_assert_setting() {
+        assert_fail_soft(false, "fatal fail-soft assertion", true);
+    }
 
     #[test]
     fn stubbed_fence_is_immediately_signaled_and_noop() {

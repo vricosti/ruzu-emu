@@ -17512,3 +17512,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: `ShaderNotify` is process-local synchronized state and is neither raw-copied nor serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_fence_manager.rs` vs Eden `src/video_core/renderer_opengl/gl_fence_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust composition delegates Eden's templated `GenericFenceManager` base to the common
+  `FenceManager<Fence>` owner. `Arc<Mutex<GLInnerFence>>` replaces `shared_ptr<GLInnerFence>` so
+  callback-owned fence handles can be shared safely.
+- The test-only forced-stub switch allows the common fence lifecycle to be exercised without an
+  OpenGL context and is absent from production builds.
+
+### Unintentional differences (to fix)
+
+- None after all three `GLInnerFence` state assertions use Eden's fail-soft assertion policy and
+  become fatal when `use_debug_asserts` is enabled, instead of merely logging in every mode.
+
+### Missing items
+
+- None in fence creation, queueing, signal polling, waiting, or generic-manager delegation.
+
+### Binary layout verification
+
+- N/A: the fence manager owns process-local OpenGL sync handles and callback state; no payload is
+  raw-copied or serialized.

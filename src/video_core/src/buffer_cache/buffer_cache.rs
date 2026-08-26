@@ -32,6 +32,7 @@ use crate::delayed_destruction_ring::DelayedDestructionRing;
 use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::Maxwell3D;
+use crate::host1x::gpu_device_memory_manager::AS_BITS;
 use crate::surface::PixelFormat;
 
 use super::buffer_cache_base::*;
@@ -72,11 +73,6 @@ const STREAM_LEAP_THRESHOLD: i32 = 16;
 
 /// Device page size (4 KiB). Matches `Core::DEVICE_PAGESIZE` upstream.
 const DEVICE_PAGESIZE: u64 = 4096;
-
-/// Address space bits used by the Maxwell device memory manager.
-///
-/// Upstream: `Tegra::MaxwellDeviceMemoryManager::AS_BITS = 34`.
-const AS_BITS: u32 = 34;
 
 // ---------------------------------------------------------------------------
 // BufferCache<P>

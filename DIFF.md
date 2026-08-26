@@ -4569,9 +4569,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu exposes the batch operation through its `DeviceTracker` trait so the generic Rust word
   manager can call the concrete `MaxwellDeviceMemoryManager`; Eden's C++ template parameter calls
   that concrete method directly.
-- Ruzu's public single-range path returns before acquiring a range lock when `size == 0`. Eden
-  still acquires a zero-length lock and reads the initial CPU-backing entry, but performs no page
-  counter update or caching callback.
+
+### Unintentional differences (to fix)
+
+- Resolved on 2026-08-26: the public single-range path no longer returns early when `size == 0`;
+  it now constructs Eden's zero-length range guard and executes the acquire/read setup without a
+  page-counter update or caching callback.
 
 ## 2026-08-21 — `src/video_core/src/buffer_cache/word_manager.rs` vs `src/video_core/buffer_cache/word_manager.h`
 
@@ -14558,3 +14561,66 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: renderer traits, contexts, and factories are process-local owners.
+
+## 2026-08-26 — `src/common/src/address_space.rs` vs Eden `src/common/address_space.{h,inc}` (`FlatAllocator` prerequisite)
+
+### Intentional differences
+
+- Rust specializes the generic address-space template as `FlatAllocatorBool<u32/u64>` for the two
+  allocator instantiations used by Ruzu. Mutex ownership and bool-backed block storage remain local
+  to this specialization.
+
+### Unintentional differences (to fix)
+
+- Resolved: the linear fixed-block search now uses Eden's literal
+  `gap < size || predecessor.Mapped()` selection condition. The former Rust predicate selected a
+  conventional free gap instead, changing the address returned when a request straddled a fixed
+  mapping.
+- Resolved: all guest-VA additions and subtractions in the bool-backed map/allocator now use
+  explicit wrapping operations, preserving the unsigned C++ bit patterns in debug builds.
+
+### Missing items
+
+- None for the bool-backed `FlatAllocator` operations used by the Maxwell device memory manager.
+
+### Binary layout verification
+
+- PASS: allocator blocks are process-local and not raw-serialized; their ordered `(virt, mapped)`
+  state and mutation order match the corresponding upstream specialization.
+
+## 2026-08-26 — `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs Eden `src/core/device_memory_manager.{h,inc}` and `src/video_core/host1x/gpu_device_memory_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust owns the active Maxwell specialization in `video_core/host1x` because moving the generic
+  implementation into the `core` crate would introduce the existing `core`/`video_core` dependency
+  cycle. Dense Rust tables replace Eden's reserved `VirtualBuffer` arrays, and atomics protect the
+  shared translation cache used through `Arc`.
+- Host pointers are range-checked against the captured device-memory allocation before indexing the
+  dense physical table. Eden relies on the invariant that every pointer belongs to that allocation;
+  the Rust check prevents an invalid pointer from becoming an out-of-bounds table access.
+- Test-only host-pointer mapping and callbacks support reduced fixtures. Runtime ASID mappings use
+  registered process memory and the same physical-base-relative encoding as Eden.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Allocate` and `Free` now forward the exact byte size to `FlatAllocator` instead of
+  silently rounding to 4 KiB, and `Free` no longer ignores address zero.
+- Resolved: the missing `AllocateFixed`, `ApplyOpOnPAddr`,
+  `GetPhysicalRawAddressFromDAddr`, `HAS_FLUSH_INVALIDATION`, and `AS_BITS` API pieces are present;
+  buffer-cache code consumes `AS_BITS` from its upstream owner instead of duplicating `34`.
+- Resolved: `UpdatePagesCachedCountNoLock` executes Eden's acquire fence before reading backing
+  metadata, including for a zero-size request. Range coalescing and span bounds now preserve
+  unsigned wrapping arithmetic.
+- Resolved: the module no longer describes the dense physical/device table implementation as an
+  unfinished SMMU subset.
+
+### Missing items
+
+- None for the instantiated Maxwell manager API and allocator helpers.
+
+### Binary layout verification
+
+- PASS: the device table stores one `u32` compressed physical value and the cached-page table one
+  atomic `u8` per device page, matching Eden's element widths and zero/one initialization. These
+  process-local tables are not raw-serialized.

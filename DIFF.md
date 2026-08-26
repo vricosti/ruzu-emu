@@ -17114,3 +17114,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: Ash owns the Vulkan ABI declarations. The two retained values are UTF-8 extension-name
   constants, covered by a focused exact-string regression test.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}` (report re-audit)
+
+### Intentional differences
+
+- Rust converts Vulkan C strings to UTF-8 before passing them to the `log` and GPU-logging APIs;
+  null or invalid strings receive printable fallbacks. Vulkan guarantees valid callback strings,
+  so valid calls retain Eden's exact message, ID-name, type-prefix, and priority behavior.
+- Rust's `error!` level is the closest available counterpart to Eden's `LOG_CRITICAL`; warning,
+  info, and verbose/debug levels map directly.
+
+### Unintentional differences (to fix)
+
+- None. The report's missing GPU-logger route had already been ported before this re-audit; both
+  runtime guards and the `-1` error / `-2` warning / `0` other result mapping match Eden.
+- None for the Android `0x01257b492` literal: its leading zero does not overflow or change the
+  value, and Rust's `0x1257b492` is exactly equivalent.
+
+### Missing items
+
+- None in the debug callback, false-positive filters, messenger creation flags, or RAII lifetime.
+
+### Binary layout verification
+
+- N/A: Ash owns the callback ABI and Rust reads the callback data in place. A focused regression
+  now pins every platform-selected ignored message ID, in addition to message-type priority.

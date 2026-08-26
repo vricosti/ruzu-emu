@@ -4419,11 +4419,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- Eden reports `MemoryCommit`, image, and buffer allocations/deallocations through `GPULogger` when
-  GPU memory tracking is active. Ruzu does not yet have the corresponding GPU logging subsystem.
-- Ruzu's raw-handle `create_image`, `create_buffer`, and `create_mapped_buffer` compatibility paths
-  still use dedicated Vulkan allocations. Eden returns owning VMA-backed `vk::Image`/`vk::Buffer`
-  wrappers; `create_owned_buffer` already uses VMA but the remaining callers have not all migrated.
+- Resolved by the 2026-08-26 allocator passes recorded below: all image and buffer factories now
+  return VMA-backed owners, and GPU allocation tracking is wired to the ported logger.
 
 ## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_data_processing.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (masked shifts)
 
@@ -15954,7 +15951,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Missing items
 
-- GPU allocation/deallocation logging remains unavailable with the unported GPU logger.
+- Resolved by the later 2026-08-26 GPU-memory logging entry.
 
 ### Binary layout verification
 
@@ -16338,3 +16335,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: the callback consumes ash's Vulkan ABI structure in place. No Vulkan payload is copied or
   serialized, and the callback continues returning `VK_FALSE` on every path.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` GPU memory tracking vs Eden `src/video_core/vulkan_common/vulkan_memory_allocator.{h,cpp}`
+
+### Intentional differences
+
+- Eden converts opaque `VkDeviceMemory` handles with `reinterpret_cast<uintptr_t>`; ash exposes the
+  same opaque bits through `Handle::as_raw`, then Rust casts them to `usize` for the logger key.
+- Ruzu releases its externally synchronized VMA mutex immediately after retrieving allocation
+  metadata and before entering the independent GPU logger. Eden's VMA calls do not require this
+  Rust mutex, while the allocation/logging order is unchanged.
+
+### Unintentional differences (to fix)
+
+- None after restoring `MemoryCommit` allocation/deallocation tracking and VMA image/buffer
+  allocation tracking with Eden's exact enablement guards, sizes, memory handles, and flag values.
+
+### Missing items
+
+- None in the audited allocator GPU-memory logging path. As in Eden, explicit deallocation logging
+  belongs only to `MemoryCommit::Release`; the VMA-owning image and buffer wrappers do not add
+  extra logger calls during destruction.
+
+### Binary layout verification
+
+- PASS: `VkDeviceMemory` handle bits and `VkMemoryPropertyFlags` raw bits are forwarded without
+  reinterpretation. A focused regression verifies the opaque handle conversion.

@@ -8,8 +8,11 @@
 //! Eden delegates image and buffer ownership to Vulkan Memory Allocator (VMA).
 
 use ash::vk;
+use ash::vk::Handle;
 use std::sync::Arc;
 use vk_mem::Alloc;
+
+use crate::gpu_logging::{get_instance, is_active};
 
 use super::vma::VmaAllocator;
 use super::vulkan_device::Device;
@@ -96,6 +99,12 @@ fn memory_usage_vma(usage: MemoryUsage) -> vk_mem::MemoryUsage {
     }
 }
 
+/// Rust counterpart of Eden's `reinterpret_cast<uintptr_t>(VkDeviceMemory)`
+/// in the GPU-memory logging calls.
+fn memory_handle_for_gpu_log(memory: vk::DeviceMemory) -> usize {
+    memory.as_raw() as usize
+}
+
 // ---------------------------------------------------------------------------
 // MemoryCommit — port of `Vulkan::MemoryCommit`
 // ---------------------------------------------------------------------------
@@ -136,6 +145,17 @@ impl MemoryCommit {
         allocation: vk_mem::Allocation,
         info: &vk_mem::AllocationInfo,
     ) -> Self {
+        if is_active()
+            && *common::settings::values()
+                .gpu_log_memory_tracking
+                .get_value()
+        {
+            get_instance().log_memory_allocation(
+                memory_handle_for_gpu_log(info.device_memory),
+                info.size,
+                0,
+            );
+        }
         Self {
             allocator: Some(allocator),
             allocation: Some(allocation),
@@ -223,6 +243,14 @@ impl MemoryCommit {
             return;
         };
         let allocator = self.allocator.take().unwrap();
+        if is_active()
+            && *common::settings::values()
+                .gpu_log_memory_tracking
+                .get_value()
+            && self.memory != vk::DeviceMemory::null()
+        {
+            get_instance().log_memory_deallocation(memory_handle_for_gpu_log(self.memory));
+        }
         let allocator = allocator.lock().expect("VMA allocator mutex poisoned");
         unsafe {
             if !self.mapped_ptr.is_null() {
@@ -515,6 +543,18 @@ impl MemoryAllocator {
         let allocation_info = allocator.get_allocation_info(&allocation);
         let property_flags =
             self.properties.memory_types[allocation_info.memory_type as usize].property_flags;
+        drop(allocator);
+        if is_active()
+            && *common::settings::values()
+                .gpu_log_memory_tracking
+                .get_value()
+        {
+            get_instance().log_memory_allocation(
+                memory_handle_for_gpu_log(allocation_info.device_memory),
+                allocation_info.size,
+                property_flags.as_raw(),
+            );
+        }
         Ok(AllocatedBuffer {
             allocator: Arc::clone(&self.allocator),
             buffer,
@@ -529,10 +569,7 @@ impl MemoryAllocator {
     ///
     /// This is the Rust equivalent of the upstream `vk::Image` wrapper returned
     /// by `MemoryAllocator::CreateImage`.
-    pub fn create_image(
-        &self,
-        ci: &vk::ImageCreateInfo,
-    ) -> Result<AllocatedImage, VulkanError> {
+    pub fn create_image(&self, ci: &vk::ImageCreateInfo) -> Result<AllocatedImage, VulkanError> {
         let allocation_ci = vk_mem::AllocationCreateInfo {
             flags: vk_mem::AllocationCreateFlags::WITHIN_BUDGET,
             usage: vk_mem::MemoryUsage::AutoPreferDevice,
@@ -547,6 +584,19 @@ impl MemoryAllocator {
                 .create_image(ci, &allocation_ci)
                 .map_err(VulkanError::new)?
         };
+        let allocation_info = allocator.get_allocation_info(&allocation);
+        drop(allocator);
+        if is_active()
+            && *common::settings::values()
+                .gpu_log_memory_tracking
+                .get_value()
+        {
+            get_instance().log_memory_allocation(
+                memory_handle_for_gpu_log(allocation_info.device_memory),
+                allocation_info.size,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw(),
+            );
+        }
         Ok(AllocatedImage::new(
             Arc::clone(&self.allocator),
             image,
@@ -639,7 +689,6 @@ impl MemoryAllocator {
             &info,
         ))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -702,16 +751,21 @@ mod tests {
     }
 
     #[test]
+    fn gpu_log_memory_handle_preserves_the_vulkan_handle_bits() {
+        let raw = 0x7654_3210u64;
+        let memory = vk::DeviceMemory::from_raw(raw);
+        assert_eq!(memory_handle_for_gpu_log(memory) as u64, raw);
+    }
+
+    #[test]
     fn create_methods_return_the_owning_raii_wrappers() {
         let _: fn(
             &MemoryAllocator,
             &vk::BufferCreateInfo,
             MemoryUsage,
         ) -> Result<AllocatedBuffer, VulkanError> = MemoryAllocator::create_buffer;
-        let _: fn(
-            &MemoryAllocator,
-            &vk::ImageCreateInfo,
-        ) -> Result<AllocatedImage, VulkanError> = MemoryAllocator::create_image;
+        let _: fn(&MemoryAllocator, &vk::ImageCreateInfo) -> Result<AllocatedImage, VulkanError> =
+            MemoryAllocator::create_image;
         assert!(std::mem::needs_drop::<AllocatedBuffer>());
         assert!(std::mem::needs_drop::<AllocatedImage>());
     }

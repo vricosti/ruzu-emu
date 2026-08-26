@@ -16007,7 +16007,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Missing items
 
-- GPU draw/dispatch logging remains unavailable with the unported GPU logging subsystem.
+- Resolved by the later 2026-08-26 rasterizer GPU-logging entry.
 
 ### Binary layout verification
 
@@ -16386,3 +16386,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: scheduler diagnostics consume host-side Vulkan state and do not alter command or guest
   payload layouts. A focused test verifies the exact render-pass log string.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` GPU logging hooks vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's direct and indirect draws share `prepare_draw`, so the two Eden inline formatting blocks
+  are represented by file-local, call-specific helpers. They preserve method ownership and make
+  the exact call names and parameter strings directly testable.
+- Vulkan success is forwarded through ash's `vk::Result::SUCCESS.as_raw()` rather than Eden's
+  `VK_SUCCESS`; both pass the same signed integer zero to the logger.
+
+### Unintentional differences (to fix)
+
+- None after restoring direct draw, plain indirect draw, direct compute-dispatch, and transform-
+  feedback extension logging with Eden's exact branch placement and runtime guards.
+
+### Missing items
+
+- None in the audited rasterizer GPU-logging path. Matching Eden, byte-count draws, count-buffer
+  draws, and indirect compute dispatches return before the corresponding direct-path log hooks.
+
+### Binary layout verification
+
+- N/A: the hooks only format already-decoded host draw state. Focused tests verify indexed draw,
+  indirect draw, and dispatch payloads byte-for-byte against Eden's format strings.

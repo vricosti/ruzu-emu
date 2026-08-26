@@ -50,6 +50,7 @@ use crate::engines::maxwell_3d::{PrimitiveTopology, VertexAttribType, NUM_VIEWPO
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::fence_manager::FenceManager as GenericFenceManager;
 use crate::framebuffer_config::FramebufferConfig;
+use crate::gpu_logging::{get_instance, is_active};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
@@ -129,6 +130,55 @@ struct DrawParams {
     num_vertices: u32,
     first_index: u32,
     is_indexed: bool,
+}
+
+fn direct_draw_log_info(draw_params: DrawParams) -> (&'static str, String) {
+    if draw_params.is_indexed {
+        (
+            "vkCmdDrawIndexed",
+            format!(
+                "vertices={}, instances={}, firstIndex={}, baseVertex={}, baseInstance={}",
+                draw_params.num_vertices,
+                draw_params.num_instances,
+                draw_params.first_index,
+                draw_params.base_vertex,
+                draw_params.base_instance
+            ),
+        )
+    } else {
+        (
+            "vkCmdDraw",
+            format!(
+                "vertices={}, instances={}, firstVertex={}, firstInstance={}",
+                draw_params.num_vertices,
+                draw_params.num_instances,
+                draw_params.base_vertex,
+                draw_params.base_instance
+            ),
+        )
+    }
+}
+
+fn indirect_draw_log_info(
+    is_indexed: bool,
+    max_draw_counts: usize,
+    stride: usize,
+) -> (&'static str, String) {
+    (
+        if is_indexed {
+            "vkCmdDrawIndexedIndirect"
+        } else {
+            "vkCmdDrawIndirect"
+        },
+        format!("drawCount={}, stride={}", max_draw_counts, stride),
+    )
+}
+
+fn dispatch_log_info(dim: [u32; 3]) -> String {
+    format!(
+        "groupCountX={}, groupCountY={}, groupCountZ={}",
+        dim[0], dim[1], dim[2]
+    )
 }
 
 fn make_draw_params(draw: &Maxwell3DDrawView<'_>, instance_count: u32) -> DrawParams {
@@ -1310,6 +1360,18 @@ impl RasterizerVulkan {
                         );
                     }
                 });
+                if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+                    let (call_name, log_params) = indirect_draw_log_info(
+                        params.is_indexed,
+                        params.max_draw_counts,
+                        params.stride,
+                    );
+                    get_instance().log_vulkan_call(
+                        call_name,
+                        &log_params,
+                        vk::Result::SUCCESS.as_raw(),
+                    );
+                }
             }
         } else {
             let draw_params = make_draw_params(draw, instance_count);
@@ -1339,6 +1401,10 @@ impl RasterizerVulkan {
                     );
                 });
             }
+            if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+                let (call_name, params) = direct_draw_log_info(draw_params);
+                get_instance().log_vulkan_call(call_name, &params, vk::Result::SUCCESS.as_raw());
+            }
         }
     }
 
@@ -1367,8 +1433,14 @@ impl RasterizerVulkan {
             QueryType::StreamingByteCount as u32,
             enabled,
         );
-        if enabled && tessellation_enabled {
-            warn!("Transform feedback with tessellation shaders is not implemented");
+        if enabled {
+            if is_active() {
+                get_instance()
+                    .log_extension_usage("VK_EXT_transform_feedback", "HandleTransformFeedback");
+            }
+            if tessellation_enabled {
+                warn!("Transform feedback with tessellation shaders is not implemented");
+            }
         }
     }
 
@@ -3136,6 +3208,13 @@ impl RasterizerInterface for RasterizerVulkan {
             let device = device.get().get_logical();
             device.cmd_dispatch(cmdbuf, dim[0], dim[1], dim[2]);
         });
+        if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+            get_instance().log_vulkan_call(
+                "vkCmdDispatch",
+                &dispatch_log_info(dim),
+                vk::Result::SUCCESS.as_raw(),
+            );
+        }
     }
 
     fn reset_counter(&mut self, query_type: u32) {
@@ -3933,6 +4012,33 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<DeviceReference>(),
             std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn gpu_draw_and_dispatch_log_payloads_match_upstream() {
+        let indexed = DrawParams {
+            base_instance: 9,
+            num_instances: 2,
+            base_vertex: -4,
+            num_vertices: 12,
+            first_index: 3,
+            is_indexed: true,
+        };
+        assert_eq!(
+            direct_draw_log_info(indexed),
+            (
+                "vkCmdDrawIndexed",
+                "vertices=12, instances=2, firstIndex=3, baseVertex=-4, baseInstance=9".to_owned()
+            )
+        );
+        assert_eq!(
+            indirect_draw_log_info(false, 7, 20),
+            ("vkCmdDrawIndirect", "drawCount=7, stride=20".to_owned())
+        );
+        assert_eq!(
+            dispatch_log_info([8, 4, 2]),
+            "groupCountX=8, groupCountY=4, groupCountZ=2"
         );
     }
 

@@ -14807,3 +14807,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: GLSL sources are text; Vulkan modules are validated separately by the generated-SPIR-V
   tests.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_base.rs` vs Eden `src/video_core/texture_cache/image_base.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses `Vec` for Eden's inline-capacity `small_vector` slice metadata. Element ordering and
+  lookup behavior are unchanged; only small-allocation strategy differs.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ImageBase::null` now retains the in-class `CPU_MODIFIED` default exactly like Eden's
+  empty `NullImageParams` constructor.
+- Resolved: `layer_mip_offset` now follows C++ usual arithmetic conversions for its mixed
+  `s32`/`u32` division and remainder. Offsets with bit 31 set no longer take the signed Rust path.
+- Resolved: the missing `has_scaled` accessor is present, address/range calculations preserve
+  unsigned wrapping, and alias block rounding uses the upstream-owned common `div_ceil` helper.
+
+### Missing items
+
+- None for flags, constructors, subresource lookup, view tracking, overlap state, or alias-copy
+  generation.
+
+### Binary layout verification
+
+- N/A: `ImageBase`, `ImageMapView`, and alias vectors are process-local cache owners and are not
+  copied to guest memory or serialized as raw bytes.

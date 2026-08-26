@@ -11,6 +11,7 @@ use super::image_view_info::ImageViewInfo;
 use super::types::*;
 use super::util;
 use crate::surface;
+use common::div_ceil::div_ceil_u32;
 
 // ── Type aliases matching upstream ─────────────────────────────────────
 
@@ -134,7 +135,7 @@ impl ImageBase {
             flags: ImageFlagBits::CPU_MODIFIED,
             gpu_addr,
             cpu_addr,
-            cpu_addr_end: cpu_addr + guest_size_bytes as u64,
+            cpu_addr_end: cpu_addr.wrapping_add(guest_size_bytes as u64),
             modification_tick: 0,
             lru_index: usize::MAX,
             mip_level_offsets,
@@ -162,7 +163,7 @@ impl ImageBase {
             scale_tick: 0,
             has_scaled: false,
             channel: 0,
-            flags: ImageFlagBits::empty(),
+            flags: ImageFlagBits::CPU_MODIFIED,
             gpu_addr: 0,
             cpu_addr: 0,
             cpu_addr_end: 0,
@@ -245,16 +246,23 @@ impl ImageBase {
         true
     }
 
+    /// Whether this image has ever been scaled.
+    ///
+    /// Port of `ImageBase::HasScaled`.
+    pub fn has_scaled(&self) -> bool {
+        self.has_scaled
+    }
+
     /// Whether this image overlaps a CPU address range.
     pub fn overlaps(&self, overlap_cpu_addr: VAddr, overlap_size: usize) -> bool {
-        let overlap_end = overlap_cpu_addr + overlap_size as u64;
+        let overlap_end = overlap_cpu_addr.wrapping_add(overlap_size as u64);
         self.cpu_addr < overlap_end && overlap_cpu_addr < self.cpu_addr_end
     }
 
     /// Whether this image overlaps a GPU address range.
     pub fn overlaps_gpu(&self, overlap_gpu_addr: GPUVAddr, overlap_size: usize) -> bool {
-        let overlap_end = overlap_gpu_addr + overlap_size as u64;
-        let gpu_addr_end = self.gpu_addr + self.guest_size_bytes as u64;
+        let overlap_end = overlap_gpu_addr.wrapping_add(overlap_size as u64);
+        let gpu_addr_end = self.gpu_addr.wrapping_add(self.guest_size_bytes as u64);
         self.gpu_addr < overlap_end && overlap_gpu_addr < gpu_addr_end
     }
 
@@ -307,14 +315,14 @@ impl ImageMapView {
     }
 
     pub fn overlaps(&self, overlap_cpu_addr: VAddr, overlap_size: usize) -> bool {
-        let overlap_end = overlap_cpu_addr + overlap_size as u64;
-        let cpu_addr_end = self.cpu_addr + self.size as u64;
+        let overlap_end = overlap_cpu_addr.wrapping_add(overlap_size as u64);
+        let cpu_addr_end = self.cpu_addr.wrapping_add(self.size as u64);
         self.cpu_addr < overlap_end && overlap_cpu_addr < cpu_addr_end
     }
 
     pub fn overlaps_gpu(&self, overlap_gpu_addr: GPUVAddr, overlap_size: usize) -> bool {
-        let overlap_end = overlap_gpu_addr + overlap_size as u64;
-        let gpu_addr_end = self.gpu_addr + self.size as u64;
+        let overlap_end = overlap_gpu_addr.wrapping_add(overlap_size as u64);
+        let gpu_addr_end = self.gpu_addr.wrapping_add(self.size as u64);
         self.gpu_addr < overlap_end && overlap_gpu_addr < gpu_addr_end
     }
 }
@@ -336,7 +344,8 @@ fn layer_mip_offset(diff: i32, layer_stride: u32) -> (i32, i32) {
     if layer_stride == 0 {
         (0, diff)
     } else {
-        (diff / layer_stride as i32, diff % layer_stride as i32)
+        let diff = diff as u32;
+        ((diff / layer_stride) as i32, (diff % layer_stride) as i32)
     }
 }
 
@@ -358,23 +367,19 @@ fn validate_copy(copy: &ImageCopy, dst: &ImageInfo, src: &ImageInfo) -> bool {
     if !validate_layers(&copy.dst_subresource, dst) {
         return false;
     }
-    if copy.src_offset.x as u32 + copy.extent.width > src_size.width
-        || copy.src_offset.y as u32 + copy.extent.height > src_size.height
-        || copy.src_offset.z as u32 + copy.extent.depth > src_size.depth
+    if (copy.src_offset.x as u32).wrapping_add(copy.extent.width) > src_size.width
+        || (copy.src_offset.y as u32).wrapping_add(copy.extent.height) > src_size.height
+        || (copy.src_offset.z as u32).wrapping_add(copy.extent.depth) > src_size.depth
     {
         return false;
     }
-    if copy.dst_offset.x as u32 + copy.extent.width > dst_size.width
-        || copy.dst_offset.y as u32 + copy.extent.height > dst_size.height
-        || copy.dst_offset.z as u32 + copy.extent.depth > dst_size.depth
+    if (copy.dst_offset.x as u32).wrapping_add(copy.extent.width) > dst_size.width
+        || (copy.dst_offset.y as u32).wrapping_add(copy.extent.height) > dst_size.height
+        || (copy.dst_offset.z as u32).wrapping_add(copy.extent.depth) > dst_size.depth
     {
         return false;
     }
     true
-}
-
-fn div_ceil(a: u32, b: u32) -> u32 {
-    (a + b - 1) / b
 }
 
 /// Create bidirectional alias records between two images.
@@ -433,12 +438,12 @@ pub fn add_image_alias(
         let mut lhs_size = util::mip_size(lhs.info.size, (base.level + mip_level) as u32);
         let mut rhs_size = util::mip_size(rhs.info.size, mip_level as u32);
         if is_lhs_compressed {
-            lhs_size.width = div_ceil(lhs_size.width, lhs_block.width);
-            lhs_size.height = div_ceil(lhs_size.height, lhs_block.height);
+            lhs_size.width = div_ceil_u32(lhs_size.width, lhs_block.width);
+            lhs_size.height = div_ceil_u32(lhs_size.height, lhs_block.height);
         }
         if is_rhs_compressed {
-            rhs_size.width = div_ceil(rhs_size.width, rhs_block.width);
-            rhs_size.height = div_ceil(rhs_size.height, rhs_block.height);
+            rhs_size.width = div_ceil_u32(rhs_size.width, rhs_block.width);
+            rhs_size.height = div_ceil_u32(rhs_size.height, rhs_block.height);
         }
         let copy_size = Extent3D {
             width: lhs_size.width.min(rhs_size.width),
@@ -523,6 +528,22 @@ pub fn add_image_alias(
 mod tests {
     use super::*;
     use crate::texture_cache::format_lookup_table::PixelFormat;
+
+    #[test]
+    fn null_image_keeps_upstream_default_flags() {
+        let mut image = ImageBase::null(NullImageParams);
+        assert_eq!(image.flags, ImageFlagBits::CPU_MODIFIED);
+        assert!(!image.has_scaled());
+
+        image.has_scaled = true;
+        assert!(image.has_scaled());
+    }
+
+    #[test]
+    fn layer_mip_offset_uses_upstream_unsigned_arithmetic() {
+        assert_eq!(layer_mip_offset(-1, 0x1000), (0x000f_ffff, 0x0fff));
+        assert_eq!(layer_mip_offset(-1, 0), (0, -1));
+    }
 
     #[test]
     fn msaa_download_is_not_safe() {

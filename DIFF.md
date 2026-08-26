@@ -15900,6 +15900,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: removed the unused root `swapchain.rs` phase-one stub and its module declaration. Eden
   has no root `video_core/swapchain.*`; the implemented swapchain remains owned by
   `renderer_vulkan/swapchain.rs`.
+- Resolved: removed the isolated root `shader/{mod,decoder,interpreter}.rs` software-interpreter
+  prototype and its only consumer, the unused root `rasterizer.rs` CPU-renderer prototype. Neither
+  had runtime callers or an Eden counterpart; configured rendering remains owned by the mirrored
+  OpenGL, Vulkan, and Null backends, and Maxwell shader translation by `shader_recompiler`.
 
 ### Missing items
 
@@ -15907,7 +15911,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 
-- N/A: the removed type was unused host-only placeholder state.
+- N/A: the removed types were unused host-only placeholder state.
 
 ## 2026-08-26 — Vulkan scheduler tick consumers vs Eden `vk_scheduler.h`, `vk_texture_cache.cpp`, and `vk_query_cache.cpp`
 

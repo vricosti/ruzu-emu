@@ -3396,6 +3396,7 @@ impl Maxwell3D {
     // ── Descriptor table methods ─────────────────────────────────────────
 
     /// Port of upstream `Maxwell3D::GetTICEntry`.
+    #[allow(dead_code)]
     fn get_tic_entry(&self, index: u32) -> TicEntry {
         let tic_address_gpu = self
             .tex_header_pool_address()
@@ -3418,6 +3419,7 @@ impl Maxwell3D {
     }
 
     /// Port of upstream `Maxwell3D::GetTSCEntry`.
+    #[allow(dead_code)]
     fn get_tsc_entry(&self, index: u32) -> TscEntry {
         let tsc_address_gpu = self
             .tex_sampler_pool_address()

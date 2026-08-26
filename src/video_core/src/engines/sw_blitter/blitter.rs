@@ -9,12 +9,14 @@
 
 use super::converter::ConverterFactory;
 use crate::engines::fermi_2d::{Config, Filter, MemoryLayout, Surface};
-use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
 use crate::surface;
 use crate::textures::decoders;
 use parking_lot::Mutex;
 use std::sync::Arc;
+
+#[cfg(test)]
+use crate::gpu::RenderTargetFormat;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 

@@ -120,6 +120,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
     }
 
     #[inline]
+    #[allow(dead_code)] // Mirrors upstream's mutable Span overload; raw pointers avoid borrow aliasing below.
     fn span_mut(&mut self, ty: Type) -> &mut [u64] {
         &mut self.heap[ty as usize]
     }

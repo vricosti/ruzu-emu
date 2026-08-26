@@ -277,6 +277,7 @@ unsafe impl Pod for Surface {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
+#[cfg(test)]
 struct BlockDimensionsRaw {
     raw: u32,
 }

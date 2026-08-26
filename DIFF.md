@@ -13587,3 +13587,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: scheduler state is host-only synchronization and ownership state.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/decode_bc.rs` vs Eden `src/video_core/texture_cache/decode_bc.h` and `.cpp`
+
+### Intentional differences
+
+- Rust reaches Eden's vendored C++ `bc_decoder` through thin `extern "C"` functions in
+  `src/video_core/src/textures/bcn_shim.cpp`; every wrapper delegates directly to the matching
+  `bcn::DecodeBc1` through `bcn::DecodeBc7` function without owning decode behavior.
+- The shared Rust traversal uses a closure in place of Eden's function-valued template parameter,
+  and splits signed and unsigned decoder signatures at the FFI boundary. The format dispatch,
+  constants, loop nesting, offsets, and decoder arguments are unchanged.
+- Rust returns for zero extents or undersized input/output spans instead of performing pointer
+  arithmetic outside a span or dividing by a zero block width. Valid `BufferImageCopy` inputs take
+  the same path as Eden.
+
+### Unintentional differences (to fix)
+
+- None after removing the custom BC1 through BC5 implementations and routing every BC format to
+  the same `bc_decoder` revision vendored by Eden. Unsigned offset arithmetic now also preserves
+  Eden's `u32` wraparound behavior.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the API transforms compressed byte spans into decoded byte spans and does not serialize a
+  host struct. The C ABI uses pointer, `size_t`, and `bool` arguments matching `bc_decoder.h`.

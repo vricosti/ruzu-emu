@@ -41,6 +41,13 @@ enum AntiAlias {
     Smaa(SMAA),
 }
 
+#[inline]
+fn framebuffer_address(framebuffer: &FramebufferConfig) -> u64 {
+    framebuffer
+        .address
+        .wrapping_add(u64::from(framebuffer.offset))
+}
+
 /// A presentation layer.
 ///
 /// Corresponds to `OpenGL::Layer`.
@@ -242,7 +249,7 @@ impl Layer {
         &mut self,
         framebuffer: &FramebufferConfig,
     ) -> FramebufferTextureInfo {
-        let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
+        let framebuffer_addr = framebuffer_address(framebuffer);
 
         let rasterizer = unsafe {
             self.rasterizer
@@ -426,5 +433,16 @@ mod tests {
         let _: &OGLTexture = &info.resource;
         let _: AndroidPixelFormat = info.pixel_format;
         assert!(std::mem::needs_drop::<TextureInfo>());
+    }
+
+    #[test]
+    fn framebuffer_address_preserves_upstream_unsigned_wraparound() {
+        let framebuffer = FramebufferConfig {
+            address: u64::MAX,
+            offset: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(framebuffer_address(&framebuffer), 0);
     }
 }

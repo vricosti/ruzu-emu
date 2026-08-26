@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/present/present_uniforms.h
+//! Port of Eden's video_core/renderer_opengl/present/present_uniforms.h
 //!
 //! Uniform locations and vertex types for the presentation pipeline.
 

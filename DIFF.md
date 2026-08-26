@@ -15780,3 +15780,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the renderer owners, GL handles, and frontend callbacks are host-only and are not serialized
   or copied as guest payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/present/layer.rs` vs Eden `src/video_core/renderer_opengl/present/layer.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the heap-stable rasterizer through a non-owning pointer and reads device memory
+  through the renderer-owned callback, replacing Eden's two C++ references without moving layer
+  behavior out of its upstream owner.
+- `AntiAlias` represents Eden's `variant<monostate, FXAA, SMAA>`, while `Option<FSR>` represents
+  its optional FSR owner; Rust field order preserves the effective C++ destruction order.
+
+### Unintentional differences (to fix)
+
+- Resolved: the fallback display path now computes `framebuffer.address + framebuffer.offset` with
+  unsigned wraparound. It no longer panics in debug builds where Eden's `DAddr` arithmetic wraps.
+
+### Missing items
+
+- None in render-target preparation, accelerated-display fallback, framebuffer unswizzling/upload,
+  anti-alias selection, FSR application, or presentation vertex construction.
+
+### Binary layout verification
+
+- N/A: `Layer` and `TextureInfo` are host-side GL owners. `ScreenRectVertex`, the buffer payload
+  emitted by this file, is verified separately against Eden's four-`GLfloat` layout.

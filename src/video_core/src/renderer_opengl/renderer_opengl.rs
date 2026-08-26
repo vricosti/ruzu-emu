@@ -565,7 +565,7 @@ impl RendererBase for RendererOpenGL {
 
     fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
         use crate::capture;
-        let tiled_size = capture::tiled_size() as usize;
+        let tiled_size = capture::TILED_SIZE as usize;
         let mut out = vec![0u8; tiled_size];
 
         unsafe {

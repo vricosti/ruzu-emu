@@ -523,14 +523,13 @@ impl RendererVulkan {
     /// Downloads the applet capture image from GPU to CPU and returns the
     /// pixel data as a byte vector.
     pub fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
-        let mut out = vec![0; crate::capture::tiled_size() as usize];
+        let mut out = vec![0; crate::capture::TILED_SIZE as usize];
 
         if self.applet_frame.image == vk::Image::null() {
             return out;
         }
 
-        let dst_buffer =
-            self.create_download_buffer(crate::capture::tiled_size() as vk::DeviceSize);
+        let dst_buffer = self.create_download_buffer(crate::capture::TILED_SIZE as vk::DeviceSize);
         self.scheduler
             .request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();

@@ -13284,3 +13284,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   CPU-address field order; nested fixed arrays are contiguous without padding between channels,
   and focused tests verify the enum representation, channel order, inline size, word count, and
   constructor tail mask. The structure is not serialized or raw-copied across an ABI boundary.
+
+## 2026-08-26 — `src/video_core/src/capture.rs` vs Eden `src/video_core/capture.h`
+
+### Intentional differences
+
+- Ruzu's shared `align_up_log2` accepts and returns `u64`, so the `u32` framebuffer height is
+  widened for the constant evaluation and narrowed after alignment. The result and unsigned bit
+  pattern match Eden's templated `Common::AlignUpLog2` call.
+
+### Unintentional differences (to fix)
+
+- None after restoring `TILED_HEIGHT` and `TILED_SIZE` as compile-time constants owned by
+  `capture.rs`, using the common alignment helper, and making all three renderer consumers use the
+  shared tiled-size constant. This also fixes the null renderer's former unaligned
+  `1280 * 720 * 4` allocation; Eden allocates `1280 * 768 * 4` bytes.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: this file owns constants and a normal `FramebufferLayout` value; it defines no raw-copied
+  or serialized payload. Focused tests verify the aligned height, tiled size, pixel format, and
+  complete framebuffer layout.

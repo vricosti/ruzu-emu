@@ -17,11 +17,6 @@ use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::renderer_base::{RendererBase, RendererBaseData};
 
-/// Tiled capture buffer size (matching zuyu's `VideoCore::Capture::TiledSize`).
-///
-/// 1280 * 720 * 4 bytes (RGBA8) = 3,686,400 bytes.
-const CAPTURE_TILED_SIZE: usize = 1280 * 720 * 4;
-
 /// Null renderer — corresponds to zuyu's `Null::RendererNull`.
 ///
 /// Extends the renderer base concept with no-op frame composition.
@@ -65,7 +60,7 @@ impl RendererNull {
     ///
     /// Matches zuyu: returns `TiledSize` bytes of zeros.
     pub fn get_applet_capture_buffer(&self) -> Vec<u8> {
-        vec![0u8; CAPTURE_TILED_SIZE]
+        vec![0u8; crate::capture::TILED_SIZE as usize]
     }
 
     /// Access the rasterizer.
@@ -201,7 +196,7 @@ mod tests {
         let renderer = RendererNull::new(sp);
 
         let buf = renderer.get_applet_capture_buffer();
-        assert_eq!(buf.len(), 1280 * 720 * 4);
+        assert_eq!(buf.len(), crate::capture::TILED_SIZE as usize);
         assert!(buf.iter().all(|&b| b == 0));
     }
 

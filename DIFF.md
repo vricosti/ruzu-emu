@@ -17489,3 +17489,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this slice moves host-side control flow and constant ownership; it does not serialize or
   raw-copy any guest-visible payload.
+
+## 2026-08-26 — `src/video_core/src/shader_notify.rs` vs Eden `src/video_core/shader_notify.{h,cpp}`
+
+### Intentional differences
+
+- Rust protects Eden's four non-atomic reporting fields with a mutex because callers may query
+  progress concurrently. The two counters remain independent atomics and retain Eden's ordering.
+- `Option<Instant>` represents Eden's default-constructed `steady_clock::time_point`; the value is
+  only read after the same `completed` transition has stored a completion time.
+
+### Unintentional differences (to fix)
+
+- None after retaining `relaxed` only for Eden's two explicit initial snapshots, using fresh
+  sequentially-consistent `num_complete` loads inside both completion-state branches, and restoring
+  the default sequentially-consistent ordering of both C++ atomic pre-increments.
+
+### Missing items
+
+- None in the notification counters, completion timeout, or reporting-state lifecycle.
+
+### Binary layout verification
+
+- N/A: `ShaderNotify` is process-local synchronized state and is neither raw-copied nor serialized.

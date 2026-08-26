@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 ruzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of `video_core/host1x/codecs/vp9_types.h`.
+//! VP9 portion of Eden's `video_core/host1x/codec_types.h`.
 //!
 //! VP9-specific types: frame dimensions, flags, segmentation, loop filter,
 //! entropy probabilities, picture info, and entropy conversion.
@@ -19,6 +19,8 @@ pub enum Vp9SurfaceIndex {
     AltRef = 2,
     Current = 3,
 }
+
+const _: () = assert!(std::mem::size_of::<Vp9SurfaceIndex>() == 0x4);
 
 /// VP9 frame dimensions.
 ///
@@ -47,6 +49,8 @@ bitflags! {
     }
 }
 
+const _: () = assert!(std::mem::size_of::<FrameFlags>() == 0x4);
+
 /// Transform sizes.
 ///
 /// Port of `Tegra::Decoders::TxSize`.
@@ -59,6 +63,8 @@ pub enum TxSize {
     Tx32x32 = 3,
     TxSizes = 4,
 }
+
+const _: () = assert!(std::mem::size_of::<TxSize>() == 0x4);
 
 /// Transform modes.
 ///
@@ -73,6 +79,8 @@ pub enum TxMode {
     TxModeSelect = 4,
     TxModes = 5,
 }
+
+const _: () = assert!(std::mem::size_of::<TxMode>() == 0x4);
 
 /// VP9 segmentation parameters.
 ///
@@ -418,6 +426,125 @@ impl Default for RefPoolElement {
             frame: 0,
             reference: Ref::Last,
             refresh: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_nvdec_layout_matches_codec_types_header() {
+        assert_eq!(std::mem::size_of::<Vp9SurfaceIndex>(), 0x4);
+        assert_eq!(std::mem::size_of::<Vp9FrameDimensions>(), 0x8);
+        assert_eq!(std::mem::size_of::<FrameFlags>(), 0x4);
+        assert_eq!(std::mem::size_of::<TxSize>(), 0x4);
+        assert_eq!(std::mem::size_of::<TxMode>(), 0x4);
+        assert_eq!(std::mem::size_of::<Segmentation>(), 0x64);
+        assert_eq!(std::mem::size_of::<LoopFilter>(), 0x7);
+        assert_eq!(std::mem::size_of::<Vp9EntropyProbs>(), 0x7b4);
+        assert_eq!(std::mem::size_of::<PictureInfo>(), 0x100);
+        assert_eq!(std::mem::size_of::<EntropyProbs>(), 0xea0);
+
+        assert_eq!(std::mem::offset_of!(PictureInfo, bitstream_size), 0x30);
+        assert_eq!(std::mem::offset_of!(PictureInfo, last_frame_size), 0x48);
+        assert_eq!(std::mem::offset_of!(PictureInfo, first_level), 0x70);
+        assert_eq!(std::mem::offset_of!(PictureInfo, segmentation), 0x80);
+        assert_eq!(std::mem::offset_of!(PictureInfo, loop_filter), 0xe4);
+        assert_eq!(std::mem::offset_of!(EntropyProbs, inter_mode_prob), 0x400);
+        assert_eq!(std::mem::offset_of!(EntropyProbs, tx_8x8_prob), 0x470);
+        assert_eq!(std::mem::offset_of!(EntropyProbs, partition_prob), 0x4e0);
+        assert_eq!(std::mem::offset_of!(EntropyProbs, class_0), 0x540);
+        assert_eq!(std::mem::offset_of!(EntropyProbs, class_0_fr), 0x560);
+        assert_eq!(std::mem::offset_of!(EntropyProbs, coef_probs), 0x5a0);
+    }
+
+    #[test]
+    fn picture_info_conversion_matches_codec_types_header() {
+        let mut raw = PictureInfo::default();
+        raw.bitstream_size = 0x1234_5678;
+        raw.current_frame_size = Vp9FrameDimensions {
+            width: 1280,
+            height: 720,
+            luma_pitch: 1344,
+            chroma_pitch: 672,
+        };
+        raw.vp9_flags = FrameFlags::IS_KEY_FRAME
+            | FrameFlags::LAST_FRAME_IS_KEY_FRAME
+            | FrameFlags::ERROR_RESILIENT_MODE
+            | FrameFlags::LAST_SHOW_FRAME
+            | FrameFlags::INTRA_ONLY;
+        raw.ref_frame_sign_bias = [-1, 0, 1, 2];
+        raw.first_level = 17;
+        raw.sharpness_level = 5;
+        raw.base_q_index = 0xff;
+        raw.y_dc_delta_q = 0x80;
+        raw.uv_dc_delta_q = 0x7f;
+        raw.uv_ac_delta_q = 0xfe;
+        raw.lossless = 1;
+        raw.tx_mode = TxMode::Allow32X32 as u8;
+        raw.allow_high_precision_mv = 1;
+        raw.interp_filter = 3;
+        raw.reference_mode = 2;
+        raw.log2_tile_cols = 4;
+        raw.log2_tile_rows = 1;
+        raw.segmentation.enabled = 1;
+        raw.loop_filter.mode_ref_delta_enabled = 1;
+        raw.loop_filter.ref_deltas = [-1, 2, -3, 4];
+        raw.loop_filter.mode_deltas = [-5, 6];
+
+        let converted = raw.convert();
+        assert_eq!(converted.bitstream_size, 0x1234_5678);
+        assert_eq!(converted.frame_offsets, [0; 4]);
+        assert_eq!(converted.frame_size.width, 1280);
+        assert_eq!(converted.ref_frame_sign_bias, [-1, 0, 1, 2]);
+        assert_eq!(converted.base_q_index, 255);
+        assert_eq!(converted.y_dc_delta_q, 128);
+        assert_eq!(converted.uv_dc_delta_q, 127);
+        assert_eq!(converted.uv_ac_delta_q, 254);
+        assert_eq!(converted.transform_mode, TxMode::Allow32X32 as i32);
+        assert_eq!(converted.ref_deltas, [-1, 2, -3, 4]);
+        assert_eq!(converted.mode_deltas, [-5, 6]);
+        assert!(converted.is_key_frame);
+        assert!(converted.intra_only);
+        assert!(converted.last_frame_was_key);
+        assert!(converted.error_resilient_mode);
+        assert!(converted.last_frame_shown);
+        assert!(converted.show_frame);
+        assert!(converted.lossless);
+        assert!(converted.allow_high_precision_mv);
+        assert!(converted.segment_enabled);
+        assert!(converted.mode_ref_delta_enabled);
+    }
+
+    #[test]
+    fn entropy_conversion_skips_each_unused_fourth_coefficient() {
+        let mut raw = EntropyProbs::default();
+        for (index, value) in raw.coef_probs.iter_mut().enumerate() {
+            *value = (index % 251) as u8;
+        }
+        for row in 0..4 {
+            raw.y_mode_prob_e0e7[row] = std::array::from_fn(|column| (row * 16 + column) as u8);
+            raw.y_mode_prob_e8[row] = (row * 16 + 8) as u8;
+        }
+
+        let mut converted = Vp9EntropyProbs::default();
+        raw.convert(&mut converted);
+
+        let expected_coefficients: Vec<u8> = raw
+            .coef_probs
+            .chunks_exact(4)
+            .flat_map(|chunk| chunk[..3].iter().copied())
+            .collect();
+        assert_eq!(converted.coef_probs.as_slice(), expected_coefficients);
+        for row in 0..4 {
+            assert_eq!(
+                &converted.y_mode_prob[row * 9..row * 9 + 9],
+                &(0..9)
+                    .map(|column| (row * 16 + column) as u8)
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }

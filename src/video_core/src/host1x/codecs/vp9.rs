@@ -1173,4 +1173,41 @@ mod tests {
         assert_eq!(remap_probability(1, 1), 20);
         assert_eq!(remap_probability(255, 1), 19);
     }
+
+    #[test]
+    fn complete_default_probability_table_matches_upstream() {
+        let fields: &[&[u8]] = &[
+            &DEFAULT_PROBS.y_mode_prob,
+            &DEFAULT_PROBS.partition_prob,
+            &DEFAULT_PROBS.coef_probs,
+            &DEFAULT_PROBS.switchable_interp_prob,
+            &DEFAULT_PROBS.inter_mode_prob,
+            &DEFAULT_PROBS.intra_inter_prob,
+            &DEFAULT_PROBS.comp_inter_prob,
+            &DEFAULT_PROBS.single_ref_prob,
+            &DEFAULT_PROBS.comp_ref_prob,
+            &DEFAULT_PROBS.tx_32x32_prob,
+            &DEFAULT_PROBS.tx_16x16_prob,
+            &DEFAULT_PROBS.tx_8x8_prob,
+            &DEFAULT_PROBS.skip_probs,
+            &DEFAULT_PROBS.joints,
+            &DEFAULT_PROBS.sign,
+            &DEFAULT_PROBS.classes,
+            &DEFAULT_PROBS.class_0,
+            &DEFAULT_PROBS.prob_bits,
+            &DEFAULT_PROBS.class_0_fr,
+            &DEFAULT_PROBS.fr,
+            &DEFAULT_PROBS.class_0_hp,
+            &DEFAULT_PROBS.high_precision,
+        ];
+        let hash = fields
+            .iter()
+            .flat_map(|field| field.iter())
+            .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+
+        assert_eq!(fields.iter().map(|field| field.len()).sum::<usize>(), 0x7b4);
+        assert_eq!(hash, 0x419a_161c_6321_18a8);
+    }
 }

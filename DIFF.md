@@ -197,7 +197,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The turbo compute shader is byte-for-byte identical to upstream. This slice introduces no
   guest-visible raw-memory structure.
 
-## 2026-08-09 — `src/video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `vp9_types.h`
+## 2026-08-09 — `src/video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `src/video_core/host1x/codec_types.h`
 
 ### Intentional differences
 
@@ -17059,3 +17059,33 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: this module selects the external VMA binding and Rust ownership wrapper; it defines no
   copied or serialized payload. A focused type-level test pins the shareable, externally locked
   allocator ownership contract.
+
+## 2026-08-26 — `src/video_core/src/host1x/codecs/vp9_types.rs` vs Eden `src/video_core/host1x/codec_types.h` (VP9 section) and `src/video_core/host1x/codecs/vp9.cpp`
+
+### Intentional differences
+
+- Eden groups the raw H.264, VP9, and VP8 codec structures in one header. Rust keeps the VP9
+  portion in a codec-specific module so the decoder can import it without exposing unrelated raw
+  formats; the module documentation now names the exact upstream owner and every VP9 type remains
+  in the same order as that contiguous header section.
+- Rust uses `bitflags` for `FrameFlags`, native enums for the C++ scoped enums, and explicit byte
+  arrays for upstream padding macros. Their sizes, discriminants, offsets, and raw bytes match the
+  C++ representations.
+
+### Unintentional differences (to fix)
+
+- None found in the VP9 structures, conversions, or default probabilities. The report's reference
+  to a nonexistent `vp9_types.h` was corrected to `host1x/codec_types.h`.
+
+### Missing items
+
+- None in the audited VP9 portion. The 22 default-probability fields contain the same 1,972 bytes
+  as Eden, and both `PictureInfo::Convert` and `EntropyProbs::Convert` preserve Eden's field and
+  loop ordering.
+
+### Binary layout verification
+
+- PASS: compile-time and focused runtime checks cover enum/flag widths, all upstream size and
+  offset assertions for `Vp9FrameDimensions`, `Segmentation`, `LoopFilter`, `Vp9EntropyProbs`,
+  `PictureInfo`, and `EntropyProbs`. Regression tests cover zero-extension and flag conversion,
+  every skipped fourth coefficient, Y-mode reshaping, and the complete default-table hash.

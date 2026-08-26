@@ -9,8 +9,10 @@
 //! The C++ version splits the template definition across `buffer_cache_base.h`
 //! (class declaration) and `buffer_cache.h` (template method implementations),
 //! plus `buffer_cache.cpp` (explicit template instantiation and profiling macros).
-//! In Rust, the struct definition lives in `buffer_cache_base.rs` and the
-//! method implementations live here.
+//! Rust keeps the private `BufferCache` storage beside these implementations:
+//! placing the struct in the sibling `buffer_cache_base` module would require
+//! exposing every private field across modules. Public declarations and shared
+//! runtime contracts remain in `buffer_cache_base.rs`.
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -3157,7 +3159,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::ResolveOverlaps`
     fn resolve_overlaps(&mut self, device_addr: VAddr, wanted_size: u32) -> OverlapResult {
-        let mut overlap_ids: Vec<BufferId> = Vec::new();
+        let mut overlap_ids: SmallVec<[BufferId; 16]> = SmallVec::new();
         let mut begin = device_addr;
         let mut end = device_addr + wanted_size as u64;
 
@@ -3308,7 +3310,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .clear_buffer(&self.slot_buffers[new_buffer_id], 0, size as u64, 0);
         self.slot_buffers[new_buffer_id].mark_usage(0, size as u64);
 
-        let overlap_ids: Vec<BufferId> = overlap.ids.clone();
+        let overlap_ids = overlap.ids.clone();
         let has_stream_leap = overlap.has_stream_leap;
         for overlap_id in overlap_ids {
             self.join_overlap(new_buffer_id, overlap_id, !has_stream_leap);

@@ -929,6 +929,17 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         BufferCacheRuntime::index_offset(self)
     }
 
+    fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        BufferCacheRuntime::bind_vertex_buffer(self, index, buffer, offset, size, stride);
+    }
+
     /// Port of upstream `BufferCacheRuntime::BindVertexBuffers`
     /// (`gl_buffer_cache.cpp:242`).
     fn bind_vertex_buffers(&mut self, bindings: &HostBindings, buffers: &mut SlotVector<Buffer>) {

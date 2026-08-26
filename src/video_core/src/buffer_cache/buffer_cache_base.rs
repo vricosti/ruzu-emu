@@ -452,7 +452,7 @@ pub struct BufferCopy {
 /// Result of resolving overlapping buffers for a new allocation.
 pub struct OverlapResult {
     /// Buffer IDs that overlap the requested range.
-    pub ids: Vec<BufferId>,
+    pub ids: SmallVec<[BufferId; 16]>,
     /// Start of the merged range.
     pub begin: VAddr,
     /// End of the merged range.
@@ -464,7 +464,7 @@ pub struct OverlapResult {
 impl Default for OverlapResult {
     fn default() -> Self {
         Self {
-            ids: Vec::new(),
+            ids: SmallVec::new(),
             begin: 0,
             end: 0,
             has_stream_leap: false,
@@ -767,6 +767,19 @@ pub trait BufferCacheRuntime {
     }
 
     // -- Vertex buffer binding --
+
+    /// Bind one vertex buffer.
+    ///
+    /// Upstream: `Runtime::BindVertexBuffer(index, buffer, offset, size, stride)`
+    /// through `BufferCache<P>::BindHostVertexBuffer`.
+    fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut Self::Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    );
 
     /// Bind vertex buffers collected in `HostBindings`.
     ///
@@ -1208,6 +1221,16 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
     ) {
     }
 
+    fn bind_vertex_buffer(
+        &mut self,
+        _index: u32,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+        _stride: u32,
+    ) {
+    }
+
     fn bind_vertex_buffers(
         &mut self,
         _bindings: &HostBindings,
@@ -1419,6 +1442,17 @@ mod tests {
     }
 
     #[test]
+    fn obtain_buffer_enum_values_match_upstream() {
+        assert_eq!(ObtainBufferSynchronize::NoSynchronize as u32, 0);
+        assert_eq!(ObtainBufferSynchronize::FullSynchronize as u32, 1);
+        assert_eq!(ObtainBufferSynchronize::SynchronizeNoDirty as u32, 2);
+        assert_eq!(ObtainBufferOperation::DoNothing as u32, 0);
+        assert_eq!(ObtainBufferOperation::MarkAsWritten as u32, 1);
+        assert_eq!(ObtainBufferOperation::DiscardWrite as u32, 2);
+        assert_eq!(ObtainBufferOperation::MarkQuery as u32, 3);
+    }
+
+    #[test]
     fn test_channel_info_default() {
         let info = BufferCacheChannelInfo::default();
         assert_eq!(info.enabled_compute_uniform_buffer_mask, 0);
@@ -1450,6 +1484,27 @@ mod tests {
         assert!(!bindings.offsets.spilled());
         assert!(!bindings.sizes.spilled());
         assert!(!bindings.strides.spilled());
+    }
+
+    #[test]
+    fn overlap_result_keeps_upstream_inline_capacity() {
+        let mut overlap = OverlapResult::default();
+        for index in 0..16 {
+            overlap.ids.push(SlotId { index });
+        }
+        assert!(!overlap.ids.spilled());
+        overlap.ids.push(SlotId { index: 16 });
+        assert!(overlap.ids.spilled());
+    }
+
+    #[test]
+    fn runtime_exposes_upstream_single_vertex_binding_contract() {
+        fn require_signature(
+            _: fn(&mut TestBufferCacheRuntime, u32, &mut TestBuffer, u32, u32, u32),
+        ) {
+        }
+
+        require_signature(TestBufferCacheRuntime::bind_vertex_buffer);
     }
 
     #[test]

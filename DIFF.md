@@ -13118,3 +13118,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: `BufferBase` is neither raw-copied nor serialized. Its state order follows Eden
   conceptually, and focused tests verify all flag bit patterns, constructor defaults, cached
   address state, boundary arithmetic, LRU state, stream score, preemptive flag, and write tick.
+## 2026-08-26 — buffer-cache base contract and backend adapters vs Eden buffer-cache headers/runtimes
+
+### Intentional differences
+
+- Eden relies on C++ template duck typing for the backend runtime, buffer, async allocation, and
+  memory tracker. Rust makes those contracts explicit with traits; the concrete device tracker is
+  the second `BufferCache` type parameter because `MemoryTrackerBase` itself is a Rust generic.
+- `HostBindings` retains slot identifiers instead of C++ `Buffer*` values, then resolves the
+  backend buffers from the same slot vector at the runtime boundary. This avoids retaining Rust
+  references across cache mutations while preserving binding order and values.
+- `TextureBufferBinding::default` initializes `format` to `PixelFormat::Invalid`; Eden's implicit
+  default construction leaves that member indeterminate until a valid binding is assigned. Rust
+  cannot safely represent an uninitialized enum, and no binding path consumes the sentinel format.
+- Vulkan's common trait receives the concrete cached `Buffer` and forwards its native handle to
+  the existing `VkBuffer`-shaped runtime method. This is the Rust equivalent of Eden's
+  `if constexpr` branch calling `buffer.Handle()`; OpenGL forwards the buffer object directly.
+- The private `BufferCache` storage and its private constants remain beside the method bodies in
+  `buffer_cache.rs`. A sibling-module struct would require widening every private field merely so
+  Rust could implement the upstream methods; shared types and runtime interfaces remain owned by
+  `buffer_cache_base.rs`.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's single-vertex-buffer runtime contract and the inline overlap-ID
+  storage.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS (not ABI-shared): these host-only cache structures are not serialized or copied as raw
+  bytes. Focused tests verify enum values, default sentinels, inline capacities, and the restored
+  runtime method signature.

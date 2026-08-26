@@ -1230,6 +1230,17 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         });
     }
 
+    fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        BufferCacheRuntime::bind_vertex_buffer(self, index, buffer.handle(), offset, size, stride);
+    }
+
     fn bind_vertex_buffers(
         &mut self,
         bindings: &HostBindings,

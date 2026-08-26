@@ -13,7 +13,6 @@ pub mod cdma_pusher;
 pub mod compatible_formats;
 pub mod control;
 pub mod delayed_destruction_ring;
-pub mod descriptor_table;
 pub mod dirty_flags;
 pub mod dma_pusher;
 pub mod engines;

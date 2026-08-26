@@ -431,7 +431,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             } else {
                 &mut channel_state.graphics_image_table
             };
-            if index > table.limit() {
+            if index > table.current_limit {
                 log::debug!("Invalid image view index={}", index);
                 return NULL_IMAGE_VIEW_ID;
             }
@@ -1777,7 +1777,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             } else {
                 &mut channel_state.graphics_sampler_table
             };
-            if index > table.limit() {
+            if index > table.current_limit {
                 log::debug!("Invalid sampler index={}", index);
                 return NULL_SAMPLER_ID;
             }
@@ -4518,8 +4518,8 @@ mod tests {
             },
         );
 
-        assert_eq!(cache.channel_state.compute_image_table.limit(), 4);
-        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 2);
+        assert_eq!(cache.channel_state.compute_image_table.current_limit, 4);
+        assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 2);
         assert!(cache.channel_state.image_view_ids.is_empty());
         assert!(cache.channel_state.sampler_ids.is_empty());
     }
@@ -4538,8 +4538,8 @@ mod tests {
             },
         );
 
-        assert_eq!(cache.channel_state.compute_image_table.limit(), 6);
-        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 6);
+        assert_eq!(cache.channel_state.compute_image_table.current_limit, 6);
+        assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 6);
         assert!(cache.channel_state.image_view_ids.is_empty());
         assert!(cache.channel_state.sampler_ids.is_empty());
     }
@@ -4566,12 +4566,12 @@ mod tests {
             .channel_caches
             .channel_state_by_bind_id(10)
             .expect("bound texture-cache channel exists");
-        assert_eq!(bound.graphics_image_table.limit(), 808);
-        assert_eq!(bound.graphics_sampler_table.limit(), 64);
+        assert_eq!(bound.graphics_image_table.current_limit, 808);
+        assert_eq!(bound.graphics_sampler_table.current_limit, 64);
         assert!(bound.image_view_ids.is_empty());
         assert!(bound.sampler_ids.is_empty());
-        assert_eq!(cache.channel_state.graphics_image_table.limit(), 0);
-        assert_eq!(cache.channel_state.graphics_sampler_table.limit(), 0);
+        assert_eq!(cache.channel_state.graphics_image_table.current_limit, 0);
+        assert_eq!(cache.channel_state.graphics_sampler_table.current_limit, 0);
     }
 
     #[test]
@@ -4596,12 +4596,12 @@ mod tests {
             .channel_caches
             .channel_state_by_bind_id(10)
             .expect("bound texture-cache channel exists");
-        assert_eq!(bound.compute_image_table.limit(), 12);
-        assert_eq!(bound.compute_sampler_table.limit(), 12);
+        assert_eq!(bound.compute_image_table.current_limit, 12);
+        assert_eq!(bound.compute_sampler_table.current_limit, 12);
         assert!(bound.image_view_ids.is_empty());
         assert!(bound.sampler_ids.is_empty());
-        assert_eq!(cache.channel_state.compute_image_table.limit(), 0);
-        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 0);
+        assert_eq!(cache.channel_state.compute_image_table.current_limit, 0);
+        assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 0);
     }
 
     #[test]

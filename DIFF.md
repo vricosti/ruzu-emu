@@ -13766,3 +13766,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: descriptor metadata is consumed field-wise and Vulkan structures are built through ash.
   Focused tests cover all-field superset matching, multi-shader accumulation, unsigned wrapping,
   and bank address stability across outer-vector growth.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/descriptor_table.rs` and Maxwell3D TIC/TSC accessors vs Eden `src/video_core/texture_cache/descriptor_table.h` and `src/video_core/engines/maxwell_3d.{h,cpp}`
+
+### Intentional differences
+
+- Rust accepts a `GpuMemoryReader` trait object where Eden's `read` accepts a concrete
+  `Tegra::MemoryManager` reference. Channel-specific texture-cache state can therefore pass either
+  its direct memory manager or the backend-independent SMMU reader without changing descriptor
+  table behavior.
+- `read_with` is the Rust overload used by call sites that own a locked channel memory manager;
+  both read paths execute the same owner-local descriptor-cache logic.
+- Rust initializes descriptor storage through `T::default()` before exposing its bytes to the
+  memory reader. Eden default-constructs the `std::pair<T, bool>` storage before
+  `ReadBlockUnsafe`; the supported POD descriptor types accept every overwritten bit pattern.
+
+### Unintentional differences (to fix)
+
+- None after deleting the duplicate root-level descriptor table, keeping the implementation in
+  Eden's `texture_cache` owner, restoring Eden's public field order, removing invented cached/limit
+  accessors, and using the common `DivCeil` counterpart.
+- None after removing Maxwell3D's invented cached TIC/TSC tables and synchronization method.
+  `get_tic_entry` and `get_tsc_entry` now directly read a 32-byte `TicEntry`/`TscEntry` from the
+  register-selected pool, matching Eden's method ownership, return type, address calculation, and
+  lack of change-detection state.
+
+### Missing items
+
+- None in `DescriptorTable<T>::Synchronize`, `Invalidate`, `Read`, or `Refresh`, or in the audited
+  Maxwell3D TIC/TSC accessors.
+
+### Binary layout verification
+
+- PASS: `TicEntry` and `TscEntry` are `#[repr(C)]` wrappers over `[u64; 4]` with compile-time
+  0x20-byte size assertions, matching Eden's two descriptor payloads. `DescriptorTable<T>` itself
+  is host-only cache state and is not serialized or copied as raw bytes.

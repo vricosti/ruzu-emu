@@ -7,6 +7,7 @@
 //! on demand, tracking which entries have been read and whether they changed.
 
 use super::image_base::GPUVAddr;
+use common::div_ceil::div_ceil_usize;
 use std::mem::MaybeUninit;
 
 /// Read N bytes from a GPU device address into `output`.
@@ -47,32 +48,30 @@ pub trait GpuMemoryReader {
 ///
 /// Port of `VideoCommon::DescriptorTable<Descriptor>`.
 ///
-/// The upstream implementation stores a `Tegra::MemoryManager&` reference;
-/// ruzu instead threads a `&dyn GpuMemoryReader` through `Read` so the
-/// table doesn't need a back-reference to the memory manager. The caller
-/// (texture-cache visit_image_view) already has access to the channel's
-/// `MaxwellDeviceMemoryManager` via the cache's `device_memory` Arc.
+/// Eden accepts a concrete `Tegra::MemoryManager&` in `Read`; ruzu accepts a
+/// `&dyn GpuMemoryReader` so the caller can supply either the channel memory
+/// manager or the backend-independent SMMU reader.
 ///
 /// `T` must be `Copy + PartialEq + Default`. Reads overwrite stack-backed
 /// `MaybeUninit<T>` storage directly, so `T` must be a plain `#[repr(C)]` POD
 /// type (TICEntry / TSCEntry both qualify — fixed-size `[u64; 4]` wrappers).
 pub struct DescriptorTable<T: Copy + PartialEq + Default> {
-    current_gpu_addr: GPUVAddr,
-    current_limit: u32,
     /// Bitset: one bit per descriptor; 1 = previously read.
-    read_descriptors: Vec<u64>,
+    pub read_descriptors: Vec<u64>,
     /// Cached descriptor values.
-    descriptors: Vec<T>,
+    pub descriptors: Vec<T>,
+    pub current_gpu_addr: GPUVAddr,
+    pub current_limit: u32,
 }
 
 impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     /// Create a new, empty descriptor table.
     pub fn new() -> Self {
         Self {
-            current_gpu_addr: 0,
-            current_limit: 0,
             read_descriptors: Vec::new(),
             descriptors: Vec::new(),
+            current_gpu_addr: 0,
+            current_limit: 0,
         }
     }
 
@@ -125,7 +124,9 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     ) -> (T, bool) {
         debug_assert!(index <= self.current_limit);
         let item_size = std::mem::size_of::<T>();
-        let descriptor_addr = self.current_gpu_addr + (index as u64) * (item_size as u64);
+        let descriptor_addr = self
+            .current_gpu_addr
+            .wrapping_add((index as u64).wrapping_mul(item_size as u64));
 
         // `std::pair<T, bool> result` default-constructs `result.first` in
         // upstream before `ReadBlockUnsafe` overwrites its bytes.
@@ -152,21 +153,6 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         (descriptor, changed)
     }
 
-    /// Current descriptor limit.
-    pub fn limit(&self) -> u32 {
-        self.current_limit
-    }
-
-    /// Read the currently-cached descriptor for `index` (without re-reading
-    /// guest memory). Returns None if the descriptor has never been read.
-    pub fn cached(&self, index: u32) -> Option<&T> {
-        if (index as usize) < self.descriptors.len() && self.is_descriptor_read(index) {
-            Some(&self.descriptors[index as usize])
-        } else {
-            None
-        }
-    }
-
     // ── Private helpers ────────────────────────────────────────────────
 
     fn refresh(&mut self, gpu_addr: GPUVAddr, limit: u32) {
@@ -178,7 +164,8 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         // observed limit.
         let num_descriptors = (((limit.wrapping_add(0x80000)) & !0x7ffff).wrapping_add(1)) as usize;
         let old_read_size = self.read_descriptors.len();
-        self.read_descriptors.resize((num_descriptors + 63) / 64, 0);
+        self.read_descriptors
+            .resize(div_ceil_usize(num_descriptors, 64), 0);
         let retained_read_size = old_read_size.min(self.read_descriptors.len());
         self.read_descriptors[..retained_read_size].fill(0);
         self.descriptors.resize(num_descriptors, T::default());

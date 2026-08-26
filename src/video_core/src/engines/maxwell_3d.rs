@@ -17,7 +17,6 @@ use super::const_buffer_info::ConstBufferInfo;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
-use crate::descriptor_table::{TicTable, TscTable};
 use crate::dirty_flags;
 use crate::engines::draw_manager as dm;
 use crate::macro_engine::macro_engine::MacroEngine;
@@ -26,6 +25,7 @@ use crate::query_cache::query_cache::{RenderConditionState, RenderConditionState
 use crate::query_cache::types::ComparisonMode;
 use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
+use crate::textures::texture::{TicEntry, TscEntry};
 use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
 use shader_recompiler::shader_info::ReplaceConstant;
 
@@ -2204,10 +2204,6 @@ pub struct Maxwell3D {
     guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
     /// Rust owner-local bridge for upstream `system.GPU().GetTicks()` query timestamp writes.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
-    /// Graphics TIC descriptor table (texture image descriptors).
-    tic_table: TicTable,
-    /// Graphics TSC descriptor table (texture sampler descriptors).
-    tsc_table: TscTable,
     /// Upstream owner `EngineHint engine_state`.
     engine_state: EngineHint,
     /// Upstream owner `replace_table`.
@@ -2385,8 +2381,6 @@ impl Maxwell3D {
             guest_memory_reader: None,
             guest_memory_writer: None,
             gpu_ticks_getter: None,
-            tic_table: TicTable::new(),
-            tsc_table: TscTable::new(),
             engine_state: EngineHint::None,
             replace_table: std::collections::HashMap::new(),
         };
@@ -3262,51 +3256,48 @@ impl Maxwell3D {
 
     // ── Descriptor table methods ─────────────────────────────────────────
 
-    /// Synchronize descriptor tables with current register state.
-    /// Call before accessing descriptors during draw dispatch.
-    pub fn sync_descriptor_tables(&mut self) {
-        let tic_addr = self.tex_header_pool_address();
-        let tic_limit = self.regs[(TEX_HEADER_POOL_BASE + 2) as usize];
-        self.tic_table.synchronize(tic_addr, tic_limit);
-
-        let linked = self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
-        let tsc_addr = self.tex_sampler_pool_address();
-        let tsc_limit = if linked {
-            tic_limit
-        } else {
-            self.regs[(TEX_SAMPLER_POOL_BASE + 2) as usize]
+    /// Port of upstream `Maxwell3D::GetTICEntry`.
+    fn get_tic_entry(&self, index: u32) -> TicEntry {
+        let tic_address_gpu = self
+            .tex_header_pool_address()
+            .wrapping_add((index as u64).wrapping_mul(std::mem::size_of::<TicEntry>() as u64));
+        let mut tic_entry = TicEntry::default();
+        let tic_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut tic_entry as *mut TicEntry).cast::<u8>(),
+                std::mem::size_of::<TicEntry>(),
+            )
         };
-        self.tsc_table.synchronize(tsc_addr, tsc_limit);
-    }
-
-    /// Read a TIC entry by index from the texture header pool.
-    /// Returns `(TextureDescriptor, changed)`.
-    pub fn get_tic_entry(&mut self, index: u32) -> (TextureDescriptor, bool) {
         let memory_manager = self
             .memory_manager
             .as_ref()
-            .cloned()
             .expect("Maxwell3D::get_tic_entry requires a MemoryManager owner");
-        let (raw, changed) = self.tic_table.read(index, &|addr, output| {
-            memory_manager.lock().read_block_unsafe(addr, output);
-        });
-        let words = words_from_bytes(&raw);
-        (TextureDescriptor::from_words(&words), changed)
+        memory_manager
+            .lock()
+            .read_block_unsafe(tic_address_gpu, tic_bytes);
+        tic_entry
     }
 
-    /// Read a TSC entry by index from the texture sampler pool.
-    /// Returns `(SamplerDescriptor, changed)`.
-    pub fn get_tsc_entry(&mut self, index: u32) -> (SamplerDescriptor, bool) {
+    /// Port of upstream `Maxwell3D::GetTSCEntry`.
+    fn get_tsc_entry(&self, index: u32) -> TscEntry {
+        let tsc_address_gpu = self
+            .tex_sampler_pool_address()
+            .wrapping_add((index as u64).wrapping_mul(std::mem::size_of::<TscEntry>() as u64));
+        let mut tsc_entry = TscEntry::default();
+        let tsc_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut tsc_entry as *mut TscEntry).cast::<u8>(),
+                std::mem::size_of::<TscEntry>(),
+            )
+        };
         let memory_manager = self
             .memory_manager
             .as_ref()
-            .cloned()
             .expect("Maxwell3D::get_tsc_entry requires a MemoryManager owner");
-        let (raw, changed) = self.tsc_table.read(index, &|addr, output| {
-            memory_manager.lock().read_block_unsafe(addr, output);
-        });
-        let words = words_from_bytes(&raw);
-        (SamplerDescriptor::from_words(&words), changed)
+        memory_manager
+            .lock()
+            .read_block_unsafe(tsc_address_gpu, tsc_bytes);
+        tsc_entry
     }
 
     /// Decode a texture handle into `(tic_id, tsc_id)` based on sampler
@@ -5238,20 +5229,6 @@ impl EngineInterface for Maxwell3D {
     fn set_current_dirty(&mut self, dirty: bool) {
         self.interface_state.current_dirty = dirty;
     }
-}
-
-/// Convert 32 raw bytes to 8 u32 words (little-endian).
-fn words_from_bytes(bytes: &[u8; 32]) -> [u32; 8] {
-    let mut words = [0u32; 8];
-    for i in 0..8 {
-        words[i] = u32::from_le_bytes([
-            bytes[i * 4],
-            bytes[i * 4 + 1],
-            bytes[i * 4 + 2],
-            bytes[i * 4 + 3],
-        ]);
-    }
-    words
 }
 
 impl Engine for Maxwell3D {
@@ -8079,9 +8056,9 @@ mod tests {
         let base = TEX_HEADER_POOL_BASE as usize;
 
         // Build a TIC entry for A8B8G8R8 UNorm at index 3.
-        // word0: format=0x1D(A8B8G8R8), component types UNorm(2), swizzle RGBA.
+        // word0: format=0x08(A8B8G8R8), component types UNorm(2), swizzle RGBA.
         let mut raw = [0u8; 32];
-        let word0: u32 = 0x1D
+        let word0: u32 = 0x08
             | (2 << 7)   // r_type = UNorm
             | (2 << 10)  // g_type = UNorm
             | (2 << 13)  // b_type = UNorm
@@ -8098,11 +8075,19 @@ mod tests {
         engine.regs[base] = 0;
         engine.regs[base + 1] = tic_pool_addr as u32;
         engine.regs[base + 2] = 10;
-        engine.sync_descriptor_tables();
+        let desc = engine.get_tic_entry(3);
+        assert_eq!(
+            desc.format(),
+            crate::textures::texture::TextureFormat::A8B8G8R8 as u32
+        );
 
-        let (desc, changed) = engine.get_tic_entry(3);
-        assert!(changed);
-        assert_eq!(desc.format, TextureFormat::A8B8G8R8);
+        // Maxwell3D does not cache these direct reads upstream.
+        backing[offset..offset + 4].copy_from_slice(&0x1Du32.to_le_bytes());
+        let updated = engine.get_tic_entry(3);
+        assert_eq!(
+            updated.format(),
+            crate::textures::texture::TextureFormat::R8 as u32
+        );
     }
 
     #[test]
@@ -8128,13 +8113,10 @@ mod tests {
         engine.regs[base] = 0;
         engine.regs[base + 1] = tsc_pool_addr as u32;
         engine.regs[base + 2] = 5;
-        engine.sync_descriptor_tables();
-
-        let (desc, changed) = engine.get_tsc_entry(1);
-        assert!(changed);
-        assert_eq!(desc.wrap_u, WrapMode::Wrap);
-        assert_eq!(desc.wrap_v, WrapMode::ClampToEdge);
-        assert_eq!(desc.wrap_p, WrapMode::Mirror);
+        let desc = engine.get_tsc_entry(1);
+        assert_eq!(desc.wrap_u(), WrapMode::Wrap as u32);
+        assert_eq!(desc.wrap_v(), WrapMode::ClampToEdge as u32);
+        assert_eq!(desc.wrap_p(), WrapMode::Mirror as u32);
     }
 
     #[test]

@@ -2054,6 +2054,7 @@ impl RasterizerVulkan {
             | PrimitiveTopology::TrianglesAdjacency
             | PrimitiveTopology::TriangleStripAdjacency
             | PrimitiveTopology::Patches => rasterizer.polygon_offset_fill_enable,
+            invalid => panic!("invalid topology for depth-bias lookup: {invalid:?}"),
         };
         let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
@@ -3091,7 +3092,8 @@ impl RasterizerInterface for RasterizerVulkan {
             }
             let indirect_buffer = vk::Buffer::from_raw(raw_buffer);
             let device = self.device;
-            self.scheduler.request_outside_render_pass_operation_context();
+            self.scheduler
+                .request_outside_render_pass_operation_context();
             self.scheduler.record(move |cmdbuf| unsafe {
                 if *compute_pipeline.lock().unwrap() == vk::Pipeline::null() {
                     return;
@@ -3112,7 +3114,8 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
         let barrier_device = self.device;
-        self.scheduler.request_outside_render_pass_operation_context();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.scheduler.record(move |cmdbuf| unsafe {
             let barrier_device = barrier_device.get().get_logical();
             let barrier = vk::MemoryBarrier::builder()
@@ -3464,7 +3467,8 @@ impl RasterizerInterface for RasterizerVulkan {
 
         let device = self.device;
         let event = self.wfi_event;
-        self.scheduler.request_outside_render_pass_operation_context();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.scheduler.record(move |cmdbuf| unsafe {
             let device = device.get().get_logical();
             device.cmd_set_event(cmdbuf, event, flags);
@@ -3492,7 +3496,8 @@ impl RasterizerInterface for RasterizerVulkan {
         // Upstream `RasterizerVulkan::FragmentBarrier` ends the active render
         // pass. `Scheduler::request_outside_render_pass_operation_context` emits the attachment
         // write barrier needed before a later texture read.
-        self.scheduler.request_outside_render_pass_operation_context();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
     }
 
     fn tiled_cache_barrier(&mut self) {}

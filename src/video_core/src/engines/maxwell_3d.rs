@@ -495,6 +495,115 @@ pub enum PrimitiveTopology {
     TrianglesAdjacency = 12,
     TriangleStripAdjacency = 13,
     Patches = 14,
+    // C++ can retain these `PrimitiveTopologyOverride` bit patterns through
+    // its explicit enum-to-enum cast even though PrimitiveTopology does not
+    // declare names for them. Rust needs explicit discriminants to preserve
+    // the same values without constructing an invalid enum.
+    LegacyPoints = 0x1001,
+    LegacyIndexedLines = 0x1002,
+    LegacyIndexedTriangles = 0x1003,
+    LegacyLines = 0x100F,
+    LegacyLineStrip = 0x1010,
+    LegacyIndexedLineStrip = 0x1011,
+    LegacyTriangles = 0x1012,
+    LegacyTriangleStrip = 0x1013,
+    LegacyIndexedTriangleStrip = 0x1014,
+    LegacyTriangleFan = 0x1015,
+    LegacyIndexedTriangleFan = 0x1016,
+    LegacyTriangleFanImm = 0x1017,
+    LegacyLinesImm = 0x1018,
+    LegacyIndexedTriangles2 = 0x101A,
+    LegacyIndexedLines2 = 0x101B,
+}
+
+/// Selects whether draws use the topology encoded by begin methods or the
+/// separate topology-override register.
+///
+/// Corresponds to `Maxwell3D::Regs::PrimitiveTopologyControl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum PrimitiveTopologyControl {
+    #[default]
+    UseInBeginMethods = 0,
+    UseSeparateState = 1,
+}
+
+impl PrimitiveTopologyControl {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            1 => Self::UseSeparateState,
+            _ => Self::UseInBeginMethods,
+        }
+    }
+}
+
+/// Values accepted by the separate topology-override register.
+///
+/// Corresponds to `Maxwell3D::Regs::PrimitiveTopologyOverride`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum PrimitiveTopologyOverride {
+    #[default]
+    None = 0x0,
+    Points = 0x1,
+    Lines = 0x2,
+    LineStrip = 0x3,
+    Triangles = 0x4,
+    TriangleStrip = 0x5,
+    LinesAdjacency = 0xA,
+    LineStripAdjacency = 0xB,
+    TrianglesAdjacency = 0xC,
+    TriangleStripAdjacency = 0xD,
+    Patches = 0xE,
+    LegacyPoints = 0x1001,
+    LegacyIndexedLines = 0x1002,
+    LegacyIndexedTriangles = 0x1003,
+    LegacyLines = 0x100F,
+    LegacyLineStrip = 0x1010,
+    LegacyIndexedLineStrip = 0x1011,
+    LegacyTriangles = 0x1012,
+    LegacyTriangleStrip = 0x1013,
+    LegacyIndexedTriangleStrip = 0x1014,
+    LegacyTriangleFan = 0x1015,
+    LegacyIndexedTriangleFan = 0x1016,
+    LegacyTriangleFanImm = 0x1017,
+    LegacyLinesImm = 0x1018,
+    LegacyIndexedTriangles2 = 0x101A,
+    LegacyIndexedLines2 = 0x101B,
+}
+
+impl PrimitiveTopologyOverride {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            0x0 => Self::None,
+            0x1 => Self::Points,
+            0x2 => Self::Lines,
+            0x3 => Self::LineStrip,
+            0x4 => Self::Triangles,
+            0x5 => Self::TriangleStrip,
+            0xA => Self::LinesAdjacency,
+            0xB => Self::LineStripAdjacency,
+            0xC => Self::TrianglesAdjacency,
+            0xD => Self::TriangleStripAdjacency,
+            0xE => Self::Patches,
+            0x1001 => Self::LegacyPoints,
+            0x1002 => Self::LegacyIndexedLines,
+            0x1003 => Self::LegacyIndexedTriangles,
+            0x100F => Self::LegacyLines,
+            0x1010 => Self::LegacyLineStrip,
+            0x1011 => Self::LegacyIndexedLineStrip,
+            0x1012 => Self::LegacyTriangles,
+            0x1013 => Self::LegacyTriangleStrip,
+            0x1014 => Self::LegacyIndexedTriangleStrip,
+            0x1015 => Self::LegacyTriangleFan,
+            0x1016 => Self::LegacyIndexedTriangleFan,
+            0x1017 => Self::LegacyTriangleFanImm,
+            0x1018 => Self::LegacyLinesImm,
+            0x101A => Self::LegacyIndexedTriangles2,
+            0x101B => Self::LegacyIndexedLines2,
+            _ => Self::None,
+        }
+    }
 }
 
 impl PrimitiveTopology {
@@ -515,6 +624,21 @@ impl PrimitiveTopology {
             12 => Self::TrianglesAdjacency,
             13 => Self::TriangleStripAdjacency,
             14 => Self::Patches,
+            0x1001 => Self::LegacyPoints,
+            0x1002 => Self::LegacyIndexedLines,
+            0x1003 => Self::LegacyIndexedTriangles,
+            0x100F => Self::LegacyLines,
+            0x1010 => Self::LegacyLineStrip,
+            0x1011 => Self::LegacyIndexedLineStrip,
+            0x1012 => Self::LegacyTriangles,
+            0x1013 => Self::LegacyTriangleStrip,
+            0x1014 => Self::LegacyIndexedTriangleStrip,
+            0x1015 => Self::LegacyTriangleFan,
+            0x1016 => Self::LegacyIndexedTriangleFan,
+            0x1017 => Self::LegacyTriangleFanImm,
+            0x1018 => Self::LegacyLinesImm,
+            0x101A => Self::LegacyIndexedTriangles2,
+            0x101B => Self::LegacyIndexedLines2,
             _ => {
                 log::warn!(
                     "Maxwell3D: unknown topology {}, defaulting to Triangles",
@@ -2820,6 +2944,19 @@ impl Maxwell3D {
         }
         let regs = self.upload_registers();
         self.upload_state.process_data_multi(&regs, data);
+    }
+
+    /// Process a batch of packed inline indices without replaying every method write.
+    /// Matches upstream `Maxwell3D::ProcessInlineIndexMultiData`.
+    fn process_inline_index_multi_data(&mut self, method: u32, data: &[u32]) {
+        let Some(&last_argument) = data.last() else {
+            return;
+        };
+        let argument = self.process_shadow_ram(method, last_argument);
+        self.process_dirty_registers(method, argument);
+        self.with_draw_manager(|draw_manager, _| {
+            draw_manager.set_inline_index_buffer_multi(method, data);
+        });
     }
 
     /// Width of render target `index`.
@@ -5190,6 +5327,12 @@ impl EngineInterface for Maxwell3D {
             INLINE_DATA => {
                 assert!(methods_pending == amount as u32);
                 self.process_inline_upload_multi(&base_start[..amount]);
+            }
+            DRAW_INLINE_INDEX | INLINE_INDEX_2X16_EVEN | INLINE_INDEX_4X8_INDEX0
+                if ShadowRamControl::from_raw(self.shadow_state[SHADOW_RAM_CONTROL as usize])
+                    != ShadowRamControl::Replay =>
+            {
+                self.process_inline_index_multi_data(method, &base_start[..amount]);
             }
             _ => {
                 for i in 0..amount {
@@ -8175,6 +8318,61 @@ mod tests {
         engine.call_multi_method(CB_DATA_BASE, &data, 4, 4);
         // Offset should advance by 4*4 = 16 bytes.
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 16);
+    }
+
+    #[test]
+    fn test_call_multi_method_inline_indices_use_upstream_bulk_shadow_path() {
+        let mut engine = Maxwell3D::new();
+        let data = [0x4433_2211, 0x8877_6655];
+
+        engine.call_multi_method(
+            DRAW_INLINE_INDEX,
+            &data,
+            data.len() as u32,
+            data.len() as u32,
+        );
+
+        assert_eq!(engine.shadow_state[DRAW_INLINE_INDEX as usize], data[1]);
+        assert_eq!(engine.regs[DRAW_INLINE_INDEX as usize], data[1]);
+        assert_eq!(
+            engine.draw_manager_state().inline_index_draw_indexes,
+            bytemuck::cast_slice::<u32, u8>(&data)
+        );
+    }
+
+    #[test]
+    fn test_call_multi_method_inline_indices_replay_each_shadowed_word() {
+        let mut engine = Maxwell3D::new();
+        engine.shadow_state[SHADOW_RAM_CONTROL as usize] = ShadowRamControl::Replay as u32;
+        engine.shadow_state[DRAW_INLINE_INDEX as usize] = 0x4433_2211;
+
+        engine.call_multi_method(DRAW_INLINE_INDEX, &[0xAAAA_AAAA, 0xBBBB_BBBB], 2, 2);
+
+        let word = 0x4433_2211u32.to_le_bytes();
+        assert_eq!(
+            engine.draw_manager_state().inline_index_draw_indexes,
+            [word, word].concat()
+        );
+    }
+
+    #[test]
+    fn draw_manager_instance_arithmetic_wraps_like_upstream_u32() {
+        let mut engine = Maxwell3D::new();
+        engine.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_state.instance_count = u32::MAX;
+            draw_manager.process_method_call(INDEX_BUFFER32_SUBSEQUENT, 0, this);
+            assert_eq!(draw_manager.draw_state.instance_count, 0);
+
+            draw_manager.draw_state.instance_count = 0;
+            draw_manager.draw_array_instanced(PrimitiveTopology::Triangles, 0, 3, true, this);
+            assert_eq!(draw_manager.draw_state.base_instance, u32::MAX);
+            assert_eq!(draw_manager.draw_state.instance_count, 1);
+
+            draw_manager.draw_state.draw_mode = dm::DrawMode::Instance;
+            draw_manager.draw_state.instance_count = u32::MAX;
+            draw_manager.draw_deferred(this);
+            assert_eq!(draw_manager.draw_state.instance_count, 0);
+        });
     }
 
     #[test]

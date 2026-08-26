@@ -13866,3 +13866,45 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   overlapping 13-bit method, 24-bit legacy method-count, 3-bit subchannel, 13-bit argument-count,
   and 3-bit submission-mode views. Focused tests decode the raw bit patterns and verify the 512
   inline entries of each command-list small vector.
+
+## 2026-08-26 — Draw-manager and topology consumers vs Eden `src/video_core/engines/draw_manager.cpp`, `maxwell_3d.h/.cpp`, and renderer counterparts
+
+### Intentional differences
+
+- Rust passes Maxwell3D access through the `Maxwell3DAccess` trait where each Eden method receives
+  `Maxwell3D&`. This preserves the per-call relationship without creating overlapping mutable
+  borrows between the engine and its embedded draw manager.
+- The bulk inline-index overload accepts a `&[u32]`; the slice length is Eden's `amount`, and
+  `bytemuck::cast_slice` preserves the same native in-memory word representation used by Eden's
+  `reinterpret_cast` and `memcpy` paths.
+- Test builds retain compatibility draw snapshots before invoking the rasterizer. This state is
+  absent from production builds and exists only for renderer-independent regression assertions.
+- C++ permits the explicit override-enum to primitive-enum cast to retain `Legacy*` discriminants
+  that `PrimitiveTopology` does not declare. Rust cannot hold an undeclared enum discriminant
+  safely, so its `PrimitiveTopology` declares representation-only `Legacy*` variants with the same
+  `u32` values. OpenGL/Vulkan conversion, pipeline runtime info, query counting, and depth-bias
+  consumers retain Eden's respective invalid/default handling for those values.
+
+### Unintentional differences (to fix)
+
+- None after porting the bulk `SetInlineIndexBuffer` overload and
+  `Maxwell3D::ProcessInlineIndexMultiData`, including the one-time last-word Shadow RAM/dirty update
+  and the per-word fallback when Shadow RAM is in Replay mode.
+- None after restoring all declared `PrimitiveTopologyOverride` values in their `maxwell_3d.rs`
+  owner and making `UpdateTopology` execute Eden's default raw-topology conversion. Overrides such
+  as triangles, adjacency topologies, patches, and legacy values are no longer silently converted
+  to `None` or `Triangles`.
+- None after using wrapping `u32` arithmetic for instance accumulation, deferred-draw count, and
+  base-instance subtraction, matching C++ unsigned arithmetic in debug and release builds.
+
+### Missing items
+
+- None in the audited DrawManager state, method dispatch, direct/indirect draw, inline-index,
+  topology-override, clear, or draw-texture paths.
+
+### Binary layout verification
+
+- N/A: draw-manager state is host-only and is consumed field-wise. The topology-control,
+  topology-override, and representation-preserving primitive-topology enums are `#[repr(u32)]`;
+  focused tests cover every modern and legacy override bit pattern plus each packed bulk
+  inline-index representation.

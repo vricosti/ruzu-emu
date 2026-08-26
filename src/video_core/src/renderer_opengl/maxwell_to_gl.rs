@@ -330,6 +330,10 @@ pub fn primitive_topology(topology: PrimitiveTopology) -> u32 {
         TrianglesAdjacency => gl::TRIANGLES_ADJACENCY,
         TriangleStripAdjacency => gl::TRIANGLE_STRIP_ADJACENCY,
         Patches => gl::PATCHES,
+        invalid => {
+            debug_assert!(false, "Invalid topology={invalid:?}");
+            gl::POINTS
+        }
     }
 }
 

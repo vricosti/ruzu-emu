@@ -739,6 +739,10 @@ pub fn primitive_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology 
             );
             vk::PrimitiveTopology::TRIANGLE_FAN
         }
+        invalid => {
+            log::error!("Unimplemented topology={invalid:?}");
+            vk::PrimitiveTopology::POINT_LIST
+        }
     }
 }
 

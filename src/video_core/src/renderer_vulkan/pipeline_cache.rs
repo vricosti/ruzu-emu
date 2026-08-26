@@ -514,6 +514,7 @@ fn make_runtime_info_with_features(
         | PrimitiveTopology::QuadStrip
         | PrimitiveTopology::Polygon
         | PrimitiveTopology::Patches => InputTopology::Triangles,
+        _ => InputTopology::Points,
     };
     info.force_early_z = state.early_z();
     info.y_negate = state.y_negate();

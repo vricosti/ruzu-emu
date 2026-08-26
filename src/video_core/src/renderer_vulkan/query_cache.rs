@@ -887,6 +887,7 @@ fn primitives_from_vertices(
         }
         PrimitiveTopology::Polygon => u64::from(num_vertices >= 3),
         PrimitiveTopology::Patches => num_vertices / u64::from(patch_vertices.max(1)),
+        _ => num_vertices,
     }
 }
 

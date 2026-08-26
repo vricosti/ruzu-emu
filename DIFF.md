@@ -15837,3 +15837,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this file owns host Vulkan objects and frontend callbacks; capture pixel buffers use the
   separately verified capture constants and texture swizzle implementation.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/fence_manager.rs`, `scheduler.rs`, and `vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_fence_manager.{h,cpp}`
+
+### Intentional differences
+
+- Each Rust fence retains a clone of the scheduler-owned semaphore handle for thread-safe
+  `IsFree` and `Wait`, while Eden retains a `Scheduler&`. `Queue` receives the live mutable
+  scheduler because the complete Rust scheduler is owned by and moves with the rasterizer.
+
+### Unintentional differences (to fix)
+
+- Resolved: `InnerFence::queue` now captures `Scheduler::current_tick` and flushes in that order;
+  this behavior no longer belongs to `RasterizerVulkan`.
+- Resolved: `InnerFence::is_signaled` and `InnerFence::wait` now own the scheduler synchronization
+  queries, and the Vulkan fence-manager overrides delegate directly to the inner fence.
+- Resolved: the Rust-only public `wait_tick` and `is_stubbed` accessors were removed after their
+  rasterizer-side callers were eliminated.
+
+### Missing items
+
+- None in Vulkan fence creation, queuing, completion checks, or waiting.
+
+### Binary layout verification
+
+- N/A: Vulkan fences and scheduler synchronization handles are host-only owners and are not raw
+  guest payloads.

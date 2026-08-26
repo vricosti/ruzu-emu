@@ -316,6 +316,10 @@ pub(crate) struct SchedulerWaitHandle {
 }
 
 impl SchedulerWaitHandle {
+    pub(crate) fn is_free(&self, tick: u64) -> bool {
+        self.master_semaphore.is_free(tick)
+    }
+
     pub(crate) fn wait(&self, tick: u64) {
         if tick == 0 {
             return;

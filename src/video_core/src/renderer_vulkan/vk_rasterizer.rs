@@ -1451,23 +1451,15 @@ impl RasterizerVulkan {
     }
 
     fn queue_fence(&mut self, fence: &mut VkFence) {
-        let is_stubbed = fence.lock().unwrap().is_stubbed();
-        let tick = if is_stubbed {
-            0
-        } else {
-            self.scheduler.flush()
-        };
-        self.fence_backend.queue_fence(fence, tick);
+        self.fence_backend.queue_fence(fence, &mut self.scheduler);
     }
 
     fn is_fence_signaled(&self, fence: &VkFence) -> bool {
-        let wait_tick = fence.lock().unwrap().wait_tick();
-        self.scheduler.is_free(wait_tick)
+        self.fence_backend.is_fence_signaled(fence)
     }
 
     fn wait_fence(&mut self, fence: &VkFence) {
-        let wait_tick = fence.lock().unwrap().wait_tick();
-        self.scheduler.wait(wait_tick);
+        self.fence_backend.wait_fence(fence);
     }
 
     // ── Dynamic state update methods ──────────────────────────────────────

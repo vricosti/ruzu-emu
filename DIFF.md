@@ -12180,6 +12180,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   types, geometry point size, transform-feedback capability guards, geometry passthrough state,
   negative compute entries, and fixed-state serialization.
 
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+- Rust splits construction from synchronous or worker-backed Vulkan pipeline completion so the
+  worker owns an immutable snapshot instead of capturing a movable `this`. The shader build
+  notification still begins at graphics-pipeline construction and completes from the selected
+  build path.
+- Scheduler pipeline identity uses the stable Rust `GraphicsPipeline` address through a raw
+  identity handle; this is the direct counterpart of Eden tracking `GraphicsPipeline*`.
+- GPU pipeline/shader logging remains unavailable because the project-wide Eden GPU logging
+  subsystem is not ported.
+
+### Unintentional differences (to fix)
+- None in the reviewed construction, vertex-input, runtime-info, geometry-passthrough, pipeline
+  configuration, or bind-order paths. `MarkShaderBuilding` is now owned by the Rust graphics
+  pipeline constructor counterpart instead of `pipeline_cache.rs`.
+
+### Missing items
+- The project-wide GPU logging subsystem remains outside this file-level parity slice.
+
+### Binary layout verification
+- PASS: no serialized or raw-copied layout changed. The correction only moves notification
+  ownership across the existing constructor boundary.
+
 ## 2026-08-25 — `src/video_core/src/query_cache/query_stream.rs` vs Eden `src/video_core/query_cache/query_stream.h`
 
 ### Intentional differences

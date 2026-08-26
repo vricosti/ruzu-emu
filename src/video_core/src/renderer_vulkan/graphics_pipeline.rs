@@ -629,12 +629,14 @@ impl GraphicsPipeline {
     pub(crate) fn new_unbuilt(
         device_owner: DeviceReference,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         key: &GraphicsPipelineKey,
         stage_infos: [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
         shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
         is_built: bool,
         runtime: GraphicsPipelineRuntime,
     ) -> Option<Self> {
+        shader_notify.mark_shader_building();
         let descriptor_layout = unsafe {
             Self::create_descriptor_layout(
                 device_owner.get(),

@@ -897,10 +897,10 @@ impl GraphicsPipelineBuilder {
         pipeline_statistics: Option<Arc<PipelineStatistics>>,
     ) -> Option<GraphicsPipeline> {
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
-        shader_notify.mark_shader_building();
         let pipeline = match GraphicsPipeline::new_unbuilt(
             self.device_owner,
             pipeline_cache,
+            shader_notify,
             key,
             stage_infos_from_compiled(&compiled_stages),
             shader_modules,

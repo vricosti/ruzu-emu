@@ -14465,3 +14465,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: compute and graphics keys are read, hashed, and serialized through their complete `repr(C)`
   byte layouts; their dedicated pipeline modules retain size/layout regression tests.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_shader_context.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_context.h`
+
+### Intentional differences
+
+- A frontend-supplied `SharedContextFactory` replaces Eden's direct `EmuWindow::CreateSharedContext`
+  call, preserving one independently owned shared GL context per shader worker.
+- `Context::Drop` explicitly controls the self-referential lifetime that Eden expresses with
+  `GraphicsContext::Scoped`: pools are destroyed while the context is current, `DoneCurrent` runs,
+  then the boxed context is destroyed.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ShaderPools::Drop` now releases live flow blocks, IR blocks, and instructions in Eden's
+  reverse-member destruction order. Automatic Rust field destruction previously visited the three
+  pools in declaration order.
+
+### Missing items
+
+- None; `ShaderPools`, `Context`, their capacities, release ordering, and shared-context lifecycle
+  are present.
+
+### Binary layout verification
+
+- N/A: contexts and object pools are process-local allocation owners and are never raw-serialized.

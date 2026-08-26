@@ -16872,3 +16872,25 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: this owner passes ordinary scalar values and OpenGL handles and defines no guest-visible or
   raw-serialized payload. Focused tests cover every `StoreFormat` mapping and its fail-soft
   fallback.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/vertex_shaders.rs` vs Eden `src/video_core/host_shaders/CMakeLists.txt` and vertex shader sources
+
+### Intentional differences
+
+- Eden generates one C++ header per GLSL source, while Rust exposes the same source text through
+  `include_str!` constants and separately compiles the Vulkan subset to SPIR-V in `build.rs`.
+
+### Unintentional differences (to fix)
+
+- None after exporting `sgsr1_shader.vert`; it was compiled by the Rust SPIR-V build path but was
+  the only one of Eden's ten vertex sources absent from the source registry.
+
+### Missing items
+
+- None: the ten vertex files listed by Eden's host-shader build are present and byte-identical,
+  and each now has a corresponding Rust source constant.
+
+### Binary layout verification
+
+- N/A: this module embeds text sources and defines no binary payload. The generated SPIR-V owner
+  has its own magic-word coverage; a focused test pins the complete ten-source registry here.

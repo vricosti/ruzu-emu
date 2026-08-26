@@ -136,6 +136,13 @@ pub fn set_current_thread_name(name: &str) {
     }
 }
 
+/// Port of upstream `Common::SetCurrentThreadToPerformanceCores`.
+///
+/// Eden only changes affinity in its Android implementation; Android JNI and
+/// ADPF integration are excluded from this Rust port, so other hosts take the
+/// same no-op branch.
+pub fn set_current_thread_to_performance_cores() {}
+
 /// An event that can be set and waited on, matching the C++ Common::Event.
 pub struct Event {
     mutex: Mutex<()>,

@@ -35,7 +35,7 @@ pub fn make_nearest_neighbor(device: &Device, frame_format: vk::Format) -> Windo
     let sampler = util::create_nearest_neighbor_sampler(logical);
     let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
         .expect("Failed to build vulkan_present.frag");
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 /// Port of `MakeBilinear`.
@@ -47,7 +47,7 @@ pub fn make_bilinear(device: &Device, frame_format: vk::Format) -> WindowAdaptPa
     let sampler = util::create_bilinear_sampler(logical);
     let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
         .expect("Failed to build vulkan_present.frag");
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 /// Rust counterpart of `VkCubicFilterWeightsQCOM`. ash 0.37 does not expose
@@ -76,7 +76,7 @@ pub fn make_bicubic(
         let sampler = util::create_cubic_sampler(logical);
         let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
             .expect("Failed to build vulkan_present.frag");
-        return WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader);
+        return WindowAdaptPass::new(device, frame_format, sampler, fragment_shader);
     }
 
     let (shader, shader_name) = match weights {
@@ -92,7 +92,7 @@ pub fn make_bicubic(
     let sampler = util::create_bilinear_sampler(logical);
     let fragment_shader =
         build_shader(logical, shader).unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 fn make_shader_filter(
@@ -105,7 +105,7 @@ fn make_shader_filter(
     let sampler = util::create_bilinear_sampler(logical);
     let fragment_shader =
         build_shader(logical, shader).unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 /// Port of `MakeSpline1`.
@@ -127,7 +127,7 @@ pub fn make_gaussian(device: &Device, frame_format: vk::Format) -> WindowAdaptPa
     let sampler = util::create_bilinear_sampler(logical);
     let fragment_shader = build_shader(logical, PRESENT_GAUSSIAN_FRAG_SPV)
         .expect("Failed to build present_gaussian.frag");
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 /// Port of `MakeLanczos`.
@@ -160,7 +160,7 @@ pub fn make_scale_force(device: &Device, frame_format: vk::Format) -> WindowAdap
     };
     let fragment_shader = build_shader(logical, shader_spv)
         .unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 /// Port of `MakeArea`.
@@ -179,7 +179,7 @@ pub fn make_mmpx(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
     let sampler = util::create_nearest_neighbor_sampler(logical);
     let fragment_shader =
         build_shader(logical, PRESENT_MMPX_FRAG_SPV).expect("Failed to build present_mmpx.frag");
-    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
 #[cfg(test)]

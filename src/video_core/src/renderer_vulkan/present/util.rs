@@ -11,7 +11,7 @@
 use ash::vk;
 
 use crate::renderer_vulkan::scheduler::Scheduler;
-use crate::vulkan_common::vulkan_memory_allocator::{MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
 
 // ---------------------------------------------------------------------------
 // Buffer / Image creation
@@ -43,7 +43,27 @@ pub fn create_wrapped_image(
     dimensions: vk::Extent2D,
     format: vk::Format,
 ) -> vk::Image {
-    let image_ci = vk::ImageCreateInfo::builder()
+    let image_ci = wrapped_image_create_info(dimensions, format);
+
+    allocator
+        .create_image(&image_ci)
+        .expect("Failed to create wrapped image")
+}
+
+/// Owning Rust form of `CreateWrappedImage`, used where Eden stores the
+/// returned `vk::Image` RAII wrapper directly in a `Frame`.
+pub fn create_wrapped_image_allocation(
+    allocator: &MemoryAllocator,
+    dimensions: vk::Extent2D,
+    format: vk::Format,
+) -> AllocatedImage {
+    allocator
+        .create_owned_image(&wrapped_image_create_info(dimensions, format))
+        .expect("Failed to create wrapped image")
+}
+
+fn wrapped_image_create_info(dimensions: vk::Extent2D, format: vk::Format) -> vk::ImageCreateInfo {
+    vk::ImageCreateInfo::builder()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -63,11 +83,7 @@ pub fn create_wrapped_image(
         )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .build();
-
-    allocator
-        .create_image(&image_ci)
-        .expect("Failed to create wrapped image")
+        .build()
 }
 
 /// Port of `TransitionImageLayout`.

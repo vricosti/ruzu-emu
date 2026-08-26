@@ -12883,3 +12883,154 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: compression state is local algorithm data. Focused tests verify multi-row/multi-plane
   output placement and Eden's BC1 alpha-threshold boundary.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present_manager.rs` vs Eden `src/video_core/renderer_vulkan/vk_present_manager.{h,cpp}`
+
+### Intentional differences
+
+- Eden passes stable `Frame*` values through its presentation queue. Rust keeps each owning
+  `Frame` in its unavailable pool slot and queues a copy of only the handles consumed by the
+  present thread; the same index returns to the free queue after presentation.
+- The present-thread state is held in an `Arc` context rather than borrowing the enclosing
+  renderer. Swapchain image count and view format are cached atomically because the upstream
+  renderer reads them concurrently without taking `PresentManager::swapchain_mutex`, whereas the
+  Rust swapchain itself is protected by a mutex.
+- Frame images use `AllocatedImage` ownership and a non-owning stable allocator pointer. Resource
+  replacement explicitly destroys framebuffer and views before releasing the old image, avoiding
+  a Vulkan-invalid dependency order that raw C++ wrapper assignment can transiently create.
+- Android surface recreation and performance-core policy retain their platform branches, but the
+  excluded Android JNI/ADPF implementation is not built. The current non-LSFG build takes Eden's
+  `CanStoreToFrame == false` branch.
+
+### Unintentional differences (to fix)
+
+- Fixed both submit wait stages to `TRANSFER`, matching the copy/blit command buffer.
+- Fixed frame creation flags and usage to include `MUTABLE_FORMAT | EXTENDED_USAGE` and
+  `TRANSFER_SRC | TRANSFER_DST | COLOR_ATTACHMENT | SAMPLED`, with the storage-view path retained.
+- Fixed the pre-copy source stages to Eden's graphics/compute/transfer set.
+- Restored `Frame::index`, `Frame::storage_view`, `MaxExtraFrames`, present-thread naming,
+  high-priority selection, performance-core call, and the `MAX_FRAMES_IN_FLIGHT` owner/name.
+- Fixed frame-image allocation ownership, current swapchain-format selection during recreation,
+  device-loss reporting, non-surface error propagation, and surface-loss retries across both
+  swapchain recreation and the copy path.
+- Fixed destruction order so the present thread stops before frames are released and every frame
+  releases fence, semaphore, framebuffer, views, then image before the command pool.
+
+### Missing items
+
+- Optional `HAS_LSFG` frame-generation scheduling is not enabled in Ruzu; all non-LSFG
+  `PresentManager` behavior is present.
+
+### Binary layout verification
+
+- N/A: `Frame` is a host Vulkan-resource owner, not a raw-copied or serialized payload. Focused
+  tests verify its upstream defaults, the seven-frame cap, copy/blit extents, and snapshot handle
+  identity without moving image ownership.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/blit_screen.rs` vs Eden `src/video_core/renderer_vulkan/vk_blit_screen.{h,cpp}`
+
+### Intentional differences
+
+- C++ reference members are explicit call dependencies in Rust to avoid a self-referential
+  `RendererVulkan`. The present-manager-owned path uses a frame index and a same-file mechanical
+  `draw_layers` tail so no mutable frame borrow aliases the manager during recreation.
+- `WindowAdaptPass` uses `Option` for Eden's nullable `unique_ptr`; Vulkan construction failures
+  panic at the same points where Eden's wrapper throws.
+
+### Unintentional differences (to fix)
+
+- Removed the invented `BlitFrame` snapshot and restored mutable `Frame` recreation on every
+  `presentation_recreate_required` path, including capture and applet frames.
+- Restored `PrepareFrame`, `std::list<Layer>` ownership through `LinkedList`, Eden's concrete
+  nearest-neighbor initial filter, and `image_index = 0` after every resource or framebuffer
+  rebuild.
+- Restored the full-layout `CreateFramebuffer` interface and use of the caller's high-level
+  `Device` in `WaitIdle` and framebuffer creation.
+- Moved pipeline selection, push-constant/descriptor allocation, layer configuration, and draw
+  recording back to `present/window_adapt_pass.rs`, their upstream owner.
+
+### Missing items
+
+- None in `vk_blit_screen.h`/`.cpp`; `PrepareFrame` is present even though the optional LSFG caller
+  is not built.
+
+### Binary layout verification
+
+- N/A: `FramebufferTextureInfo` is field-wise host state and presentation objects are not
+  serialized. A focused test verifies every constructor default used by the first resource update.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/window_adapt_pass.rs` and `present/filters.rs` vs Eden `src/video_core/renderer_vulkan/present/window_adapt_pass.{h,cpp}`
+
+### Intentional differences
+
+- Construction helpers return their newly created handle because Rust cannot call mutating methods
+  on a partially initialized value. The helper names, ownership, call order, and inputs match Eden.
+- Raw ash handles retain a cloned logical-device dispatch table and are destroyed explicitly in
+  reverse C++ member order.
+
+### Unintentional differences (to fix)
+
+- Restored `Draw` ownership of blend-pipeline selection, `ConfigureDraw`, push constants,
+  descriptor sets, and command recording; `BlitScreen` no longer preconfigures this state.
+- Restored the high-level `Device&` constructor interface and the five upstream-owned creation
+  helper boundaries instead of flattening them into `new`.
+- Removed the invented public sampler accessor; Eden exposes only descriptor-set layout and render
+  pass accessors.
+
+### Missing items
+
+- None in the constructor, creation helpers, draw path, accessors, or resource destruction.
+
+### Binary layout verification
+
+- N/A: the pass owns host Vulkan handles. Existing tests verify the complete background-color
+  normalization used by its clear command.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and `renderer_vulkan.rs` frame ownership integration vs Eden `src/video_core/renderer_vulkan/present/util.{h,cpp}` and `renderer_vulkan.cpp`
+
+### Intentional differences
+
+- `create_wrapped_image_allocation` is the owning Rust return form of Eden's `vk::Image`; it shares
+  the exact `CreateWrappedImage` create-info owner with the legacy raw-handle form.
+- Rust explicitly destroys and nulls the local/app-capture framebuffer and view before the owning
+  image drops. Eden obtains the same reverse resource order from wrapper destructors.
+
+### Unintentional differences (to fix)
+
+- Restored zero-initialized `Frame` dimensions in `RenderToBuffer` and
+  `RenderAppletCaptureLayer`, so the first `DrawToFrame` performs Eden's presentation-frame
+  recreation rather than bypassing it.
+- Replaced allocator-retained raw images in those frames with per-frame owning allocations, so
+  recreation and local-frame destruction release the replaced images instead of leaking them.
+- Updated all `BlitScreen` construction, framebuffer, draw, and present-manager construction calls
+  to the restored ownership and lifecycle interfaces.
+
+### Missing items
+
+- None in the frame-creation and presentation integration changed by this slice.
+
+### Binary layout verification
+
+- N/A: this integration changes Vulkan ownership and call ordering, not guest-visible or serialized
+  data.
+
+## 2026-08-26 — `src/common/src/thread.rs` vs Eden `src/common/thread.{h,cpp}` (`SetCurrentThreadToPerformanceCores` integration)
+
+### Intentional differences
+
+- The function is a no-op on the current Linux, Windows, and macOS targets exactly like Eden's
+  non-Android branch. Android ADPF/topology policy remains excluded by the project's documented
+  platform exceptions.
+
+### Unintentional differences (to fix)
+
+- Restored the named function so presentation and other worker owners can keep Eden's explicit
+  thread-policy call sites instead of omitting them.
+
+### Missing items
+
+- Android's ADPF session and core-group implementation is not built.
+
+### Binary layout verification
+
+- N/A: thread placement has no raw-copied or serialized payload.

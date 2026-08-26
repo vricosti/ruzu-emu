@@ -29,8 +29,10 @@ use crate::vulkan_common::vulkan_surface;
 use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
 
-use super::blit_screen::{BlitFrame, BlitScreen};
-use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
+use super::blit_screen::BlitScreen;
+use super::present::util::{
+    create_wrapped_image_allocation, create_wrapped_image_view, download_color_image,
+};
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
 use super::state_tracker::StateTracker;
@@ -209,6 +211,7 @@ impl OwnedSurface {
         self.handle
     }
 
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(super) fn replace(&mut self, handle: vk::SurfaceKHR) {
         if self.handle != vk::SurfaceKHR::null() {
             unsafe {
@@ -285,13 +288,6 @@ impl RendererVulkan {
         )));
 
         let device = Box::new(create_device(&instance, surface.lock().unwrap().handle())?);
-        let physical_device = device.get_physical();
-        let memory_properties = unsafe {
-            instance
-                .instance
-                .get_physical_device_memory_properties(physical_device)
-        };
-
         // `RasterizerVulkan` and its `PipelineCache` retain the upstream
         // `const Device&`. Box the owner before constructing either borrower
         // so its address remains stable when `RendererVulkan` is returned.
@@ -335,7 +331,6 @@ impl RendererVulkan {
             drawable_size.0.max(1),
             drawable_size.1.max(1),
         )?;
-        let frame_image_format = swapchain.get_image_format();
         let swapchain_image_count = swapchain.get_image_count();
         let swapchain = std::sync::Arc::new(std::sync::Mutex::new(swapchain));
         // Upstream gates the present thread on `Settings::values.async_presentation`.
@@ -346,8 +341,7 @@ impl RendererVulkan {
             surface_info,
             Arc::clone(&surface),
             device.as_ref(),
-            memory_properties,
-            frame_image_format,
+            memory_allocator.as_mut(),
             device.get_graphics_family(),
             swapchain_image_count,
             use_present_thread,
@@ -355,14 +349,9 @@ impl RendererVulkan {
             std::sync::Arc::clone(&swapchain),
             device.get_graphics_queue(),
         );
-        let blit_swapchain =
-            BlitScreen::new(device.get_logical().clone(), &PRESENT_FILTERS_FOR_DISPLAY);
-        let blit_capture =
-            BlitScreen::new(device.get_logical().clone(), &PRESENT_FILTERS_FOR_DISPLAY);
-        let blit_applet = BlitScreen::new(
-            device.get_logical().clone(),
-            &PRESENT_FILTERS_FOR_APPLET_CAPTURE,
-        );
+        let blit_swapchain = BlitScreen::new(&PRESENT_FILTERS_FOR_DISPLAY);
+        let blit_capture = BlitScreen::new(&PRESENT_FILTERS_FOR_DISPLAY);
+        let blit_applet = BlitScreen::new(&PRESENT_FILTERS_FOR_APPLET_CAPTURE);
         let rasterizer = super::RasterizerVulkan::new(
             shader_notify,
             device.as_ref(),
@@ -505,7 +494,8 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
-        self.scheduler.request_outside_render_pass_operation_context();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.blit_swapchain.draw_to_present_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -541,7 +531,8 @@ impl RendererVulkan {
 
         let dst_buffer =
             self.create_download_buffer(crate::capture::tiled_size() as vk::DeviceSize);
-        self.scheduler.request_outside_render_pass_operation_context();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();
         let image = self.applet_frame.image;
         let buffer = dst_buffer.buffer();
@@ -609,27 +600,24 @@ impl RendererVulkan {
         buffer_size: vk::DeviceSize,
     ) -> MappedBuffer {
         let mut frame = Frame::default();
-        frame.width = layout.width;
-        frame.height = layout.height;
-        frame.image = create_wrapped_image(
-            self.device.get_logical(),
-            &self.memory_allocator,
+        let image = create_wrapped_image_allocation(
+            self.memory_allocator.as_ref(),
             vk::Extent2D {
                 width: layout.width,
                 height: layout.height,
             },
             format,
         );
+        frame.set_image_allocation(image);
         frame.image_view =
             create_wrapped_image_view(self.device.get_logical(), frame.image, format);
         frame.framebuffer = self.blit_capture.create_framebuffer(
             self.device.as_ref(),
             &mut self.scheduler,
             &self.present_manager,
+            layout,
             frame.image_view,
             format,
-            layout.width,
-            layout.height,
         );
 
         let dst_buffer = self.create_download_buffer(buffer_size);
@@ -640,14 +628,15 @@ impl RendererVulkan {
             &self.present_manager,
             &self.memory_allocator,
             &self.device_memory,
-            BlitFrame::from(&frame),
+            &mut frame,
             framebuffers,
             layout,
             1,
             format,
         );
 
-        self.scheduler.request_outside_render_pass_operation_context();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();
         let image = frame.image;
         let buffer = dst_buffer.buffer();
@@ -667,11 +656,13 @@ impl RendererVulkan {
                 self.device
                     .get_logical()
                     .destroy_framebuffer(frame.framebuffer, None);
+                frame.framebuffer = vk::Framebuffer::null();
             }
             if frame.image_view != vk::ImageView::null() {
                 self.device
                     .get_logical()
                     .destroy_image_view(frame.image_view, None);
+                frame.image_view = vk::ImageView::null();
             }
         }
         dst_buffer
@@ -725,15 +716,14 @@ impl RendererVulkan {
     /// Renders framebuffers to the applet capture frame at 1280x720
     /// using the applet-specific blit screen and filter configuration.
     fn render_applet_capture_layer(&mut self, framebuffers: &[FramebufferConfig]) {
+        let layout = capture_framebuffer_layout();
         if self.applet_frame.image == vk::Image::null() {
-            self.applet_frame.width = crate::capture::LINEAR_WIDTH;
-            self.applet_frame.height = crate::capture::LINEAR_HEIGHT;
-            self.applet_frame.image = create_wrapped_image(
-                self.device.get_logical(),
-                &self.memory_allocator,
+            let image = create_wrapped_image_allocation(
+                self.memory_allocator.as_ref(),
                 CAPTURE_IMAGE_SIZE,
                 CAPTURE_FORMAT,
             );
+            self.applet_frame.set_image_allocation(image);
             self.applet_frame.image_view = create_wrapped_image_view(
                 self.device.get_logical(),
                 self.applet_frame.image,
@@ -743,15 +733,12 @@ impl RendererVulkan {
                 self.device.as_ref(),
                 &mut self.scheduler,
                 &self.present_manager,
+                &layout,
                 self.applet_frame.image_view,
                 CAPTURE_FORMAT,
-                crate::capture::LINEAR_WIDTH,
-                crate::capture::LINEAR_HEIGHT,
             );
         }
 
-        let layout = capture_framebuffer_layout();
-        let frame = BlitFrame::from(&self.applet_frame);
         self.blit_applet.draw_to_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -759,7 +746,7 @@ impl RendererVulkan {
             &self.present_manager,
             &self.memory_allocator,
             &self.device_memory,
-            frame,
+            &mut self.applet_frame,
             framebuffers,
             &layout,
             1,

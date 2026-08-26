@@ -7,10 +7,17 @@
 //! using opaque, premultiplied, or coverage blending pipelines.
 
 use ash::vk;
+use std::collections::LinkedList;
 
+use crate::framebuffer_config::{BlendMode, FramebufferConfig};
 use crate::host_shaders::spirv_shaders::VULKAN_PRESENT_VERT_SPV;
+use crate::renderer_vulkan::present::layer::Layer;
+use crate::renderer_vulkan::present_manager::Frame;
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
+use crate::renderer_vulkan::RasterizerVulkan;
+use crate::vulkan_common::vulkan_device::Device;
+use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 use super::present_push_constants::PresentPushConstants;
 use super::util;
@@ -40,58 +47,17 @@ pub struct WindowAdaptPass {
 impl WindowAdaptPass {
     /// Port of `WindowAdaptPass::WindowAdaptPass`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         frame_format: vk::Format,
         sampler: vk::Sampler,
         fragment_shader: vk::ShaderModule,
     ) -> Self {
-        // Create descriptor set layout: 1 combined image sampler
-        let descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            &device,
-            &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
-        );
-
-        // Create pipeline layout with push constants for vertex stage
-        let push_constant_range = vk::PushConstantRange {
-            stage_flags: vk::ShaderStageFlags::VERTEX,
-            offset: 0,
-            size: std::mem::size_of::<PresentPushConstants>() as u32,
-        };
-        let set_layouts = [descriptor_set_layout];
-        let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_constant_range))
-            .build();
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(&pipeline_layout_ci, None)
-                .expect("Failed to create WindowAdaptPass pipeline layout")
-        };
-
-        let vertex_shader = build_shader(&device, VULKAN_PRESENT_VERT_SPV)
-            .expect("Failed to build vulkan_present.vert");
-
-        // Create render pass
-        let render_pass =
-            util::create_wrapped_render_pass(&device, frame_format, vk::ImageLayout::UNDEFINED);
-
-        // Create pipelines
-        let opaque_pipeline = util::create_wrapped_pipeline(
-            &device,
-            render_pass,
-            pipeline_layout,
-            vertex_shader,
-            fragment_shader,
-        );
-        let premultiplied_pipeline = util::create_wrapped_premultiplied_blending_pipeline(
-            &device,
-            render_pass,
-            pipeline_layout,
-            vertex_shader,
-            fragment_shader,
-        );
-        let coverage_pipeline = util::create_wrapped_coverage_blending_pipeline(
-            &device,
+        let descriptor_set_layout = Self::create_descriptor_set_layout(device);
+        let pipeline_layout = Self::create_pipeline_layout(device, descriptor_set_layout);
+        let vertex_shader = Self::create_vertex_shader(device);
+        let render_pass = Self::create_render_pass(device, frame_format);
+        let (opaque_pipeline, premultiplied_pipeline, coverage_pipeline) = Self::create_pipelines(
+            device,
             render_pass,
             pipeline_layout,
             vertex_shader,
@@ -99,7 +65,7 @@ impl WindowAdaptPass {
         );
 
         WindowAdaptPass {
-            device,
+            device: device.get_logical().clone(),
             descriptor_set_layout,
             pipeline_layout,
             sampler,
@@ -112,6 +78,86 @@ impl WindowAdaptPass {
         }
     }
 
+    /// Port of `WindowAdaptPass::CreateDescriptorSetLayout`.
+    fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
+        util::create_wrapped_descriptor_set_layout(
+            device.get_logical(),
+            &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+        )
+    }
+
+    /// Port of `WindowAdaptPass::CreatePipelineLayout`.
+    fn create_pipeline_layout(
+        device: &Device,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+    ) -> vk::PipelineLayout {
+        let range = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            offset: 0,
+            size: std::mem::size_of::<PresentPushConstants>() as u32,
+        };
+        let set_layouts = [descriptor_set_layout];
+        let create_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(std::slice::from_ref(&range))
+            .build();
+        unsafe {
+            device
+                .get_logical()
+                .create_pipeline_layout(&create_info, None)
+                .expect("Failed to create WindowAdaptPass pipeline layout")
+        }
+    }
+
+    /// Port of `WindowAdaptPass::CreateVertexShader`.
+    fn create_vertex_shader(device: &Device) -> vk::ShaderModule {
+        build_shader(device.get_logical(), VULKAN_PRESENT_VERT_SPV)
+            .expect("Failed to build vulkan_present.vert")
+    }
+
+    /// Port of `WindowAdaptPass::CreateRenderPass`.
+    fn create_render_pass(device: &Device, frame_format: vk::Format) -> vk::RenderPass {
+        util::create_wrapped_render_pass(
+            device.get_logical(),
+            frame_format,
+            vk::ImageLayout::UNDEFINED,
+        )
+    }
+
+    /// Port of `WindowAdaptPass::CreatePipelines`.
+    fn create_pipelines(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        pipeline_layout: vk::PipelineLayout,
+        vertex_shader: vk::ShaderModule,
+        fragment_shader: vk::ShaderModule,
+    ) -> (vk::Pipeline, vk::Pipeline, vk::Pipeline) {
+        let logical = device.get_logical();
+        (
+            util::create_wrapped_pipeline(
+                logical,
+                render_pass,
+                pipeline_layout,
+                vertex_shader,
+                fragment_shader,
+            ),
+            util::create_wrapped_premultiplied_blending_pipeline(
+                logical,
+                render_pass,
+                pipeline_layout,
+                vertex_shader,
+                fragment_shader,
+            ),
+            util::create_wrapped_coverage_blending_pipeline(
+                logical,
+                render_pass,
+                pipeline_layout,
+                vertex_shader,
+                fragment_shader,
+            ),
+        )
+    }
+
     /// Port of `WindowAdaptPass::GetDescriptorSetLayout`.
     pub fn get_descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
         self.descriptor_set_layout
@@ -122,39 +168,54 @@ impl WindowAdaptPass {
         self.render_pass
     }
 
-    /// Port access to the sampler owned by `WindowAdaptPass`.
-    pub fn get_sampler(&self) -> vk::Sampler {
-        self.sampler
-    }
-
     /// Port of `WindowAdaptPass::Draw`.
-    ///
-    /// Composites one or more layers into the destination frame. Each layer
-    /// has its own push constants, descriptor set, and blending mode.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
+        device: &Device,
+        rasterizer: &mut RasterizerVulkan,
         scheduler: &mut Scheduler,
-        push_constants_list: &[PresentPushConstants],
-        descriptor_sets: &[vk::DescriptorSet],
-        blend_modes: &[BlendMode],
-        dst_framebuffer: vk::Framebuffer,
-        render_area: vk::Extent2D,
+        image_index: usize,
+        layers: &mut LinkedList<Layer>,
+        configs: &[FramebufferConfig],
+        layout: &FramebufferLayout,
+        dst: &Frame,
     ) {
-        let layer_count = push_constants_list.len();
+        let host_framebuffer = dst.framebuffer;
+        let render_area = vk::Extent2D {
+            width: dst.width,
+            height: dst.height,
+        };
+        let layer_count = configs.len();
+        let mut push_constants = vec![PresentPushConstants::default(); layer_count];
+        let mut descriptor_sets = vec![vk::DescriptorSet::null(); layer_count];
+        let mut graphics_pipelines = vec![vk::Pipeline::null(); layer_count];
 
-        let graphics_pipelines: Vec<vk::Pipeline> = blend_modes
-            .iter()
-            .map(|mode| match mode {
+        let mut layer_it = layers.iter_mut();
+        for i in 0..layer_count {
+            graphics_pipelines[i] = match configs[i].blending {
                 BlendMode::Opaque => self.opaque_pipeline,
                 BlendMode::Premultiplied => self.premultiplied_pipeline,
                 BlendMode::Coverage => self.coverage_pipeline,
-            })
-            .collect();
+            };
+            layer_it
+                .next()
+                .expect("each framebuffer must have a presentation layer")
+                .configure_draw_from_framebuffer(
+                    device,
+                    &mut push_constants[i],
+                    &mut descriptor_sets[i],
+                    rasterizer,
+                    self.sampler,
+                    image_index,
+                    &configs[i],
+                    layout,
+                );
+        }
+
         let device = self.device.clone();
         let render_pass = self.render_pass;
         let pipeline_layout = self.pipeline_layout;
-        let push_constants = push_constants_list.to_vec();
-        let descriptor_sets = descriptor_sets.to_vec();
 
         scheduler.record(move |cmdbuf| unsafe {
             let values = common::settings::values();
@@ -163,7 +224,7 @@ impl WindowAdaptPass {
                 *values.bg_green.get_value(),
                 *values.bg_blue.get_value(),
             );
-            util::begin_render_pass(&device, cmdbuf, render_pass, dst_framebuffer, render_area);
+            util::begin_render_pass(&device, cmdbuf, render_pass, host_framebuffer, render_area);
 
             let clear_attachment = vk::ClearAttachment {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -285,12 +346,4 @@ impl Drop for WindowAdaptPass {
             }
         }
     }
-}
-
-/// Blend mode for a presentation layer, matching upstream `Tegra::BlendMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlendMode {
-    Opaque,
-    Premultiplied,
-    Coverage,
 }

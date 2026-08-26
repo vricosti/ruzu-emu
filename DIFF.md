@@ -14043,3 +14043,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: the canonical component and texture enums are `repr(u32)` with upstream discriminants, and
   a focused non-uniform hash test verifies every component shift plus the sRGB bit.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/formatter.rs` vs Eden `src/video_core/texture_cache/formatter.{h,cpp}`
+
+### Intentional differences
+
+- Rust implements `Display` instead of `fmt::formatter` specializations and gives the three C++
+  `Name` overloads distinct snake-case names. Their ownership and formatted output are unchanged.
+
+### Unintentional differences (to fix)
+
+- Resolved: every one of Eden's 112 `PIXEL_FORMAT_LIST` entries now returns its exact enumerator
+  spelling instead of valid ASTC, BC sRGB, ETC2, EAC, and packed formats falling through to
+  `Invalid`.
+- Resolved: image-view addresses now use lower-case hexadecimal digits, matching Eden's `{:#x}`
+  formatting used by the already-correct image formatter.
+
+### Missing items
+
+- None in the reviewed pixel-format, image-type, extent, image, image-view, or render-target
+  formatters.
+
+### Binary layout verification
+
+- N/A: this file only creates text and does not define or serialize binary payloads.

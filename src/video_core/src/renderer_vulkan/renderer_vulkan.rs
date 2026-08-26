@@ -359,8 +359,6 @@ impl RendererVulkan {
             device.get_physical(),
             device.get_driver_id(),
             device.cant_blit_msaa(),
-            crate::capture::LINEAR_WIDTH,
-            crate::capture::LINEAR_HEIGHT,
             device.is_depth_bounds_supported(),
             device.is_ext_depth_range_unrestricted_supported(),
             device.is_nv_viewport_swizzle_supported(),

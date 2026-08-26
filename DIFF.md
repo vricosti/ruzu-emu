@@ -13403,3 +13403,46 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the cache is host-only state and is neither raw-copied nor serialized. Focused tests verify
   stable payload addresses, FIFO slot reuse bookkeeping, once-per-address-space registration, and
   pointer identity of the retained GPU-memory owner.
+
+## 2026-08-26 — removed `src/video_core/src/command_processor.rs` and `gpu_context.rs` vs Eden `src/video_core/dma_pusher.{h,cpp}` and `gpu_thread.{h,cpp}`
+
+### Intentional differences
+
+- None. These two Rust-only files had no upstream owner and no production caller.
+
+### Unintentional differences (to fix)
+
+- None after removing the second GPFIFO parser and its sole `GpuContext` owner. The live Ruzu path
+  now has one owner chain, matching Eden: the GPU thread schedules a channel command list and that
+  channel's `DmaPusher` parses and dispatches it through `Puller` and bound engine interfaces.
+
+### Missing items
+
+- None introduced by the removal. `dma_pusher.rs`, `gpu_thread.rs`, and `control/scheduler.rs`
+  remain the active counterparts of Eden's submission path.
+
+### Binary layout verification
+
+- N/A: the removed types were private host-side duplicate state. The live `CommandListHeader` and
+  `CommandHeader` layouts remain owned and tested in `dma_pusher.rs`.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (obsolete GPFIFO batch path)
+
+### Intentional differences
+
+- None in this removal slice.
+
+### Unintentional differences (to fix)
+
+- None after removing the unused fixed-size color/depth framebuffer, mapped readback buffer,
+  private render pass, resize/readback helpers, and `render_draw_calls` batch entry point. Eden's
+  rasterizer renders directly into texture-cache-owned guest render targets and owns none of those
+  resources. Ruzu's live `RasterizerInterface` path does the same.
+
+### Missing items
+
+- None introduced by this removal.
+
+### Binary layout verification
+
+- N/A: only dead host-side Vulkan resources and methods were removed.

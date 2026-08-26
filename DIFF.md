@@ -12856,3 +12856,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this slice changes host ownership and error propagation only.
+
+## 2026-08-26 — `src/video_core/src/textures/bcn.rs` vs Eden `src/video_core/textures/bcn.{h,cpp}`
+
+### Intentional differences
+
+- Worker closures carry checked `Send` pointer wrappers because Rust's shared worker queue owns
+  `'static` jobs. `compress_bcn` waits after every depth slice, so the captured input/output spans
+  remain alive for exactly Eden's worker lifetime and each job writes a distinct compressed row.
+- Rust validates the input and output span lengths before exposing their pointers to worker jobs;
+  Eden relies on its callers to satisfy the same buffer-size precondition and would otherwise
+  access outside the spans.
+- The C `stb_dxt` shim fixes the mode to `STB_DXT_NORMAL`, preserving the two direct Eden calls
+  without exposing the C++ implementation through Rust FFI.
+
+### Unintentional differences (to fix)
+
+- None after restoring one queued task per compressed row, `WaitForRequests` after each depth
+  slice, the stack-owned 64-byte texel block, and `Common::DivideUp` ownership.
+
+### Missing items
+
+- None: the generic BC compressor and both public BC1/BC3 entry points are present.
+
+### Binary layout verification
+
+- N/A: compression state is local algorithm data. Focused tests verify multi-row/multi-plane
+  output placement and Eden's BC1 alpha-threshold boundary.

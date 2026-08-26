@@ -7,6 +7,10 @@
 //! uses the `stb_dxt` library for the actual block compression; this port
 //! provides the same interface and dispatching logic.
 
+use common::alignment::divide_up;
+
+use super::workers::get_thread_workers;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Type alias for a BCN block compressor function.
@@ -20,11 +24,6 @@ extern "C" {
     fn ruzu_stb_compress_bc1_block(dest: *mut u8, src: *const u8, alpha: i32);
     fn ruzu_stb_compress_bc3_block(dest: *mut u8, src: *const u8);
 }
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-const ALPHA_THRESHOLD: u8 = 128;
-const BYTES_PER_PX: u32 = 4;
 
 // ── Internal ─────────────────────────────────────────────────────────────────
 
@@ -41,67 +40,105 @@ fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
     output: &mut [u8],
     f: BcnCompressor,
 ) {
-    fn divide_up(a: u32, b: u32) -> u32 {
-        (a + b - 1) / b
+    const ALPHA_THRESHOLD: u8 = 128;
+    const BYTES_PER_PX: u32 = 4;
+
+    #[derive(Clone, Copy)]
+    struct SendConstPtr(*const u8);
+    unsafe impl Send for SendConstPtr {}
+    unsafe impl Sync for SendConstPtr {}
+    impl SendConstPtr {
+        unsafe fn as_slice<'a>(self, len: usize) -> &'a [u8] {
+            std::slice::from_raw_parts(self.0, len)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SendPtr(*mut u8);
+    unsafe impl Send for SendPtr {}
+    unsafe impl Sync for SendPtr {}
+    impl SendPtr {
+        unsafe fn slice_at<'a>(self, offset: usize, len: usize) -> &'a mut [u8] {
+            std::slice::from_raw_parts_mut(self.0.add(offset), len)
+        }
     }
 
     let plane_dim = width * height;
+    let bytes_per_row = BYTES_PER_BLOCK * divide_up(u64::from(width), 4) as u32;
+    let bytes_per_plane = bytes_per_row * divide_up(u64::from(height), 4) as u32;
+
+    let required_input_len = usize::try_from(plane_dim)
+        .unwrap()
+        .checked_mul(depth as usize)
+        .and_then(|size| size.checked_mul(BYTES_PER_PX as usize))
+        .expect("BCN input dimensions overflow the host address space");
+    let required_output_len = usize::try_from(bytes_per_plane)
+        .unwrap()
+        .checked_mul(depth as usize)
+        .expect("BCN output dimensions overflow the host address space");
+    assert!(data.len() >= required_input_len);
+    assert!(output.len() >= required_output_len);
+
+    let workers = get_thread_workers();
+    let send_data = SendConstPtr(data.as_ptr());
+    let data_len = data.len();
+    let send_output = SendPtr(output.as_mut_ptr());
 
     for z in 0..depth {
         for y in (0..height).step_by(4) {
-            // In upstream, each row is dispatched to the thread pool.
-            // We process inline for now; workers integration is a future step.
-            for x in (0..width).step_by(4) {
-                // Gather 4x4 block of RGBA texels
-                let mut input_colors = [[0u8; 4]; 16]; // 4x4 * 4 channels
-                let mut any_alpha = false;
+            workers.queue_work(move || {
+                // SAFETY: all queued rows complete before the borrowed spans
+                // can cease to be valid, matching Eden's by-value span capture.
+                let data = unsafe { send_data.as_slice(data_len) };
 
-                for j in 0..4u32 {
-                    for i in 0..4u32 {
-                        let coord = (z * plane_dim + (y + j) * width + (x + i)) as usize
-                            * BYTES_PER_PX as usize;
-                        let dst_idx = (j * 4 + i) as usize;
+                for x in (0..width).step_by(4) {
+                    // Gather 4x4 block of RGBA texels.
+                    let mut input_colors = [0u8; 4 * 4 * 4];
+                    let mut any_alpha = false;
 
-                        if (x + i < width) && (y + j < height) {
-                            if THRESHOLD_ALPHA {
-                                if coord + 3 < data.len() && data[coord + 3] >= ALPHA_THRESHOLD {
-                                    input_colors[dst_idx][0] = data[coord];
-                                    input_colors[dst_idx][1] = data[coord + 1];
-                                    input_colors[dst_idx][2] = data[coord + 2];
-                                    input_colors[dst_idx][3] = 255;
+                    for j in 0..4u32 {
+                        for i in 0..4u32 {
+                            let coord = (z * plane_dim + (y + j) * width + (x + i)) as usize
+                                * BYTES_PER_PX as usize;
+                            let dst_idx = ((j * 4 + i) * BYTES_PER_PX) as usize;
+
+                            if (x + i < width) && (y + j < height) {
+                                if THRESHOLD_ALPHA {
+                                    if data[coord + 3] >= ALPHA_THRESHOLD {
+                                        input_colors[dst_idx] = data[coord];
+                                        input_colors[dst_idx + 1] = data[coord + 1];
+                                        input_colors[dst_idx + 2] = data[coord + 2];
+                                        input_colors[dst_idx + 3] = 255;
+                                    } else {
+                                        any_alpha = true;
+                                        input_colors[dst_idx..dst_idx + BYTES_PER_PX as usize]
+                                            .fill(0);
+                                    }
                                 } else {
-                                    any_alpha = true;
-                                    input_colors[dst_idx] = [0, 0, 0, 0];
+                                    input_colors[dst_idx..dst_idx + BYTES_PER_PX as usize]
+                                        .copy_from_slice(
+                                            &data[coord..coord + BYTES_PER_PX as usize],
+                                        );
                                 }
-                            } else if coord + BYTES_PER_PX as usize <= data.len() {
-                                input_colors[dst_idx][0] = data[coord];
-                                input_colors[dst_idx][1] = data[coord + 1];
-                                input_colors[dst_idx][2] = data[coord + 2];
-                                input_colors[dst_idx][3] = data[coord + 3];
+                            } else {
+                                input_colors[dst_idx..dst_idx + BYTES_PER_PX as usize].fill(0);
                             }
                         }
-                        // Else: already zero-initialized
                     }
+
+                    let offset = (z * bytes_per_plane
+                        + (y / 4) * bytes_per_row
+                        + (x / 4) * BYTES_PER_BLOCK) as usize;
+
+                    // SAFETY: each queued row writes to a distinct output row,
+                    // and each block occupies a non-overlapping range within it.
+                    let out_slice =
+                        unsafe { send_output.slice_at(offset, BYTES_PER_BLOCK as usize) };
+                    f(out_slice, &input_colors, any_alpha);
                 }
-
-                let bytes_per_row = BYTES_PER_BLOCK * divide_up(width, 4);
-                let bytes_per_plane = bytes_per_row * divide_up(height, 4);
-                let offset = (z * bytes_per_plane
-                    + (y / 4) * bytes_per_row
-                    + (x / 4) * BYTES_PER_BLOCK) as usize;
-
-                // Flatten input_colors for the compressor
-                let flat_input: Vec<u8> = input_colors
-                    .iter()
-                    .flat_map(|c| c.iter().copied())
-                    .collect();
-
-                if offset + BYTES_PER_BLOCK as usize <= output.len() {
-                    let out_slice = &mut output[offset..offset + BYTES_PER_BLOCK as usize];
-                    f(out_slice, &flat_input, any_alpha);
-                }
-            }
+            });
         }
+        workers.wait_for_requests();
     }
 }
 
@@ -148,16 +185,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn divide_up_basic() {
-        fn divide_up(a: u32, b: u32) -> u32 {
-            (a + b - 1) / b
-        }
-        assert_eq!(divide_up(7, 4), 2);
-        assert_eq!(divide_up(8, 4), 2);
-        assert_eq!(divide_up(9, 4), 3);
-    }
-
-    #[test]
     fn bc1_uses_stb_dxt_output() {
         let mut rgba = vec![0u8; 4 * 4 * 4];
         for pixel in rgba.chunks_exact_mut(4) {
@@ -177,5 +204,64 @@ mod tests {
         let mut output = [0u8; 16];
         compress_bc3(&rgba, 4, 4, 1, &mut output);
         assert_ne!(output, [0u8; 16]);
+    }
+
+    #[test]
+    fn threaded_bc3_matches_independently_compressed_rows_and_planes() {
+        const WIDTH: u32 = 9;
+        const HEIGHT: u32 = 7;
+        const DEPTH: u32 = 2;
+
+        let mut rgba = vec![0u8; (WIDTH * HEIGHT * DEPTH * 4) as usize];
+        for (index, byte) in rgba.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
+        }
+
+        let blocks_x = divide_up(u64::from(WIDTH), 4) as usize;
+        let blocks_y = divide_up(u64::from(HEIGHT), 4) as usize;
+        let row_bytes = blocks_x * 16;
+        let plane_bytes = row_bytes * blocks_y;
+        let mut threaded = vec![0u8; plane_bytes * DEPTH as usize];
+        compress_bc3(&rgba, WIDTH, HEIGHT, DEPTH, &mut threaded);
+
+        let mut independently_compressed = vec![0u8; threaded.len()];
+        let source_row_bytes = WIDTH as usize * 4;
+        let source_plane_bytes = source_row_bytes * HEIGHT as usize;
+        for z in 0..DEPTH as usize {
+            for block_y in 0..blocks_y {
+                let y = block_y * 4;
+                let row_height = (HEIGHT as usize - y).min(4);
+                let source_offset = z * source_plane_bytes + y * source_row_bytes;
+                let source_len = row_height * source_row_bytes;
+                let output_offset = z * plane_bytes + block_y * row_bytes;
+                compress_bc3(
+                    &rgba[source_offset..source_offset + source_len],
+                    WIDTH,
+                    row_height as u32,
+                    1,
+                    &mut independently_compressed[output_offset..output_offset + row_bytes],
+                );
+            }
+        }
+
+        assert_eq!(threaded, independently_compressed);
+    }
+
+    #[test]
+    fn bc1_alpha_threshold_matches_eden_boundary() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[9, 31, 127, 128]);
+        }
+        let mut opaque = [0u8; 8];
+        compress_bc1(&rgba, 4, 4, 1, &mut opaque);
+
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = 127;
+        }
+        let mut transparent = [0u8; 8];
+        compress_bc1(&rgba, 4, 4, 1, &mut transparent);
+
+        assert_ne!(opaque, transparent);
     }
 }

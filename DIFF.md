@@ -15593,3 +15593,24 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: tests verify the upstream-owned `RescalingLayout` size/alignment (32/16 bytes),
   `RenderAreaLayout` size (16 bytes), and offsets 0/24/0 used by Vulkan push constants.
+
+## 2026-08-26 — `src/video_core/src/pte_kind.rs` vs Eden `src/video_core/pte_kind.h`
+
+### Intentional differences
+
+- Rust uses a transparent `u8` newtype rather than an enum so raw PTE values remain representable;
+  every named constant and `is_pitch_kind` still maps directly to Eden.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed thirteen named kinds absent from Eden and restored Eden's exact names for
+  `C32_MS2_2CRA`, `C64_MS2_2CRA`, and `SMASKED_MESSAGE`.
+
+### Missing items
+
+- None: all 233 Eden enumerators and `IsPitchKind` are present.
+
+### Binary layout verification
+
+- PASS: `PteKind` is `repr(transparent)` over `u8`; focused tests cover the sparse corrected values
+  and pitch-kind predicate.

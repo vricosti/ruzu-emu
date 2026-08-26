@@ -24,11 +24,6 @@ impl PteKind {
     pub const Z16_MS4_2Z: Self = Self(0x09);
     pub const Z16_MS8_2Z: Self = Self(0x0a);
     pub const Z16_MS16_2Z: Self = Self(0x0b);
-    pub const Z16_2CZ: Self = Self(0x36);
-    pub const Z16_MS2_2CZ: Self = Self(0x37);
-    pub const Z16_MS4_2CZ: Self = Self(0x38);
-    pub const Z16_MS8_2CZ: Self = Self(0x39);
-    pub const Z16_MS16_2CZ: Self = Self(0x5f);
     pub const Z16_4CZ: Self = Self(0x0c);
     pub const Z16_MS2_4CZ: Self = Self(0x0d);
     pub const Z16_MS4_4CZ: Self = Self(0x0e);
@@ -104,12 +99,6 @@ impl PteKind {
     pub const Z24V8_MS4_VC4: Self = Self(0x5c);
     pub const Z24V8_MS8_VC8: Self = Self(0x5d);
     pub const Z24V8_MS8_VC24: Self = Self(0x5e);
-    pub const YUV_B8C1_2Y: Self = Self(0x60);
-    pub const YUV_B8C2_2Y: Self = Self(0x61);
-    pub const YUV_B10C1_2Y: Self = Self(0x62);
-    pub const YUV_B10C2_2Y: Self = Self(0x6b);
-    pub const YUV_B12C1_2Y: Self = Self(0x6c);
-    pub const YUV_B12C2_2Y: Self = Self(0x6d);
     pub const Z24V8_MS4_VC12_1ZV: Self = Self(0x63);
     pub const Z24V8_MS4_VC4_1ZV: Self = Self(0x64);
     pub const Z24V8_MS8_VC8_1ZV: Self = Self(0x65);
@@ -220,13 +209,12 @@ impl PteKind {
     pub const C32_2BRA: Self = Self(0xdc);
     pub const C32_MS2_2C: Self = Self(0xdd);
     pub const C32_MS2_2CBR: Self = Self(0xde);
-    pub const C32_MS2_4CBRA: Self = Self(0xcc);
+    pub const C32_MS2_2CRA: Self = Self(0xcc);
     pub const C32_MS4_2C: Self = Self(0xdf);
     pub const C32_MS4_2CBR: Self = Self(0xe0);
     pub const C32_MS4_2CBA: Self = Self(0xe1);
     pub const C32_MS4_2CRA: Self = Self(0xe2);
     pub const C32_MS4_2BRA: Self = Self(0xe3);
-    pub const C32_MS4_4CBRA: Self = Self(0x2c);
     pub const C32_MS8_MS16_2C: Self = Self(0xe4);
     pub const C32_MS8_MS16_2CRA: Self = Self(0xe5);
     pub const C64_2C: Self = Self(0xe6);
@@ -236,13 +224,12 @@ impl PteKind {
     pub const C64_2BRA: Self = Self(0xea);
     pub const C64_MS2_2C: Self = Self(0xeb);
     pub const C64_MS2_2CBR: Self = Self(0xec);
-    pub const C64_MS2_4CBRA: Self = Self(0xcd);
+    pub const C64_MS2_2CRA: Self = Self(0xcd);
     pub const C64_MS4_2C: Self = Self(0xed);
     pub const C64_MS4_2CBR: Self = Self(0xee);
     pub const C64_MS4_2CBA: Self = Self(0xef);
     pub const C64_MS4_2CRA: Self = Self(0xf0);
     pub const C64_MS4_2BRA: Self = Self(0xf1);
-    pub const C64_MS4_4CBRA: Self = Self(0x2d);
     pub const C64_MS8_MS16_2C: Self = Self(0xf2);
     pub const C64_MS8_MS16_2CRA: Self = Self(0xf3);
     pub const C128_2C: Self = Self(0xf4);
@@ -255,7 +242,7 @@ impl PteKind {
     pub const C128_MS8_MS16_2CR: Self = Self(0xfb);
     pub const X8C24: Self = Self(0xfc);
     pub const PITCH_NO_SWIZZLE: Self = Self(0xfd);
-    pub const SMSKED_MESSAGE: Self = Self(0xca);
+    pub const SMASKED_MESSAGE: Self = Self(0xca);
     pub const SMHOST_MESSAGE: Self = Self(0xcb);
 
     pub const fn from_raw(raw: u8) -> Self {
@@ -276,4 +263,27 @@ impl Default for PteKind {
 /// Returns true if the PTE kind is a pitch (linear) kind.
 pub const fn is_pitch_kind(kind: PteKind) -> bool {
     kind.raw() == PteKind::PITCH.raw() || kind.raw() == PteKind::PITCH_NO_SWIZZLE.raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_pte_kinds_preserve_upstream_names_and_values() {
+        assert_eq!(PteKind::C32_MS2_2CRA.raw(), 0xcc);
+        assert_eq!(PteKind::C64_MS2_2CRA.raw(), 0xcd);
+        assert_eq!(PteKind::SMASKED_MESSAGE.raw(), 0xca);
+        assert_eq!(PteKind::SMHOST_MESSAGE.raw(), 0xcb);
+        assert_eq!(PteKind::GENERIC_16BX2.raw(), 0xfe);
+        assert_eq!(PteKind::INVALID.raw(), 0xff);
+    }
+
+    #[test]
+    fn only_upstream_pitch_kinds_are_linear() {
+        assert!(is_pitch_kind(PteKind::PITCH));
+        assert!(is_pitch_kind(PteKind::PITCH_NO_SWIZZLE));
+        assert!(!is_pitch_kind(PteKind::Z16));
+        assert!(!is_pitch_kind(PteKind::INVALID));
+    }
 }

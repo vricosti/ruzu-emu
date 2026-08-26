@@ -14202,3 +14202,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the framebuffer texture metadata is an in-process typed descriptor and is not serialized by
   raw memory copy in this path.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_buffer_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_buffer_cache.{h,cpp}`
+
+### Intentional differences
+
+- The common C++ buffer-cache template is expressed through Rust traits, while all OpenGL runtime
+  methods and constants remain owned by this matching backend file.
+- The staging pool is a shared synchronized owner and the device is a non-owning stable pointer,
+  adapting Eden's references to the renderer's Rust ownership graph. A context-free constructor is
+  compiled only for unit tests.
+- Optional NV extension entry points are loaded explicitly because the generated GL bindings do not
+  expose them; their signatures and call sites match Eden.
+- Explicit `Drop` ordering mirrors reverse C++ member destruction for GL resource wrappers.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Buffer::view` now creates its texture before translating the surface format, matching
+  Eden's allocation and failure ordering.
+- Resolved: GPU-address, binding-index, program-parameter-index, and initial memory-budget additions
+  now preserve C++ unsigned wrapping instead of panicking in debug Rust on overflow.
+- Resolved: unified index-buffer size alignment is truncated back to Eden's `u32` result before it
+  is converted to `GLsizeiptr`.
+
+### Missing items
+
+- None in `Buffer`, `BufferCacheRuntime`, `BindlessSSBO`, or `BufferCacheParams`; every public and
+  private upstream runtime operation has a corresponding Rust owner in this file.
+
+### Binary layout verification
+
+- PASS: `BindlessSSBO` remains a 16-byte `repr(C)` payload (`u64`, `i32`, `i32`), matching Eden's
+  four-`GLuint` static assertion. Focused tests also cover the unsigned-width alignment edge.

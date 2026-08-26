@@ -17140,6 +17140,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: Ash owns the callback ABI and Rust reads the callback data in place. A focused regression
   now pins every platform-selected ignored message ID, in addition to message-type priority.
+
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
 
 ### Intentional differences
@@ -17202,3 +17203,49 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `ash` owns both Vulkan `pNext` payload layouts; the focused test verifies the exact LDR
   ASTC range boundary and rejects HDR ASTC formats.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` Haiku prerequisite vs Eden `src/video_core/vulkan_common/vulkan_instance.{h,cpp}`
+
+### Intentional differences
+
+- Platform variants and their code are selected with Rust `cfg(target_os)` attributes instead of
+  Eden's preprocessor branches; the resulting Haiku-only branch owns the same XCB extension name.
+
+### Unintentional differences (to fix)
+
+- Resolved: `WindowSystemType::Xcb` and `VK_KHR_xcb_surface` are now present on Haiku, completing
+  the platform dispatch consumed by `vulkan_surface.rs`.
+
+### Missing items
+
+- None in the Haiku/XCB instance-extension prerequisite.
+
+### Binary layout verification
+
+- N/A: this change selects a Vulkan extension name and does not define an ABI payload.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_surface.rs` vs Eden `src/video_core/vulkan_common/vulkan_surface.{h,cpp}`
+
+### Intentional differences
+
+- Ash's XCB extension loader replaces Eden's function-pointer lookup through
+  `vkGetInstanceProcAddr`; both submit the same `VkXcbSurfaceCreateInfoKHR` fields and return the
+  same raw surface handle ownership to the caller.
+- The repeated upstream initialization error is a mechanical file-local helper so its exact
+  `VkResult` can be tested without constructing a native window or Vulkan instance.
+
+### Unintentional differences (to fix)
+
+- Resolved: the previously omitted Haiku/XCB path now forwards `display_connection` as
+  `xcb_connection_t*` and converts `render_surface` through `uintptr_t` to `xcb_window_t`.
+- Resolved: every platform creation failure now logs Eden's platform-specific message and becomes
+  `VK_ERROR_INITIALIZATION_FAILED`; successful calls returning a null surface are rejected by the
+  same final guard as upstream.
+
+### Missing items
+
+- None in the platform surface dispatch.
+
+### Binary layout verification
+
+- PASS: `ash` owns `VkXcbSurfaceCreateInfoKHR`; no locally declared or serialized payload is used.

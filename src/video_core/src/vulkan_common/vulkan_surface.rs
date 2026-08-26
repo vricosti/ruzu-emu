@@ -33,6 +33,10 @@ pub struct WindowSystemInfo {
 unsafe impl Send for WindowSystemInfo {}
 unsafe impl Sync for WindowSystemInfo {}
 
+fn surface_initialization_error() -> VulkanError {
+    VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
 /// Creates a Vulkan surface from the given window system info.
 ///
 /// Port of `Vulkan::CreateSurface` from `vulkan_surface.cpp`.
@@ -57,7 +61,10 @@ pub unsafe fn create_surface(
                 .build();
             xlib_surface_fn
                 .create_xlib_surface(&create_info, None)
-                .map_err(|e| VulkanError::new(e))?
+                .map_err(|_| {
+                    log::error!("Failed to initialize Xlib surface");
+                    surface_initialization_error()
+                })?
         }
         #[cfg(target_os = "linux")]
         WindowSystemType::Wayland => {
@@ -68,7 +75,10 @@ pub unsafe fn create_surface(
                 .build();
             wayland_surface_fn
                 .create_wayland_surface(&create_info, None)
-                .map_err(|e| VulkanError::new(e))?
+                .map_err(|_| {
+                    log::error!("Failed to initialize Wayland surface");
+                    surface_initialization_error()
+                })?
         }
         #[cfg(target_os = "windows")]
         WindowSystemType::Windows => {
@@ -79,7 +89,10 @@ pub unsafe fn create_surface(
                 .build();
             win32_surface_fn
                 .create_win32_surface(&create_info, None)
-                .map_err(|e| VulkanError::new(e))?
+                .map_err(|_| {
+                    log::error!("Failed to initialize Win32 surface");
+                    surface_initialization_error()
+                })?
         }
         #[cfg(target_os = "macos")]
         WindowSystemType::Cocoa => {
@@ -89,7 +102,10 @@ pub unsafe fn create_surface(
                 .build();
             metal_surface_fn
                 .create_metal_surface(&create_info, None)
-                .map_err(|e| VulkanError::new(e))?
+                .map_err(|_| {
+                    log::error!("Failed to initialize Metal surface");
+                    surface_initialization_error()
+                })?
         }
         #[cfg(target_os = "android")]
         WindowSystemType::Android => {
@@ -99,13 +115,48 @@ pub unsafe fn create_surface(
                 .build();
             android_surface_fn
                 .create_android_surface(&create_info, None)
-                .map_err(|e| VulkanError::new(e))?
+                .map_err(|_| {
+                    log::error!("Failed to initialize Android surface");
+                    surface_initialization_error()
+                })?
+        }
+        #[cfg(target_os = "haiku")]
+        WindowSystemType::Xcb => {
+            let xcb_surface_fn = ash::extensions::khr::XcbSurface::new(entry, instance);
+            let create_info = vk::XcbSurfaceCreateInfoKHR::builder()
+                .connection(window_info.display_connection.cast())
+                .window(window_info.render_surface as usize as u32)
+                .build();
+            xcb_surface_fn
+                .create_xcb_surface(&create_info, None)
+                .map_err(|_| {
+                    log::error!("Failed to initialize Xcb surface");
+                    surface_initialization_error()
+                })?
         }
         WindowSystemType::Headless => {
-            log::error!("Presentation not supported on headless platform");
-            return Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED));
+            log::error!("Presentation not supported on this platform");
+            return Err(surface_initialization_error());
         }
     };
 
+    if surface == vk::SurfaceKHR::null() {
+        log::error!("Presentation not supported on this platform");
+        return Err(surface_initialization_error());
+    }
+
     Ok(surface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_surface_creation_failure_uses_upstream_initialization_error() {
+        assert_eq!(
+            surface_initialization_error().result,
+            vk::Result::ERROR_INITIALIZATION_FAILED
+        );
+    }
 }

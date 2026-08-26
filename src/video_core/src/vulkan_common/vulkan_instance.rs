@@ -25,6 +25,8 @@ pub enum WindowSystemType {
     Cocoa,
     #[cfg(target_os = "android")]
     Android,
+    #[cfg(target_os = "haiku")]
+    Xcb,
     #[cfg(target_os = "linux")]
     X11,
     #[cfg(target_os = "linux")]
@@ -78,6 +80,10 @@ fn required_extensions(
         #[cfg(target_os = "android")]
         WindowSystemType::Android => {
             extensions.push(CString::new("VK_KHR_android_surface").unwrap());
+        }
+        #[cfg(target_os = "haiku")]
+        WindowSystemType::Xcb => {
+            extensions.push(CString::new("VK_KHR_xcb_surface").unwrap());
         }
         #[cfg(target_os = "linux")]
         WindowSystemType::X11 => {
@@ -249,6 +255,18 @@ mod tests {
 
         let extensions = required_extensions(&properties, WindowSystemType::Headless, true);
         assert_eq!(extensions, vec![debug_utils]);
+        assert!(are_extensions_supported(&properties, &extensions));
+    }
+
+    #[cfg(target_os = "haiku")]
+    #[test]
+    fn haiku_requests_xcb_and_common_surface_extensions() {
+        let xcb = CString::new("VK_KHR_xcb_surface").unwrap();
+        let surface = CString::new("VK_KHR_surface").unwrap();
+        let properties = [extension_property(&xcb), extension_property(&surface)];
+
+        let extensions = required_extensions(&properties, WindowSystemType::Xcb, false);
+        assert_eq!(extensions, vec![xcb, surface]);
         assert!(are_extensions_supported(&properties, &extensions));
     }
 }

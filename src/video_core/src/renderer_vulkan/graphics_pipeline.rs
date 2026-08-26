@@ -21,6 +21,7 @@ use crate::buffer_cache::buffer_cache_base::{
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::{CullFace, VertexAttribSize, VertexAttribType};
 use crate::gpu::RenderTargetFormat;
+use crate::gpu_logging::{get_instance, is_active};
 use crate::memory_manager::MemoryManager;
 use crate::shader_cache::NUM_PROGRAMS;
 use crate::shader_notify::ShaderNotifyHandle;
@@ -219,6 +220,14 @@ fn should_update_descriptor_set(
     bind_pipeline
         || previous.len() != current.len()
         || slice_bytes(previous) != slice_bytes(current)
+}
+
+fn graphics_pipeline_bind_log_info(key: &GraphicsPipelineKey) -> String {
+    format!("hash={:#016x}", key.hash_value())
+}
+
+fn graphics_pipeline_creation_log_info(stage_count: usize, attachment_count: usize) -> String {
+    format!("GraphicsPipeline created: stages={stage_count}, attachments={attachment_count}")
 }
 
 trait ConfigureSpec {
@@ -1287,6 +1296,14 @@ impl GraphicsPipeline {
             && self.uses_descriptor_buffer
             && scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
 
+        if bind_pipeline
+            && is_active()
+            && *common::settings::values().gpu_log_vulkan_calls.get_value()
+        {
+            let pipeline_info = graphics_pipeline_bind_log_info(&self.key);
+            get_instance().log_pipeline_bind(false, &pipeline_info);
+        }
+
         let update_descriptors = if self.descriptor_set_layout != vk::DescriptorSetLayout::null()
             && !self.uses_push_descriptor
             && !self.uses_descriptor_buffer
@@ -1434,12 +1451,14 @@ impl GraphicsPipeline {
                 shader_modules: self.shader_modules,
                 num_image_elements: self.num_image_elements,
             },
+            &self.pipeline,
             render_pass,
         )
     }
 
     fn make_pipeline_from_snapshot(
         build: &GraphicsPipelineBuildSnapshot,
+        pipeline_state: &Arc<Mutex<vk::Pipeline>>,
         render_pass: vk::RenderPass,
     ) -> Option<vk::Pipeline> {
         let device = build.device_owner.get();
@@ -1703,7 +1722,18 @@ impl GraphicsPipeline {
                 .get_logical()
                 .create_graphics_pipelines(build.pipeline_cache, &[pipeline_info], None)
         } {
-            Ok(pipelines) => Some(pipelines[0]),
+            Ok(pipelines) => {
+                let created = pipelines[0];
+                *pipeline_state.lock().unwrap() = created;
+                if is_active() {
+                    let pipeline_info = graphics_pipeline_creation_log_info(
+                        shader_stages.len(),
+                        blend_attachments.len(),
+                    );
+                    get_instance().log_pipeline_state_change(&pipeline_info);
+                }
+                Some(created)
+            }
             Err((_, error)) => {
                 warn!("GraphicsPipeline: pipeline creation failed: {error:?}");
                 None
@@ -1724,7 +1754,6 @@ impl GraphicsPipeline {
         let Some(created) = self.make_pipeline(render_pass) else {
             return false;
         };
-        *self.pipeline.lock().unwrap() = created;
         if let Some(statistics) = pipeline_statistics {
             statistics.collect(self.device_owner.get(), created);
         }
@@ -1777,10 +1806,9 @@ impl GraphicsPipeline {
                         &build.stage_infos,
                         build.num_image_elements,
                     );
-                    GraphicsPipeline::make_pipeline_from_snapshot(&build, render_pass)
+                    GraphicsPipeline::make_pipeline_from_snapshot(&build, &pipeline, render_pass)
                 });
             if let Some(created) = created {
-                *pipeline.lock().unwrap() = created;
                 if let Some(statistics) = &pipeline_statistics {
                     statistics.collect(build.device_owner.get(), created);
                 }
@@ -2348,6 +2376,22 @@ mod tests {
         assert!(should_update_descriptor_set(true, &first, &first));
         assert!(should_update_descriptor_set(false, &[], &first));
         assert!(should_update_descriptor_set(false, &first, &changed));
+    }
+
+    #[test]
+    fn gpu_log_payloads_match_upstream_graphics_pipeline_strings() {
+        let key = GraphicsPipelineKey {
+            unique_hashes: [0, 123, 0, 0, 0, 456],
+            fixed_state: FixedPipelineState::default(),
+        };
+        assert_eq!(
+            graphics_pipeline_bind_log_info(&key),
+            format!("hash={:#016x}", key.hash_value())
+        );
+        assert_eq!(
+            graphics_pipeline_creation_log_info(3, 2),
+            "GraphicsPipeline created: stages=3, attachments=2"
+        );
     }
 
     #[test]

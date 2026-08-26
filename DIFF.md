@@ -12186,20 +12186,42 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   build path.
 - Scheduler pipeline identity uses the stable Rust `GraphicsPipeline` address through a raw
   identity handle; this is the direct counterpart of Eden tracking `GraphicsPipeline*`.
-- GPU pipeline/shader logging remains unavailable because the project-wide Eden GPU logging
-  subsystem is not ported.
 
 ### Unintentional differences (to fix)
 - None in the reviewed construction, vertex-input, runtime-info, geometry-passthrough, pipeline
-  configuration, or bind-order paths. `MarkShaderBuilding` is now owned by the Rust graphics
-  pipeline constructor counterpart instead of `pipeline_cache.rs`.
+  configuration, bind-order, or GPU-logging paths. `MarkShaderBuilding` is now owned by the Rust
+  graphics pipeline constructor counterpart instead of `pipeline_cache.rs`.
 
 ### Missing items
-- The project-wide GPU logging subsystem remains outside this file-level parity slice.
+- None in `GraphicsPipeline`.
 
 ### Binary layout verification
 - PASS: no serialized or raw-copied layout changed. The correction only moves notification
   ownership across the existing constructor boundary.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+
+- Rust moves Eden's two inline `fmt::format` expressions into file-local formatting helpers so
+  their exact payloads can be covered without constructing Vulkan objects. The helpers remain in
+  the matching pipeline owner file; logger access uses the process-wide singleton functions.
+
+### Unintentional differences (to fix)
+
+- None after logging a graphics bind only when the scheduler changes pipeline and Eden's Vulkan
+  call logging guard is enabled, and logging successful graphics-pipeline creation with the exact
+  shader-stage and color-attachment counts after publishing the created handle and before
+  collecting pipeline statistics, in Eden's lifecycle order.
+
+### Missing items
+
+- None in the GPU-logging hooks owned by `GraphicsPipeline`.
+
+### Binary layout verification
+
+- N/A: the change adds host-side logging calls without modifying pipeline keys, Vulkan create
+  structures, descriptor payloads, or serialized data.
 
 ## 2026-08-26 — `src/video_core/src/host1x/{host1x,nvdec}.rs` vs Eden `src/video_core/host1x/host1x.{h,cpp}` and `nvdec.cpp`
 

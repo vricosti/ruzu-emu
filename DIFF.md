@@ -13309,3 +13309,63 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: this file owns constants and a normal `FramebufferLayout` value; it defines no raw-copied
   or serialized payload. Focused tests verify the aligned height, tiled size, pixel format, and
   complete framebuffer layout.
+
+## 2026-08-26 — `src/video_core/src/cdma_pusher.rs` vs Eden `src/video_core/cdma_pusher.h` and `.cpp`
+
+### Intentional differences
+
+- Eden uses virtual inheritance for each device's `ProcessMethod`; Ruzu stores the corresponding
+  `ProcessMethodHook` trait object. NvDec and Vic install their concrete processors, and the call
+  remains owned by the CDMA pusher's `SetMethod1` path.
+- Ruzu keeps the worker-owned parser/register state behind mutexes because the pusher is shared
+  through `Arc`; its condition variable plus explicit stop flag and joined thread reproduce the
+  `std::jthread` wait, stop, and destruction ordering.
+- The core/video bridge materializes a safe-read command list into an owned vector before enqueue,
+  whereas Eden's `CpuGuestMemory` may retain a direct guest span when contiguous. This avoids a
+  borrowed, self-referential guest-memory view crossing the Rust worker-thread boundary; normal
+  submitted command buffers are immutable after submission, so command order and contents match.
+- Ruzu diagnoses and skips a THI register index beyond `NUM_REGS`. Eden indexes the fixed register
+  array out of bounds for such an invalid command, which is undefined behavior; valid methods use
+  the identical register write and dispatch sequence.
+
+### Unintentional differences (to fix)
+
+- None after replacing lossy enum conversions with transparent raw-value-preserving
+  `ChClassId`/Control-method wrappers. Unknown class IDs now remain in parser state, and unknown
+  Control methods reach the same unimplemented/default path instead of being mapped to `NoClass`
+  or silently discarded.
+
+### Missing items
+
+- None in the CDMA parser, worker lifecycle, Control dispatch, THI register actions, or virtual
+  device dispatch used by NvDec and Vic.
+
+### Binary layout verification
+
+- PASS: focused tests verify the 4-byte command header, every header bit field and submission-mode
+  value, the 4-byte class identifier including unknown raw values, all THI method offsets, and the
+  0x80-byte THI register array.
+
+## 2026-08-26 — `src/video_core/src/host1x/control.rs` vs Eden `src/video_core/host1x/control.h` and `.cpp`
+
+### Intentional differences
+
+- `Control` owns the shared syncpoint manager rather than receiving the parent `Host1x&` on each
+  method call. This avoids a parent/device reference cycle while preserving the same manager and
+  wait operation.
+- `Method` is a transparent `u32` newtype rather than a Rust enum so Eden's default switch arm can
+  safely receive arbitrary values produced by `Control::Method(raw)`.
+
+### Unintentional differences (to fix)
+
+- None after forwarding unknown raw methods to the unimplemented diagnostic path instead of
+  dropping them in `CDmaPusher::execute_command`.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `Method` remains four bytes, and focused tests verify all three constants plus preservation
+  of an unknown raw method value.

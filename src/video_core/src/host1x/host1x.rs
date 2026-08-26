@@ -337,7 +337,7 @@ impl Host1x {
         };
         let pusher = Arc::new(CDmaPusher::new_with_processor(
             self.syncpoint_manager.clone(),
-            class_id as i32,
+            class_id.raw() as i32,
             processor,
         ));
         self.devices.lock().unwrap().insert(fd, pusher);

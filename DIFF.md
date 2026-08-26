@@ -13198,3 +13198,34 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: `BufferCache` is host-only state and is never raw-copied or serialized. Focused tests verify
   the fixed page-table length, inline `SmallVec` capacities, enum/runtime contracts, range
   arithmetic, upload/download behavior, binding usage, and overlap/tick lifecycle ordering.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/memory_tracker_base.rs` vs Eden `src/video_core/buffer_cache/memory_tracker_base.h`
+
+### Intentional differences
+
+- Rust stores stable `(pool_index, slot_index)` locations instead of raw `Manager*` values. Each
+  32-manager batch is a boxed fixed array, so its elements stay at stable addresses while the
+  outer collection grows, and every lookup resolves the same manager selected by Eden.
+- The fixed top-tier array is boxed to avoid placing it on the Rust object stack; its compile-time
+  length and indexing contract match Eden's `std::array`.
+- `cached_cpu_write` records page identifiers during manager iteration and inserts them afterward
+  to split simultaneous mutable borrows of the manager pool and cached-page set. The same page IDs
+  are inserted into an unordered set.
+- Both page iterators detect an index beyond the 34-bit tracked address space, emit a rate-limited
+  diagnostic, and stop. Eden indexes its fixed array out of bounds in that invalid state, which is
+  undefined behavior; valid device-address ranges follow the same iteration path.
+
+### Unintentional differences (to fix)
+
+- None after restoring fixed-size top-tier/pool storage, explicit FIFO free-manager ordering, and
+  wrapping unsigned address composition.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the tracker is host-only state and is not raw-copied or serialized. Focused tests verify the
+  4096-entry top tier, 32-manager pool batches, FIFO slot order, normal queries, and out-of-range
+  handling.

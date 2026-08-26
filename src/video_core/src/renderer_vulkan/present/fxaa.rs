@@ -94,7 +94,7 @@ impl Fxaa {
             let image =
                 util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
             let image_view = util::create_wrapped_image_view(
-                device.get_logical(),
+                device,
                 image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
@@ -110,14 +110,14 @@ impl Fxaa {
     /// Port of `FXAA::CreateRenderPasses`.
     fn create_render_passes(&mut self, device: &Device) {
         self.renderpass = util::create_wrapped_render_pass(
-            device.get_logical(),
+            device,
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageLayout::GENERAL,
         );
 
         for image in &mut self.dynamic_images {
             image.framebuffer = util::create_wrapped_framebuffer(
-                device.get_logical(),
+                device,
                 self.renderpass,
                 image.image_view,
                 self.extent,
@@ -127,7 +127,7 @@ impl Fxaa {
 
     /// Port of `FXAA::CreateSampler`.
     fn create_sampler(&mut self, device: &Device) {
-        self.sampler = util::create_wrapped_sampler(device.get_logical(), vk::Filter::LINEAR);
+        self.sampler = util::create_wrapped_sampler(device, vk::Filter::LINEAR);
     }
 
     /// Port of `FXAA::CreateShaders`.
@@ -142,9 +142,9 @@ impl Fxaa {
     fn create_descriptor_pool(&mut self, device: &Device) {
         // 2 descriptors, 1 descriptor set per image
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            device.get_logical(),
-            2 * self.image_count,
-            self.image_count,
+            device,
+            2 * self.image_count as usize,
+            self.image_count as usize,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
     }
@@ -152,11 +152,12 @@ impl Fxaa {
     /// Port of `FXAA::CreateDescriptorSetLayouts`.
     fn create_descriptor_set_layouts(&mut self, device: &Device) {
         self.descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            device.get_logical(),
+            device,
             &[
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             ],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
     }
 
@@ -174,13 +175,13 @@ impl Fxaa {
     /// Port of `FXAA::CreatePipelineLayouts`.
     fn create_pipeline_layouts(&mut self, device: &Device) {
         self.pipeline_layout =
-            util::create_wrapped_pipeline_layout(device.get_logical(), self.descriptor_set_layout);
+            util::create_wrapped_pipeline_layout(device, self.descriptor_set_layout);
     }
 
     /// Port of `FXAA::CreatePipelines`.
     fn create_pipelines(&mut self, device: &Device) {
         self.pipeline = util::create_wrapped_pipeline(
-            device.get_logical(),
+            device,
             self.renderpass,
             self.pipeline_layout,
             self.vertex_shader,

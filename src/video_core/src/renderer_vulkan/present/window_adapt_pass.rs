@@ -81,8 +81,9 @@ impl WindowAdaptPass {
     /// Port of `WindowAdaptPass::CreateDescriptorSetLayout`.
     fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
         util::create_wrapped_descriptor_set_layout(
-            device.get_logical(),
+            device,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         )
     }
 
@@ -117,11 +118,7 @@ impl WindowAdaptPass {
 
     /// Port of `WindowAdaptPass::CreateRenderPass`.
     fn create_render_pass(device: &Device, frame_format: vk::Format) -> vk::RenderPass {
-        util::create_wrapped_render_pass(
-            device.get_logical(),
-            frame_format,
-            vk::ImageLayout::UNDEFINED,
-        )
+        util::create_wrapped_render_pass(device, frame_format, vk::ImageLayout::UNDEFINED)
     }
 
     /// Port of `WindowAdaptPass::CreatePipelines`.
@@ -132,24 +129,23 @@ impl WindowAdaptPass {
         vertex_shader: vk::ShaderModule,
         fragment_shader: vk::ShaderModule,
     ) -> (vk::Pipeline, vk::Pipeline, vk::Pipeline) {
-        let logical = device.get_logical();
         (
             util::create_wrapped_pipeline(
-                logical,
+                device,
                 render_pass,
                 pipeline_layout,
                 vertex_shader,
                 fragment_shader,
             ),
             util::create_wrapped_premultiplied_blending_pipeline(
-                logical,
+                device,
                 render_pass,
                 pipeline_layout,
                 vertex_shader,
                 fragment_shader,
             ),
             util::create_wrapped_coverage_blending_pipeline(
-                logical,
+                device,
                 render_pass,
                 pipeline_layout,
                 vertex_shader,

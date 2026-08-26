@@ -62,7 +62,7 @@ impl Sgsr {
             let image =
                 util::create_wrapped_image(allocator, extent, vk::Format::R16G16B16A16_SFLOAT);
             let image_view = util::create_wrapped_image_view(
-                logical,
+                device,
                 image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
@@ -75,16 +75,16 @@ impl Sgsr {
         }
 
         let renderpass = util::create_wrapped_render_pass(
-            logical,
+            device,
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageLayout::GENERAL,
         );
         for images in &mut dynamic_images {
             images.framebuffer =
-                util::create_wrapped_framebuffer(logical, renderpass, images.image_view, extent);
+                util::create_wrapped_framebuffer(device, renderpass, images.image_view, extent);
         }
 
-        let sampler = util::create_bilinear_sampler(logical);
+        let sampler = util::create_bilinear_sampler(device);
         let vert_shader = build_shader(logical, SGSR1_SHADER_VERT_SPV)
             .expect("Failed to build sgsr1_shader.vert");
         let (stage_code, stage_name) = if edge_dir {
@@ -99,14 +99,15 @@ impl Sgsr {
             .unwrap_or_else(|_| panic!("Failed to build {stage_name}"));
 
         let descriptor_pool = util::create_wrapped_descriptor_pool(
-            logical,
-            image_count as u32,
-            image_count as u32,
+            device,
+            image_count,
+            image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
         let descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            logical,
+            device,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
         for images in &mut dynamic_images {
             images.descriptor_sets = util::create_wrapped_descriptor_sets(
@@ -132,7 +133,7 @@ impl Sgsr {
                 .expect("Failed to create SGSR pipeline layout")
         };
         let stage_pipeline = util::create_wrapped_pipeline(
-            logical,
+            device,
             renderpass,
             pipeline_layout,
             vert_shader,

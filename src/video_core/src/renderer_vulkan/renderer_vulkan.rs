@@ -602,8 +602,7 @@ impl RendererVulkan {
             format,
         );
         frame.set_image_allocation(image);
-        frame.image_view =
-            create_wrapped_image_view(self.device.get_logical(), frame.image, format);
+        frame.image_view = create_wrapped_image_view(&self.device, frame.image, format);
         frame.framebuffer = self.blit_capture.create_framebuffer(
             self.device.as_ref(),
             &mut self.scheduler,
@@ -711,11 +710,8 @@ impl RendererVulkan {
                 CAPTURE_FORMAT,
             );
             self.applet_frame.set_image_allocation(image);
-            self.applet_frame.image_view = create_wrapped_image_view(
-                self.device.get_logical(),
-                self.applet_frame.image,
-                CAPTURE_FORMAT,
-            );
+            self.applet_frame.image_view =
+                create_wrapped_image_view(&self.device, self.applet_frame.image, CAPTURE_FORMAT);
             self.applet_frame.framebuffer = self.blit_applet.create_framebuffer(
                 self.device.as_ref(),
                 &mut self.scheduler,

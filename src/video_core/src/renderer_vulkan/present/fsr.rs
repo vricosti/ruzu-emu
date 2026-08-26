@@ -126,12 +126,12 @@ impl Fsr {
             let rcas_image =
                 util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
             let easu_view = util::create_wrapped_image_view(
-                device.get_logical(),
+                device,
                 easu_image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
             let rcas_view = util::create_wrapped_image_view(
-                device.get_logical(),
+                device,
                 rcas_image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
@@ -147,20 +147,20 @@ impl Fsr {
     /// Port of `FSR::CreateRenderPasses`.
     fn create_render_passes(&mut self, device: &Device) {
         self.renderpass = util::create_wrapped_render_pass(
-            device.get_logical(),
+            device,
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageLayout::GENERAL,
         );
 
         for images in &mut self.dynamic_images {
             images.framebuffers[FsrStage::Easu as usize] = util::create_wrapped_framebuffer(
-                device.get_logical(),
+                device,
                 self.renderpass,
                 images.image_views[FsrStage::Easu as usize],
                 self.extent,
             );
             images.framebuffers[FsrStage::Rcas as usize] = util::create_wrapped_framebuffer(
-                device.get_logical(),
+                device,
                 self.renderpass,
                 images.image_views[FsrStage::Rcas as usize],
                 self.extent,
@@ -170,7 +170,7 @@ impl Fsr {
 
     /// Port of `FSR::CreateSampler`.
     fn create_sampler(&mut self, device: &Device) {
-        self.sampler = util::create_bilinear_sampler(device.get_logical());
+        self.sampler = util::create_bilinear_sampler(device);
     }
 
     /// Port of `FSR::CreateShaders`.
@@ -204,9 +204,9 @@ impl Fsr {
         // RCAS: 1 descriptor
         // 2 descriptors, 2 descriptor sets per invocation
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            device.get_logical(),
-            2 * self.image_count as u32,
-            2 * self.image_count as u32,
+            device,
+            2 * self.image_count,
+            2 * self.image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
     }
@@ -214,8 +214,9 @@ impl Fsr {
     /// Port of `FSR::CreateDescriptorSetLayout`.
     fn create_descriptor_set_layout(&mut self, device: &Device) {
         self.descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            device.get_logical(),
+            device,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
     }
 
@@ -254,14 +255,14 @@ impl Fsr {
     /// Port of `FSR::CreatePipelines`.
     fn create_pipelines(&mut self, device: &Device) {
         self.easu_pipeline = util::create_wrapped_pipeline(
-            device.get_logical(),
+            device,
             self.renderpass,
             self.pipeline_layout,
             self.vert_shader,
             self.easu_shader,
         );
         self.rcas_pipeline = util::create_wrapped_pipeline(
-            device.get_logical(),
+            device,
             self.renderpass,
             self.pipeline_layout,
             self.vert_shader,

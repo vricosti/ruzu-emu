@@ -16800,3 +16800,42 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests pin the empty member at 1 byte, `DescriptorAddress` at 24 bytes with offsets
   0/8/16, and `DescriptorUpdateEntry` to the maximum member size and alignment used as Vulkan
   update-template stride.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and presentation callers vs Eden `src/video_core/renderer_vulkan/present/util.{h,cpp}`
+
+### Intentional differences
+
+- Command-recording helpers receive raw Ash device and command-buffer handles because Rust's
+  scheduler closures own copied dispatch tables and handles instead of borrowing Eden's
+  `vk::CommandBuffer` wrapper. Barrier contents and command ordering are unchanged.
+- Vulkan objects are raw handles with explicit destruction in their presentation owners rather
+  than Eden's move-only `vk::*` wrappers. `CreateWrappedDescriptorSets` consequently also needs
+  the logical device that Eden obtains from its descriptor-pool wrapper.
+- C++ default arguments and the descriptor-layout initializer-list overload are explicit Rust
+  arguments. Callers pass Eden's default combined-image-sampler type and vertex/fragment stages;
+  the common slice implementation also accepts compute stages for the matching upstream path.
+- Small create-info builders are same-file mechanical test seams for Eden's local vectors and
+  input-assembly structure; they do not move behavior out of the `present/util.rs` owner.
+
+### Unintentional differences (to fix)
+
+- None after porting the previously absent `CreateWrappedComputePipeline` implementation.
+- None after replacing `ALL_COMMANDS` in `download_color_image` with Eden's precise
+  graphics/compute/transfer source and graphics/compute destination stage masks.
+- None after restoring MoltenVK-only primitive restart for the presentation triangle-strip
+  pipelines.
+- None after forwarding descriptor-layout stage flags, preserving explicit empty descriptor-pool
+  type lists and Eden's `size_t`-to-`u32` casts, and restoring the fail-soft capacity assertion
+  that protects descriptor-image pointers from vector reallocation.
+- None after restoring the high-level `Device` boundary for resource, sampler, descriptor, and
+  pipeline creation helpers and updating their presentation callers accordingly.
+
+### Missing items
+
+- None in the audited `present/util.h`/`.cpp` public API or file-static pipeline helper.
+
+### Binary layout verification
+
+- N/A for the Vulkan handles and create-info values changed here. Existing focused tests continue
+  to verify the locally declared QCOM sampler pNext ABI; new tests pin descriptor construction,
+  unsigned descriptor-count conversion, pointer stability, and MoltenVK input assembly state.

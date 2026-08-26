@@ -195,9 +195,9 @@ impl Layer {
     /// Port of `Layer::CreateDescriptorPool`.
     fn create_descriptor_pool(&mut self, device: &Device) {
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            device.get_logical(),
-            self.image_count as u32,
-            self.image_count as u32,
+            device,
+            self.image_count,
+            self.image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
     }
@@ -606,7 +606,7 @@ impl Layer {
                 }
             }
             self.raw_image_views[image_index] =
-                util::create_wrapped_image_view(device.get_logical(), image.handle(), format);
+                util::create_wrapped_image_view(device, image.handle(), format);
             self.raw_images.push(image);
         }
     }

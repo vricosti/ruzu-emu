@@ -34,7 +34,7 @@ pub use super::util::CubicFilterWeights;
 /// the basic present fragment shader.
 pub fn make_nearest_neighbor(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
     let logical = device.get_logical();
-    let sampler = util::create_nearest_neighbor_sampler(logical);
+    let sampler = util::create_nearest_neighbor_sampler(device);
     let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
         .expect("Failed to build vulkan_present.frag");
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
@@ -46,7 +46,7 @@ pub fn make_nearest_neighbor(device: &Device, frame_format: vk::Format) -> Windo
 /// present fragment shader.
 pub fn make_bilinear(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
     let logical = device.get_logical();
-    let sampler = util::create_bilinear_sampler(logical);
+    let sampler = util::create_bilinear_sampler(device);
     let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
         .expect("Failed to build vulkan_present.frag");
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
@@ -89,7 +89,7 @@ pub fn make_bicubic(
             (PRESENT_MITCHELL_FRAG_SPV, "present_mitchell.frag")
         }
     };
-    let sampler = util::create_bilinear_sampler(logical);
+    let sampler = util::create_bilinear_sampler(device);
     let fragment_shader =
         build_shader(logical, shader).unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
@@ -102,7 +102,7 @@ fn make_shader_filter(
     shader_name: &str,
 ) -> WindowAdaptPass {
     let logical = device.get_logical();
-    let sampler = util::create_bilinear_sampler(logical);
+    let sampler = util::create_bilinear_sampler(device);
     let fragment_shader =
         build_shader(logical, shader).unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
@@ -124,7 +124,7 @@ pub fn make_spline1(device: &Device, frame_format: vk::Format) -> WindowAdaptPas
 /// Gaussian blur fragment shader.
 pub fn make_gaussian(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
     let logical = device.get_logical();
-    let sampler = util::create_bilinear_sampler(logical);
+    let sampler = util::create_bilinear_sampler(device);
     let fragment_shader = build_shader(logical, PRESENT_GAUSSIAN_FRAG_SPV)
         .expect("Failed to build present_gaussian.frag");
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
@@ -146,7 +146,7 @@ pub fn make_lanczos(device: &Device, frame_format: vk::Format) -> WindowAdaptPas
 /// ScaleForce shader (fp16 preferred, fp32 fallback).
 pub fn make_scale_force(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
     let logical = device.get_logical();
-    let sampler = util::create_bilinear_sampler(logical);
+    let sampler = util::create_bilinear_sampler(device);
     let (shader_spv, shader_name) = if device.is_float16_supported() {
         (
             VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV,
@@ -176,7 +176,7 @@ pub fn make_area(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
 /// Port of `MakeMmpx`; upstream selects a nearest-neighbour sampler for MMPX.
 pub fn make_mmpx(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
     let logical = device.get_logical();
-    let sampler = util::create_nearest_neighbor_sampler(logical);
+    let sampler = util::create_nearest_neighbor_sampler(device);
     let fragment_shader =
         build_shader(logical, PRESENT_MMPX_FRAG_SPV).expect("Failed to build present_mmpx.frag");
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)

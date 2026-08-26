@@ -14781,3 +14781,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `SyncptIncr` is `repr(C)`, size 16, alignment 4, with its four fields at offsets 0, 4, 8,
   and 12. It is process-local and is not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/mod.rs` and source exports vs Eden `src/video_core/host_shaders/`
+
+### Intentional differences
+
+- Rust groups source strings by shader stage and generates Vulkan SPIR-V from `build.rs`; Eden's
+  CMake helpers generate C++ headers. The source files passed to the compilers are the same.
+- Three copied shader files retain a final newline absent from Eden. GLSL parsing and generated
+  instructions are unaffected.
+
+### Unintentional differences (to fix)
+
+- Resolved: vertex shaders and `opengl_smaa.glsl` are no longer duplicated as large Rust raw
+  strings. Their exported constants now use `include_str!`, like the compute and fragment exports,
+  so each upstream shader has a single auditable source owner.
+- Resolved: `opengl_present.vert` now exists beside the other shader sources instead of living only
+  inside `vertex_shaders.rs`.
+
+### Missing items
+
+- None from Eden's runtime `.comp`, `.frag`, `.vert`, or `.glsl` source inventory.
+
+### Binary layout verification
+
+- N/A: GLSL sources are text; Vulkan modules are validated separately by the generated-SPIR-V
+  tests.

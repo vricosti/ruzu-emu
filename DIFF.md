@@ -17391,3 +17391,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the singleton contains host-only synchronization objects and boxed closures.
+
+## 2026-08-26 — `src/video_core/src/query_cache_top.rs` and `src/video_core/src/renderer_opengl/gl_query_cache.rs` vs Eden `src/video_core/query_cache.h` and `src/video_core/renderer_opengl/gl_query_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses the CRTP relationship among the legacy cache, cached query, counter stream, and
+  host counter with `LegacyCachedQuery` and `CounterHandle` traits. The shared lifecycle and
+  renderer-specific method ownership remain split at the same boundary as Eden.
+- `Arc<Mutex<_>>` replaces `shared_ptr` ownership for host counters and the OpenGL query pool, and
+  `ReentrantMutex` replaces Eden's `recursive_mutex`.
+- Rasterizer services and `AnyCommandQueued()` are passed explicitly through the Rust call sites
+  rather than retained as self-referential backend references. The values are sampled at the same
+  operations where Eden calls the rasterizer.
+- `PopAsyncFlushes` clones the front batch's scalar slot identifiers so Rust can mutate the cache
+  while preserving Eden's requirement that the original front batch remains queued throughout
+  processing.
+
+### Unintentional differences (to fix)
+
+- Resolved: `FlushAndRemoveRegion` now retains a cached-page map entry after its last query is
+  erased, matching `std::erase_if(contents, ...)` on Eden's existing map value.
+- Resolved: `PopAsyncFlushes` no longer removes a non-null batch before collecting its queries; it
+  keeps that batch at the front and pops it only after processing, matching Eden's lifecycle order.
+
+### Missing items
+
+- None in the audited legacy query-cache or OpenGL query-cache paths.
+
+### Binary layout verification
+
+- N/A: these caches contain host-only Rust/C++ ownership and synchronization objects; guest
+  writebacks explicitly serialize the same 32-bit/64-bit values and optional timestamp bytes as
+  Eden.

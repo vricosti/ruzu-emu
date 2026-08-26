@@ -638,7 +638,11 @@ mod tests {
 
         cache.flush_region(0x5510_6000, 8, false);
 
-        assert!(!cache.legacy.cached_queries.contains_key(&hit_page));
+        assert!(cache
+            .legacy
+            .cached_queries
+            .get(&hit_page)
+            .is_some_and(Vec::is_empty));
         assert!(cache.legacy.cached_queries.contains_key(&cold_page));
     }
 
@@ -664,7 +668,11 @@ mod tests {
 
         cache.flush_region(cpu_addr, 8, false);
 
-        assert!(!cache.legacy.cached_queries.contains_key(&page));
+        assert!(cache
+            .legacy
+            .cached_queries
+            .get(&page)
+            .is_some_and(Vec::is_empty));
     }
 
     #[test]

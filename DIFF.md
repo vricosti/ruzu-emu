@@ -14292,3 +14292,45 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `Device` is a private in-process capability object and is never serialized or copied as a
   raw upstream payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_graphics_pipeline.rs` vs Eden `src/video_core/renderer_opengl/gl_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+
+- Eden's constructor-selected `ConfigureImpl<Spec>` function pointer is represented by a private
+  `ConfigureSpec` enum. Selection order, enabled stages, descriptor-family gates, and the complete
+  configure operation order remain identical.
+- Stable non-owning pointers and a synchronized completed-build slot adapt Eden's references and
+  worker lambda without letting a Rust worker mutate a partially constructed object. Program and
+  fence publication still precede `MarkShaderComplete`, and synchronous/parallel fence creation
+  follows the same conditions.
+- Maxwell register data is borrowed through the renderer's live draw view and the GPU-memory guard
+  is released before `FillImageViews`; this preserves Eden's descriptor snapshot and cache-lock
+  ordering within the Rust ownership graph.
+- Absent stages use `Option<Shader::Info>` instead of Eden's default-constructed `Shader::Info`;
+  the selected configure specialization excludes those stages, so their descriptor state is never
+  consumed.
+- Rust zero-initializes fixed OpenGL-handle staging arrays because safe Rust cannot expose
+  partially initialized arrays. Like Eden, every OpenGL call consumes only the populated prefix.
+
+### Unintentional differences (to fix)
+
+- Resolved: GLSL strings and SPIR-V vectors are now moved into the one-shot program-build task and
+  released after compilation, rather than cloned and retained for every cached pipeline's entire
+  lifetime.
+- Resolved: cumulative descriptor totals, base uniform/storage bindings, and transform-feedback
+  stride arithmetic now preserve Eden's unsigned `u32` wrapping semantics in debug builds.
+- Resolved: global sampler, texture, and image binding counters now retain OpenGL's signed 32-bit
+  `GLsizei` representation through pointer selection, array indexing, and final bind calls.
+- Resolved: per-stage view traversal now advances by the wrapped `Shader::NumDescriptors` result,
+  rather than independently summing descriptor counts in host `usize` arithmetic.
+
+### Missing items
+
+- None in `GraphicsPipelineKey`, constructor metadata, `ConfigureImpl`, transform feedback,
+  asynchronous program construction, `WaitForBuild`, or `IsBuilt`.
+
+### Binary layout verification
+
+- PASS: `GraphicsPipelineKey` is `repr(C)`, 624 bytes, with the same 52-byte no-XFB hash prefix;
+  `TransformFeedbackState` is 560 bytes and raw cache round trips cover the complete XFB key.

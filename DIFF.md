@@ -13092,3 +13092,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: `AllocatedBuffer` is an owning host wrapper and is never copied or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/buffer_base.rs` vs Eden `src/video_core/buffer_cache/buffer_base.h`
+
+### Intentional differences
+
+- Eden's `VAddr` and `DAddr` are both aliases of `u64`. Ruzu retains its existing `VAddr` alias for
+  the private CPU address and spells the public cached device-address field as `u64`, preserving
+  the same type identity, value, visibility, and bit pattern without introducing another local
+  address alias.
+- Eden's class-static page constants are module constants in the corresponding Rust file. The
+  owner, values, and visibility remain local to `buffer_base.rs`.
+
+### Unintentional differences (to fix)
+
+- None after restoring public `cpu_addr_cached`, initializing it in both constructors, consuming it
+  in `SynchronizeBuffer`, and using wrapping unsigned additions in `is_in_bounds`.
+
+### Missing items
+
+- None in `BufferFlagBits`, `NullBufferParams`, `BufferBase` state, constructors, or methods.
+
+### Binary layout verification
+
+- N/A: `BufferBase` is neither raw-copied nor serialized. Its state order follows Eden
+  conceptually, and focused tests verify all flag bit patterns, constructor defaults, cached
+  address state, boundary arithmetic, LRU state, stream score, preemptive flag, and write tick.

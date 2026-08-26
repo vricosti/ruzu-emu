@@ -50,6 +50,9 @@ pub const BASE_PAGE_SIZE: u64 = 1u64 << BASE_PAGE_BITS;
 /// not own any GPU-side resource — that is the responsibility of the
 /// backend-specific `Buffer` type.
 pub struct BufferBase {
+    /// Cached device-address view of `cpu_addr`, matching Eden's public
+    /// `DAddr cpu_addr_cached` member (`DAddr` and `VAddr` are both `u64`).
+    pub cpu_addr_cached: u64,
     cpu_addr: VAddr,
     flags: BufferFlagBits,
     stream_score: i32,
@@ -63,6 +66,7 @@ impl BufferBase {
     /// Create a new buffer base for the given CPU address and size.
     pub fn new(cpu_addr: VAddr, size_bytes: u64) -> Self {
         Self {
+            cpu_addr_cached: cpu_addr,
             cpu_addr,
             flags: BufferFlagBits::empty(),
             stream_score: 0,
@@ -75,6 +79,7 @@ impl BufferBase {
     /// Create a null buffer (no storage, no size).
     pub fn null(_params: NullBufferParams) -> Self {
         Self {
+            cpu_addr_cached: 0,
             cpu_addr: 0,
             flags: BufferFlagBits::empty(),
             stream_score: 0,
@@ -117,7 +122,8 @@ impl BufferBase {
     /// Returns true when `vaddr .. vaddr+size` is fully contained in the buffer.
     #[inline]
     pub fn is_in_bounds(&self, addr: VAddr, size: u64) -> bool {
-        addr >= self.cpu_addr && addr + size <= self.cpu_addr + self.size_bytes() as u64
+        addr >= self.cpu_addr
+            && addr.wrapping_add(size) <= self.cpu_addr.wrapping_add(self.size_bytes() as u64)
     }
 
     /// Returns true if the buffer has been marked as picked.
@@ -186,8 +192,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn buffer_flag_bits_match_upstream() {
+        assert_eq!(BufferFlagBits::PICKED.bits(), 1);
+        assert_eq!(BufferFlagBits::CACHED_WRITES.bits(), 2);
+        assert_eq!(BufferFlagBits::PREEMTIVE_DOWNLOAD.bits(), 4);
+    }
+
+    #[test]
     fn test_null_buffer() {
         let buf = BufferBase::null(NullBufferParams);
+        assert_eq!(buf.cpu_addr_cached, 0);
         assert_eq!(buf.cpu_addr(), 0);
         assert_eq!(buf.size_bytes(), 0);
         assert!(!buf.is_picked());
@@ -206,10 +220,20 @@ mod tests {
     #[test]
     fn test_is_in_bounds() {
         let buf = BufferBase::new(0x1000, 0x2000);
+        assert_eq!(buf.cpu_addr_cached, 0x1000);
         assert!(buf.is_in_bounds(0x1000, 0x2000));
         assert!(buf.is_in_bounds(0x1500, 0x500));
         assert!(!buf.is_in_bounds(0x0FFF, 1));
         assert!(!buf.is_in_bounds(0x1000, 0x2001));
+    }
+
+    #[test]
+    fn is_in_bounds_preserves_upstream_unsigned_wrapping() {
+        let buf = BufferBase::new(0, 0);
+        assert!(buf.is_in_bounds(u64::MAX, 1));
+
+        let wrapped_end = BufferBase::new(u64::MAX - 1, 2);
+        assert!(!wrapped_end.is_in_bounds(u64::MAX - 1, 0));
     }
 
     #[test]
@@ -227,6 +251,18 @@ mod tests {
         assert_eq!(buf.stream_score(), 5);
         buf.increase_stream_score(-2);
         assert_eq!(buf.stream_score(), 3);
+    }
+
+    #[test]
+    fn preemptive_download_and_write_tick_match_upstream_defaults() {
+        let mut buf = BufferBase::new(0x1000, 0x100);
+        assert!(!buf.is_preemtive_download());
+        assert_eq!(buf.write_tick(), 0);
+
+        buf.mark_preemtive_download();
+        buf.set_write_tick(27);
+        assert!(buf.is_preemtive_download());
+        assert_eq!(buf.write_tick(), 27);
     }
 
     #[test]

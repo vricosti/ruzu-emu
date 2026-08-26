@@ -3386,7 +3386,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut total_size_bytes: u64 = 0;
         let mut largest_copy: u64 = 0;
 
-        let buffer_start = self.slot_buffers[buffer_id].cpu_addr();
+        let buffer_start = self.slot_buffers[buffer_id].cpu_addr_cached;
 
         self.memory_tracker.for_each_upload_range(
             device_addr,

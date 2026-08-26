@@ -13229,3 +13229,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the tracker is host-only state and is not raw-copied or serialized. Focused tests verify the
   4096-entry top tier, 32-manager pool batches, FIFO slot order, normal queries, and out-of-range
   handling.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/usage_tracker.rs` vs Eden `src/video_core/buffer_cache/usage_tracker.h`
+
+### Intentional differences
+
+- Eden's `~u64{0} >> (64 - num_bits)` has undefined C++ behavior when `num_bits == 0`.
+  GCC 13.3 on the supported x86-64 host lowers the variable shift to the hardware modulo-64
+  operation, yielding an all-ones mask. Rust spells out that conservative over-marking explicitly
+  so sub-64-byte and zero-length ranges do not panic or silently become no-ops.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's effective conservative mask for sub-granule ranges and preserving
+  unsigned wrapping before page calculation.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: `UsageTracker` is host-only state. Focused tests cover empty, single-page, cross-page,
+  reset, sub-64-byte, and zero-length range behavior.

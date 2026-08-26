@@ -16839,3 +16839,36 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A for the Vulkan handles and create-info values changed here. Existing focused tests continue
   to verify the locally declared QCOM sampler pNext ABI; new tests pin descriptor construction,
   unsigned descriptor-count conversion, pointer stability, and MoltenVK input assembly state.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/util_shaders.rs` vs Eden `src/video_core/renderer_opengl/util_shaders.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the existing shared, locked `ProgramManagerHandle` instead of Eden's non-owning
+  `ProgramManager&`; the lock covers each complete utility operation and preserves the program
+  bind, dispatch, and guest-state restoration ordering.
+- Program fields are declared in Eden's reverse member order because Rust drops structure fields
+  in declaration order, while C++ destroys members in reverse declaration order. The program
+  manager handle is dropped last so every OpenGL program is released first.
+- `ImageInfo` is cloned once per operation to satisfy Rust borrowing while preserving Eden's
+  immutable snapshot. Its tagged `TilingMode` explicitly reads `block.width` for the otherwise
+  invalid block-linear pitch path, matching the first `u32` shared by Eden's anonymous union.
+- Eden's fail-soft assertion handler is represented by an error log and a panic only when
+  `use_debug_asserts` is enabled; normal execution continues after the same failed invariants.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's fail-soft assertion policy for ASTC parameters, image-copy layer
+  invariants, non-power-of-two pitch uploads, and the invalid `StoreFormat` fallback. Ruzu had
+  logged some of these conditions without honoring `use_debug_asserts`.
+
+### Missing items
+
+- None in the audited constructor, utility operations, or `StoreFormat`. All eight compute-shader
+  source files consumed by this owner are byte-identical to Eden's current sources.
+
+### Binary layout verification
+
+- N/A: this owner passes ordinary scalar values and OpenGL handles and defines no guest-visible or
+  raw-serialized payload. Focused tests cover every `StoreFormat` mapping and its fail-soft
+  fallback.

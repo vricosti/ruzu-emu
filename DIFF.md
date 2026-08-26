@@ -13034,3 +13034,61 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: thread placement has no raw-copied or serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/buffer_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust's common-cache trait names the three concrete handle combinations for `CopyBuffer` and
+  supplies the mapped-uniform-buffer span through a callback. They preserve Eden's destination,
+  source, staging ownership, descriptor insertion, and command ordering without returning a borrow
+  tied simultaneously to the runtime and staging pool.
+- `DeviceReference` and stable `NonNull` service pointers represent Eden's reference members, and
+  the two anonymous quad-index subclasses are represented by topology-keyed state plus same-file
+  generation helpers. Method and constant ownership remains in `buffer_cache.rs`.
+- The unused, default-constructed `MemoryCommit` member left in Eden's anonymous
+  `QuadIndexBuffer` is omitted; allocation ownership already resides in Eden's `vk::Buffer` and
+  Ruzu's corresponding `AllocatedBuffer`, and neither implementation reads that extra member.
+- Ash exposes raw Vulkan handles rather than Eden's owning `vk::Buffer`; the allocation itself is
+  retained by `AllocatedBuffer`, and its views are explicitly destroyed before that allocation.
+
+### Unintentional differences (to fix)
+
+- None after restoring the host-visible direct-write/flush path, null transform-feedback fallback,
+  both single-buffer binding methods, `Quad LUT` debug name, native-endian LUT writes, upstream
+  allocation/replacement order, and the no-op behavior for non-quad topologies.
+
+### Missing items
+
+- None in `Buffer`, the quad-index hierarchy, `BufferCacheRuntime`, or `BufferCacheParams`.
+
+### Binary layout verification
+
+- N/A: this file owns host Vulkan resources and command parameters rather than raw-copied or
+  serialized structs. Focused tests verify LUT byte generation, index-type thresholds, null-binding
+  ranges, usage flags, and the restored single-binding API signatures.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden `src/video_core/vulkan_common/vulkan_wrapper.{h,cpp}` (`AllocatedBuffer` integration)
+
+### Intentional differences
+
+- Eden's `vk::Buffer` combines the Vulkan handle and VMA allocation in its wrapper layer. Ash has
+  no owning buffer wrapper, so the existing `AllocatedBuffer` in the allocator module owns the same
+  VMA allocation and provides the mapped-memory operations required by `vk_buffer_cache.cpp`.
+- VMA calls are serialized through the allocator mutex because Ruzu creates VMA for external
+  synchronization; Eden stores and calls its opaque allocator handle directly.
+
+### Unintentional differences (to fix)
+
+- None in the added `IsHostVisible`, mutable `Mapped`, and `Flush` equivalents: visibility follows
+  `pMappedData`, the span covers the requested buffer size, and non-coherent memory is flushed from
+  offset zero through `VK_WHOLE_SIZE` while preserving Eden's ignored VMA return value.
+
+### Missing items
+
+- None required by the buffer-cache host-visible LUT path. Other wrapper/allocator coverage remains
+  tracked by the dedicated Vulkan wrapper and memory-allocator audits.
+
+### Binary layout verification
+
+- N/A: `AllocatedBuffer` is an owning host wrapper and is never copied or serialized as raw bytes.

@@ -383,12 +383,40 @@ impl AllocatedBuffer {
         self.mapped_ptr
     }
 
+    /// Port of `vk::Buffer::IsHostVisible` for the owning ash/VMA wrapper.
+    pub fn is_host_visible(&self) -> bool {
+        !self.mapped_ptr.is_null() && self.size != 0
+    }
+
+    /// Port of mutable `vk::Buffer::Mapped`.
+    pub fn mapped_slice_mut(&mut self) -> &mut [u8] {
+        if !self.is_host_visible() {
+            return &mut [];
+        }
+        unsafe { std::slice::from_raw_parts_mut(self.mapped_ptr, self.size as usize) }
+    }
+
     pub fn size(&self) -> vk::DeviceSize {
         self.size
     }
 
     pub fn is_host_coherent(&self) -> bool {
         self.coherent
+    }
+
+    /// Port of `vk::Buffer::Flush`.
+    pub fn flush(&self) {
+        if self.coherent {
+            return;
+        }
+        let Some(allocation) = self.allocation.as_ref() else {
+            return;
+        };
+        let _ = self
+            .allocator
+            .lock()
+            .expect("VMA allocator mutex poisoned")
+            .flush_allocation(allocation, 0, vk::WHOLE_SIZE as usize);
     }
 }
 

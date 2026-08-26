@@ -15750,3 +15750,33 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: renderer state and frontend callback owners are host-only and are not raw guest payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/renderer_opengl.rs` vs Eden `src/video_core/renderer_opengl/renderer_opengl.{h,cpp}` and `renderer_base.cpp`
+
+### Intentional differences
+
+- Rust owns the device, tracker, rasterizer, presentation passes, and context through heap-stable
+  owners and non-owning pointers instead of C++ references; declaration order preserves Eden's
+  effective reverse destruction order.
+- The frontend layout and frame notifications use shared state and callbacks to avoid retaining
+  mutable GPU/window references across the Rust ownership cycle. The callback order remains
+  `RendererFrameEndNotify`, rasterizer tick, swap, then `OnFrameDisplayed`.
+- Construction releases the current context after GL resources are initialized so it can be moved
+  to the renderer thread; Eden's frontend transfers its context through the C++ window owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: OpenGL construction now performs the inherited `RendererBase` framebuffer-layout
+  refresh before entering the backend constructor body.
+- Resolved: an empty composite now returns before reading frontend layout state or making the GL
+  context current, matching Eden's first operation in `Composite`.
+
+### Missing items
+
+- None in construction, composition, telemetry, screenshot rendering, applet capture, debug
+  handling, or inherited base-renderer behavior.
+
+### Binary layout verification
+
+- N/A: the renderer owners, GL handles, and frontend callbacks are host-only and are not serialized
+  or copied as guest payloads.

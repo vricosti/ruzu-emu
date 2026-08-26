@@ -86,7 +86,7 @@ fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
 
     for z in 0..depth {
         for y in (0..height).step_by(4) {
-            workers.queue_work(move || {
+            workers.queue_stateless_work(move || {
                 // SAFETY: all queued rows complete before the borrowed spans
                 // can cease to be valid, matching Eden's by-value span capture.
                 let data = unsafe { send_data.as_slice(data_len) };

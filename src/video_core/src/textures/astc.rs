@@ -2181,7 +2181,7 @@ pub fn decompress(
     for z in 0..depth {
         let depth_offset = z * height * width * 4;
         for y_index in 0..rows {
-            workers.queue_work(move || {
+            workers.queue_stateless_work(move || {
                 // SAFETY: `decompress` waits for every queued request before its
                 // borrowed input slice can cease to be valid.
                 let data = unsafe { send_data.as_slice(data_len) };

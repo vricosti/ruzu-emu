@@ -225,6 +225,7 @@ impl ThreadWorker {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
 
     #[test]
     fn test_stateless_worker() {
@@ -240,6 +241,56 @@ mod tests {
 
         worker.wait_for_requests();
         assert_eq!(counter.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn single_worker_executes_requests_in_fifo_order() {
+        let worker = ThreadWorker::new_stateless(1, "fifo-worker".to_string());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        worker.queue_stateless_work(move || release_receiver.recv().unwrap());
+        for value in 0..4 {
+            let order = Arc::clone(&order);
+            worker.queue_stateless_work(move || order.lock().unwrap().push(value));
+        }
+        release_sender.send(()).unwrap();
+
+        worker.wait_for_requests();
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn wait_for_requests_waits_for_the_running_request() {
+        let worker = Arc::new(ThreadWorker::new_stateless(1, "wait-worker".to_string()));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_work = Arc::clone(&completed);
+
+        worker.queue_stateless_work(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            completed_for_work.store(true, Ordering::Release);
+        });
+        started_receiver.recv().unwrap();
+
+        let worker_for_wait = Arc::clone(&worker);
+        let (waited_sender, waited_receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            worker_for_wait.wait_for_requests();
+            waited_sender.send(()).unwrap();
+        });
+        assert!(waited_receiver
+            .recv_timeout(Duration::from_millis(20))
+            .is_err());
+
+        release_sender.send(()).unwrap();
+        waited_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        waiter.join().unwrap();
+        assert!(completed.load(Ordering::Acquire));
     }
 
     #[test]

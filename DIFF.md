@@ -17359,3 +17359,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: `PresentPushConstants` is `repr(C)` and exactly 128 bytes (a 64-byte matrix followed by
   four 16-byte vectors); the complete payload is passed to Vulkan with the same vertex-stage range
   as Eden. All Vulkan create-info layouts remain owned by Ash.
+
+## 2026-08-26 — `src/video_core/src/textures/workers.rs` vs Eden `src/video_core/textures/workers.{h,cpp}`
+
+### Intentional differences
+
+- `OnceLock` supplies Rust's function-local-static equivalent. Rust process statics are not
+  destructed during normal runtime shutdown, whereas Eden's local static destroys its `jthread`
+  pool; explicit `ThreadWorker` owners still stop and join identically, and process termination
+  reclaims the singleton threads.
+- `available_parallelism()` replaces `std::thread::hardware_concurrency()`; both clamp the reported
+  value to at least two before halving it, and the Rust error fallback therefore produces the same
+  one-worker minimum.
+- ASTC and BCN call the common port's `queue_stateless_work` adapter because Rust cannot overload
+  the stateful `queue_work` closure signature for the `StatefulThreadWorker<()>` alias.
+
+### Unintentional differences (to fix)
+
+- Resolved: `textures/workers.rs` no longer reimplements `Common::ThreadWorker`. It now owns only
+  the `ImageTranscode` singleton construction and returns the implementation owned by
+  `common/thread_worker.rs`, matching Eden's file and method boundaries.
+- The report's LIFO statement is obsolete: the common owner consumes `VecDeque::pop_front`, and a
+  single-worker regression test verifies Eden's FIFO ordering.
+- The report's BCN usage warning is obsolete: both ASTC decompression and BCN compression queue
+  one job per row/stride on this shared pool and wait after each depth plane, matching Eden.
+
+### Missing items
+
+- None in the texture worker singleton or its ASTC/BCN call sites.
+
+### Binary layout verification
+
+- N/A: the singleton contains host-only synchronization objects and boxed closures.

@@ -16625,3 +16625,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these are host-side containers rather than raw guest or disk payloads. Focused tests pin
   the upstream inline capacities, initial scratch sizes, common worker owner, and existing cache
   lifecycle behavior.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/types.rs` vs Eden `src/video_core/texture_cache/types.h`
+
+### Intentional differences
+
+- Rust represents Eden's flag enum and generated bitwise operators with a `u32`-backed
+  `bitflags` type. Its four bit positions and combined mask remain identical.
+- C++ comparison operators are represented by the corresponding Rust equality, ordering, and
+  hashing derives where the structures expose those operations.
+
+### Unintentional differences (to fix)
+
+- None after restoring `MAX_MIP_LEVELS` from 14 to Eden's 16. This also restores the length of
+  `LevelArray` and `ImageBase::mip_level_offsets`, so levels 14 and 15 are no longer rejected or
+  omitted by the common texture-cache storage.
+
+### Missing items
+
+- None. All constants, slot-ID aliases, enumerations, flags, geometry structures, subresource
+  structures, and copy/swizzle descriptors from the upstream header are present in this owner.
+
+### Binary layout verification
+
+- PASS: focused tests pin every fixed structure's size and the field offsets of `ImageCopy`.
+  Pointer-width-specific tests pin the 64-bit layouts and field offsets of `BufferImageCopy`,
+  `BufferCopy`, and `SwizzleParameters`, plus their expected 32-bit sizes.

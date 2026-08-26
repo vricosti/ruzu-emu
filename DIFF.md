@@ -14624,3 +14624,40 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: the device table stores one `u32` compressed physical value and the cached-page table one
   atomic `u8` per device page, matching Eden's element widths and zero/one initialization. These
   process-local tables are not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/gpu_thread.rs` and `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu_thread.{h,cpp}` and `src/video_core/gpu.cpp`
+
+### Intentional differences
+
+- `Arc<AtomicBool>` plus explicit queue/condition-variable wakeups implement the stop-token portion
+  of Eden's `std::jthread`; `ThreadManager::shutdown` joins before renderer and scheduler teardown.
+- Rust retains stable rasterizer, GPU, graphics-context, and scheduler handles across the spawned
+  closure because those owners cross Rust trait/crate boundaries. Eden captures references to the
+  same owners directly.
+- `last_fence` is atomic for shared Rust access, although every mutation remains serialized by
+  `write_lock` exactly as in Eden. The worker body is a same-file helper rather than an inline
+  closure so it can borrow the shared synchronization state safely.
+
+### Unintentional differences (to fix)
+
+- Resolved: `SynchState` now owns the upstream `BoundedSPSCQueue`; the removed MPSC wrapper had an
+  extra producer mutex despite `write_lock` already serializing producers.
+- Resolved: `is_async` remains owned only by `Gpu` and is passed to every thread-manager operation,
+  matching Eden's method signatures and avoiding duplicated mode state.
+- Resolved: stop now wakes a caller blocked on a fence, the wait predicate observes the stop flag,
+  and the worker checks stop immediately after `PopWait` before dispatching the returned command.
+- Resolved: the worker calls `SetCurrentThreadToPerformanceCores`, requires the renderer context and
+  rasterizer installed by `StartThread`, and treats both `monostate` and the non-queued combined
+  flush/invalidate command as assertion failures.
+- Resolved: fence increment uses unsigned wrapping semantics and the non-upstream GPU-thread profile,
+  submit timing, trace emissions, CLI environment switch, and dump hooks were removed from the hot
+  path.
+
+### Missing items
+
+- None for the command variants, public operations, worker dispatch, fence synchronization, or
+  stop/join lifecycle.
+
+### Binary layout verification
+
+- N/A: command enums and synchronization owners are process-local and are not raw-serialized.

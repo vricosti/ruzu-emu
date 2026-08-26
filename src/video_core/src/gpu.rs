@@ -225,10 +225,7 @@ impl Gpu {
             shader_notify: ShaderNotify::new(),
             rasterizer: Mutex::new(None),
             scheduler: crate::control::scheduler::Scheduler::new(),
-            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(
-                SystemRef::null(),
-                is_async,
-            )),
+            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(SystemRef::null())),
             cpu_context: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
             guest_memory_reader: Mutex::new(None),
@@ -724,7 +721,7 @@ impl Gpu {
         self.gpu_thread
             .lock()
             .unwrap()
-            .submit_list(channel, entries);
+            .submit_list(channel, entries, self.is_async);
     }
 
     /// Notify rasterizer about a CPU read.
@@ -762,7 +759,7 @@ impl Gpu {
                 );
             }
         }));
-        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
         self.wait_for_sync_operation(fence);
         raster_area
     }
@@ -770,7 +767,10 @@ impl Gpu {
     /// Flush a region.
     /// Matches upstream `GPU::Impl::FlushRegion(DAddr, u64)`.
     pub fn flush_region(&self, addr: DAddr, size: u64) {
-        self.gpu_thread.lock().unwrap().flush_region(addr, size);
+        self.gpu_thread
+            .lock()
+            .unwrap()
+            .flush_region(addr, size, self.is_async);
     }
 
     /// Invalidate a region.
@@ -797,7 +797,7 @@ impl Gpu {
         self.gpu_thread
             .lock()
             .unwrap()
-            .flush_and_invalidate_region(addr, size);
+            .flush_and_invalidate_region(addr, size, self.is_async);
     }
 
     /// Request framebuffer compositing.
@@ -861,7 +861,7 @@ impl Gpu {
         }));
         self.pending_composite_fence
             .store(pending_fence, Ordering::Relaxed);
-        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
     }
 
     /// Wait for registration of the previous composite request.
@@ -919,7 +919,7 @@ impl Gpu {
                 *result_clone.lock().unwrap() = renderer.get_applet_capture_buffer();
             }
         }));
-        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
         self.wait_for_sync_operation(wait_fence);
         Arc::try_unwrap(result).unwrap().into_inner().unwrap()
     }

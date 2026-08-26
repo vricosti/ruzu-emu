@@ -644,7 +644,6 @@ fn main() {
     let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
-    let want_gpu_thread_profile = std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some();
     let want_gl_draw_stall_profile = std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_some();
     let want_refresh_stages_stall_profile =
         std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_some();
@@ -672,7 +671,6 @@ fn main() {
         || want_hwc_cache_profile
         || want_vsync_profile
         || want_submit_gpfifo_profile
-        || want_gpu_thread_profile
         || want_gl_draw_stall_profile
         || want_refresh_stages_stall_profile
         || want_make_shader_info_stall_profile
@@ -691,7 +689,6 @@ fn main() {
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr2");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
-            video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_service_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
@@ -724,7 +721,6 @@ fn main() {
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("atexit");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
-            video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_service_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();

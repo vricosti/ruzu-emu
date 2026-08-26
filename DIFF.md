@@ -14422,3 +14422,46 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: these wrappers own process-local OpenGL handles and are never raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_shader_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_cache.{h,cpp}`
+
+### Intentional differences
+
+- Cache owners, the program manager, state tracker, context factory, and shader notification use
+  stable Rust handles/pointers in place of Eden reference members. Disk workers compile through a
+  temporary cache facade and return completed pipelines to the renderer thread instead of mutating
+  the live cache through a captured `this` pointer.
+- Disk entries are collected before scheduling so `load_pipelines` can keep safe borrowed callbacks;
+  the same compute-then-graphics work is queued, progress begins at `(0, total)`, and completed
+  pipelines are inserted after the cancellation-aware wait.
+- The Rust recompiler owns indexed IR blocks and instructions in each `Program`; consequently the
+  OpenGL `ShaderPools` objects preserve worker-context lifecycle but are not allocation owners as
+  Eden's pointer-based IR pools are.
+- The renderer path may disable asynchronous compilation when the frontend supplies no shareable GL
+  context factory. Eden always receives an `EmuWindow` capable of constructing its worker contexts.
+
+### Unintentional differences (to fix)
+
+- Resolved: `CurrentGraphicsPipeline` now uses `current_pipeline` as Eden's actual fast path instead
+  of performing a hash-map lookup on every unchanged draw.
+- Resolved: `CurrentGraphicsPipelineSlowPath` updates `current_pipeline` only after obtaining a
+  non-null pipeline. A cached or newly compiled failure no longer replaces the prior current
+  pipeline key.
+- Resolved: `ShaderCache` destruction now relies on declaration-order worker destruction, which
+  requests stop and joins before cached pipelines are dropped. The removed custom `Drop` first
+  drained every queued compile, unlike Eden's default destructor.
+- Verified already correct: both graphics and compute maps retain `None` entries after compilation
+  failure, matching Eden's `try_emplace` negative-cache behavior.
+- Verified already correct: runtime graphics compilation supplies workers only when
+  `use_asynchronous_shaders` is true. Unlike Vulkan's cache, Eden's OpenGL cache does not always
+  build runtime pipelines on the pool.
+
+### Missing items
+
+- None among cache-key construction, negative caching, runtime pipeline selection, disk loading,
+  shader translation/emission, progress reporting, or worker lifecycle.
+
+### Binary layout verification
+
+- PASS: compute and graphics keys are read, hashed, and serialized through their complete `repr(C)`
+  byte layouts; their dedicated pipeline modules retain size/layout regression tests.

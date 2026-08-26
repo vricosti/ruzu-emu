@@ -35,12 +35,10 @@ use crate::texture_cache::texture_cache_base::{
 };
 use crate::texture_cache::types::{
     BufferImageCopy, Extent2D, Extent3D, FramebufferId, ImageCopy, ImageId, ImageType, ImageViewId,
-    ImageViewType, Offset3D, Region2D as CommonRegion2D, SamplerId, SubresourceExtent,
-    SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
+    ImageViewType, Offset3D, Region2D as CommonRegion2D, SamplerId, SubresourceRange,
+    NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
 };
 use crate::texture_cache::util::full_download_copies;
-#[cfg(test)]
-use crate::texture_cache::util::make_shrink_image_copies;
 use crate::textures::texture::{
     SamplerReduction, TextureFilter, TextureMipmapFilter, TscEntry, WrapMode,
 };
@@ -1727,73 +1725,6 @@ struct SentencedVkResource {
     resource: DeferredVkResource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinCopyOperation {
-    CopyImage,
-    CopyImageMsaa,
-    Reinterpret,
-    Convert,
-}
-
-fn should_reinterpret_join_copy(
-    dst: &ImageBase,
-    src: &ImageBase,
-    shader_stencil_export_supported: bool,
-) -> bool {
-    if crate::surface::get_format_type(dst.info.format) == SurfaceType::DepthStencil
-        && !shader_stencil_export_supported
-    {
-        return true;
-    }
-    dst.info.format == PixelFormat::D32FloatS8Uint || src.info.format == PixelFormat::D32FloatS8Uint
-}
-
-fn can_convert_join_copy_formats(dst_format: PixelFormat, src_format: PixelFormat) -> bool {
-    matches!(
-        (dst_format, src_format),
-        (PixelFormat::R16Unorm, PixelFormat::D16Unorm)
-            | (PixelFormat::A8B8G8R8Srgb, PixelFormat::D32Float)
-            | (PixelFormat::A8B8G8R8Unorm, PixelFormat::S8UintD24Unorm)
-            | (PixelFormat::A8B8G8R8Unorm, PixelFormat::D24UnormS8Uint)
-            | (PixelFormat::A8B8G8R8Unorm, PixelFormat::D32Float)
-            | (PixelFormat::B8G8R8A8Srgb, PixelFormat::D32Float)
-            | (PixelFormat::B8G8R8A8Unorm, PixelFormat::D32Float)
-            | (PixelFormat::R32Float, PixelFormat::D32Float)
-            | (PixelFormat::D16Unorm, PixelFormat::R16Unorm)
-            | (PixelFormat::S8UintD24Unorm, PixelFormat::A8B8G8R8Unorm)
-            | (PixelFormat::S8UintD24Unorm, PixelFormat::B8G8R8A8Unorm)
-            | (PixelFormat::D32Float, PixelFormat::A8B8G8R8Unorm)
-            | (PixelFormat::D32Float, PixelFormat::B8G8R8A8Unorm)
-            | (PixelFormat::D32Float, PixelFormat::A8B8G8R8Srgb)
-            | (PixelFormat::D32Float, PixelFormat::B8G8R8A8Srgb)
-            | (PixelFormat::D32Float, PixelFormat::R32Float)
-    )
-}
-
-fn select_join_copy_operation(
-    dst: &ImageBase,
-    src: &ImageBase,
-    shader_stencil_export_supported: bool,
-) -> Option<JoinCopyOperation> {
-    let dst_format_type = crate::surface::get_format_type(dst.info.format);
-    let src_format_type = crate::surface::get_format_type(src.info.format);
-    if dst_format_type == src_format_type {
-        return Some(if dst.info.num_samples != src.info.num_samples {
-            JoinCopyOperation::CopyImageMsaa
-        } else {
-            JoinCopyOperation::CopyImage
-        });
-    }
-    if dst.info.image_type != ImageType::E2D || src.info.image_type != ImageType::E2D {
-        return None;
-    }
-    if should_reinterpret_join_copy(dst, src, shader_stencil_export_supported) {
-        return Some(JoinCopyOperation::Reinterpret);
-    }
-    can_convert_join_copy_formats(dst.info.format, src.info.format)
-        .then_some(JoinCopyOperation::Convert)
-}
-
 /// Runtime services used by the Vulkan texture cache backend.
 ///
 /// Port-facing counterpart of upstream `Vulkan::TextureCacheRuntime`. The
@@ -2366,6 +2297,17 @@ impl TextureCacheRuntime {
         if let Some(shadow) = self.resolve_shadows.remove(&msaa_image) {
             unsafe { self.device.destroy_image_view(shadow.view, None) };
         }
+    }
+
+    fn should_reinterpret(&self, dst: &Image, src: &Image) -> bool {
+        let lacks_stencil_export = !self.shader_stencil_export_supported;
+        (lacks_stencil_export
+            && (crate::surface::get_format_type(dst.base().info.format)
+                == SurfaceType::DepthStencil
+                || crate::surface::get_format_type(src.base().info.format)
+                    == SurfaceType::DepthStencil))
+            || dst.base().info.format == PixelFormat::D32FloatS8Uint
+            || src.base().info.format == PixelFormat::D32FloatS8Uint
     }
 
     fn reinterpret_image(&mut self, dst: &Image, src: &Image, copies: &[ImageCopy]) -> bool {
@@ -4183,12 +4125,129 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         src_id: ImageId,
         copies: &[ImageCopy],
     ) {
-        if !texture_cache_from_base(cache).copy_join_image(dst_id, src_id, copies) {
-            log::error!(
-                "TextureCacheVulkan::JoinImages unsupported copy: dst={} src={}",
-                dst_id.index,
-                src_id.index,
-            );
+        let texture_cache = texture_cache_from_base(cache);
+        let dst_base = texture_cache.base.slot_images[dst_id].base.as_ref().clone();
+        let src_base = texture_cache.base.slot_images[src_id].base.as_ref().clone();
+        let dst_aspect = image_aspect_mask(dst_base.info.format);
+        let src_aspect = image_aspect_mask(src_base.info.format);
+        let dst_format = texture_cache
+            .base
+            .runtime()
+            .surface_format(dst_base.info.format, false);
+        let src_format = texture_cache
+            .base
+            .runtime()
+            .surface_format(src_base.info.format, false);
+        if texture_cache
+            .ensure_image(dst_id, &dst_base, dst_format, dst_aspect)
+            .is_err()
+            || texture_cache
+                .ensure_image(src_id, &src_base, src_format, src_aspect)
+                .is_err()
+        {
+            return;
+        }
+        let Some(src) = texture_cache.take_backend_image(src_id) else {
+            return;
+        };
+        let Some(dst) = texture_cache.take_backend_image(dst_id) else {
+            texture_cache.base.slot_images[src_id].backend = Some(src);
+            return;
+        };
+        texture_cache
+            .base
+            .runtime_mut()
+            .copy_image(&dst, &src, copies);
+        texture_cache.base.slot_images[dst_id].backend = Some(dst);
+        texture_cache.base.slot_images[src_id].backend = Some(src);
+    }
+
+    fn should_reinterpret(
+        cache: &CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+    ) -> bool {
+        cache.slot_images[dst_id]
+            .backend
+            .as_ref()
+            .zip(cache.slot_images[src_id].backend.as_ref())
+            .is_some_and(|(dst, src)| cache.runtime().should_reinterpret(dst, src))
+    }
+
+    fn reinterpret_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) {
+        let texture_cache = texture_cache_from_base(cache);
+        let dst_base = texture_cache.base.slot_images[dst_id].base.as_ref().clone();
+        let src_base = texture_cache.base.slot_images[src_id].base.as_ref().clone();
+        let dst_aspect = image_aspect_mask(dst_base.info.format);
+        let src_aspect = image_aspect_mask(src_base.info.format);
+        let dst_format = texture_cache
+            .base
+            .runtime()
+            .surface_format(dst_base.info.format, false);
+        let src_format = texture_cache
+            .base
+            .runtime()
+            .surface_format(src_base.info.format, false);
+        if texture_cache
+            .ensure_image(dst_id, &dst_base, dst_format, dst_aspect)
+            .is_err()
+            || texture_cache
+                .ensure_image(src_id, &src_base, src_format, src_aspect)
+                .is_err()
+        {
+            return;
+        }
+        let Some(src) = texture_cache.take_backend_image(src_id) else {
+            return;
+        };
+        let Some(dst) = texture_cache.take_backend_image(dst_id) else {
+            texture_cache.base.slot_images[src_id].backend = Some(src);
+            return;
+        };
+        if !texture_cache
+            .base
+            .runtime_mut()
+            .reinterpret_image(&dst, &src, copies)
+        {
+            log::error!("Vulkan::TextureCacheRuntime::ReinterpretImage failed");
+        }
+        texture_cache.base.slot_images[dst_id].backend = Some(dst);
+        texture_cache.base.slot_images[src_id].backend = Some(src);
+    }
+
+    fn convert_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_framebuffer_id: FramebufferId,
+        dst_view_id: ImageViewId,
+        src_view_id: ImageViewId,
+    ) {
+        let texture_cache = texture_cache_from_base(cache);
+        if texture_cache.ensure_image_view(src_view_id).is_err()
+            || texture_cache.ensure_image_view(dst_view_id).is_err()
+        {
+            return;
+        }
+        let Some(dst_framebuffer) = texture_cache.blit_framebuffer_info(dst_framebuffer_id) else {
+            return;
+        };
+        let Some(src_view) = texture_cache.conversion_image_view_from_image_view(src_view_id)
+        else {
+            return;
+        };
+        let dst_format = texture_cache.base.slot_image_views[dst_view_id].format;
+        let src_format = texture_cache.base.slot_image_views[src_view_id].format;
+        if !texture_cache.base.runtime_mut().convert_image(
+            dst_framebuffer,
+            dst_format,
+            src_format,
+            src_view,
+        ) {
+            log::error!("Vulkan::TextureCacheRuntime::ConvertImage failed");
         }
     }
 
@@ -4198,13 +4257,44 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         src_id: ImageId,
         copies: &[ImageCopy],
     ) {
-        if !texture_cache_from_base(cache).copy_join_image(dst_id, src_id, copies) {
-            log::error!(
-                "TextureCacheVulkan::JoinImages unsupported MSAA copy: dst={} src={}",
-                dst_id.index,
-                src_id.index,
-            );
+        let texture_cache = texture_cache_from_base(cache);
+        let dst_base = texture_cache.base.slot_images[dst_id].base.as_ref().clone();
+        let src_base = texture_cache.base.slot_images[src_id].base.as_ref().clone();
+        let dst_aspect = image_aspect_mask(dst_base.info.format);
+        let src_aspect = image_aspect_mask(src_base.info.format);
+        let dst_format = texture_cache
+            .base
+            .runtime()
+            .surface_format(dst_base.info.format, false);
+        let src_format = texture_cache
+            .base
+            .runtime()
+            .surface_format(src_base.info.format, false);
+        if texture_cache
+            .ensure_image(dst_id, &dst_base, dst_format, dst_aspect)
+            .is_err()
+            || texture_cache
+                .ensure_image(src_id, &src_base, src_format, src_aspect)
+                .is_err()
+        {
+            return;
         }
+        let Some(mut src) = texture_cache.take_backend_image(src_id) else {
+            return;
+        };
+        let Some(mut dst) = texture_cache.take_backend_image(dst_id) else {
+            texture_cache.base.slot_images[src_id].backend = Some(src);
+            return;
+        };
+        if !texture_cache
+            .base
+            .runtime_mut()
+            .copy_image_msaa(&mut dst, &mut src, copies)
+        {
+            log::error!("Vulkan::TextureCacheRuntime::CopyImageMSAA failed");
+        }
+        texture_cache.base.slot_images[dst_id].backend = Some(dst);
+        texture_cache.base.slot_images[src_id].backend = Some(src);
     }
 
     fn blit_image(
@@ -5008,153 +5098,6 @@ impl TextureCache {
         })
     }
 
-    fn blit_framebuffer_from_image_view(
-        &mut self,
-        view_id: ImageViewId,
-    ) -> Option<BlitFramebufferInfo> {
-        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
-            return None;
-        }
-        let view_base = self.base.slot_image_views[view_id].base.as_ref().clone();
-        let image_id = view_base.image_id;
-        if !self.base_image_exists(image_id) {
-            return None;
-        }
-        let image_base = self.base.slot_images[image_id].base.as_ref().clone();
-        let aspect = image_aspect_mask(image_base.info.format);
-        let format = self
-            .base
-            .runtime_mut()
-            .surface_format(image_base.info.format, false);
-        if aspect.is_empty()
-            || self
-                .ensure_image(image_id, &image_base, format, aspect)
-                .is_err()
-        {
-            return None;
-        }
-        self.ensure_image_view(view_id).ok()?;
-
-        let is_rescaled = self.base.slot_images[image_id]
-            .flags
-            .contains(ImageFlagBits::RESCALED);
-        let mut extent = view_base.size;
-        if is_rescaled {
-            let resolution = common::settings::values().resolution_info.clone();
-            extent.width = resolution.scale_up_i32(extent.width as i32) as u32;
-            if image_base.info.image_type == ImageType::E2D {
-                extent.height = resolution.scale_up_i32(extent.height as i32) as u32;
-            }
-        }
-        let (samples_x, samples_y) =
-            crate::texture_cache::samples_helper::samples_log2(image_base.info.num_samples as i32);
-        let fb_extent = vk::Extent2D {
-            width: (extent.width >> samples_x).max(1),
-            height: (extent.height >> samples_y).max(1),
-        };
-        let is_color =
-            crate::surface::get_format_type(view_base.format) == SurfaceType::ColorTexture;
-        let mut key = RenderTargets {
-            size: Extent2D {
-                width: fb_extent.width,
-                height: fb_extent.height,
-            },
-            is_rescaled,
-            ..RenderTargets::default()
-        };
-        if is_color {
-            key.color_buffer_ids[0] = view_id;
-        } else {
-            key.depth_buffer_id = view_id;
-        }
-
-        let framebuffer_id = if let Some(&framebuffer_id) = self.base.framebuffers.get(&key) {
-            framebuffer_id
-        } else {
-            let view = self.backend_image_view(view_id)?;
-            let view_handle = view.render_target();
-            let mut rp_key = RenderPassKey::default();
-            let color_views;
-            let depth_view;
-            if is_color {
-                rp_key.color_formats[0] = view_base.format;
-                color_views = vec![view_handle];
-                depth_view = None;
-            } else {
-                rp_key.depth_format = view_base.format;
-                color_views = Vec::new();
-                depth_view = Some(view_handle);
-            }
-            rp_key.samples = vk::SampleCountFlags::TYPE_1;
-            let render_pass = self
-                .base
-                .runtime_mut()
-                .render_pass_cache()
-                .get(&rp_key)
-                .ok()?;
-            let framebuffer = self
-                .base
-                .runtime_mut()
-                .create_framebuffer(
-                    render_pass,
-                    &{
-                        let mut attachments = color_views.clone();
-                        if let Some(depth) = depth_view {
-                            attachments.push(depth);
-                        }
-                        attachments
-                    },
-                    fb_extent,
-                )
-                .ok()?;
-            let mut images = [vk::Image::null(); NUM_RT + 1];
-            let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
-            images[0] = self.backend_image(image_id)?.handle();
-            image_ranges[0] = make_subresource_range(aspect, view_base.range, view_base.flags);
-            let owner = Framebuffer {
-                device: Some(self.base.runtime_mut().device().clone()),
-                framebuffer,
-                render_pass,
-                render_pass_key: rp_key,
-                render_pass_cache: self.base.runtime_mut().render_pass_cache,
-                render_area: fb_extent,
-                num_color_buffers: if is_color { 1 } else { 0 },
-                has_depth: !is_color,
-                has_stencil: aspect.contains(vk::ImageAspectFlags::STENCIL),
-                is_rescaled,
-                samples: vk::SampleCountFlags::TYPE_1,
-                rt_map: if is_color {
-                    let mut map = [0; NUM_RT];
-                    map[0] = 0;
-                    map
-                } else {
-                    [0; NUM_RT]
-                },
-                images,
-                image_ranges,
-                num_images: 1,
-                resolve_images: Vec::new(),
-                resolve_image_views: Vec::new(),
-                discard_msaa_color: false,
-            };
-            let framebuffer_id = self.base.slot_framebuffers.insert(Box::new(owner));
-            self.base.framebuffers.insert(key, framebuffer_id);
-            framebuffer_id
-        };
-
-        let fb = &self.base.slot_framebuffers[framebuffer_id];
-        Some(BlitFramebufferInfo {
-            framebuffer: fb.framebuffer,
-            render_pass: fb.render_pass,
-            render_area: fb.render_area,
-            images: fb.images,
-            image_ranges: fb.image_ranges,
-            num_images: fb.num_images,
-            samples: fb.samples,
-            has_stencil: fb.has_stencil,
-        })
-    }
-
     fn conversion_image_view_from_image_view(
         &mut self,
         view_id: ImageViewId,
@@ -5183,227 +5126,6 @@ impl TextureCache {
         copy: &crate::engines::fermi_2d::Config,
     ) -> bool {
         self.base.blit_image(dst, src, copy)
-    }
-
-    fn copy_join_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) -> bool {
-        if !dst_id.is_valid() || !src_id.is_valid() || copies.is_empty() {
-            return true;
-        }
-        if !self.base_image_exists(dst_id) || !self.base_image_exists(src_id) {
-            return false;
-        }
-        let dst_base = self.base.slot_images[dst_id].base.as_ref().clone();
-        let src_base = self.base.slot_images[src_id].base.as_ref().clone();
-        if dst_base.flags.contains(ImageFlagBits::RESCALED)
-            != src_base.flags.contains(ImageFlagBits::RESCALED)
-        {
-            return false;
-        }
-        let mut copies = copies.to_vec();
-        let is_rescaled = src_base.flags.contains(ImageFlagBits::RESCALED);
-        if is_rescaled {
-            let both_2d = src_base.info.image_type == ImageType::E2D
-                && dst_base.info.image_type == ImageType::E2D;
-            let resolution = common::settings::values().resolution_info.clone();
-            for copy in &mut copies {
-                copy.src_offset.x = resolution.scale_up_i32(copy.src_offset.x);
-                copy.dst_offset.x = resolution.scale_up_i32(copy.dst_offset.x);
-                copy.extent.width = resolution.scale_up_u32(copy.extent.width);
-                if both_2d {
-                    copy.src_offset.y = resolution.scale_up_i32(copy.src_offset.y);
-                    copy.dst_offset.y = resolution.scale_up_i32(copy.dst_offset.y);
-                    copy.extent.height = resolution.scale_up_u32(copy.extent.height);
-                }
-            }
-        }
-        let Some(operation) = select_join_copy_operation(
-            &dst_base,
-            &src_base,
-            self.base.runtime_mut().shader_stencil_export_supported,
-        ) else {
-            return false;
-        };
-        let dst_aspect = image_aspect_mask(dst_base.info.format);
-        let src_aspect = image_aspect_mask(src_base.info.format);
-        let same_format_type = matches!(
-            operation,
-            JoinCopyOperation::CopyImage | JoinCopyOperation::CopyImageMsaa
-        );
-        if dst_aspect.is_empty()
-            || src_aspect.is_empty()
-            || (same_format_type && dst_aspect != src_aspect)
-        {
-            return false;
-        }
-        let dst_format = self
-            .base
-            .runtime()
-            .surface_format(dst_base.info.format, false);
-        let src_format = self
-            .base
-            .runtime()
-            .surface_format(src_base.info.format, false);
-        if self
-            .ensure_image(dst_id, &dst_base, dst_format, dst_aspect)
-            .is_err()
-            || self
-                .ensure_image(src_id, &src_base, src_format, src_aspect)
-                .is_err()
-        {
-            return false;
-        }
-        if operation == JoinCopyOperation::CopyImageMsaa {
-            let Some(mut src) = self.take_backend_image(src_id) else {
-                return false;
-            };
-            let Some(mut dst) = self.take_backend_image(dst_id) else {
-                self.base.slot_images[src_id].backend = Some(src);
-                return false;
-            };
-            let copied = self
-                .base
-                .runtime_mut()
-                .copy_image_msaa(&mut dst, &mut src, &copies);
-            self.base.slot_images[dst_id].backend = Some(dst);
-            self.base.slot_images[src_id].backend = Some(src);
-            return copied;
-        }
-
-        if operation == JoinCopyOperation::Convert {
-            return self.convert_join_image(dst_id, src_id, &dst_base, &src_base, &copies);
-        }
-
-        let Some(src) = self.take_backend_image(src_id) else {
-            return false;
-        };
-        let Some(dst) = self.take_backend_image(dst_id) else {
-            self.base.slot_images[src_id].backend = Some(src);
-            return false;
-        };
-        let copied = match operation {
-            JoinCopyOperation::CopyImage => {
-                self.base.runtime_mut().copy_image(&dst, &src, &copies);
-                true
-            }
-            JoinCopyOperation::Reinterpret => self
-                .base
-                .runtime_mut()
-                .reinterpret_image(&dst, &src, &copies),
-            JoinCopyOperation::CopyImageMsaa | JoinCopyOperation::Convert => unreachable!(),
-        };
-        self.base.slot_images[dst_id].backend = Some(dst);
-        self.base.slot_images[src_id].backend = Some(src);
-        copied
-    }
-
-    fn convert_join_image(
-        &mut self,
-        dst_id: ImageId,
-        src_id: ImageId,
-        dst_base: &ImageBase,
-        src_base: &ImageBase,
-        copies: &[ImageCopy],
-    ) -> bool {
-        for copy in copies {
-            if copy.dst_subresource.num_layers != 1
-                || copy.src_subresource.num_layers != 1
-                || copy.src_offset != crate::texture_cache::types::Offset3D::default()
-                || copy.dst_offset != crate::texture_cache::types::Offset3D::default()
-            {
-                return false;
-            }
-
-            let dst_range = SubresourceRange {
-                base: crate::texture_cache::types::SubresourceBase {
-                    level: copy.dst_subresource.base_level,
-                    layer: copy.dst_subresource.base_layer,
-                },
-                extent: SubresourceExtent {
-                    levels: 1,
-                    layers: 1,
-                },
-            };
-            let src_range = SubresourceRange {
-                base: crate::texture_cache::types::SubresourceBase {
-                    level: copy.src_subresource.base_level,
-                    layer: copy.src_subresource.base_layer,
-                },
-                extent: SubresourceExtent {
-                    levels: 1,
-                    layers: 1,
-                },
-            };
-            let mut dst_format = dst_base.info.format;
-            if crate::surface::get_format_type(src_base.info.format) == SurfaceType::DepthStencil
-                && crate::surface::get_format_type(dst_format) == SurfaceType::ColorTexture
-                && crate::surface::bytes_per_block(dst_format) == 4
-            {
-                dst_format = PixelFormat::A8B8G8R8Unorm;
-            }
-            let dst_view_id = self.base.find_or_emplace_image_view(
-                dst_id,
-                ImageViewInfo::for_render_target(ImageViewType::E2D, dst_format, dst_range),
-                dst_base.cpu_addr,
-            );
-            let src_view_id = self.base.find_or_emplace_image_view(
-                src_id,
-                ImageViewInfo::for_render_target(
-                    ImageViewType::E2D,
-                    src_base.info.format,
-                    src_range,
-                ),
-                src_base.cpu_addr,
-            );
-            let Some(dst_framebuffer) = self.blit_framebuffer_from_image_view(dst_view_id) else {
-                return false;
-            };
-            let Some(src_view) = self.conversion_image_view_from_image_view(src_view_id) else {
-                return false;
-            };
-            let expected_width = self
-                .base
-                .slot_image_views
-                .get(dst_view_id)
-                .size
-                .width
-                .min(self.base.slot_image_views.get(src_view_id).size.width);
-            let expected_height = self
-                .base
-                .slot_image_views
-                .get(dst_view_id)
-                .size
-                .height
-                .min(self.base.slot_image_views.get(src_view_id).size.height);
-            let expected_depth = self
-                .base
-                .slot_image_views
-                .get(dst_view_id)
-                .size
-                .depth
-                .min(self.base.slot_image_views.get(src_view_id).size.depth);
-            let mut scaled_extent = crate::texture_cache::types::Extent3D {
-                width: expected_width,
-                height: expected_height,
-                depth: expected_depth,
-            };
-            if src_base.flags.contains(ImageFlagBits::RESCALED) {
-                let resolution = common::settings::values().resolution_info.clone();
-                scaled_extent.width = resolution.scale_up_u32(scaled_extent.width);
-                scaled_extent.height = resolution.scale_up_u32(scaled_extent.height);
-            }
-            if copy.extent != scaled_extent {
-                return false;
-            }
-            if !self.base.runtime_mut().convert_image(
-                dst_framebuffer,
-                dst_format,
-                src_base.info.format,
-                src_view,
-            ) {
-                return false;
-            }
-        }
-        true
     }
 
     pub fn tick_frame(&mut self, scheduler_tick: u64) {
@@ -6859,85 +6581,6 @@ mod tests {
         assert_eq!(
             barriers.post[1].subresource_range.layer_count,
             barriers.pre[1].subresource_range.layer_count
-        );
-    }
-
-    #[test]
-    fn join_shrink_copy_selects_runtime_copy_image() {
-        let mut full = ImageInfo {
-            format: PixelFormat::A8B8G8R8Unorm,
-            image_type: ImageType::E2D,
-            resources: SubresourceExtent {
-                levels: 2,
-                layers: 1,
-            },
-            size: Extent3D {
-                width: 64,
-                height: 64,
-                depth: 1,
-            },
-            ..ImageInfo::default()
-        };
-        full.layer_stride = crate::texture_cache::util::calculate_layer_stride(&full);
-        full.maybe_unaligned_layer_stride = crate::texture_cache::util::calculate_layer_size(&full);
-        let sub = ImageInfo {
-            resources: SubresourceExtent {
-                levels: 1,
-                layers: 1,
-            },
-            size: Extent3D {
-                width: 32,
-                height: 32,
-                depth: 1,
-            },
-            ..full.clone()
-        };
-
-        let full_base = ImageBase::new(full.clone(), 0x5000, 0x9000);
-        let mip_offset = full_base.mip_level_offsets[1] as u64;
-        let sub_base = ImageBase::new(sub.clone(), 0x5000 + mip_offset, 0x9000 + mip_offset);
-        let base = full_base
-            .try_find_base(sub_base.gpu_addr)
-            .expect("mip-sized overlap must map into the full image");
-        let copies = make_shrink_image_copies(&full, &sub, base, 1, 0);
-
-        assert!(!copies.is_empty());
-        assert_eq!(
-            select_join_copy_operation(&full_base, &sub_base, true),
-            Some(JoinCopyOperation::CopyImage)
-        );
-    }
-
-    #[test]
-    fn same_surface_type_with_different_block_sizes_reaches_runtime_copy_image() {
-        let dst = ImageBase::new(
-            ImageInfo {
-                format: PixelFormat::A8B8G8R8Unorm,
-                ..ImageInfo::default()
-            },
-            0x1000,
-            0x2000,
-        );
-        let src = ImageBase::new(
-            ImageInfo {
-                format: PixelFormat::R8Unorm,
-                ..ImageInfo::default()
-            },
-            0x3000,
-            0x4000,
-        );
-
-        assert_eq!(
-            crate::surface::get_format_type(dst.info.format),
-            crate::surface::get_format_type(src.info.format)
-        );
-        assert_ne!(
-            crate::surface::bytes_per_block(dst.info.format),
-            crate::surface::bytes_per_block(src.info.format)
-        );
-        assert_eq!(
-            select_join_copy_operation(&dst, &src, true),
-            Some(JoinCopyOperation::CopyImage)
         );
     }
 

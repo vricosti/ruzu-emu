@@ -2705,7 +2705,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 else {
                     continue;
                 };
-                P::copy_image(self, new_image_id, alias.id, &alias.copies);
+                self.copy_image(new_image_id, alias.id, &alias.copies);
                 self.slot_images[new_image_id].modification_tick =
                     self.slot_images[copy_object.id].modification_tick;
                 continue;
@@ -3849,7 +3849,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     self.scale_down(alias_id);
                 }
             }
-            P::copy_image(self, image_id, alias_id, &copies);
+            self.copy_image(image_id, alias_id, &copies);
         }
     }
 
@@ -3876,6 +3876,149 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         }
         let lru_index = self.slot_images[image_id].lru_index;
         self.lru_cache.touch(lru_index, self.frame_tick);
+    }
+
+    /// Port of upstream `TextureCache<P>::CopyImage`.
+    fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+        let mut copies = copies.to_vec();
+        let is_rescaled = self.slot_images[src_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED);
+        if is_rescaled {
+            if !self.slot_images[dst_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED)
+            {
+                log::error!(
+                    "TextureCache::CopyImage source is rescaled but destination is not: src={} dst={}",
+                    src_id.index,
+                    dst_id.index,
+                );
+            }
+            let both_2d = self.slot_images[src_id].info.image_type == ImageType::E2D
+                && self.slot_images[dst_id].info.image_type == ImageType::E2D;
+            let resolution = common::settings::values().resolution_info.clone();
+            for copy in &mut copies {
+                copy.src_offset.x = resolution.scale_up_i32(copy.src_offset.x);
+                copy.dst_offset.x = resolution.scale_up_i32(copy.dst_offset.x);
+                copy.extent.width = resolution.scale_up_u32(copy.extent.width);
+                if both_2d {
+                    copy.src_offset.y = resolution.scale_up_i32(copy.src_offset.y);
+                    copy.dst_offset.y = resolution.scale_up_i32(copy.dst_offset.y);
+                    copy.extent.height = resolution.scale_up_u32(copy.extent.height);
+                }
+            }
+        }
+
+        let dst_format_type = surface::get_format_type(self.slot_images[dst_id].info.format);
+        let src_format_type = surface::get_format_type(self.slot_images[src_id].info.format);
+        if src_format_type == dst_format_type {
+            if P::HAS_EMULATED_COPIES && !P::can_image_be_copied(self, dst_id, src_id) {
+                P::emulate_copy_image(self, dst_id, src_id, &copies);
+                return;
+            }
+            P::copy_image(self, dst_id, src_id, &copies);
+            return;
+        }
+
+        let dst_info = self.slot_images[dst_id].info.clone();
+        let src_info = self.slot_images[src_id].info.clone();
+        if dst_info.image_type != ImageType::E2D {
+            log::error!(
+                "TextureCache::CopyImage destination reinterpret type is not 2D: {:?}",
+                dst_info.image_type,
+            );
+        }
+        if src_info.image_type != ImageType::E2D {
+            log::error!(
+                "TextureCache::CopyImage source reinterpret type is not 2D: {:?}",
+                src_info.image_type,
+            );
+        }
+        if P::should_reinterpret(self, dst_id, src_id) {
+            P::reinterpret_image(self, dst_id, src_id, &copies);
+            return;
+        }
+
+        let dst_gpu_addr = self.slot_images[dst_id].gpu_addr;
+        let src_gpu_addr = self.slot_images[src_id].gpu_addr;
+        for copy in &copies {
+            if copy.dst_subresource.num_layers != 1 {
+                log::error!("TextureCache::CopyImage destination layer count is not one");
+            }
+            if copy.src_subresource.num_layers != 1 {
+                log::error!("TextureCache::CopyImage source layer count is not one");
+            }
+            if copy.src_offset != Offset3D::default() {
+                log::error!("TextureCache::CopyImage source offset is not zero");
+            }
+            if copy.dst_offset != Offset3D::default() {
+                log::error!("TextureCache::CopyImage destination offset is not zero");
+            }
+
+            let dst_range = SubresourceRange {
+                base: SubresourceBase {
+                    level: copy.dst_subresource.base_level,
+                    layer: copy.dst_subresource.base_layer,
+                },
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            };
+            let src_range = SubresourceRange {
+                base: SubresourceBase {
+                    level: copy.src_subresource.base_level,
+                    layer: copy.src_subresource.base_layer,
+                },
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            };
+            let mut dst_format = dst_info.format;
+            if src_format_type == surface::SurfaceType::DepthStencil
+                && dst_format_type == surface::SurfaceType::ColorTexture
+                && surface::bytes_per_block(dst_format) == 4
+            {
+                dst_format = PixelFormat::A8B8G8R8Unorm;
+            }
+            let dst_view_info =
+                ImageViewInfo::for_render_target(ImageViewType::E2D, dst_format, dst_range);
+            let src_view_info =
+                ImageViewInfo::for_render_target(ImageViewType::E2D, src_info.format, src_range);
+            let Ok((dst_framebuffer_id, dst_view_id)) =
+                self.render_target_from_image(dst_id, dst_view_info, dst_gpu_addr)
+            else {
+                return;
+            };
+            let src_view_id = self.find_or_emplace_image_view(src_id, src_view_info, src_gpu_addr);
+            let dst_view = &self.slot_image_views[dst_view_id];
+            let src_view = &self.slot_image_views[src_view_id];
+            let expected_size = Extent3D {
+                width: dst_view.size.width.min(src_view.size.width),
+                height: dst_view.size.height.min(src_view.size.height),
+                depth: dst_view.size.depth.min(src_view.size.depth),
+            };
+            let scaled_extent = if is_rescaled {
+                let resolution = common::settings::values().resolution_info.clone();
+                Extent3D {
+                    width: resolution.scale_up_u32(expected_size.width),
+                    height: resolution.scale_up_u32(expected_size.height),
+                    depth: expected_size.depth,
+                }
+            } else {
+                expected_size
+            };
+            if copy.extent != scaled_extent {
+                log::error!(
+                    "TextureCache::CopyImage extent differs from the conversion views: copy={:?} expected={:?}",
+                    copy.extent,
+                    scaled_extent,
+                );
+            }
+            P::convert_image(self, dst_framebuffer_id, dst_view_id, src_view_id);
+        }
     }
 
     // ── Modification marks ─────────────────────────────────────────────
@@ -4196,6 +4339,9 @@ mod tests {
         static JOIN_COPY_DISPATCH: std::cell::Cell<(u32, u32)> = const {
             std::cell::Cell::new((0, 0))
         };
+        static JOIN_COPY_COPIES: std::cell::RefCell<Vec<ImageCopy>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
         static FRAMEBUFFER_CONSTRUCTIONS: std::cell::Cell<u32> = const {
             std::cell::Cell::new(0)
         };
@@ -4367,11 +4513,17 @@ mod tests {
             UPLOAD_BARRIER_CALLS.with(|calls| calls.set(calls.get().wrapping_add(1)));
         }
 
-        fn copy_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: ImageId, _: &[ImageCopy]) {
+        fn copy_image(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: ImageId,
+            copies: &[ImageCopy],
+        ) {
             JOIN_COPY_DISPATCH.with(|dispatch| {
                 let (copy, msaa) = dispatch.get();
                 dispatch.set((copy + 1, msaa));
             });
+            JOIN_COPY_COPIES.with(|observed| observed.borrow_mut().extend_from_slice(copies));
         }
 
         fn copy_image_msaa(
@@ -7246,6 +7398,99 @@ mod tests {
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED | ImageFlagBits::RESCALED));
         JOIN_COPY_DISPATCH.with(|dispatch| assert_eq!(dispatch.get(), (1, 0)));
+    }
+
+    #[test]
+    fn copy_image_owns_upstream_same_type_and_rescaling_policy() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let _settings_guard = crate::test_support::RESOLUTION_SETTINGS_MUTEX
+            .lock()
+            .unwrap();
+        let previous_resolution = common::settings::values().resolution_info.clone();
+        struct ResolutionRestore(common::settings::ResolutionScalingInfo);
+        impl Drop for ResolutionRestore {
+            fn drop(&mut self) {
+                common::settings::values_mut().resolution_info = self.0.clone();
+            }
+        }
+        let _restore = ResolutionRestore(previous_resolution);
+        {
+            let mut values = common::settings::values_mut();
+            values.resolution_info.up_scale = 3;
+            values.resolution_info.down_shift = 1;
+            values.resolution_info.active = true;
+        }
+
+        JOIN_COPY_DISPATCH.with(|dispatch| dispatch.set((0, 0)));
+        JOIN_COPY_COPIES.with(|copies| copies.borrow_mut().clear());
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let image_info = |format| ImageInfo {
+            format,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 64,
+                height: 32,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let dst_id = cache.insert_typed_image(ImageBase::new(
+            image_info(PixelFormat::A8B8G8R8Unorm),
+            0x1000,
+            0x2000,
+        ));
+        let src_id = cache.insert_typed_image(ImageBase::new(
+            image_info(PixelFormat::R8Unorm),
+            0x3000,
+            0x4000,
+        ));
+        cache.slot_images[dst_id]
+            .flags
+            .insert(ImageFlagBits::RESCALED);
+        cache.slot_images[src_id]
+            .flags
+            .insert(ImageFlagBits::RESCALED);
+        let copy = ImageCopy {
+            src_offset: Offset3D { x: 2, y: 4, z: 1 },
+            dst_offset: Offset3D { x: 6, y: 8, z: 1 },
+            extent: Extent3D {
+                width: 10,
+                height: 12,
+                depth: 2,
+            },
+            ..ImageCopy::default()
+        };
+
+        cache.copy_image(dst_id, src_id, &[copy]);
+
+        assert_eq!(
+            surface::get_format_type(cache.slot_images[dst_id].info.format),
+            surface::get_format_type(cache.slot_images[src_id].info.format)
+        );
+        assert_ne!(
+            surface::bytes_per_block(cache.slot_images[dst_id].info.format),
+            surface::bytes_per_block(cache.slot_images[src_id].info.format)
+        );
+        JOIN_COPY_DISPATCH.with(|dispatch| assert_eq!(dispatch.get(), (1, 0)));
+        JOIN_COPY_COPIES.with(|copies| {
+            let copies = copies.borrow();
+            assert_eq!(copies.len(), 1);
+            let observed = copies[0];
+            assert_eq!(observed.src_offset, Offset3D { x: 3, y: 6, z: 1 });
+            assert_eq!(observed.dst_offset, Offset3D { x: 9, y: 12, z: 1 });
+            assert_eq!(
+                observed.extent,
+                Extent3D {
+                    width: 15,
+                    height: 18,
+                    depth: 2,
+                }
+            );
+        });
     }
 
     #[test]

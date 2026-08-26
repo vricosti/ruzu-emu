@@ -447,7 +447,21 @@ pub trait TextureCacheParams {
     where
         Self: Sized;
 
-    /// Backend operation used by upstream `CopyImage`.
+    /// Backend `Runtime::CanImageBeCopied` primitive used by the common
+    /// `TextureCache<P>::CopyImage` policy.
+    fn can_image_be_copied(
+        _cache: &TextureCacheBase<Self>,
+        _dst_id: ImageId,
+        _src_id: ImageId,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
+    /// Backend `Runtime::CopyImage` primitive used by the common
+    /// `TextureCache<P>::CopyImage` policy.
     fn copy_image(
         cache: &mut TextureCacheBase<Self>,
         dst_id: ImageId,
@@ -455,6 +469,54 @@ pub trait TextureCacheParams {
         copies: &[ImageCopy],
     ) where
         Self: Sized;
+
+    /// Backend `Runtime::EmulateCopyImage` primitive used when
+    /// `HAS_EMULATED_COPIES` is set and a direct copy is unsuitable.
+    fn emulate_copy_image(
+        cache: &mut TextureCacheBase<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) where
+        Self: Sized,
+    {
+        Self::copy_image(cache, dst_id, src_id, copies);
+    }
+
+    /// Backend `Runtime::ShouldReinterpret` primitive.
+    fn should_reinterpret(
+        _cache: &TextureCacheBase<Self>,
+        _dst_id: ImageId,
+        _src_id: ImageId,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    /// Backend `Runtime::ReinterpretImage` primitive.
+    fn reinterpret_image(
+        _cache: &mut TextureCacheBase<Self>,
+        _dst_id: ImageId,
+        _src_id: ImageId,
+        _copies: &[ImageCopy],
+    ) where
+        Self: Sized,
+    {
+    }
+
+    /// Backend `Runtime::ConvertImage` primitive. The common cache owns
+    /// image-view/framebuffer selection exactly as upstream does.
+    fn convert_image(
+        _cache: &mut TextureCacheBase<Self>,
+        _dst_framebuffer_id: FramebufferId,
+        _dst_view_id: ImageViewId,
+        _src_view_id: ImageViewId,
+    ) where
+        Self: Sized,
+    {
+    }
 
     /// Backend operation used by the multisample branch of upstream
     /// `TextureCache<P>::JoinImages`.

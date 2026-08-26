@@ -17452,3 +17452,40 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these types own host OpenGL objects and mapped host pointers and are not serialized or
   copied as raw guest payloads. Compile-time assertions retain Eden's stream-size divisibility
   invariants.
+
+## 2026-08-26 — OpenGL texture cache and common `CopyImage` ownership vs Eden `gl_texture_cache.{h,cpp}`, `texture_cache.{h,cpp}`, and `vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses the C++ `TextureCache<P>` calls through `TextureCacheParams`; the common cache
+  owns copy selection, scaling, view construction, and framebuffer construction, while each
+  backend adapter only obtains its concrete objects and calls the matching runtime method.
+- OpenGL reads the mutex-protected live `resolution_info` value when scaling instead of retaining
+  Eden's reference into the global settings object. This preserves live settings semantics without
+  a self-referential unsynchronised pointer.
+- Vulkan framebuffer construction is fallible in Rust, so the conversion path returns if creating
+  the destination render target fails; Eden propagates the equivalent Vulkan failure by exception.
+
+### Unintentional differences (to fix)
+
+- Resolved: `TextureCache<P>::CopyImage` again belongs to the common cache. Rescaled-coordinate
+  handling, emulated-copy selection, reinterpretation, conversion-view construction, and extent
+  validation are no longer duplicated in the OpenGL and Vulkan backends.
+- Resolved: `JoinImages` preserves Eden's two distinct call paths: alias copies use common
+  `CopyImage`, while non-alias shrink copies call the runtime directly because
+  `MakeShrinkImageCopies` already applied its scaling factors.
+- Resolved: Vulkan `TextureCacheRuntime::ShouldReinterpret` checks both destination and source
+  depth/stencil formats when stencil export is unavailable, and the method is owned by the Vulkan
+  runtime rather than the generic adapter.
+- Resolved: OpenGL now uses the canonical `NUM_RT` and `Shader::NUM_TEXTURE_TYPES` owners, retains
+  Eden's file-local accelerated-format table, materializes `StorageViews` before probing it, and
+  uses unsigned wrapping arithmetic for the device-memory budget.
+
+### Missing items
+
+- None in the audited common image-copy policy or the OpenGL/Vulkan runtime operations it calls.
+
+### Binary layout verification
+
+- N/A: this slice moves host-side control flow and constant ownership; it does not serialize or
+  raw-copy any guest-visible payload.

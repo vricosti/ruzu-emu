@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use common::settings;
+use shader_recompiler::shader_info::NUM_TEXTURE_TYPES;
 use smallvec::SmallVec;
 
 use super::gl_resource_manager::{
@@ -37,15 +38,12 @@ use crate::texture_cache::texture_cache_base::{
 };
 #[cfg(test)]
 use crate::texture_cache::types::SubresourceExtent;
-use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
+use crate::texture_cache::types::{BufferImageCopy, ImageCopy, NUM_RT};
 use crate::texture_cache::types::{
     Extent2D, Extent3D, FramebufferId, ImageId, ImageType, ImageViewId, ImageViewType, Region2D,
     SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID,
 };
 use crate::texture_cache::util::{full_download_copies, map_size_bytes};
-
-/// Number of render targets.
-pub const NUM_RT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FramebufferAttachmentMode {
@@ -83,25 +81,6 @@ unsafe fn attach_framebuffer_texture(
             gl::NamedFramebufferTextureLayer(framebuffer, attachment, texture, 0, layer);
         }
     }
-}
-
-fn scale_up_image_copies(copies: &[ImageCopy], both_2d: bool) -> Vec<ImageCopy> {
-    let resolution = settings::values().resolution_info.clone();
-    copies
-        .iter()
-        .copied()
-        .map(|mut copy| {
-            copy.src_offset.x = resolution.scale_up_i32(copy.src_offset.x);
-            copy.dst_offset.x = resolution.scale_up_i32(copy.dst_offset.x);
-            copy.extent.width = resolution.scale_up_u32(copy.extent.width);
-            if both_2d {
-                copy.src_offset.y = resolution.scale_up_i32(copy.src_offset.y);
-                copy.dst_offset.y = resolution.scale_up_i32(copy.dst_offset.y);
-                copy.extent.height = resolution.scale_up_u32(copy.extent.height);
-            }
-            copy
-        })
-        .collect()
 }
 
 fn is_pixel_format_bgr(format: PixelFormat) -> bool {
@@ -176,9 +155,56 @@ fn is_converted_image(has_native_astc: bool, format: PixelFormat, image_type: Im
     matches!(format, PixelFormat::Bc4Unorm | PixelFormat::Bc5Unorm) && image_type == ImageType::E3D
 }
 
+// Preserved beside Eden's `CanBeAccelerated`. The formats remain unreachable while Eden's
+// unconditional `return false` disables non-ASTC accelerated uploads.
+#[allow(dead_code)]
+const ACCELERATED_FORMATS: [u32; 39] = [
+    gl::RGBA32F,
+    gl::RGBA16F,
+    gl::RG32F,
+    gl::RG16F,
+    gl::R11F_G11F_B10F,
+    gl::R32F,
+    gl::R16F,
+    gl::RGBA32UI,
+    gl::RGBA16UI,
+    gl::RGB10_A2UI,
+    gl::RGBA8UI,
+    gl::RG32UI,
+    gl::RG16UI,
+    gl::RG8UI,
+    gl::R32UI,
+    gl::R16UI,
+    gl::R8UI,
+    gl::RGBA32I,
+    gl::RGBA16I,
+    gl::RGBA8I,
+    gl::RG32I,
+    gl::RG16I,
+    gl::RG8I,
+    gl::R32I,
+    gl::R16I,
+    gl::R8I,
+    gl::RGBA16,
+    gl::RGB10_A2,
+    gl::RGBA8,
+    gl::RG16,
+    gl::RG8,
+    gl::R16,
+    gl::R8,
+    gl::RGBA16_SNORM,
+    gl::RGBA8_SNORM,
+    gl::RG16_SNORM,
+    gl::RG8_SNORM,
+    gl::R16_SNORM,
+    gl::R8_SNORM,
+];
+
 /// Port of upstream `CanBeAccelerated(const TextureCacheRuntime&, const ImageInfo&)`.
-fn can_be_accelerated(has_native_astc: bool, info: &ImageInfo) -> bool {
-    if crate::surface::is_pixel_format_astc(info.format) && info.size.depth == 1 && !has_native_astc
+fn can_be_accelerated(runtime: &TextureCacheRuntime, info: &ImageInfo) -> bool {
+    if crate::surface::is_pixel_format_astc(info.format)
+        && info.size.depth == 1
+        && !runtime.has_native_astc()
     {
         return *common::settings::values().accelerate_astc.get_value()
             == common::settings_enums::AstcDecodeMode::Gpu
@@ -189,9 +215,9 @@ fn can_be_accelerated(has_native_astc: bool, info: &ImageInfo) -> bool {
 }
 
 /// Port of upstream `CanBeDecodedAsync(const TextureCacheRuntime&, const ImageInfo&)`.
-fn can_be_decoded_async(has_native_astc: bool, info: &ImageInfo) -> bool {
+fn can_be_decoded_async(runtime: &TextureCacheRuntime, info: &ImageInfo) -> bool {
     crate::surface::is_pixel_format_astc(info.format)
-        && !has_native_astc
+        && !runtime.has_native_astc()
         && *common::settings::values().accelerate_astc.get_value()
             == common::settings_enums::AstcDecodeMode::CpuAsynchronous
 }
@@ -233,9 +259,6 @@ fn select_astc_format(_format: PixelFormat, is_srgb: bool) -> u32 {
         }
     }
 }
-
-/// Number of texture types (1D, 2D, 2DRect, 3D, Cube, 1DArray, 2DArray, Buffer, CubeArray).
-const NUM_TEXTURE_TYPES: usize = 9;
 
 /// Format properties for a given GL internal format.
 ///
@@ -388,8 +411,7 @@ pub struct TextureCacheRuntime {
     state_tracker: NonNull<StateTracker>,
     staging_buffer_pool: SharedStagingBufferPool,
     format_properties: [HashMap<u32, FormatProperties>; 3],
-    null_image_views: [u32; NUM_TEXTURE_TYPES],
-    resolution: common::settings::ResolutionScalingInfo,
+    null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     #[cfg(test)]
     is_test_stub: bool,
 }
@@ -493,7 +515,7 @@ impl TextureCacheRuntime {
             }
         }
 
-        let mut null_image_views = [0u32; NUM_TEXTURE_TYPES];
+        let mut null_image_views = [0u32; NUM_TEXTURE_TYPES as usize];
         let mut set_view = |texture_type: TextureType, handle: u32| {
             if device.has_debugging_tool_attached() {
                 let name = format!("NullImage {texture_type:?}");
@@ -523,7 +545,9 @@ impl TextureCacheRuntime {
 
         const HALF_GIB: u64 = 512 * 1024 * 1024;
         let device_access_memory = if device.can_report_memory_usage() {
-            device.get_current_dedicated_video_memory() + HALF_GIB
+            device
+                .get_current_dedicated_video_memory()
+                .wrapping_add(HALF_GIB)
         } else {
             2 * 1024 * 1024 * 1024
         };
@@ -551,7 +575,6 @@ impl TextureCacheRuntime {
             staging_buffer_pool,
             format_properties,
             null_image_views,
-            resolution,
             #[cfg(test)]
             is_test_stub: false,
         }
@@ -587,8 +610,7 @@ impl TextureCacheRuntime {
             state_tracker: NonNull::from(state_tracker),
             staging_buffer_pool,
             format_properties: std::array::from_fn(|_| HashMap::new()),
-            null_image_views: [0; NUM_TEXTURE_TYPES],
-            resolution: common::settings::ResolutionScalingInfo::default(),
+            null_image_views: [0; NUM_TEXTURE_TYPES as usize],
             is_test_stub: true,
         }
     }
@@ -1813,12 +1835,7 @@ impl Image {
     /// Port of `Image::ScaleUp`.
     /// Scales the image up by the resolution scaling factor.
     pub fn scale_up(&mut self, base: &mut ImageBase, ignore: bool) -> bool {
-        let resolution_active = self.runtime.is_some_and(|runtime| {
-            // SAFETY: production images retain the runtime that constructed
-            // them, matching Eden's TextureCacheRuntime pointer lifetime.
-            unsafe { runtime.as_ref() }.resolution.active
-        });
-        if !resolution_active {
+        if self.runtime.is_none() || !settings::values().resolution_info.active {
             return false;
         }
         if base.flags.contains(ImageFlagBits::RESCALED) {
@@ -1845,11 +1862,7 @@ impl Image {
     /// Port of `Image::ScaleDown`.
     /// Scales the image down from the resolution scaling factor.
     pub fn scale_down(&mut self, base: &mut ImageBase, ignore: bool) -> bool {
-        let resolution_active = self.runtime.is_some_and(|runtime| {
-            // SAFETY: see `scale_up`.
-            unsafe { runtime.as_ref() }.resolution.active
-        });
-        if !resolution_active {
+        if self.runtime.is_none() || !settings::values().resolution_info.active {
             return false;
         }
         if !base.flags.contains(ImageFlagBits::RESCALED) {
@@ -1883,7 +1896,10 @@ impl Image {
             .expect("production OpenGL Image requires TextureCacheRuntime");
         // SAFETY: the runtime is boxed by the texture cache and outlives all
         // image slots, matching Eden's retained runtime pointer.
-        let resolution = unsafe { runtime_ptr.as_ref() }.resolution.clone();
+        // Eden retains a reference to the live global resolution state. Rust
+        // reads the locked global here instead of retaining an unsynchronised
+        // pointer into `Settings::Values`.
+        let resolution = settings::values().resolution_info.clone();
         let scaled_width = resolution.scale_up_u32(base.info.size.width);
         let scaled_height = if is_2d {
             resolution.scale_up_u32(base.info.size.height)
@@ -1980,8 +1996,8 @@ impl Image {
 /// formats than unsigned, even at the same bit width).
 #[derive(Default)]
 struct StorageViews {
-    signeds: [u32; NUM_TEXTURE_TYPES],
-    unsigneds: [u32; NUM_TEXTURE_TYPES],
+    signeds: [u32; NUM_TEXTURE_TYPES as usize],
+    unsigneds: [u32; NUM_TEXTURE_TYPES as usize],
 }
 
 /// An OpenGL image view.
@@ -1991,7 +2007,7 @@ pub struct ImageView {
     /// Stable address of the `ImageViewBase` subobject owned by the typed
     /// slot, matching upstream's inheritance rather than duplicating it.
     base: NonNull<ImageViewBase>,
-    pub views: [u32; NUM_TEXTURE_TYPES],
+    pub views: [u32; NUM_TEXTURE_TYPES as usize],
     pub default_handle: u32,
     pub internal_format: u32,
     pub buffer_size: u32,
@@ -2013,12 +2029,12 @@ pub struct ImageView {
 impl ImageView {
     #[cfg(test)]
     pub fn new(base: &mut ImageViewBase) -> Self {
-        Self::with_null_views(NonNull::from(base), [0; NUM_TEXTURE_TYPES])
+        Self::with_null_views(NonNull::from(base), [0; NUM_TEXTURE_TYPES as usize])
     }
 
     fn with_null_views(
         base: NonNull<ImageViewBase>,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     ) -> Self {
         Self {
             base,
@@ -2041,7 +2057,7 @@ impl ImageView {
     /// Port of `ImageView(TextureCacheRuntime&, NullImageViewParams)`.
     fn from_null_base(
         base: NonNull<ImageViewBase>,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     ) -> Self {
         Self::with_null_views(base, null_image_views)
     }
@@ -2098,7 +2114,7 @@ impl ImageView {
     pub fn new_color_2d(
         base: NonNull<ImageViewBase>,
         image: &Image,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
         set_object_label: bool,
     ) -> Self {
         // SAFETY: `base` points into the boxed base of the owning slot.
@@ -2138,7 +2154,7 @@ impl ImageView {
     pub fn from_buffer_base(
         base: NonNull<ImageViewBase>,
         _view_info: &ImageViewInfo,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     ) -> Self {
         // SAFETY: `base` points into the boxed base of the owning slot.
         let base_ref = unsafe { base.as_ref() };
@@ -2197,7 +2213,7 @@ impl ImageView {
         base: NonNull<ImageViewBase>,
         info: &ImageViewInfo,
         image: &Image,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
         set_object_label: bool,
     ) -> Self {
         use crate::texture_cache::types::ImageViewType;
@@ -2365,23 +2381,25 @@ impl ImageView {
         }
         let is_signed = matches!(image_format, ImageFormat::R8Sint | ImageFormat::R16Sint);
         let idx = texture_type as usize;
-        // Probe the cache first (immutable read), then create + insert
-        // if missing. The make_view borrow + storage_views borrow can't
-        // overlap, so split into two stages.
-        let cached = self.storage_views.as_ref().map(|sv| {
+        // Eden materializes `StorageViews` before selecting and probing the
+        // requested slot. End the borrow before `make_view`, then publish the
+        // new handle into the already-created cache.
+        let cached = {
+            let storage = self.storage_views.get_or_insert_with(StorageViews::default);
             if is_signed {
-                sv.signeds[idx]
+                storage.signeds[idx]
             } else {
-                sv.unsigneds[idx]
+                storage.unsigneds[idx]
             }
-        });
-        if let Some(h) = cached {
-            if h != 0 {
-                return h;
-            }
+        };
+        if cached != 0 {
+            return cached;
         }
         let new_view = self.make_view(texture_type, shader_format(image_format));
-        let storage = self.storage_views.get_or_insert_with(StorageViews::default);
+        let storage = self
+            .storage_views
+            .as_mut()
+            .expect("StorageViews was materialized before MakeView");
         if is_signed {
             storage.signeds[idx] = new_view;
         } else {
@@ -2716,10 +2734,7 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
     ) -> Image {
         let runtime = runtime.expect("OpenGL TextureCache runtime must be bound");
         // SAFETY: the generic cache exclusively owns the just-inserted slot.
-        TextureCache::apply_backend_image_flags(
-            unsafe { base.as_mut() },
-            runtime.has_native_astc(),
-        );
+        TextureCache::apply_backend_image_flags(unsafe { base.as_mut() }, runtime);
         Image::from_base(base, runtime)
     }
 
@@ -2881,6 +2896,19 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         cache.runtime().insert_upload_memory_barrier();
     }
 
+    fn can_image_be_copied(
+        cache: &CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+    ) -> bool {
+        cache.runtime.is_some()
+            && cache.slot_images[dst_id]
+                .backend
+                .as_ref()
+                .zip(cache.slot_images[src_id].backend.as_ref())
+                .is_some_and(|(dst, src)| cache.runtime().can_image_be_copied(dst, src))
+    }
+
     fn copy_image(
         cache: &mut CommonTextureCache<Self>,
         dst_id: ImageId,
@@ -2891,6 +2919,75 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
             return;
         }
         texture_cache_from_base(cache).copy_image(dst_id, src_id, copies);
+    }
+
+    fn emulate_copy_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) {
+        if cache.runtime.is_none() {
+            return;
+        }
+        texture_cache_from_base(cache).emulate_copy_image(dst_id, src_id, copies);
+    }
+
+    fn should_reinterpret(
+        cache: &CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+    ) -> bool {
+        cache.slot_images[dst_id]
+            .backend
+            .as_ref()
+            .zip(cache.slot_images[src_id].backend.as_ref())
+            .is_some_and(|(dst, src)| cache.runtime().should_reinterpret(dst, src))
+    }
+
+    fn reinterpret_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) {
+        if cache.runtime.is_none() {
+            return;
+        }
+        texture_cache_from_base(cache).reinterpret_image(dst_id, src_id, copies);
+    }
+
+    fn convert_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_framebuffer_id: FramebufferId,
+        dst_view_id: ImageViewId,
+        src_view_id: ImageViewId,
+    ) {
+        if cache.runtime.is_none() {
+            return;
+        }
+        let runtime = cache.runtime_mut() as *mut TextureCacheRuntime;
+        let dst_framebuffer =
+            &mut cache.slot_framebuffers[dst_framebuffer_id] as *mut TextureCacheFramebuffer;
+        let dst_view = cache.slot_image_views[dst_view_id]
+            .backend
+            .as_mut()
+            .expect("OpenGL destination conversion view must be materialized")
+            as *mut ImageView;
+        let src_view = cache.slot_image_views[src_view_id]
+            .backend
+            .as_mut()
+            .expect("OpenGL source conversion view must be materialized")
+            as *mut ImageView;
+        // SAFETY: the runtime, framebuffer, and two distinct view slots are
+        // disjoint owners in the texture cache.
+        unsafe {
+            (&mut *runtime).convert_image(
+                Some(&mut *dst_framebuffer),
+                &mut *dst_view,
+                &mut *src_view,
+            );
+        }
     }
 
     fn copy_image_msaa(
@@ -3279,15 +3376,19 @@ impl TextureCache {
         self.base.slot_image_views[view_id].backend.take()
     }
 
-    fn apply_backend_image_flags(image: &mut ImageBase, has_native_astc: bool) {
+    fn apply_backend_image_flags(image: &mut ImageBase, runtime: &TextureCacheRuntime) {
         // Upstream sets ASYNCHRONOUS_DECODE / ACCELERATED_UPLOAD in
         // OpenGL::Image::Image with this priority.
-        if can_be_decoded_async(has_native_astc, &image.info) {
+        if can_be_decoded_async(runtime, &image.info) {
             image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
-        } else if can_be_accelerated(has_native_astc, &image.info) {
+        } else if can_be_accelerated(runtime, &image.info) {
             image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
         }
-        if is_converted_image(has_native_astc, image.info.format, image.info.image_type) {
+        if is_converted_image(
+            runtime.has_native_astc(),
+            image.info.format,
+            image.info.image_type,
+        ) {
             image
                 .flags
                 .insert(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD);
@@ -3295,8 +3396,8 @@ impl TextureCache {
     }
 
     #[cfg(test)]
-    fn apply_backend_image_flags_for_test(image: &mut ImageBase, has_native_astc: bool) {
-        Self::apply_backend_image_flags(image, has_native_astc);
+    fn apply_backend_image_flags_for_test(image: &mut ImageBase, runtime: &TextureCacheRuntime) {
+        Self::apply_backend_image_flags(image, runtime);
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
@@ -3304,86 +3405,18 @@ impl TextureCache {
     }
 
     fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
-        if !dst_id.is_valid() || !src_id.is_valid() || copies.is_empty() {
-            return;
-        }
-
-        let dst_info = self.base.slot_images[dst_id].info.clone();
-        let src_info = self.base.slot_images[src_id].info.clone();
-        let src_flags = self.base.slot_images[src_id].flags;
-        let src_rescaled = src_flags.contains(ImageFlagBits::RESCALED);
-        let scaled_copies = if src_rescaled {
-            if !self.base.slot_images[dst_id]
-                .flags
-                .contains(ImageFlagBits::RESCALED)
-            {
-                // Eden's ASSERT is fail-soft: it reports the invariant but
-                // continues through the rescaled-copy path.
-                log::error!(
-                    "TextureCache::CopyImage source is rescaled but destination is not: src={} dst={}",
-                    src_id.index,
-                    dst_id.index,
-                );
-            }
-            let both_2d =
-                src_info.image_type == ImageType::E2D && dst_info.image_type == ImageType::E2D;
-            Some(scale_up_image_copies(copies, both_2d))
-        } else {
-            None
-        };
-        let copies = scaled_copies.as_deref().unwrap_or(copies);
-
-        let dst_format_type = crate::surface::get_format_type(dst_info.format);
-        let src_format_type = crate::surface::get_format_type(src_info.format);
-
         if !self.backend_image_is_ready(dst_id) || !self.backend_image_is_ready(src_id) {
             return;
         }
-
-        if self.backend_image(dst_id).map(Image::handle).unwrap_or(0) == 0
-            || self.backend_image(src_id).map(Image::handle).unwrap_or(0) == 0
-        {
-            return;
-        }
-
-        let can_copy = self
+        let runtime = self.base.runtime() as *const TextureCacheRuntime;
+        let dst = self
             .backend_image(dst_id)
-            .zip(self.backend_image(src_id))
-            .is_some_and(|(dst, src)| self.base.runtime().can_image_be_copied(dst, src));
-        if src_format_type == dst_format_type && can_copy {
-            let runtime = self.base.runtime() as *const TextureCacheRuntime;
-            let dst = self
-                .backend_image(dst_id)
-                .expect("backend image was checked above");
-            let src = self
-                .backend_image(src_id)
-                .expect("backend image was checked above");
-            // SAFETY: runtime and image slots are disjoint cache owners.
-            unsafe { &*runtime }.copy_image(dst, src, copies);
-            return;
-        }
-
-        if src_format_type == dst_format_type {
-            self.emulate_copy_image(dst_id, src_id, copies);
-            return;
-        }
-
-        if dst_info.image_type != ImageType::E2D || src_info.image_type != ImageType::E2D {
-            // These are upstream UNIMPLEMENTED_IF checks. Eden reports them
-            // and then continues into ShouldReinterpret.
-            log::error!(
-                "TextureCache::copy_image: reinterpret path only implemented for 2D images dst={:?} src={:?}",
-                dst_info.image_type,
-                src_info.image_type
-            );
-        }
-        let should_reinterpret = self
-            .backend_image(dst_id)
-            .zip(self.backend_image(src_id))
-            .is_some_and(|(dst, src)| self.base.runtime().should_reinterpret(dst, src));
-        if should_reinterpret {
-            self.reinterpret_image(dst_id, src_id, copies);
-        }
+            .expect("backend image was checked above");
+        let src = self
+            .backend_image(src_id)
+            .expect("backend image was checked above");
+        // SAFETY: runtime and image slots are disjoint cache owners.
+        unsafe { &*runtime }.copy_image(dst, src, copies);
     }
 
     fn copy_image_msaa(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {

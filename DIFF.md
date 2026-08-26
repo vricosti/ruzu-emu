@@ -16564,3 +16564,64 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: the change moves host-side ownership and control flow. `Region2D`, `RenderTargets`, image
   IDs, image-view IDs, and framebuffer IDs retain their existing layouts; no guest payload or
   serialized cache structure changed.
+
+## 2026-08-26 — `src/common/src/thread.rs` and `thread_worker.rs` vs Eden `src/common/thread.{h,cpp}` and `thread_worker.h`
+
+### Intentional differences
+
+- Rust's `std::thread::Builder` owns thread naming instead of calling
+  `Common::SetCurrentThreadName` from inside the worker. Placement is still applied before the
+  per-thread state maker runs.
+- The Android ADPF/core-affinity bodies remain no-ops because the Android JNI integration is an
+  explicit port exception. Desktop hosts follow Eden's no-op affinity branches, while every
+  non-default placement still lowers the worker priority first.
+
+### Unintentional differences (to fix)
+
+- None after restoring `ThreadPlacement::{Default,Background,Efficiency}`, the placement-aware
+  worker constructor, Eden's low-priority ordering, and the per-placement routing.
+
+### Missing items
+
+- None in the audited `StatefulThreadWorker` placement contract on supported desktop hosts.
+
+### Binary layout verification
+
+- PASS: `ThreadPlacement` is `repr(u32)` with Eden's exact discriminants 0, 1, and 2. It is
+  host-only state and is not serialized.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/texture_cache_base.rs`, `texture_cache.rs`, and `util.rs` storage ownership vs Eden `src/video_core/texture_cache/texture_cache_base.h`, `texture_cache.{h,cpp}`, and `util.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps per-address-space GPU page tables in a `Vec` and stores stable indices in channel
+  state rather than retaining pointers into Eden's `std::deque`. The indices preserve the same
+  shared address-space ownership without self-referential Rust pointers.
+- `AsyncDecodeContext` is held by `Arc` while its queued closure runs, and its decoded bytes and
+  copy list share one mutex-protected output object. Eden retains a `unique_ptr`, passes a raw
+  pointer to the worker, and uses the mutex as the publication boundary; completion ordering and
+  object lifetime remain equivalent.
+- `sparse_views` names its inline values `ImageMapId`, because both ports insert IDs from
+  `slot_map_views`. Eden's header spells the alias `ImageViewId`; both aliases are the same
+  `SlotId`, and Eden's implementation indexes `slot_map_views` with the stored values.
+- Ruzu builds the supported desktop/non-`YUZU_LEGACY` profile, so the 4-GiB threshold and eight-
+  tick destruction rings match that Eden configuration. Eden's current CMake labels
+  `YUZU_LEGACY` Android-only, and the Android frontend is an explicit port exception.
+
+### Unintentional differences (to fix)
+
+- None after restoring `ScratchBuffer<u8>` for decoded, swizzle, and unswizzle storage;
+  `SmallVec` inline capacities 16 and 4 for sparse/decode and join state; and the dedicated
+  `Common::ThreadWorker` with `ThreadPlacement::Efficiency` for texture decoding.
+
+### Missing items
+
+- None in the audited constants, associated backend types, per-channel descriptor state, slot
+  storage, page tables, download queues, LRU/destruction state, unswizzle state, or join-cache
+  fields of `TextureCache<P>`.
+
+### Binary layout verification
+
+- N/A: these are host-side containers rather than raw guest or disk payloads. Focused tests pin
+  the upstream inline capacities, initial scratch sizes, common worker owner, and existing cache
+  lifecycle behavior.

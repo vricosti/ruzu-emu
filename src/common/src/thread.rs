@@ -34,6 +34,19 @@ fn lowest_allowed_nice() -> i32 {
     }
 }
 
+/// Preferred CPU placement for worker threads.
+///
+/// Port of upstream `Common::ThreadPlacement`. On non-Android hosts the
+/// placement helpers are no-ops, while non-default placement still lowers the
+/// worker priority exactly as `StatefulThreadWorker` does upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ThreadPlacement {
+    Default = 0,
+    Background = 1,
+    Efficiency = 2,
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn nice_value_for_priority(priority: ThreadPriority) -> i32 {
     const NICE_AUDIO: i32 = -16;
@@ -142,6 +155,19 @@ pub fn set_current_thread_name(name: &str) {
 /// ADPF integration are excluded from this Rust port, so other hosts take the
 /// same no-op branch.
 pub fn set_current_thread_to_performance_cores() {}
+
+/// Port of upstream `Common::SetCurrentThreadToEfficiencyCores`.
+///
+/// Eden only changes affinity in its Android implementation. Android JNI and
+/// ADPF integration are excluded from this Rust port, so supported desktop
+/// hosts take the same no-op branch.
+pub fn set_current_thread_to_efficiency_cores() {}
+
+/// Port of upstream `Common::SetCurrentThreadToBackgroundWork`.
+pub fn set_current_thread_to_background_work() {}
+
+/// Port of upstream `Common::SetCurrentThreadToAllCores`.
+pub fn set_current_thread_to_all_cores() {}
 
 /// An event that can be set and waited on, matching the C++ Common::Event.
 pub struct Event {

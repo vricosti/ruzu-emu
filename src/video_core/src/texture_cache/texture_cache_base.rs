@@ -20,11 +20,22 @@ use std::sync::{Arc, Mutex};
 
 use common::hash::{BuildIdentityHasher, BuildUnorderedDenseHasher};
 use common::lru_cache::LeastRecentlyUsedCache;
+use common::scratch_buffer::ScratchBuffer;
+use common::thread::ThreadPlacement;
+use common::thread_worker::ThreadWorker;
 use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
 use smallvec::SmallVec;
 
 use common::slot_vector::SlotVector;
 
+use super::descriptor_table::DescriptorTable;
+use super::image_base::{
+    GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
+};
+use super::image_view_base::{ImageViewBase, NullImageViewParams};
+use super::image_view_info::ImageViewInfo;
+use super::render_targets::RenderTargets;
+use super::types::*;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{
     ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches, FromChannelState,
@@ -35,16 +46,6 @@ use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::memory_manager::MemoryManager;
 use crate::renderer_base::GuestMemoryWriter;
-use crate::textures::workers::ThreadWorker;
-
-use super::descriptor_table::DescriptorTable;
-use super::image_base::{
-    GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
-};
-use super::image_view_base::{ImageViewBase, NullImageViewParams};
-use super::image_view_info::ImageViewInfo;
-use super::render_targets::RenderTargets;
-use super::types::*;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -90,8 +91,8 @@ pub struct AsyncDecodeContext {
 }
 
 pub struct AsyncDecodeOutput {
-    pub decoded_data: Vec<u8>,
-    pub copies: Vec<BufferImageCopy>,
+    pub decoded_data: ScratchBuffer<u8>,
+    pub copies: SmallVec<[BufferImageCopy; 16]>,
 }
 
 /// State for an in-flight GPU block-linear 3D unswizzle.
@@ -129,8 +130,8 @@ impl AsyncDecodeContext {
         Self {
             image_id,
             output: Mutex::new(AsyncDecodeOutput {
-                decoded_data: Vec::new(),
-                copies: Vec::new(),
+                decoded_data: ScratchBuffer::new(),
+                copies: SmallVec::new(),
             }),
             complete: std::sync::atomic::AtomicBool::new(false),
         }
@@ -752,7 +753,7 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub framebuffers: HashMap<RenderTargets, FramebufferId, BuildUnorderedDenseHasher>,
     // Page tables
     pub page_table: HashMap<u64, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
-    pub sparse_views: HashMap<ImageId, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+    pub sparse_views: HashMap<ImageId, SmallVec<[ImageMapId; 16]>, BuildUnorderedDenseHasher>,
 
     // Memory tracking
     pub has_deleted_images: bool,
@@ -793,13 +794,13 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub current_unswizzle_frame: u8,
 
     // Join caching
-    pub join_overlap_ids: Vec<ImageId>,
+    pub join_overlap_ids: SmallVec<[ImageId; 4]>,
     pub join_overlaps_found: HashSet<ImageId, BuildUnorderedDenseHasher>,
-    pub join_left_aliased_ids: Vec<ImageId>,
-    pub join_right_aliased_ids: Vec<ImageId>,
+    pub join_left_aliased_ids: SmallVec<[ImageId; 4]>,
+    pub join_right_aliased_ids: SmallVec<[ImageId; 4]>,
     pub join_ignore_textures: HashSet<ImageId, BuildUnorderedDenseHasher>,
-    pub join_bad_overlap_ids: Vec<ImageId>,
-    pub join_copies_to_do: Vec<JoinCopy>,
+    pub join_bad_overlap_ids: SmallVec<[ImageId; 4]>,
+    pub join_copies_to_do: SmallVec<[JoinCopy; 4]>,
     pub join_alias_indices: HashMap<ImageId, usize, BuildUnorderedDenseHasher>,
 
     // Image alloc table
@@ -809,8 +810,8 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub virtual_invalid_space: u64,
 
     // Scratch buffers
-    pub swizzle_data_buffer: Vec<u8>,
-    pub unswizzle_data_buffer: Vec<u8>,
+    pub swizzle_data_buffer: ScratchBuffer<u8>,
+    pub unswizzle_data_buffer: ScratchBuffer<u8>,
 
     // Rust adaptation of upstream `Runtime::DownloadStagingBuffer` +
     // backend `Image::DownloadMemory` and `Tegra::MemoryManager`.
@@ -1079,24 +1080,28 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             sampler_heap_budget: None,
             last_sampler_gc_frame: u64::MAX,
             async_decodes: Vec::new(),
-            texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
+            texture_decode_worker: ThreadWorker::new_stateless_with_placement(
+                1,
+                "TextureDecoder".to_owned(),
+                ThreadPlacement::Efficiency,
+            ),
             gpu_unswizzle_maxsize,
             swizzle_chunk_size,
             swizzle_slices_per_batch,
             unswizzle_queue: VecDeque::new(),
             current_unswizzle_frame: 0,
-            join_overlap_ids: Vec::new(),
+            join_overlap_ids: SmallVec::new(),
             join_overlaps_found: HashSet::default(),
-            join_left_aliased_ids: Vec::new(),
-            join_right_aliased_ids: Vec::new(),
+            join_left_aliased_ids: SmallVec::new(),
+            join_right_aliased_ids: SmallVec::new(),
             join_ignore_textures: HashSet::default(),
-            join_bad_overlap_ids: Vec::new(),
-            join_copies_to_do: Vec::new(),
+            join_bad_overlap_ids: SmallVec::new(),
+            join_copies_to_do: SmallVec::new(),
             join_alias_indices: HashMap::default(),
             image_allocs_table: HashMap::default(),
             virtual_invalid_space: 0,
-            swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
-            unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
+            swizzle_data_buffer: ScratchBuffer::with_capacity(8 * 1024 * 1024),
+            unswizzle_data_buffer: ScratchBuffer::with_capacity(1024 * 1024),
             image_downloader: None,
             guest_memory_writer: None,
             channel_gpu_memory: None,
@@ -1636,6 +1641,25 @@ mod tests {
         assert_eq!(cache.minimum_memory, 2 * 1024 * 1024 * 1024);
         assert_eq!(cache.expected_memory, 6_012_954_215);
         assert_eq!(cache.critical_memory, 7_730_941_133);
+    }
+
+    #[test]
+    fn cache_scratch_and_inline_containers_match_upstream_owners() {
+        fn assert_common_worker(_: &common::thread_worker::ThreadWorker) {}
+
+        let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        assert_eq!(cache.swizzle_data_buffer.size(), 8 * 1024 * 1024);
+        assert_eq!(cache.unswizzle_data_buffer.size(), 1024 * 1024);
+        assert!(cache.join_overlap_ids.capacity() >= 4);
+        assert!(cache.join_left_aliased_ids.capacity() >= 4);
+        assert!(cache.join_right_aliased_ids.capacity() >= 4);
+        assert!(cache.join_bad_overlap_ids.capacity() >= 4);
+        assert!(cache.join_copies_to_do.capacity() >= 4);
+        assert_common_worker(&cache.texture_decode_worker);
+
+        let decode = super::AsyncDecodeContext::new(ImageId::default());
+        let output = decode.output.lock().unwrap();
+        assert!(output.copies.capacity() >= 16);
     }
 
     #[test]

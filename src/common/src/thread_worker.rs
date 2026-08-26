@@ -15,6 +15,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::thread::{
+    set_current_thread_priority, set_current_thread_to_all_cores,
+    set_current_thread_to_background_work, set_current_thread_to_efficiency_cores, ThreadPlacement,
+    ThreadPriority,
+};
+
 /// Internal shared state between the pool and its workers.
 struct SharedState<S: Send + 'static> {
     queue: Mutex<VecDeque<Box<dyn FnOnce(&mut S) + Send>>>,
@@ -47,6 +53,19 @@ impl<S: Send + 'static> StatefulThreadWorker<S> {
     where
         F: Fn() -> S + Send + Clone + 'static,
     {
+        Self::new_with_placement(num_workers, name, state_maker, ThreadPlacement::Default)
+    }
+
+    /// Create a worker pool with upstream `ThreadPlacement` semantics.
+    pub fn new_with_placement<F>(
+        num_workers: usize,
+        name: String,
+        state_maker: F,
+        placement: ThreadPlacement,
+    ) -> Self
+    where
+        F: Fn() -> S + Send + Clone + 'static,
+    {
         let shared = Arc::new(SharedState {
             queue: Mutex::new(VecDeque::new()),
             condition: Condvar::new(),
@@ -67,6 +86,14 @@ impl<S: Send + 'static> StatefulThreadWorker<S> {
                 thread::Builder::new()
                     .name(name_clone)
                     .spawn(move || {
+                        if placement != ThreadPlacement::Default {
+                            set_current_thread_priority(ThreadPriority::Low);
+                        }
+                        match placement {
+                            ThreadPlacement::Efficiency => set_current_thread_to_efficiency_cores(),
+                            ThreadPlacement::Background => set_current_thread_to_background_work(),
+                            ThreadPlacement::Default => set_current_thread_to_all_cores(),
+                        }
                         let mut state = maker();
                         loop {
                             let task;
@@ -176,6 +203,15 @@ impl ThreadWorker {
         Self::new(num_workers, name, || ())
     }
 
+    /// Create a stateless worker with upstream placement semantics.
+    pub fn new_stateless_with_placement(
+        num_workers: usize,
+        name: String,
+        placement: ThreadPlacement,
+    ) -> Self {
+        Self::new_with_placement(num_workers, name, || (), placement)
+    }
+
     /// Queue a stateless task.
     pub fn queue_stateless_work<F>(&self, work: F)
     where
@@ -204,6 +240,22 @@ mod tests {
 
         worker.wait_for_requests();
         assert_eq!(counter.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn placed_stateless_worker_executes_requests() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let worker = ThreadWorker::new_stateless_with_placement(
+            1,
+            "placed-worker".to_string(),
+            ThreadPlacement::Efficiency,
+        );
+        let queued_counter = Arc::clone(&counter);
+        worker.queue_stateless_work(move || {
+            queued_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        worker.wait_for_requests();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -161,13 +161,15 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
-        self.swizzle_data_buffer.resize(guest_size_bytes, 0);
+        self.swizzle_data_buffer
+            .resize_destructive(guest_size_bytes);
         gpu_memory
             .lock()
             .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
 
         let copies = if flags.contains(ImageFlagBits::CONVERTED) {
-            self.unswizzle_data_buffer.resize(unswizzled_size_bytes, 0);
+            self.unswizzle_data_buffer
+                .resize_destructive(unswizzled_size_bytes);
             let mut copies = unswizzle_image(
                 &(),
                 gpu_addr,
@@ -219,21 +221,25 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::QueueAsyncDecode requires bound channel GPU memory");
-        self.swizzle_data_buffer.resize(guest_size_bytes, 0);
+        self.swizzle_data_buffer
+            .resize_destructive(guest_size_bytes);
         gpu_memory
             .lock()
             .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
         let mut local_unswizzle_data_buffer = vec![0; unswizzled_size_bytes];
-        let mut copies = unswizzle_image(
+        let mut copies: SmallVec<[BufferImageCopy; 16]> = unswizzle_image(
             &(),
             gpu_addr,
             &info,
             &self.swizzle_data_buffer,
             &mut local_unswizzle_data_buffer,
-        );
+        )
+        .into_iter()
+        .collect();
         let out_size = map_size_bytes(&self.slot_images[image_id]) as usize;
-        self.texture_decode_worker.queue_work(move || {
-            let mut decoded_data = vec![0; out_size];
+        self.texture_decode_worker.queue_stateless_work(move || {
+            let mut decoded_data = common::scratch_buffer::ScratchBuffer::<u8>::new();
+            decoded_data.resize_destructive(out_size);
             convert_image(
                 &local_unswizzle_data_buffer,
                 &info,
@@ -2867,7 +2873,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         if is_sparse {
             let segments = self.sparse_segments_for_image(image_id, "TextureCache::register_image");
-            let mut sparse_maps = Vec::new();
+            let mut sparse_maps = SmallVec::<[ImageMapId; 16]>::new();
             for (segment_gpu_addr, cpu_addr, segment_size) in segments {
                 let map_id = self.slot_map_views.insert(ImageMapView::new(
                     segment_gpu_addr,
@@ -3073,7 +3079,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Field-split body of upstream `TextureCache<P>::UntrackImage`.
     fn untrack_image_parts(
         device_memory: &crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
-        sparse_views: &HashMap<ImageId, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+        sparse_views: &HashMap<ImageId, SmallVec<[ImageMapId; 16]>, BuildUnorderedDenseHasher>,
         slot_map_views: &common::slot_vector::SlotVector<ImageMapView>,
         image_id: ImageId,
         image: &mut ImageBase,

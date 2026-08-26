@@ -22,6 +22,7 @@ use crate::textures::decoders::{
     GOB_SIZE_SHIFT, GOB_SIZE_X, GOB_SIZE_X_SHIFT, GOB_SIZE_Y, GOB_SIZE_Y_SHIFT, GOB_SIZE_Z,
     GOB_SIZE_Z_SHIFT,
 };
+use common::scratch_buffer::ScratchBuffer;
 
 // ── Alignment helpers ─────────────────────────────────────────────────
 
@@ -1085,7 +1086,7 @@ pub fn swizzle_image(
     info: &ImageInfo,
     copies: &[BufferImageCopy],
     memory: &[u8],
-    tmp_buffer: &mut Vec<u8>,
+    tmp_buffer: &mut ScratchBuffer<u8>,
 ) {
     let bytes_per_block = surface::bytes_per_block(info.format);
     if bytes_per_block == 0 {
@@ -1164,8 +1165,7 @@ pub fn swizzle_image(
                 break;
             }
 
-            tmp_buffer.clear();
-            tmp_buffer.resize(subresource_size, 0);
+            tmp_buffer.resize_destructive(subresource_size);
             guest_memory_reader(gpu_addr + guest_offset, tmp_buffer);
             crate::textures::decoders::swizzle_texture(
                 tmp_buffer,
@@ -2007,7 +2007,7 @@ mod tests {
         let mut memory: Vec<u8> = (0..32).collect();
         memory[8..16].fill(0xAA);
         memory[24..32].fill(0xBB);
-        let mut tmp = Vec::new();
+        let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
             &|_, output| output.fill(0),
@@ -2077,7 +2077,7 @@ mod tests {
             },
         };
         let memory: Vec<u8> = (0..16).collect();
-        let mut tmp = Vec::new();
+        let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
             &|_, output| output.fill(0),
@@ -2134,7 +2134,7 @@ mod tests {
         };
         let copies = full_download_copies(&info);
         let memory = vec![0x5a; calculate_unswizzled_size_bytes(&info) as usize];
-        let mut tmp = Vec::new();
+        let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
             &|_, output| output.fill(0),
@@ -2213,7 +2213,7 @@ mod tests {
         };
         let copies = full_download_copies(&info);
         let memory = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
-        let mut tmp = Vec::new();
+        let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
             &|_, output| output.fill(0xa5),
@@ -2265,7 +2265,7 @@ mod tests {
         let mut copy = full_download_copies(&info)[0];
         copy.image_offset.x = 1;
         let memory = vec![0x5a; copy.buffer_size];
-        let mut tmp = Vec::new();
+        let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
             &|_, output| output.fill(0),

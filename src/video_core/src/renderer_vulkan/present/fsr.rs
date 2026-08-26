@@ -153,7 +153,7 @@ impl Fsr {
         self.renderpass = util::create_wrapped_render_pass(
             &self.device,
             vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
         );
 
         for images in &mut self.dynamic_images {

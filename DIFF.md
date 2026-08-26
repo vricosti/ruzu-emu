@@ -14151,3 +14151,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: focused tests compare all sixteen EASU output words and representative RCAS/packed-half
   words bit-for-bit against values produced by the Eden C++ expressions.
+
+## 2026-08-26 — Vulkan `present/{fxaa,fsr,smaa}.rs` vs Eden `renderer_vulkan/present/{fxaa,fsr,smaa}.{h,cpp}`
+
+### Intentional differences
+
+- Rust passes the render-pass initial layout explicitly because Rust has no default function
+  arguments; the selected value now equals Eden's `CreateWrappedRenderPass` default.
+- Raw Vulkan handles are destroyed explicitly in `Drop`, corresponding to Eden's RAII wrappers.
+
+### Unintentional differences (to fix)
+
+- Resolved: FXAA, FSR, and all three SMAA render passes now start in `GENERAL` with attachment
+  `LOAD`, matching Eden. They no longer opt into `UNDEFINED`/`DONT_CARE`, which Eden reserves here
+  for the explicitly different window-adaptation pass.
+
+### Missing items
+
+- None in the reviewed FXAA pass; the same local render-pass mismatch identified by the report was
+  also corrected in its FSR and SMAA peers.
+
+### Binary layout verification
+
+- N/A: the correction changes Vulkan attachment state and does not define or serialize a binary
+  payload.

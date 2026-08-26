@@ -221,19 +221,19 @@ impl Smaa {
         self.renderpasses[SmaaStage::EdgeDetection as usize] = util::create_wrapped_render_pass(
             &self.device,
             vk::Format::R16G16_SFLOAT,
-            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
         );
         self.renderpasses[SmaaStage::BlendingWeightCalculation as usize] =
             util::create_wrapped_render_pass(
                 &self.device,
                 vk::Format::R16G16B16A16_SFLOAT,
-                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
             );
         self.renderpasses[SmaaStage::NeighborhoodBlending as usize] =
             util::create_wrapped_render_pass(
                 &self.device,
                 vk::Format::R16G16B16A16_SFLOAT,
-                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
             );
 
         for images in &mut self.dynamic_images {

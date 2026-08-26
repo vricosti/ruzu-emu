@@ -15454,3 +15454,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the stub is not passed through a C ABI and stores no state.
+
+## 2026-08-26 — removed `src/video_core/src/renderer_null/null_backend.rs`; factory comparison with Eden `src/video_core/video_core.{h,cpp}`
+
+### Intentional differences
+
+- Eden's anonymous `CreateRenderer` owns backend selection inside `video_core.cpp`. Ruzu's frontend
+  constructs the platform graphics context and concrete renderer before binding it through
+  `video_core::video_core::create_gpu`, because the `video_core` crate does not depend on the SDL/GTK
+  window implementation.
+
+### Unintentional differences (to fix)
+
+- Resolved: the unused `NullBackend`, `BackendType`, and generic `GpuBackend` abstraction was
+  removed. It had no Eden file or call site and duplicated the real `RendererBase` factory path.
+- Resolved: `renderer_null/mod.rs` now only dispatches the two upstream-owned null renderer modules
+  and names the Eden source tree.
+
+### Missing items
+
+- The null selection arm itself is present in the frontend renderer factory and constructs
+  `renderer_null::RendererNull`; no separate null-backend object exists upstream.
+
+### Binary layout verification
+
+- N/A: the removed marker type and trait carried no ABI payload.

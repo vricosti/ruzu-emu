@@ -12158,8 +12158,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   borrow boundaries. Existing cache entries are skipped before submission rather than by
   `try_emplace` inside the worker; the resulting positive and negative runtime cache states are
   unchanged.
-- GPU pipeline/shader logging remains unavailable because the project-wide Eden GPU logging
-  subsystem is not ported. Standard shader errors and pipeline hashes remain logged.
 - Android's configurable pipeline-worker count is not applicable to the currently supported
   desktop targets; non-Android worker-count selection matches Eden.
 
@@ -12168,14 +12166,37 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   negative-cache paths.
 
 ### Missing items
-- None in the ownership and behavior slice covered by the two parity reports. Project-wide GPU
-  logging remains a separate missing subsystem.
+- None in the ownership, behavior, or GPU shader-logging slice covered by the two parity reports.
 
 ### Binary layout verification
 - PASS: compute and graphics pipeline cache keys and their serialized byte encodings are unchanged.
   The ownership move only relocates implementation logic. Focused tests cover MoltenVK-only color
   types, geometry point size, transform-feedback capability guards, geometry passthrough state,
   negative compute entries, and fixed-state serialization.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust centralizes Eden's duplicated graphics/compute shader-name and shader-info formatting in
+  two file-local helpers so the exact payload contract is directly testable. Both hooks remain in
+  the matching pipeline-cache owner.
+
+### Unintentional differences (to fix)
+
+- None after passing every successfully emitted graphics SPIR-V module to `Device::save_shader`,
+  then logging and optionally dumping graphics and compute SPIR-V only after successful Vulkan
+  shader-module creation, with independent `is_active` and `gpu_log_shader_dumps` guards, and
+  restoring Eden's graphics shader-module debug names after those hooks.
+
+### Missing items
+
+- None in the shader save/log/dump lifecycle owned by `PipelineCache`.
+
+### Binary layout verification
+
+- PASS: pipeline cache keys and their serialized encodings are unchanged; the added operations
+  consume emitted SPIR-V words without modifying them.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
 

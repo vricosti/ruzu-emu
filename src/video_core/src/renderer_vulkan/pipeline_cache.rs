@@ -24,6 +24,7 @@ use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::{ComparisonOp, PrimitiveTopology, VertexAttribType};
+use crate::gpu_logging::{dump_spirv_shader, get_instance, get_shader_stage_name, is_active};
 use crate::rasterizer_interface::{
     DiskResourceLoadCallback, DiskResourceLoadStop, LoadCallbackStage,
 };
@@ -896,7 +897,7 @@ impl GraphicsPipelineBuilder {
         runtime: GraphicsPipelineRuntime,
         pipeline_statistics: Option<Arc<PipelineStatistics>>,
     ) -> Option<GraphicsPipeline> {
-        let shader_modules = self.create_shader_modules(&compiled_stages)?;
+        let shader_modules = self.create_shader_modules(key, &compiled_stages)?;
         let pipeline = match GraphicsPipeline::new_unbuilt(
             self.device_owner,
             pipeline_cache,
@@ -927,6 +928,7 @@ impl GraphicsPipelineBuilder {
 
     fn create_shader_modules(
         &self,
+        key: &GraphicsPipelineKey,
         compiled_stages: &[Option<CompiledShader>; 5],
     ) -> Option<[vk::ShaderModule; 5]> {
         let mut modules = [vk::ShaderModule::null(); 5];
@@ -934,6 +936,7 @@ impl GraphicsPipelineBuilder {
             let Some(compiled) = compiled else {
                 continue;
             };
+            self.device_owner.get().save_shader(&compiled.spirv_words);
             let create_info = vk::ShaderModuleCreateInfo::builder()
                 .code(&compiled.spirv_words)
                 .build();
@@ -950,6 +953,24 @@ impl GraphicsPipelineBuilder {
                     return None;
                 }
             };
+            let unique_hash = key.unique_hashes[index + 1];
+            let should_log = is_active();
+            let should_dump = *common::settings::values().gpu_log_shader_dumps.get_value();
+            if should_log || should_dump {
+                let shader_name = shader_log_name(unique_hash, get_shader_stage_name(index));
+                if should_log {
+                    let shader_info = shader_log_info(unique_hash, compiled.spirv_words.len());
+                    get_instance().log_shader_compilation(&shader_name, &shader_info);
+                }
+                if should_dump {
+                    dump_spirv_shader(unique_hash, &compiled.spirv_words);
+                }
+            }
+            if self.device_owner.get().has_debugging_tool_attached() {
+                self.device_owner
+                    .get()
+                    .set_shader_module_name(modules[index], &format!("Shader {unique_hash:016x}"));
+            }
         }
         Some(modules)
     }
@@ -1235,6 +1256,17 @@ fn compute_key_to_cache_bytes(key: &ComputePipelineCacheKey) -> Vec<u8> {
     bytes
 }
 
+fn shader_log_name(unique_hash: u64, stage_name: &str) -> String {
+    format!("shader_{unique_hash:016x}_{stage_name}")
+}
+
+fn shader_log_info(unique_hash: u64, spirv_word_count: usize) -> String {
+    format!(
+        "SPIR-V size: {} bytes, hash: {unique_hash:016x}",
+        spirv_word_count * std::mem::size_of::<u32>()
+    )
+}
+
 /// Compute half of upstream `PipelineCache::CreateComputePipeline` between
 /// CFG/environment construction and `BuildShader`.
 fn compile_compute_program(
@@ -1326,6 +1358,18 @@ where
         .code(&compiled.spirv_words)
         .build();
     let spv_module = unsafe { device.create_shader_module(&create_info, None).ok()? };
+    let should_log = is_active();
+    let should_dump = *common::settings::values().gpu_log_shader_dumps.get_value();
+    if should_log || should_dump {
+        let shader_name = shader_log_name(key.unique_hash, "compute");
+        if should_log {
+            let shader_info = shader_log_info(key.unique_hash, compiled.spirv_words.len());
+            get_instance().log_shader_compilation(&shader_name, &shader_info);
+        }
+        if should_dump {
+            dump_spirv_shader(key.unique_hash, &compiled.spirv_words);
+        }
+    }
     if vulkan_device.has_debugging_tool_attached() {
         vulkan_device
             .set_shader_module_name(spv_module, &format!("Shader {:016x}", key.unique_hash));
@@ -2480,6 +2524,23 @@ mod tests {
     #[test]
     fn cache_version_matches_upstream_wire_format() {
         assert_eq!(CACHE_VERSION, 18);
+    }
+
+    #[test]
+    fn gpu_shader_log_payloads_match_upstream_format() {
+        let hash = 0x0123_4567_89ab_cdef;
+        assert_eq!(
+            shader_log_name(hash, "geometry"),
+            "shader_0123456789abcdef_geometry"
+        );
+        assert_eq!(
+            shader_log_name(hash, "compute"),
+            "shader_0123456789abcdef_compute"
+        );
+        assert_eq!(
+            shader_log_info(hash, 12),
+            "SPIR-V size: 48 bytes, hash: 0123456789abcdef"
+        );
     }
 
     #[test]

@@ -15040,3 +15040,34 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the accumulator is a process-local owner and is not copied to guest memory or serialized.
+
+## 2026-08-26 — `src/video_core/src/engines/kepler_compute.rs` vs Eden `src/video_core/engines/kepler_compute.{h,cpp}`
+
+### Intentional differences
+
+- Rust reads the raw 0x100-byte QMD into `LaunchParamsLayout`, then exposes decoded bitfields
+  through `LaunchParams`; Eden overlays bitfields directly on its raw struct. The raw read size,
+  offsets, and every exposed field are unchanged.
+- The rasterizer receives a synchronous `DispatchCall` snapshot of the current engine state.
+  Re-reading the same engine through the channel's raw pointer while `call_method` holds `&mut
+  KeplerCompute` would create forbidden Rust aliasing; all snapshot fields come from Eden's
+  engine-owned registers immediately before the call.
+- The upload state receives an owner-local register snapshot instead of retaining a
+  self-referential pointer into `regs`. Method bounds are checked before Rust array access rather
+  than relying on C++'s asserted indexing contract.
+
+### Unintentional differences (to fix)
+
+- Resolved: `get_tic_entry` and `get_tsc_entry` are compiled as runtime-private methods instead of
+  existing only in test builds. Their pool offset arithmetic now preserves unsigned wrapping.
+
+### Missing items
+
+- None for register ownership, QMD fields, upload tracking, indirect-compute detection, launch,
+  sink consumption, or TIC/TSC reads.
+
+### Binary layout verification
+
+- PASS: the register array contains exactly 0xCF8 words; `LaunchParamsLayout` is 0x100 bytes and
+  compile-time assertions verify the upstream program, grid, shared-memory, block, constant-buffer
+  mask, and constant-buffer table offsets.

@@ -15,7 +15,6 @@ use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
-#[cfg(test)]
 use crate::textures::texture::{TicEntry, TscEntry};
 
 // ── Register offset constants (method addresses) ────────────────────────────
@@ -489,10 +488,11 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTICEntry`.
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn get_tic_entry(&self, tic_index: u32) -> TicEntry {
-        let tic_address_gpu =
-            self.tic_address() + tic_index as u64 * std::mem::size_of::<TicEntry>() as u64;
+        let tic_address_gpu = self
+            .tic_address()
+            .wrapping_add((tic_index as u64).wrapping_mul(std::mem::size_of::<TicEntry>() as u64));
         let mut bytes = [0u8; std::mem::size_of::<TicEntry>()];
         self.memory_manager
             .lock()
@@ -501,10 +501,11 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTSCEntry`.
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn get_tsc_entry(&self, tsc_index: u32) -> TscEntry {
-        let tsc_address_gpu =
-            self.tsc_address() + tsc_index as u64 * std::mem::size_of::<TscEntry>() as u64;
+        let tsc_address_gpu = self
+            .tsc_address()
+            .wrapping_add((tsc_index as u64).wrapping_mul(std::mem::size_of::<TscEntry>() as u64));
         let mut bytes = [0u8; std::mem::size_of::<TscEntry>()];
         self.memory_manager
             .lock()

@@ -4468,13 +4468,37 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   it does not retain Eden's inner `config_mutex`; the cache owners must provide any cross-thread
   synchronization around the complete `ChannelSetupCaches` value.
 
-## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/ffmpeg.rs` and `ffmpeg_shim.c` vs `src/video_core/host1x/ffmpeg.h` and `.cpp`
+## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c}` and `src/video_core/build.rs` vs `src/video_core/host1x/ffmpeg.{h,cpp}`
 
 ### Intentional differences
 
 - The native C shim retains Eden's `DecoderContext::m_decoder` codec pointer inside
   `RuzuFfmpegDecoder`; the Rust wrapper therefore does not duplicate that codec or hold a
   self-referential borrow into `DecodeApi::decoder`.
+- Rust's `Packet<'a>` borrows the compressed byte span directly while the C shim creates and frees
+  the temporary `AVPacket` around `avcodec_send_packet`. This preserves Eden's non-owning packet
+  data lifetime without exposing FFmpeg structure layouts through Rust FFI.
+- `AVFrame`, `AVCodecContext`, `AVBufferRef`, and FFmpeg enum constants remain owned by the native
+  shim. Rust accessors copy pointer arrays/strides rather than returning C array pointers, while the
+  backing `AVFrame` and all ownership/destruction remain identical.
+- `build.rs` probes libva on Linux and FreeBSD to define Eden's optional `LIBVA_FOUND` path; other
+  targets compile the same non-libva branch selected by Eden's build configuration.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's complete platform-specific preferred-device lists, GPU pixel-format
+  reselection, hardware initialization ownership, Android MediaCodec selection/deferred open/H.264
+  parameter-set extradata, Android low-delay flags, decoder-open reset behavior, allocated default
+  frames, hardware-frame detection, and optional VDPAU-over-VAAPI rejection.
+
+### Missing items
+
+- None in the FFmpeg packet/frame/decoder/hardware-context/decode-API slice.
+
+### Binary layout verification
+
+- N/A: all libav structures are allocated and accessed by the C shim compiled against the active
+  FFmpeg headers; Rust exchanges only opaque pointers, primitive values, and borrowed byte spans.
 
 ## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs `src/video_core/renderer_vulkan/present/fsr.h` and `.cpp`
 

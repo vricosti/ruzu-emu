@@ -37,6 +37,10 @@ fn main() {
     let avutil = pkg_config::Config::new()
         .probe("libavutil")
         .expect("libavutil is required for video_core FFmpeg decoding");
+    let libva = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux" | "freebsd") => pkg_config::Config::new().probe("libva").ok(),
+        _ => None,
+    };
 
     let mut build = cc::Build::new();
     build.file("src/host1x/ffmpeg/ffmpeg_shim.c");
@@ -47,6 +51,12 @@ fn main() {
         .chain(avutil.include_paths.iter())
     {
         build.include(path);
+    }
+    if let Some(libva) = &libva {
+        build.define("LIBVA_FOUND", None);
+        for path in &libva.include_paths {
+            build.include(path);
+        }
     }
     build.compile("ruzu_video_core_ffmpeg_shim");
 

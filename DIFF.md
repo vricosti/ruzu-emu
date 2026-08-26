@@ -13536,3 +13536,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: these are text shader sources. A normalized byte comparison verifies every source against
   Eden, and focused tests cover the three previously drifted semantic expressions.
+
+## 2026-08-26 — `src/video_core/src/engines/const_buffer_info.rs` vs Eden `src/video_core/engines/const_buffer_info.h`
+
+### Intentional differences
+
+- Rust applies `repr(C)` explicitly and derives value traits; Eden receives the equivalent natural
+  C++ aggregate layout and value-initializes the containing Maxwell state.
+- `Maxwell3D::process_cb_bind` rejects a shader-slot value outside the 18-entry array. Eden uses
+  unchecked `std::array::operator[]`; preserving that undefined behavior would be unsound in Rust.
+
+### Unintentional differences (to fix)
+
+- None after removing the differently ordered `ConstBufferBinding` duplicate from `maxwell_3d.rs`
+  and using the upstream-owned `ConstBufferInfo` throughout Maxwell state, draw snapshots, shader
+  environments, and both renderer pipelines.
+- None after making a disabled bind retain the current address and size before disabling the slot,
+  matching Eden's `ProcessCBBind` update order instead of replacing the whole entry with defaults.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `ConstBufferInfo` is 16 bytes with alignment 8; `address`, `size`, and `enabled` are at
+  offsets 0, 8, and 12 respectively. Focused tests also verify value-initialized defaults.

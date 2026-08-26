@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::const_buffer_info::ConstBufferInfo;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
@@ -1993,24 +1994,6 @@ pub struct LineStippleInfo {
     pub pattern: u32,
 }
 
-/// A constant buffer binding for one slot of one shader stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConstBufferBinding {
-    pub enabled: bool,
-    pub address: u64,
-    pub size: u32,
-}
-
-impl Default for ConstBufferBinding {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: 0,
-            size: 0,
-        }
-    }
-}
-
 /// Render target configuration for one color target.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderTargetInfo {
@@ -2090,7 +2073,7 @@ pub struct DrawCall {
     pub line_anti_alias_enable: bool,
     pub line_stipple: LineStippleInfo,
     pub program_base_address: u64,
-    pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    pub cb_bindings: [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     pub vertex_attribs: [VertexAttribInfo; NUM_VERTEX_ATTRIBS as usize],
     pub shader_stages: [ShaderStageInfo; NUM_SHADER_PROGRAMS],
     pub color_masks: [ColorMaskInfo; 8],
@@ -2186,7 +2169,7 @@ pub struct Maxwell3D {
     /// without cloning it.
     active_draw_manager_state: Option<usize>,
     /// Constant buffer bindings: 5 shader stages x 18 slots.
-    cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    cb_bindings: [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     /// Pending semaphore writes to be returned by execute_pending.
     pending_semaphore_writes: Vec<PendingWrite>,
     /// Bound rasterizer backend.
@@ -2387,7 +2370,7 @@ impl Maxwell3D {
             dirty: DirtyState::new(),
             draw_manager: Some(Box::new(dm::DrawManager::new())),
             active_draw_manager_state: None,
-            cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+            cb_bindings: [[ConstBufferInfo::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
             macro_positions: [0u32; 0x80],
@@ -3475,7 +3458,7 @@ impl Maxwell3D {
     // ── Constant buffer accessors ────────────────────────────────────────
 
     /// Read constant buffer bindings for a shader stage (0..4).
-    pub fn const_buffer_bindings(&self, stage: usize) -> &[ConstBufferBinding; MAX_CB_SLOTS] {
+    pub fn const_buffer_bindings(&self, stage: usize) -> &[ConstBufferInfo; MAX_CB_SLOTS] {
         &self.cb_bindings[stage]
     }
 
@@ -3990,7 +3973,7 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.program_base_address()
     }
 
-    fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferBinding {
+    fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferInfo {
         self.cb_bindings[stage][slot]
     }
 
@@ -4271,18 +4254,18 @@ impl Maxwell3D {
             return;
         }
 
-        if valid {
-            let cb_base = CB_CONFIG_BASE as usize;
-            let size = self.regs[cb_base];
-            let addr_high = self.regs[cb_base + 1] as u64;
-            let addr_low = self.regs[cb_base + 2] as u64;
-            let address = (addr_high << 32) | addr_low;
+        let cb_base = CB_CONFIG_BASE as usize;
+        let size = self.regs[cb_base];
+        let addr_high = self.regs[cb_base + 1] as u64;
+        let addr_low = self.regs[cb_base + 2] as u64;
+        let address = (addr_high << 32) | addr_low;
+        self.cb_bindings[stage_index][slot] = ConstBufferInfo {
+            address,
+            size,
+            enabled: valid,
+        };
 
-            self.cb_bindings[stage_index][slot] = ConstBufferBinding {
-                enabled: true,
-                address,
-                size,
-            };
+        if valid {
             log::trace!(
                 "Maxwell3D: CB_BIND stage={} slot={} addr=0x{:X} size={}",
                 stage_index,
@@ -4294,7 +4277,6 @@ impl Maxwell3D {
                 rasterizer.bind_graphics_uniform_buffer(stage_index, slot as u32, address, size)
             });
         } else {
-            self.cb_bindings[stage_index][slot] = ConstBufferBinding::default();
             log::trace!(
                 "Maxwell3D: CB_BIND stage={} slot={} disabled",
                 stage_index,
@@ -6172,6 +6154,21 @@ mod tests {
         // Other slots should be disabled.
         assert!(!bindings[0].enabled);
         assert!(!bindings[1].enabled);
+    }
+
+    #[test]
+    fn disabling_cb_keeps_the_current_address_and_size_like_upstream() {
+        let mut engine = Maxwell3D::new();
+
+        engine.write_reg(CB_CONFIG_BASE, 0x400);
+        engine.write_reg(CB_CONFIG_BASE + 1, 0x2);
+        engine.write_reg(CB_CONFIG_BASE + 2, 0x3000);
+        engine.write_reg(CB_BIND_TRIGGER_0, 3 << 4);
+
+        let binding = engine.const_buffer_bindings(0)[3];
+        assert!(!binding.enabled);
+        assert_eq!(binding.address, 0x2_0000_3000);
+        assert_eq!(binding.size, 0x400);
     }
 
     #[test]

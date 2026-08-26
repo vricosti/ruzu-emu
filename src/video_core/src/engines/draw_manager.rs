@@ -8,11 +8,12 @@
 //! instanced draws, and draw textures.
 
 use crate::dirty_flags::flags as Dirty;
+use crate::engines::const_buffer_info::ConstBufferInfo;
 use crate::engines::maxwell_3d::{
-    ConstBufferBinding, DrawCall, Maxwell3D, RenderTargetInfo, RtControlInfo, ShaderStageType,
-    CLEAR_SURFACE, DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE,
-    IB_OFF_COUNT, IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT,
-    INDEX_BUFFER32_FIRST, INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
+    DrawCall, Maxwell3D, RenderTargetInfo, RtControlInfo, ShaderStageType, CLEAR_SURFACE,
+    DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT,
+    IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
+    INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
     NUM_SHADER_STAGES, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
     VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
@@ -599,11 +600,7 @@ pub trait Maxwell3DAccess {
     fn program_base_address(&self) -> u64;
 
     /// Read one constant-buffer binding.
-    fn const_buffer_binding(
-        &self,
-        stage: usize,
-        slot: usize,
-    ) -> crate::engines::maxwell_3d::ConstBufferBinding;
+    fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferInfo;
 
     /// Read vertex attribute info for one attribute slot.
     fn vertex_attrib_info(&self, index: u32) -> crate::engines::maxwell_3d::VertexAttribInfo;
@@ -693,7 +690,7 @@ pub struct Maxwell3DDrawRegisters {
     pub index_buffer_gpu_addr: u64,
     pub index_buffer_gpu_addr_end: u64,
     pub render_targets: Maxwell3DRenderTargets,
-    pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    pub cb_bindings: [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     pub vertex_streams: [crate::engines::maxwell_3d::VertexStreamInfo; 32],
     pub vertex_stream_instances: [u32; 32],
     pub vertex_stream_limits: [VertexStreamLimit; 32],
@@ -1251,7 +1248,7 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn cb_bindings(&self) -> [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES] {
+    pub fn cb_bindings(&self) -> [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
@@ -1260,7 +1257,7 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferBinding {
+    pub fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferInfo {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.const_buffer_binding(stage, slot),
             Maxwell3DDrawSource::Snapshot(registers) => registers.cb_bindings[stage][slot],

@@ -7,6 +7,8 @@
 //! rasterization with barycentric coordinate interpolation, depth testing,
 //! alpha blending, scissor clipping, color write masks, and back-face culling.
 
+#[cfg(test)]
+use crate::engines::const_buffer_info::ConstBufferInfo;
 use crate::engines::maxwell_3d::{
     BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComparisonOp,
     ComponentType, CullFace, DepthStencilInfo, DrawCall, FrontFace, IndexFormat, PrimitiveTopology,
@@ -2851,7 +2853,7 @@ mod tests {
             line_anti_alias_enable: false,
             line_stipple: Default::default(),
             program_base_address: 0,
-            cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
+            cb_bindings: [[ConstBufferInfo::default(); 18]; 5],
             vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); 8],

@@ -1747,12 +1747,12 @@ fn read_u64(file: &mut std::fs::File) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::const_buffer_info::ConstBufferInfo;
     use crate::engines::maxwell_3d::{
-        AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ConstBufferBinding,
-        DepthMode, DepthStencilInfo, DrawCall, IndexFormat, LogicOpInfo, RasterizerInfo,
-        RenderTargetInfo, RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo,
-        StencilFaceInfo, VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo,
-        ZetaInfo,
+        AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, DepthMode,
+        DepthStencilInfo, DrawCall, IndexFormat, LogicOpInfo, RasterizerInfo, RenderTargetInfo,
+        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo,
+        VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo, ZetaInfo,
     };
     use std::collections::hash_map::DefaultHasher;
 
@@ -1942,7 +1942,7 @@ mod tests {
             line_anti_alias_enable: false,
             line_stipple: Default::default(),
             program_base_address: 0,
-            cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
+            cb_bindings: [[ConstBufferInfo::default(); 18]; 5],
             vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); NUM_RENDER_TARGETS],

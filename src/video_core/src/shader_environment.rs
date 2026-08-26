@@ -13,10 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(test)]
+use crate::engines::const_buffer_info::ConstBufferInfo;
+#[cfg(test)]
 use crate::engines::kepler_compute::ConstBufferConfig;
 use crate::engines::kepler_compute::KeplerCompute;
-#[cfg(test)]
-use crate::engines::maxwell_3d::ConstBufferBinding;
 use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, SamplerBinding, ShaderStageType};
 use crate::memory_manager::MemoryManager;
 use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
@@ -667,7 +667,7 @@ pub struct GraphicsEnvironment {
 #[cfg(test)]
 #[derive(Clone, Copy)]
 struct GraphicsEnvironmentDetachedState {
-    const_buffers: [ConstBufferBinding; 18],
+    const_buffers: [ConstBufferInfo; 18],
     tex_header_pool_addr: u64,
     tex_header_pool_limit: u32,
     sampler_binding: SamplerBinding,
@@ -682,7 +682,7 @@ impl GraphicsEnvironment {
             file_backed: false,
             #[cfg(test)]
             detached_state: GraphicsEnvironmentDetachedState {
-                const_buffers: [ConstBufferBinding::default(); 18],
+                const_buffers: [ConstBufferInfo::default(); 18],
                 tex_header_pool_addr: 0,
                 tex_header_pool_limit: 0,
                 sampler_binding: SamplerBinding::Independently,
@@ -786,10 +786,7 @@ impl GraphicsEnvironment {
     }
 
     #[cfg(test)]
-    fn graphics_const_buffer_binding_for_test(
-        &self,
-        cbuf_index: u32,
-    ) -> Option<ConstBufferBinding> {
+    fn graphics_const_buffer_binding_for_test(&self, cbuf_index: u32) -> Option<ConstBufferInfo> {
         unsafe { self.maxwell3d.as_ref() }
             .and_then(|maxwell3d| {
                 maxwell3d
@@ -988,7 +985,7 @@ impl GraphicsEnvironment {
     }
 
     #[cfg(test)]
-    fn set_detached_const_buffer_binding(&mut self, index: usize, binding: ConstBufferBinding) {
+    fn set_detached_const_buffer_binding(&mut self, index: usize, binding: ConstBufferInfo) {
         self.detached_state.const_buffers[index] = binding;
         self.maxwell3d = std::ptr::null();
     }
@@ -2366,7 +2363,9 @@ mod tests {
             .with_gpu_read(reader)
             .with_program(program_base, 0);
 
-        let size = env.try_find_size().expect("EXIT must terminate this shader");
+        let size = env
+            .try_find_size()
+            .expect("EXIT must terminate this shader");
         assert_eq!(size as usize, exit_offset + INST_SIZE);
         assert_eq!(log.lock().unwrap().as_slice(), &[(program_base, 0x1000)]);
     }
@@ -2394,7 +2393,8 @@ mod tests {
         env.is_proprietary_driver = true;
 
         assert_eq!(
-            env.try_find_size().expect("self branch must terminate this shader") as usize,
+            env.try_find_size()
+                .expect("self branch must terminate this shader") as usize,
             sentinel_offset
         );
     }
@@ -2587,10 +2587,10 @@ mod tests {
             .with_program(gpu_base, 0);
         env.set_detached_const_buffer_binding(
             0,
-            ConstBufferBinding {
-                enabled: true,
+            ConstBufferInfo {
                 address: gpu_base,
                 size: 0x1000,
+                enabled: true,
             },
         );
 

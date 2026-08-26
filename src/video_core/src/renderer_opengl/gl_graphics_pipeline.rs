@@ -11,9 +11,10 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
+use crate::engines::const_buffer_info::ConstBufferInfo;
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::SurfaceClipInfo;
-use crate::engines::maxwell_3d::{ConstBufferBinding, Maxwell3D, MAX_CB_SLOTS};
+use crate::engines::maxwell_3d::{Maxwell3D, MAX_CB_SLOTS};
 use crate::memory_manager::MemoryManager;
 use crate::renderer_opengl::gl_shader_context::Context as ShaderContext;
 use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
@@ -803,7 +804,7 @@ impl GraphicsPipeline {
         stage: usize,
         buffer_cache: &mut OpenGLBufferCache,
         texture_cache: &mut OpenGLTextureCache,
-        cbufs: &[ConstBufferBinding; MAX_CB_SLOTS],
+        cbufs: &[ConstBufferInfo; MAX_CB_SLOTS],
         gpu_memory: &MemoryManager,
         via_header_index: bool,
         views: &mut [ImageViewInOut; (MAX_TEXTURES + MAX_IMAGES) as usize],

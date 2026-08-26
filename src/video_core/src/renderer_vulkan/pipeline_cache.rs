@@ -2157,12 +2157,12 @@ impl Drop for PipelineCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::const_buffer_info::ConstBufferInfo;
     use crate::engines::maxwell_3d::{
         AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ComparisonOp,
-        ConstBufferBinding, CullFace, DepthMode, DepthStencilInfo, DrawCall, FrontFace,
-        IndexFormat, LogicOpInfo, PolygonMode, PrimitiveTopology, RasterizerInfo, RenderTargetInfo,
-        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
-        ZetaInfo,
+        CullFace, DepthMode, DepthStencilInfo, DrawCall, FrontFace, IndexFormat, LogicOpInfo,
+        PolygonMode, PrimitiveTopology, RasterizerInfo, RenderTargetInfo, RtControlInfo,
+        SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo, ZetaInfo,
     };
 
     fn program_slots_with(
@@ -2421,7 +2421,7 @@ mod tests {
             line_anti_alias_enable: false,
             line_stipple: Default::default(),
             program_base_address: 0,
-            cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
+            cb_bindings: [[ConstBufferInfo::default(); 18]; 5],
             vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); 8],

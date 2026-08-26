@@ -14265,3 +14265,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `ComputePipelineKey` is `repr(C)`, 24 bytes, with offsets 0/8/12 and no padding; hashing
   and cache serialization cover the same complete byte representation as Eden.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_device.rs` vs Eden `src/video_core/renderer_opengl/gl_device.{h,cpp}`
+
+### Intentional differences
+
+- Construction returns `Result` instead of throwing and receives the frontend's already-computed
+  strict-context flag because the Qt `EmuWindow` owner is outside the `video_core` crate.
+- The Rust GL bindings do not expose GLAD's extension booleans, so the matching flags are derived
+  from Eden's copied extension-name list. The same extension names and conjunctions are used.
+- A null `glGetString` result becomes an empty owned string rather than constructing a C++ string
+  from a null pointer; valid OpenGL contexts follow the identical path.
+
+### Unintentional differences (to fix)
+
+- Resolved: NVIDIA's GLSL-workaround version parser now preserves `std::atoi` prefix semantics,
+  including leading whitespace/signs and suffixes after the numeric major version. It no longer
+  silently returns zero merely because the major-version substring has a non-numeric suffix.
+
+### Missing items
+
+- None: all device limits, vendor predicates, extension flags, driver quirks, shader probes,
+  public capability queries, and dedicated-memory reporting are present.
+
+### Binary layout verification
+
+- N/A: `Device` is a private in-process capability object and is never serialized or copied as a
+  raw upstream payload.

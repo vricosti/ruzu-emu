@@ -4,8 +4,8 @@ use crate::renderer::memory::{
     AddressInfo, MemoryPoolInParameter, MemoryPoolInfo, MemoryPoolOutStatus, MemoryPoolResultState,
     MemoryPoolState, PoolLocation,
 };
-use common::alignment::is_4kb_aligned;
-use common::ResultCode;
+use common::alignment::is_aligned;
+use common::{ResultCode, PAGE_SIZE_U64};
 
 pub struct PoolMapper<'a> {
     process_handle: Option<usize>,
@@ -186,8 +186,8 @@ impl<'a> PoolMapper<'a> {
 
         if in_params.address == 0
             || in_params.size == 0
-            || !is_4kb_aligned(in_params.address)
-            || !is_4kb_aligned(in_params.size)
+            || !is_aligned(in_params.address, PAGE_SIZE_U64)
+            || !is_aligned(in_params.size, PAGE_SIZE_U64)
         {
             return MemoryPoolResultState::BadParam;
         }

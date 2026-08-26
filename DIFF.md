@@ -13616,3 +13616,81 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the API transforms compressed byte spans into decoded byte spans and does not serialize a
   host struct. The C ABI uses pointer, `size_t`, and `bool` arguments matching `bc_decoder.h`.
+
+## 2026-08-26 — `src/common/src/alignment.rs` and `div_ceil.rs` vs Eden `src/common/alignment.h` and `div_ceil.h`
+
+### Intentional differences
+
+- Rust exposes fixed `u64`, `u32`, and `usize` functions instead of C++ constrained function
+  templates. The selected integer width is explicit at each call site and preserves the same
+  arithmetic width.
+- Signed alignment has a separate Rust entry point; it performs Eden's conversion through the
+  corresponding unsigned width before converting the result back.
+- Eden's unused `AlignmentAllocator` C++ container adapter has no standalone Rust type. Rust
+  allocation sites that need stronger alignment request it through `std::alloc::Layout`; Eden has
+  no source-tree consumer of this adapter to map here.
+
+### Unintentional differences (to fix)
+
+- None after spelling every unsigned intermediate that can overflow with wrapping arithmetic.
+  Debug builds now retain C++ unsigned behavior instead of panicking before the caller observes the
+  wrapped result.
+- None after removing the invented `is_4kb_aligned` convenience function. Its only consumer now
+  calls the upstream-owned `is_aligned` operation with the shared guest page-size constant.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: these files contain integer functions and no raw-memory data structures.
+
+## 2026-08-26 — `src/video_core/src/textures/decoders.rs` vs Eden `src/video_core/textures/decoders.h` and `.cpp`
+
+### Intentional differences
+
+- Rust slice checks skip a copy whose source or destination range is outside the supplied span.
+  Eden indexes the span and calls `memcpy`, which is undefined for the same invalid range; valid
+  texture spans use the same offsets and copy sizes.
+- Eden's `ASSERT_MSG` for an unsupported bytes-per-pixel value is represented by `panic!`.
+- The eight C++ `BPP_CASE` macro expansions are written as explicit Rust match arms.
+
+### Unintentional differences (to fix)
+
+- None after removing the dead `SwizzleTable`/`make_swizzle_table` API that has no counterpart in
+  Eden, restoring const-generic `TO_LINEAR`, `BYTES_PER_PIXEL`, mask, and increment parameters, and
+  using the upstream-owned `common` alignment/division helpers.
+- None after preserving the wrapping behavior of every upstream `u32` offset, size, and coordinate
+  calculation in debug builds.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the module copies byte spans and owns no serialized structure. Focused tests exercise every
+  BPP dispatch arm, GOB offsets, overflow behavior, and Eden's non-power-of-two subrectangle
+  overlap semantics.
+
+## 2026-08-26 — `src/audio_core/src/renderer/memory/pool_mapper.rs` vs Eden `src/audio_core/renderer/memory/pool_mapper.cpp`
+
+### Intentional differences
+
+- Ruzu obtains the 4 KiB guest-page value from `common::PAGE_SIZE_U64`; Eden names the same value
+  `Core::Memory::YUZU_PAGESIZE`. This avoids introducing a dependency on a C++ memory-header
+  boundary while retaining the shared constant rather than a literal.
+
+### Unintentional differences (to fix)
+
+- None after `PoolMapper::update` began calling the upstream-owned generic `is_aligned` helper for
+  both the address and size instead of an invented 4 KiB-specific wrapper.
+
+### Missing items
+
+- None for this alignment validation path.
+
+### Binary layout verification
+
+- N/A: this change only selects the validation helper and does not alter `MemoryPoolInfo` payloads.

@@ -15393,3 +15393,40 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the module returns Vulkan handles/enums and does not copy its Rust structures as raw data.
+
+## 2026-08-26 — `src/video_core/src/memory_manager.rs` vs Eden `src/video_core/memory_manager.{h,cpp}`
+
+### Intentional differences
+
+- The Rust owner graph keeps the device-memory manager in an `Arc` and places the page-table
+  implementation behind the public `MemoryManager` adapter used by channel mutexes. Eden stores
+  direct references and a raw rasterizer pointer in one C++ class.
+- Rasterizer notifications may be deferred by the nvdrv adapter and replayed after releasing the
+  memory-manager mutex. This preserves Eden's effective lock ordering while avoiding the Rust
+  CPU/GPU-thread ABBA cycle.
+- `for_each_mapped_device_segment` is a mechanical borrow-checker adapter around Eden's nested
+  `MemoryOperation` calls. It invokes the rasterizer immediately, in the same page order and with
+  the same chunk sizes; it does not allocate or merge ranges.
+
+### Unintentional differences (to fix)
+
+- Resolved: `FlushRegion`, `InvalidateRegion`, and `IsMemoryDirty` no longer coalesce physically
+  adjacent small pages through `GetSubmappedRangeImpl`; each mapped page produces the same
+  rasterizer call as Eden, and dirty checking stops on the first positive result.
+- Resolved: the continuous-big-page branch of `IsGranularRange` uses Eden's exact
+  `(page_index & big_page_mask) + size` calculation.
+- Resolved: `GetID` and `ModifyGPUMemory` now read the same identifier stored by the actual page
+  table owner instead of maintaining separate outer and inner identifiers.
+- Resolved: `HAS_FLUSH_INVALIDATION` is owned by `MemoryManager`, and the guest-memory adapter
+  references that constant instead of duplicating the literal.
+
+### Missing items
+
+- No upstream public operation is missing after auditing map/sparse-map/unmap, address translation,
+  scalar and block access, range queries, cache invalidation, copy, page-kind/layout queries, and
+  span access.
+
+### Binary layout verification
+
+- N/A: the page tables and range maps are internal host data structures and are not serialized or
+  copied across an ABI boundary.

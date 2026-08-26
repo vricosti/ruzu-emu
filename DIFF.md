@@ -16998,3 +16998,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: these functions convert transparent Vulkan integer enums to diagnostic strings and define
   no serialized or guest-visible payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (clear command ordering)
+
+### Intentional differences
+
+- Optional Ash extension dispatch tables and channel GPU-memory ownership remain checked before
+  use. Eden reaches those paths through assumed-valid pointers; valid draw and render-target paths
+  issue the same commands, while invalid Rust state fails softly instead of calling a missing
+  function pointer.
+- Command-buffer invalidation and per-channel release are forwarded explicitly to Ruzu's separate
+  `StateTracker`; Eden's tracker observes the same lifecycle through scheduler and live Maxwell
+  state ownership.
+
+### Unintentional differences (to fix)
+
+- None after recording full-channel color and depth/stencil attachment clears separately and in
+  Eden's order. This also restores color-before-blit ordering when a color clear is followed by a
+  partial stencil clear.
+- None among the report's cache-invalidation, channel-locking, device-page alignment, and GPU-
+  logging findings; those corrections were already present when this report was re-audited.
+
+### Missing items
+
+- None in the report's audited rasterizer slice. The obsolete offscreen framebuffer/readback path
+  named by the report is no longer present in the current rasterizer owner.
+
+### Binary layout verification
+
+- N/A: this change only restores Vulkan command recording order and adds no binary payload.

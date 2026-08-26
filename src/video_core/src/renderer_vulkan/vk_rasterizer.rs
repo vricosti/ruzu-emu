@@ -3003,7 +3003,6 @@ impl RasterizerInterface for RasterizerVulkan {
             layer_count,
         };
         let color_attachment = ((clear_state.flags >> 6) & 0xF) as usize;
-        let mut attachments = Vec::with_capacity(2);
         if use_color && target.has_aspect_color_bit(color_attachment) {
             let format = crate::surface::pixel_format_from_render_target_format(
                 render_targets.render_targets[color_attachment].format,
@@ -3013,10 +3012,15 @@ impl RasterizerInterface for RasterizerVulkan {
                 self.scheduler
                     .defer_color_clear(&target, color_attachment as u32, clear_value);
             } else if color_full_channels {
-                attachments.push(vk::ClearAttachment {
+                let attachment = vk::ClearAttachment {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     color_attachment: color_attachment as u32,
                     clear_value,
+                };
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_clear_attachments(cmdbuf, &[attachment], &[clear_rect]);
                 });
             } else {
                 let color_mask = u8::from(use_r)
@@ -3040,6 +3044,9 @@ impl RasterizerInterface for RasterizerVulkan {
                     &dst_region,
                 );
             }
+        }
+        if !use_depth && !use_stencil {
+            return;
         }
         let mut depth_stencil_aspects = vk::ImageAspectFlags::empty();
         if target.has_aspect_depth_bit() && use_depth {
@@ -3080,7 +3087,7 @@ impl RasterizerInterface for RasterizerVulkan {
                     },
                 );
             } else {
-                attachments.push(vk::ClearAttachment {
+                let attachment = vk::ClearAttachment {
                     aspect_mask: depth_stencil_aspects,
                     color_attachment: 0,
                     clear_value: vk::ClearValue {
@@ -3089,18 +3096,14 @@ impl RasterizerInterface for RasterizerVulkan {
                             stencil: clear_state.stencil as u32,
                         },
                     },
+                };
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_clear_attachments(cmdbuf, &[attachment], &[clear_rect]);
                 });
             }
         }
-        if attachments.is_empty() {
-            return;
-        }
-
-        let device = self.device;
-        self.scheduler.record(move |cmdbuf| unsafe {
-            let device = device.get().get_logical();
-            device.cmd_clear_attachments(cmdbuf, &attachments, &[clear_rect]);
-        });
     }
 
     fn dispatch_compute(&mut self, dispatch: &DispatchCall) {

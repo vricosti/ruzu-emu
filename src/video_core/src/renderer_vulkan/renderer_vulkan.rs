@@ -16,7 +16,7 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::present::{PRESENT_FILTERS_FOR_APPLET_CAPTURE, PRESENT_FILTERS_FOR_DISPLAY};
 use crate::rasterizer_interface::RasterizerInterface;
-use crate::renderer_base::{RendererBase, RendererBaseData};
+use crate::renderer_base::{update_current_framebuffer_layout, RendererBase, RendererBaseData};
 use crate::textures::decoders;
 use crate::vulkan_common::vulkan_debug_callback::{
     create_debug_utils_callback, DebugUtilsMessenger,
@@ -246,7 +246,6 @@ impl RendererVulkan {
     pub fn new(
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
         window_info: &ruzu_core::frontend::emu_window::WindowSystemInfo,
-        drawable_size: (u32, u32),
         window_shown: Arc<AtomicBool>,
         framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
         frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
@@ -254,6 +253,11 @@ impl RendererVulkan {
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
     ) -> Result<Self, VulkanError> {
+        // Eden constructs RendererBase first, which refreshes the frontend
+        // framebuffer layout before any Vulkan owner is initialized.
+        update_current_framebuffer_layout(&framebuffer_layout);
+        let initial_layout = framebuffer_layout.read().unwrap().clone();
+
         let entry = vulkan_library::open_library()?;
         let window_type = map_window_type(window_info.type_)?;
         let instance = vulkan_instance::create_instance(
@@ -326,8 +330,8 @@ impl RendererVulkan {
             surface_handle,
             &device,
             submit_mutex.clone(),
-            drawable_size.0.max(1),
-            drawable_size.1.max(1),
+            initial_layout.width,
+            initial_layout.height,
         )?;
         let swapchain_image_count = swapchain.get_image_count();
         let swapchain = std::sync::Arc::new(std::sync::Mutex::new(swapchain));
@@ -470,10 +474,13 @@ impl RendererVulkan {
         if !should_present_window(&self.window_shown) {
             return;
         }
-        let layout = self.current_framebuffer_layout_for_present();
         self.render_screenshot(framebuffers);
 
         let frame_index = self.present_manager.get_render_frame_index();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
+
+        let layout = self.current_framebuffer_layout_for_present();
         // Upstream reads these swapchain getters without a lock
         // (renderer_vulkan.cpp:163). Locking `swapchain_mutex` here stalled
         // the GPU thread behind the present thread, which holds that mutex
@@ -482,8 +489,6 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
-        self.scheduler
-            .request_outside_render_pass_operation_context();
         self.blit_swapchain.draw_to_present_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -664,18 +669,12 @@ impl RendererVulkan {
             return;
         }
 
-        let screenshot_layout = self
+        let layout = self
             .base_data
             .settings
             .screenshot_framebuffer_layout
             .clone();
-        let layout = FramebufferLayout {
-            width: screenshot_layout.width,
-            height: screenshot_layout.height,
-            screen: Rectangle::new(0, 0, screenshot_layout.width, screenshot_layout.height),
-            is_srgb: false,
-        };
-        let buffer_size = layout.width as vk::DeviceSize * layout.height as vk::DeviceSize * 4;
+        let buffer_size = screenshot_buffer_size(&layout);
         let dst_buffer = self.render_to_buffer(
             framebuffers,
             &layout,
@@ -726,6 +725,8 @@ impl RendererVulkan {
             );
         }
 
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.blit_applet.draw_to_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -835,7 +836,7 @@ impl RendererBase for RendererVulkan {
     }
 
     fn refresh_base_settings(&mut self) {
-        crate::renderer_base::update_current_framebuffer_layout(&self.framebuffer_layout);
+        update_current_framebuffer_layout(&self.framebuffer_layout);
     }
 
     fn is_screenshot_pending(&self) -> bool {
@@ -917,6 +918,10 @@ fn capture_framebuffer_layout() -> FramebufferLayout {
         ),
         is_srgb: false,
     }
+}
+
+fn screenshot_buffer_size(layout: &FramebufferLayout) -> vk::DeviceSize {
+    layout.width.wrapping_mul(layout.height).wrapping_mul(4) as vk::DeviceSize
 }
 
 fn should_present_window(window_shown: &AtomicBool) -> bool {
@@ -1004,6 +1009,20 @@ mod tests {
         assert_eq!(CAPTURE_IMAGE_SIZE.height, crate::capture::LINEAR_HEIGHT);
         assert_eq!(CAPTURE_IMAGE_EXTENT.depth, crate::capture::LINEAR_DEPTH);
         assert_eq!(CAPTURE_FORMAT, vk::Format::A8B8G8R8_UNORM_PACK32);
+    }
+
+    #[test]
+    fn screenshot_buffer_size_preserves_upstream_u32_wraparound() {
+        let layout = FramebufferLayout {
+            width: u32::MAX,
+            height: 2,
+            ..FramebufferLayout::default()
+        };
+
+        assert_eq!(
+            screenshot_buffer_size(&layout),
+            u32::MAX.wrapping_mul(2).wrapping_mul(4) as u64
+        );
     }
 
     #[test]

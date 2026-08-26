@@ -355,7 +355,6 @@ impl Drop for EmulationSession {
 /// updated by the window on visibility and resize.
 pub fn boot_game(
     window_info: WindowSystemInfo,
-    drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     opengl_context_source: Option<OpenGLContextSource>,
@@ -388,7 +387,6 @@ pub fn boot_game(
         .spawn(move || {
             run_boot(
                 window_info,
-                drawable_size,
                 shown_state,
                 framebuffer_layout,
                 opengl_context_source,
@@ -431,7 +429,6 @@ pub fn boot_game(
 /// renderer factory and to the corresponding `ruzu_cmd` backend paths.
 fn run_boot(
     window_info: WindowSystemInfo,
-    drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     opengl_context_source: Option<OpenGLContextSource>,
@@ -730,7 +727,6 @@ fn run_boot(
                     // `Gpu` drops the renderer before its shader notifier.
                     unsafe { gpu.shader_notify_handle() },
                     &window_info,
-                    drawable_size,
                     Arc::clone(&shown_state),
                     Arc::clone(&framebuffer_layout),
                     frame_displayed_notify,

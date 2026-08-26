@@ -1188,7 +1188,7 @@ fn main() {
                     Box::new(renderer)
                 }
                 "vulkan" => {
-                    let Some((window_info, drawable_size, shown_state, framebuffer_layout)) =
+                    let Some((window_info, _drawable_size, shown_state, framebuffer_layout)) =
                         vulkan_window_info.as_ref()
                     else {
                         return Err(
@@ -1224,7 +1224,6 @@ fn main() {
                             // `Gpu` drops the renderer before its shader notifier.
                             unsafe { gpu.shader_notify_handle() },
                             window_info,
-                            *drawable_size,
                             Arc::clone(shown_state),
                             Arc::clone(framebuffer_layout),
                             frame_displayed_notify,

@@ -15805,3 +15805,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `Layer` and `TextureInfo` are host-side GL owners. `ScreenRectVertex`, the buffer payload
   emitted by this file, is verified separately against Eden's four-`GLfloat` layout.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/renderer_vulkan.rs` vs Eden `src/video_core/renderer_vulkan/renderer_vulkan.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses explicit heap-stable Vulkan owners, shared surface/swapchain synchronization, frontend
+  callbacks, and `Drop` in place of Eden's reference members and `vk::` RAII wrappers. Field and
+  explicit cleanup order preserve Eden's dependent-resource teardown.
+- `current_framebuffer_layout_for_present` reconciles the frontend layout with the cached WSI
+  extent without blocking on the present thread; this is the existing Rust/MoltenVK ownership
+  adaptation and does not change the surrounding `Composite` lifecycle order.
+
+### Unintentional differences (to fix)
+
+- Resolved: construction now performs Eden's inherited `RendererBase` layout refresh first and
+  initializes the swapchain from that live layout rather than a separate drawable-size argument.
+- Resolved: `Composite` now renders screenshots and obtains its render frame before requesting the
+  outside-render-pass context and reading presentation layout/swapchain state, matching Eden's
+  ordering.
+- Resolved: applet-layer rendering now requests an outside-render-pass operation context after
+  lazy frame creation and before `DrawToFrame`.
+- Resolved: screenshots retain the complete requested framebuffer layout instead of replacing its
+  screen rectangle, and their byte-size multiplication preserves Eden's unsigned `u32` wraparound.
+
+### Missing items
+
+- Eden's optional `HAS_LSFG` frame-generation path is not built or exposed by Ruzu.
+
+### Binary layout verification
+
+- N/A: this file owns host Vulkan objects and frontend callbacks; capture pixel buffers use the
+  separately verified capture constants and texture swizzle implementation.

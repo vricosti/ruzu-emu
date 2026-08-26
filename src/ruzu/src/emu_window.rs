@@ -9,7 +9,6 @@
 //   * `window_info()`        → `WindowSystemInfo { Cocoa, render_surface = CAMetalLayer }`
 //   * `shown_state()`        → `Arc<AtomicBool>` (window visible)
 //   * `framebuffer_layout()` → `Arc<RwLock<FramebufferLayout>>` (updated on resize)
-//   * `drawable_size()`      → physical pixel size of the drawable
 //
 // The Vulkan renderer runs presentation on the GPU thread and reads these
 // shared handles directly, so once the emulation system is booted with this
@@ -35,7 +34,6 @@ pub struct GtkEmuWindow {
     window_info: WindowSystemInfo,
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
-    drawable_size: (u32, u32),
 }
 
 impl GtkEmuWindow {
@@ -60,7 +58,6 @@ impl GtkEmuWindow {
             window_info,
             shown_state: Arc::new(AtomicBool::new(true)),
             framebuffer_layout: Arc::new(RwLock::new(layout)),
-            drawable_size,
         }
     }
 
@@ -81,11 +78,6 @@ impl GtkEmuWindow {
         Arc::clone(&self.framebuffer_layout)
     }
 
-    /// Current drawable size in physical pixels.
-    pub fn drawable_size(&self) -> (u32, u32) {
-        self.drawable_size
-    }
-
     /// Update the visibility flag (GTK `map`/`unmap`).
     pub fn set_shown(&self, shown: bool) {
         self.shown_state.store(shown, Ordering::SeqCst);
@@ -94,7 +86,6 @@ impl GtkEmuWindow {
     /// Recompute the framebuffer layout after a resize. Mirrors
     /// `EmuWindowBase::update_current_framebuffer_layout`.
     pub fn update_framebuffer_layout(&mut self, width: u32, height: u32) {
-        self.drawable_size = (width, height);
         *self.framebuffer_layout.write().unwrap() = default_frame_layout(width, height);
     }
 }

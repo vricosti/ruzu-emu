@@ -5,6 +5,7 @@
 //!
 //! VP8 video decoder implementation.
 
+use crate::host1x::codec_types::Vp8PictureInfo;
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
@@ -21,53 +22,6 @@ pub enum Vp8SurfaceIndex {
     Golden = 1,
     AltRef = 2,
     Current = 3,
-}
-
-/// VP8 picture info read from NVDEC registers.
-///
-/// Port of `Tegra::Decoders::VP8::VP8PictureInfo`.
-#[repr(C)]
-#[derive(Clone)]
-pub struct Vp8PictureInfo {
-    pub reserved0: [u32; 14],
-    pub frame_width: u16,
-    pub frame_height: u16,
-    pub key_frame: u8,
-    pub version: u8,
-    pub surface_format: u8, // bitfield: tile_format(2), gob_height(3), reserved(3)
-    pub error_conceal_on: u8,
-    pub first_part_size: u32,
-    pub hist_buffer_size: u32,
-    pub vld_buffer_size: u32,
-    pub frame_stride: [u32; 2],
-    pub luma_top_offset: u32,
-    pub luma_bot_offset: u32,
-    pub luma_frame_offset: u32,
-    pub chroma_top_offset: u32,
-    pub chroma_bot_offset: u32,
-    pub chroma_frame_offset: u32,
-    pub display_params: [u8; 0x1c],
-    pub current_output_memory_layout: i8,
-    pub output_memory_layout: [i8; 3],
-    pub segmentation_feature_data_update: u8,
-    pub _pad: [u8; 3],
-    pub result_value: u32,
-    pub partition_offset: [u32; 8],
-    pub reserved1: [u32; 3],
-}
-
-const _: () = assert!(std::mem::size_of::<Vp8PictureInfo>() == 0xc0);
-const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, frame_width) == 0x38);
-const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, first_part_size) == 0x40);
-const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, vld_buffer_size) == 0x48);
-const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, current_output_memory_layout) == 0x88);
-const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, partition_offset) == 0x94);
-
-impl Default for Vp8PictureInfo {
-    fn default() -> Self {
-        // Safety: zeroed representation is valid for this C-layout struct.
-        unsafe { std::mem::zeroed() }
-    }
 }
 
 /// Writes the VP8 frame tag and, for key frames, the uncompressed key-frame

@@ -1,12 +1,196 @@
 // SPDX-FileCopyrightText: Copyright 2024 ruzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! VP9 portion of Eden's `video_core/host1x/codec_types.h`.
+//! Port of Eden's `video_core/host1x/codec_types.h`.
 //!
-//! VP9-specific types: frame dimensions, flags, segmentation, loop filter,
-//! entropy probabilities, picture info, and entropy conversion.
+//! Guest codec payload layouts and the small conversion helpers owned by the
+//! upstream header live together here so their binary layout remains directly
+//! auditable against the source of truth.
 
 use bitflags::bitflags;
+
+/// 32-bit offset storing an address shifted by eight bits.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Offset {
+    offset: u32,
+}
+
+impl Offset {
+    pub const fn address(&self) -> u32 {
+        self.offset << 8
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Offset>() == 0x4);
+
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct H264ParameterSet {
+    pub log2_max_pic_order_cnt_lsb_minus4: i32,
+    pub delta_pic_order_always_zero_flag: i32,
+    pub frame_mbs_only_flag: i32,
+    pub pic_width_in_mbs: u32,
+    pub frame_height_in_mbs: u32,
+    pub surface_format: u32,
+    pub entropy_coding_mode_flag: u32,
+    pub pic_order_present_flag: i32,
+    pub num_refidx_l0_default_active: i32,
+    pub num_refidx_l1_default_active: i32,
+    pub deblocking_filter_control_present_flag: i32,
+    pub redundant_pic_cnt_present_flag: i32,
+    pub transform_8x8_mode_flag: u32,
+    pub pitch_luma: u32,
+    pub pitch_chroma: u32,
+    pub luma_top_offset: Offset,
+    pub luma_bot_offset: Offset,
+    pub luma_frame_offset: Offset,
+    pub chroma_top_offset: Offset,
+    pub chroma_bot_offset: Offset,
+    pub chroma_frame_offset: Offset,
+    pub hist_buffer_size: u32,
+    /// The C++ union is logically a `u64`, but the guest ABI gives the
+    /// containing structure four-byte alignment. Two words preserve both.
+    pub flags_raw: [u32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<H264ParameterSet>() == 0x60);
+
+impl H264ParameterSet {
+    #[inline]
+    fn flags(&self) -> u64 {
+        self.flags_raw[0] as u64 | ((self.flags_raw[1] as u64) << 32)
+    }
+
+    pub fn mbaff_frame(&self) -> u64 {
+        self.flags() & 1
+    }
+
+    pub fn direct_8x8_inference(&self) -> u64 {
+        (self.flags() >> 1) & 1
+    }
+
+    pub fn weighted_pred(&self) -> u64 {
+        (self.flags() >> 2) & 1
+    }
+
+    pub fn constrained_intra_pred(&self) -> u64 {
+        (self.flags() >> 3) & 1
+    }
+
+    pub fn log2_max_frame_num_minus4(&self) -> u64 {
+        (self.flags() >> 8) & 0xf
+    }
+
+    pub fn chroma_format_idc(&self) -> u64 {
+        (self.flags() >> 12) & 0x3
+    }
+
+    pub fn pic_order_cnt_type(&self) -> u64 {
+        (self.flags() >> 14) & 0x3
+    }
+
+    pub fn pic_init_qp_minus26(&self) -> i64 {
+        let raw = ((self.flags() >> 16) & 0x3f) as i64;
+        if raw & 0x20 != 0 {
+            raw | !0x3f
+        } else {
+            raw
+        }
+    }
+
+    pub fn chroma_qp_index_offset(&self) -> i64 {
+        let raw = ((self.flags() >> 22) & 0x1f) as i64;
+        if raw & 0x10 != 0 {
+            raw | !0x1f
+        } else {
+            raw
+        }
+    }
+
+    pub fn second_chroma_qp_index_offset(&self) -> i64 {
+        let raw = ((self.flags() >> 27) & 0x1f) as i64;
+        if raw & 0x10 != 0 {
+            raw | !0x1f
+        } else {
+            raw
+        }
+    }
+
+    pub fn weighted_bipred_idc(&self) -> u64 {
+        (self.flags() >> 32) & 0x3
+    }
+
+    pub fn curr_pic_idx(&self) -> u64 {
+        (self.flags() >> 34) & 0x7f
+    }
+
+    pub fn frame_number(&self) -> u64 {
+        (self.flags() >> 46) & 0xffff
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct DpbEntry {
+    pub flags: u32,
+    pub field_order_cnt: [u32; 2],
+    pub frame_idx: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DpbEntry>() == 0x10);
+
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct DisplayParam {
+    pub flags0: u32,
+    pub output_top: [i32; 2],
+    pub output_bottom: [i32; 2],
+    pub histogram_flags1: u32,
+    pub histogram_flags2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DisplayParam>() == 0x1c);
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct H264DecoderContext {
+    pub reserved0: [u32; 13],
+    pub eos: [u8; 16],
+    pub explicit_eos_present_flag: u8,
+    pub hint_dump_en: u8,
+    pub _pad0: [u8; 2],
+    pub stream_len: u32,
+    pub slice_count: u32,
+    pub mbhist_buffer_size: u32,
+    pub gptimer_timeout_value: u32,
+    pub h264_parameter_set: H264ParameterSet,
+    pub curr_field_order_cnt: [i32; 2],
+    pub dpb: [DpbEntry; 16],
+    pub weight_scale_4x4: [u8; 0x60],
+    pub weight_scale_8x8: [u8; 0x80],
+    pub num_inter_view_refs_lx: [u8; 2],
+    pub reserved2: [u8; 14],
+    pub inter_view_refidx_lx: [[i8; 16]; 2],
+    pub lossless_flags: u32,
+    pub display_param: DisplayParam,
+    pub reserved4: [u32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<H264DecoderContext>() == 0x2fc);
+
+impl Default for H264DecoderContext {
+    fn default() -> Self {
+        // All fields are integer storage or integer arrays in the guest ABI.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl H264DecoderContext {
+    pub fn qpprime_y_zero_transform_bypass_flag(&self) -> u32 {
+        (self.lossless_flags >> 1) & 1
+    }
+}
 
 /// Surface indices used by the VP9 decoder.
 ///
@@ -430,12 +614,61 @@ impl Default for RefPoolElement {
     }
 }
 
+#[repr(C)]
+#[derive(Clone)]
+pub struct Vp8PictureInfo {
+    pub reserved0: [u32; 14],
+    pub frame_width: u16,
+    pub frame_height: u16,
+    pub key_frame: u8,
+    pub version: u8,
+    pub surface_format: u8,
+    pub error_conceal_on: u8,
+    pub first_part_size: u32,
+    pub hist_buffer_size: u32,
+    pub vld_buffer_size: u32,
+    pub frame_stride: [u32; 2],
+    pub luma_top_offset: u32,
+    pub luma_bot_offset: u32,
+    pub luma_frame_offset: u32,
+    pub chroma_top_offset: u32,
+    pub chroma_bot_offset: u32,
+    pub chroma_frame_offset: u32,
+    pub display_params: [u8; 0x1c],
+    pub current_output_memory_layout: i8,
+    pub output_memory_layout: [i8; 3],
+    pub segmentation_feature_data_update: u8,
+    pub _pad: [u8; 3],
+    pub result_value: u32,
+    pub partition_offset: [u32; 8],
+    pub reserved1: [u32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<Vp8PictureInfo>() == 0xc0);
+const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, frame_width) == 0x38);
+const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, first_part_size) == 0x40);
+const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, vld_buffer_size) == 0x48);
+const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, current_output_memory_layout) == 0x88);
+const _: () = assert!(std::mem::offset_of!(Vp8PictureInfo, partition_offset) == 0x94);
+
+impl Default for Vp8PictureInfo {
+    fn default() -> Self {
+        // All fields are integer storage or integer arrays in the guest ABI.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn raw_nvdec_layout_matches_codec_types_header() {
+        assert_eq!(std::mem::size_of::<Offset>(), 0x4);
+        assert_eq!(std::mem::size_of::<H264ParameterSet>(), 0x60);
+        assert_eq!(std::mem::size_of::<DpbEntry>(), 0x10);
+        assert_eq!(std::mem::size_of::<DisplayParam>(), 0x1c);
+        assert_eq!(std::mem::size_of::<H264DecoderContext>(), 0x2fc);
         assert_eq!(std::mem::size_of::<Vp9SurfaceIndex>(), 0x4);
         assert_eq!(std::mem::size_of::<Vp9FrameDimensions>(), 0x8);
         assert_eq!(std::mem::size_of::<FrameFlags>(), 0x4);
@@ -446,6 +679,40 @@ mod tests {
         assert_eq!(std::mem::size_of::<Vp9EntropyProbs>(), 0x7b4);
         assert_eq!(std::mem::size_of::<PictureInfo>(), 0x100);
         assert_eq!(std::mem::size_of::<EntropyProbs>(), 0xea0);
+        assert_eq!(std::mem::size_of::<Vp8PictureInfo>(), 0xc0);
+
+        assert_eq!(
+            std::mem::offset_of!(H264ParameterSet, log2_max_pic_order_cnt_lsb_minus4),
+            0x00
+        );
+        assert_eq!(std::mem::offset_of!(H264ParameterSet, surface_format), 0x14);
+        assert_eq!(
+            std::mem::offset_of!(H264ParameterSet, luma_top_offset),
+            0x3c
+        );
+        assert_eq!(
+            std::mem::offset_of!(H264ParameterSet, chroma_frame_offset),
+            0x50
+        );
+        assert_eq!(std::mem::offset_of!(H264ParameterSet, flags_raw), 0x58);
+        assert_eq!(std::mem::offset_of!(H264DecoderContext, stream_len), 0x48);
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, h264_parameter_set),
+            0x58
+        );
+        assert_eq!(std::mem::offset_of!(H264DecoderContext, dpb), 0xc0);
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, weight_scale_4x4),
+            0x1c0
+        );
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, weight_scale_8x8),
+            0x220
+        );
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, display_param),
+            0x2d4
+        );
 
         assert_eq!(std::mem::offset_of!(PictureInfo, bitstream_size), 0x30);
         assert_eq!(std::mem::offset_of!(PictureInfo, last_frame_size), 0x48);
@@ -458,6 +725,47 @@ mod tests {
         assert_eq!(std::mem::offset_of!(EntropyProbs, class_0), 0x540);
         assert_eq!(std::mem::offset_of!(EntropyProbs, class_0_fr), 0x560);
         assert_eq!(std::mem::offset_of!(EntropyProbs, coef_probs), 0x5a0);
+        assert_eq!(std::mem::offset_of!(Vp8PictureInfo, frame_width), 0x38);
+        assert_eq!(std::mem::offset_of!(Vp8PictureInfo, first_part_size), 0x40);
+        assert_eq!(std::mem::offset_of!(Vp8PictureInfo, vld_buffer_size), 0x48);
+        assert_eq!(
+            std::mem::offset_of!(Vp8PictureInfo, current_output_memory_layout),
+            0x88
+        );
+        assert_eq!(std::mem::offset_of!(Vp8PictureInfo, partition_offset), 0x94);
+    }
+
+    #[test]
+    fn h264_parameter_bitfields_match_upstream_positions_and_sign_extension() {
+        let mut params = H264ParameterSet::default();
+        let flags = 1u64
+            | (1 << 1)
+            | (1 << 2)
+            | (1 << 3)
+            | (9 << 8)
+            | (3 << 12)
+            | (2 << 14)
+            | (0b10_0001 << 16)
+            | (0b1_0001 << 22)
+            | (0b0_1111 << 27)
+            | (2 << 32)
+            | (0x55 << 34)
+            | (0xabcd << 46);
+        params.flags_raw = [flags as u32, (flags >> 32) as u32];
+
+        assert_eq!(params.mbaff_frame(), 1);
+        assert_eq!(params.direct_8x8_inference(), 1);
+        assert_eq!(params.weighted_pred(), 1);
+        assert_eq!(params.constrained_intra_pred(), 1);
+        assert_eq!(params.log2_max_frame_num_minus4(), 9);
+        assert_eq!(params.chroma_format_idc(), 3);
+        assert_eq!(params.pic_order_cnt_type(), 2);
+        assert_eq!(params.pic_init_qp_minus26(), -31);
+        assert_eq!(params.chroma_qp_index_offset(), -15);
+        assert_eq!(params.second_chroma_qp_index_offset(), 15);
+        assert_eq!(params.weighted_bipred_idc(), 2);
+        assert_eq!(params.curr_pic_idx(), 0x55);
+        assert_eq!(params.frame_number(), 0xabcd);
     }
 
     #[test]

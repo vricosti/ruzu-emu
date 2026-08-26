@@ -17536,3 +17536,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the fence manager owns process-local OpenGL sync handles and callback state; no payload is
   raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/codec_types.rs` vs Eden `src/video_core/host1x/codec_types.h`
+
+### Intentional differences
+
+- C++ `BitField` unions are represented by integer backing fields plus typed accessors. In
+  particular, the 64-bit H264 parameter union uses two `u32` words so the containing guest payload
+  retains Eden's four-byte alignment.
+- Rust `Vec<u8>` and deterministic zeroed `Default` implementations replace `std::vector<u8>` and
+  C++ aggregate initialization without changing guest-memory serialization.
+
+### Unintentional differences (to fix)
+
+- Resolved: the H264, VP9, and VP8 codec payload declarations, their inline conversions, and their
+  layout assertions now share the `host1x/codec_types.rs` owner matching Eden. They are no longer
+  split across `codecs/h264.rs`, `codecs/vp8.rs`, and the removed `codecs/vp9_types.rs` module.
+
+### Missing items
+
+- None in the declarations, inline conversions, or layout contracts owned by `codec_types.h`.
+
+### Binary layout verification
+
+- PASS: compile-time assertions and `raw_nvdec_layout_matches_codec_types_header` verify every
+  upstream size assertion and all upstream offset assertions for H264, VP9, and VP8 payloads.

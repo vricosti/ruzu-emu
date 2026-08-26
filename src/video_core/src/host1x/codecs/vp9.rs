@@ -6,11 +6,11 @@
 //! VP9 video decoder implementation, including the VpxRangeEncoder and
 //! VpxBitStreamWriter for composing VP9 compressed/uncompressed headers.
 
-use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
-use crate::host1x::codecs::vp9_types::{
+use crate::host1x::codec_types::{
     EntropyProbs, PictureInfo, Segmentation, Vp9EntropyProbs, Vp9FrameContainer, Vp9PictureInfo,
     Vp9SurfaceIndex,
 };
+use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 use crate::memory_manager::MemoryManager;

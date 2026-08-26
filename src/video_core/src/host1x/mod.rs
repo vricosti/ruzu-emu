@@ -3,6 +3,7 @@
 
 //! Port of `video_core/host1x/` — Host1x subsystem modules.
 
+pub mod codec_types;
 pub mod codecs;
 pub mod control;
 pub mod ffmpeg;

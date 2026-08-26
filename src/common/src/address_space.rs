@@ -332,7 +332,7 @@ impl<VaType: FlatVa> FlatAllocatorBool<VaType> {
                     let gap = self.inner.blocks[succ]
                         .virt
                         .wrapping_sub(self.inner.blocks[pred].virt);
-                    if gap < size || self.inner.blocks[pred].mapped {
+                    if gap >= size && !self.inner.blocks[pred].mapped {
                         alloc_start = Some(self.inner.blocks[pred].virt);
                         break;
                     }
@@ -441,13 +441,11 @@ mod tests {
     }
 
     #[test]
-    fn test_flat_allocator_fixed_mapping_uses_upstream_linear_selection() {
+    fn test_flat_allocator_skips_fixed_mapping() {
         let mut alloc = FlatAllocator64::new(0x1000, (1u64 << 34) - 1);
         alloc.allocate_fixed(0x2000, 0x1000);
 
-        // This is the literal result of Eden's linear selection condition:
-        // a request straddling a fixed block selects that block's start.
-        assert_eq!(alloc.allocate(0x2000), Some(0x2000));
+        assert_eq!(alloc.allocate(0x2000), Some(0x3000));
     }
 
     #[test]

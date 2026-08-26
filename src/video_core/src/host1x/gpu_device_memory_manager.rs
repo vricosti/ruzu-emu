@@ -2234,16 +2234,15 @@ mod tests {
     }
 
     #[test]
-    fn smmu_allocate_fixed_forwards_to_the_upstream_allocator() {
+    fn smmu_allocate_fixed_reserves_the_range() {
         let mgr = MaxwellDeviceMemoryManager::default();
         mgr.smmu_allocate_fixed(SMMU_BASE + 0x1000, 0x1000);
 
-        // Eden's current FlatAllocator advances to the fixed block's start
-        // when a linear allocation straddles that block. Preserve that exact,
-        // counter-intuitive result rather than imposing different policy here.
+        // The alternative policy never returns an address overlapping the
+        // fixed range, even when the linear allocation straddles its start.
         let address = mgr.smmu_allocate(0x2000);
 
-        assert_eq!(address, SMMU_BASE + 0x1000);
+        assert_eq!(address, SMMU_BASE + 0x2000);
     }
 
     #[test]

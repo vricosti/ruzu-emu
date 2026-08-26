@@ -15725,3 +15725,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `RenderPassKey` and cached Vulkan handles are host-only and are not serialized or copied to
   guest memory.
+
+## 2026-08-26 — `src/video_core/src/renderer_null/renderer_null.rs` vs Eden `src/video_core/renderer_null/renderer_null.{h,cpp}` and `renderer_base.{h,cpp}`
+
+### Intentional differences
+
+- The Rust renderer receives `Arc` callbacks for `GPU::RendererFrameEndNotify` and
+  `EmuWindow::OnFrameDisplayed`, plus the frontend's shared framebuffer layout, instead of retaining
+  mutable references across the renderer/GPU/window ownership cycle.
+
+### Unintentional differences (to fix)
+
+- Resolved: non-empty Null composites now notify frame end and then frame displayed in Eden's exact
+  order; they no longer increment `RendererBase::m_current_frame` or emit a backend-only trace.
+- Resolved: Null construction and `refresh_base_settings` recalculate the live framebuffer layout,
+  and screenshot requests use the inherited base lifecycle instead of immediately reporting
+  failure.
+
+### Missing items
+
+- None in `RendererNull` construction, composite, capture-buffer, vendor, rasterizer access, or
+  inherited renderer-base behavior.
+
+### Binary layout verification
+
+- N/A: renderer state and frontend callback owners are host-only and are not raw guest payloads.

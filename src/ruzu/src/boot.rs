@@ -741,7 +741,12 @@ fn run_boot(
                 .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
             ),
             common::settings_enums::RendererBackend::Null => Box::new(
-                video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone()),
+                video_core::renderer_null::renderer_null::RendererNull::new(
+                    syncpoints.clone(),
+                    Arc::clone(&framebuffer_layout),
+                    Arc::clone(&frame_displayed_notify),
+                    Arc::clone(&frame_end_notify),
+                ),
             ),
         };
         gpu.bind_renderer(renderer);

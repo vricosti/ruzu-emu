@@ -1027,6 +1027,10 @@ fn main() {
         )),
         _ => None,
     };
+    let null_framebuffer_layout = match &emu_window {
+        EmuWindow::Null(w) => Some(w.framebuffer_layout()),
+        _ => None,
+    };
     let renderer_backend_str = renderer_backend.to_string();
 
     system.set_subsystem_factory(Box::new(move |system| {
@@ -1231,9 +1235,22 @@ fn main() {
                         .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
                     )
                 }
-                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                    syncpoints.clone(),
-                )),
+                _ => {
+                    let framebuffer_layout = null_framebuffer_layout.as_ref().ok_or_else(|| {
+                        "Null renderer selected without framebuffer layout".to_owned()
+                    })?;
+                    let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                    let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || unsafe {
+                        let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
+                        gpu_ref.renderer_frame_end_notify();
+                    });
+                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                        syncpoints.clone(),
+                        Arc::clone(framebuffer_layout),
+                        frame_displayed_notify,
+                        frame_end_notify,
+                    ))
+                }
             };
         gpu.bind_renderer(renderer);
         let memory_raw_reader = memory_raw.clone();

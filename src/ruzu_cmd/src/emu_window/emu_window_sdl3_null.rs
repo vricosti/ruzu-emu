@@ -15,9 +15,11 @@
 
 use sdl3::sys::everything as sdl;
 use std::ffi::CStr;
+use std::sync::{Arc, RwLock};
 
 use super::emu_window_sdl3::{DummyContext, EmuWindowSdl3};
 use ruzu_core::core::SystemRef;
+use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 // Screen layout constants.
 // Maps to C++ `Layout::ScreenUndocked::Width` / `Layout::ScreenUndocked::Height`.
@@ -101,6 +103,11 @@ impl EmuWindowSdl3Null {
     /// Returns the raw SDL window pointer.
     pub fn raw_window(&self) -> *mut sdl::SDL_Window {
         self.base.render_window
+    }
+
+    /// Returns the live framebuffer layout owned by the base emulation window.
+    pub fn framebuffer_layout(&self) -> Arc<RwLock<FramebufferLayout>> {
+        self.base.framebuffer_layout()
     }
 }
 

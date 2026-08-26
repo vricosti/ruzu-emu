@@ -8,8 +8,15 @@
 use super::format_lookup_table::PixelFormat;
 use super::image_base::GPUVAddr;
 use super::image_info::ImageInfo;
-use super::image_view_info::{ImageViewInfo, SwizzleSource};
+use super::image_view_info::ImageViewInfo;
 use super::types::*;
+
+fn fail_soft(message: String) {
+    log::error!("{message}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("{message}");
+    }
+}
 
 // ── ImageViewFlagBits ──────────────────────────────────────────────────
 
@@ -42,7 +49,6 @@ pub struct ImageViewBase {
     pub format: PixelFormat,
     pub view_type: ImageViewType,
     pub range: SubresourceRange,
-    pub swizzle: [u8; 4],
     pub size: Extent3D,
     pub flags: ImageViewFlagBits,
 
@@ -61,64 +67,52 @@ impl ImageViewBase {
         image_id: ImageId,
         addr: GPUVAddr,
     ) -> Self {
-        assert!(
-            crate::compatible_formats::is_view_compatible(
-                image_info.format,
-                info.format,
-                false,
-                true,
-            ),
-            "Image view format {:?} is incompatible with image format {:?}",
-            info.format,
-            image_info.format
-        );
         let level = info.range.base.level as u32;
-        let mut flags = ImageViewFlagBits::empty();
-        if image_info.forced_flushed {
-            flags |= ImageViewFlagBits::PREEMTIVE_DOWNLOAD;
-        }
-        if image_info.image_type == ImageType::E3D && info.view_type != ImageViewType::E3D {
-            flags |= ImageViewFlagBits::SLICE;
-        }
-        Self {
+        let mut view = Self {
             image_id,
             gpu_addr: addr,
             format: info.format,
             view_type: info.view_type,
             range: info.range,
-            swizzle: [info.x_source, info.y_source, info.z_source, info.w_source],
             size: Extent3D {
                 width: (image_info.size.width >> level).max(1),
                 height: (image_info.size.height >> level).max(1),
                 depth: (image_info.size.depth >> level).max(1),
             },
-            flags,
+            flags: ImageViewFlagBits::empty(),
             invalidation_tick: 0,
             modification_tick: 0,
+        };
+        if !crate::compatible_formats::is_view_compatible(
+            image_info.format,
+            info.format,
+            false,
+            true,
+        ) {
+            fail_soft(format!(
+                "Image view format {:?} is incompatible with image format {:?}",
+                info.format, image_info.format
+            ));
         }
+        if image_info.forced_flushed {
+            view.flags |= ImageViewFlagBits::PREEMTIVE_DOWNLOAD;
+        }
+        if image_info.image_type == ImageType::E3D && info.view_type != ImageViewType::E3D {
+            view.flags |= ImageViewFlagBits::SLICE;
+        }
+        view
     }
 
     /// Construct a buffer-type view.
     ///
     /// Port of `ImageViewBase::ImageViewBase(const ImageInfo&, const ImageViewInfo&, GPUVAddr)`.
     pub fn new_buffer(info: &ImageInfo, view_info: &ImageViewInfo, addr: GPUVAddr) -> Self {
-        assert_eq!(
-            view_info.view_type,
-            ImageViewType::Buffer,
-            "Expected texture buffer"
-        );
-        Self {
+        let view = Self {
             image_id: NULL_IMAGE_ID,
             gpu_addr: addr,
             format: info.format,
             view_type: ImageViewType::Buffer,
             range: SubresourceRange::default(),
-            swizzle: [
-                view_info.x_source,
-                view_info.y_source,
-                view_info.z_source,
-                view_info.w_source,
-            ],
             size: Extent3D {
                 width: info.size.width,
                 height: 1,
@@ -127,7 +121,11 @@ impl ImageViewBase {
             flags: ImageViewFlagBits::empty(),
             invalidation_tick: 0,
             modification_tick: 0,
+        };
+        if view_info.view_type != ImageViewType::Buffer {
+            fail_soft("Expected texture buffer".to_owned());
         }
+        view
     }
 
     /// Construct a null/sentinel image view.
@@ -140,12 +138,6 @@ impl ImageViewBase {
             format: PixelFormat::Invalid,
             view_type: ImageViewType::E1D,
             range: SubresourceRange::default(),
-            swizzle: [
-                SwizzleSource::R as u8,
-                SwizzleSource::G as u8,
-                SwizzleSource::B as u8,
-                SwizzleSource::A as u8,
-            ],
             size: Extent3D {
                 width: 0,
                 height: 0,
@@ -160,15 +152,6 @@ impl ImageViewBase {
     /// Whether this view is a buffer view.
     pub fn is_buffer(&self) -> bool {
         self.view_type == ImageViewType::Buffer
-    }
-
-    /// Whether this view was created from a render-target `ImageViewInfo`.
-    ///
-    /// Upstream stores this state only on `ImageViewInfo::IsRenderTarget()`;
-    /// Rust keeps the source swizzle bytes on `ImageViewBase`, so the same
-    /// sentinel check lives here for backend materialisation.
-    pub fn is_render_target(&self) -> bool {
-        self.swizzle == [u8::MAX; 4]
     }
 
     /// Whether this view supports anisotropic filtering.
@@ -232,8 +215,7 @@ mod tests {
     use common::slot_vector::SlotId;
 
     #[test]
-    #[should_panic(expected = "Image view format")]
-    fn image_view_base_rejects_incompatible_view_format_like_upstream() {
+    fn image_view_base_keeps_constructing_after_incompatible_format_assert_like_upstream() {
         let image_info = ImageInfo {
             format: PixelFormat::R8Unorm,
             image_type: ImageType::E2D,
@@ -245,12 +227,12 @@ mod tests {
             ..ImageViewInfo::default()
         };
 
-        let _ = ImageViewBase::new(&view_info, &image_info, SlotId { index: 1 }, 0x1000);
+        let view = ImageViewBase::new(&view_info, &image_info, SlotId { index: 1 }, 0x1000);
+        assert_eq!(view.format, PixelFormat::R32G32B32A32Float);
     }
 
     #[test]
-    #[should_panic(expected = "Expected texture buffer")]
-    fn image_view_base_buffer_constructor_rejects_non_buffer_view_like_upstream() {
+    fn image_view_base_buffer_constructor_keeps_constructing_after_assert_like_upstream() {
         let image_info = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             ..ImageInfo::default()
@@ -261,6 +243,7 @@ mod tests {
             ..ImageViewInfo::default()
         };
 
-        let _ = ImageViewBase::new_buffer(&image_info, &view_info, 0x1000);
+        let view = ImageViewBase::new_buffer(&image_info, &view_info, 0x1000);
+        assert!(view.is_buffer());
     }
 }

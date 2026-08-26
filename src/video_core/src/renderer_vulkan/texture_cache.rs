@@ -1309,7 +1309,7 @@ impl Framebuffer {
             num_layers = num_layers.max(base.range.extent.layers);
             images[num_images] = color_buffer.image_handle();
             image_ranges[num_images] =
-                make_subresource_range(image_view_aspect_mask(base), base.range, base.flags);
+                make_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
             rt_map[index] = num_images;
             samples = color_buffer.samples();
             num_images += 1;
@@ -1337,7 +1337,7 @@ impl Framebuffer {
             num_layers = num_layers.max(base.range.extent.layers);
             images[num_images] = depth_buffer.image_handle();
             let subresource_range =
-                make_subresource_range(image_view_aspect_mask(base), base.range, base.flags);
+                make_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
             image_ranges[num_images] = subresource_range;
             samples = depth_buffer.samples();
             num_images += 1;
@@ -3528,6 +3528,7 @@ impl TextureCacheRuntime {
     fn make_image_view(
         &self,
         _view_id: ImageViewId,
+        info: &ImageViewInfo,
         view_base: NonNull<ImageViewBase>,
         image: &Image,
     ) -> Result<ImageView, vk::Result> {
@@ -3536,12 +3537,13 @@ impl TextureCacheRuntime {
         let view_base = unsafe { view_base.as_ref() };
         let format_info = self.surface_format_info(view_base.format, true);
         let format = format_info.format;
-        let aspect_mask = image_view_aspect_mask(view_base);
+        let aspect_mask = image_view_aspect_mask(info);
         let components = image_view_components(
-            view_base,
+            info,
             aspect_mask,
             self.must_emulate_bgr565,
             self.ext_4444_formats_supported,
+            self.vulkan_device().supports_depth_stencil_swizzle_one(),
         );
         let base_range = make_subresource_range(aspect_mask, view_base.range, view_base.flags);
         let image_format_info = self.surface_format_info(image.base().info.format, false);
@@ -3633,6 +3635,7 @@ impl TextureCacheRuntime {
     fn make_buffer_image_view(
         &self,
         _view_id: ImageViewId,
+        _info: &ImageViewInfo,
         base: NonNull<ImageViewBase>,
     ) -> ImageView {
         // SAFETY: the pointer is owned by the typed view slot.
@@ -3987,17 +3990,19 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
     fn create_image_view(
         runtime: Option<&mut TextureCacheRuntime>,
         view_id: ImageViewId,
+        info: &ImageViewInfo,
         base: NonNull<ImageViewBase>,
         image: Option<&Image>,
     ) -> ImageView {
         let runtime = runtime.expect("Vulkan TextureCache runtime must be bound");
         // SAFETY: the pointer is the base of the slot receiving the payload.
         if unsafe { base.as_ref() }.is_buffer() {
-            runtime.make_buffer_image_view(view_id, base)
+            runtime.make_buffer_image_view(view_id, info, base)
         } else {
             runtime
                 .make_image_view(
                     view_id,
+                    info,
                     base,
                     image.expect("non-buffer Vulkan image view requires its parent image"),
                 )
@@ -4856,6 +4861,7 @@ impl TextureCache {
             return Ok(());
         }
         let view_base = NonNull::from(self.base.slot_image_views[view_id].base.as_mut());
+        let info = self.base.slot_image_views[view_id].info;
         // SAFETY: the boxed base allocation remains stable for the complete
         // typed-slot lifetime.
         let view_base_ref = unsafe { view_base.as_ref() };
@@ -4863,7 +4869,7 @@ impl TextureCache {
             let view = self
                 .base
                 .runtime_mut()
-                .make_buffer_image_view(view_id, view_base);
+                .make_buffer_image_view(view_id, &info, view_base);
             self.base.slot_image_views[view_id].backend = Some(view);
             return Ok(());
         }
@@ -4874,7 +4880,7 @@ impl TextureCache {
         let view = self
             .base
             .runtime()
-            .make_image_view(view_id, view_base, image)?;
+            .make_image_view(view_id, &info, view_base, image)?;
         self.base.slot_image_views[view_id].backend = Some(view);
         Ok(())
     }
@@ -6568,6 +6574,28 @@ mod tests {
     }
 
     #[test]
+    fn image_view_aspect_uses_image_view_info_like_upstream() {
+        let mut info = ImageViewInfo {
+            format: PixelFormat::D24UnormS8Uint,
+            ..ImageViewInfo::default()
+        };
+        assert_eq!(image_view_aspect_mask(&info), vk::ImageAspectFlags::DEPTH);
+
+        info.x_source = SwizzleSource::G as u8;
+        assert_eq!(image_view_aspect_mask(&info), vk::ImageAspectFlags::STENCIL);
+
+        let render_target = ImageViewInfo::for_render_target(
+            ImageViewType::E2D,
+            PixelFormat::D24UnormS8Uint,
+            SubresourceRange::default(),
+        );
+        assert_eq!(
+            image_view_aspect_mask(&render_target),
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+    }
+
+    #[test]
     fn d32_color_blit_destination_list_matches_upstream_boundaries() {
         assert!(color_blit_from_d32_destination(PixelFormat::B5G6R5Unorm));
         assert!(color_blit_from_d32_destination(PixelFormat::Bc1RgbaUnorm));
@@ -6591,6 +6619,27 @@ mod tests {
                 SwizzleSource::A as u8,
             ]
         );
+
+        let mut unsupported_one = [
+            SwizzleSource::R as u8,
+            SwizzleSource::OneFloat as u8,
+            SwizzleSource::OneInt as u8,
+            SwizzleSource::A as u8,
+        ];
+        sanitize_depth_stencil_swizzle(&mut unsupported_one, false);
+        assert_eq!(
+            unsupported_one,
+            [
+                SwizzleSource::R as u8,
+                SwizzleSource::Zero as u8,
+                SwizzleSource::Zero as u8,
+                SwizzleSource::A as u8,
+            ]
+        );
+
+        let mut supported_one = [SwizzleSource::OneFloat as u8; 4];
+        sanitize_depth_stencil_swizzle(&mut supported_one, true);
+        assert_eq!(supported_one, [SwizzleSource::OneFloat as u8; 4]);
     }
 
     #[test]
@@ -7705,17 +7754,14 @@ fn image_aspect_mask(format: PixelFormat) -> vk::ImageAspectFlags {
     }
 }
 
-fn image_view_aspect_mask(
-    view: &crate::texture_cache::image_view_base::ImageViewBase,
-) -> vk::ImageAspectFlags {
-    if view.is_render_target() {
-        return image_aspect_mask(view.format);
+fn image_view_aspect_mask(info: &ImageViewInfo) -> vk::ImageAspectFlags {
+    if info.is_render_target() {
+        return image_aspect_mask(info.format);
     }
-    let any_r = view
-        .swizzle
+    let any_r = [info.x_source, info.y_source, info.z_source, info.w_source]
         .iter()
         .any(|&source| source == crate::texture_cache::image_view_info::SwizzleSource::R as u8);
-    match view.format {
+    match info.format {
         PixelFormat::D24UnormS8Uint | PixelFormat::D32FloatS8Uint => {
             if any_r {
                 vk::ImageAspectFlags::DEPTH
@@ -7799,13 +7845,27 @@ fn try_transform_swizzle_if_needed(
     }
 }
 
+fn sanitize_depth_stencil_swizzle(swizzle: &mut [u8; 4], supports_depth_stencil_swizzle_one: bool) {
+    if supports_depth_stencil_swizzle_one {
+        return;
+    }
+    swizzle.iter_mut().for_each(|source| {
+        if *source == crate::texture_cache::image_view_info::SwizzleSource::OneFloat as u8
+            || *source == crate::texture_cache::image_view_info::SwizzleSource::OneInt as u8
+        {
+            *source = crate::texture_cache::image_view_info::SwizzleSource::Zero as u8;
+        }
+    });
+}
+
 fn image_view_components(
-    view: &crate::texture_cache::image_view_base::ImageViewBase,
+    info: &ImageViewInfo,
     aspect_mask: vk::ImageAspectFlags,
     emulate_bgr565: bool,
     ext_4444_formats_supported: bool,
+    supports_depth_stencil_swizzle_one: bool,
 ) -> vk::ComponentMapping {
-    let mut swizzle = if view.is_render_target() {
+    let mut swizzle = if info.is_render_target() {
         [
             crate::texture_cache::image_view_info::SwizzleSource::R as u8,
             crate::texture_cache::image_view_info::SwizzleSource::G as u8,
@@ -7813,11 +7873,11 @@ fn image_view_components(
             crate::texture_cache::image_view_info::SwizzleSource::A as u8,
         ]
     } else {
-        view.swizzle
+        [info.x_source, info.y_source, info.z_source, info.w_source]
     };
-    if !view.is_render_target() {
+    if !info.is_render_target() {
         try_transform_swizzle_if_needed(
-            view.format,
+            info.format,
             &mut swizzle,
             emulate_bgr565,
             !ext_4444_formats_supported,
@@ -7826,6 +7886,7 @@ fn image_view_components(
             swizzle
                 .iter_mut()
                 .for_each(|source| *source = convert_green_red(*source));
+            sanitize_depth_stencil_swizzle(&mut swizzle, supports_depth_stencil_swizzle_one);
         }
     }
     vk::ComponentMapping {

@@ -42,6 +42,7 @@ use super::image_base::{
     GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
 };
 use super::image_view_base::{ImageViewBase, NullImageViewParams};
+use super::image_view_info::ImageViewInfo;
 use super::render_targets::RenderTargets;
 use super::types::*;
 
@@ -347,6 +348,7 @@ pub trait TextureCacheParams {
     fn create_image_view(
         runtime: Option<&mut Self::Runtime>,
         view_id: ImageViewId,
+        info: &ImageViewInfo,
         base: std::ptr::NonNull<ImageViewBase>,
         image: Option<&Self::Image>,
     ) -> Self::ImageView;
@@ -513,15 +515,19 @@ impl<B> From<ImageBase> for ImageSlot<B> {
 pub struct ImageViewSlot<B = ()> {
     /// Drop the derived/backend portion before its base subobject.
     pub backend: Option<B>,
+    /// Constructor input retained for backend rematerialisation. Upstream
+    /// consumes this directly while constructing its derived `ImageView`.
+    pub info: ImageViewInfo,
     /// Stable allocation corresponding to upstream's inherited
     /// `ImageViewBase` subobject. See `ImageSlot::base`.
     pub base: Box<ImageViewBase>,
 }
 
 impl<B> ImageViewSlot<B> {
-    pub fn pending(base: ImageViewBase) -> Self {
+    pub fn pending(info: ImageViewInfo, base: ImageViewBase) -> Self {
         Self {
             backend: None,
+            info,
             base: Box::new(base),
         }
     }
@@ -538,12 +544,6 @@ impl<B> Deref for ImageViewSlot<B> {
 impl<B> DerefMut for ImageViewSlot<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.base.as_mut()
-    }
-}
-
-impl<B> From<ImageViewBase> for ImageViewSlot<B> {
-    fn from(value: ImageViewBase) -> Self {
-        Self::pending(value)
     }
 }
 
@@ -625,6 +625,7 @@ impl TextureCacheParams for CommonTextureCacheParams {
     fn create_image_view(
         _: Option<&mut ()>,
         _: ImageViewId,
+        _: &ImageViewInfo,
         _: std::ptr::NonNull<ImageViewBase>,
         _: Option<&()>,
     ) {
@@ -1102,9 +1103,10 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .slot_images
             .insert(ImageBase::null(NullImageParams).into());
         debug_assert_eq!(null_image_id, crate::texture_cache::types::NULL_IMAGE_ID);
-        let null_view_id = cache
-            .slot_image_views
-            .insert(ImageViewBase::null(NullImageViewParams).into());
+        let null_view_id = cache.slot_image_views.insert(ImageViewSlot::pending(
+            ImageViewInfo::default(),
+            ImageViewBase::null(NullImageViewParams),
+        ));
         debug_assert_eq!(
             null_view_id,
             crate::texture_cache::types::NULL_IMAGE_VIEW_ID
@@ -1331,7 +1333,7 @@ impl TextureCacheBase<CommonTextureCacheParams> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommonTextureCacheParams, ImageSlot, TextureCacheBase, TextureCacheGPUMap,
+        CommonTextureCacheParams, ImageSlot, ImageViewSlot, TextureCacheBase, TextureCacheGPUMap,
         TextureCacheParams, TICKS_TO_DESTROY,
     };
     use crate::framebuffer_config::FramebufferConfig;
@@ -1386,6 +1388,7 @@ mod tests {
         fn create_image_view(
             _: Option<&mut ()>,
             _: crate::texture_cache::types::ImageViewId,
+            _: &ImageViewInfo,
             _: std::ptr::NonNull<ImageViewBase>,
             _: Option<&DropProbe>,
         ) {
@@ -1648,7 +1651,9 @@ mod tests {
                 SubresourceRange::default(),
             );
             let view = ImageViewBase::new(&view_info, &info, image_id, gpu_addr);
-            let view_id = cache.slot_image_views.insert(view.into());
+            let view_id = cache
+                .slot_image_views
+                .insert(ImageViewSlot::pending(view_info, view));
             cache.slot_images[image_id].insert_view(view_info, view_id);
             cache.register_image(image_id);
             image_id

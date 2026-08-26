@@ -2122,6 +2122,7 @@ impl ImageView {
     /// and `ImageViewBase::new_buffer` already copied those two fields.
     pub fn from_buffer_base(
         base: NonNull<ImageViewBase>,
+        _view_info: &ImageViewInfo,
         null_image_views: [u32; NUM_TEXTURE_TYPES],
     ) -> Self {
         // SAFETY: `base` points into the boxed base of the owning slot.
@@ -2179,6 +2180,7 @@ impl ImageView {
     /// from the same boxed `ImageBase` subobject as the generic cache.
     pub fn from_image_view_info(
         base: NonNull<ImageViewBase>,
+        info: &ImageViewInfo,
         image: &Image,
         null_image_views: [u32; NUM_TEXTURE_TYPES],
         set_object_label: bool,
@@ -2205,12 +2207,14 @@ impl ImageView {
         view.full_range = base_ref.range;
         view.flat_range = base_ref.range;
         view.set_object_label = set_object_label;
-        view.is_render_target = base_ref.is_render_target();
+        view.is_render_target = info.is_render_target();
         if !view.is_render_target {
-            view.swizzle = decode_swizzle(base_ref.swizzle).unwrap_or_else(|| {
-                log::error!("OpenGL::ImageView received an invalid component swizzle");
-                [SwizzleSource::Zero; 4]
-            });
+            view.swizzle =
+                decode_swizzle([info.x_source, info.y_source, info.z_source, info.w_source])
+                    .unwrap_or_else(|| {
+                        log::error!("OpenGL::ImageView received an invalid component swizzle");
+                        [SwizzleSource::Zero; 4]
+                    });
         }
 
         // First switch: per-type SetupView calls.
@@ -2711,16 +2715,18 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
     fn create_image_view(
         runtime: Option<&mut TextureCacheRuntime>,
         _view_id: ImageViewId,
+        info: &ImageViewInfo,
         base: NonNull<ImageViewBase>,
         image: Option<&Image>,
     ) -> ImageView {
         let runtime = runtime.expect("OpenGL TextureCache runtime must be bound");
         // SAFETY: the base belongs to the slot receiving this payload.
         if unsafe { base.as_ref() }.is_buffer() {
-            ImageView::from_buffer_base(base, runtime.null_image_views)
+            ImageView::from_buffer_base(base, info, runtime.null_image_views)
         } else {
             ImageView::from_image_view_info(
                 base,
+                info,
                 image.expect("non-buffer OpenGL image view requires its parent image"),
                 runtime.null_image_views,
                 runtime.has_debugging_tool_attached(),
@@ -4337,6 +4343,7 @@ impl TextureCache {
             self.remove_framebuffers_for_view(view_id);
         }
         if self.base.slot_image_views[view_id].backend.is_none() {
+            let info = self.base.slot_image_views[view_id].info;
             let base = NonNull::from(self.base.slot_image_views[view_id].base.as_mut());
             let backend_image = self.base.slot_images[image_id]
                 .backend
@@ -4344,6 +4351,7 @@ impl TextureCache {
                 .expect("image inserted above must be present");
             let backend_view = ImageView::from_image_view_info(
                 base,
+                &info,
                 backend_image,
                 self.base.runtime().null_image_views,
                 self.base.runtime().has_debugging_tool_attached(),

@@ -80,6 +80,55 @@ impl Default for PhysicalDeviceDepthBiasControlFeaturesExt {
     }
 }
 
+// ash 0.37 predates VK_KHR_maintenance5. Keep its feature/property ABI
+// payloads in the upstream device owner until the workspace binding is
+// upgraded.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceMaintenance5FeaturesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    maintenance5: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceMaintenance5FeaturesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_470_000),
+            p_next: std::ptr::null_mut(),
+            maintenance5: vk::FALSE,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceMaintenance5PropertiesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    early_fragment_multisample_coverage_after_sample_counting: vk::Bool32,
+    early_fragment_sample_mask_test_before_sample_counting: vk::Bool32,
+    depth_stencil_swizzle_one_support: vk::Bool32,
+    polygon_mode_point_size: vk::Bool32,
+    non_strict_single_pixel_wide_lines_use_parallelogram: vk::Bool32,
+    non_strict_wide_lines_use_parallelogram: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceMaintenance5PropertiesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_470_001),
+            p_next: std::ptr::null_mut(),
+            early_fragment_multisample_coverage_after_sample_counting: vk::FALSE,
+            early_fragment_sample_mask_test_before_sample_counting: vk::FALSE,
+            depth_stencil_swizzle_one_support: vk::FALSE,
+            polygon_mode_point_size: vk::FALSE,
+            non_strict_single_pixel_wide_lines_use_parallelogram: vk::FALSE,
+            non_strict_wide_lines_use_parallelogram: vk::FALSE,
+        }
+    }
+}
+
 fn pnext_chain_has_unique_structure_types(mut next: *const std::ffi::c_void) -> bool {
     let mut structure_types = Vec::new();
     while !next.is_null() {
@@ -298,6 +347,7 @@ pub struct DeviceExtensions {
     pub vertex_input_dynamic_state: bool,
     pub pipeline_executable_properties: bool,
     pub workgroup_memory_explicit_layout: bool,
+    pub maintenance5: bool,
     /// Diagnostic-only `VK_EXT_device_fault`, enabled through
     /// `RUZU_VK_DEVICE_FAULT` when the host exposes the feature.
     pub device_fault: bool,
@@ -425,6 +475,10 @@ pub struct Device {
     /// `IsSharedInt64AtomicsSupported` and `IsExtShaderAtomicInt64Supported`
     /// answer different questions.
     pub shader_shared_int64_atomics_supported: bool,
+    maintenance5_early_fragment_multisample_coverage_after_sample_counting: bool,
+    maintenance5_early_fragment_sample_mask_test_before_sample_counting: bool,
+    maintenance5_depth_stencil_swizzle_one_supported: bool,
+    maintenance5_polygon_mode_point_size_supported: bool,
     /// Feature bits from `VkPhysicalDeviceDescriptorIndexingFeatures`.
     pub descriptor_binding_partially_bound_supported: bool,
     pub sampled_image_array_non_uniform_indexing_supported: bool,
@@ -603,6 +657,7 @@ impl Device {
             supported_extensions.contains("VK_KHR_pipeline_executable_properties");
         let has_workgroup_memory_explicit_layout =
             supported_extensions.contains("VK_KHR_workgroup_memory_explicit_layout");
+        let has_maintenance5 = supported_extensions.contains("VK_KHR_maintenance5");
         let has_4444_formats = supported_extensions.contains("VK_EXT_4444_formats");
         let has_index_type_uint8 = supported_extensions.contains("VK_EXT_index_type_uint8");
         let has_vertex_attribute_divisor =
@@ -656,6 +711,7 @@ impl Device {
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
         let mut workgroup_memory_explicit_layout_features =
             vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default();
+        let mut maintenance5_features = PhysicalDeviceMaintenance5FeaturesKhr::default();
         let mut primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
         let mut extended_dynamic_state_features =
@@ -794,6 +850,12 @@ impl Device {
                     as *mut PhysicalDeviceDepthBiasControlFeaturesExt)
                     .cast();
             }
+            if has_maintenance5 {
+                maintenance5_features.p_next = features2.p_next;
+                features2.p_next = (&mut maintenance5_features
+                    as *mut PhysicalDeviceMaintenance5FeaturesKhr)
+                    .cast();
+            }
             features2
         };
         unsafe {
@@ -895,6 +957,7 @@ impl Device {
             vk::PhysicalDeviceTransformFeedbackPropertiesEXT::default();
         let mut descriptor_buffer_properties =
             vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
+        let mut maintenance5_properties = PhysicalDeviceMaintenance5PropertiesKhr::default();
         let mut properties2_builder = vk::PhysicalDeviceProperties2::builder()
             .push_next(&mut driver_properties)
             .push_next(&mut subgroup_properties);
@@ -917,6 +980,12 @@ impl Device {
             properties2_builder = properties2_builder.push_next(&mut transform_feedback_properties);
         }
         let mut properties2 = properties2_builder.build();
+        if has_maintenance5 {
+            maintenance5_properties.p_next = properties2.p_next;
+            properties2.p_next = (&mut maintenance5_properties
+                as *mut PhysicalDeviceMaintenance5PropertiesKhr)
+                .cast();
+        }
         unsafe {
             instance.get_physical_device_properties2(physical, &mut properties2);
         }
@@ -927,6 +996,7 @@ impl Device {
         let supports_timeline_semaphore = timeline_semaphore_features.timeline_semaphore != 0;
         let supports_synchronization2 =
             has_synchronization2 && synchronization2_features.synchronization2 != 0;
+        let supports_maintenance5 = has_maintenance5 && maintenance5_features.maintenance5 != 0;
         let mut supports_buffer_device_address = has_buffer_device_address
             && if device_properties.api_version >= vk::API_VERSION_1_2 {
                 vulkan12_features.buffer_device_address != 0
@@ -1458,6 +1528,11 @@ impl Device {
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
+            "VK_KHR_maintenance5",
+            supports_maintenance5,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
             "VK_EXT_shader_demote_to_helper_invocation",
             supports_shader_demote_to_helper_invocation,
         );
@@ -1528,6 +1603,9 @@ impl Device {
         }
         if !supports_workgroup_memory_explicit_layout {
             clear_feature_preserving_chain!(workgroup_memory_explicit_layout_features);
+        }
+        if !supports_maintenance5 {
+            maintenance5_features.maintenance5 = vk::FALSE;
         }
         if !supports_subgroup_size_control {
             clear_feature_preserving_chain!(subgroup_size_control_features);
@@ -1710,6 +1788,7 @@ impl Device {
                 robustness_2: loaded_extensions.contains("VK_EXT_robustness2"),
                 pipeline_executable_properties: supports_pipeline_executable_properties,
                 workgroup_memory_explicit_layout: supports_workgroup_memory_explicit_layout,
+                maintenance5: supports_maintenance5,
                 device_fault: supports_device_fault,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 draw_indirect_count: has_draw_indirect_count,
@@ -1785,6 +1864,17 @@ impl Device {
             shader_output_layer_supported: vulkan12_features.shader_output_layer != 0,
             exact_depth_bias_control_supported,
             shader_shared_int64_atomics_supported,
+            maintenance5_early_fragment_multisample_coverage_after_sample_counting:
+                maintenance5_properties.early_fragment_multisample_coverage_after_sample_counting
+                    != 0,
+            maintenance5_early_fragment_sample_mask_test_before_sample_counting:
+                maintenance5_properties.early_fragment_sample_mask_test_before_sample_counting != 0,
+            maintenance5_depth_stencil_swizzle_one_supported: maintenance5_properties
+                .depth_stencil_swizzle_one_support
+                != 0,
+            maintenance5_polygon_mode_point_size_supported: maintenance5_properties
+                .polygon_mode_point_size
+                != 0,
             descriptor_binding_partially_bound_supported,
             sampled_image_array_non_uniform_indexing_supported,
             storage_image_array_non_uniform_indexing_supported,
@@ -2705,6 +2795,24 @@ impl Device {
         self.extensions.workgroup_memory_explicit_layout
     }
 
+    pub fn is_khr_maintenance5_supported(&self) -> bool {
+        self.extensions.maintenance5
+    }
+
+    pub fn supports_polygon_mode_point_size(&self) -> bool {
+        self.extensions.maintenance5 && self.maintenance5_polygon_mode_point_size_supported
+    }
+
+    pub fn supports_depth_stencil_swizzle_one(&self) -> bool {
+        self.extensions.maintenance5 && self.maintenance5_depth_stencil_swizzle_one_supported
+    }
+
+    pub fn supports_early_fragment_tests(&self) -> bool {
+        self.extensions.maintenance5
+            && self.maintenance5_early_fragment_multisample_coverage_after_sample_counting
+            && self.maintenance5_early_fragment_sample_mask_test_before_sample_counting
+    }
+
     pub fn is_khr_image_format_list_supported(&self) -> bool {
         self.extensions.image_format_list || self.instance_version >= vk::API_VERSION_1_2
     }
@@ -3043,6 +3151,7 @@ fn initial_loaded_extensions(
         "VK_EXT_robustness2",
         "VK_EXT_transform_feedback",
         "VK_EXT_vertex_input_dynamic_state",
+        "VK_KHR_maintenance5",
         "VK_KHR_pipeline_executable_properties",
         "VK_KHR_workgroup_memory_explicit_layout",
     ];
@@ -3592,6 +3701,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maintenance5_raw_payloads_match_vulkan_abi() {
+        let pointer_size = std::mem::size_of::<*mut std::ffi::c_void>();
+        assert_eq!(
+            std::mem::size_of::<PhysicalDeviceMaintenance5FeaturesKhr>(),
+            if pointer_size == 8 { 24 } else { 12 }
+        );
+        assert_eq!(
+            std::mem::offset_of!(PhysicalDeviceMaintenance5FeaturesKhr, maintenance5),
+            pointer_size * 2
+        );
+        assert_eq!(
+            std::mem::size_of::<PhysicalDeviceMaintenance5PropertiesKhr>(),
+            if pointer_size == 8 { 40 } else { 32 }
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                PhysicalDeviceMaintenance5PropertiesKhr,
+                depth_stencil_swizzle_one_support
+            ),
+            pointer_size * 2 + 2 * std::mem::size_of::<vk::Bool32>()
+        );
+    }
+
+    #[test]
     fn robustness2_enables_only_null_descriptors() {
         let mut features = vk::PhysicalDeviceRobustness2FeaturesEXT {
             robust_buffer_access2: vk::TRUE,
@@ -3642,6 +3775,7 @@ mod tests {
             "VK_KHR_timeline_semaphore",
             "VK_EXT_shader_demote_to_helper_invocation",
             "VK_EXT_subgroup_size_control",
+            "VK_KHR_maintenance5",
             "VK_KHR_swapchain",
             "VK_EXT_filter_cubic",
             "VK_IMG_filter_cubic",
@@ -3658,6 +3792,7 @@ mod tests {
         assert!(vulkan_11.contains("VK_KHR_timeline_semaphore"));
         assert!(vulkan_11.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(vulkan_11.contains("VK_EXT_subgroup_size_control"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance5"));
         assert!(vulkan_11.contains("VK_EXT_filter_cubic"));
         assert!(vulkan_11.contains("VK_IMG_filter_cubic"));
         assert!(vulkan_11.contains("VK_QCOM_filter_cubic_weights"));
@@ -3669,6 +3804,7 @@ mod tests {
         assert!(!vulkan_13.contains("VK_KHR_timeline_semaphore"));
         assert!(!vulkan_13.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(!vulkan_13.contains("VK_EXT_subgroup_size_control"));
+        assert!(vulkan_13.contains("VK_KHR_maintenance5"));
         assert!(vulkan_13.contains("VK_EXT_custom_border_color"));
         assert!(vulkan_13.contains("VK_EXT_4444_formats"));
         assert!(vulkan_13.contains("VK_EXT_index_type_uint8"));

@@ -14860,3 +14860,62 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `ImageInfo` is a process-local descriptor and is not raw-serialized. Its Rust enum replacing
   the anonymous union intentionally has a different host layout.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_view_base.rs` vs Eden `src/video_core/texture_cache/image_view_base.{h,cpp}`
+
+### Intentional differences
+
+- Rust's split base/backend slot retains the constructor's `ImageViewInfo` beside, rather than
+  inside, `ImageViewBase` so an OpenGL or Vulkan backend view can be rematerialized after its
+  derived payload is released. Eden constructs the derived object directly from the same info and
+  therefore does not need this Rust-only lifetime adapter.
+- The file-local `fail_soft` helper implements Eden's `ASSERT_MSG` policy through the same
+  `use_debug_asserts` setting because Rust has no C++ assertion macro expansion.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ImageViewBase` no longer owns non-upstream swizzle bytes or an `is_render_target`
+  helper. OpenGL and Vulkan constructors now consume `ImageViewInfo` directly, preserving Eden's
+  method and state ownership.
+- Resolved: compatibility and buffer-type assertions are fail-soft by default and run after base
+  initialization, in the same lifecycle position as Eden.
+- Resolved: Vulkan framebuffer subresource ranges use the base view format's full aspect mask;
+  descriptor swizzle affects only initial Vulkan image-view creation, as in Eden.
+- Resolved: depth/stencil component swizzles now replace unsupported integer/float `ONE` sources
+  with `ZERO`, guarded by the same maintenance5 property as Eden.
+
+### Missing items
+
+- None for constructors, flags, buffer detection, or anisotropy support.
+
+### Binary layout verification
+
+- N/A: `ImageViewBase` and the Rust slot wrapper are process-local cache objects and are not copied
+  to guest memory or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` maintenance5 prerequisite vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- The workspace's ash 0.37 bindings predate `VK_KHR_maintenance5`, so its feature and property
+  payloads are declared locally with their Vulkan ABI structure-type values. They remain in the
+  corresponding device owner and participate in the same feature/property `pNext` chains.
+- Rust retains the four maintenance5 property answers as booleans after physical-device discovery
+  instead of retaining a self-referential raw property-chain node inside `Device`.
+
+### Unintentional differences (to fix)
+
+- Resolved: maintenance5 is queried, suitability-filtered, enabled on the logical device, and
+  exposed through the upstream `IsKhrMaintenance5Supported`, `SupportsPolygonModePointSize`,
+  `SupportsDepthStencilSwizzleOne`, and `SupportsEarlyFragmentTests` counterparts.
+
+### Missing items
+
+- None for the maintenance5 feature, queried properties, extension state, or accessors required by
+  the texture-cache view constructor.
+
+### Binary layout verification
+
+- PASS: the local feature payload is 24 bytes on 64-bit hosts (12 on 32-bit), and the property
+  payload is 40 bytes on 64-bit hosts (32 on 32-bit), with `depthStencilSwizzleOneSupport` at the
+  Vulkan ABI offset. Focused tests verify these sizes and offsets.

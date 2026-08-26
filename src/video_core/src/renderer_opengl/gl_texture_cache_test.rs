@@ -246,26 +246,23 @@ fn typed_image_view_keeps_inherited_base_address_across_slot_growth() {
         format: info.format,
         ..ImageViewInfo::default()
     };
-    let view_id = cache
-        .slot_image_views
-        .insert(ImageViewSlot::pending(ImageViewBase::new_buffer(
-            &info,
-            &view_info,
-            0x1234_0000,
-        )));
+    let view_id = cache.slot_image_views.insert(ImageViewSlot::pending(
+        view_info,
+        ImageViewBase::new_buffer(&info, &view_info, 0x1234_0000),
+    ));
     let base = std::ptr::NonNull::from(cache.slot_image_views[view_id].base.as_mut());
-    cache.slot_image_views[view_id].backend =
-        Some(ImageView::from_buffer_base(base, [0; NUM_TEXTURE_TYPES]));
+    cache.slot_image_views[view_id].backend = Some(ImageView::from_buffer_base(
+        base,
+        &view_info,
+        [0; NUM_TEXTURE_TYPES],
+    ));
     let expected = cache.slot_image_views[view_id].base.as_ref() as *const ImageViewBase;
 
     for index in 0..256u64 {
-        cache
-            .slot_image_views
-            .insert(ImageViewSlot::pending(ImageViewBase::new_buffer(
-                &info,
-                &view_info,
-                0x2000_0000 + index * 0x1000,
-            )));
+        cache.slot_image_views.insert(ImageViewSlot::pending(
+            view_info,
+            ImageViewBase::new_buffer(&info, &view_info, 0x2000_0000 + index * 0x1000),
+        ));
     }
 
     assert_eq!(
@@ -304,7 +301,7 @@ fn buffer_image_view_materializes_upstream_buffer_size() {
     };
     let mut base = ImageViewBase::new_buffer(&info, &view_info, 0x1234_0000);
     let base_ptr = std::ptr::NonNull::from(&mut base);
-    let view = ImageView::from_buffer_base(base_ptr, [0; NUM_TEXTURE_TYPES]);
+    let view = ImageView::from_buffer_base(base_ptr, &view_info, [0; NUM_TEXTURE_TYPES]);
 
     assert_eq!(view.pixel_format(), PixelFormat::A8B8G8R8Unorm);
     assert_eq!(
@@ -632,7 +629,7 @@ fn image_view_parent_guard_accepts_slice_effective_full_range() {
 }
 
 #[test]
-fn image_view_info_render_target_sentinel_is_preserved_for_backend_materialization() {
+fn image_view_info_render_target_sentinel_is_preserved_outside_image_view_base() {
     use crate::texture_cache::format_lookup_table::PixelFormat;
     use crate::texture_cache::image_info::ImageInfo;
     use crate::texture_cache::image_view_base::ImageViewBase;
@@ -656,9 +653,8 @@ fn image_view_info_render_target_sentinel_is_preserved_for_backend_materializati
         PixelFormat::A8B8G8R8Unorm,
         SubresourceRange::default(),
     );
-    let mut base = ImageViewBase::new(&view_info, &image_info, image_id, 0x1000);
-    assert!(base.is_render_target());
-    assert_eq!(base.swizzle, [u8::MAX; 4]);
-    let view = ImageView::new(&mut base);
-    assert!(view.base().is_render_target());
+    let base = ImageViewBase::new(&view_info, &image_info, image_id, 0x1000);
+    let slot =
+        crate::texture_cache::texture_cache_base::ImageViewSlot::<()>::pending(view_info, base);
+    assert!(slot.info.is_render_target());
 }

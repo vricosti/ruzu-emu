@@ -514,10 +514,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     fn insert_typed_image_view(
         &mut self,
+        info: ImageViewInfo,
         base: ImageViewBase,
         image_id: Option<ImageId>,
     ) -> ImageViewId {
-        let view_id = self.slot_image_views.insert(ImageViewSlot::pending(base));
+        let view_id = self
+            .slot_image_views
+            .insert(ImageViewSlot::pending(info, base));
         let base = std::ptr::NonNull::from(self.slot_image_views[view_id].base.as_mut());
         let image = image_id.and_then(|id| {
             self.slot_images[id]
@@ -531,7 +534,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             // constructed and registered.
             unsafe { &*image }
         });
-        let backend = P::create_image_view(runtime, view_id, base, image);
+        let backend = P::create_image_view(runtime, view_id, &info, base, image);
         self.slot_image_views[view_id].backend = Some(backend);
         view_id
     }
@@ -1202,7 +1205,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         } else {
             let image = &self.slot_images[image_id];
             let view = ImageViewBase::new(&info, &image.info, image_id, image.gpu_addr);
-            let view_id = self.insert_typed_image_view(view, Some(image_id));
+            let view_id = self.insert_typed_image_view(info, view, Some(image_id));
             self.slot_images[image_id].insert_view(info, view_id);
             view_id
         };
@@ -1362,7 +1365,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
-            return self.insert_typed_image_view(view, None);
+            return self.insert_typed_image_view(view_info, view, None);
         }
         let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
@@ -1404,7 +1407,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
-            return self.insert_typed_image_view(view, None);
+            return self.insert_typed_image_view(view_info, view, None);
         }
         let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
@@ -2441,7 +2444,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         let image_info = self.slot_images[image_id].info.clone();
         let view = ImageViewBase::new(&info, &image_info, image_id, gpu_addr);
-        let view_id = self.insert_typed_image_view(view, Some(image_id));
+        let view_id = self.insert_typed_image_view(info, view, Some(image_id));
         self.slot_images[image_id].insert_view(info, view_id);
         view_id
     }
@@ -3756,6 +3759,7 @@ mod tests {
         fn create_image_view(
             _: Option<&mut ()>,
             _: ImageViewId,
+            _: &ImageViewInfo,
             _: std::ptr::NonNull<ImageViewBase>,
             _: Option<&()>,
         ) {
@@ -3937,6 +3941,7 @@ mod tests {
         };
         let view_id = cache.slot_image_views.insert(ImageViewSlot {
             backend: Some(()),
+            info: view_info,
             base: Box::new(ImageViewBase::new(
                 &view_info,
                 &image_info,
@@ -4026,6 +4031,7 @@ mod tests {
         };
         let view_id = cache.slot_image_views.insert(ImageViewSlot {
             backend: Some(()),
+            info: view_info,
             base: Box::new(ImageViewBase::new(
                 &view_info,
                 &image_info,
@@ -7512,7 +7518,9 @@ mod tests {
         let mut view =
             ImageViewBase::null(crate::texture_cache::image_view_base::NullImageViewParams);
         view.image_id = image_id;
-        cache.slot_image_views.insert(view.into())
+        cache
+            .slot_image_views
+            .insert(ImageViewSlot::pending(ImageViewInfo::default(), view))
     }
 
     #[test]

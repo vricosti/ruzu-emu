@@ -14393,3 +14393,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: `Maxwell3DDrawRegisters` is a typed in-process snapshot and is never raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_resource_manager.rs` vs Eden `src/video_core/renderer_opengl/gl_resource_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust `Drop` replaces every C++ destructor and naturally releases the destination's previous
+  resource on assignment. Eden's `OGLPipeline` move-assignment uniquely omits `Release`; reproducing
+  that leak would violate Rust assignment semantics rather than observable OpenGL ownership intent.
+- A mechanical macro emits wrappers whose create/delete signatures are identical. Wrappers with
+  distinct behavior (`OGLTexture`, shader/program objects, syncs, framebuffers, and queries) remain
+  explicit in this upstream-owned file.
+- The `gl` bindings do not expose `glDeleteProgramsARB`; the optional entry point is loaded beside
+  the other GLASM functions in `gl_shader_util.rs`, while `OGLAssemblyProgram::release` retains the
+  resource lifecycle here.
+
+### Unintentional differences (to fix)
+
+- Resolved: `OGLSync::is_signaled` now reproduces Eden's always-on fail-soft assertion for
+  `GL_WAIT_FAILED`, including fatal behavior when `use_debug_asserts` is enabled, before applying
+  the same `status != GL_TIMEOUT_EXPIRED` completion test.
+
+### Missing items
+
+- None; all thirteen Eden OpenGL resource owners and their distinct create/release operations are
+  present.
+
+### Binary layout verification
+
+- N/A: these wrappers own process-local OpenGL handles and are never raw-serialized.

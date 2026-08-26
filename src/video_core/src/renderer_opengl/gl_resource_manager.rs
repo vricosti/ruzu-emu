@@ -204,13 +204,23 @@ impl OGLSync {
 
     pub fn is_signaled(&self) -> bool {
         let sync_status = unsafe { gl::ClientWaitSync(self.handle, 0, 0) };
-        if sync_status == gl::WAIT_FAILED {
-            // Eden's `ASSERT` is fail-soft unless debug assertions are enabled,
-            // then returns the same `WAIT_FAILED != TIMEOUT_EXPIRED` result.
-            log::error!("OGLSync::IsSignaled: glClientWaitSync returned GL_WAIT_FAILED");
-        }
-        sync_status != gl::TIMEOUT_EXPIRED
+        sync_status_is_signaled(
+            sync_status,
+            *common::settings::values().use_debug_asserts.get_value(),
+        )
     }
+}
+
+/// Testable body of Eden's fail-soft assertion and completion check in
+/// `OGLSync::IsSignaled`.
+fn sync_status_is_signaled(sync_status: u32, debug_asserts_enabled: bool) -> bool {
+    if sync_status == gl::WAIT_FAILED {
+        log::error!("OGLSync::IsSignaled: glClientWaitSync returned GL_WAIT_FAILED");
+        if debug_asserts_enabled {
+            panic!("OGLSync::IsSignaled: glClientWaitSync returned GL_WAIT_FAILED");
+        }
+    }
+    sync_status != gl::TIMEOUT_EXPIRED
 }
 
 impl Drop for OGLSync {
@@ -318,5 +328,17 @@ mod tests {
         assert_eq!(OGLFramebuffer::new().handle, 0);
         assert_eq!(OGLQuery::new().handle, 0);
         assert_eq!(OGLTransformFeedback::new().handle, 0);
+    }
+
+    #[test]
+    fn sync_status_matches_upstream_timeout_and_fail_soft_behavior() {
+        assert!(!sync_status_is_signaled(gl::TIMEOUT_EXPIRED, false));
+        assert!(sync_status_is_signaled(gl::ALREADY_SIGNALED, false));
+        assert!(sync_status_is_signaled(gl::WAIT_FAILED, false));
+
+        let fatal_wait_failure = std::panic::catch_unwind(|| {
+            sync_status_is_signaled(gl::WAIT_FAILED, true);
+        });
+        assert!(fatal_wait_failure.is_err());
     }
 }

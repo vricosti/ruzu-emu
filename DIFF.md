@@ -16502,3 +16502,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: ash owns the Vulkan ABI definition of `VkPhysicalDeviceBorderColorSwizzleFeaturesEXT`;
   Ruzu uses that structure directly in both the physical-device query and logical-device feature
   chains, without copying or serializing its bytes.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` sampler extension logging vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- The two inline Eden predicates are represented by a file-local fixed-size array helper so their
+  exact enablement and custom-border-before-swizzle order can be tested without constructing a
+  Vulkan sampler. Each enabled branch still queries the logger state separately, as Eden does.
+- Ruzu's validated `custom_border_color_supported` boolean combines Eden's extension,
+  `customBorderColors`, and `customBorderColorWithoutFormat` checks during device discovery.
+
+### Unintentional differences (to fix)
+
+- None after restoring `VK_EXT_custom_border_color` and `VK_EXT_border_color_swizzle` usage logs
+  in the sampler constructor, before reduction-mode conversion and exactly once per cached sampler
+  rather than once per derived Vulkan sampler handle.
+
+### Missing items
+
+- None in the audited `Sampler::Sampler` extension-usage path. The report's broader image,
+  transfer, blit, and layout-transition review remains part of the continuing texture-cache audit.
+
+### Binary layout verification
+
+- N/A: these hooks inspect host capability booleans and emit diagnostic strings; sampler create
+  structures and guest texture descriptors are unchanged. A focused test covers both guards and
+  their upstream order.

@@ -20,6 +20,7 @@ use crate::engines::fermi_2d::{Filter as BlitFilter, Operation as BlitOperation}
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::dma;
 use crate::framebuffer_config::FramebufferConfig;
+use crate::gpu_logging::{get_instance, is_active};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::{PixelFormat, SurfaceType};
 use crate::texture_cache::image_base::{ImageBase, ImageFlagBits};
@@ -142,6 +143,18 @@ fn sampler_reduction_from_raw(value: u32) -> SamplerReduction {
         2 => SamplerReduction::Max,
         value => panic!("invalid Maxwell sampler reduction mode {value}"),
     }
+}
+
+/// Mechanical representation of the two extension-usage branches in
+/// upstream `Sampler::Sampler`, kept in their original order.
+fn sampler_extension_usage(
+    has_custom_border_colors: bool,
+    has_border_color_swizzle: bool,
+) -> [Option<&'static str>; 2] {
+    [
+        has_custom_border_colors.then_some("VK_EXT_custom_border_color"),
+        has_border_color_swizzle.then_some("VK_EXT_border_color_swizzle"),
+    ]
 }
 
 /// Backend-owned Vulkan image.
@@ -6012,6 +6025,23 @@ impl TextureCache {
         let wrap_p = wrap_mode_from_raw(tsc.wrap_p());
         let max_anisotropy = tsc.computed_max_anisotropy().clamp(1.0, 16.0);
         let border_color = tsc.computed_border_color();
+        let [custom_border_color_extension, border_color_swizzle_extension] =
+            sampler_extension_usage(
+                runtime.custom_border_color_supported,
+                runtime
+                    .vulkan_device()
+                    .is_ext_border_color_swizzle_supported(),
+            );
+        if let Some(extension) = custom_border_color_extension {
+            if is_active() {
+                get_instance().log_extension_usage(extension, "Sampler::Sampler");
+            }
+        }
+        if let Some(extension) = border_color_swizzle_extension {
+            if is_active() {
+                get_instance().log_extension_usage(extension, "Sampler::Sampler");
+            }
+        }
         let reduction = sampler_reduction_from_raw(tsc.reduction_filter());
         let reduction_mode = maxwell_to_vk::sampler_reduction(reduction);
         let create_sampler = |anisotropy: f32, force_nearest: bool, disable_compare: bool| {
@@ -6446,6 +6476,26 @@ mod tests {
             SwizzleSource::B as u8,
             SwizzleSource::A as u8,
         ]
+    }
+
+    #[test]
+    fn sampler_extension_usage_matches_upstream_guards_and_order() {
+        assert_eq!(sampler_extension_usage(false, false), [None, None]);
+        assert_eq!(
+            sampler_extension_usage(true, false),
+            [Some("VK_EXT_custom_border_color"), None]
+        );
+        assert_eq!(
+            sampler_extension_usage(false, true),
+            [None, Some("VK_EXT_border_color_swizzle")]
+        );
+        assert_eq!(
+            sampler_extension_usage(true, true),
+            [
+                Some("VK_EXT_custom_border_color"),
+                Some("VK_EXT_border_color_swizzle")
+            ]
+        );
     }
 
     #[test]

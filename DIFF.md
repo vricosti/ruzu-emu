@@ -17424,3 +17424,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these caches contain host-only Rust/C++ ownership and synchronization objects; guest
   writebacks explicitly serialize the same 32-bit/64-bit values and optional timestamp bytes as
   Eden.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_staging_buffer_pool.rs` vs Eden `src/video_core/renderer_opengl/gl_staging_buffer_pool.{h,cpp}`
+
+### Intentional differences
+
+- Mapped spans retain their pointer and length as separate fields because Rust cannot store a
+  mutable slice without imposing a lifetime on the movable RAII result.
+- Rust declares GL-owning fields in C++ reverse-destruction order: allocation buffers precede
+  their sync objects, stream fences precede the stream buffer, and download buffers precede upload
+  buffers. Rust's declaration-order drop therefore matches Eden's reverse member destruction.
+- The renderer shares its single staging-pool owner through `Arc<Mutex<_>>`; allocation selection,
+  fence creation, deferred release, and stream-buffer requests remain serialized at the same owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: `STREAM_BUFFER_SIZE`, `NUM_SYNCS`, `REGION_SIZE`, and `MAX_ALIGNMENT` are private
+  `StreamBuffer` associated constants again, rather than module-level constants, matching their
+  upstream class ownership.
+
+### Missing items
+
+- None in `StagingBufferMap`, `StagingBuffers`, `StreamBuffer`, or `StagingBufferPool`.
+
+### Binary layout verification
+
+- N/A: these types own host OpenGL objects and mapped host pointers and are not serialized or
+  copied as raw guest payloads. Compile-time assertions retain Eden's stream-size divisibility
+  invariants.

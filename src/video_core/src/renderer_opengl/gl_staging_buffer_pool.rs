@@ -17,22 +17,6 @@ pub(crate) fn make_shared_staging_buffer_pool() -> SharedStagingBufferPool {
     Arc::new(Mutex::new(StagingBufferPool::new()))
 }
 
-/// Stream buffer size (64 MiB).
-const STREAM_BUFFER_SIZE: usize = 64 * 1024 * 1024;
-
-/// Number of sync regions in the stream buffer.
-const NUM_SYNCS: usize = 16;
-
-/// Size of each sync region.
-const REGION_SIZE: usize = STREAM_BUFFER_SIZE / NUM_SYNCS;
-
-/// Maximum alignment for stream buffer requests.
-const MAX_ALIGNMENT: usize = 256;
-
-const _: () = assert!(STREAM_BUFFER_SIZE % MAX_ALIGNMENT == 0);
-const _: () = assert!(STREAM_BUFFER_SIZE % NUM_SYNCS == 0);
-const _: () = assert!(REGION_SIZE % MAX_ALIGNMENT == 0);
-
 /// A mapped region from a staging buffer.
 ///
 /// Corresponds to `OpenGL::StagingBufferMap`.
@@ -266,7 +250,7 @@ impl StagingBuffers {
 pub struct StreamBuffer {
     // Rust drops owning fields in declaration order, matching Eden's reverse
     // C++ member destruction: fences before buffer.
-    fences: [OGLSync; NUM_SYNCS],
+    fences: [OGLSync; StreamBuffer::NUM_SYNCS],
     buffer: OGLBuffer,
     iterator: usize,
     used_iterator: usize,
@@ -278,6 +262,18 @@ pub struct StreamBuffer {
 unsafe impl Send for StreamBuffer {}
 
 impl StreamBuffer {
+    /// Stream buffer size (64 MiB).
+    const STREAM_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
+    /// Number of sync regions in the stream buffer.
+    const NUM_SYNCS: usize = 16;
+
+    /// Size of each sync region.
+    const REGION_SIZE: usize = Self::STREAM_BUFFER_SIZE / Self::NUM_SYNCS;
+
+    /// Maximum alignment for stream buffer requests.
+    const MAX_ALIGNMENT: usize = 256;
+
     /// Create a new stream buffer.
     ///
     /// Port of `StreamBuffer::StreamBuffer`.
@@ -292,12 +288,12 @@ impl StreamBuffer {
             gl::ObjectLabel(gl::BUFFER, buffer.handle, -1, c"Stream Buffer".as_ptr());
             gl::NamedBufferStorage(
                 buffer.handle,
-                STREAM_BUFFER_SIZE as isize,
+                Self::STREAM_BUFFER_SIZE as isize,
                 std::ptr::null(),
                 flags,
             );
             mapped_pointer =
-                gl::MapNamedBufferRange(buffer.handle, 0, STREAM_BUFFER_SIZE as isize, flags)
+                gl::MapNamedBufferRange(buffer.handle, 0, Self::STREAM_BUFFER_SIZE as isize, flags)
                     as *mut u8;
         }
 
@@ -321,9 +317,10 @@ impl StreamBuffer {
     ///
     /// Port of `StreamBuffer::Request`.
     pub fn request(&mut self, size: usize) -> (*mut u8, usize) {
-        if size >= REGION_SIZE {
+        if size >= Self::REGION_SIZE {
             log::error!(
-                "StreamBuffer::Request size {size} must be smaller than region size {REGION_SIZE}"
+                "StreamBuffer::Request size {size} must be smaller than region size {}",
+                Self::REGION_SIZE
             );
         }
 
@@ -338,7 +335,9 @@ impl StreamBuffer {
         // Wait for regions we're about to overwrite
         let wait_start = Self::region(self.free_iterator).wrapping_add(1);
         let request_end = self.iterator.wrapping_add(size);
-        let wait_end = Self::region(request_end).wrapping_add(1).min(NUM_SYNCS);
+        let wait_end = Self::region(request_end)
+            .wrapping_add(1)
+            .min(Self::NUM_SYNCS);
         for region in wait_start..wait_end {
             unsafe {
                 gl::ClientWaitSync(self.fences[region].handle, 0, gl::TIMEOUT_IGNORED);
@@ -350,8 +349,8 @@ impl StreamBuffer {
         }
 
         // Wrap around if needed
-        if request_end > STREAM_BUFFER_SIZE {
-            for region in Self::region(self.used_iterator)..NUM_SYNCS {
+        if request_end > Self::STREAM_BUFFER_SIZE {
+            for region in Self::region(self.used_iterator)..Self::NUM_SYNCS {
                 self.fences[region].create();
             }
             self.used_iterator = 0;
@@ -371,8 +370,8 @@ impl StreamBuffer {
         self.iterator = self
             .iterator
             .wrapping_add(size)
-            .wrapping_add(MAX_ALIGNMENT - 1)
-            & !(MAX_ALIGNMENT - 1);
+            .wrapping_add(Self::MAX_ALIGNMENT - 1)
+            & !(Self::MAX_ALIGNMENT - 1);
 
         let ptr = unsafe { self.mapped_pointer.add(offset) };
         (ptr, offset)
@@ -384,9 +383,13 @@ impl StreamBuffer {
     }
 
     fn region(offset: usize) -> usize {
-        offset / REGION_SIZE
+        offset / Self::REGION_SIZE
     }
 }
+
+const _: () = assert!(StreamBuffer::STREAM_BUFFER_SIZE % StreamBuffer::MAX_ALIGNMENT == 0);
+const _: () = assert!(StreamBuffer::STREAM_BUFFER_SIZE % StreamBuffer::NUM_SYNCS == 0);
+const _: () = assert!(StreamBuffer::REGION_SIZE % StreamBuffer::MAX_ALIGNMENT == 0);
 
 /// Top-level staging buffer pool.
 ///
@@ -451,18 +454,24 @@ mod tests {
 
     #[test]
     fn constants() {
-        assert_eq!(STREAM_BUFFER_SIZE, 64 * 1024 * 1024);
-        assert_eq!(NUM_SYNCS, 16);
-        assert_eq!(REGION_SIZE, STREAM_BUFFER_SIZE / NUM_SYNCS);
-        assert_eq!(MAX_ALIGNMENT, 256);
+        assert_eq!(StreamBuffer::STREAM_BUFFER_SIZE, 64 * 1024 * 1024);
+        assert_eq!(StreamBuffer::NUM_SYNCS, 16);
+        assert_eq!(
+            StreamBuffer::REGION_SIZE,
+            StreamBuffer::STREAM_BUFFER_SIZE / StreamBuffer::NUM_SYNCS
+        );
+        assert_eq!(StreamBuffer::MAX_ALIGNMENT, 256);
     }
 
     #[test]
     fn stream_buffer_region() {
         assert_eq!(StreamBuffer::region(0), 0);
-        assert_eq!(StreamBuffer::region(REGION_SIZE - 1), 0);
-        assert_eq!(StreamBuffer::region(REGION_SIZE), 1);
-        assert_eq!(StreamBuffer::region(STREAM_BUFFER_SIZE - 1), NUM_SYNCS - 1);
+        assert_eq!(StreamBuffer::region(StreamBuffer::REGION_SIZE - 1), 0);
+        assert_eq!(StreamBuffer::region(StreamBuffer::REGION_SIZE), 1);
+        assert_eq!(
+            StreamBuffer::region(StreamBuffer::STREAM_BUFFER_SIZE - 1),
+            StreamBuffer::NUM_SYNCS - 1
+        );
     }
 
     #[test]

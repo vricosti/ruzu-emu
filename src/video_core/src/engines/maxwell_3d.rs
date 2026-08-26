@@ -8904,7 +8904,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_upload_linear_uses_constructor_memory_manager_owner_without_guest_writer() {
+    fn inline_upload_linear_forwards_through_the_bound_rasterizer() {
         let device_memory = Arc::new(
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
         );
@@ -8930,7 +8930,10 @@ mod tests {
         ));
         memory_manager.lock().map(0x2000, 0x8000, 0x1000, 0, false);
 
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(Arc::clone(&calls));
         let mut engine = Maxwell3D::new_with_memory_manager(memory_manager);
+        engine.bind_rasterizer(&rasterizer);
         engine.regs[UPLOAD_REGS_BASE as usize] = 8;
         engine.regs[(UPLOAD_REGS_BASE + 1) as usize] = 1;
         engine.regs[(UPLOAD_REGS_BASE + 2) as usize] = 0;
@@ -8945,8 +8948,12 @@ mod tests {
         engine.process_inline_upload_multi(&[0x1122_3344, 0x5566_7788]);
 
         assert_eq!(
-            &backing[..8],
-            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+            calls.lock().unwrap().inline_to_memory,
+            vec![(
+                0x2000,
+                8,
+                [0x1122_3344u32.to_ne_bytes(), 0x5566_7788u32.to_ne_bytes()].concat(),
+            )]
         );
     }
 

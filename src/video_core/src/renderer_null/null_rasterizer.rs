@@ -114,6 +114,8 @@ pub struct RasterizerNull {
     /// CPU VA, so we must translate first via this hook. Without it,
     /// addresses (the GPU VA being passed verbatim to write_block).
     gpu_to_cpu: Option<GpuToCpuTranslator>,
+    #[cfg(test)]
+    inline_upload_callback: Option<Box<dyn FnMut(u64, usize, &[u8]) + Send>>,
 }
 
 impl RasterizerNull {
@@ -125,6 +127,8 @@ impl RasterizerNull {
             guest_memory_writer: None,
             gpu_ticks_getter: None,
             gpu_to_cpu: None,
+            #[cfg(test)]
+            inline_upload_callback: None,
         }
     }
 
@@ -144,6 +148,14 @@ impl RasterizerNull {
 
     pub fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
         self.gpu_ticks_getter = Some(getter);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inline_upload_callback(
+        &mut self,
+        callback: impl FnMut(u64, usize, &[u8]) + Send + 'static,
+    ) {
+        self.inline_upload_callback = Some(Box::new(callback));
     }
 }
 
@@ -336,7 +348,12 @@ impl RasterizerInterface for RasterizerNull {
         true
     }
 
-    fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+    fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {
+        #[cfg(test)]
+        if let Some(callback) = self.inline_upload_callback.as_mut() {
+            callback(_address, _copy_size, _memory);
+        }
+    }
 
     fn access_accelerate_dma(&mut self) -> &mut dyn AccelerateDMAInterface {
         &mut self.accelerate_dma

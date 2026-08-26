@@ -13908,3 +13908,34 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   topology-override, and representation-preserving primitive-topology enums are `#[repr(u32)]`;
   focused tests cover every modern and legacy override bit pattern plus each packed bulk
   inline-index representation.
+
+## 2026-08-26 — `src/video_core/src/engines/engine_upload.rs` vs Eden `src/video_core/engines/engine_upload.{h,cpp}`
+
+### Intentional differences
+- Eden stores a `Registers&` inside `Upload::State`. Rust passes the owning engine's register view
+  to each entry point to avoid a movable self-referential engine; every owner constructs that view
+  immediately before the same Eden call boundary.
+- `Common::ScratchBuffer<u8>` is represented by reusable `Vec<u8>` storage. The block-linear
+  `GpuGuestMemoryScoped<SafeReadCachedWrite>` lifecycle is expressed as an ordered
+  `read_block`/swizzle/`write_block_cached` sequence while holding the Rust memory-manager owner.
+- Runtime `MemoryManager&` and `RasterizerInterface*` ownership is represented by
+  `Arc<Mutex<MemoryManager>>` and `RasterizerHandle`; the optional memory-manager state exists only
+  for reduced `cfg(test)` Maxwell fixtures.
+- Invalid short upload input panics at Rust slice construction rather than invoking Eden's C++
+  out-of-bounds behavior. Valid command streams use the same line slices.
+
+### Unintentional differences (to fix)
+- Resolved: `ProcessExec`, word accumulation, and linear destination calculations now use wrapping
+  unsigned arithmetic matching Eden's `u32`/`GPUVAddr` operations in debug and release builds.
+- Resolved: single-word accumulation now uses native byte order, matching Eden's `memcpy` from the
+  host `u32`, instead of forcing little-endian bytes.
+- Resolved: the linear path no longer depends on the unrelated memory-manager owner, silently skips
+  short lines, or falls back to a direct memory write when the required rasterizer is absent.
+
+### Missing items
+- None in the reviewed register helpers, transfer state machine, linear upload, or block-linear
+  swizzle path.
+
+### Binary layout verification
+- PASS: `Registers` and `DestRegisters` are `repr(C)` and focused tests verify their complete Eden
+  sizes, alignments, and field offsets (`0x30` and `0x28` bytes respectively).

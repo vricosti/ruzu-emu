@@ -640,6 +640,7 @@ mod tests {
         dirty_size: u64,
         dispatches: Cell<u32>,
         last_dispatch: RefCell<Option<DispatchCall>>,
+        inline_uploads: RefCell<Vec<(u64, usize, Vec<u8>)>>,
     }
 
     impl TestRasterizer {
@@ -650,6 +651,7 @@ mod tests {
                 dirty_size,
                 dispatches: Cell::new(0),
                 last_dispatch: RefCell::new(None),
+                inline_uploads: RefCell::new(Vec::new()),
             }
         }
     }
@@ -781,12 +783,10 @@ mod tests {
             false
         }
 
-        fn accelerate_inline_to_memory(
-            &mut self,
-            _address: u64,
-            _copy_size: usize,
-            _memory: &[u8],
-        ) {
+        fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
+            self.inline_uploads
+                .borrow_mut()
+                .push((address, copy_size, memory.to_vec()));
         }
     }
 
@@ -1086,6 +1086,8 @@ mod tests {
 
         let mut engine = KeplerCompute::new(Arc::clone(&memory_manager));
         let rasterizer = TestRasterizer::new(0x8000_0000, 4);
+        memory_manager.lock().bind_rasterizer(&rasterizer);
+        engine.bind_rasterizer(&rasterizer);
         engine.set_current_dma_segment(0x10000);
 
         engine.regs[LAUNCH_DESC_LOC as usize] = (launch_desc >> 8) as u32;
@@ -1101,12 +1103,14 @@ mod tests {
         engine.call_method(EXEC_UPLOAD, 1, true);
         engine.call_method(DATA_UPLOAD, 0x0000_0042, true);
         assert_eq!(
-            &backing[0x1000 + 0x0C * 4..0x1000 + 0x0C * 4 + 4],
-            &[0x42, 0, 0, 0]
+            rasterizer.inline_uploads.borrow().as_slice(),
+            &[(
+                launch_desc + 0x0C * 4,
+                4,
+                0x0000_0042u32.to_ne_bytes().to_vec(),
+            )]
         );
         engine.call_method(EXEC_UPLOAD, 1, true);
-        memory_manager.lock().bind_rasterizer(&rasterizer);
-        engine.bind_rasterizer(&rasterizer);
 
         engine.call_method(LAUNCH, 1, true);
 

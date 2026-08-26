@@ -282,6 +282,15 @@ mod tests {
             .map(0x10000, 0x8000_0000, 0x1000, 0, false);
 
         let mut engine = KeplerMemory::new(Arc::clone(&memory_manager));
+        let syncpoints = Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let mut rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        let upload_memory_manager = Arc::clone(&memory_manager);
+        rasterizer.set_inline_upload_callback(move |address, copy_size, memory| {
+            upload_memory_manager
+                .lock()
+                .write_block(address, &memory[..copy_size]);
+        });
+        engine.bind_rasterizer(&rasterizer);
 
         engine.call_method(UPLOAD_REG_OFFSET as u32, 4, true);
         engine.call_method((UPLOAD_REG_OFFSET + 1) as u32, 1, true);

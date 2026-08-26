@@ -4558,16 +4558,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   would only retain dead code.
 - The Rust callback adapter uses `Option<bool>` to represent Eden's compile-time distinction
   between callbacks returning `bool` and callbacks returning `void`.
-- A null tracker is tolerated by the default/empty Rust manager and discards collected ranges;
-  Eden's default constructor also leaves `tracker` null, but invoking a notifying mutation on that
-  object would dereference it.
 
-### Unintentional differences (to fix)
+### Resolved differences
 
 - Eden's `size_bytes` is a template parameter and its five tracking channels occupy one fixed
-  `std::array`. Ruzu stores `size_bytes` at runtime and uses separate stack-or-heap channel views.
-  Restoring that structural/layout parity requires changing the manager-pool type graph and is
-  outside this local batching slice.
+  `std::array`. The 2026-08-26 parity pass replaced Ruzu's runtime-sized stack-or-heap storage with
+  the compile-time-sized inline storage recorded in the later entry below.
+- The 2026-08-26 parity pass also stopped silently discarding notifications from a default manager
+  with a null tracker; an invalid notifying use now fails explicitly.
 
 ## 2026-08-22 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs `src/video_core/vulkan_common/vulkan_debug_callback.h` and `.cpp`
 
@@ -13252,3 +13250,37 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `UsageTracker` is host-only state. Focused tests cover empty, single-page, cross-page,
   reset, sub-64-byte, and zero-length range behavior.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/word_manager.rs` vs Eden `src/video_core/buffer_cache/word_manager.h`
+
+### Intentional differences
+
+- Stable Rust cannot use `Type::Max * DivCeil(SIZE_BYTES, BYTES_PER_WORD)` directly as a generic
+  array length. Ruzu stores the same fixed inline words as `[[u64; STACK_WORDS]; Type::Max]` and
+  validates that `STACK_WORDS` equals Eden's compile-time `num_words`; arrays remain contiguous in
+  the same type-major, word-minor order and no heap allocation occurs.
+- Mutable operations obtain raw pointers to separate tracking channels because Rust cannot hold
+  the overlapping mutable slice borrows that Eden expresses as independent `std::span` values.
+- The callback adapter uses `Option<bool>` for Eden's compile-time distinction between callbacks
+  returning `bool` and callbacks returning `void`.
+- Eden's unused `NotifyRasterizer` legacy helper remains omitted. Every active mutation path in
+  both trees uses `CollectChangedRanges` followed by the batched `ApplyCollectedRanges` operation.
+- Applying ranges through a default manager without a tracker fails explicitly. Eden would
+  dereference its null default tracker in this invalid lifecycle state; valid managers behave
+  identically.
+
+### Unintentional differences (to fix)
+
+- None after restoring `size_bytes` as a const generic, the fixed inline five-channel storage,
+  `Type::Max`, associated `NUM_WORDS`, upstream field order, and unsigned wrapping arithmetic.
+
+### Missing items
+
+- None on active paths; only the dead `NotifyRasterizer` helper is intentionally omitted above.
+
+### Binary layout verification
+
+- PASS for the host-only manager layout: `#[repr(C)]` fixes Eden's `heap`, tracker pointer, and
+  CPU-address field order; nested fixed arrays are contiguous without padding between channels,
+  and focused tests verify the enum representation, channel order, inline size, word count, and
+  constructor tail mask. The structure is not serialized or raw-copied across an ABI boundary.

@@ -39,6 +39,9 @@ const MANAGER_POOL_SIZE: usize = 32;
 /// Number of words each manager needs on the stack.
 const WORDS_STACK_NEEDED: usize = (HIGHER_PAGE_SIZE as usize) / (BYTES_PER_WORD as usize);
 
+/// Matching upstream `using Manager = WordManager<...>` alias.
+type Manager<DT> = WordManager<DT, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
+
 /// Diagnostic: how many out-of-range tracker queries have been logged so far.
 /// Upstream indexes a `std::array<Manager*, NUM_HIGH_PAGES>` with the raw page
 /// index (silent UB if the device address exceeds the 16 GiB device address
@@ -85,7 +88,7 @@ fn report_out_of_range(cpu_address: VAddr, size: u64, page_index: usize) {
 /// Corresponds to the C++ `MemoryTrackerBase<DeviceTracker>` template.
 pub struct MemoryTrackerBase<DT: DeviceTracker> {
     /// Pool storage for word managers.
-    manager_pool: Vec<Box<[WordManager<DT, WORDS_STACK_NEEDED>; MANAGER_POOL_SIZE]>>,
+    manager_pool: Vec<Box<[Manager<DT>; MANAGER_POOL_SIZE]>>,
     /// Free-list indices: `(pool_index, slot_index)`.
     free_managers: VecDeque<(usize, usize)>,
     /// Top-tier mapping from higher-page index to pool location.
@@ -339,9 +342,9 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Get a mutable reference to the manager at a given pool location.
     fn get_manager_mut(
-        pool: &mut [Box<[WordManager<DT, WORDS_STACK_NEEDED>; MANAGER_POOL_SIZE]>],
+        pool: &mut [Box<[Manager<DT>; MANAGER_POOL_SIZE]>],
         loc: (usize, usize),
-    ) -> &mut WordManager<DT, WORDS_STACK_NEEDED> {
+    ) -> &mut Manager<DT> {
         &mut pool[loc.0][loc.1]
     }
 
@@ -354,7 +357,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         mut func: F,
     ) -> bool
     where
-        F: FnMut(&mut WordManager<DT, WORDS_STACK_NEEDED>, u64, u64) -> IterateResult,
+        F: FnMut(&mut Manager<DT>, u64, u64) -> IterateResult,
     {
         let mut remaining_size = size as usize;
         let mut page_index = (cpu_address >> HIGHER_PAGE_BITS) as usize;
@@ -399,7 +402,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         mut func: F,
     ) -> (u64, u64)
     where
-        F: FnMut(&WordManager<DT, WORDS_STACK_NEEDED>, u64, u64) -> (u64, u64),
+        F: FnMut(&Manager<DT>, u64, u64) -> (u64, u64),
     {
         let mut remaining_size = size as usize;
         let mut page_index = (cpu_address >> HIGHER_PAGE_BITS) as usize;
@@ -416,7 +419,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
             }
 
             let mut execute =
-                |mgr: &WordManager<DT, WORDS_STACK_NEEDED>, begin: &mut u64, end: &mut u64| {
+                |mgr: &Manager<DT>, begin: &mut u64, end: &mut u64| {
                     let (new_begin, new_end) = func(mgr, page_offset, copy_amount as u64);
                     if new_begin != 0 || new_end != 0 {
                         let base_address = (page_index as u64) << HIGHER_PAGE_BITS;
@@ -463,7 +466,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         let tracker = unsafe { &*self.device_tracker };
         let mut batch = Vec::with_capacity(MANAGER_POOL_SIZE);
         for _ in 0..MANAGER_POOL_SIZE {
-            batch.push(WordManager::new(0, tracker, HIGHER_PAGE_SIZE));
+            batch.push(Manager::new(0, tracker));
         }
         let batch = batch
             .into_boxed_slice()

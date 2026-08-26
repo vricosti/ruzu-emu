@@ -13694,3 +13694,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this change only selects the validation helper and does not alter `MemoryPoolInfo` payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/descriptor_buffer.rs` vs Eden `src/video_core/renderer_vulkan/vk_descriptor_buffer.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores the same non-owning device relationship as a `DeviceReference`, because a C++
+  reference cannot be stored directly without making every renderer type lifetime-parameterized.
+  The renderer parent retains ownership and destroys the ring first.
+- Vulkan allocation failures use `Result<VulkanError>` instead of constructor exceptions.
+- The raw mapped pointers make the ring non-`Send` by inference. The explicit `Send` implementation
+  records Eden's GPU-thread ownership contract; mutation still requires exclusive access.
+
+### Unintentional differences (to fix)
+
+- None after failure of the host-visible or host-coherent checks clears only `chunks`, exactly as
+  Eden does. Address/host vectors and capacity metadata are no longer reset by an invented
+  `disable` helper.
+- None after replacing the file-local alignment functions with the upstream-owned `common`
+  operations and preserving unsigned wrapping in address, cursor, index, and generation updates.
+- None after removing the public `device()` accessor, which has no upstream counterpart.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: `Allocation` is returned within Rust and is not copied to a Vulkan or guest-memory payload;
+  its pointer, offset, chunk, and generation values correspond field-for-field to Eden.

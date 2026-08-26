@@ -4,6 +4,7 @@
 //! Port of `vk_descriptor_buffer.{h,cpp}`.
 
 use ash::vk;
+use common::alignment::{align_down, align_up};
 
 use super::scheduler::Scheduler;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
@@ -23,6 +24,8 @@ pub struct Allocation {
 }
 
 pub struct DescriptorBufferRing {
+    // Stored to mirror Eden's `const Device&` member and parent-owned lifetime.
+    #[allow(dead_code)]
     device: DeviceReference,
     chunks: Vec<MappedBuffer>,
     chunk_addresses: Vec<vk::DeviceAddress>,
@@ -111,12 +114,12 @@ impl DescriptorBufferRing {
                 memory_allocator.create_mapped_buffer(&buffer_info, MemoryUsage::Upload)?;
             if !buffer.is_host_visible() {
                 log::debug!("Descriptor buffer is not host visible, disabling");
-                ring.disable();
+                ring.chunks.clear();
                 return Ok(ring);
             }
             if !buffer.is_host_coherent() {
                 log::debug!("Descriptor buffer is not host coherent, disabling");
-                ring.disable();
+                ring.chunks.clear();
                 return Ok(ring);
             }
             device.set_buffer_name(buffer.buffer(), "Descriptor buffer");
@@ -129,19 +132,14 @@ impl DescriptorBufferRing {
             };
             let address = align_up(raw_address, ring.alignment);
             ring.chunk_addresses.push(address);
-            ring.chunk_hosts
-                .push(unsafe { buffer.mapped_ptr().add((address - raw_address) as usize) });
+            ring.chunk_hosts.push(unsafe {
+                buffer
+                    .mapped_ptr()
+                    .add(address.wrapping_sub(raw_address) as usize)
+            });
             ring.chunks.push(buffer);
         }
         Ok(ring)
-    }
-
-    fn disable(&mut self) {
-        self.chunks.clear();
-        self.chunk_addresses.clear();
-        self.chunk_hosts.clear();
-        self.chunk_capacity = 0;
-        self.chunks_per_frame = 0;
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -157,13 +155,13 @@ impl DescriptorBufferRing {
     }
 
     pub fn tick_frame(&mut self) {
-        self.frame_index += 1;
+        self.frame_index = self.frame_index.wrapping_add(1);
         if self.frame_index >= FRAMES_IN_FLIGHT {
             self.frame_index = 0;
         }
         self.chunk_cursor = 0;
         self.cursor = 0;
-        self.generation += 1;
+        self.generation = self.generation.wrapping_add(1);
         self.frame_reused = true;
     }
 
@@ -182,20 +180,23 @@ impl DescriptorBufferRing {
             self.frame_reused = false;
             scheduler.wait(self.frame_ticks[self.frame_index]);
         }
-        if self.cursor + needed > self.chunk_capacity {
-            if self.chunk_cursor + 1 < self.chunks_per_frame {
-                self.chunk_cursor += 1;
+        if self.cursor.wrapping_add(needed) > self.chunk_capacity {
+            if self.chunk_cursor.wrapping_add(1) < self.chunks_per_frame {
+                self.chunk_cursor = self.chunk_cursor.wrapping_add(1);
             } else {
                 log::debug!("Descriptor buffer frame exhausted, stalling on the GPU");
                 scheduler.finish();
                 self.chunk_cursor = 0;
-                self.generation += 1;
+                self.generation = self.generation.wrapping_add(1);
             }
             self.cursor = 0;
         }
-        let chunk = self.frame_index * self.chunks_per_frame + self.chunk_cursor;
+        let chunk = self
+            .frame_index
+            .wrapping_mul(self.chunks_per_frame)
+            .wrapping_add(self.chunk_cursor);
         let offset = self.cursor;
-        self.cursor += needed;
+        self.cursor = self.cursor.wrapping_add(needed);
         self.frame_ticks[self.frame_index] = scheduler.current_tick();
         Allocation {
             host: unsafe { self.chunk_hosts[chunk].add(offset as usize) },
@@ -218,20 +219,6 @@ impl DescriptorBufferRing {
     pub fn is_valid(&self) -> bool {
         !self.chunks.is_empty()
     }
-
-    pub fn device(&self) -> &Device {
-        self.device.get()
-    }
-}
-
-fn align_up(value: u64, alignment: u64) -> u64 {
-    debug_assert_ne!(alignment, 0);
-    value.div_ceil(alignment) * alignment
-}
-
-fn align_down(value: u64, alignment: u64) -> u64 {
-    debug_assert_ne!(alignment, 0);
-    value / alignment * alignment
 }
 
 #[cfg(test)]
@@ -243,5 +230,6 @@ mod tests {
         assert_eq!(align_up(1, 32), 32);
         assert_eq!(align_up(32, 32), 32);
         assert_eq!(align_down(63, 32), 32);
+        assert_eq!(align_up(u64::MAX, 2), 0);
     }
 }

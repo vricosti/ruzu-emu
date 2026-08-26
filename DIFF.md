@@ -16287,3 +16287,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: logger entries and snapshots are host-only diagnostic data copied field-by-field. Focused
   tests verify enum discriminants, shader-stage names, unit formatting, snapshot section ordering,
   and the exact settings defaults.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` GPU logging lifecycle vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's loaded-extension owner is a `BTreeSet`, so the diagnostic extension list is sorted rather
+  than retaining Eden's vector insertion order. Classification into Qualcomm and standard groups,
+  all extension names, and the total count are unchanged.
+- Vulkan fixed-size character arrays are decoded through `CStr::to_string_lossy`; valid driver
+  strings are byte-for-byte unchanged while invalid UTF-8 is made printable for the diagnostic log.
+- Rust `Drop` calls `shutdown_gpu_logging` before automatic field destruction. This preserves
+  Eden's destructor order: logger shutdown precedes VMA allocator and logical-device destruction.
+
+### Unintentional differences (to fix)
+
+- None after restoring `initialize_gpu_logging`/`shutdown_gpu_logging`, driver classification,
+  logger feature configuration, driver/version/device metadata, extension reporting, and their
+  constructor/destructor call order.
+
+### Missing items
+
+- None in the audited `Device` GPU-logging lifecycle.
+
+### Binary layout verification
+
+- N/A: this lifecycle only reads Vulkan-owned property structures field-by-field and writes
+  host-side diagnostics.

@@ -14,6 +14,8 @@ use std::ffi::{CStr, CString};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use crate::gpu_logging::{get_instance, DriverType, LogLevel};
+
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
 use super::vma::VmaAllocator;
 use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, VulkanError};
@@ -1736,7 +1738,7 @@ impl Device {
             is_integrated,
         );
 
-        Ok(Self {
+        let device = Self {
             instance,
             physical,
             allocator,
@@ -1920,7 +1922,102 @@ impl Device {
             valid_heap_memory,
             format_properties,
             nsight_aftermath_tracker: enable_nsight_aftermath.then(NsightAftermathTracker::new),
-        })
+        };
+        device.initialize_gpu_logging();
+        Ok(device)
+    }
+
+    /// Initialize Eden's optional GPU logging after the logical device and VMA
+    /// allocator are ready.
+    pub fn initialize_gpu_logging(&self) {
+        let settings = common::settings::values();
+        let log_level = LogLevel::from(*settings.gpu_log_level.get_value());
+        if log_level == LogLevel::Off {
+            return;
+        }
+
+        let driver_id = self.get_driver_id();
+        let detected_driver = if driver_id == vk::DriverId::MESA_TURNIP {
+            DriverType::Turnip
+        } else if driver_id == vk::DriverId::QUALCOMM_PROPRIETARY {
+            DriverType::Qualcomm
+        } else {
+            DriverType::Unknown
+        };
+
+        let logger = get_instance();
+        logger.initialize(log_level, detected_driver);
+        logger.enable_vulkan_call_tracking(*settings.gpu_log_vulkan_calls.get_value());
+        logger.enable_memory_tracking(*settings.gpu_log_memory_tracking.get_value());
+        logger.enable_driver_debug_info(*settings.gpu_log_driver_debug.get_value());
+        logger.set_ring_buffer_size(*settings.gpu_log_ring_buffer_size.get_value() as usize);
+
+        if !*settings.gpu_log_driver_debug.get_value() {
+            return;
+        }
+
+        let device_name = unsafe {
+            CStr::from_ptr(self.device_properties.device_name.as_ptr()).to_string_lossy()
+        };
+        let driver_name = unsafe {
+            CStr::from_ptr(self.driver_properties.driver_name.as_ptr()).to_string_lossy()
+        };
+        let driver_info = unsafe {
+            CStr::from_ptr(self.driver_properties.driver_info.as_ptr()).to_string_lossy()
+        };
+        let driver_version = self.device_properties.driver_version;
+        let api_version = self.device_properties.api_version;
+        let mut details = format!(
+            "Device: {device_name}\n\
+             Driver Name: {driver_name}\n\
+             Driver Info: {driver_info}\n\
+             Driver Version: {}.{}.{}\n\
+             Vulkan API Version: {}.{}.{}\n\
+             Driver ID: {}\n\
+             Vendor ID: {:#04x}\n\
+             Device ID: {:#04x}\n\
+             \n=== Loaded Vulkan Extensions ===\n",
+            vk::api_version_major(driver_version),
+            vk::api_version_minor(driver_version),
+            vk::api_version_patch(driver_version),
+            vk::api_version_major(api_version),
+            vk::api_version_minor(api_version),
+            vk::api_version_patch(api_version),
+            driver_id.as_raw(),
+            self.device_properties.vendor_id,
+            self.device_properties.device_id,
+        );
+
+        let (qcom_extensions, other_extensions): (Vec<_>, Vec<_>) = self
+            .loaded_extensions
+            .iter()
+            .partition(|extension| extension.contains("QCOM") || extension.contains("qcom"));
+        if !qcom_extensions.is_empty() {
+            details.push_str("\nQualcomm Proprietary Extensions:\n");
+            for extension in qcom_extensions {
+                details.push_str(&format!("  - {extension}\n"));
+            }
+        }
+        if !other_extensions.is_empty() {
+            details.push_str("\nStandard Extensions:\n");
+            for extension in other_extensions {
+                details.push_str(&format!("  - {extension}\n"));
+            }
+        }
+        details.push_str(&format!(
+            "\nTotal Extensions Loaded: {}\n",
+            self.loaded_extensions.len()
+        ));
+        logger.log_driver_debug_info(&details);
+    }
+
+    /// Shut down Eden's process-wide GPU logger before the allocator and
+    /// logical device are destroyed.
+    pub fn shutdown_gpu_logging(&self) {
+        let logger = get_instance();
+        if logger.is_initialized() {
+            logger.shutdown();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2929,6 +3026,12 @@ impl Device {
     /// Port of upstream `Device::IsExt4444FormatsSupported`.
     pub fn is_ext_4444_formats_supported(&self) -> bool {
         self.format_a4b4g4r4_supported
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.shutdown_gpu_logging();
     }
 }
 

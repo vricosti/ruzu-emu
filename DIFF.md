@@ -17027,3 +17027,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this change only restores Vulkan command recording order and adds no binary payload.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vma.rs` vs Eden `src/video_core/vulkan_common/vma.h`
+
+### Intentional differences
+
+- Eden compiles VMA with static Vulkan symbols disabled and dynamic resolution enabled, passing
+  `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`. The `vk-mem` crate compiles the same VMA
+  implementation with both built-in loaders disabled and supplies the complete Ash function table
+  explicitly. Both avoid a static Vulkan-library dependency; the Rust binding requires the latter
+  integration and preserves the same allocator operations.
+- Eden stores an opaque `VmaAllocator` handle and promises external synchronization. Rust owns the
+  allocator through `Arc<Mutex<vk_mem::Allocator>>`; `vulkan_device.rs` sets the matching
+  `EXTERNALLY_SYNCHRONIZED` allocator flag and the mutex supplies its required serialization.
+- Eden selects the one translation unit defining `VMA_IMPLEMENTATION` in each frontend. The
+  `vk-mem` build script compiles its own `wrapper.cpp` translation unit with that definition.
+
+### Unintentional differences (to fix)
+
+- None after correcting the binding documentation and removing four unused type aliases that had
+  no counterpart in Eden's VMA configuration header.
+
+### Missing items
+
+- None in this binding/configuration owner. Allocator creation flags and block-size policy remain
+  in `vulkan_device.rs`, matching Eden's `vulkan_device.cpp`; allocation policy remains in
+  `vulkan_memory_allocator.rs`.
+
+### Binary layout verification
+
+- N/A: this module selects the external VMA binding and Rust ownership wrapper; it defines no
+  copied or serialized payload. A focused type-level test pins the shareable, externally locked
+  allocator ownership contract.

@@ -1604,9 +1604,6 @@ impl Device {
         if !supports_workgroup_memory_explicit_layout {
             clear_feature_preserving_chain!(workgroup_memory_explicit_layout_features);
         }
-        if !supports_maintenance5 {
-            maintenance5_features.maintenance5 = vk::FALSE;
-        }
         if !supports_subgroup_size_control {
             clear_feature_preserving_chain!(subgroup_size_control_features);
         }

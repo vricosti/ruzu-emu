@@ -15919,6 +15919,133 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the removed types were unused host-only placeholder state.
 
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden `src/video_core/vulkan_common/vulkan_memory_allocator.{h,cpp}` (remaining buffer paths)
+
+### Intentional differences
+
+- Rust exposes `AllocatedBuffer` and the `MappedBuffer` alias instead of Eden's move-only
+  `vk::Buffer` wrapper; both own the VMA allocation and destroy buffer plus allocation together.
+- Compatibility callers that still store a raw `VkBuffer` leave the `VmaAllocation` in the
+  allocator's retained-buffer registry until explicit `destroy_buffer` or allocator teardown.
+  This preserves their existing raw-handle API while using Eden's allocation policy.
+- Rust retains Eden's `[[maybe_unused]] MemoryUsagePropertyFlags` helper and allocator-owned device
+  state with local dead-code annotations because ash/VMA wrappers carry the handles used at runtime.
+
+### Unintentional differences (to fix)
+
+- Resolved: raw-handle buffers now use VMA `create_buffer` with `WITHIN_BUDGET`, the same
+  usage/mapping flags, memory-type mask, preferred flags, and ANV stream workaround as Eden.
+- Resolved: persistently mapped upload/download buffers now reuse the VMA-owning buffer path;
+  flush and invalidate operate on the VMA allocation instead of dedicated `VkDeviceMemory`.
+- Resolved: raw-handle destruction and allocator teardown call VMA `destroy_buffer` rather than
+  pairing `vkDestroyBuffer` with a dedicated `vkFreeMemory` allocation.
+
+### Missing items
+
+- Raw-handle compatibility owners should ultimately store `AllocatedBuffer` directly so each
+  buffer's Rust field, rather than the allocator registry, owns its exact destruction point.
+- GPU allocation/deallocation logging remains unavailable with the unported GPU logger.
+
+### Binary layout verification
+
+- N/A: these are host Vulkan/VMA ownership wrappers and are not serialized or guest-visible.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.{h,cpp}`
+
+### Intentional differences
+
+- Ash owns dynamic-loader resolution and returns an `Entry`; Eden retains a shared
+  `Common::DynamicLibrary` and fills its dispatch table separately.
+- The Android frontend-provided driver-library path is not available in Ruzu's current frontend
+  interface.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the development-only hard-coded lookup into a separate Eden build tree on
+  macOS. Explicit `LIBVULKAN_PATH`, the active application bundle, and the system loader remain the
+  only library sources.
+
+### Missing items
+
+- Android frontend-owned driver-library injection remains unported.
+
+### Binary layout verification
+
+- N/A: this change selects a host dynamic library and does not define a shared binary payload.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`
+
+### Intentional differences
+
+- Validation messages are routed to Rust's logging facade; Eden additionally forwards them to its
+  GPU logger, a subsystem Ruzu has not ported.
+
+### Unintentional differences (to fix)
+
+- Resolved: the Android false-positive ID for `vkCmdSetLogicOpEXT` is `0x1257b492`, exactly as in
+  Eden. The previous Rust constant had dropped the final hexadecimal digit and matched a different
+  message ID.
+
+### Missing items
+
+- GPU-logger forwarding remains unavailable with the unported GPU logging subsystem.
+
+### Binary layout verification
+
+- N/A: the callback consumes Vulkan-owned ABI structures without copying or serializing them.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` vs Eden `src/video_core/vulkan_common/vulkan_instance.cpp`
+
+### Intentional differences
+
+- Rust creates the instance synchronously through ash instead of wrapping creation in
+  `std::async(...).get()`; ash owns the loader dispatch and does not expose Eden's dynamic-library
+  locking boundary.
+- Application and engine names identify Ruzu while preserving Eden's version and API metadata
+  fields.
+
+### Unintentional differences (to fix)
+
+- Resolved: optional-extension probing and final required-extension validation now consume one
+  shared enumeration snapshot, preserving Eden's protection against inconsistent consecutive
+  extension queries on affected drivers.
+- Resolved: `VkApplicationInfo::apiVersion` now receives the Vulkan version reported by the loader
+  instead of an unconditional Vulkan 1.3 value.
+- Resolved: extension discovery and validation precede the available-version check in the same
+  lifecycle order as Eden.
+
+### Missing items
+
+- None in extension selection, validation-layer filtering, version validation, or platform
+  instance flags.
+
+### Binary layout verification
+
+- N/A: Vulkan ABI payloads are constructed by ash and are not serialized by Ruzu.
+
+## 2026-08-26 — `src/video_core/src/textures/workers.rs` vs Eden `src/video_core/textures/workers.{h,cpp}` and `src/common/thread_worker.h`
+
+### Intentional differences
+
+- Rust uses `Mutex`/`Condvar`, boxed `FnOnce` jobs, and joined `std::thread` handles in place of
+  Eden's `UniqueFunction`, `condition_variable_any`, and `std::jthread` stop tokens.
+
+### Unintentional differences (to fix)
+
+- Resolved: queued texture jobs are consumed FIFO through `VecDeque::pop_front`, matching Eden's
+  `std::queue::front/pop`, instead of the previous LIFO `Vec::pop` order.
+- Resolved: completion waits compare monotonically increasing scheduled and completed counts, as
+  Eden does. This closes the interval in which the queue was empty but a removed request had not
+  yet incremented Ruzu's former active counter.
+
+### Missing items
+
+- None for the texture worker singleton, worker count, queueing, completion waits, or teardown.
+
+### Binary layout verification
+
+- N/A: work queues and closures are host-only state.
+
 ## 2026-08-26 — `src/video_core/src/host1x/syncpoint_manager.rs` vs Eden `src/video_core/host1x/syncpoint_manager.{h,cpp}`
 
 ### Intentional differences

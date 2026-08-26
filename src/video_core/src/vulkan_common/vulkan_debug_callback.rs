@@ -62,7 +62,7 @@ const IGNORED_MESSAGE_IDS: &[u32] = &[
     0xb13c8036, // VUID-vkCmdSetDepthBiasEnable-None-04872
     0xdff2e5c1, // VUID-vkCmdSetRasterizerDiscardEnable-None-04871
     0x0cc85f41, // VUID-vkCmdSetPrimitiveRestartEnable-None-04866
-    0x01257b49, // VUID-vkCmdSetLogicOpEXT-None-0486
+    0x1257b492, // VUID-vkCmdSetLogicOpEXT-None-0486
     0x398e0dab, // VUID-vkCmdSetVertexInputEXT-None-04790
     0x970c11a5, // VUID-vkCmdSetColorWriteMaskEXT-*
     0x6b453f78, // VUID-vkCmdSetColorBlendEnableEXT-*
@@ -167,7 +167,10 @@ mod tests {
         #[cfg(not(target_os = "android"))]
         assert!(is_ignored_message_id(0x682a878a));
         #[cfg(target_os = "android")]
-        assert!(is_ignored_message_id(0xbf9cf353));
+        {
+            assert!(is_ignored_message_id(0xbf9cf353));
+            assert!(is_ignored_message_id(0x1257b492));
+        }
         assert!(!is_ignored_message_id(0));
     }
 }

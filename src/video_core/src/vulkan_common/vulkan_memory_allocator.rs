@@ -41,6 +41,7 @@ pub enum MemoryUsage {
 /// Returns the `VkMemoryPropertyFlags` for a given `MemoryUsage`.
 ///
 /// Port of `MemoryUsagePropertyFlags` from `vulkan_memory_allocator.cpp`.
+#[allow(dead_code)] // Eden retains this helper as [[maybe_unused]].
 fn memory_usage_property_flags(usage: MemoryUsage) -> vk::MemoryPropertyFlags {
     match usage {
         MemoryUsage::DeviceLocal => vk::MemoryPropertyFlags::DEVICE_LOCAL,
@@ -110,100 +111,6 @@ pub struct MemoryCommit {
     offset: vk::DeviceSize,
     size: vk::DeviceSize,
     mapped_ptr: *mut u8,
-}
-
-// ---------------------------------------------------------------------------
-// MappedBuffer — port-facing wrapper for host-visible VMA buffers
-// ---------------------------------------------------------------------------
-
-/// Host-visible buffer allocation returned by `MemoryAllocator::CreateBuffer`.
-///
-/// Upstream uses a VMA allocation wrapper exposing `Mapped()`/`Flush()`. The
-/// Rust port keeps the same ownership at the allocator boundary with a
-/// dedicated allocation until the VMA backend is ported.
-pub struct MappedBuffer {
-    device: ash::Device,
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    mapped_ptr: *mut u8,
-    size: vk::DeviceSize,
-    coherent: bool,
-}
-
-unsafe impl Send for MappedBuffer {}
-unsafe impl Sync for MappedBuffer {}
-
-impl MappedBuffer {
-    pub fn buffer(&self) -> vk::Buffer {
-        self.buffer
-    }
-
-    pub fn mapped_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.mapped_ptr, self.size as usize) }
-    }
-
-    pub fn mapped_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.mapped_ptr, self.size as usize) }
-    }
-
-    pub fn mapped_ptr(&self) -> *mut u8 {
-        self.mapped_ptr
-    }
-
-    pub fn is_host_visible(&self) -> bool {
-        !self.mapped_ptr.is_null()
-    }
-
-    pub fn is_host_coherent(&self) -> bool {
-        self.coherent
-    }
-
-    pub fn flush(&self) {
-        if self.coherent {
-            return;
-        }
-        let range = vk::MappedMemoryRange::builder()
-            .memory(self.memory)
-            .offset(0)
-            .size(self.size)
-            .build();
-        unsafe {
-            self.device.flush_mapped_memory_ranges(&[range]).ok();
-        }
-    }
-
-    pub fn invalidate(&self) {
-        if self.coherent {
-            return;
-        }
-        let range = vk::MappedMemoryRange::builder()
-            .memory(self.memory)
-            .offset(0)
-            .size(self.size)
-            .build();
-        unsafe {
-            self.device.invalidate_mapped_memory_ranges(&[range]).ok();
-        }
-    }
-}
-
-impl Drop for MappedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.mapped_ptr.is_null() {
-                self.device.unmap_memory(self.memory);
-                self.mapped_ptr = std::ptr::null_mut();
-            }
-            if self.buffer != vk::Buffer::null() {
-                self.device.destroy_buffer(self.buffer, None);
-                self.buffer = vk::Buffer::null();
-            }
-            if self.memory != vk::DeviceMemory::null() {
-                self.device.free_memory(self.memory, None);
-                self.memory = vk::DeviceMemory::null();
-            }
-        }
-    }
 }
 
 // SAFETY: The memory handle is owned by the Vulkan device and the commit
@@ -370,10 +277,18 @@ pub struct AllocatedBuffer {
     coherent: bool,
 }
 
+/// Name retained for call sites that require a persistently mapped buffer.
+/// VMA returns the same owning buffer type for mapped and device-local usage.
+pub type MappedBuffer = AllocatedBuffer;
+
 unsafe impl Send for AllocatedBuffer {}
 unsafe impl Sync for AllocatedBuffer {}
 
 impl AllocatedBuffer {
+    pub fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
     pub fn handle(&self) -> vk::Buffer {
         self.buffer
     }
@@ -393,6 +308,13 @@ impl AllocatedBuffer {
             return &mut [];
         }
         unsafe { std::slice::from_raw_parts_mut(self.mapped_ptr, self.size as usize) }
+    }
+
+    pub fn mapped_slice(&self) -> &[u8] {
+        if !self.is_host_visible() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.mapped_ptr, self.size as usize) }
     }
 
     pub fn size(&self) -> vk::DeviceSize {
@@ -416,6 +338,20 @@ impl AllocatedBuffer {
             .lock()
             .expect("VMA allocator mutex poisoned")
             .flush_allocation(allocation, 0, vk::WHOLE_SIZE as usize);
+    }
+
+    pub fn invalidate(&self) {
+        if self.coherent {
+            return;
+        }
+        let Some(allocation) = self.allocation.as_ref() else {
+            return;
+        };
+        let _ = self
+            .allocator
+            .lock()
+            .expect("VMA allocator mutex poisoned")
+            .invalidate_allocation(allocation, 0, vk::WHOLE_SIZE as usize);
     }
 }
 
@@ -481,11 +417,9 @@ impl Drop for AllocatedImage {
 // MemoryAllocator — port of `Vulkan::MemoryAllocator`
 // ---------------------------------------------------------------------------
 
-enum DedicatedResource {
-    Buffer {
-        buffer: vk::Buffer,
-        memory: vk::DeviceMemory,
-    },
+struct RetainedBuffer {
+    buffer: vk::Buffer,
+    allocation: vk_mem::Allocation,
 }
 
 /// Memory allocator container.
@@ -497,14 +431,16 @@ enum DedicatedResource {
 pub struct MemoryAllocator {
     /// VMA allocator owned by `Device`, matching upstream `device.GetAllocator()`.
     allocator: VmaAllocator,
-    /// The Vulkan device.
+    /// The Vulkan device retained by the upstream allocator owner. Ash/VMA
+    /// wrappers carry the handles used by Ruzu's allocation paths directly.
+    #[allow(dead_code)]
     device: ash::Device,
     /// Physical device memory properties.
     properties: vk::PhysicalDeviceMemoryProperties,
     /// Buffer-image granularity from device limits.
     #[allow(dead_code)] // Retained because Eden's allocator owns the same device limit.
     buffer_image_granularity: vk::DeviceSize,
-    dedicated_resources: Mutex<Vec<DedicatedResource>>,
+    retained_buffers: Mutex<Vec<RetainedBuffer>>,
     /// Valid memory types bitmask (may exclude small device-local heaps for debugging).
     valid_memory_types: u32,
     driver_id: vk::DriverId,
@@ -550,7 +486,7 @@ impl MemoryAllocator {
                 .device_properties
                 .limits
                 .buffer_image_granularity,
-            dedicated_resources: Mutex::new(Vec::new()),
+            retained_buffers: Mutex::new(Vec::new()),
             valid_memory_types,
             driver_id: vulkan_device.get_driver_id(),
         }
@@ -633,66 +569,44 @@ impl MemoryAllocator {
     ///
     /// Port of `MemoryAllocator::CreateBuffer`.
     ///
-    /// NOTE: Upstream delegates to VMA. The Rust port currently uses a
-    /// dedicated Vulkan allocation per buffer and keeps it alive in the
-    /// allocator until drop.
+    /// Raw-handle compatibility path. The allocator retains the owning VMA
+    /// allocation until `destroy_buffer` or allocator teardown.
     pub fn create_buffer(
         &self,
         ci: &vk::BufferCreateInfo,
         usage: MemoryUsage,
     ) -> Result<vk::Buffer, VulkanError> {
-        let buffer = unsafe {
-            self.device
-                .create_buffer(ci, None)
+        let anv_flags = if usage == MemoryUsage::Stream
+            && self.driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA
+        {
+            vk::MemoryPropertyFlags::HOST_CACHED
+        } else {
+            vk::MemoryPropertyFlags::empty()
+        };
+        let allocation_ci = vk_mem::AllocationCreateInfo {
+            flags: vk_mem::AllocationCreateFlags::WITHIN_BUDGET | memory_usage_vma_flags(usage),
+            usage: memory_usage_vma(usage),
+            required_flags: vk::MemoryPropertyFlags::empty(),
+            preferred_flags: memory_usage_preferred_vma_flags(usage) | anv_flags,
+            memory_type_bits: if usage == MemoryUsage::Stream {
+                0
+            } else {
+                self.valid_memory_types
+            },
+            ..Default::default()
+        };
+        let allocator = self.allocator.lock().expect("VMA allocator mutex poisoned");
+        let (buffer, allocation) = unsafe {
+            allocator
+                .create_buffer(ci, &allocation_ci)
                 .map_err(VulkanError::new)?
         };
-        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let flags = self.memory_property_flags(
-            requirements.memory_type_bits,
-            memory_usage_property_flags(usage),
-        );
-        let type_index = match self.find_type(flags, requirements.memory_type_bits) {
-            Some(index) => index,
-            None => {
-                unsafe {
-                    self.device.destroy_buffer(buffer, None);
-                }
-                return Err(VulkanError::new(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
-            }
-        };
-        let mut address_flags =
-            vk::MemoryAllocateFlagsInfo::builder().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-        let mut alloc_info_builder = vk::MemoryAllocateInfo::builder()
-            .allocation_size(requirements.size)
-            .memory_type_index(type_index);
-        if ci
-            .usage
-            .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-        {
-            alloc_info_builder = alloc_info_builder.push_next(&mut address_flags);
-        }
-        let alloc_info = alloc_info_builder.build();
-        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
-            Ok(memory) => memory,
-            Err(err) => {
-                unsafe {
-                    self.device.destroy_buffer(buffer, None);
-                }
-                return Err(VulkanError::new(err));
-            }
-        };
-        if let Err(err) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.device.free_memory(memory, None);
-                self.device.destroy_buffer(buffer, None);
-            }
-            return Err(VulkanError::new(err));
-        }
+        drop(allocator);
 
-        self.dedicated_resources
+        self.retained_buffers
             .lock()
-            .expect("dedicated resource mutex poisoned")
-            .push(DedicatedResource::Buffer { buffer, memory });
+            .expect("retained buffer mutex poisoned")
+            .push(RetainedBuffer { buffer, allocation });
         Ok(buffer)
     }
 
@@ -703,20 +617,24 @@ impl MemoryAllocator {
         if buffer == vk::Buffer::null() {
             return;
         }
-        let Ok(mut resources) = self.dedicated_resources.lock() else {
+        let Ok(mut resources) = self.retained_buffers.lock() else {
             return;
         };
-        let Some(index) = resources.iter().position(|resource| {
-            matches!(resource, DedicatedResource::Buffer { buffer: owned, .. } if *owned == buffer)
-        }) else {
+        let Some(index) = resources
+            .iter()
+            .position(|resource| resource.buffer == buffer)
+        else {
             return;
         };
-        let DedicatedResource::Buffer { buffer, memory } = resources.swap_remove(index) else {
-            unreachable!();
-        };
+        let RetainedBuffer {
+            buffer,
+            mut allocation,
+        } = resources.swap_remove(index);
         unsafe {
-            self.device.destroy_buffer(buffer, None);
-            self.device.free_memory(memory, None);
+            self.allocator
+                .lock()
+                .expect("VMA allocator mutex poisoned")
+                .destroy_buffer(buffer, &mut allocation);
         }
     }
 
@@ -729,75 +647,11 @@ impl MemoryAllocator {
         ci: &vk::BufferCreateInfo,
         usage: MemoryUsage,
     ) -> Result<MappedBuffer, VulkanError> {
-        let buffer = unsafe {
-            self.device
-                .create_buffer(ci, None)
-                .map_err(VulkanError::new)?
-        };
-        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let flags = self.memory_property_flags(
-            requirements.memory_type_bits,
-            memory_usage_property_flags(usage),
-        );
-        if !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
-            unsafe {
-                self.device.destroy_buffer(buffer, None);
-            }
+        let buffer = self.create_owned_buffer(ci, usage)?;
+        if !buffer.is_host_visible() {
             return Err(VulkanError::new(vk::Result::ERROR_MEMORY_MAP_FAILED));
         }
-        let type_index = match self.find_type(flags, requirements.memory_type_bits) {
-            Some(index) => index,
-            None => {
-                unsafe {
-                    self.device.destroy_buffer(buffer, None);
-                }
-                return Err(VulkanError::new(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
-            }
-        };
-        let alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(requirements.size)
-            .memory_type_index(type_index)
-            .build();
-        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
-            Ok(memory) => memory,
-            Err(err) => {
-                unsafe {
-                    self.device.destroy_buffer(buffer, None);
-                }
-                return Err(VulkanError::new(err));
-            }
-        };
-        if let Err(err) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.device.free_memory(memory, None);
-                self.device.destroy_buffer(buffer, None);
-            }
-            return Err(VulkanError::new(err));
-        }
-        let mapped_ptr = match unsafe {
-            self.device
-                .map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(ptr) => ptr.cast::<u8>(),
-            Err(err) => {
-                unsafe {
-                    self.device.free_memory(memory, None);
-                    self.device.destroy_buffer(buffer, None);
-                }
-                return Err(VulkanError::new(err));
-            }
-        };
-        let coherent = self.properties.memory_types[type_index as usize]
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-        Ok(MappedBuffer {
-            device: self.device.clone(),
-            buffer,
-            memory,
-            mapped_ptr,
-            size: requirements.size,
-            coherent,
-        })
+        Ok(buffer)
     }
 
     /// Commits a memory region with the specified requirements.
@@ -929,15 +783,17 @@ impl MemoryAllocator {
 
 impl Drop for MemoryAllocator {
     fn drop(&mut self) {
-        if let Ok(mut resources) = self.dedicated_resources.lock() {
+        if let Ok(mut resources) = self.retained_buffers.lock() {
             for resource in resources.drain(..).rev() {
+                let RetainedBuffer {
+                    buffer,
+                    mut allocation,
+                } = resource;
                 unsafe {
-                    match resource {
-                        DedicatedResource::Buffer { buffer, memory } => {
-                            self.device.destroy_buffer(buffer, None);
-                            self.device.free_memory(memory, None);
-                        }
-                    }
+                    self.allocator
+                        .lock()
+                        .expect("VMA allocator mutex poisoned")
+                        .destroy_buffer(buffer, &mut allocation);
                 }
             }
         }

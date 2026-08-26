@@ -423,7 +423,9 @@ impl Info {
 
 /// Count total descriptors (sum of all `count` fields).
 pub fn num_descriptors<T: HasCount>(descriptors: &[T]) -> u32 {
-    descriptors.iter().map(|d| d.descriptor_count()).sum()
+    descriptors.iter().fold(0u32, |num, descriptor| {
+        num.wrapping_add(descriptor.descriptor_count())
+    })
 }
 
 /// Trait for descriptors that have a `count` field.
@@ -464,5 +466,30 @@ impl HasCount for TextureDescriptor {
 impl HasCount for ImageDescriptor {
     fn descriptor_count(&self) -> u32 {
         self.count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn num_descriptors_preserves_upstream_u32_wrapping() {
+        let descriptors = [
+            StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: u32::MAX,
+                is_written: false,
+            },
+            StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 2,
+                is_written: false,
+            },
+        ];
+
+        assert_eq!(num_descriptors(&descriptors), 1);
     }
 }

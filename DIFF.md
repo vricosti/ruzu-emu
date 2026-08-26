@@ -14234,3 +14234,34 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `BindlessSSBO` remains a 16-byte `repr(C)` payload (`u64`, `i32`, `i32`), matching Eden's
   four-`GLuint` static assertion. Focused tests also cover the unsigned-width alignment edge.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_compute_pipeline.rs` vs Eden `src/video_core/renderer_opengl/gl_compute_pipeline.{h,cpp}`
+
+### Intentional differences
+
+- Stable non-owning pointers and synchronized shared owners adapt Eden's references and raw
+  `MemoryManager*` to the renderer's Rust ownership graph; `SetEngine` still replaces both live
+  channel objects before `Configure` uses them.
+- `Configure` is split into file-local helpers so Rust can release the GPU-memory guard before
+  `FillImageViews` borrows the texture cache. The helpers retain Eden's operation order and remain
+  owned by the matching compute-pipeline file.
+- `SmallVec` supplies the inline storage of Eden's `static_vector`; checked insertion prevents its
+  heap-spill capability from changing the upstream fixed-capacity invariant.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Shader::NumDescriptors` and the constructor's combined texture/image counts now use
+  wrapping `u32` addition, preserving C++ unsigned arithmetic instead of panicking in debug Rust.
+- Resolved: sampler, texture, and image binding counters now use signed 32-bit `GLsizei` semantics
+  through indexing, scaling-mask shifts, and the final OpenGL calls.
+- Resolved: compute descriptor views and samplers can no longer grow beyond Eden's 80- and
+  64-element `static_vector` capacities.
+
+### Missing items
+
+- None in `ComputePipelineKey`, `ComputePipeline`, `Configure`, or `WaitForBuild`.
+
+### Binary layout verification
+
+- PASS: `ComputePipelineKey` is `repr(C)`, 24 bytes, with offsets 0/8/12 and no padding; hashing
+  and cache serialization cover the same complete byte representation as Eden.

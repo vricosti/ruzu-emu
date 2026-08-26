@@ -2416,7 +2416,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: this is host-global scalar state and is not serialized or copied to guest memory.
 
-## 2026-08-21 — macro dumping in `src/video_core/src/macro_engine/macro_engine.rs` vs Eden `src/video_core/macro.{h,cpp}`
+## 2026-08-21 — macro dumping in `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}`
 
 ### Intentional differences
 
@@ -15266,3 +15266,48 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the wrappers own host Vulkan/VMA handles and are not copied to guest memory or disk.
+
+## 2026-08-26 — `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses inline `macro_hle`, `macro_interpreter`, and x86-64-only `macro_jit_x64` scopes inside
+  the single physical `macro.rs` counterpart. They provide conditional compilation and name
+  scoping without moving any upstream-owned implementation into another source file.
+- `AnyCachedMacro::execute` receives the active `Maxwell3D` as a non-owning raw pointer,
+  corresponding to Eden's non-null reference. The pointer is never retained by an HLE,
+  interpreter, or JIT cache entry; this permits the enclosing Maxwell owner to pass itself through
+  Rust's enum dispatch.
+- The JIT state's second pointer addresses Maxwell's boxed register array instead of storing Eden's
+  `Core::System*`. Rust cannot emit a stable member offset into a non-`repr(C)` `Maxwell3D`; method
+  sends use the engine's owner-local system bridge, while register reads remain direct native
+  indexed loads.
+- Invalid macro-code and parameter indexing terminates through Rust bounds checks after reporting
+  the corresponding assertion. Eden's fail-soft assertion would otherwise continue into invalid
+  C++ span access, which has no defined behavior to preserve.
+
+### Unintentional differences (to fix)
+
+- Resolved: the former `macro_engine/` split and duplicate root `macro_interpreter.rs` were
+  consolidated into the single counterpart of Eden's `macro.h`/`macro.cpp`.
+- Resolved: `AnyCachedMacro` is one Rust enum mirroring Eden's `std::variant`; `CacheInfo` no longer
+  stores two boxed programs plus a discriminator, and `get_hle_program` is again a free function
+  rather than state owned by `MacroEngine`.
+- Resolved: cached HLE, interpreter, and JIT programs receive the current Maxwell owner on every
+  execution instead of retaining callbacks or the first engine pointer seen at compilation.
+- Resolved: HLE clear depth, transform-feedback byte-count draws, refreshed-topology fallbacks,
+  wrapping indirect sizes, replacement attributes, and cleanup ordering now follow the matching
+  `HLE_*::Execute`/`Fallback` implementations.
+- Resolved: interpreter assertions use Eden's fail-soft policy for validly recoverable cases, and
+  the x86-64 emitter follows Eden's optimizer, delay-slot, method-send, and parameter-fetch paths.
+
+### Missing items
+
+- None in the macro instruction representation, HLE table and implementations, interpreter,
+  x86-64 JIT, cache dispatch, rebased upload lookup, or macro dumping.
+
+### Binary layout verification
+
+- PASS: focused tests verify every opcode/method-address field and the native `u32` dump payload.
+  `JitState` remains 56 bytes on x86-64 with the two pointer slots, eight registers, and carry flag
+  at the same offsets as Eden; only the meaning of the second pointer is the documented adaptation.

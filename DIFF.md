@@ -14175,3 +14175,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the correction changes Vulkan attachment state and does not define or serialize a binary
   payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_blit_screen.rs` vs Eden `src/video_core/renderer_opengl/gl_blit_screen.{h,cpp}`
+
+### Intentional differences
+
+- Non-owning C++ references are represented by renderer-owned raw pointers/handles because the
+  referenced Rust objects must remain heap-stable while `RendererOpenGL` owns `BlitScreen`.
+- `current_window_adapt` is optional until the first pass is created; Eden's default enum value is
+  observationally irrelevant while its `window_adapt` pointer is null.
+- `GL_ALPHA_TEST` is declared locally because the generated core-profile Rust GL bindings omit this
+  compatibility enumerator that Eden still disables.
+
+### Unintentional differences (to fix)
+
+- Resolved: when an existing window-adaptation pass no longer matches the configured scaling
+  filter, Rust now performs Eden's second callback read before selecting the replacement pass. It
+  no longer reuses the value read for the early-return comparison.
+
+### Missing items
+
+- None in `FramebufferTextureInfo`, `BlitScreen::DrawScreen`, or
+  `BlitScreen::CreateWindowAdapt`.
+
+### Binary layout verification
+
+- N/A: the framebuffer texture metadata is an in-process typed descriptor and is not serialized by
+  raw memory copy in this path.

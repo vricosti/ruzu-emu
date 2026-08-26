@@ -14730,3 +14730,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: command enums and synchronization owners are process-local and are not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/codecs/vp9.rs` vs Eden `src/video_core/host1x/codecs/vp9.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the range encoder bytes directly in a `Vec<u8>` instead of wrapping Eden's
+  `Common::Stream`; indexed carry propagation preserves the same seek/peek/write order.
+- `DecoderImpl::compose_frame` returns an owned `Vec<u8>` across the Rust trait boundary instead of
+  Eden's span into `frame_scratch`; header and payload concatenation order is unchanged.
+
+### Unintentional differences (to fix)
+
+- Resolved: probability remapping and range normalization now use Eden's literal arithmetic and
+  `countl_zero` formulas. The removed `MAP_LUT` and `NORM_LUT` constants had no upstream owner and
+  obscured the bitstream comparison.
+- Resolved: unsigned range arithmetic and bit extraction preserve Eden's `u32` wrapping and shift
+  semantics explicitly, including in debug builds.
+
+### Missing items
+
+- None for VP9 header composition, probability/context updates, segmentation, frame buffering, or
+  range/bitstream encoding.
+
+### Binary layout verification
+
+- N/A: this file consumes the raw NVDEC layouts owned and verified in `vp9_types.rs`; its encoder
+  state and output vectors are process-local.

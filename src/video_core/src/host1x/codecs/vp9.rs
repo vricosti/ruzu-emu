@@ -145,33 +145,6 @@ const DEFAULT_PROBS: Vp9EntropyProbs = Vp9EntropyProbs {
     class_0_hp: [160, 160],
     high_precision: [128, 128],
 };
-const NORM_LUT: [u8; 256] = [
-    0, 7, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-];
-
-const MAP_LUT: [u8; 254] = [
-    20, 21, 22, 23, 24, 25, 0, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 1, 38, 39, 40, 41,
-    42, 43, 44, 45, 46, 47, 48, 49, 2, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 3, 62, 63,
-    64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 4, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 5,
-    86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 6, 98, 99, 100, 101, 102, 103, 104, 105, 106,
-    107, 108, 109, 7, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 8, 122, 123, 124,
-    125, 126, 127, 128, 129, 130, 131, 132, 133, 9, 134, 135, 136, 137, 138, 139, 140, 141, 142,
-    143, 144, 145, 10, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 11, 158, 159,
-    160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 12, 170, 171, 172, 173, 174, 175, 176, 177,
-    178, 179, 180, 181, 13, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 14, 194,
-    195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 15, 206, 207, 208, 209, 210, 211, 212,
-    213, 214, 215, 216, 217, 16, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 17,
-    230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 18, 242, 243, 244, 245, 246, 247,
-    248, 249, 250, 251, 252, 253, 19,
-];
-
 fn calc_min_log2_tile_cols(frame_width: i32) -> i32 {
     let sb64_cols = (frame_width + 63) / 64;
     let mut min_log2 = 0;
@@ -203,12 +176,17 @@ fn recenter_non_neg(new_prob: i32, old_prob: i32) -> i32 {
 fn remap_probability(mut new_prob: i32, mut old_prob: i32) -> i32 {
     new_prob -= 1;
     old_prob -= 1;
-    let index = if old_prob * 2 <= 0xff {
+    let i = if old_prob * 2 <= 0xff {
         (recenter_non_neg(new_prob, old_prob) - 1).max(0)
     } else {
         (recenter_non_neg(0xfe - new_prob, 0xfe - old_prob) - 1).max(0)
-    } as usize;
-    MAP_LUT[index] as i32
+    } as u8;
+    let i = i as i32;
+    if (i + 7) % 13 == 0 {
+        (i + 7) / 13 - 1
+    } else {
+        i + 20 - (i + 7) / 13
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -253,14 +231,19 @@ impl VpxRangeEncoder {
 
     /// Writes a bit encoded with the given probability.
     pub fn write_bool(&mut self, bit: bool, probability: i32) {
-        let split = 1 + (((self.range - 1) * probability as u32) >> 8);
+        let split =
+            1u32.wrapping_add(self.range.wrapping_sub(1).wrapping_mul(probability as u32) >> 8);
         let mut local_range = split;
         if bit {
             self.low_value = self.low_value.wrapping_add(split);
-            local_range = self.range - split;
+            local_range = self.range.wrapping_sub(split);
         }
 
-        let mut shift = NORM_LUT[local_range as usize] as i32;
+        let mut shift = if local_range == 0 {
+            0
+        } else {
+            local_range.leading_zeros() as i32 - 24
+        };
         local_range <<= shift;
         self.count += shift;
 
@@ -390,11 +373,11 @@ impl VpxBitStreamWriter {
             let free_bits = self.get_free_buffer_bits();
             let copy_size = remaining.min(free_bits);
 
-            let mask = (1i32 << copy_size) - 1;
+            let mask = (1u32 << copy_size) - 1;
             let src_shift = (bit_count as i32 - value_pos as i32) - copy_size;
             let dst_shift = (self.buffer_size - self.buffer_pos) - copy_size;
 
-            self.buffer |= (((value as i32) >> src_shift) & mask) << dst_shift;
+            self.buffer |= (((value >> src_shift) & mask) << dst_shift) as i32;
 
             value_pos += copy_size as u32;
             self.buffer_pos += copy_size;
@@ -1182,14 +1165,12 @@ mod tests {
     }
 
     #[test]
-    fn probability_tables_match_vp9_reference_boundaries() {
+    fn probability_defaults_and_remapping_match_upstream_boundaries() {
         assert_eq!(DEFAULT_PROBS.y_mode_prob[0], 65);
         assert_eq!(DEFAULT_PROBS.coef_probs[0], 195);
         assert_eq!(DEFAULT_PROBS.coef_probs[1727], 6);
         assert_eq!(DEFAULT_PROBS.high_precision, [128, 128]);
-        assert_eq!(NORM_LUT[1], 7);
-        assert_eq!(NORM_LUT[128], 0);
-        assert_eq!(MAP_LUT[0], 20);
-        assert_eq!(MAP_LUT[253], 19);
+        assert_eq!(remap_probability(1, 1), 20);
+        assert_eq!(remap_probability(255, 1), 19);
     }
 }

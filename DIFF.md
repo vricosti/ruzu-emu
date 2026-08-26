@@ -13562,3 +13562,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `ConstBufferInfo` is 16 bytes with alignment 8; `address`, `size`, and `enabled` are at
   offsets 0, 8, and 12 respectively. Focused tests also verify value-initialized defaults.
+
+## 2026-08-26 — `src/video_core/src/control/scheduler.rs` vs Eden `src/video_core/control/scheduler.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores the channel map inside the mutex that represents Eden's `scheduling_guard`, rather
+  than keeping the map and mutex as separate fields.
+- A channel is retained as `Arc<Mutex<ChannelState>>` instead of `shared_ptr<ChannelState>`. The
+  per-channel lock provides Rust's required synchronization while the map lock is still released
+  before DMA push and dispatch, preserving Eden's global-lock scope.
+- Missing channels and uninitialized DMA pushers panic through `expect`; these correspond to Eden's
+  assertion and required initialized `payload` invariant.
+
+### Unintentional differences (to fix)
+
+- None after replacing `HashMap::insert` with entry insertion. Declaring a duplicate channel now
+  preserves the first entry like Eden's `unordered_dense::map::emplace` instead of replacing it.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: scheduler state is host-only synchronization and ownership state.

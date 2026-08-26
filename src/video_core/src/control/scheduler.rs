@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/control/scheduler.h and scheduler.cpp
+//! Port of Eden's `video_core/control/scheduler.h` and `scheduler.cpp`.
 //!
 //! The `Scheduler` receives command lists from host threads and dispatches
 //! them to the correct GPU channel's DMA pusher under a global scheduling
@@ -67,7 +67,7 @@ impl Scheduler {
     /// Corresponds to `Scheduler::DeclareChannel(shared_ptr<ChannelState>)`.
     pub fn declare_channel(&self, new_channel: Arc<Mutex<ChannelState>>) {
         let bind_id = new_channel.lock().bind_id;
-        self.channels.lock().insert(bind_id, new_channel);
+        self.channels.lock().entry(bind_id).or_insert(new_channel);
     }
 }
 
@@ -83,5 +83,18 @@ mod tests {
         sched.declare_channel(cs);
 
         assert!(sched.channels.lock().contains_key(&5));
+    }
+
+    #[test]
+    fn declaring_an_existing_channel_preserves_the_first_entry_like_emplace() {
+        let sched = Scheduler::new();
+        let first = Arc::new(Mutex::new(ChannelState::new(5)));
+        let duplicate = Arc::new(Mutex::new(ChannelState::new(5)));
+
+        sched.declare_channel(Arc::clone(&first));
+        sched.declare_channel(duplicate);
+
+        let channels = sched.channels.lock();
+        assert!(Arc::ptr_eq(channels.get(&5).unwrap(), &first));
     }
 }

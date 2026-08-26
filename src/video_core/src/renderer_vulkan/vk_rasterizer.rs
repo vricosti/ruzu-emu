@@ -1433,7 +1433,11 @@ impl RasterizerVulkan {
             self.texture_cache.commit_async_flushes();
             self.common_buffer_cache.commit_async_flushes();
         }
-        self.query_cache.commit_async_flushes(&mut self.scheduler);
+        let this = self as *mut Self;
+        self.query_cache
+            .commit_async_flushes(&mut self.scheduler, move |operation| unsafe {
+                (*this).sync_operation(operation);
+            });
     }
 
     /// Callback adaptation of upstream `FenceManager::SignalOrdering`, which
@@ -3148,8 +3152,11 @@ impl RasterizerInterface for RasterizerVulkan {
             );
             return;
         }
+        let this = self as *mut Self;
         self.query_cache
-            .counter_reset(&mut self.scheduler, query_type);
+            .counter_reset(&mut self.scheduler, query_type, move |operation| unsafe {
+                (*this).sync_operation(operation);
+            });
     }
 
     fn query(
@@ -3459,7 +3466,11 @@ impl RasterizerInterface for RasterizerVulkan {
             flags |= vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT;
         }
 
-        self.query_cache.notify_wfi();
+        let this = self as *mut Self;
+        self.query_cache
+            .notify_wfi(&mut self.scheduler, move |operation| unsafe {
+                (*this).sync_operation(operation);
+            });
 
         let device = self.device;
         let event = self.wfi_event;

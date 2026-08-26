@@ -15638,3 +15638,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `QueryLocation` remains a 32-bit packed value with a 27-bit query id and 5-bit stream id;
   the new regression test verifies wrapping accumulation at the `u64` boundary.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/query_cache.rs`, `vk_rasterizer.rs`, and `query_cache/query_cache_base.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}` and `query_cache/query_cache.h`
+
+### Intentional differences
+
+- Vulkan query banks and reports use `Arc` ownership so fence-thread callbacks cannot outlive a
+  bank. Samples reports materialize Eden's bank chain as ordered spans; transform-feedback reports
+  retain a persistently mapped per-bank readback mirror instead of a movable staging-pool slice.
+- The shared query-cache owner exposes the three mechanical WFI phases separately. This lets the
+  Vulkan-owned streamers join the single Eden barrier pair without storing a pointer to the movable
+  Rust rasterizer; `notify_wfi` itself still performs the original phase order unchanged.
+
+### Unintentional differences (to fix)
+
+- Resolved: samples queries now implement Eden's complete pending-sync lifecycle, accumulation
+  checkpoints, reset operations, current-query replication, amendment carry, ordered bank resolve,
+  mobile-driver guard, and post-presync history abandonment.
+- Resolved: the accumulation buffer has Eden's transfer-source usage and is cleared during streamer
+  construction; repeated WFI operations no longer recopy an unbounded history.
+- Resolved: transform-feedback counters now participate in WFI guest-buffer synchronization and
+  async host readback, while primitive queries reuse Eden's last byte-count query and stride when
+  one exists.
+- Resolved: `QueryCacheRuntime` again owns all Vulkan streamers, the conditional-rendering resolve
+  buffer is created on unsupported hosts with only the supported usage flags, and guest-generated
+  and host-buffer sync values share the same page grouping logic.
+
+### Missing items
+
+- A live Vulkan query-pool validation remains necessary because unit tests cannot execute recorded
+  device commands.
+
+### Binary layout verification
+
+- N/A: the corrected query bookkeeping and synchronization payloads are host-only Rust structures;
+  no raw guest or cache serialization layout changed.

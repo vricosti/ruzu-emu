@@ -565,28 +565,42 @@ impl QueryCacheBase {
     /// syncs all pending streamer writes via PresyncWrites / SyncWrites and
     /// issues a runtime Barrier pair.
     pub fn notify_wfi(&mut self) {
+        if !self.has_pending_sync() {
+            return;
+        }
+        self.presync_writes();
+        if let Some(runtime) = self.impl_.runtime_mut() {
+            runtime.barriers(true);
+        }
+        self.sync_writes();
+        if let Some(runtime) = self.impl_.runtime_mut() {
+            runtime.barriers(false);
+        }
+    }
+
+    /// Mechanical phases of `NotifyWFI`, exposed so a backend-owned streamer
+    /// can join the single upstream barrier pair.
+    pub(crate) fn has_pending_sync(&self) -> bool {
         let mut should_sync = false;
         self.impl_.for_each_streamer(|streamer| {
             should_sync |= streamer.has_pending_sync();
             false
         });
-        if !should_sync {
-            return;
-        }
+        should_sync
+    }
+
+    pub(crate) fn presync_writes(&mut self) {
         self.impl_.for_each_streamer_mut(|streamer| {
             streamer.presync_writes();
             false
         });
-        if let Some(runtime) = self.impl_.runtime_mut() {
-            runtime.barriers(true);
-        }
+    }
+
+    pub(crate) fn sync_writes(&mut self) {
         self.impl_.for_each_streamer_mut(|streamer| {
             streamer.sync_writes();
             false
         });
-        if let Some(runtime) = self.impl_.runtime_mut() {
-            runtime.barriers(false);
-        }
     }
 
     /// Attempt to use host-side conditional rendering.

@@ -167,6 +167,11 @@ pub struct Gpu {
     /// Upstream: `VideoCommon::GPUThread::ThreadManager gpu_thread` in GPU::Impl.
     gpu_thread: Mutex<crate::gpu_thread::ThreadManager>,
 
+    /// Lazily-created CPU graphics context used only by synchronous
+    /// single-core execution. Upstream: `GPU::Impl::cpu_context`.
+    cpu_context:
+        Mutex<Option<Box<dyn ruzu_core::frontend::graphics_context::GraphicsContext + Send>>>,
+
     /// Registered GPU channels.
     /// Upstream: `std::unordered_map<s32, std::shared_ptr<ChannelState>> channels`.
     channels:
@@ -224,6 +229,7 @@ impl Gpu {
                 SystemRef::null(),
                 is_async,
             )),
+            cpu_context: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
             guest_memory_reader: Mutex::new(None),
             guest_memory_writer: Mutex::new(None),
@@ -681,6 +687,37 @@ impl Gpu {
         self.sync_request_cv.notify_all();
     }
 
+    /// Obtain the CPU graphics context for synchronous single-core GPU work.
+    ///
+    /// Port of `GPU::Impl::ObtainContext`: create the shared context lazily,
+    /// then make it current on the calling CPU thread.
+    pub fn obtain_context(&self) {
+        let mut cpu_context = self.cpu_context.lock().unwrap();
+        if cpu_context.is_none() {
+            let renderer = self.renderer.lock().unwrap();
+            let renderer = renderer
+                .as_ref()
+                .expect("GPU::ObtainContext requires a bound renderer");
+            *cpu_context = Some(renderer.create_shared_context());
+        }
+        cpu_context
+            .as_mut()
+            .expect("CPU context was just initialized")
+            .make_current();
+    }
+
+    /// Release the CPU graphics context from the calling thread.
+    ///
+    /// Port of `GPU::Impl::ReleaseContext`.
+    pub fn release_context(&self) {
+        self.cpu_context
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("GPU::ReleaseContext requires an obtained context")
+            .done_current();
+    }
+
     /// Push GPU command entries to be processed.
     /// Matches upstream `GPU::Impl::PushGPUEntries(s32, CommandList&&)`.
     pub fn push_gpu_entries(&self, channel: i32, entries: CommandList) {
@@ -791,9 +828,8 @@ impl Gpu {
         let gpu_addr = self as *const Gpu as usize;
         let pending_fence = self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            let valid_fences: Vec<NvFence> =
-                fences.into_iter().filter(|fence| fence.id >= 0).collect();
-            if valid_fences.is_empty() {
+            let num_fences = fences.len();
+            if num_fences == 0 {
                 gpu.composite_layers(&layers);
                 return;
             }
@@ -802,14 +838,14 @@ impl Gpu {
             let Some(host1x) = system.get().host1x_core() else {
                 log::warn!(
                     "Gpu::request_composite missing host1x_core; composing without {} fences",
-                    valid_fences.len()
+                    num_fences
                 );
                 gpu.composite_layers(&layers);
                 return;
             };
 
-            let current_request_counter = gpu.allocate_request_swap_counter(valid_fences.len());
-            for fence in valid_fences {
+            let current_request_counter = gpu.allocate_request_swap_counter(num_fences);
+            for fence in fences {
                 let layers = layers.clone();
                 host1x.register_guest_action(
                     fence.id as u32,
@@ -1118,6 +1154,14 @@ impl GpuCoreInterface for Gpu {
         Gpu::notify_shutdown(self);
     }
 
+    fn obtain_context(&self) {
+        Gpu::obtain_context(self);
+    }
+
+    fn release_context(&self) {
+        Gpu::release_context(self);
+    }
+
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool {
         Gpu::on_cpu_write(self, addr, size)
     }
@@ -1152,6 +1196,20 @@ mod tests {
         RasterizerDownloadArea, RasterizerHandle, RasterizerInterface,
     };
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+    struct RecordingGraphicsContext {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl ruzu_core::frontend::graphics_context::GraphicsContext for RecordingGraphicsContext {
+        fn make_current(&mut self) {
+            self.events.lock().unwrap().push("make_current");
+        }
+
+        fn done_current(&mut self) {
+            self.events.lock().unwrap().push("done_current");
+        }
+    }
 
     struct FakeRasterizer {
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
@@ -1380,6 +1438,24 @@ mod tests {
         let counters = gpu.request_swap_counters.lock().unwrap();
         assert_eq!(counters.request_swap_counters.len(), 1);
         assert_eq!(counters.free_swap_counters.front().copied(), Some(first));
+    }
+
+    #[test]
+    fn cpu_context_matches_upstream_obtain_and_release_lifecycle() {
+        let gpu = Gpu::new(false, false);
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        *gpu.cpu_context.lock().unwrap() = Some(Box::new(RecordingGraphicsContext {
+            events: Arc::clone(&events),
+        }));
+
+        gpu.obtain_context();
+        gpu.obtain_context();
+        gpu.release_context();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["make_current", "make_current", "done_current"]
+        );
     }
 
     #[test]

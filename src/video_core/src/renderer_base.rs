@@ -10,6 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::framebuffer_config::FramebufferConfig;
 pub use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
+/// Context used by renderers that do not require a host graphics context.
+///
+/// This is the Rust counterpart of the dummy context returned by non-OpenGL
+/// `EmuWindow::CreateSharedContext()` implementations.
+pub struct DummyGraphicsContext;
+
+impl ruzu_core::frontend::graphics_context::GraphicsContext for DummyGraphicsContext {}
+
 /// Renderer settings (screenshots, etc.).
 pub struct RendererSettings {
     pub screenshot_requested: AtomicBool,
@@ -52,6 +60,17 @@ pub trait RendererBase: Send {
     /// Matches upstream `RendererBase::Context()`.
     /// The returned pointer is valid for the lifetime of the renderer.
     fn context_ptr(&mut self) -> *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext;
+
+    /// Create the CPU-thread context used by `GPU::ObtainContext()` in
+    /// synchronous single-core mode.
+    ///
+    /// Upstream delegates this to `GetRenderWindow().CreateSharedContext()`.
+    /// Non-OpenGL backends use a context with no host-side work.
+    fn create_shared_context(
+        &self,
+    ) -> Box<dyn ruzu_core::frontend::graphics_context::GraphicsContext + Send> {
+        Box::new(DummyGraphicsContext)
+    }
 
     /// Finalize rendering the guest frame and draw into the presentation texture.
     fn composite(&mut self, layers: &[FramebufferConfig]);

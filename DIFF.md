@@ -14490,3 +14490,71 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: contexts and object pools are process-local allocation owners and are never raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
+
+### Intentional differences
+
+- `Mutex<Option<Box<dyn GraphicsContext + Send>>>` replaces Eden's thread-confined
+  `unique_ptr<GraphicsContext>` while preserving lazy construction and GPU ownership.
+- The renderer exposes shared-context construction through the split-crate `RendererBase` trait;
+  Eden reaches the same frontend owner through `RendererBase::GetRenderWindow()`.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Gpu::obtain_context` and `Gpu::release_context` now reproduce Eden's lazy shared-context
+  creation, `MakeCurrent`, and `DoneCurrent` lifecycle. The CPU context was previously absent.
+- Resolved: `RequestComposite` now counts and registers the exact fence vector supplied by its
+  caller. The removed negative-ID filter changed Eden's invalid-input behavior and counter size.
+
+### Missing items
+
+- `ReleaseChannel` remains deliberately unimplemented exactly as in Eden.
+
+### Binary layout verification
+
+- N/A: `Gpu` is a process-local orchestrator and is never raw-serialized.
+
+## 2026-08-26 — `src/core/src/{cpu_manager.rs,gpu_core.rs}` vs Eden `src/core/cpu_manager.cpp` and `src/video_core/gpu.h`
+
+### Intentional differences
+
+- `GpuCoreInterface` bridges the crate boundary that Eden does not have. Its context methods forward
+  directly to the concrete GPU owner.
+- Context acquisition skips only null-system unit-test kernels; an initialized system still
+  requires a GPU exactly where Eden dereferences `system.GPU()`.
+
+### Unintentional differences (to fix)
+
+- Resolved: the synchronous single-core CPU thread now calls `obtain_context` after the GPU barrier,
+  at the same point and under the same `!is_async_gpu && !is_multicore` condition as Eden.
+
+### Missing items
+
+- None for the `CpuManager::RunThread` graphics-context handoff.
+
+### Binary layout verification
+
+- N/A: these interfaces and thread owners are not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/{renderer_base.rs,renderer_opengl/renderer_opengl.rs}` vs Eden `src/video_core/renderer_base.h` and `src/video_core/renderer_opengl/renderer_opengl.{h,cpp}`
+
+### Intentional differences
+
+- The frontend-provided `SharedContextFactory` is retained by `RendererOpenGL` in place of Eden's
+  retained `EmuWindow&`; both create a fresh shared context per request.
+- Non-OpenGL renderers inherit a no-op graphics context, matching their frontend dummy-context
+  behavior without adding backend-specific state.
+
+### Unintentional differences (to fix)
+
+- Resolved: OpenGL shared-context creation is now non-optional at renderer construction and remains
+  available to `GPU::ObtainContext`, rather than being consumed solely by shader workers.
+
+### Missing items
+
+- None for shared-context creation used by the GPU CPU thread.
+
+### Binary layout verification
+
+- N/A: renderer traits, contexts, and factories are process-local owners.

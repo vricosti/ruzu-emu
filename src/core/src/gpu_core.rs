@@ -123,6 +123,13 @@ pub trait GpuCoreInterface: Any + Send {
     /// Mirrors the upstream `GPU::NotifyShutdown()`.
     fn notify_shutdown(&self) {}
 
+    /// Mirrors the upstream `GPU::ObtainContext()` call made by the
+    /// synchronous single-core CPU thread.
+    fn obtain_context(&self) {}
+
+    /// Mirrors upstream `GPU::ReleaseContext()` for frontend teardown.
+    fn release_context(&self) {}
+
     /// Bridges `GPU::Renderer().GetDeviceVendor()` across the split crates.
     fn get_device_vendor(&self) -> String {
         String::new()

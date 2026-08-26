@@ -662,7 +662,7 @@ fn run_boot(
                         unsafe { gpu.shader_notify_handle() },
                         false,
                         context,
-                        Some(shared_context_factory),
+                        shared_context_factory,
                         Arc::clone(&framebuffer_layout),
                         Arc::clone(&frame_end_notify),
                         Arc::clone(&frame_displayed_notify),

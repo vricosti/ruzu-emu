@@ -1131,7 +1131,7 @@ fn main() {
                         unsafe { gpu.shader_notify_handle() },
                         strict_gl_context_required,
                         context,
-                        Some(shared_context_factory),
+                        shared_context_factory,
                         Arc::clone(framebuffer_layout),
                         frame_end_notify,
                         frame_displayed_notify,

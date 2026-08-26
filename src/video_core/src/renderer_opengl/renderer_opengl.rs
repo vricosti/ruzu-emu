@@ -157,6 +157,10 @@ pub struct RendererOpenGL {
     /// OpenGL resources above.
     /// Upstream: `std::unique_ptr<Core::Frontend::GraphicsContext> context` in RendererBase.
     context: Box<dyn GraphicsContext + Send>,
+    /// Frontend-owned equivalent of
+    /// `render_window.CreateSharedContext()`. Shader workers and the GPU CPU
+    /// thread each request independent shared contexts from this same owner.
+    shared_context_factory: gl_shader_context::SharedContextFactory,
 }
 
 // The renderer and its OpenGL-owned state move to, then remain on, the render
@@ -177,7 +181,7 @@ impl RendererOpenGL {
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
         strict_context_required: bool,
         mut context: Box<dyn GraphicsContext + Send>,
-        shared_context_factory: Option<gl_shader_context::SharedContextFactory>,
+        shared_context_factory: gl_shader_context::SharedContextFactory,
         framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
         frame_end_notify: Arc<dyn Fn() + Send + Sync>,
         frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
@@ -228,7 +232,7 @@ impl RendererOpenGL {
             device_memory,
             Arc::clone(&program_manager),
             state_tracker.as_mut(),
-            shared_context_factory,
+            Some(Arc::clone(&shared_context_factory)),
             shader_notify,
         ));
         rasterizer.set_device_memory_reader(Arc::clone(&device_memory_reader));
@@ -334,6 +338,7 @@ impl RendererOpenGL {
             base_data: RendererBaseData::new(),
             framebuffer_layout,
             context,
+            shared_context_factory,
         })
     }
 
@@ -522,6 +527,10 @@ impl RendererOpenGL {
 impl RendererBase for RendererOpenGL {
     fn context_ptr(&mut self) -> *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext {
         &mut *self.context as *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext
+    }
+
+    fn create_shared_context(&self) -> Box<dyn GraphicsContext + Send> {
+        (self.shared_context_factory)()
     }
 
     fn composite(&mut self, layers: &[FramebufferConfig]) {

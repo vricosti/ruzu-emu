@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/bank_base.h
+//! Port of Eden's `src/video_core/query_cache/bank_base.h`.
 //!
 //! Provides the base bank allocation type (`BankBase`) and a pool manager (`BankPool`)
 //! used by the query cache to manage slots for host queries.

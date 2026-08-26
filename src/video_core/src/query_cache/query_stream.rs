@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/query_stream.h
+//! Port of Eden's `src/video_core/query_cache/query_stream.h`.
 //!
 //! Defines `StreamerInterface`, the shared non-virtual streamer state and
 //! interface, plus `SimpleStreamer<Q>`, the slot-backed generic streamer owner.

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/query_base.h
+//! Port of Eden's `src/video_core/query_cache/query_base.h`.
 //!
 //! Defines the base query types: `QueryBase`, `GuestQuery`, and `HostQueryBase`,
 //! along with the `QueryFlagBits` bitflags used to track query state.

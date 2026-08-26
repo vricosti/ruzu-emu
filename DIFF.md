@@ -15614,3 +15614,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `PteKind` is `repr(transparent)` over `u8`; focused tests cover the sparse corrected values
   and pitch-kind predicate.
+
+## 2026-08-26 — `src/video_core/src/query_cache/query_cache_base.rs` vs Eden `src/video_core/query_cache/query_cache_base.h` and `query_cache.h`
+
+### Intentional differences
+
+- C++ template dependencies are represented by bound Rust trait-object owners; counter, cache,
+  conditional-rendering, and async-flush ordering remains in `QueryCacheBase`.
+
+### Unintentional differences (to fix)
+
+- Resolved: address calculations and query accumulation now retain Eden's unsigned wrapping
+  behavior in debug builds instead of relying on Rust's overflow-checked `+`.
+- Resolved: query-cache module headers now identify the actual Eden source counterparts rather
+  than the stale pre-fork project name.
+
+### Missing items
+
+- The generic lifecycle hooks are present. The Vulkan samples streamer still needs to be wired
+  through the complete `PresyncWrites`/`SyncWrites` lifecycle in its owning backend file.
+
+### Binary layout verification
+
+- PASS: `QueryLocation` remains a 32-bit packed value with a 27-bit query id and 5-bit stream id;
+  the new regression test verifies wrapping accumulation at the `u64` boundary.

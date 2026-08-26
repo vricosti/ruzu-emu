@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/query_cache_base.h
+//! Port of Eden's `src/video_core/query_cache/query_cache_base.h`.
 //!
 //! Defines `QueryCacheBase`, the core query-cache manager that tracks cached
 //! queries by page address, handles invalidation, flushing, and region-dirty
@@ -459,7 +459,7 @@ impl QueryCacheBase {
             };
             if let Some(device_memory) = self.impl_.device_memory_mut() {
                 if has_timestamp {
-                    device_memory.write_u64(cpu_addr + 8, timestamp);
+                    device_memory.write_u64(cpu_addr.wrapping_add(8), timestamp);
                     device_memory.write_u64(cpu_addr, payload as u64);
                 } else {
                     device_memory.write_u32(cpu_addr, payload);
@@ -503,7 +503,7 @@ impl QueryCacheBase {
                 .get_streamer_for_query_type(streamer_id)
                 .map(|streamer| streamer.get_amend_value())
                 .unwrap_or(0);
-            let final_value = query_value + amend_value;
+            let final_value = query_value.wrapping_add(amend_value);
             if let Some(query) = owner.impl_.obtain_query_mut(query_location) {
                 query.value = final_value;
             }
@@ -521,7 +521,7 @@ impl QueryCacheBase {
             };
             if let Some(device_memory) = owner.impl_.device_memory_mut() {
                 if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) {
-                    device_memory.write_u64(cpu_addr + 8, timestamp);
+                    device_memory.write_u64(cpu_addr.wrapping_add(8), timestamp);
                     device_memory.write_u64(cpu_addr, final_value);
                 } else {
                     device_memory.write_u32(cpu_addr, final_value as u32);
@@ -678,7 +678,11 @@ impl QueryCacheBase {
             }
             ComparisonMode::IfEqual => {
                 let object_1 = gen_lookup(self, render_condition_state.address, &mut qc_dirty);
-                let object_2 = gen_lookup(self, render_condition_state.address + 16, &mut qc_dirty);
+                let object_2 = gen_lookup(
+                    self,
+                    render_condition_state.address.wrapping_add(16),
+                    &mut qc_dirty,
+                );
                 let Some(runtime) = self.impl_.runtime_mut() else {
                     return false;
                 };
@@ -687,7 +691,11 @@ impl QueryCacheBase {
             }
             ComparisonMode::IfNotEqual => {
                 let object_1 = gen_lookup(self, render_condition_state.address, &mut qc_dirty);
-                let object_2 = gen_lookup(self, render_condition_state.address + 16, &mut qc_dirty);
+                let object_2 = gen_lookup(
+                    self,
+                    render_condition_state.address.wrapping_add(16),
+                    &mut qc_dirty,
+                );
                 let Some(runtime) = self.impl_.runtime_mut() else {
                     return false;
                 };
@@ -856,7 +864,7 @@ impl QueryCacheBase {
         F: FnMut(QueryLocation) -> bool,
     {
         let addr_begin = addr;
-        let addr_end = addr_begin + size as u64;
+        let addr_end = addr_begin.wrapping_add(size as u64);
         let page_end = addr_end >> DEVICE_PAGEBITS;
 
         let _lock = cache_mutex.lock().unwrap();
@@ -865,8 +873,8 @@ impl QueryCacheBase {
             let page_start = page << DEVICE_PAGEBITS;
 
             let in_range = |query_offset: u32| -> bool {
-                let cache_begin = page_start + query_offset as u64;
-                let cache_end = cache_begin + std::mem::size_of::<u32>() as u64;
+                let cache_begin = page_start.wrapping_add(query_offset as u64);
+                let cache_end = cache_begin.wrapping_add(std::mem::size_of::<u32>() as u64);
                 cache_begin < addr_end && addr_begin < cache_end
             };
 
@@ -1740,6 +1748,41 @@ mod tests {
             .cached_queries
             .get(&(0x5500 >> DEVICE_PAGEBITS))
             .is_none_or(|contents| contents.is_empty()));
+    }
+
+    #[test]
+    fn counter_report_accumulation_uses_upstream_unsigned_wrapping() {
+        let _gpu_accuracy =
+            crate::test_support::GpuAccuracyGuard::set(common::settings_enums::GpuAccuracy::High);
+
+        let mut cache = QueryCacheBase::new();
+        let mut payload_streamer =
+            CountingStreamer::new(QueryType::Payload as usize, QueryBase::new());
+        payload_streamer.base.amend_value = u64::MAX;
+        let mut device_memory = CountingDeviceMemory::default();
+        let mut gpu_memory = CountingGpuMemory::default();
+        let mut gpu = CountingGpu { ticks: 0 };
+        let mut rasterizer = CountingRasterizer::default();
+        gpu_memory.translations.insert(0xA000, 0x6600);
+
+        cache
+            .impl_
+            .register_streamer(QueryType::Payload as usize, &mut payload_streamer);
+        cache.bind_device_memory(&mut device_memory);
+        cache.bind_gpu_memory(&mut gpu_memory);
+        cache.bind_gpu(&mut gpu);
+        cache.bind_rasterizer(&mut rasterizer);
+
+        cache.counter_report(
+            0xA000,
+            QueryType::Payload,
+            QueryPropertiesFlags::empty(),
+            2,
+            0,
+        );
+
+        assert_eq!(payload_streamer.query.value, 1);
+        assert_eq!(device_memory.writes32, vec![(0x6600, 1)]);
     }
 
     #[test]

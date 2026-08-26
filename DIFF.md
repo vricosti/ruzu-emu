@@ -16651,3 +16651,49 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests pin every fixed structure's size and the field offsets of `ImageCopy`.
   Pointer-width-specific tests pin the 64-bit layouts and field offsets of `BufferImageCopy`,
   `BufferCopy`, and `SwizzleParameters`, plus their expected 32-bit sizes.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/util.rs`, `image_base.rs`, and `texture_cache_base.rs` vs Eden `src/video_core/texture_cache/util.{h,cpp}`, `image_base.{h,cpp}`, and `texture_cache.h`
+
+### Intentional differences
+
+- `UnswizzleImage` consumes bytes already read by the common cache, and `SwizzleImage` receives
+  read/write callbacks. Eden passes `Tegra::MemoryManager` directly; the Rust split avoids holding
+  a memory-manager lock across mutable texture-cache borrows while preserving the same unsafe
+  read, read-modify-write, guest-offset, and layer ordering.
+- `is_valid_entry_with_range_valid` is a mechanical callback form used while the common cache
+  already owns the channel-memory lock; it performs Eden's address-only translation followed by
+  the exact sized-range translation in the same order.
+- Rust rejects undersized spans and mip counts that would make slice indexing out of bounds after
+  Eden's fail-soft assertion. Valid inputs retain Eden's behavior without reproducing C++ undefined
+  behavior. It also returns early for an invalid zero-byte pixel format before invoking decoders;
+  Eden relies on callers never supplying that invalid format.
+- `CommonTextureCacheParams`, the backend-neutral Rust test policy, now allocates the requested
+  mapped staging span. Eden always obtains such a span from a concrete renderer runtime; this
+  target-only policy keeps common-cache tests subject to that same contract.
+- Eden's `FixSmallVectorADL` works around a Boost/GCC 12 ADL defect. Rust has no Boost range
+  niebloids, so no equivalent compatibility copy is required.
+
+### Unintentional differences (to fix)
+
+- None after restoring `NumBlocks`, `AdjustSize`, `CalculateLevelOffset`,
+  `SwizzlePitchLinearImage`, and `SwizzleBlockLinearImage` as their upstream-owned helpers and
+  routing their callers through them.
+- None after restoring Eden's layer-size/stride calculation, 16-level bounds and error behavior,
+  linear mip-size behavior, generic alignment arithmetic, fail-soft invariants, value-initialized
+  image-view fallback, and unsigned integer bit patterns.
+- None after restoring 3D mip-depth reduction and slice bounds in overlap/subresource checks,
+  block-linear swizzle's default stride alignment of one, reusable ASTC decode scratch storage,
+  exact pitch-linear offsets, and full-span processing instead of silent truncation.
+- None after replacing heap-first `Vec` results and `ImageBase` slice storage with the upstream
+  16-element inline `SmallVec` containers.
+
+### Missing items
+
+- None in the audited `util.h`/`util.cpp` API, private helper set, image-layout calculations,
+  copy generation, conversion, swizzle/unswizzle, overlap resolution, or map-size selection.
+
+### Binary layout verification
+
+- N/A: the changed arrays and small vectors are host-side containers and are not raw-copied or
+  serialized. The copy descriptor layouts remain covered by the `types.rs` layout tests; focused
+  tests additionally pin Eden's compile-time layout-size oracles and the 16-entry inline capacity.

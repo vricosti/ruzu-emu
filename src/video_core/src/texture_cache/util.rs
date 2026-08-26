@@ -6,9 +6,8 @@
 //! Utility functions for the texture cache: size/offset calculations,
 //! swizzle/unswizzle, copy generation, subresource lookup, and more.
 //!
-//! util.cpp is ~1 500 lines of dense GPU-texture math.  Method signatures
-//! and constant definitions are ported in full; complex bodies are stubbed
-//! with `todo!()` and will be filled as dependent types are completed.
+//! The helper and public-function boundaries mirror the upstream owner so the
+//! dense layout and overlap calculations remain directly reviewable.
 
 use crate::textures::texture::TicEntry;
 
@@ -23,29 +22,45 @@ use crate::textures::decoders::{
     GOB_SIZE_Z_SHIFT,
 };
 use common::scratch_buffer::ScratchBuffer;
+use smallvec::{smallvec, SmallVec};
+
+fn assert_fail_soft(condition: bool, message: impl FnOnce() -> String) {
+    if condition {
+        return;
+    }
+    let message = message();
+    log::error!("{message}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("{message}");
+    }
+}
 
 // ── Alignment helpers ─────────────────────────────────────────────────
 
 fn align_up_log2(value: u32, alignment_log2: u32) -> u32 {
     let mask = (1u32 << alignment_log2) - 1;
-    (value + mask) & !mask
+    value.wrapping_add(mask) & !mask
 }
 
 fn div_ceil(a: u32, b: u32) -> u32 {
-    (a + b - 1) / b
+    a.wrapping_add(b).wrapping_sub(1) / b
 }
 
 fn div_ceil_log2(value: u32, shift: u32) -> u32 {
     let mask = (1u32 << shift) - 1;
-    (value + mask) >> shift
+    value.wrapping_add(mask) >> shift
 }
 
 fn align_up(value: u32, alignment: u32) -> u32 {
     if alignment == 0 {
         return value;
     }
-    let mask = alignment - 1;
-    (value + mask) & !mask
+    let remainder = value % alignment;
+    if remainder == 0 {
+        value
+    } else {
+        value.wrapping_sub(remainder).wrapping_add(alignment)
+    }
 }
 
 // ── Type aliases matching upstream ─────────────────────────────────────
@@ -86,7 +101,7 @@ fn adjust_tile_size_scalar(shift: u32, unit_factor: u32, dimension: u32) -> u32 
         return 0;
     }
     let mut s = shift;
-    let mut x = unit_factor << (s - 1);
+    let mut x = unit_factor.wrapping_shl(s - 1);
     if x >= dimension {
         while s > 0 {
             s -= 1;
@@ -112,7 +127,9 @@ fn adjust_mip_block_size_impl(
     mut level: u32,
 ) -> u32 {
     loop {
-        while block_size > 0 && num_tiles <= (1u32 << (block_size - 1)) * gob_extent {
+        while block_size > 0
+            && num_tiles <= 1u32.wrapping_shl(block_size - 1).wrapping_mul(gob_extent)
+        {
             block_size -= 1;
         }
         if level == 0 {
@@ -149,6 +166,20 @@ fn adjust_tile_size_3d(size: Extent3D, tile_size: Extent2D) -> Extent3D {
         height: div_ceil(size.height, tile_size.height),
         depth: size.depth,
     }
+}
+
+/// Port of `NumBlocks`.
+fn num_blocks(size: Extent3D, tile_size: Extent2D) -> u32 {
+    let num_blocks = adjust_tile_size_3d(size, tile_size);
+    num_blocks
+        .width
+        .wrapping_mul(num_blocks.height)
+        .wrapping_mul(num_blocks.depth)
+}
+
+/// Port of `AdjustSize`.
+fn adjust_size(size: u32, level: u32, block_size: u32) -> u32 {
+    div_ceil(adjust_mip_size(size, level), block_size)
 }
 
 /// Port of `AdjustMipBlockSize(Extent3D, Extent3D, u32, u32)`.
@@ -192,7 +223,9 @@ fn stride_alignment(
 /// Port of `PitchLinearAlignedSize`.
 fn pitch_linear_aligned_size(info: &ImageInfo) -> Extent2D {
     const STRIDE_ALIGNMENT: u32 = 32;
-    debug_assert!(info.image_type == ImageType::Linear);
+    assert_fail_soft(info.image_type == ImageType::Linear, || {
+        "PitchLinearAlignedSize requires a linear image".to_owned()
+    });
     let num_tiles = Extent2D {
         width: div_ceil(info.size.width, surface::default_block_width(info.format)),
         height: div_ceil(info.size.height, surface::default_block_height(info.format)),
@@ -206,7 +239,9 @@ fn pitch_linear_aligned_size(info: &ImageInfo) -> Extent2D {
 
 /// Port of `BlockLinearAlignedSize`.
 fn block_linear_aligned_size(info: &ImageInfo, level: u32) -> Extent3D {
-    debug_assert!(info.image_type != ImageType::Linear);
+    assert_fail_soft(info.image_type != ImageType::Linear, || {
+        "BlockLinearAlignedSize requires a block-linear image".to_owned()
+    });
     let size = adjust_mip_size_3d(info.size, level);
     let num_tiles = Extent3D {
         width: div_ceil(size.width, surface::default_block_width(info.format)),
@@ -226,14 +261,24 @@ fn block_linear_aligned_size(info: &ImageInfo, level: u32) -> Extent3D {
 
 /// Port of `NumBlocksPerLayer`.
 fn num_blocks_per_layer(info: &ImageInfo, tile_size: Extent2D) -> u32 {
-    let mut num_blocks = 0;
+    let mut num_blocks = 0u32;
     for level in 0..info.resources.levels as u32 {
         let mip_size = adjust_mip_size_3d(info.size, level);
-        num_blocks += div_ceil(mip_size.width, tile_size.width)
-            * div_ceil(mip_size.height, tile_size.height)
-            * mip_size.depth;
+        num_blocks = num_blocks.wrapping_add(self::num_blocks(mip_size, tile_size));
     }
     num_blocks
+}
+
+/// Port of `NumSlices`.
+fn num_slices(info: &ImageInfo) -> u32 {
+    assert_fail_soft(info.image_type == ImageType::E3D, || {
+        "NumSlices requires a 3D image".to_owned()
+    });
+    let mut slices = 0u32;
+    for level in 0..info.resources.levels {
+        slices = slices.wrapping_add(adjust_mip_size(info.size.depth, level as u32));
+    }
+    slices
 }
 
 /// Port of `BytesPerBlockLog2(u32)`.
@@ -257,14 +302,9 @@ fn default_block_size(format: PixelFormat) -> Extent2D {
 /// Port of `NumLevelBlocks(info, level)`.
 fn num_level_blocks(info: &LevelInfo, level: u32) -> Extent3D {
     Extent3D {
-        width: div_ceil(
-            adjust_mip_size(info.size.width, level),
-            info.tile_size.width,
-        ) << info.bpp_log2,
-        height: div_ceil(
-            adjust_mip_size(info.size.height, level),
-            info.tile_size.height,
-        ),
+        width: adjust_size(info.size.width, level, info.tile_size.width)
+            .wrapping_shl(info.bpp_log2),
+        height: adjust_size(info.size.height, level, info.tile_size.height),
         depth: adjust_mip_size(info.size.depth, level),
     }
 }
@@ -285,16 +325,18 @@ fn tile_shift(info: &LevelInfo, level: u32) -> Extent3D {
 /// Port of `GobSize(bpp_log2, block_height, tile_width_spacing)`.
 fn gob_size(bpp_log2: u32, block_height: u32, tile_width_spacing: u32) -> Extent2D {
     Extent2D {
-        width: GOB_SIZE_X_SHIFT - bpp_log2 + tile_width_spacing,
-        height: GOB_SIZE_Y_SHIFT + block_height,
+        width: GOB_SIZE_X_SHIFT
+            .wrapping_sub(bpp_log2)
+            .wrapping_add(tile_width_spacing),
+        height: GOB_SIZE_Y_SHIFT.wrapping_add(block_height),
     }
 }
 
 /// Port of `IsSmallerThanGobSize`.
 fn is_smaller_than_gob_size(num_tiles: Extent3D, gob: Extent2D, block_depth: u32) -> bool {
-    num_tiles.width <= (1u32 << gob.width)
-        || num_tiles.height <= (1u32 << gob.height)
-        || num_tiles.depth < (1u32 << block_depth)
+    num_tiles.width <= 1u32.wrapping_shl(gob.width)
+        || num_tiles.height <= 1u32.wrapping_shl(gob.height)
+        || num_tiles.depth < 1u32.wrapping_shl(block_depth)
 }
 
 /// Port of `NumGobs(info, level)`.
@@ -329,9 +371,12 @@ fn level_tiles(info: &LevelInfo, level: u32) -> Extent3D {
 fn calculate_level_size(info: &LevelInfo, level: u32) -> u32 {
     let ts = tile_shift(info, level);
     let tiles = level_tiles(info, level);
-    let num_tiles = tiles.width * tiles.height * tiles.depth;
+    let num_tiles = tiles
+        .width
+        .wrapping_mul(tiles.height)
+        .wrapping_mul(tiles.depth);
     let shift = GOB_SIZE_SHIFT + ts.width + ts.height + ts.depth;
-    num_tiles << shift
+    num_tiles.wrapping_shl(shift)
 }
 
 /// Port of `CalculateLevelSizes(info, num_levels)`.
@@ -346,7 +391,9 @@ fn calculate_level_sizes(info: &LevelInfo, num_levels: u32) -> LevelArray {
 
 /// Port of `CalculateLevelBytes(sizes, num_levels)`.
 fn calculate_level_bytes(sizes: &LevelArray, num_levels: u32) -> u32 {
-    sizes[..num_levels as usize].iter().sum()
+    sizes[..num_levels as usize]
+        .iter()
+        .fold(0, |total, size| total.wrapping_add(*size))
 }
 
 /// Port of `MakeLevelInfo(format, size, block, tile_width_spacing, num_levels)`.
@@ -375,8 +422,24 @@ fn make_level_info_from_image(info: &ImageInfo) -> LevelInfo {
         info.size,
         info.block(),
         info.tile_width_spacing,
-        info.resources.levels as u32 as u32,
+        info.resources.levels as u32,
     )
+}
+
+/// Port of `CalculateLevelOffset`.
+fn calculate_level_offset(
+    format: PixelFormat,
+    size: Extent3D,
+    block: Extent3D,
+    tile_width_spacing: u32,
+    level: u32,
+) -> u32 {
+    let info = make_level_info(format, size, block, tile_width_spacing, level);
+    let mut offset = 0u32;
+    for current_level in 0..level {
+        offset = offset.wrapping_add(calculate_level_size(&info, current_level));
+    }
+    offset
 }
 
 /// Port of `AlignLayerSize`.
@@ -392,16 +455,18 @@ fn align_layer_size(
         return align_up_log2(size_bytes, alignment_log2);
     }
     let aligned_height = align_up(size.height, tile_size_y);
-    while block.height != 0 && aligned_height <= (1u32 << (block.height - 1)) * GOB_SIZE_Y {
+    while block.height != 0
+        && aligned_height <= 1u32.wrapping_shl(block.height - 1).wrapping_mul(GOB_SIZE_Y)
+    {
         block.height -= 1;
     }
-    while block.depth != 0 && size.depth <= (1u32 << (block.depth - 1)) {
+    while block.depth != 0 && size.depth <= 1u32.wrapping_shl(block.depth - 1) {
         block.depth -= 1;
     }
     let block_shift = GOB_SIZE_SHIFT + block.height + block.depth;
     let num_blocks = size_bytes >> block_shift;
     if size_bytes != num_blocks << block_shift {
-        (num_blocks + 1) << block_shift
+        num_blocks.wrapping_add(1).wrapping_shl(block_shift)
     } else {
         size_bytes
     }
@@ -412,18 +477,22 @@ fn align_layer_size(
 /// Port of `CalculateGuestSizeInBytes`.
 pub fn calculate_guest_size_in_bytes(info: &ImageInfo) -> u32 {
     if info.image_type == ImageType::Buffer {
-        return surface::bytes_per_block(info.format) * info.size.width;
+        return info
+            .size
+            .width
+            .wrapping_mul(surface::bytes_per_block(info.format));
     }
     if info.image_type == ImageType::Linear {
-        return info.pitch()
-            * div_ceil(info.size.height, surface::default_block_height(info.format));
+        return info.pitch().wrapping_mul(div_ceil(
+            info.size.height,
+            surface::default_block_height(info.format),
+        ));
     }
     if info.resources.layers > 1 {
-        assert_ne!(
-            info.layer_stride, 0,
-            "CalculateGuestSizeInBytes requires layer_stride for layered images"
-        );
-        return info.layer_stride * info.resources.layers as u32;
+        assert_fail_soft(info.layer_stride != 0, || {
+            "CalculateGuestSizeInBytes requires layer_stride for layered images".to_owned()
+        });
+        return info.layer_stride.wrapping_mul(info.resources.layers as u32);
     }
     calculate_layer_size(info)
 }
@@ -431,22 +500,30 @@ pub fn calculate_guest_size_in_bytes(info: &ImageInfo) -> u32 {
 /// Port of `CalculateUnswizzledSizeBytes`.
 pub fn calculate_unswizzled_size_bytes(info: &ImageInfo) -> u32 {
     if info.image_type == ImageType::Buffer {
-        return surface::bytes_per_block(info.format) * info.size.width;
+        return info
+            .size
+            .width
+            .wrapping_mul(surface::bytes_per_block(info.format));
     }
     if info.image_type == ImageType::Linear {
-        return info.pitch()
-            * div_ceil(info.size.height, surface::default_block_height(info.format));
+        return info.pitch().wrapping_mul(div_ceil(
+            info.size.height,
+            surface::default_block_height(info.format),
+        ));
     }
     let tile_size = default_block_size(info.format);
     num_blocks_per_layer(info, tile_size)
-        * info.resources.layers as u32
-        * surface::bytes_per_block(info.format)
+        .wrapping_mul(info.resources.layers as u32)
+        .wrapping_mul(surface::bytes_per_block(info.format))
 }
 
 /// Port of `CalculateConvertedSizeBytes`.
 pub fn calculate_converted_size_bytes(info: &ImageInfo) -> u32 {
     if info.image_type == ImageType::Buffer {
-        return surface::bytes_per_block(info.format) * info.size.width;
+        return info
+            .size
+            .width
+            .wrapping_mul(surface::bytes_per_block(info.format));
     }
 
     let recompression = *common::settings::values().astc_recompression.get_value();
@@ -458,11 +535,15 @@ pub fn calculate_converted_size_bytes(info: &ImageInfo) -> u32 {
         } else {
             1
         };
-        let mut output_size = 0;
+        let mut output_size = 0u32;
         for level in 0..info.resources.levels as u32 {
             let mip_size = adjust_mip_size_3d(info.size, level);
-            let plane_dim = align_up(mip_size.width, 4) * align_up(mip_size.height, 4);
-            output_size += (plane_dim * info.size.depth * info.resources.layers as u32) / bpp_div;
+            let plane_dim = align_up(mip_size.width, 4).wrapping_mul(align_up(mip_size.height, 4));
+            let level_size = plane_dim
+                .wrapping_mul(info.size.depth)
+                .wrapping_mul(info.resources.layers as u32)
+                / bpp_div;
+            output_size = output_size.wrapping_add(level_size);
         }
         return output_size;
     }
@@ -473,18 +554,19 @@ pub fn calculate_converted_size_bytes(info: &ImageInfo) -> u32 {
             width: 1,
             height: 1,
         },
-    ) * info.resources.layers as u32
-        * crate::texture_cache::decode_bc::converted_bytes_per_block(info.format)
+    )
+    .wrapping_mul(info.resources.layers as u32)
+    .wrapping_mul(crate::texture_cache::decode_bc::converted_bytes_per_block(
+        info.format,
+    ))
 }
 
 /// Port of `CalculateLayerStride`.
 pub fn calculate_layer_stride(info: &ImageInfo) -> u32 {
-    if info.image_type == ImageType::Linear {
-        return info.pitch() * info.size.height;
-    }
-    let level_info = make_level_info_from_image(info);
-    let sizes = calculate_level_sizes(&level_info, info.resources.levels as u32);
-    let level_bytes = calculate_level_bytes(&sizes, info.resources.levels as u32);
+    assert_fail_soft(info.image_type != ImageType::Linear, || {
+        "CalculateLayerStride requires a block-linear image".to_owned()
+    });
+    let level_bytes = calculate_layer_size(info);
     align_layer_size(
         level_bytes,
         info.size,
@@ -496,9 +578,16 @@ pub fn calculate_layer_stride(info: &ImageInfo) -> u32 {
 
 /// Port of `CalculateLayerSize`.
 pub fn calculate_layer_size(info: &ImageInfo) -> u32 {
-    let level_info = make_level_info_from_image(info);
-    let sizes = calculate_level_sizes(&level_info, info.resources.levels as u32);
-    calculate_level_bytes(&sizes, info.resources.levels as u32)
+    assert_fail_soft(info.image_type != ImageType::Linear, || {
+        "CalculateLayerSize requires a block-linear image".to_owned()
+    });
+    calculate_level_offset(
+        info.format,
+        info.size,
+        info.block(),
+        info.tile_width_spacing,
+        info.resources.levels as u32,
+    )
 }
 
 /// Port of `CalculateMipLevelOffsets`.
@@ -506,55 +595,68 @@ pub fn calculate_mip_level_offsets(info: &ImageInfo) -> LevelArray {
     if info.image_type == ImageType::Linear {
         return [0u32; MAX_MIP_LEVELS];
     }
+    if info.resources.levels > MAX_MIP_LEVELS as i32 {
+        log::error!(
+            "Image has too many mip levels={}, maximum supported is={}",
+            info.resources.levels,
+            MAX_MIP_LEVELS
+        );
+        return [0u32; MAX_MIP_LEVELS];
+    }
     let level_info = make_level_info_from_image(info);
-    let sizes = calculate_level_sizes(&level_info, info.resources.levels as u32);
     let mut offsets = [0u32; MAX_MIP_LEVELS];
     let mut offset = 0u32;
-    for level in 0..(info.resources.levels as u32 as usize) {
-        offsets[level] = offset;
-        offset += sizes[level];
+    for level in 0..info.resources.levels {
+        offsets[level as usize] = offset;
+        offset = offset.wrapping_add(calculate_level_size(&level_info, level as u32));
     }
     offsets
 }
 
 /// Port of `CalculateMipLevelSizes`.
 pub fn calculate_mip_level_sizes(info: &ImageInfo) -> LevelArray {
-    if info.image_type == ImageType::Linear {
-        let mut sizes = [0u32; MAX_MIP_LEVELS];
-        sizes[0] = info.pitch() * info.size.height;
-        return sizes;
-    }
     let level_info = make_level_info_from_image(info);
     calculate_level_sizes(&level_info, info.resources.levels as u32)
 }
 
 /// Port of `CalculateSliceOffsets`.
-pub fn calculate_slice_offsets(info: &ImageInfo) -> Vec<u32> {
-    debug_assert!(info.image_type == ImageType::E3D);
+pub fn calculate_slice_offsets(info: &ImageInfo) -> SmallVec<[u32; 16]> {
+    assert_fail_soft(info.image_type == ImageType::E3D, || {
+        "CalculateSliceOffsets requires a 3D image".to_owned()
+    });
     let level_info = make_level_info_from_image(info);
-    let mut offsets = Vec::new();
+    let mut offsets = SmallVec::with_capacity(num_slices(info) as usize);
     let mut mip_offset = 0u32;
     for level in 0..info.resources.levels as u32 {
         let ts = tile_shift(&level_info, level);
         let tiles = level_tiles(&level_info, level);
         let gob_size_shift = ts.height + GOB_SIZE_SHIFT;
-        let slice_size = (tiles.width * tiles.height) << gob_size_shift;
+        let slice_size = tiles
+            .width
+            .wrapping_mul(tiles.height)
+            .wrapping_shl(gob_size_shift);
         let z_mask = (1u32 << ts.depth) - 1;
         let depth = adjust_mip_size(info.size.depth, level);
         for slice in 0..depth {
             let z_low = slice & z_mask;
             let z_high = slice & !z_mask;
-            offsets.push(mip_offset + (z_low << gob_size_shift) + (z_high * slice_size));
+            offsets.push(
+                mip_offset
+                    .wrapping_add(z_low.wrapping_shl(gob_size_shift))
+                    .wrapping_add(z_high.wrapping_mul(slice_size)),
+            );
         }
-        mip_offset += calculate_level_size(&level_info, level);
+        mip_offset = mip_offset.wrapping_add(calculate_level_size(&level_info, level));
     }
     offsets
 }
 
 /// Port of `CalculateSliceSubresources`.
-pub fn calculate_slice_subresources(info: &ImageInfo) -> Vec<SubresourceBase> {
-    debug_assert!(info.image_type == ImageType::E3D);
-    let mut subresources = Vec::new();
+pub fn calculate_slice_subresources(info: &ImageInfo) -> SmallVec<[SubresourceBase; 16]> {
+    assert_fail_soft(info.image_type == ImageType::E3D, || {
+        "CalculateSliceSubresources requires a 3D image".to_owned()
+    });
+    let mut subresources = SmallVec::with_capacity(num_slices(info) as usize);
     for level in 0..info.resources.levels {
         let depth = adjust_mip_size(info.size.depth, level as u32) as i32;
         for slice in 0..depth {
@@ -569,9 +671,6 @@ pub fn calculate_slice_subresources(info: &ImageInfo) -> Vec<SubresourceBase> {
 
 /// Port of `CalculateLevelStrideAlignment`.
 pub fn calculate_level_stride_alignment(info: &ImageInfo, level: u32) -> u32 {
-    if info.image_type == ImageType::Linear {
-        return 0;
-    }
     let tile_size = default_block_size(info.format);
     let level_size = adjust_mip_size_3d(info.size, level);
     let num_tiles = adjust_tile_size_3d(level_size, tile_size);
@@ -608,8 +707,10 @@ pub fn render_target_image_view_type(info: &ImageInfo) -> ImageViewType {
         ImageType::E3D => ImageViewType::E2DArray,
         ImageType::Linear => ImageViewType::E2D,
         _ => {
-            log::error!("Unimplemented image type {:?}", info.image_type);
-            ImageViewType::E2D
+            assert_fail_soft(false, || {
+                format!("Unimplemented image type {:?}", info.image_type)
+            });
+            ImageViewType::E1D
         }
     }
 }
@@ -623,15 +724,21 @@ pub fn make_shrink_image_copies(
     base: SubresourceBase,
     up_scale: u32,
     down_shift: u32,
-) -> Vec<ImageCopy> {
-    debug_assert!(dst.resources.levels >= src.resources.levels);
+) -> SmallVec<[ImageCopy; 16]> {
+    assert_fail_soft(dst.resources.levels >= src.resources.levels, || {
+        "MakeShrinkImageCopies destination has fewer levels than the source".to_owned()
+    });
     let is_dst_3d = dst.image_type == ImageType::E3D;
     if is_dst_3d {
-        debug_assert!(src.image_type == ImageType::E3D);
-        debug_assert!(src.resources.levels == 1);
+        assert_fail_soft(src.image_type == ImageType::E3D, || {
+            "MakeShrinkImageCopies requires a 3D source for a 3D destination".to_owned()
+        });
+        assert_fail_soft(src.resources.levels == 1, || {
+            "MakeShrinkImageCopies requires one source level for a 3D destination".to_owned()
+        });
     }
     let both_2d = src.image_type == ImageType::E2D && dst.image_type == ImageType::E2D;
-    let mut copies = Vec::with_capacity(src.resources.levels as usize);
+    let mut copies = SmallVec::with_capacity(src.resources.levels as usize);
     for level in 0..src.resources.levels {
         let src_subresource = SubresourceLayers {
             base_level: level,
@@ -654,9 +761,9 @@ pub fn make_shrink_image_copies(
         if is_dst_3d {
             extent.depth = src.size.depth;
         }
-        extent.width = ((extent.width * up_scale) >> down_shift).max(1);
+        extent.width = (extent.width.wrapping_mul(up_scale) >> down_shift).max(1);
         if both_2d {
-            extent.height = ((extent.height * up_scale) >> down_shift).max(1);
+            extent.height = (extent.height.wrapping_mul(up_scale) >> down_shift).max(1);
         }
         copies.push(ImageCopy {
             src_subresource,
@@ -674,9 +781,9 @@ pub fn make_reinterpret_image_copies(
     src: &ImageInfo,
     up_scale: u32,
     down_shift: u32,
-) -> Vec<ImageCopy> {
+) -> SmallVec<[ImageCopy; 16]> {
     let is_3d = src.image_type == ImageType::E3D;
-    let mut copies = Vec::with_capacity(src.resources.levels as usize);
+    let mut copies = SmallVec::with_capacity(src.resources.levels as usize);
     for level in 0..src.resources.levels {
         let subresource = SubresourceLayers {
             base_level: level,
@@ -689,8 +796,8 @@ pub fn make_reinterpret_image_copies(
         if is_3d {
             extent.depth = src.size.depth;
         }
-        extent.width = ((extent.width * up_scale) >> down_shift).max(1);
-        extent.height = ((extent.height * up_scale) >> down_shift).max(1);
+        extent.width = (extent.width.wrapping_mul(up_scale) >> down_shift).max(1);
+        extent.height = (extent.height.wrapping_mul(up_scale) >> down_shift).max(1);
         copies.push(ImageCopy {
             src_subresource: subresource,
             dst_subresource: subresource,
@@ -729,13 +836,8 @@ pub fn is_valid_entry(
     })
 }
 
-pub fn is_valid_entry_with_addr_valid(
-    config: &crate::textures::texture::TicEntry,
-    mut addr_valid: impl FnMut(GPUVAddr) -> bool,
-) -> bool {
-    is_valid_entry_with_range_valid(config, |address, _size| addr_valid(address))
-}
-
+/// Callback-shaped adaptation of `IsValidEntry` for texture-cache call sites
+/// that already hold the memory-manager lock.
 pub fn is_valid_entry_with_range_valid(
     config: &crate::textures::texture::TicEntry,
     mut range_valid: impl FnMut(GPUVAddr, u64) -> bool,
@@ -769,20 +871,27 @@ pub fn unswizzle_image(
     info: &ImageInfo,
     input: &[u8],
     output: &mut [u8],
-) -> Vec<BufferImageCopy> {
+) -> SmallVec<[BufferImageCopy; 16]> {
     let bytes_per_block = surface::bytes_per_block(info.format);
-    if bytes_per_block == 0 {
-        return Vec::new();
-    }
     let tile_size = default_block_size(info.format);
 
     if info.image_type == ImageType::Linear {
-        let copy_size = input.len().min(output.len());
-        output[..copy_size].copy_from_slice(&input[..copy_size]);
-        return vec![BufferImageCopy {
+        assert!(
+            output.len() >= input.len(),
+            "UnswizzleImage linear output is too small: output={} input={}",
+            output.len(),
+            input.len()
+        );
+        output[..input.len()].copy_from_slice(input);
+        let bpp_log2 = bytes_per_block_log2(bytes_per_block);
+        assert_fail_soft(
+            (info.pitch() >> bpp_log2) << bpp_log2 == info.pitch(),
+            || "UnswizzleImage pitch is not aligned to the bytes per block".to_owned(),
+        );
+        return smallvec![BufferImageCopy {
             buffer_offset: 0,
             buffer_size: input.len(),
-            buffer_row_length: info.pitch() * tile_size.width / bytes_per_block,
+            buffer_row_length: info.pitch().wrapping_mul(tile_size.width) >> bpp_log2,
             buffer_image_height: info.size.height,
             image_subresource: SubresourceLayers {
                 base_level: 0,
@@ -810,16 +919,19 @@ pub fn unswizzle_image(
     );
     let mut guest_offset = 0usize;
     let mut host_offset = 0u32;
-    let mut copies = Vec::with_capacity(num_levels as usize);
+    let mut copies = SmallVec::with_capacity(num_levels as usize);
 
     for level in 0..num_levels {
         let level_size = adjust_mip_size_3d(info.size, level as u32);
         let num_tiles = adjust_tile_size_3d(level_size, tile_size);
-        let num_blocks_per_layer = num_tiles.width * num_tiles.height * num_tiles.depth;
-        let host_bytes_per_layer = num_blocks_per_layer << bpp_log2;
+        let num_blocks_per_layer = num_tiles
+            .width
+            .wrapping_mul(num_tiles.height)
+            .wrapping_mul(num_tiles.depth);
+        let host_bytes_per_layer = num_blocks_per_layer.wrapping_shl(bpp_log2);
         copies.push(BufferImageCopy {
             buffer_offset: host_offset as usize,
-            buffer_size: (host_bytes_per_layer * num_layers as u32) as usize,
+            buffer_size: (host_bytes_per_layer as usize).wrapping_mul(num_layers as usize),
             buffer_row_length: align_up(level_size.width, tile_size.width),
             buffer_image_height: align_up(level_size.height, tile_size.height),
             image_subresource: SubresourceLayers {
@@ -842,12 +954,8 @@ pub fn unswizzle_image(
 
         for _layer in 0..num_layers {
             let dst_offset = host_offset as usize;
-            let src_offset = guest_offset.saturating_add(guest_layer_offset);
-            if dst_offset >= output.len() || src_offset >= input.len() {
-                break;
-            }
-            let dst_size = (host_bytes_per_layer as usize).min(output.len() - dst_offset);
-            let dst = &mut output[dst_offset..dst_offset + dst_size];
+            let src_offset = guest_offset + guest_layer_offset;
+            let dst = &mut output[dst_offset..];
             let src = &input[src_offset..];
             crate::textures::decoders::unswizzle_texture(
                 dst,
@@ -860,10 +968,10 @@ pub fn unswizzle_image(
                 block.depth,
                 stride_alignment,
             );
-            guest_layer_offset = guest_layer_offset.saturating_add(layer_stride as usize);
-            host_offset = host_offset.saturating_add(host_bytes_per_layer);
+            guest_layer_offset += layer_stride as usize;
+            host_offset = host_offset.wrapping_add(host_bytes_per_layer);
         }
-        guest_offset = guest_offset.saturating_add(level_sizes[level as usize] as usize);
+        guest_offset += level_sizes[level as usize] as usize;
     }
 
     copies
@@ -879,25 +987,41 @@ pub fn convert_image(
     copies: &mut [BufferImageCopy],
 ) {
     let mut output_offset = 0u32;
+    let mut decode_scratch = ScratchBuffer::<u8>::new();
     let tile_size = default_block_size(info.format);
 
     for copy in copies.iter_mut() {
         let level = copy.image_subresource.base_level;
-        let _mip_size = adjust_mip_size_3d(info.size, level as u32);
+        let mip_size = adjust_mip_size_3d(info.size, level as u32);
+        assert_fail_soft(copy.image_offset == Offset3D::default(), || {
+            "ConvertImage requires a zero image offset".to_owned()
+        });
+        assert_fail_soft(copy.image_subresource.base_layer == 0, || {
+            "ConvertImage requires base layer zero".to_owned()
+        });
+        assert_fail_soft(copy.image_extent == mip_size, || {
+            "ConvertImage copy extent does not match its mip size".to_owned()
+        });
+        assert_fail_soft(
+            copy.buffer_row_length == align_up(mip_size.width, tile_size.width),
+            || "ConvertImage row length does not match the aligned mip width".to_owned(),
+        );
+        assert_fail_soft(
+            copy.buffer_image_height == align_up(mip_size.height, tile_size.height),
+            || "ConvertImage image height does not match the aligned mip height".to_owned(),
+        );
 
         let input_offset = copy.buffer_offset;
         copy.buffer_offset = output_offset as usize;
 
-        let astc = surface::is_pixel_format_astc(
-            // SAFETY: info.format is a valid PixelFormat discriminant from the texture cache
-            unsafe { std::mem::transmute::<u32, surface::PixelFormat>(info.format as u32) },
-        );
+        let astc = surface::is_pixel_format_astc(info.format);
 
         let recompression = *common::settings::values().astc_recompression.get_value();
 
         if astc && recompression == common::settings_enums::AstcRecompression::Uncompressed {
             let input_slice = &input[input_offset..];
-            let depth_layers = copy.image_subresource.num_layers as u32 * copy.image_extent.depth;
+            let depth_layers =
+                (copy.image_subresource.num_layers as u32).wrapping_mul(copy.image_extent.depth);
             crate::textures::astc::decompress(
                 input_slice,
                 copy.image_extent.width,
@@ -908,23 +1032,34 @@ pub fn convert_image(
                 &mut output[output_offset as usize..],
             );
 
-            output_offset += copy.image_extent.width
-                * copy.image_extent.height
-                * copy.image_subresource.num_layers as u32
-                * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
+            output_offset = output_offset.wrapping_add(
+                copy.image_extent
+                    .width
+                    .wrapping_mul(copy.image_extent.height)
+                    .wrapping_mul(copy.image_subresource.num_layers as u32)
+                    .wrapping_mul(surface::bytes_per_block(
+                        surface::PixelFormat::A8B8G8R8Unorm,
+                    )),
+            );
         } else if astc {
             let bpp_div = if recompression == common::settings_enums::AstcRecompression::Bc1 {
                 2
             } else {
                 1
             };
-            let plane_dim = copy.image_extent.width * copy.image_extent.height;
-            let depth_layers = copy.image_subresource.num_layers as u32 * copy.image_extent.depth;
+            let plane_dim = copy
+                .image_extent
+                .width
+                .wrapping_mul(copy.image_extent.height);
+            let depth_layers =
+                (copy.image_subresource.num_layers as u32).wrapping_mul(copy.image_extent.depth);
             let level_size = plane_dim
-                * copy.image_extent.depth
-                * copy.image_subresource.num_layers as u32
-                * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
-            let mut decode_scratch = vec![0; level_size as usize];
+                .wrapping_mul(copy.image_extent.depth)
+                .wrapping_mul(copy.image_subresource.num_layers as u32)
+                .wrapping_mul(surface::bytes_per_block(
+                    surface::PixelFormat::A8B8G8R8Unorm,
+                ));
+            decode_scratch.resize_destructive(level_size as usize);
 
             crate::textures::astc::decompress(
                 &input[input_offset..],
@@ -954,13 +1089,13 @@ pub fn convert_image(
                 );
             }
 
-            let aligned_plane_dim =
-                align_up(copy.image_extent.width, 4) * align_up(copy.image_extent.height, 4);
-            copy.buffer_size = ((aligned_plane_dim
-                * copy.image_extent.depth
-                * copy.image_subresource.num_layers as u32)
+            let aligned_plane_dim = align_up(copy.image_extent.width, 4)
+                .wrapping_mul(align_up(copy.image_extent.height, 4));
+            copy.buffer_size = (aligned_plane_dim
+                .wrapping_mul(copy.image_extent.depth)
+                .wrapping_mul(copy.image_subresource.num_layers as u32)
                 / bpp_div) as usize;
-            output_offset += copy.buffer_size as u32;
+            output_offset = output_offset.wrapping_add(copy.buffer_size as u32);
         } else {
             crate::texture_cache::decode_bc::decompress_bcn(
                 &input[input_offset..],
@@ -968,27 +1103,33 @@ pub fn convert_image(
                 copy,
                 info.format,
             );
-            let bytes = copy.image_extent.width
-                * copy.image_extent.height
-                * copy.image_subresource.num_layers as u32
-                * crate::texture_cache::decode_bc::converted_bytes_per_block(info.format);
-            output_offset += bytes;
+            let bytes = copy
+                .image_extent
+                .width
+                .wrapping_mul(copy.image_extent.height)
+                .wrapping_mul(copy.image_subresource.num_layers as u32)
+                .wrapping_mul(crate::texture_cache::decode_bc::converted_bytes_per_block(
+                    info.format,
+                ));
+            output_offset = output_offset.wrapping_add(bytes);
         }
 
-        copy.buffer_row_length = _mip_size.width;
-        copy.buffer_image_height = _mip_size.height;
+        copy.buffer_row_length = mip_size.width;
+        copy.buffer_image_height = mip_size.height;
     }
 }
 
 /// Port of `FullDownloadCopies`.
-pub fn full_download_copies(info: &ImageInfo) -> Vec<BufferImageCopy> {
+pub fn full_download_copies(info: &ImageInfo) -> SmallVec<[BufferImageCopy; 16]> {
     let size = info.size;
     let bpb = surface::bytes_per_block(info.format);
     if info.image_type == ImageType::Linear {
-        debug_assert!(info.pitch() % bpb == 0);
-        return vec![BufferImageCopy {
+        assert_fail_soft(info.pitch() % bpb == 0, || {
+            "FullDownloadCopies pitch is not divisible by bytes per block".to_owned()
+        });
+        return smallvec![BufferImageCopy {
             buffer_offset: 0,
-            buffer_size: (info.pitch() * size.height) as usize,
+            buffer_size: (info.pitch() as usize).wrapping_mul(size.height as usize),
             buffer_row_length: info.pitch() / bpb,
             buffer_image_height: size.height,
             image_subresource: SubresourceLayers {
@@ -1001,21 +1142,25 @@ pub fn full_download_copies(info: &ImageInfo) -> Vec<BufferImageCopy> {
         }];
     }
     if info.tile_width_spacing > 0 {
-        log::error!(
-            "FullDownloadCopies: tile_width_spacing={} is unimplemented",
-            info.tile_width_spacing
-        );
+        assert_fail_soft(false, || {
+            format!(
+                "FullDownloadCopies: tile_width_spacing={} is unimplemented",
+                info.tile_width_spacing
+            )
+        });
     }
     let num_layers = info.resources.layers;
     let num_levels = info.resources.levels;
     let tile_size = default_block_size(info.format);
     let mut host_offset = 0u32;
-    let mut copies = Vec::with_capacity(num_levels as usize);
+    let mut copies = SmallVec::with_capacity(num_levels as usize);
     for level in 0..num_levels {
         let level_size = adjust_mip_size_3d(size, level as u32);
         let adj = adjust_tile_size_3d(level_size, tile_size);
-        let num_blocks_per_layer = adj.width * adj.height * adj.depth;
-        let host_bytes_per_level = num_blocks_per_layer * bpb * num_layers as u32;
+        let num_blocks_per_layer = adj.width.wrapping_mul(adj.height).wrapping_mul(adj.depth);
+        let host_bytes_per_level = num_blocks_per_layer
+            .wrapping_mul(bpb)
+            .wrapping_mul(num_layers as u32);
         copies.push(BufferImageCopy {
             buffer_offset: host_offset as usize,
             buffer_size: host_bytes_per_level as usize,
@@ -1029,16 +1174,16 @@ pub fn full_download_copies(info: &ImageInfo) -> Vec<BufferImageCopy> {
             image_offset: Offset3D { x: 0, y: 0, z: 0 },
             image_extent: level_size,
         });
-        host_offset += host_bytes_per_level;
+        host_offset = host_offset.wrapping_add(host_bytes_per_level);
     }
     copies
 }
 
 /// Port of `FullUploadSwizzles`.
-pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
+pub fn full_upload_swizzles(info: &ImageInfo) -> SmallVec<[SwizzleParameters; 16]> {
     let tile_size = default_block_size(info.format);
     if info.image_type == ImageType::Linear {
-        return vec![SwizzleParameters {
+        return smallvec![SwizzleParameters {
             num_tiles: adjust_tile_size_3d(info.size, tile_size),
             block: Extent3D {
                 width: 0,
@@ -1053,7 +1198,7 @@ pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
     let size = info.size;
     let num_levels = info.resources.levels;
     let mut guest_offset = 0u32;
-    let mut params = Vec::with_capacity(num_levels as usize);
+    let mut params = SmallVec::with_capacity(num_levels as usize);
     for level in 0..num_levels {
         let level_size = adjust_mip_size_3d(size, level as u32);
         let num_tiles = adjust_tile_size_3d(level_size, tile_size);
@@ -1069,9 +1214,122 @@ pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
             buffer_offset: guest_offset as usize,
             level,
         });
-        guest_offset += calculate_level_size(&level_info, level as u32);
+        guest_offset = guest_offset.wrapping_add(calculate_level_size(&level_info, level as u32));
     }
     params
+}
+
+/// Port of `SwizzlePitchLinearImage`.
+fn swizzle_pitch_linear_image(
+    guest_memory_writer: &dyn Fn(u64, &[u8]),
+    gpu_addr: GPUVAddr,
+    info: &ImageInfo,
+    copy: &BufferImageCopy,
+    memory: &[u8],
+) {
+    assert_fail_soft(copy.image_offset.z == 0, || {
+        "SwizzlePitchLinearImage requires z offset zero".to_owned()
+    });
+    assert_fail_soft(copy.image_extent.depth == 1, || {
+        "SwizzlePitchLinearImage requires depth one".to_owned()
+    });
+    assert_fail_soft(copy.image_subresource.base_level == 0, || {
+        "SwizzlePitchLinearImage requires base level zero".to_owned()
+    });
+    assert_fail_soft(copy.image_subresource.base_layer == 0, || {
+        "SwizzlePitchLinearImage requires base layer zero".to_owned()
+    });
+    assert_fail_soft(copy.image_subresource.num_layers == 1, || {
+        "SwizzlePitchLinearImage requires one layer".to_owned()
+    });
+
+    let bytes_per_block = surface::bytes_per_block(info.format);
+    let row_length = copy.image_extent.width.wrapping_mul(bytes_per_block) as usize;
+    let guest_offset_x = (copy.image_offset.x as u32).wrapping_mul(bytes_per_block) as u64;
+
+    for line in 0..copy.image_extent.height {
+        let host_offset_y = line.wrapping_mul(info.pitch()) as usize;
+        let guest_offset_y = (copy.image_offset.y as u32)
+            .wrapping_add(line)
+            .wrapping_mul(info.pitch()) as u64;
+        let guest_offset = guest_offset_x.wrapping_add(guest_offset_y);
+        guest_memory_writer(
+            gpu_addr.wrapping_add(guest_offset),
+            &memory[host_offset_y..host_offset_y + row_length],
+        );
+    }
+}
+
+/// Port of `SwizzleBlockLinearImage`.
+fn swizzle_block_linear_image(
+    guest_memory_reader: &dyn Fn(u64, &mut [u8]),
+    guest_memory_writer: &dyn Fn(u64, &[u8]),
+    gpu_addr: GPUVAddr,
+    info: &ImageInfo,
+    copy: &BufferImageCopy,
+    memory: &[u8],
+    tmp_buffer: &mut ScratchBuffer<u8>,
+) {
+    let size = info.size;
+    let level_info = make_level_info_from_image(info);
+    let tile_size = default_block_size(info.format);
+    let bytes_per_block = surface::bytes_per_block(info.format);
+
+    let level = copy.image_subresource.base_level as u32;
+    let level_size = adjust_mip_size_3d(size, level);
+    let host_bytes_per_layer = num_blocks(level_size, tile_size).wrapping_mul(bytes_per_block);
+
+    assert_fail_soft(copy.image_offset.x == 0, || {
+        "SwizzleBlockLinearImage does not implement a nonzero x offset".to_owned()
+    });
+    assert_fail_soft(copy.image_offset.y == 0, || {
+        "SwizzleBlockLinearImage does not implement a nonzero y offset".to_owned()
+    });
+    assert_fail_soft(copy.image_offset.z == 0, || {
+        "SwizzleBlockLinearImage does not implement a nonzero z offset".to_owned()
+    });
+    assert_fail_soft(copy.image_extent == level_size, || {
+        "SwizzleBlockLinearImage does not implement partial mip extents".to_owned()
+    });
+
+    let num_tiles = adjust_tile_size_3d(level_size, tile_size);
+    let block = adjust_mip_block_size_3d(num_tiles, level_info.block, level, level_info.num_levels);
+    let mut host_offset = copy.buffer_offset;
+
+    let num_levels = info.resources.levels as u32;
+    let sizes = calculate_level_sizes(&level_info, num_levels);
+    let mut guest_offset = calculate_level_bytes(&sizes, level) as u64;
+    let layer_stride = align_layer_size(
+        calculate_level_bytes(&sizes, num_levels),
+        size,
+        level_info.block,
+        tile_size.height,
+        info.tile_width_spacing,
+    ) as u64;
+    let subresource_size = sizes[level as usize] as usize;
+
+    for _layer in 0..info.resources.layers {
+        tmp_buffer.resize_destructive(subresource_size);
+        guest_memory_reader(gpu_addr.wrapping_add(guest_offset), tmp_buffer);
+        crate::textures::decoders::swizzle_texture(
+            tmp_buffer,
+            &memory[host_offset..],
+            bytes_per_block,
+            num_tiles.width,
+            num_tiles.height,
+            num_tiles.depth,
+            block.height,
+            block.depth,
+            1,
+        );
+        guest_memory_writer(gpu_addr.wrapping_add(guest_offset), tmp_buffer);
+
+        host_offset += host_bytes_per_layer as usize;
+        guest_offset = guest_offset.wrapping_add(layer_stride);
+    }
+    assert_fail_soft(host_offset - copy.buffer_offset == copy.buffer_size, || {
+        "SwizzleBlockLinearImage consumed a different byte count than the copy declares".to_owned()
+    });
 }
 
 /// Port of `SwizzleImage`.
@@ -1082,111 +1340,31 @@ pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
 pub fn swizzle_image(
     guest_memory_reader: &dyn Fn(u64, &mut [u8]),
     guest_memory_writer: &dyn Fn(u64, &[u8]),
-    gpu_addr: VAddr,
+    gpu_addr: GPUVAddr,
     info: &ImageInfo,
     copies: &[BufferImageCopy],
     memory: &[u8],
     tmp_buffer: &mut ScratchBuffer<u8>,
 ) {
-    let bytes_per_block = surface::bytes_per_block(info.format);
-    if bytes_per_block == 0 {
+    if surface::bytes_per_block(info.format) == 0 {
         return;
     }
 
+    let is_pitch_linear = info.image_type == ImageType::Linear;
     for copy in copies {
-        if info.image_type == ImageType::Linear {
-            let pitch = info.pitch();
-            if pitch == 0 {
-                continue;
-            }
-            assert_eq!(copy.image_offset.z, 0);
-            assert_eq!(copy.image_extent.depth, 1);
-            assert_eq!(copy.image_subresource.base_level, 0);
-            assert_eq!(copy.image_subresource.base_layer, 0);
-            assert_eq!(copy.image_subresource.num_layers, 1);
-
-            let row_length = copy.image_extent.width.saturating_mul(bytes_per_block) as usize;
-            let guest_offset_x = (copy.image_offset.x as u32).wrapping_mul(bytes_per_block) as u64;
-            for line in 0..copy.image_extent.height {
-                let host_offset = copy.buffer_offset + line as usize * pitch as usize;
-                let host_end = host_offset.saturating_add(row_length);
-                if host_end > memory.len() {
-                    break;
-                }
-                let guest_offset_y = (copy.image_offset.y as u32)
-                    .wrapping_add(line)
-                    .wrapping_mul(pitch) as u64;
-                let guest_offset = guest_offset_x + guest_offset_y;
-                guest_memory_writer(gpu_addr + guest_offset, &memory[host_offset..host_end]);
-            }
-            continue;
-        }
-
-        let level = copy.image_subresource.base_level.max(0) as u32;
-        let level_info = make_level_info_from_image(info);
-        let tile_size = default_block_size(info.format);
-        let level_size = adjust_mip_size_3d(info.size, level);
-
-        assert_eq!(
-            copy.image_offset,
-            (Offset3D { x: 0, y: 0, z: 0 }),
-            "Unimplemented code!"
-        );
-        assert_eq!(copy.image_extent, level_size, "Unimplemented code!");
-
-        let num_tiles = adjust_tile_size_3d(level_size, tile_size);
-        let num_blocks_per_layer = num_tiles.width * num_tiles.height * num_tiles.depth;
-        let host_bytes_per_layer = num_blocks_per_layer * bytes_per_block;
-        if host_bytes_per_layer == 0 {
-            continue;
-        }
-
-        let block =
-            adjust_mip_block_size_3d(num_tiles, level_info.block, level, level_info.num_levels);
-        let num_levels = info.resources.levels as u32;
-        let sizes = calculate_level_sizes(&level_info, num_levels);
-        let mut guest_offset = calculate_level_bytes(&sizes, level) as u64;
-        let layer_stride = align_layer_size(
-            calculate_level_bytes(&sizes, num_levels),
-            info.size,
-            level_info.block,
-            tile_size.height,
-            info.tile_width_spacing,
-        ) as u64;
-        let subresource_size = sizes[level as usize] as usize;
-        if subresource_size == 0 {
-            continue;
-        }
-
-        let mut host_offset = copy.buffer_offset;
-        for _layer in 0..info.resources.layers.max(0) as u32 {
-            let src_end = host_offset.saturating_add(host_bytes_per_layer as usize);
-            if src_end > memory.len() {
-                break;
-            }
-
-            tmp_buffer.resize_destructive(subresource_size);
-            guest_memory_reader(gpu_addr + guest_offset, tmp_buffer);
-            crate::textures::decoders::swizzle_texture(
+        if is_pitch_linear {
+            swizzle_pitch_linear_image(guest_memory_writer, gpu_addr, info, copy, memory);
+        } else {
+            swizzle_block_linear_image(
+                guest_memory_reader,
+                guest_memory_writer,
+                gpu_addr,
+                info,
+                copy,
+                memory,
                 tmp_buffer,
-                &memory[host_offset..src_end],
-                bytes_per_block,
-                num_tiles.width,
-                num_tiles.height,
-                num_tiles.depth,
-                block.height,
-                block.depth,
-                calculate_level_stride_alignment(info, level),
             );
-
-            guest_memory_writer(gpu_addr + guest_offset, tmp_buffer);
-            host_offset += host_bytes_per_layer as usize;
-            guest_offset += layer_stride;
         }
-        debug_assert_eq!(
-            host_offset.saturating_sub(copy.buffer_offset),
-            copy.buffer_size
-        );
     }
 }
 
@@ -1196,11 +1374,7 @@ pub fn swizzle_image(
 ///
 /// Port of `MipSize`.
 pub fn mip_size(size: Extent3D, level: u32) -> Extent3D {
-    Extent3D {
-        width: (size.width >> level).max(1),
-        height: (size.height >> level).max(1),
-        depth: (size.depth >> level).max(1),
-    }
+    adjust_mip_size_3d(size, level)
 }
 
 /// Compute the block size at a given mip level.
@@ -1209,16 +1383,8 @@ pub fn mip_size(size: Extent3D, level: u32) -> Extent3D {
 pub fn mip_block_size(info: &ImageInfo, level: u32) -> Extent3D {
     let level_info = make_level_info_from_image(info);
     let tile_size = default_block_size(info.format);
-    let level_size = Extent3D {
-        width: adjust_mip_size(info.size.width, level),
-        height: adjust_mip_size(info.size.height, level),
-        depth: adjust_mip_size(info.size.depth, level),
-    };
-    let num_tiles = Extent3D {
-        width: div_ceil(level_size.width, tile_size.width),
-        height: div_ceil(level_size.height, tile_size.height),
-        depth: level_size.depth,
-    };
+    let level_size = adjust_mip_size_3d(info.size, level);
+    let num_tiles = adjust_tile_size_3d(level_size, tile_size);
     adjust_mip_block_size_3d(num_tiles, level_info.block, level, level_info.num_levels)
 }
 
@@ -1232,8 +1398,12 @@ pub fn is_block_linear_size_compatible(
     rhs_level: u32,
     strict_size: bool,
 ) -> bool {
-    debug_assert!(lhs.image_type != ImageType::Linear);
-    debug_assert!(rhs.image_type != ImageType::Linear);
+    assert_fail_soft(lhs.image_type != ImageType::Linear, || {
+        "IsBlockLinearSizeCompatible requires a block-linear lhs".to_owned()
+    });
+    assert_fail_soft(rhs.image_type != ImageType::Linear, || {
+        "IsBlockLinearSizeCompatible requires a block-linear rhs".to_owned()
+    });
     if strict_size {
         let lhs_size = adjust_mip_size_3d(lhs.size, lhs_level);
         let rhs_size = adjust_mip_size_3d(rhs.size, rhs_level);
@@ -1247,8 +1417,12 @@ pub fn is_block_linear_size_compatible(
 
 /// Port of `IsPitchLinearSameSize`.
 pub fn is_pitch_linear_same_size(lhs: &ImageInfo, rhs: &ImageInfo, strict_size: bool) -> bool {
-    debug_assert!(lhs.image_type == ImageType::Linear);
-    debug_assert!(rhs.image_type == ImageType::Linear);
+    assert_fail_soft(lhs.image_type == ImageType::Linear, || {
+        "IsPitchLinearSameSize requires a linear lhs".to_owned()
+    });
+    assert_fail_soft(rhs.image_type == ImageType::Linear, || {
+        "IsPitchLinearSameSize requires a linear rhs".to_owned()
+    });
     if strict_size {
         lhs.size.width == rhs.size.width && lhs.size.height == rhs.size.height
     } else {
@@ -1263,14 +1437,18 @@ pub fn is_block_linear_size_compatible_bpp_relaxed(
     lhs_level: u32,
     rhs_level: u32,
 ) -> bool {
-    debug_assert!(lhs.image_type != ImageType::Linear);
-    debug_assert!(rhs.image_type != ImageType::Linear);
+    assert_fail_soft(lhs.image_type != ImageType::Linear, || {
+        "IsBlockLinearSizeCompatibleBPPRelaxed requires a block-linear lhs".to_owned()
+    });
+    assert_fail_soft(rhs.image_type != ImageType::Linear, || {
+        "IsBlockLinearSizeCompatibleBPPRelaxed requires a block-linear rhs".to_owned()
+    });
     let lhs_bpp = surface::bytes_per_block(lhs.format);
     let rhs_bpp = surface::bytes_per_block(rhs.format);
     let lhs_size = adjust_mip_size_3d(lhs.size, lhs_level);
     let rhs_size = adjust_mip_size_3d(rhs.size, rhs_level);
-    align_up_log2(lhs_size.width * lhs_bpp, GOB_SIZE_X_SHIFT)
-        == align_up_log2(rhs_size.width * rhs_bpp, GOB_SIZE_X_SHIFT)
+    align_up_log2(lhs_size.width.wrapping_mul(lhs_bpp), GOB_SIZE_X_SHIFT)
+        == align_up_log2(rhs_size.width.wrapping_mul(rhs_bpp), GOB_SIZE_X_SHIFT)
         && align_up_log2(lhs_size.height, GOB_SIZE_Y_SHIFT)
             == align_up_log2(rhs_size.height, GOB_SIZE_Y_SHIFT)
 }
@@ -1312,8 +1490,8 @@ fn resolve_overlap_right_address_3d(
     if !is_block_linear_size_compatible(new_info, info, base.level as u32, 0, strict_size) {
         return None;
     }
-    let mip_depth = 1u32.max(new_info.size.depth << base.level as u32);
-    if mip_depth < info.size.depth + base.layer as u32 {
+    let mip_depth = adjust_mip_size(new_info.size.depth, base.level as u32);
+    if mip_depth < info.size.depth.wrapping_add(base.layer as u32) {
         return None;
     }
     if mip_block_size(new_info, base.level as u32) != info.block() {
@@ -1336,7 +1514,7 @@ fn resolve_overlap_right_address_2d(
     strict_size: bool,
 ) -> Option<SubresourceExtent> {
     let layer_stride = new_info.layer_stride as u64;
-    let new_size = layer_stride * new_info.resources.layers as u64;
+    let new_size = layer_stride.wrapping_mul(new_info.resources.layers as u64);
     let diff = overlap.gpu_addr - gpu_addr;
     if diff > new_size {
         return None;
@@ -1407,10 +1585,14 @@ fn resolve_overlap_left_address(
         return None;
     }
     let resources = new_info.resources;
-    let layers = if info.image_type != ImageType::E3D {
-        resources.layers.max(info.resources.layers + base.layer)
-    } else {
+    let layers = if info.image_type == ImageType::E3D {
+        let mip_depth = adjust_mip_size(info.size.depth, base.level as u32);
+        if mip_depth < new_info.size.depth.wrapping_add(base.layer as u32) {
+            return None;
+        }
         1
+    } else {
+        resources.layers.max(info.resources.layers + base.layer)
     };
     Some(OverlapResult {
         gpu_addr: overlap.gpu_addr,
@@ -1432,8 +1614,12 @@ pub fn resolve_overlap(
     broken_views: bool,
     native_bgr: bool,
 ) -> Option<OverlapResult> {
-    debug_assert!(new_info.image_type != ImageType::Linear);
-    debug_assert!(overlap.info.image_type != ImageType::Linear);
+    assert_fail_soft(new_info.image_type != ImageType::Linear, || {
+        "ResolveOverlap requires a block-linear new image".to_owned()
+    });
+    assert_fail_soft(overlap.info.image_type != ImageType::Linear, || {
+        "ResolveOverlap requires a block-linear overlapping image".to_owned()
+    });
     if !is_layer_stride_compatible(new_info, &overlap.info) {
         return None;
     }
@@ -1516,8 +1702,8 @@ pub fn find_subresource(
         return None;
     }
     if existing.image_type == ImageType::E3D {
-        let mip_depth = 1u32.max(existing.size.depth << base.level as u32);
-        if mip_depth < candidate.size.depth + base.layer as u32 {
+        let mip_depth = adjust_mip_size(existing.size.depth, base.level as u32);
+        if mip_depth < candidate.size.depth.wrapping_add(base.layer as u32) {
             return None;
         }
     } else if existing.resources.layers < candidate.resources.layers + base.layer {
@@ -1561,8 +1747,8 @@ pub fn is_sub_copy(candidate: &ImageInfo, image: &ImageBase, candidate_addr: GPU
         return false;
     }
     if existing.image_type == ImageType::E3D {
-        let mip_depth = 1u32.max(existing.size.depth << base.level as u32);
-        if mip_depth < candidate.size.depth + base.layer as u32 {
+        let mip_depth = adjust_mip_size(existing.size.depth, base.level as u32);
+        if mip_depth < candidate.size.depth.wrapping_add(base.layer as u32) {
             return false;
         }
     } else if existing.resources.layers < candidate.resources.layers + base.layer {
@@ -1886,7 +2072,7 @@ mod tests {
     }
 
     #[test]
-    fn is_sub_copy_3d_uses_upstream_mip_depth_expansion() {
+    fn is_sub_copy_3d_uses_upstream_mip_depth_reduction() {
         let existing = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E3D,
@@ -1914,7 +2100,7 @@ mod tests {
             dma_downloaded: false,
             is_sparse: false,
         };
-        let candidate = ImageInfo {
+        let mut candidate = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E3D,
             resources: SubresourceExtent {
@@ -1950,7 +2136,301 @@ mod tests {
             .expect("test image must expose mip level 1 slice 1");
         let candidate_addr = image.gpu_addr + offsets[index] as u64;
 
+        assert!(!is_sub_copy(&candidate, &image, candidate_addr));
+        candidate.size.depth = 1;
         assert!(is_sub_copy(&candidate, &image, candidate_addr));
+
+        let mut left_candidate = candidate.clone();
+        left_candidate.size.width = 16;
+        left_candidate.size.height = 16;
+        left_candidate.size.depth = 2;
+        assert!(
+            resolve_overlap_left_address(&left_candidate, candidate_addr, 0, &image, true,)
+                .is_none()
+        );
+        left_candidate.size.depth = 1;
+        assert!(
+            resolve_overlap_left_address(&left_candidate, candidate_addr, 0, &image, true,)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn size_calculations_preserve_upstream_unsigned_overflow() {
+        let info = ImageInfo {
+            format: PixelFormat::R16Uint,
+            image_type: ImageType::Buffer,
+            size: Extent3D {
+                width: u32::MAX,
+                height: 1,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let expected = u32::MAX.wrapping_mul(2);
+
+        assert_eq!(calculate_guest_size_in_bytes(&info), expected);
+        assert_eq!(calculate_unswizzled_size_bytes(&info), expected);
+        assert_eq!(calculate_converted_size_bytes(&info), expected);
+    }
+
+    #[test]
+    fn mip_offsets_accept_all_sixteen_upstream_levels_and_reject_seventeen() {
+        let mut info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: MAX_MIP_LEVELS as i32,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D::default()),
+            ..ImageInfo::default()
+        };
+
+        let offsets = calculate_mip_level_offsets(&info);
+        assert_ne!(offsets[MAX_MIP_LEVELS - 1], 0);
+
+        info.resources.levels += 1;
+        assert_eq!(calculate_mip_level_offsets(&info), [0; MAX_MIP_LEVELS]);
+    }
+
+    #[test]
+    fn level_offsets_match_upstream_compile_time_oracles() {
+        assert_eq!(
+            calculate_level_size(
+                &LevelInfo {
+                    size: Extent3D {
+                        width: 1920,
+                        height: 1080,
+                        depth: 1,
+                    },
+                    block: Extent3D {
+                        width: 0,
+                        height: 2,
+                        depth: 0,
+                    },
+                    tile_size: Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bpp_log2: 2,
+                    tile_width_spacing: 0,
+                    num_levels: 1,
+                },
+                0,
+            ),
+            0x7f8000
+        );
+        assert_eq!(
+            calculate_level_size(
+                &LevelInfo {
+                    size: Extent3D {
+                        width: 32,
+                        height: 32,
+                        depth: 1,
+                    },
+                    block: Extent3D {
+                        width: 0,
+                        height: 0,
+                        depth: 4,
+                    },
+                    tile_size: Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bpp_log2: 4,
+                    tile_width_spacing: 0,
+                    num_levels: 1,
+                },
+                0,
+            ),
+            0x40000
+        );
+        assert_eq!(
+            calculate_level_size(
+                &LevelInfo {
+                    size: Extent3D {
+                        width: 128,
+                        height: 8,
+                        depth: 1,
+                    },
+                    block: Extent3D {
+                        width: 0,
+                        height: 4,
+                        depth: 0,
+                    },
+                    tile_size: Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bpp_log2: 4,
+                    tile_width_spacing: 0,
+                    num_levels: 1,
+                },
+                0,
+            ),
+            0x40000
+        );
+
+        let rgba_size = Extent3D {
+            width: 1024,
+            height: 1024,
+            depth: 1,
+        };
+        let rgba_block = Extent3D {
+            width: 0,
+            height: 4,
+            depth: 0,
+        };
+        let expected = [
+            0, 0x400000, 0x500000, 0x540000, 0x550000, 0x554000, 0x555000, 0x555400, 0x555600,
+            0x555800,
+        ];
+        for (level, expected_offset) in expected.into_iter().enumerate() {
+            assert_eq!(
+                calculate_level_offset(
+                    PixelFormat::A8B8G8R8Unorm,
+                    rgba_size,
+                    rgba_block,
+                    0,
+                    level as u32,
+                ),
+                expected_offset
+            );
+        }
+
+        assert_eq!(
+            calculate_level_offset(
+                PixelFormat::R8Sint,
+                Extent3D {
+                    width: 1920,
+                    height: 1080,
+                    depth: 1,
+                },
+                Extent3D {
+                    width: 0,
+                    height: 2,
+                    depth: 0,
+                },
+                0,
+                7,
+            ),
+            0x2afc00
+        );
+        assert_eq!(
+            calculate_level_offset(
+                PixelFormat::Astc2d12x12Unorm,
+                Extent3D {
+                    width: 8192,
+                    height: 4096,
+                    depth: 1,
+                },
+                Extent3D {
+                    width: 0,
+                    height: 2,
+                    depth: 0,
+                },
+                0,
+                12,
+            ),
+            0x50d200
+        );
+    }
+
+    #[test]
+    fn layer_sizes_match_upstream_compile_time_oracles() {
+        fn validate_layer_size(
+            format: PixelFormat,
+            width: u32,
+            height: u32,
+            block_height: u32,
+            tile_width_spacing: u32,
+            level: u32,
+        ) -> u32 {
+            let size = Extent3D {
+                width,
+                height,
+                depth: 1,
+            };
+            let block = Extent3D {
+                width: 0,
+                height: block_height,
+                depth: 0,
+            };
+            let offset = calculate_level_offset(format, size, block, tile_width_spacing, level);
+            align_layer_size(
+                offset,
+                size,
+                block,
+                surface::default_block_height(format),
+                tile_width_spacing,
+            )
+        }
+
+        assert_eq!(
+            validate_layer_size(PixelFormat::Astc2d12x12Unorm, 8192, 4096, 2, 0, 12),
+            0x50d800
+        );
+        assert_eq!(
+            validate_layer_size(PixelFormat::A8B8G8R8Unorm, 1024, 1024, 2, 0, 10),
+            0x556000
+        );
+        assert_eq!(
+            validate_layer_size(PixelFormat::Bc3Unorm, 128, 128, 2, 0, 8),
+            0x6000
+        );
+        assert_eq!(
+            validate_layer_size(PixelFormat::A8B8G8R8Unorm, 518, 572, 4, 3, 1),
+            0x190000
+        );
+        assert_eq!(
+            validate_layer_size(PixelFormat::Bc5Unorm, 1024, 1024, 3, 4, 11),
+            0x160000
+        );
+    }
+
+    #[test]
+    fn invalid_render_target_type_uses_value_initialized_view_type() {
+        let info = ImageInfo {
+            image_type: ImageType::Buffer,
+            ..ImageInfo::default()
+        };
+
+        assert_eq!(render_target_image_view_type(&info), ImageViewType::E1D);
+    }
+
+    #[test]
+    fn sixteen_entry_results_stay_in_upstream_inline_storage() {
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E3D,
+            resources: SubresourceExtent {
+                levels: MAX_MIP_LEVELS as i32,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D::default()),
+            ..ImageInfo::default()
+        };
+
+        let copies = full_download_copies(&info);
+        let slices = calculate_slice_offsets(&info);
+        let subresources = calculate_slice_subresources(&info);
+        assert_eq!(copies.len(), MAX_MIP_LEVELS);
+        assert_eq!(slices.len(), MAX_MIP_LEVELS);
+        assert_eq!(subresources.len(), MAX_MIP_LEVELS);
+        assert!(!copies.spilled());
+        assert!(!slices.spilled());
+        assert!(!subresources.spilled());
     }
 
     #[test]
@@ -2232,8 +2712,83 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unimplemented code!")]
-    fn swizzle_image_block_linear_rejects_offset_rectangles_like_upstream() {
+    fn swizzle_image_uses_upstream_default_stride_alignment() {
+        let written = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let written_for_callback = Arc::clone(&written);
+        let writer = move |_addr: u64, bytes: &[u8]| {
+            *written_for_callback.lock().unwrap() = bytes.to_vec();
+        };
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 70,
+                height: 64,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 2,
+                depth: 0,
+            }),
+            tile_width_spacing: 2,
+            ..ImageInfo::default()
+        };
+        let copies = full_download_copies(&info);
+        let memory = (0..copies[0].buffer_size)
+            .map(|index| index.wrapping_mul(37) as u8)
+            .collect::<Vec<_>>();
+        let level_info = make_level_info_from_image(&info);
+        let guest_size = calculate_level_size(&level_info, 0) as usize;
+        let mut tmp = ScratchBuffer::new();
+
+        swizzle_image(
+            &|_, output| output.fill(0xa5),
+            &writer,
+            0x4000,
+            &info,
+            &copies,
+            &memory,
+            &mut tmp,
+        );
+
+        let num_tiles = adjust_tile_size_3d(info.size, default_block_size(info.format));
+        let block = mip_block_size(&info, 0);
+        let mut expected = vec![0xa5; guest_size];
+        crate::textures::decoders::swizzle_texture(
+            &mut expected,
+            &memory,
+            surface::bytes_per_block(info.format),
+            num_tiles.width,
+            num_tiles.height,
+            num_tiles.depth,
+            block.height,
+            block.depth,
+            1,
+        );
+        let mut non_upstream = vec![0xa5; guest_size];
+        crate::textures::decoders::swizzle_texture(
+            &mut non_upstream,
+            &memory,
+            surface::bytes_per_block(info.format),
+            num_tiles.width,
+            num_tiles.height,
+            num_tiles.depth,
+            block.height,
+            block.depth,
+            calculate_level_stride_alignment(&info, 0),
+        );
+
+        assert_eq!(*written.lock().unwrap(), expected);
+        assert_ne!(expected, non_upstream);
+    }
+
+    #[test]
+    fn swizzle_image_block_linear_reports_offset_rectangles_and_continues_like_upstream() {
         let writer = |_addr: u64, _bytes: &[u8]| {};
         let info = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,

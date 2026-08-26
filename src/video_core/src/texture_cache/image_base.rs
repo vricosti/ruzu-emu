@@ -12,6 +12,7 @@ use super::types::*;
 use super::util;
 use crate::surface;
 use common::div_ceil::div_ceil_u32;
+use smallvec::SmallVec;
 
 // ── Type aliases matching upstream ─────────────────────────────────────
 
@@ -97,8 +98,8 @@ pub struct ImageBase {
     pub image_view_infos: Vec<ImageViewInfo>,
     pub image_view_ids: Vec<ImageViewId>,
 
-    pub slice_offsets: Vec<u32>,
-    pub slice_subresources: Vec<SubresourceBase>,
+    pub slice_offsets: SmallVec<[u32; 16]>,
+    pub slice_subresources: SmallVec<[SubresourceBase; 16]>,
 
     pub aliased_images: Vec<AliasedImage>,
     pub overlapping_images: Vec<ImageId>,
@@ -117,12 +118,12 @@ impl ImageBase {
         let slice_offsets = if info.image_type == ImageType::E3D {
             util::calculate_slice_offsets(&info)
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         let slice_subresources = if info.image_type == ImageType::E3D {
             util::calculate_slice_subresources(&info)
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         Self {
             guest_size_bytes,
@@ -172,8 +173,8 @@ impl ImageBase {
             mip_level_offsets: [0; MAX_MIP_LEVELS],
             image_view_infos: Vec::new(),
             image_view_ids: Vec::new(),
-            slice_offsets: Vec::new(),
-            slice_subresources: Vec::new(),
+            slice_offsets: SmallVec::new(),
+            slice_subresources: SmallVec::new(),
             aliased_images: Vec::new(),
             overlapping_images: Vec::new(),
             map_view_id: ImageMapId::default(),

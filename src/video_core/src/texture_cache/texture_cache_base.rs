@@ -628,7 +628,7 @@ impl TextureCacheParams for CommonTextureCacheParams {
     type Sampler = ();
     type Framebuffer = ();
     type FramebufferError = std::convert::Infallible;
-    type AsyncBuffer = ();
+    type AsyncBuffer = Vec<u8>;
     type BufferType = ();
 
     const ENABLE_VALIDATION: bool = true;
@@ -671,13 +671,15 @@ impl TextureCacheParams for CommonTextureCacheParams {
         false
     }
 
-    fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, _: usize, _: bool) {}
-
-    fn staging_mapped_span(_: &mut ()) -> &mut [u8] {
-        &mut []
+    fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, size: usize, _: bool) -> Vec<u8> {
+        vec![0; size]
     }
 
-    fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut ()) {}
+    fn staging_mapped_span(buffer: &mut Vec<u8>) -> &mut [u8] {
+        buffer
+    }
+
+    fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut Vec<u8>) {}
 
     fn can_upload_msaa(_: &TextureCacheBase<Self>) -> bool {
         true
@@ -685,12 +687,18 @@ impl TextureCacheParams for CommonTextureCacheParams {
 
     fn transition_image_layout(_: &mut TextureCacheBase<Self>, _: ImageId) {}
 
-    fn upload_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: &(), _: &[BufferImageCopy]) {}
+    fn upload_image(
+        _: &mut TextureCacheBase<Self>,
+        _: ImageId,
+        _: &Vec<u8>,
+        _: &[BufferImageCopy],
+    ) {
+    }
 
     fn accelerate_image_upload(
         _: &mut TextureCacheBase<Self>,
         _: ImageId,
-        _: &(),
+        _: &Vec<u8>,
         _: &[SwizzleParameters],
         _: u32,
         _: u32,
@@ -1555,6 +1563,20 @@ mod tests {
         drop(cache);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
+
+    #[test]
+    fn common_backend_staging_buffer_exposes_the_requested_mapped_span() {
+        let mut cache = TextureCacheBase::<CommonTextureCacheParams>::new(std::sync::Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let mut staging = CommonTextureCacheParams::upload_staging_buffer(&mut cache, 37, false);
+
+        assert_eq!(
+            CommonTextureCacheParams::staging_mapped_span(&mut staging).len(),
+            37
+        );
+    }
+
     use std::hash::{BuildHasher, Hash, Hasher};
     use std::sync::Arc;
 

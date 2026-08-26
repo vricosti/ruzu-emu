@@ -15430,3 +15430,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: the page tables and range maps are internal host data structures and are not serialized or
   copied across an ABI boundary.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/nsight_aftermath_tracker.rs` vs Eden `src/video_core/vulkan_common/nsight_aftermath_tracker.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu has no `HAS_NSIGHT_AFTERMATH` build configuration or proprietary NVIDIA SDK bindings, so it
+  implements Eden's header-only unsupported-build path. The SDK-enabled DLL loading, callbacks,
+  shader dumps, crash dumps, and JSON decoding remain platform tooling outside this build.
+
+### Unintentional differences (to fix)
+
+- Resolved: the unsupported-build tracker is now stateless like Eden's `#ifndef
+  HAS_NSIGHT_AFTERMATH` class instead of retaining an unused mutex and initialization flag.
+- Resolved: the non-upstream `is_initialized` method was removed, and the module documentation now
+  names the Eden source tree.
+
+### Missing items
+
+- The proprietary `HAS_NSIGHT_AFTERMATH` implementation is unavailable; the no-SDK constructor,
+  destructor, and `SaveShader` behavior are present.
+
+### Binary layout verification
+
+- N/A: the stub is not passed through a C ABI and stores no state.

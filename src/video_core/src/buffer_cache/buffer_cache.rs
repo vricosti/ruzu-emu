@@ -58,6 +58,10 @@ const DEFAULT_CRITICAL_MEMORY: u64 = 1024 * 1024 * 1024;
 const TARGET_THRESHOLD: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Debug flag: when true, GPU->CPU downloads are disabled.
+///
+/// Eden declares this flag but does not consume it. Keep the declaration for
+/// source parity; using it would incorrectly disable synchronous downloads.
+#[allow(dead_code)]
 const DISABLE_DOWNLOADS: bool = true;
 
 /// Number of page-table entries: covers 2^34 bytes / CACHING_PAGESIZE.
@@ -118,13 +122,20 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     slot_buffers: SlotVector<P::Buffer>,
 
     // -- Page table: maps device page -> BufferId --
-    page_table: Vec<BufferId>,
+    // Rust boxes the fixed array so constructing/moving BufferCache does not
+    // place Eden's multi-megabyte member on the host stack.
+    page_table: Box<[BufferId; PAGE_TABLE_SIZE]>,
 
     // -- Vertex buffer slots --
     // Upstream: enabled_vertex_buffers_mask, vertex_buffers_serial, v_buffer.
     enabled_vertex_buffers_mask: u32,
     vertex_buffers_serial: u64,
     v_buffer: [Binding; 32],
+
+    /// Reusable upload descriptors.
+    ///
+    /// Upstream: `boost::container::small_vector<BufferCopy, 4> upload_copies`.
+    upload_copies: SmallVec<[BufferCopy; 4]>,
 
     // -- Memory tracker --
     memory_tracker: MemoryTrackerBase<DT>,
@@ -215,10 +226,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             device_memory: None,
             current_draw_indirect: None,
             slot_buffers,
-            page_table: vec![SlotId::invalid(); PAGE_TABLE_SIZE],
+            page_table: vec![SlotId::invalid(); PAGE_TABLE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("buffer-cache page table has its fixed upstream size"),
             enabled_vertex_buffers_mask: 0,
             vertex_buffers_serial: 0,
             v_buffer: [NULL_BINDING; 32],
+            upload_copies: SmallVec::new(),
             memory_tracker: MemoryTrackerBase::new(device_tracker),
             uncommitted_gpu_modified_ranges: RangeSet::new(),
             gpu_modified_ranges: RangeSet::new(),
@@ -447,26 +462,31 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::CachedWriteMemory`
     ///
-    /// NOTE: `device_memory.ReadBlockUnsafe` is not available; the inline path falls back to
-    /// `write_memory` for non-GPU-modified regions and logs a warning for the inline path.
     pub fn cached_write_memory(&mut self, device_addr: VAddr, size: u64) {
         let is_dirty = self.is_region_registered(device_addr, size as usize);
         if !is_dirty {
             return;
         }
         let aligned_start = device_addr & !(DEVICE_PAGESIZE - 1);
-        let aligned_end = (device_addr + size + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
-        if !self.is_region_gpu_modified(aligned_start, (aligned_end - aligned_start) as usize) {
+        let aligned_end = device_addr
+            .wrapping_add(size)
+            .wrapping_add(DEVICE_PAGESIZE - 1)
+            & !(DEVICE_PAGESIZE - 1);
+        if !self.is_region_gpu_modified(
+            aligned_start,
+            aligned_end.wrapping_sub(aligned_start) as usize,
+        ) {
             self.write_memory(device_addr, size);
             return;
         }
         // Upstream: device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size)
         //           InlineMemoryImplementation(device_addr, size, tmp_buffer)
         if let Some(ref dm) = self.device_memory {
-            self.tmp_buffer.resize(size as usize, 0);
-            dm.read_block_unsafe(device_addr, &mut self.tmp_buffer);
-            let buf_copy: Vec<u8> = self.tmp_buffer[..size as usize].to_vec();
-            self.inline_memory_implementation(device_addr, size as usize, &buf_copy);
+            let mut tmp_buffer = std::mem::take(&mut self.tmp_buffer);
+            tmp_buffer.resize(size as usize, 0);
+            dm.read_block_unsafe(device_addr, &mut tmp_buffer);
+            self.inline_memory_implementation(device_addr, size as usize, &tmp_buffer);
+            self.tmp_buffer = tmp_buffer;
         } else {
             log::warn!(
                 "cached_write_memory: GPU-modified region at {:#x}+{} — device_memory \
@@ -501,7 +521,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DownloadMemory`
     pub fn download_memory(&mut self, device_addr: VAddr, size: u64) {
-        let mut buffer_ids = Vec::new();
+        let mut buffer_ids: SmallVec<[BufferId; 4]> = SmallVec::new();
         self.for_each_buffer_in_range(device_addr, size, |buffer_id, _buffer| {
             buffer_ids.push(buffer_id);
         });
@@ -519,8 +539,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         size: u64,
     ) -> Option<RasterizerDownloadArea> {
         let device_addr_start_aligned = device_addr & !(DEVICE_PAGESIZE - 1);
-        let device_addr_end_aligned =
-            (device_addr + size + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
+        let device_addr_end_aligned = device_addr
+            .wrapping_add(size)
+            .wrapping_add(DEVICE_PAGESIZE - 1)
+            & !(DEVICE_PAGESIZE - 1);
 
         if self
             .memory_tracker
@@ -535,11 +557,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let preemtive = !self.is_region_gpu_modified(
             device_addr_start_aligned,
-            (device_addr_end_aligned - device_addr_start_aligned) as usize,
+            device_addr_end_aligned.wrapping_sub(device_addr_start_aligned) as usize,
         );
         self.memory_tracker.mark_region_as_preflushable(
             device_addr_start_aligned,
-            device_addr_end_aligned - device_addr_start_aligned,
+            device_addr_end_aligned.wrapping_sub(device_addr_start_aligned),
         );
 
         Some(RasterizerDownloadArea {
@@ -563,9 +585,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return false;
         }
         let aligned_start = dest_address & !(DEVICE_PAGESIZE - 1);
-        let aligned_end =
-            (dest_address + copy_size as u64 + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
-        if !self.is_region_gpu_modified(aligned_start, (aligned_end - aligned_start) as usize) {
+        let aligned_end = dest_address
+            .wrapping_add(copy_size as u64)
+            .wrapping_add(DEVICE_PAGESIZE - 1)
+            & !(DEVICE_PAGESIZE - 1);
+        if !self.is_region_gpu_modified(
+            aligned_start,
+            aligned_end.wrapping_sub(aligned_start) as usize,
+        ) {
             return false;
         }
         self.inline_memory_implementation(dest_address, copy_size, inlined_buffer);
@@ -1191,8 +1218,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             ObtainBufferOperation::DiscardWrite => {
                 let device_addr_start = device_addr & !63u64; // AlignDown(device_addr, 64)
-                let device_addr_end = (device_addr + size as u64 + 63) & !63u64;
-                let new_size = device_addr_end - device_addr_start;
+                let device_addr_end =
+                    device_addr.wrapping_add(size as u64).wrapping_add(63) & !63u64;
+                let new_size = device_addr_end.wrapping_sub(device_addr_start);
                 self.clear_download(device_addr_start, new_size);
                 self.gpu_modified_ranges
                     .subtract(device_addr_start, new_size as usize);
@@ -1276,7 +1304,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut _largest_copy = 0u64;
         {
             let committed_ranges = &self.committed_gpu_modified_ranges;
-            let page_table = &self.page_table;
+            let page_table = &self.page_table[..];
             let slot_buffers = &mut self.slot_buffers;
             let memory_tracker = &mut self.memory_tracker;
             let gpu_modified_ranges = &self.gpu_modified_ranges;
@@ -1292,12 +1320,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                         size,
                         |buffer_id, buffer| {
                             let buffer_start = buffer.cpu_addr();
-                            let buffer_end = buffer_start + buffer.size_bytes() as u64;
+                            let buffer_end = buffer_start.wrapping_add(buffer.size_bytes() as u64);
                             let new_start = buffer_start.max(device_addr);
-                            let new_end = buffer_end.min(device_addr + size);
+                            let new_end = buffer_end.min(device_addr.wrapping_add(size));
                             memory_tracker.for_each_download_range(
                                 new_start,
-                                new_end - new_start,
+                                new_end.wrapping_sub(new_start),
                                 false,
                                 &mut |device_addr_out, range_size| {
                                     let buffer_addr = buffer.cpu_addr();
@@ -1414,7 +1442,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 let dst_offset = copy.dst_offset.wrapping_sub(base_offset) as usize;
                 let copy_size = copy.size as usize;
                 let read_mapped_memory = &mapped_memory[dst_offset..dst_offset + copy_size];
-                let mut write_ranges = Vec::new();
+                let mut write_ranges: SmallVec<[(VAddr, VAddr); 4]> = SmallVec::new();
                 self.async_downloads.for_each_in_range(
                     device_addr,
                     copy_size,
@@ -1501,7 +1529,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }];
 
         // Mirror GPU-modified ranges from source to destination.
-        let mut tmp_intervals: Vec<(VAddr, u64)> = Vec::new();
+        let mut tmp_intervals: SmallVec<[(VAddr, u64); 4]> = SmallVec::new();
         self.gpu_modified_ranges.for_each_in_range(
             cpu_src_address,
             amount as usize,
@@ -1602,7 +1630,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::IsRegionRegistered`
     pub fn is_region_registered(&self, addr: VAddr, size: usize) -> bool {
-        let end_addr = addr + size as u64;
+        let end_addr = addr.wrapping_add(size as u64);
         let page_end = div_ceil(end_addr, CACHING_PAGESIZE);
         let mut page = addr >> CACHING_PAGEBITS;
         while page < page_end {
@@ -1613,7 +1641,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             let buffer = &self.slot_buffers[buffer_id];
             let buf_start = buffer.cpu_addr();
-            let buf_end = buf_start + buffer.size_bytes() as u64;
+            let buf_end = buf_start.wrapping_add(buffer.size_bytes() as u64);
             if buf_start < end_addr && addr < buf_end {
                 return true;
             }
@@ -1725,7 +1753,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         F: FnMut(BufferId, &mut P::Buffer),
     {
         Self::for_each_buffer_in_range_impl(
-            &self.page_table,
+            &self.page_table[..],
             &mut self.slot_buffers,
             device_addr,
             size,
@@ -1746,7 +1774,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ) where
         F: FnMut(BufferId, &mut P::Buffer),
     {
-        let page_end = div_ceil(device_addr + size, CACHING_PAGESIZE);
+        let page_end = div_ceil(device_addr.wrapping_add(size), CACHING_PAGESIZE);
         let mut page = device_addr >> CACHING_PAGEBITS;
         while page < page_end {
             let buffer_id = page_table[page as usize];
@@ -1756,7 +1784,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             let buffer = &mut slot_buffers[buffer_id];
             func(buffer_id, buffer);
-            let end_addr = buffer.cpu_addr() + buffer.size_bytes() as u64;
+            let end_addr = buffer.cpu_addr().wrapping_add(buffer.size_bytes() as u64);
             page = div_ceil(end_addr, CACHING_PAGESIZE);
         }
     }
@@ -1764,7 +1792,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Check if a range fits within a single device page.
     fn is_range_granular(device_addr: VAddr, size: usize) -> bool {
         let device_pagemask = 4096u64 - 1; // Core::DEVICE_PAGEMASK
-        (device_addr & !device_pagemask) == ((device_addr + size as u64) & !device_pagemask)
+        (device_addr & !device_pagemask)
+            == (device_addr.wrapping_add(size as u64) & !device_pagemask)
     }
 
     // -----------------------------------------------------------------------
@@ -1788,7 +1817,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // stopping after num_iterations buffers.
         let tick_threshold = self.frame_tick.wrapping_sub(ticks_to_destroy);
         let mut remaining = num_iterations;
-        let mut to_delete: Vec<BufferId> = Vec::new();
+        let mut to_delete: SmallVec<[BufferId; 64]> = SmallVec::new();
         self.lru_cache
             .for_each_item_below(tick_threshold, |buffer_id| {
                 if remaining == 0 {
@@ -1873,8 +1902,27 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             offset
         };
         let buffer = &mut self.slot_buffers[buffer_id];
+        if !P::HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT {
+            buffer.mark_usage(offset as u64, size as u64);
+        }
         self.runtime
             .bind_index_buffer(topology, index_format, first, count, buffer, offset, size);
+    }
+
+    /// Bind one host vertex buffer through the backend-specific runtime shape.
+    ///
+    /// Upstream: `BufferCache<P>::BindHostVertexBuffer`.
+    #[allow(dead_code)] // Declared and currently unused by Eden as well.
+    fn bind_host_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut P::Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        self.runtime
+            .bind_vertex_buffer(index, buffer, offset, size, stride);
     }
 
     /// Upstream: `BufferCache<P>::VertexBufferSlot`.
@@ -1930,9 +1978,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 .map(|maxwell| maxwell.vertex_stream_info(index).stride as u64)
                 .unwrap_or_default();
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
-            if !P::IS_OPENGL {
-                self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
-            }
+            self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
             if !bindings.buffer_ids.is_empty() && index != last_index.wrapping_add(1) {
                 flush_bindings(self, &mut bindings, &mut last_index);
             }
@@ -2200,7 +2246,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_storage_buffers[stage];
         let written_mask = cs.written_storage_buffers[stage];
-        let bindings: Vec<Binding> = cs.storage_buffers[stage].to_vec();
+        let bindings = cs.storage_buffers[stage];
 
         let mut binding_index = 0u32;
         Self::for_each_enabled_bit(mask, |idx| {
@@ -2238,7 +2284,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mask = cs.enabled_texture_buffers[stage];
         let written_mask = cs.written_texture_buffers[stage];
         let image_mask = cs.image_texture_buffers[stage];
-        let bindings: Vec<TextureBufferBinding> = cs.texture_buffers[stage].to_vec();
+        let bindings = cs.texture_buffers[stage];
 
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
@@ -2278,7 +2324,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
-        let bindings: Vec<Binding> = cs.transform_feedback_buffers.to_vec();
+        let bindings = cs.transform_feedback_buffers;
         let mut host_bindings = HostBindings::default();
         for (index, binding) in bindings.into_iter().enumerate() {
             let layout = layouts[index];
@@ -2384,7 +2430,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_compute_storage_buffers;
         let written_mask = cs.written_compute_storage_buffers;
-        let bindings: Vec<Binding> = cs.compute_storage_buffers.to_vec();
+        let bindings = cs.compute_storage_buffers;
 
         let mut binding_index = 0u32;
         Self::for_each_enabled_bit(mask, |idx| {
@@ -2434,7 +2480,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mask = cs.enabled_compute_texture_buffers;
         let written_mask = cs.written_compute_texture_buffers;
         let image_mask = cs.image_compute_texture_buffers;
-        let bindings: Vec<TextureBufferBinding> = cs.compute_texture_buffers.to_vec();
+        let bindings = cs.compute_texture_buffers;
 
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
@@ -2537,8 +2583,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .inline_index_draw_indexes
             .len() as u32;
         if inline_index_size != 0 {
-            let buffer_size =
-                (inline_index_size + CACHING_PAGESIZE as u32 - 1) & !(CACHING_PAGESIZE as u32 - 1);
+            let buffer_size = inline_index_size.wrapping_add(CACHING_PAGESIZE as u32 - 1)
+                & !(CACHING_PAGESIZE as u32 - 1);
             if self.inline_buffer_id == NULL_BUFFER_ID {
                 self.inline_buffer_id = self.create_buffer(0, buffer_size);
             }
@@ -2616,8 +2662,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .inline_index_draw_indexes
             .len() as u32;
         if inline_index_size != 0 {
-            let buffer_size =
-                (inline_index_size + CACHING_PAGESIZE as u32 - 1) & !(CACHING_PAGESIZE as u32 - 1);
+            let buffer_size = inline_index_size.wrapping_add(CACHING_PAGESIZE as u32 - 1)
+                & !(CACHING_PAGESIZE as u32 - 1);
             if self.inline_buffer_id == NULL_BUFFER_ID {
                 self.inline_buffer_id = self.create_buffer(0, buffer_size);
             }
@@ -2727,9 +2773,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         let gpu_addr_begin = array.address;
-        let gpu_addr_end = limit.address + 1;
+        let gpu_addr_end = limit.address.wrapping_add(1);
         let device_addr = gpu_to_cpu_address(gpu_addr_begin);
-        let address_size = (gpu_addr_end - gpu_addr_begin) as u32;
+        let address_size = gpu_addr_end.wrapping_sub(gpu_addr_begin) as u32;
         let mut size = address_size;
 
         if !array.enabled || size == 0 || device_addr.is_none() {
@@ -2773,12 +2819,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         let gpu_addr_begin = array.address;
-        let gpu_addr_end = limit.address + 1;
+        let gpu_addr_end = limit.address.wrapping_add(1);
         let device_addr = self
             .gpu_memory
             .as_ref()
             .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr_begin));
-        let address_size = (gpu_addr_end - gpu_addr_begin) as u32;
+        let address_size = gpu_addr_end.wrapping_sub(gpu_addr_begin) as u32;
         let mut size = address_size;
 
         if !array.enabled || size == 0 || device_addr.is_none() {
@@ -3161,26 +3207,26 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     fn resolve_overlaps(&mut self, device_addr: VAddr, wanted_size: u32) -> OverlapResult {
         let mut overlap_ids: SmallVec<[BufferId; 16]> = SmallVec::new();
         let mut begin = device_addr;
-        let mut end = device_addr + wanted_size as u64;
+        let mut end = device_addr.wrapping_add(wanted_size as u64);
 
         let max_page: u64 = 1u64 << AS_BITS;
 
         let expand_begin = |begin: &mut u64, addr: &mut u64, add_value: u64| {
             let min_page = CACHING_PAGESIZE + DEVICE_PAGESIZE;
-            if add_value > *begin - min_page {
+            if add_value > begin.wrapping_sub(min_page) {
                 *begin = min_page;
                 *addr = DEVICE_PAGESIZE;
             } else {
-                *begin -= add_value;
-                *addr = *begin - CACHING_PAGESIZE;
+                *begin = begin.wrapping_sub(add_value);
+                *addr = begin.wrapping_sub(CACHING_PAGESIZE);
             }
         };
 
         let expand_end = |end: &mut u64, add_value: u64| {
-            if add_value > max_page - *end {
+            if add_value > max_page.wrapping_sub(*end) {
                 *end = max_page;
             } else {
-                *end += add_value;
+                *end = end.wrapping_add(add_value);
             }
         };
 
@@ -3212,8 +3258,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 if expands_left {
                     begin = overlap_device_addr;
                 }
-                let overlap_end =
-                    overlap_device_addr + self.slot_buffers[overlap_id].size_bytes() as u64;
+                let overlap_end = overlap_device_addr
+                    .wrapping_add(self.slot_buffers[overlap_id].size_bytes() as u64);
                 let expands_right = overlap_end > end;
                 if expands_right {
                     end = overlap_end;
@@ -3237,11 +3283,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
 
             scan_addr = scan_addr.wrapping_add(CACHING_PAGESIZE);
-        }
-
-        // Unmark picked buffers.
-        for &id in &overlap_ids {
-            self.slot_buffers[id].unpick();
         }
 
         OverlapResult {
@@ -3295,13 +3336,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     fn create_buffer(&mut self, device_addr: VAddr, wanted_size: u32) -> BufferId {
         // Align start and end to caching page boundaries.
-        let device_addr_end =
-            (device_addr + wanted_size as u64 + CACHING_PAGESIZE - 1) & !(CACHING_PAGESIZE - 1);
+        let device_addr_end = device_addr
+            .wrapping_add(wanted_size as u64)
+            .wrapping_add(CACHING_PAGESIZE - 1)
+            & !(CACHING_PAGESIZE - 1);
         let device_addr = device_addr & !(CACHING_PAGESIZE - 1);
-        let wanted_size = (device_addr_end - device_addr) as u32;
+        let wanted_size = device_addr_end.wrapping_sub(device_addr) as u32;
 
         let overlap = self.resolve_overlaps(device_addr, wanted_size);
-        let size = (overlap.end - overlap.begin) as u32;
+        let size = overlap.end.wrapping_sub(overlap.begin) as u32;
 
         let new_buffer = P::Buffer::new(&mut self.runtime, overlap.begin, size as u64);
 
@@ -3345,17 +3388,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         if insert {
-            self.total_used_memory += (size + 1023) as u64 & !1023u64; // AlignUp(size, 1024)
+            let aligned = size.wrapping_add(1023) as u64 & !1023u64;
+            self.total_used_memory = self.total_used_memory.wrapping_add(aligned);
             let lru_id = self.lru_cache.insert(buffer_id, self.frame_tick);
             self.slot_buffers[buffer_id].set_lru_id(lru_id);
         } else {
-            let aligned = (size + 1023) as u64 & !1023u64;
+            let aligned = size.wrapping_add(1023) as u64 & !1023u64;
             self.total_used_memory = self.total_used_memory.wrapping_sub(aligned);
             let lru_id = self.slot_buffers[buffer_id].get_lru_id();
             self.lru_cache.free(lru_id);
         }
 
-        let device_addr_end = device_addr_begin + size as u64;
+        let device_addr_end = device_addr_begin.wrapping_add(size as u64);
         let page_begin = device_addr_begin / CACHING_PAGESIZE;
         let page_end = div_ceil(device_addr_end, CACHING_PAGESIZE);
 
@@ -3384,17 +3428,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Returns `true` if no upload was needed (region was already clean).
     fn synchronize_buffer(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u32) -> bool {
-        let mut copies: Vec<BufferCopy> = Vec::new();
+        self.upload_copies.clear();
         let mut total_size_bytes: u64 = 0;
         let mut largest_copy: u64 = 0;
 
         let buffer_start = self.slot_buffers[buffer_id].cpu_addr_cached;
 
+        let upload_copies = &mut self.upload_copies;
         self.memory_tracker.for_each_upload_range(
             device_addr,
             size as u64,
             &mut |device_addr_out, range_size| {
-                copies.push(BufferCopy {
+                upload_copies.push(BufferCopy {
                     src_offset: total_size_bytes,
                     dst_offset: device_addr_out - buffer_start,
                     size: range_size,
@@ -3408,7 +3453,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return true;
         }
 
-        self.upload_memory(buffer_id, total_size_bytes, largest_copy, &mut copies);
+        let mut upload_copies = std::mem::take(&mut self.upload_copies);
+        self.upload_memory(
+            buffer_id,
+            total_size_bytes,
+            largest_copy,
+            &mut upload_copies,
+        );
+        self.upload_copies = upload_copies;
         self.any_buffer_uploaded = true;
         false
     }
@@ -3456,8 +3508,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     let upload_span =
                         unsafe { std::slice::from_raw_parts(ptr, copy.size as usize) };
                     self.slot_buffers[_buffer_id].immediate_upload(copy.dst_offset, upload_span);
-                    continue;
+                } else {
+                    // Eden leaves `upload_span` empty when a granular range has
+                    // no direct pointer, then performs the same empty upload.
+                    self.slot_buffers[_buffer_id].immediate_upload(copy.dst_offset, &[]);
                 }
+                continue;
             }
             if *common::settings::values()
                 .enable_gpu_buffer_readback
@@ -3537,7 +3593,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Phase 2: apply range subtractions and build copy list (borrows gpu_modified_ranges).
         let buffer_addr = self.slot_buffers[buffer_id].cpu_addr();
 
-        let mut download_ranges: Vec<(VAddr, u64)> = Vec::new();
+        let mut download_ranges: SmallVec<[(VAddr, u64); 4]> = SmallVec::new();
         self.memory_tracker.for_each_download_range_and_clear(
             device_addr,
             size,
@@ -3546,13 +3602,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             },
         );
 
-        let mut copies: Vec<BufferCopy> = Vec::new();
+        let mut copies: SmallVec<[BufferCopy; 1]> = SmallVec::new();
         let mut total_size_bytes: u64 = 0;
         let mut largest_copy: u64 = 0;
 
         for (device_addr_out, range_size) in download_ranges {
             // Iterate GPU-modified sub-ranges using RangeSet::for_each_in_range.
-            let mut sub_intervals: Vec<(VAddr, VAddr)> = Vec::new();
+            let mut sub_intervals: SmallVec<[(VAddr, VAddr); 4]> = SmallVec::new();
             self.gpu_modified_ranges.for_each_in_range(
                 device_addr_out,
                 range_size as usize,
@@ -3579,10 +3635,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         if total_size_bytes == 0 {
-            return;
-        }
-
-        if DISABLE_DOWNLOADS {
             return;
         }
 
@@ -3645,8 +3697,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         // Clear any bindings that reference this buffer.
         let mut dirty_index = false;
-        let mut dirty_vertex_buffers = Vec::new();
-        let mut updated_vertex_slots = Vec::new();
+        let mut dirty_vertex_buffers: SmallVec<[u32; NUM_VERTEX_BUFFERS as usize]> =
+            SmallVec::new();
+        let mut updated_vertex_slots: SmallVec<[(u32, Binding); NUM_VERTEX_BUFFERS as usize]> =
+            SmallVec::new();
         if cs.index_buffer.buffer_id == buffer_id {
             cs.index_buffer.buffer_id = NULL_BUFFER_ID;
             dirty_index = true;
@@ -3811,7 +3865,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let size = {
             let memory_layout_size = get_memory_layout_size(gpu_addr) as u32;
             let mut next_qword_bytes = [0u8; 8];
-            let next_qword = if read_block(ssbo_addr + 8, &mut next_qword_bytes) {
+            let next_qword = if read_block(ssbo_addr.wrapping_add(8), &mut next_qword_bytes) {
                 u64::from_le_bytes(next_qword_bytes)
             } else {
                 0
@@ -3830,7 +3884,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Upstream: alignment only applies to the offset of the buffer.
         let alignment = self.runtime.get_storage_buffer_alignment();
         let aligned_gpu_addr = gpu_addr & !(alignment as u64 - 1);
-        let aligned_size = (gpu_addr - aligned_gpu_addr) as u32 + size;
+        let aligned_size = (gpu_addr.wrapping_sub(aligned_gpu_addr) as u32).wrapping_add(size);
 
         let aligned_device_addr = gpu_to_cpu_address(aligned_gpu_addr);
         if aligned_device_addr.is_none() || size == 0 {
@@ -3850,15 +3904,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         // Upstream: const DAddr cpu_end = Common::AlignUp(*device_addr + size, Core::DEVICE_PAGESIZE);
-        let cpu_end =
-            (device_addr.unwrap() + size as u64 + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
+        let cpu_end = device_addr
+            .unwrap()
+            .wrapping_add(size as u64)
+            .wrapping_add(DEVICE_PAGESIZE - 1)
+            & !(DEVICE_PAGESIZE - 1);
 
         Binding {
             device_addr: aligned_device_addr.unwrap(),
             size: if is_written {
                 aligned_size
             } else {
-                (cpu_end - aligned_device_addr.unwrap()) as u32
+                cpu_end.wrapping_sub(aligned_device_addr.unwrap()) as u32
             },
             buffer_id: NULL_BUFFER_ID,
         }
@@ -3917,30 +3974,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         span
     }
 
-    /// Ensure `immediate_buffer_alloc` has at least `wanted_capacity` bytes and return a slice.
+    /// Resize `immediate_buffer_alloc` to `wanted_capacity` and return its full span.
     ///
     /// Upstream: `BufferCache<P>::ImmediateBuffer`
     fn immediate_buffer(immediate_buffer_alloc: &mut Vec<u8>, wanted_capacity: usize) -> &mut [u8] {
-        if immediate_buffer_alloc.len() < wanted_capacity {
-            immediate_buffer_alloc.resize(wanted_capacity, 0u8);
-        }
-        &mut immediate_buffer_alloc[..wanted_capacity]
+        immediate_buffer_alloc.resize(wanted_capacity, 0u8);
+        immediate_buffer_alloc
     }
 
     /// Return true if a fast uniform buffer is currently bound at `(stage, binding_index)`.
     ///
     /// Upstream: `BufferCache<P>::HasFastUniformBufferBound`
     fn has_fast_uniform_buffer_bound(&self, stage: usize, binding_index: u32) -> bool {
-        if P::IS_OPENGL {
-            self.channel_caches
-                .current_channel_state()
-                .map_or(false, |cs| {
-                    ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) != 0
-                })
-        } else {
-            // Only OpenGL has fast uniform buffers.
-            false
-        }
+        self.channel_caches
+            .current_channel_state()
+            .is_some_and(|cs| ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) != 0)
     }
 
     /// Remove `[base_addr, base_addr+size)` from all download tracking structures.
@@ -4004,7 +4052,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 /// Align `total` up by `new_size` rounded to `align`.
 #[inline]
 fn constexpr_align_up(total: &mut u64, new_size: u64, align: u64) {
-    *total += (new_size + align - 1) & !(align - 1);
+    let aligned = new_size.wrapping_add(align - 1) & !(align - 1);
+    *total = total.wrapping_add(aligned);
 }
 
 // ---------------------------------------------------------------------------
@@ -4038,6 +4087,38 @@ mod tests {
         const IS_OPENGL: bool = false;
         const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
         const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = true;
+        const NEEDS_BIND_UNIFORM_INDEX: bool = false;
+        const NEEDS_BIND_STORAGE_INDEX: bool = false;
+        const USE_MEMORY_MAPS: bool = false;
+        const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
+        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+    }
+
+    struct TestOpenGlParams;
+    impl BufferCacheParams for TestOpenGlParams {
+        type Runtime = TestBufferCacheRuntime;
+        type Buffer = TestBuffer;
+        type AsyncBuffer = StagingBufferRef;
+
+        const IS_OPENGL: bool = true;
+        const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
+        const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = true;
+        const NEEDS_BIND_UNIFORM_INDEX: bool = false;
+        const NEEDS_BIND_STORAGE_INDEX: bool = false;
+        const USE_MEMORY_MAPS: bool = false;
+        const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
+        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+    }
+
+    struct TestLimitedIndexParams;
+    impl BufferCacheParams for TestLimitedIndexParams {
+        type Runtime = TestBufferCacheRuntime;
+        type Buffer = TestBuffer;
+        type AsyncBuffer = StagingBufferRef;
+
+        const IS_OPENGL: bool = false;
+        const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
+        const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = false;
         const NEEDS_BIND_UNIFORM_INDEX: bool = false;
         const NEEDS_BIND_STORAGE_INDEX: bool = false;
         const USE_MEMORY_MAPS: bool = false;
@@ -4126,12 +4207,30 @@ mod tests {
     #[test]
     fn test_buffer_cache_construction() {
         let tracker = DummyTracker;
-        let cache = BufferCache::<TestParams, DummyTracker>::new(
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
             &tracker,
             TestBufferCacheRuntime::default(),
         );
         assert!(!cache.has_uncommitted_flushes());
         assert!(!cache.should_wait_async_flushes());
+        assert_eq!(cache.page_table.len(), PAGE_TABLE_SIZE);
+        for _ in 0..4 {
+            cache.upload_copies.push(BufferCopy::default());
+        }
+        assert!(!cache.upload_copies.spilled());
+    }
+
+    #[test]
+    fn buffer_cache_exposes_upstream_single_vertex_binding_helper() {
+        let helper: fn(
+            &mut BufferCache<TestParams, DummyTracker>,
+            u32,
+            &mut TestBuffer,
+            u32,
+            u32,
+            u32,
+        ) = BufferCache::<TestParams, DummyTracker>::bind_host_vertex_buffer;
+        let _ = helper;
     }
 
     #[test]
@@ -4362,6 +4461,46 @@ mod tests {
     }
 
     #[test]
+    fn immediate_buffer_shrinks_its_logical_span_like_scratch_buffer() {
+        let mut allocation = Vec::new();
+        BufferCache::<TestParams, DummyTracker>::immediate_buffer(&mut allocation, 64);
+        let retained_capacity = allocation.capacity();
+        let span = BufferCache::<TestParams, DummyTracker>::immediate_buffer(&mut allocation, 7);
+
+        assert_eq!(span.len(), 7);
+        assert_eq!(allocation.len(), 7);
+        assert!(allocation.capacity() >= retained_capacity);
+    }
+
+    #[test]
+    fn granular_upload_without_direct_pointer_keeps_upstream_empty_upload() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        let device_addr = 0x1_0080;
+        let mut bytes = vec![0; 0x2_0000];
+        bytes[device_addr as usize..device_addr as usize + 4].copy_from_slice(&[1, 2, 3, 4]);
+        cache.set_device_memory(Box::new(ImmediateDeviceMemory {
+            bytes,
+            expose_pointer: false,
+        }));
+        let buffer_id = cache.create_buffer(device_addr, 4);
+        let copy = BufferCopy {
+            src_offset: 0,
+            dst_offset: u64::from(cache.slot_buffers[buffer_id].offset(device_addr)),
+            size: 4,
+        };
+
+        cache.immediate_upload_memory(buffer_id, 4, &[copy]);
+
+        let mut observed = [0xff; 4];
+        cache.slot_buffers[buffer_id].immediate_download(copy.dst_offset, &mut observed);
+        assert_eq!(observed, [0; 4]);
+    }
+
+    #[test]
     fn test_is_range_granular() {
         // Same page
         assert!(BufferCache::<TestParams, DummyTracker>::is_range_granular(
@@ -4370,6 +4509,10 @@ mod tests {
         // Cross page
         assert!(!BufferCache::<TestParams, DummyTracker>::is_range_granular(
             0x1F00, 0x200
+        ));
+        assert!(!BufferCache::<TestParams, DummyTracker>::is_range_granular(
+            u64::MAX - 0x7ff,
+            0x1000,
         ));
     }
 
@@ -4406,6 +4549,95 @@ mod tests {
                 .uniform_buffer_skip_cache_size,
             DEFAULT_SKIP_CACHE_SIZE
         );
+    }
+
+    #[test]
+    fn tick_frame_shifts_cache_history_with_effective_upstream_memmove_order() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        bind_test_channel(&mut cache, 3);
+        let channel = cache.current_channel_state_mut().unwrap();
+        channel.uniform_cache_hits[..3].copy_from_slice(&[11, 22, 33]);
+        channel.uniform_cache_shots[..3].copy_from_slice(&[44, 55, 66]);
+
+        cache.tick_frame();
+
+        let channel = cache.current_channel_state().unwrap();
+        assert_eq!(&channel.uniform_cache_hits[..4], &[0, 11, 22, 33]);
+        assert_eq!(&channel.uniform_cache_shots[..4], &[0, 44, 55, 66]);
+    }
+
+    #[test]
+    fn streamed_uniform_marker_forces_cached_rebind_on_vulkan() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        bind_test_channel(&mut cache, 4);
+        cache
+            .current_channel_state_mut()
+            .unwrap()
+            .fast_bound_uniform_buffers[2] = 1 << 5;
+
+        assert!(cache.has_fast_uniform_buffer_bound(2, 5));
+    }
+
+    #[test]
+    fn limited_index_binding_tracks_the_bound_range() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestLimitedIndexParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        let mut owner = ChannelState::new(5);
+        owner.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        cache.create_channel(&owner);
+        cache.bind_to_channel(owner.bind_id);
+        let address = 0x2_0000;
+        let size = 0x180;
+        let buffer_id = cache.create_buffer(address, size);
+        cache.current_channel_state_mut().unwrap().index_buffer = Binding {
+            device_addr: address,
+            size,
+            buffer_id,
+        };
+        cache.slot_buffers[buffer_id].reset_usage_tracking();
+
+        cache.bind_host_index_buffer();
+
+        assert!(cache.slot_buffers[buffer_id].is_region_used(0, size as u64));
+    }
+
+    #[test]
+    fn opengl_vertex_binding_tracks_the_bound_range() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestOpenGlParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        let mut owner = ChannelState::new(6);
+        owner.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        cache.create_channel(&owner);
+        cache.bind_to_channel(owner.bind_id);
+        let address = 0x3_0000;
+        let size = 0x200;
+        let buffer_id = cache.create_buffer(address, size);
+        let binding = Binding {
+            device_addr: address,
+            size,
+            buffer_id,
+        };
+        cache.update_vertex_buffer_slot(0, binding);
+        cache.set_geometry_dirty(DirtyFlag::VertexBuffer(0));
+        cache.slot_buffers[buffer_id].reset_usage_tracking();
+
+        cache.bind_host_vertex_buffers();
+
+        assert!(cache.slot_buffers[buffer_id].is_region_used(0, size as u64));
     }
 
     #[test]
@@ -4660,6 +4892,41 @@ mod tests {
         assert!(
             overlap.ids.contains(&left),
             "the expanded left range must be rescanned so its buffer is copied"
+        );
+        assert!(cache.slot_buffers[left].is_picked());
+        assert!(cache.slot_buffers[right].is_picked());
+    }
+
+    #[test]
+    fn synchronous_download_is_not_disabled_by_the_unused_upstream_debug_constant() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        let guest_bytes = std::sync::Arc::new(parking_lot::Mutex::new(vec![0; 0x2_0000]));
+        cache.set_device_memory(Box::new(SharedDeviceMemory {
+            bytes: std::sync::Arc::clone(&guest_bytes),
+        }));
+
+        let device_addr = 0x1_0080;
+        let payload = [0x12, 0x34, 0x56, 0x78];
+        let buffer_id = cache.create_buffer(device_addr, payload.len() as u32);
+        let offset = cache.slot_buffers[buffer_id].offset(device_addr);
+        cache.slot_buffers[buffer_id].immediate_upload(u64::from(offset), &payload);
+        cache
+            .memory_tracker
+            .unmark_region_as_cpu_modified(device_addr, payload.len() as u64);
+        cache
+            .memory_tracker
+            .mark_region_as_gpu_modified(device_addr, payload.len() as u64);
+        cache.gpu_modified_ranges.add(device_addr, payload.len());
+
+        cache.download_buffer_memory_range(buffer_id, device_addr, payload.len() as u64);
+
+        assert_eq!(
+            &guest_bytes.lock()[device_addr as usize..device_addr as usize + payload.len()],
+            &payload
         );
     }
 

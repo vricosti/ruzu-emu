@@ -4533,9 +4533,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Intentional differences
 
-- Rust omits Eden's `last_index_count` and `immediate_buffer_capacity` members. Neither member is
-  read or updated upstream: indirect draw state is held by the channel bindings, while
-  `ScratchBuffer::resize_destructive` manages the immediate allocation capacity internally.
+- Rust omits Eden's `last_index_count`, `current_buffer`, and `immediate_buffer_capacity` members.
+  None is read or updated upstream: indirect draw state is held by the channel bindings, async
+  staging ownership uses the queued optionals directly, and `ScratchBuffer::resize_destructive`
+  manages the immediate allocation capacity internally.
 
 ## 2026-08-21 — `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs `src/core/device_memory_manager.h` and `.inc` (`UpdatePagesCachedBatch`)
 
@@ -13153,3 +13154,47 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS (not ABI-shared): these host-only cache structures are not serialized or copied as raw
   bytes. Focused tests verify enum values, default sentinels, inline capacities, and the restored
   runtime method signature.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
+
+### Intentional differences
+
+- The page table is a boxed fixed-size array instead of an inline `std::array`. Its length and
+  indexing contract match Eden, while boxing avoids constructing and moving a multi-megabyte Rust
+  cache object on the host stack.
+- GPU/device-memory owners are optional boxed Rust interfaces rather than C++ references and raw
+  pointers. Missing-owner guards are restricted to states Eden's production lifecycle does not
+  enter.
+- Resolver/reader variants, explicit temporary collections, and temporary field extraction split
+  mutable borrows that C++ can hold simultaneously. Range order, copy order, and mutations match
+  the owning Eden methods.
+- Garbage collection first records the same eligible LRU identifiers and then deletes them in the
+  same order. Eden deletes inside the LRU callback; Rust cannot mutate the slot vector while that
+  callback holds the LRU borrow, and buffer deletion does not affect selection of later LRU items.
+- Eden's overlapping `std::copy_n` calls are undefined by the C++ standard. The current GCC 13.3
+  libstdc++ specialization lowers this trivially-copyable array operation to `memmove`; Rust's
+  reverse shift reproduces its observed `[0, old0, old1, ...]` result deterministically.
+- `ImmediateBufferWithData` falls back to a guest-memory read if the direct base pointer is absent.
+  Eden would form a non-empty span from a null pointer for that invalid lifecycle state; Rust does
+  not construct an invalid slice.
+- The non-Android Rust frontend always uses Eden's optimized vertex-buffer batching path. Eden's
+  alternate unoptimized path is selected only by an Android-specific setting.
+
+### Unintentional differences (to fix)
+
+- None after restoring the reusable inline upload-copy collection, fixed page-table shape, scratch
+  resize semantics, granular null-pointer upload behavior, picked-overlap lifetime, wrapping
+  unsigned address arithmetic, synchronous download behavior, streamed-uniform rebinding, and
+  index/vertex usage tracking.
+
+### Missing items
+
+- None for the supported desktop buffer-cache path. Eden's three unread members
+  (`last_index_count`, `current_buffer`, and `immediate_buffer_capacity`) remain intentionally
+  omitted as recorded above.
+
+### Binary layout verification
+
+- N/A: `BufferCache` is host-only state and is never raw-copied or serialized. Focused tests verify
+  the fixed page-table length, inline `SmallVec` capacities, enum/runtime contracts, range
+  arithmetic, upload/download behavior, binding usage, and overlap/tick lifecycle ordering.

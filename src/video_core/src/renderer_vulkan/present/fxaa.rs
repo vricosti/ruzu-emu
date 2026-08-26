@@ -13,7 +13,7 @@ use crate::host_shaders::spirv_shaders::{FXAA_FRAG_SPV, FXAA_VERT_SPV};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
 use crate::vulkan_common::vulkan_device::Device;
-use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
+use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator};
 
 // ---------------------------------------------------------------------------
 // Per-image dynamic resources
@@ -23,7 +23,7 @@ use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 struct FxaaImage {
     descriptor_sets: Vec<vk::DescriptorSet>,
     framebuffer: vk::Framebuffer,
-    image: vk::Image,
+    image: AllocatedImage,
     image_view: vk::ImageView,
 }
 
@@ -54,13 +54,13 @@ pub struct Fxaa {
 impl Fxaa {
     /// Port of `FXAA::FXAA`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         allocator: &MemoryAllocator,
         image_count: usize,
         extent: vk::Extent2D,
     ) -> Self {
         let mut fxaa = Fxaa {
-            device,
+            device: device.get_logical().clone(),
             extent,
             image_count: image_count as u32,
             images_ready: false,
@@ -75,31 +75,27 @@ impl Fxaa {
             sampler: vk::Sampler::null(),
         };
 
-        fxaa.create_images(allocator);
-        fxaa.create_render_passes();
-        fxaa.create_sampler();
-        fxaa.create_shaders();
-        fxaa.create_descriptor_pool();
-        fxaa.create_descriptor_set_layouts();
-        fxaa.create_descriptor_sets();
-        fxaa.create_pipeline_layouts();
-        fxaa.create_pipelines();
+        fxaa.create_images(device, allocator);
+        fxaa.create_render_passes(device);
+        fxaa.create_sampler(device);
+        fxaa.create_shaders(device);
+        fxaa.create_descriptor_pool(device);
+        fxaa.create_descriptor_set_layouts(device);
+        fxaa.create_descriptor_sets(device);
+        fxaa.create_pipeline_layouts(device);
+        fxaa.create_pipelines(device);
         fxaa
     }
 
     /// Port of `FXAA::CreateImages`.
-    fn create_images(&mut self, allocator: &MemoryAllocator) {
+    fn create_images(&mut self, device: &Device, allocator: &MemoryAllocator) {
         self.dynamic_images.reserve_exact(self.image_count as usize);
         for _ in 0..self.image_count {
-            let image = util::create_wrapped_image(
-                &self.device,
-                allocator,
-                self.extent,
-                vk::Format::R16G16B16A16_SFLOAT,
-            );
+            let image =
+                util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
             let image_view = util::create_wrapped_image_view(
-                &self.device,
-                image,
+                device.get_logical(),
+                image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
             self.dynamic_images.push(FxaaImage {
@@ -112,16 +108,16 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::CreateRenderPasses`.
-    fn create_render_passes(&mut self) {
+    fn create_render_passes(&mut self, device: &Device) {
         self.renderpass = util::create_wrapped_render_pass(
-            &self.device,
+            device.get_logical(),
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageLayout::GENERAL,
         );
 
         for image in &mut self.dynamic_images {
             image.framebuffer = util::create_wrapped_framebuffer(
-                &self.device,
+                device.get_logical(),
                 self.renderpass,
                 image.image_view,
                 self.extent,
@@ -130,23 +126,23 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::CreateSampler`.
-    fn create_sampler(&mut self) {
-        self.sampler = util::create_wrapped_sampler(&self.device, vk::Filter::LINEAR);
+    fn create_sampler(&mut self, device: &Device) {
+        self.sampler = util::create_wrapped_sampler(device.get_logical(), vk::Filter::LINEAR);
     }
 
     /// Port of `FXAA::CreateShaders`.
-    fn create_shaders(&mut self) {
+    fn create_shaders(&mut self, device: &Device) {
         self.vertex_shader =
-            build_shader(&self.device, FXAA_VERT_SPV).expect("Failed to build fxaa.vert");
+            build_shader(device.get_logical(), FXAA_VERT_SPV).expect("Failed to build fxaa.vert");
         self.fragment_shader =
-            build_shader(&self.device, FXAA_FRAG_SPV).expect("Failed to build fxaa.frag");
+            build_shader(device.get_logical(), FXAA_FRAG_SPV).expect("Failed to build fxaa.frag");
     }
 
     /// Port of `FXAA::CreateDescriptorPool`.
-    fn create_descriptor_pool(&mut self) {
+    fn create_descriptor_pool(&mut self, device: &Device) {
         // 2 descriptors, 1 descriptor set per image
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            &self.device,
+            device.get_logical(),
             2 * self.image_count,
             self.image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
@@ -154,9 +150,9 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::CreateDescriptorSetLayouts`.
-    fn create_descriptor_set_layouts(&mut self) {
+    fn create_descriptor_set_layouts(&mut self, device: &Device) {
         self.descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            &self.device,
+            device.get_logical(),
             &[
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -165,10 +161,10 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::CreateDescriptorSets`.
-    fn create_descriptor_sets(&mut self) {
+    fn create_descriptor_sets(&mut self, device: &Device) {
         for image in &mut self.dynamic_images {
             image.descriptor_sets = util::create_wrapped_descriptor_sets(
-                &self.device,
+                device.get_logical(),
                 self.descriptor_pool,
                 &[self.descriptor_set_layout],
             );
@@ -176,15 +172,15 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::CreatePipelineLayouts`.
-    fn create_pipeline_layouts(&mut self) {
+    fn create_pipeline_layouts(&mut self, device: &Device) {
         self.pipeline_layout =
-            util::create_wrapped_pipeline_layout(&self.device, self.descriptor_set_layout);
+            util::create_wrapped_pipeline_layout(device.get_logical(), self.descriptor_set_layout);
     }
 
     /// Port of `FXAA::CreatePipelines`.
-    fn create_pipelines(&mut self) {
+    fn create_pipelines(&mut self, device: &Device) {
         self.pipeline = util::create_wrapped_pipeline(
-            &self.device,
+            device.get_logical(),
             self.renderpass,
             self.pipeline_layout,
             self.vertex_shader,
@@ -229,7 +225,11 @@ impl Fxaa {
             return;
         }
 
-        let images: Vec<vk::Image> = self.dynamic_images.iter().map(|img| img.image).collect();
+        let images: Vec<vk::Image> = self
+            .dynamic_images
+            .iter()
+            .map(|img| img.image.handle())
+            .collect();
         let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| {
             for image in images {
@@ -256,7 +256,7 @@ impl AntiAliasPass for Fxaa {
         inout_image_view: &mut vk::ImageView,
     ) {
         let input_image = *inout_image;
-        let output_image = self.dynamic_images[image_index].image;
+        let output_image = self.dynamic_images[image_index].image.handle();
         let output_image_view = self.dynamic_images[image_index].image_view;
         let descriptor_set = self.dynamic_images[image_index].descriptor_sets[0];
         let framebuffer = self.dynamic_images[image_index].framebuffer;

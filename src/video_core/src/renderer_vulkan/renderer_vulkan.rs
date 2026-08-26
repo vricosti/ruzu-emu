@@ -30,9 +30,7 @@ use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
 
 use super::blit_screen::BlitScreen;
-use super::present::util::{
-    create_wrapped_image_allocation, create_wrapped_image_view, download_color_image,
-};
+use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
 use super::state_tracker::StateTracker;
@@ -590,7 +588,7 @@ impl RendererVulkan {
         buffer_size: vk::DeviceSize,
     ) -> MappedBuffer {
         let mut frame = Frame::default();
-        let image = create_wrapped_image_allocation(
+        let image = create_wrapped_image(
             self.memory_allocator.as_ref(),
             vk::Extent2D {
                 width: layout.width,
@@ -708,7 +706,7 @@ impl RendererVulkan {
     fn render_applet_capture_layer(&mut self, framebuffers: &[FramebufferConfig]) {
         let layout = capture_framebuffer_layout();
         if self.applet_frame.image == vk::Image::null() {
-            let image = create_wrapped_image_allocation(
+            let image = create_wrapped_image(
                 self.memory_allocator.as_ref(),
                 CAPTURE_IMAGE_SIZE,
                 CAPTURE_FORMAT,

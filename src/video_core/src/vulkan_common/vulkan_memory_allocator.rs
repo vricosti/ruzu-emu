@@ -348,13 +348,12 @@ impl Default for MemoryCommit {
 
 /// Device-local image allocation returned by `MemoryAllocator::CreateImage`.
 ///
-/// Upstream returns a `vk::Image` wrapper whose allocation is released with the
-/// wrapper. Until the Rust allocator grows the full VMA-backed wrapper, this
-/// type preserves the same ownership boundary with a dedicated allocation.
+/// Like Eden's `vk::Image`, this wrapper retains the VMA allocation and releases
+/// the image and allocation together.
 pub struct AllocatedImage {
-    device: ash::Device,
+    allocator: Option<VmaAllocator>,
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    allocation: Option<vk_mem::Allocation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -438,11 +437,20 @@ unsafe impl Send for AllocatedImage {}
 unsafe impl Sync for AllocatedImage {}
 
 impl AllocatedImage {
-    fn new(device: ash::Device, image: vk::Image, memory: vk::DeviceMemory) -> Self {
+    /// Default-constructed counterpart of Eden's empty `vk::Image` wrapper.
+    pub(crate) fn null() -> Self {
         Self {
-            device,
+            allocator: None,
+            image: vk::Image::null(),
+            allocation: None,
+        }
+    }
+
+    fn new(allocator: VmaAllocator, image: vk::Image, allocation: vk_mem::Allocation) -> Self {
+        Self {
+            allocator: Some(allocator),
             image,
-            memory,
+            allocation: Some(allocation),
         }
     }
 
@@ -453,14 +461,19 @@ impl AllocatedImage {
 
 impl Drop for AllocatedImage {
     fn drop(&mut self) {
+        let Some(mut allocation) = self.allocation.take() else {
+            return;
+        };
+        let allocator = self
+            .allocator
+            .as_ref()
+            .expect("allocated image must retain its VMA allocator")
+            .lock()
+            .expect("VMA allocator mutex poisoned");
         unsafe {
-            if self.image != vk::Image::null() {
-                self.device.destroy_image(self.image, None);
-            }
-            if self.memory != vk::DeviceMemory::null() {
-                self.device.free_memory(self.memory, None);
-            }
+            allocator.destroy_image(self.image, &mut allocation);
         }
+        self.image = vk::Image::null();
     }
 }
 
@@ -469,10 +482,6 @@ impl Drop for AllocatedImage {
 // ---------------------------------------------------------------------------
 
 enum DedicatedResource {
-    Image {
-        image: vk::Image,
-        memory: vk::DeviceMemory,
-    },
     Buffer {
         buffer: vk::Buffer,
         memory: vk::DeviceMemory,
@@ -591,22 +600,6 @@ impl MemoryAllocator {
         })
     }
 
-    /// Creates a VMA-allocated image.
-    ///
-    /// Port of `MemoryAllocator::CreateImage`.
-    ///
-    /// NOTE: Upstream delegates to VMA. The Rust port currently uses a
-    /// dedicated Vulkan allocation per image and keeps it alive in the
-    /// allocator until drop.
-    pub fn create_image(&self, ci: &vk::ImageCreateInfo) -> Result<vk::Image, VulkanError> {
-        let (image, memory) = self.create_dedicated_image(ci)?;
-        self.dedicated_resources
-            .lock()
-            .expect("dedicated resource mutex poisoned")
-            .push(DedicatedResource::Image { image, memory });
-        Ok(image)
-    }
-
     /// Creates a device-local image with allocation ownership returned to the caller.
     ///
     /// This is the Rust equivalent of the upstream `vk::Image` wrapper returned
@@ -615,52 +608,25 @@ impl MemoryAllocator {
         &self,
         ci: &vk::ImageCreateInfo,
     ) -> Result<AllocatedImage, VulkanError> {
-        let (image, memory) = self.create_dedicated_image(ci)?;
-        Ok(AllocatedImage::new(self.device.clone(), image, memory))
-    }
-
-    fn create_dedicated_image(
-        &self,
-        ci: &vk::ImageCreateInfo,
-    ) -> Result<(vk::Image, vk::DeviceMemory), VulkanError> {
-        let image = unsafe {
-            self.device
-                .create_image(ci, None)
+        let allocation_ci = vk_mem::AllocationCreateInfo {
+            flags: vk_mem::AllocationCreateFlags::WITHIN_BUDGET,
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            required_flags: vk::MemoryPropertyFlags::empty(),
+            preferred_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            memory_type_bits: 0,
+            ..Default::default()
+        };
+        let allocator = self.allocator.lock().expect("VMA allocator mutex poisoned");
+        let (image, allocation) = unsafe {
+            allocator
+                .create_image(ci, &allocation_ci)
                 .map_err(VulkanError::new)?
         };
-        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
-        let flags = memory_usage_property_flags(MemoryUsage::DeviceLocal);
-        let type_index = match self.find_type(flags, requirements.memory_type_bits) {
-            Some(index) => index,
-            None => {
-                unsafe {
-                    self.device.destroy_image(image, None);
-                }
-                return Err(VulkanError::new(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
-            }
-        };
-        let alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(requirements.size)
-            .memory_type_index(type_index)
-            .build();
-        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
-            Ok(memory) => memory,
-            Err(err) => {
-                unsafe {
-                    self.device.destroy_image(image, None);
-                }
-                return Err(VulkanError::new(err));
-            }
-        };
-        if let Err(err) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
-            unsafe {
-                self.device.free_memory(memory, None);
-                self.device.destroy_image(image, None);
-            }
-            return Err(VulkanError::new(err));
-        }
-
-        Ok((image, memory))
+        Ok(AllocatedImage::new(
+            Arc::clone(&self.allocator),
+            image,
+            allocation,
+        ))
     }
 
     /// Creates a VMA-allocated buffer.
@@ -967,10 +933,6 @@ impl Drop for MemoryAllocator {
             for resource in resources.drain(..).rev() {
                 unsafe {
                     match resource {
-                        DedicatedResource::Image { image, memory } => {
-                            self.device.destroy_image(image, None);
-                            self.device.free_memory(memory, None);
-                        }
                         DedicatedResource::Buffer { buffer, memory } => {
                             self.device.destroy_buffer(buffer, None);
                             self.device.free_memory(memory, None);

@@ -35,25 +35,7 @@ pub fn create_wrapped_buffer(
 }
 
 /// Port of `CreateWrappedImage`.
-///
-/// Creates a 2D image suitable for presentation (transfer dst + storage +
-/// sampled + color attachment).
 pub fn create_wrapped_image(
-    _device: &ash::Device,
-    allocator: &MemoryAllocator,
-    dimensions: vk::Extent2D,
-    format: vk::Format,
-) -> vk::Image {
-    let image_ci = wrapped_image_create_info(dimensions, format);
-
-    allocator
-        .create_image(&image_ci)
-        .expect("Failed to create wrapped image")
-}
-
-/// Owning Rust form of `CreateWrappedImage`, used where Eden stores the
-/// returned `vk::Image` RAII wrapper directly in a `Frame`.
-pub fn create_wrapped_image_allocation(
     allocator: &MemoryAllocator,
     dimensions: vk::Extent2D,
     format: vk::Format,
@@ -90,7 +72,7 @@ fn wrapped_image_create_info(dimensions: vk::Extent2D, format: vk::Format) -> vk
 /// Port of `TransitionImageLayout`.
 ///
 /// Inserts a pipeline barrier to transition `image` from `source_layout` to
-/// `target_layout` using ALL_COMMANDS stages.
+/// `target_layout` using the graphics-and-compute stages used by Eden.
 pub fn transition_image_layout(
     device: &ash::Device,
     cmdbuf: vk::CommandBuffer,
@@ -122,8 +104,8 @@ pub fn transition_image_layout(
     unsafe {
         device.cmd_pipeline_barrier(
             cmdbuf,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
             &[],
@@ -148,7 +130,7 @@ pub fn upload_image(
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .build();
     let mut upload_buffer = allocator
-        .create_mapped_buffer(&upload_ci, MemoryUsage::Upload)
+        .create_owned_buffer(&upload_ci, MemoryUsage::Upload)
         .expect("Failed to create image upload buffer");
     upload_buffer.mapped_slice_mut()[..initial_contents.len()].copy_from_slice(initial_contents);
     upload_buffer.flush();
@@ -173,7 +155,7 @@ pub fn upload_image(
 
     scheduler.request_outside_render_pass_operation_context();
     let device = device.clone();
-    let upload_buffer_handle = upload_buffer.buffer();
+    let upload_buffer_handle = upload_buffer.handle();
     scheduler.record(move |cmdbuf| unsafe {
         transition_image_layout(
             &device,

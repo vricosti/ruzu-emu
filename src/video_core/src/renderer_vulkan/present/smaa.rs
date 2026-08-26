@@ -20,7 +20,7 @@ use crate::renderer_vulkan::shader_util::build_shader;
 use crate::smaa_area_tex::{AREATEX_HEIGHT, AREATEX_WIDTH, AREA_TEX_BYTES};
 use crate::smaa_search_tex::{SEARCHTEX_HEIGHT, SEARCHTEX_WIDTH, SEARCH_TEX_BYTES};
 use crate::vulkan_common::vulkan_device::Device;
-use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
+use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -29,45 +29,45 @@ use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 /// Port of `SMAA::SMAAStage` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
-pub enum SmaaStage {
+enum SmaaStage {
     EdgeDetection = 0,
     BlendingWeightCalculation = 1,
     NeighborhoodBlending = 2,
 }
 
-pub const MAX_SMAA_STAGE: usize = 3;
+const MAX_SMAA_STAGE: usize = 3;
 
 /// Port of `SMAA::StaticImageType` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
-pub enum StaticImageType {
+enum StaticImageType {
     Area = 0,
     Search = 1,
 }
 
-pub const MAX_STATIC_IMAGE: usize = 2;
+const MAX_STATIC_IMAGE: usize = 2;
 
 /// Port of `SMAA::DynamicImageType` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
-pub enum DynamicImageType {
+enum DynamicImageType {
     Blend = 0,
     Edges = 1,
     Output = 2,
 }
 
-pub const MAX_DYNAMIC_IMAGE: usize = 3;
+const MAX_DYNAMIC_IMAGE: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Per-image dynamic resources
 // ---------------------------------------------------------------------------
 
 /// Port of `SMAA::Images` inner struct.
-pub struct SmaaImages {
-    pub descriptor_sets: Vec<vk::DescriptorSet>,
-    pub images: [vk::Image; MAX_DYNAMIC_IMAGE],
-    pub image_views: [vk::ImageView; MAX_DYNAMIC_IMAGE],
-    pub framebuffers: [vk::Framebuffer; MAX_SMAA_STAGE],
+struct SmaaImages {
+    descriptor_sets: Vec<vk::DescriptorSet>,
+    images: [AllocatedImage; MAX_DYNAMIC_IMAGE],
+    image_views: [vk::ImageView; MAX_DYNAMIC_IMAGE],
+    framebuffers: [vk::Framebuffer; MAX_SMAA_STAGE],
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ pub struct Smaa {
     image_count: u32,
     images_ready: bool,
     dynamic_images: Vec<SmaaImages>,
-    static_images: [vk::Image; MAX_STATIC_IMAGE],
+    static_images: [AllocatedImage; MAX_STATIC_IMAGE],
     static_image_views: [vk::ImageView; MAX_STATIC_IMAGE],
 
     descriptor_pool: vk::DescriptorPool,
@@ -101,19 +101,20 @@ pub struct Smaa {
 impl Smaa {
     /// Port of `SMAA::SMAA`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         allocator: &MemoryAllocator,
         image_count: usize,
         extent: vk::Extent2D,
     ) -> Self {
+        let logical = device.get_logical();
         let mut smaa = Smaa {
-            device,
+            device: logical.clone(),
             allocator: NonNull::from(allocator),
             extent,
             image_count: image_count as u32,
             images_ready: false,
             dynamic_images: Vec::new(),
-            static_images: [vk::Image::null(); MAX_STATIC_IMAGE],
+            static_images: std::array::from_fn(|_| AllocatedImage::null()),
             static_image_views: [vk::ImageView::null(); MAX_STATIC_IMAGE],
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set_layouts: [vk::DescriptorSetLayout::null(); MAX_SMAA_STAGE],
@@ -125,20 +126,20 @@ impl Smaa {
             sampler: vk::Sampler::null(),
         };
 
-        smaa.create_images();
-        smaa.create_render_passes();
-        smaa.create_sampler();
-        smaa.create_shaders();
-        smaa.create_descriptor_pool();
-        smaa.create_descriptor_set_layouts();
-        smaa.create_descriptor_sets();
-        smaa.create_pipeline_layouts();
-        smaa.create_pipelines();
+        smaa.create_images(device);
+        smaa.create_render_passes(device);
+        smaa.create_sampler(device);
+        smaa.create_shaders(device);
+        smaa.create_descriptor_pool(device);
+        smaa.create_descriptor_set_layouts(device);
+        smaa.create_descriptor_sets(device);
+        smaa.create_pipeline_layouts(device);
+        smaa.create_pipelines(device);
         smaa
     }
 
     /// Port of `SMAA::CreateImages`.
-    fn create_images(&mut self) {
+    fn create_images(&mut self, device: &Device) {
         let allocator = unsafe { self.allocator.as_ref() };
         let area_extent = vk::Extent2D {
             width: AREATEX_WIDTH,
@@ -149,62 +150,42 @@ impl Smaa {
             height: SEARCHTEX_HEIGHT,
         };
 
-        self.static_images[StaticImageType::Area as usize] = util::create_wrapped_image(
-            &self.device,
-            allocator,
-            area_extent,
-            vk::Format::R8G8_UNORM,
-        );
-        self.static_images[StaticImageType::Search as usize] = util::create_wrapped_image(
-            &self.device,
-            allocator,
-            search_extent,
-            vk::Format::R8_UNORM,
-        );
+        self.static_images[StaticImageType::Area as usize] =
+            util::create_wrapped_image(allocator, area_extent, vk::Format::R8G8_UNORM);
+        self.static_images[StaticImageType::Search as usize] =
+            util::create_wrapped_image(allocator, search_extent, vk::Format::R8_UNORM);
         self.static_image_views[StaticImageType::Area as usize] = util::create_wrapped_image_view(
-            &self.device,
-            self.static_images[StaticImageType::Area as usize],
+            device.get_logical(),
+            self.static_images[StaticImageType::Area as usize].handle(),
             vk::Format::R8G8_UNORM,
         );
         self.static_image_views[StaticImageType::Search as usize] = util::create_wrapped_image_view(
-            &self.device,
-            self.static_images[StaticImageType::Search as usize],
+            device.get_logical(),
+            self.static_images[StaticImageType::Search as usize].handle(),
             vk::Format::R8_UNORM,
         );
 
         self.dynamic_images.reserve_exact(self.image_count as usize);
         for _ in 0..self.image_count {
-            let blend_image = util::create_wrapped_image(
-                &self.device,
-                allocator,
-                self.extent,
-                vk::Format::R16G16B16A16_SFLOAT,
-            );
-            let edges_image = util::create_wrapped_image(
-                &self.device,
-                allocator,
-                self.extent,
-                vk::Format::R16G16_SFLOAT,
-            );
-            let output_image = util::create_wrapped_image(
-                &self.device,
-                allocator,
-                self.extent,
-                vk::Format::R16G16B16A16_SFLOAT,
-            );
+            let blend_image =
+                util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
+            let edges_image =
+                util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16_SFLOAT);
+            let output_image =
+                util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
             let blend_view = util::create_wrapped_image_view(
-                &self.device,
-                blend_image,
+                device.get_logical(),
+                blend_image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
             let edges_view = util::create_wrapped_image_view(
-                &self.device,
-                edges_image,
+                device.get_logical(),
+                edges_image.handle(),
                 vk::Format::R16G16_SFLOAT,
             );
             let output_view = util::create_wrapped_image_view(
-                &self.device,
-                output_image,
+                device.get_logical(),
+                output_image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
             self.dynamic_images.push(SmaaImages {
@@ -217,21 +198,21 @@ impl Smaa {
     }
 
     /// Port of `SMAA::CreateRenderPasses`.
-    fn create_render_passes(&mut self) {
+    fn create_render_passes(&mut self, device: &Device) {
         self.renderpasses[SmaaStage::EdgeDetection as usize] = util::create_wrapped_render_pass(
-            &self.device,
+            device.get_logical(),
             vk::Format::R16G16_SFLOAT,
             vk::ImageLayout::GENERAL,
         );
         self.renderpasses[SmaaStage::BlendingWeightCalculation as usize] =
             util::create_wrapped_render_pass(
-                &self.device,
+                device.get_logical(),
                 vk::Format::R16G16B16A16_SFLOAT,
                 vk::ImageLayout::GENERAL,
             );
         self.renderpasses[SmaaStage::NeighborhoodBlending as usize] =
             util::create_wrapped_render_pass(
-                &self.device,
+                device.get_logical(),
                 vk::Format::R16G16B16A16_SFLOAT,
                 vk::ImageLayout::GENERAL,
             );
@@ -239,21 +220,21 @@ impl Smaa {
         for images in &mut self.dynamic_images {
             images.framebuffers[SmaaStage::EdgeDetection as usize] =
                 util::create_wrapped_framebuffer(
-                    &self.device,
+                    device.get_logical(),
                     self.renderpasses[SmaaStage::EdgeDetection as usize],
                     images.image_views[DynamicImageType::Edges as usize],
                     self.extent,
                 );
             images.framebuffers[SmaaStage::BlendingWeightCalculation as usize] =
                 util::create_wrapped_framebuffer(
-                    &self.device,
+                    device.get_logical(),
                     self.renderpasses[SmaaStage::BlendingWeightCalculation as usize],
                     images.image_views[DynamicImageType::Blend as usize],
                     self.extent,
                 );
             images.framebuffers[SmaaStage::NeighborhoodBlending as usize] =
                 util::create_wrapped_framebuffer(
-                    &self.device,
+                    device.get_logical(),
                     self.renderpasses[SmaaStage::NeighborhoodBlending as usize],
                     images.image_views[DynamicImageType::Output as usize],
                     self.extent,
@@ -262,12 +243,12 @@ impl Smaa {
     }
 
     /// Port of `SMAA::CreateSampler`.
-    fn create_sampler(&mut self) {
-        self.sampler = util::create_wrapped_sampler(&self.device, vk::Filter::LINEAR);
+    fn create_sampler(&mut self, device: &Device) {
+        self.sampler = util::create_wrapped_sampler(device.get_logical(), vk::Filter::LINEAR);
     }
 
     /// Port of `SMAA::CreateShaders`.
-    fn create_shaders(&mut self) {
+    fn create_shaders(&mut self, device: &Device) {
         let vertex_shader_sources = [
             SMAA_EDGE_DETECTION_VERT_SPV,
             SMAA_BLENDING_WEIGHT_CALCULATION_VERT_SPV,
@@ -279,22 +260,23 @@ impl Smaa {
             SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV,
         ];
         for index in 0..MAX_SMAA_STAGE {
-            self.vertex_shaders[index] = build_shader(&self.device, vertex_shader_sources[index])
-                .expect("Failed to build SMAA vertex shader");
+            self.vertex_shaders[index] =
+                build_shader(device.get_logical(), vertex_shader_sources[index])
+                    .expect("Failed to build SMAA vertex shader");
             self.fragment_shaders[index] =
-                build_shader(&self.device, fragment_shader_sources[index])
+                build_shader(device.get_logical(), fragment_shader_sources[index])
                     .expect("Failed to build SMAA fragment shader");
         }
     }
 
     /// Port of `SMAA::CreateDescriptorPool`.
-    fn create_descriptor_pool(&mut self) {
+    fn create_descriptor_pool(&mut self, device: &Device) {
         // Edge detection: 1 descriptor
         // Blending weight calculation: 3 descriptors
         // Neighborhood blending: 2 descriptors
         // 6 descriptors, 3 descriptor sets per image
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            &self.device,
+            device.get_logical(),
             6 * self.image_count,
             3 * self.image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
@@ -302,15 +284,15 @@ impl Smaa {
     }
 
     /// Port of `SMAA::CreateDescriptorSetLayouts`.
-    fn create_descriptor_set_layouts(&mut self) {
+    fn create_descriptor_set_layouts(&mut self, device: &Device) {
         self.descriptor_set_layouts[SmaaStage::EdgeDetection as usize] =
             util::create_wrapped_descriptor_set_layout(
-                &self.device,
+                device.get_logical(),
                 &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
             );
         self.descriptor_set_layouts[SmaaStage::BlendingWeightCalculation as usize] =
             util::create_wrapped_descriptor_set_layout(
-                &self.device,
+                device.get_logical(),
                 &[
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -319,7 +301,7 @@ impl Smaa {
             );
         self.descriptor_set_layouts[SmaaStage::NeighborhoodBlending as usize] =
             util::create_wrapped_descriptor_set_layout(
-                &self.device,
+                device.get_logical(),
                 &[
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -328,30 +310,33 @@ impl Smaa {
     }
 
     /// Port of `SMAA::CreateDescriptorSets`.
-    fn create_descriptor_sets(&mut self) {
+    fn create_descriptor_sets(&mut self, device: &Device) {
         let layouts: Vec<vk::DescriptorSetLayout> =
             self.descriptor_set_layouts.iter().copied().collect();
         for images in &mut self.dynamic_images {
-            images.descriptor_sets =
-                util::create_wrapped_descriptor_sets(&self.device, self.descriptor_pool, &layouts);
+            images.descriptor_sets = util::create_wrapped_descriptor_sets(
+                device.get_logical(),
+                self.descriptor_pool,
+                &layouts,
+            );
         }
     }
 
     /// Port of `SMAA::CreatePipelineLayouts`.
-    fn create_pipeline_layouts(&mut self) {
+    fn create_pipeline_layouts(&mut self, device: &Device) {
         for index in 0..MAX_SMAA_STAGE {
             self.pipeline_layouts[index] = util::create_wrapped_pipeline_layout(
-                &self.device,
+                device.get_logical(),
                 self.descriptor_set_layouts[index],
             );
         }
     }
 
     /// Port of `SMAA::CreatePipelines`.
-    fn create_pipelines(&mut self) {
+    fn create_pipelines(&mut self, device: &Device) {
         for index in 0..MAX_SMAA_STAGE {
             self.pipelines[index] = util::create_wrapped_pipeline(
-                &self.device,
+                device.get_logical(),
                 self.renderpasses[index],
                 self.pipeline_layouts[index],
                 self.vertex_shaders[index],
@@ -430,8 +415,8 @@ impl Smaa {
             return;
         }
 
-        let area_image = self.static_images[StaticImageType::Area as usize];
-        let search_image = self.static_images[StaticImageType::Search as usize];
+        let area_image = self.static_images[StaticImageType::Area as usize].handle();
+        let search_image = self.static_images[StaticImageType::Search as usize].handle();
         let allocator = unsafe { self.allocator.as_ref() };
 
         util::upload_image(
@@ -462,7 +447,13 @@ impl Smaa {
         let dynamic_images: Vec<[vk::Image; MAX_DYNAMIC_IMAGE]> = self
             .dynamic_images
             .iter()
-            .map(|images| images.images)
+            .map(|images| {
+                [
+                    images.images[0].handle(),
+                    images.images[1].handle(),
+                    images.images[2].handle(),
+                ]
+            })
             .collect();
 
         let device = device.get_logical().clone();
@@ -495,10 +486,10 @@ impl AntiAliasPass for Smaa {
         let images = &self.dynamic_images[image_index];
 
         let input_image = *inout_image;
-        let output_image = images.images[DynamicImageType::Output as usize];
+        let output_image = images.images[DynamicImageType::Output as usize].handle();
         let output_image_view = images.image_views[DynamicImageType::Output as usize];
-        let edges_image = images.images[DynamicImageType::Edges as usize];
-        let blend_image = images.images[DynamicImageType::Blend as usize];
+        let edges_image = images.images[DynamicImageType::Edges as usize].handle();
+        let blend_image = images.images[DynamicImageType::Blend as usize].handle();
 
         let edge_detection_ds = images.descriptor_sets[SmaaStage::EdgeDetection as usize];
         let blending_weight_ds =

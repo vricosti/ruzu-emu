@@ -201,7 +201,7 @@ impl WindowAdaptPass {
             layer_it
                 .next()
                 .expect("each framebuffer must have a presentation layer")
-                .configure_draw_from_framebuffer(
+                .configure_draw(
                     device,
                     &mut push_constants[i],
                     &mut descriptor_sets[i],

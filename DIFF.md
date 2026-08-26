@@ -15100,3 +15100,169 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `Regs` is 0x1FC bytes with alignment 4, and focused tests verify the upload, exec, and data
   word positions 0x60, 0x6C, and 0x6D.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/layer.rs` vs Eden `src/video_core/renderer_vulkan/present/layer.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains Eden's allocator and scheduler references as `NonNull` and the shared device-memory
+  owner as `Arc`; the enclosing renderer owns all three longer than every `Layer`.
+- Scheduler closures copy the command's Vulkan handles instead of capturing `this`, because Rust
+  requires queued closures to be `'static`. `resource_ticks` still waits for every such command
+  before any corresponding allocation is released.
+- Raw Ash image views and the descriptor pool are destroyed explicitly. `AllocatedImage` and
+  `AllocatedBuffer` provide the RAII ownership that Eden obtains from its Vulkan wrappers.
+
+### Unintentional differences (to fix)
+
+- Resolved: the two Rust draw entry points were merged back into the single upstream-owned
+  `configure_draw`, and every helper again receives the high-level `Device` at the same boundary as
+  Eden.
+- Resolved: framebuffer helpers now receive `FramebufferConfig`, use unsigned wrapping arithmetic,
+  preserve Eden's fail-soft unknown-format fallback, and the canonical settings `AntiAliasing`
+  enum owns the cached setting.
+- Resolved: `create_raw_images` is a separate Layer method again. Raw images and the staging buffer
+  now own VMA allocations and are released after Eden's per-image tick waits instead of remaining
+  retained by the global allocator.
+- Resolved: refresh no longer clears `anti_alias_setting`; it resets only the anti-alias variant,
+  and raw image views retain Eden's replacement/destructor lifetime rather than being cleared by
+  `release_raw_images`.
+- Resolved: a scope guard updates the resource tick on every exit from `configure_draw`, including
+  panic unwinding, matching Eden's `SCOPE_EXIT` lifecycle.
+
+### Missing items
+
+- None in Layer construction, draw configuration, resource refresh/release, staging upload,
+  anti-alias selection, push constants, descriptor updates, or tick ordering.
+
+### Binary layout verification
+
+- N/A: Layer owns host-side Vulkan resources and does not serialize its Rust representation.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs Eden `src/video_core/renderer_vulkan/present/fsr.{h,cpp}`
+
+### Intentional differences
+
+- The retained allocator reference is represented by `NonNull<MemoryAllocator>`, and a raw Ash
+  device is retained only to destroy raw non-image Vulkan handles in `Drop`.
+- Queued commands copy image handles and the logical device rather than borrowing the FSR object;
+  `UploadImages` still finishes before returning and Layer's resource tick protects draw commands.
+
+### Unintentional differences (to fix)
+
+- Resolved: construction, all creation helpers, `upload_images`, `update_descriptor_sets`, and
+  `draw` receive Eden's high-level `Device`; shader capability selection is owned by
+  `create_shaders` again.
+- Resolved: EASU and RCAS images are owning VMA allocations, so their lifetime follows the FSR
+  object instead of the global allocator.
+- Resolved: the stage enum, count, and per-image resources are private like Eden's nested members.
+
+### Missing items
+
+- None in the two-pass FSR construction, upload, descriptor, push-constant, or draw path.
+
+### Binary layout verification
+
+- N/A: push constants remain the fixed `[u32; 16]` payload; the remaining state is host-only.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/sgsr.rs` vs Eden `src/video_core/renderer_vulkan/present/sgsr.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the allocator reference as `NonNull` and the logical Ash device solely for explicit
+  raw-handle destruction. Command closures copy handles to satisfy the scheduler's `'static`
+  contract.
+
+### Unintentional differences (to fix)
+
+- Resolved: `draw`, `upload_images`, and `update_descriptor_sets` receive the high-level `Device`
+  and use its logical handle at runtime.
+- Resolved: SGSR images are owning VMA allocations and both upstream-owned `memory_allocator` and
+  `edge_dir` state are retained instead of being discarded after construction.
+
+### Missing items
+
+- Eden declares but does not define or call `Initialize`; there is no executable method to port.
+
+### Binary layout verification
+
+- N/A: the seven-word push-constant array is unchanged and host object layout is not serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/fxaa.rs` vs Eden `src/video_core/renderer_vulkan/present/fxaa.{h,cpp}`
+
+### Intentional differences
+
+- Rust explicitly destroys raw framebuffers, views, pipelines, layouts, shaders, sampler, and
+  render pass; owning images then release through VMA. The retained Ash device exists only for
+  that `Drop` implementation.
+- Queued commands copy raw handles rather than borrowing the pass across the scheduler boundary.
+
+### Unintentional differences (to fix)
+
+- Resolved: the constructor and all creation helpers receive Eden's high-level `Device` rather
+  than a stored raw device.
+- Resolved: every per-frame FXAA image owns its VMA allocation and is released when the pass is
+  replaced by Layer.
+
+### Missing items
+
+- None in FXAA creation, upload, descriptor update, draw, or resource ownership.
+
+### Binary layout verification
+
+- N/A: FXAA owns host Vulkan handles and has no serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/smaa.rs` vs Eden `src/video_core/renderer_vulkan/present/smaa.{h,cpp}`
+
+### Intentional differences
+
+- Eden's allocator reference is retained as `NonNull`; the raw Ash device is retained only for
+  explicit destruction of non-image Vulkan handles. Scheduler closures copy handles instead of
+  borrowing `self`.
+
+### Unintentional differences (to fix)
+
+- Resolved: the constructor and all creation helpers receive the high-level `Device`, matching
+  Eden's ownership boundary.
+- Resolved: both static lookup images and all three dynamic images per frame own VMA allocations;
+  replacing the SMAA pass now releases them with the pass.
+- Resolved: SMAA's nested enums, counts, and `Images` structure are private like upstream.
+
+### Missing items
+
+- None in SMAA image creation/upload, its three render passes, descriptor wiring, or draw order.
+
+### Binary layout verification
+
+- N/A: SMAA owns host Vulkan handles and does not serialize its Rust object representation.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden presentation utilities and `vulkan_memory_allocator.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents Eden's move-only `vk::Image` and `vk::Buffer` wrappers as `AllocatedImage` and
+  `AllocatedBuffer`, retaining the externally synchronized VMA allocator in `Arc<Mutex<_>>`.
+- Allocation failures return `VulkanError`; presentation helpers convert them to the same fatal
+  construction failure that Eden obtains from `vk::Check` exceptions.
+
+### Unintentional differences (to fix)
+
+- Resolved: `create_owned_image` now uses VMA with `WITHIN_BUDGET`,
+  `AUTO_PREFER_DEVICE`, and preferred `DEVICE_LOCAL`, exactly matching Eden's `CreateImage`
+  allocation policy.
+- Resolved: the allocator-retained raw-image compatibility path was removed. The single
+  `create_wrapped_image` helper now returns the owning image wrapper used by presentation frames
+  and passes.
+- Resolved: Layer staging and `upload_image` staging use the VMA-backed owning buffer path instead
+  of dedicated Vulkan allocations.
+- Resolved: `transition_image_layout` uses Eden's graphics-and-compute stage mask on both sides of
+  the barrier instead of the broader `ALL_COMMANDS` mask.
+
+### Missing items
+
+- GPU allocation/deallocation logging remains unavailable because Ruzu has not ported Eden's GPU
+  logging subsystem; this does not alter allocation policy or resource lifetime.
+
+### Binary layout verification
+
+- N/A: the wrappers own host Vulkan/VMA handles and are not copied to guest memory or disk.

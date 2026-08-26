@@ -318,7 +318,6 @@ impl BlitScreen {
                     window_size,
                     window_adapt.get_descriptor_set_layout(),
                     self.filters,
-                    device.is_float16_supported(),
                 ));
             }
         }

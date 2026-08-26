@@ -15991,6 +15991,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: these are host-only Vulkan handles and VMA allocations, not raw-copied guest payloads.
 
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (channel cache locking)
+
+### Intentional differences
+
+- Ruzu's texture and buffer caches use separate `parking_lot::ReentrantMutex` values. The local
+  two-lock retry helper supplies Eden's deadlock-safe `std::scoped_lock` behavior without changing
+  cache ownership or the texture-before-buffer operation order.
+- The separate Rust `StateTracker` releases its per-channel table before the channel caches are
+  erased; this owner has no direct counterpart call in Eden's rasterizer method.
+
+### Unintentional differences (to fix)
+
+- Resolved: channel creation, binding, and release now hold the buffer-cache and texture-cache
+  mutexes together around both cache operations, matching Eden's lifecycle synchronization.
+- Resolved: fallback flush areas now use the shared 0x1000 device-page constant and common
+  alignment helpers instead of a private literal. The end-address addition preserves unsigned
+  wraparound before alignment.
+
+### Missing items
+
+- GPU draw/dispatch logging remains unavailable with the unported GPU logging subsystem.
+
+### Binary layout verification
+
+- N/A: this changes host-side locking and address alignment only.
+
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.{h,cpp}`
 
 ### Intentional differences

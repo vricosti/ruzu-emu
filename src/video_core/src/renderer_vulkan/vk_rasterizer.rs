@@ -27,6 +27,8 @@ use std::sync::{Arc, Once};
 
 use ash::vk;
 use ash::vk::Handle;
+use common::alignment::{align_down, align_up};
+use common::types::PAGE_SIZE_U64;
 use log::{debug, info, warn};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -3318,10 +3320,9 @@ impl RasterizerInterface for RasterizerVulkan {
                 return area;
             }
         }
-        const PAGE: u64 = 4096;
         RasterizerDownloadArea {
-            start_address: addr & !(PAGE - 1),
-            end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
+            start_address: align_down(addr, PAGE_SIZE_U64),
+            end_address: align_up(addr.wrapping_add(size), PAGE_SIZE_U64),
             preemtive: true,
         }
     }
@@ -3538,8 +3539,18 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn initialize_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.create_channel(channel);
-        self.texture_cache.create_channel(channel);
-        self.common_buffer_cache.create_channel(channel);
+        {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(
+                buffer_mutex,
+                texture_mutex,
+                _buffer_guard,
+                _texture_guard
+            );
+            self.texture_cache.create_channel(channel);
+            self.common_buffer_cache.create_channel(channel);
+        }
         self.shader_cache.create_channel(channel);
         self.pipeline_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
@@ -3548,8 +3559,18 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.bind_to_channel(channel.bind_id);
-        self.texture_cache.bind_to_channel(channel.bind_id);
-        self.common_buffer_cache.bind_to_channel(channel.bind_id);
+        {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(
+                buffer_mutex,
+                texture_mutex,
+                _buffer_guard,
+                _texture_guard
+            );
+            self.texture_cache.bind_to_channel(channel.bind_id);
+            self.common_buffer_cache.bind_to_channel(channel.bind_id);
+        }
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.pipeline_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
@@ -3568,8 +3589,18 @@ impl RasterizerInterface for RasterizerVulkan {
     fn release_channel(&mut self, channel_id: i32) {
         self.state_tracker.release_channel(channel_id);
         self.channel_caches.erase_channel(channel_id);
-        self.texture_cache.erase_channel(channel_id);
-        self.common_buffer_cache.erase_channel(channel_id);
+        {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(
+                buffer_mutex,
+                texture_mutex,
+                _buffer_guard,
+                _texture_guard
+            );
+            self.texture_cache.erase_channel(channel_id);
+            self.common_buffer_cache.erase_channel(channel_id);
+        }
         self.shader_cache.erase_channel(channel_id);
         self.pipeline_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);

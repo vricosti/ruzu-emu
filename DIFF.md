@@ -15071,3 +15071,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: the register array contains exactly 0xCF8 words; `LaunchParamsLayout` is 0x100 bytes and
   compile-time assertions verify the upstream program, grid, shared-memory, block, constant-buffer
   mask, and constant-buffer table offsets.
+
+## 2026-08-26 — `src/video_core/src/engines/kepler_memory.rs` vs Eden `src/video_core/engines/kepler_memory.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps the 0x7F-word register storage as a `repr(C)` array and mechanically materializes an
+  `engine_upload::Registers` snapshot. This avoids retaining Eden's self-referential
+  `Upload::State` reference into the owning register union while preserving every field offset.
+- Rust checks the method index before array access; Eden asserts the contract and then indexes the
+  C++ array. Valid command-stream behavior is identical.
+
+### Unintentional differences (to fix)
+
+- Resolved: `NUM_REGS` is owned by `Regs`, matching Eden, and the upload/interface implementation
+  state is private rather than exposed as public engine state.
+- Resolved: `bind_rasterizer` directly resets and sets the two constant execution-mask positions,
+  and sink consumption no longer silently drops out-of-range methods.
+- Resolved: the default multi-method path uses wrapping `u32` subtraction for
+  `methods_pending - i`, matching C++ instead of saturating at zero.
+
+### Missing items
+
+- None for register layout, rasterizer binding, upload execution/data handling, multi-method
+  dispatch, or deferred sink consumption.
+
+### Binary layout verification
+
+- PASS: `Regs` is 0x1FC bytes with alignment 4, and focused tests verify the upload, exec, and data
+  word positions 0x60, 0x6C, and 0x6D.

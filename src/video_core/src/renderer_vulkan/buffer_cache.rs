@@ -815,7 +815,7 @@ impl BufferCacheRuntime {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         self.memory_allocator()
-            .create_owned_buffer(&buffer_info, MemoryUsage::DeviceLocal)
+            .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)
     }
 
     fn make_buffer_copies(copies: &[BufferCopy]) -> SmallVec<[vk::BufferCopy; 8]> {

@@ -15925,9 +15925,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Rust exposes `AllocatedBuffer` and the `MappedBuffer` alias instead of Eden's move-only
   `vk::Buffer` wrapper; both own the VMA allocation and destroy buffer plus allocation together.
-- Compatibility callers that still store a raw `VkBuffer` leave the `VmaAllocation` in the
-  allocator's retained-buffer registry until explicit `destroy_buffer` or allocator teardown.
-  This preserves their existing raw-handle API while using Eden's allocation policy.
+- Rust owners call `AllocatedBuffer::handle()` when ash requires a raw `VkBuffer`; the owning
+  wrapper remains in the same query, texture, turbo, staging, cache, or presentation object that
+  owns Eden's move-only `vk::Buffer`.
 - Rust retains Eden's `[[maybe_unused]] MemoryUsagePropertyFlags` helper and allocator-owned device
   state with local dead-code annotations because ash/VMA wrappers carry the handles used at runtime.
 
@@ -15939,16 +15939,47 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   flush and invalidate operate on the VMA allocation instead of dedicated `VkDeviceMemory`.
 - Resolved: raw-handle destruction and allocator teardown call VMA `destroy_buffer` rather than
   pairing `vkDestroyBuffer` with a dedicated `vkFreeMemory` allocation.
+- Resolved: removed the allocator-global retained-buffer registry. `MemoryAllocator::create_buffer`
+  now has one canonical owning return type, and every VMA allocation is destroyed by the field that
+  owns the corresponding buffer lifecycle.
+- Resolved: removed the unused `MemoryPropertyFlags` and `FindType` methods; current Eden has no
+  such allocator methods and its VMA paths do not call them.
 
 ### Missing items
 
-- Raw-handle compatibility owners should ultimately store `AllocatedBuffer` directly so each
-  buffer's Rust field, rather than the allocator registry, owns its exact destruction point.
 - GPU allocation/deallocation logging remains unavailable with the unported GPU logger.
 
 ### Binary layout verification
 
 - N/A: these are host Vulkan/VMA ownership wrappers and are not serialized or guest-visible.
+
+## 2026-08-26 — Vulkan buffer owners vs Eden renderer Vulkan buffer ownership
+
+### Intentional differences
+
+- Ash command and descriptor APIs consume copied raw handles, so Ruzu extracts those handles from
+  `AllocatedBuffer` before recording closures. The owning wrapper remains in the enclosing object
+  for the same lifetime as Eden's `vk::Buffer` member.
+- `TurboResources` uses `Option<AllocatedBuffer>` during fallible staged initialization; it drops
+  the buffer explicitly after `device_wait_idle` and before the dedicated Vulkan device owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: query scan, accumulation, transform-feedback, and conditional-resolve buffers are now
+  owned by `query_cache.rs` instead of an allocator-global registry.
+- Resolved: temporary texture buffers and per-image compute-unswizzle buffers are now owned by
+  `texture_cache.rs`; image views are destroyed before the unswizzle field is released, matching
+  Eden's `Image` destruction order.
+- Resolved: turbo, staging, buffer-cache, layer, and presentation utility allocations all use the
+  canonical owning `MemoryAllocator::create_buffer` path.
+
+### Missing items
+
+- GPU allocation/deallocation logging remains unavailable with the unported GPU logger.
+
+### Binary layout verification
+
+- N/A: these are host-only Vulkan handles and VMA allocations, not raw-copied guest payloads.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.{h,cpp}`
 

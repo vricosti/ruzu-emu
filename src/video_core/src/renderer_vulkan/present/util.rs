@@ -12,7 +12,9 @@ use ash::vk;
 
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::vulkan_common::vulkan_device::Device;
-use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, AllocatedImage, MemoryAllocator, MemoryUsage,
+};
 
 // ---------------------------------------------------------------------------
 // Buffer / Image creation
@@ -23,7 +25,7 @@ pub fn create_wrapped_buffer(
     allocator: &MemoryAllocator,
     size: vk::DeviceSize,
     usage: MemoryUsage,
-) -> vk::Buffer {
+) -> AllocatedBuffer {
     let buffer_ci = vk::BufferCreateInfo::builder()
         .size(size)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -130,7 +132,7 @@ pub fn upload_image(
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .build();
     let mut upload_buffer = allocator
-        .create_owned_buffer(&upload_ci, MemoryUsage::Upload)
+        .create_buffer(&upload_ci, MemoryUsage::Upload)
         .expect("Failed to create image upload buffer");
     upload_buffer.mapped_slice_mut()[..initial_contents.len()].copy_from_slice(initial_contents);
     upload_buffer.flush();

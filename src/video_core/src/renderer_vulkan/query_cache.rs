@@ -31,7 +31,9 @@ use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase, QueryLoca
 use crate::query_cache::query_stream::StreamerInterface;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::vulkan_common::vulkan_device::Device;
-use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MappedBuffer, MemoryAllocator, MemoryUsage,
+};
 
 use super::buffer_cache::VulkanCommonBufferCache;
 use super::compute_pass::{ConditionalRenderingResolvePass, QueriesPrefixScanPass};
@@ -55,10 +57,24 @@ pub const SAMPLES_QUERY_SIZE: usize = 8;
 
 const MIN_SCAN_BUFFER_LOG2: usize = 11;
 
-#[derive(Clone, Copy)]
 struct ScanBufferPair {
+    resolve: AllocatedBuffer,
+    intermediary: AllocatedBuffer,
+}
+
+#[derive(Clone, Copy)]
+struct ScanBufferHandles {
     resolve: vk::Buffer,
     intermediary: vk::Buffer,
+}
+
+impl ScanBufferPair {
+    fn handles(&self) -> ScanBufferHandles {
+        ScanBufferHandles {
+            resolve: self.resolve.handle(),
+            intermediary: self.intermediary.handle(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,7 +351,7 @@ struct SamplesStreamer {
     state: Arc<parking_lot::Mutex<SamplesQueryState>>,
     prefix_scan_pass: QueriesPrefixScanPass,
     scan_buffers: Vec<Option<ScanBufferPair>>,
-    accumulation_buffer: vk::Buffer,
+    accumulation_buffer: AllocatedBuffer,
     driver_id: vk::DriverId,
     amend_value: Arc<AtomicU64>,
     accumulation_value: Arc<AtomicU64>,
@@ -383,12 +399,13 @@ impl SamplesStreamer {
                 MemoryUsage::DeviceLocal,
             )
             .map_err(|error| error.result)?;
+        let accumulation_buffer_handle = accumulation_buffer.handle();
         scheduler.request_outside_render_pass_operation_context();
         let device_for_fill = device.clone();
         scheduler.record(move |cmdbuf| unsafe {
             device_for_fill.cmd_fill_buffer(
                 cmdbuf,
-                accumulation_buffer,
+                accumulation_buffer_handle,
                 0,
                 SAMPLES_QUERY_SIZE as u64,
                 0,
@@ -426,7 +443,7 @@ impl SamplesStreamer {
     fn create_scan_buffers(
         memory_allocator: &MemoryAllocator,
         capacity: usize,
-    ) -> Result<(vk::Buffer, vk::Buffer), vk::Result> {
+    ) -> Result<ScanBufferPair, vk::Result> {
         let size = (capacity * SAMPLES_QUERY_SIZE) as u64;
         let usage = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::TRANSFER_SRC
@@ -451,23 +468,23 @@ impl SamplesStreamer {
                 MemoryUsage::DeviceLocal,
             )
             .map_err(|error| error.result)?;
-        Ok((resolve, intermediary))
+        Ok(ScanBufferPair {
+            resolve,
+            intermediary,
+        })
     }
 
-    fn obtain_scan_buffers(&mut self, required: usize) -> Result<ScanBufferPair, vk::Result> {
+    fn obtain_scan_buffers(&mut self, required: usize) -> Result<ScanBufferHandles, vk::Result> {
         let log2 = scan_buffer_log2(required);
-        if let Some(buffers) = self.scan_buffers[log2] {
-            return Ok(buffers);
+        if let Some(buffers) = self.scan_buffers[log2].as_ref() {
+            return Ok(buffers.handles());
         }
         let capacity = 1usize << log2;
         let memory_allocator = unsafe { self.memory_allocator.as_ref() };
-        let (resolve, intermediary) = Self::create_scan_buffers(memory_allocator, capacity)?;
-        let buffers = ScanBufferPair {
-            resolve,
-            intermediary,
-        };
+        let buffers = Self::create_scan_buffers(memory_allocator, capacity)?;
+        let handles = buffers.handles();
         self.scan_buffers[log2] = Some(buffers);
-        Ok(buffers)
+        Ok(handles)
     }
 
     fn shared_state(&self) -> Arc<parking_lot::Mutex<SamplesQueryState>> {
@@ -723,7 +740,7 @@ impl SamplesStreamer {
                 self.num_slots_used,
             );
             self.prefix_scan_pass.run(
-                self.accumulation_buffer,
+                self.accumulation_buffer.handle(),
                 intermediary_buffer,
                 resolve_buffer,
                 self.num_slots_used,
@@ -731,7 +748,7 @@ impl SamplesStreamer {
                 max_accumulation_limit,
             );
         } else {
-            let accumulation_buffer = self.accumulation_buffer;
+            let accumulation_buffer = self.accumulation_buffer.handle();
             let device = self.device.clone();
             scheduler.request_outside_render_pass_operation_context();
             scheduler.record(move |cmdbuf| unsafe {
@@ -1183,7 +1200,7 @@ struct TfbQueryBankSlots {
 /// borrow across the asynchronous operation.
 struct TfbQueryBank {
     device: ash::Device,
-    buffer: vk::Buffer,
+    buffer: AllocatedBuffer,
     readback: MappedBuffer,
     slots: parking_lot::Mutex<TfbQueryBankSlots>,
     host_access: parking_lot::Mutex<()>,
@@ -1323,7 +1340,7 @@ fn make_tfb_counter_config(
 pub(crate) struct TfbCounterState {
     device: ash::Device,
     transform_feedback: Option<vk::ExtTransformFeedbackFn>,
-    counters_buffer: vk::Buffer,
+    counters_buffer: AllocatedBuffer,
     counter_buffers: [vk::Buffer; NUM_TFB_STREAMS],
     offsets: [vk::DeviceSize; NUM_TFB_STREAMS],
     maxwell3d: Option<usize>,
@@ -1529,6 +1546,7 @@ impl TfbCounterStreamer {
         let counters_buffer = memory_allocator
             .create_buffer(&create_info, MemoryUsage::DeviceLocal)
             .map_err(|error| error.result)?;
+        let counters_buffer_handle = counters_buffer.handle();
         Ok(Self {
             device: device.clone(),
             memory_allocator: NonNull::from(memory_allocator),
@@ -1536,7 +1554,7 @@ impl TfbCounterStreamer {
                 device,
                 transform_feedback,
                 counters_buffer,
-                counter_buffers: [counters_buffer; NUM_TFB_STREAMS],
+                counter_buffers: [counters_buffer_handle; NUM_TFB_STREAMS],
                 offsets: std::array::from_fn(|index| index as u64 * TFB_QUERY_SIZE),
                 maxwell3d: None,
                 config: TfbCounterConfig::default(),
@@ -1623,11 +1641,11 @@ impl TfbCounterStreamer {
             let state = self.state.lock();
             (
                 report.0.bank.device.clone(),
-                state.counters_buffer,
+                state.counters_buffer.handle(),
                 state.offsets[counter_slot],
             )
         };
-        let bank = report.0.bank.buffer;
+        let bank = report.0.bank.buffer.handle();
         let destination_offset = report.0.slot as u64 * TFB_QUERY_SIZE;
         scheduler.record(move |cmdbuf| unsafe {
             let counter_barrier = vk::MemoryBarrier::builder()
@@ -1671,8 +1689,8 @@ impl TfbCounterStreamer {
         for (report, address) in self.pending_sync.drain(..) {
             let bank = &report.0.bank;
             values_by_bank
-                .entry(bank.buffer.as_raw())
-                .or_insert_with(|| (bank.buffer, Vec::new()))
+                .entry(bank.buffer.handle().as_raw())
+                .or_insert_with(|| (bank.buffer.handle(), Vec::new()))
                 .1
                 .push(HostSyncValues {
                     address,
@@ -1696,7 +1714,7 @@ impl TfbCounterStreamer {
         }
         for report in &self.pending_flush_queries {
             let bank = &report.0.bank;
-            let source = bank.buffer;
+            let source = bank.buffer.handle();
             let destination = bank.readback.buffer();
             let offset = report.0.slot as u64 * TFB_QUERY_SIZE;
             let device = bank.device.clone();
@@ -1908,7 +1926,7 @@ struct QueryRuntimeBackend {
     buffer_cache: NonNull<VulkanCommonBufferCache>,
     device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
     conditional_resolve_pass: Option<ConditionalRenderingResolvePass>,
-    hcr_resolve_buffer: vk::Buffer,
+    hcr_resolve_buffer: AllocatedBuffer,
     driver_id: vk::DriverId,
 }
 
@@ -2444,13 +2462,13 @@ impl QueryCacheRuntime {
             return;
         };
         resolve_pass.resolve(
-            backend.hcr_resolve_buffer,
+            backend.hcr_resolve_buffer.handle(),
             src_buffer,
             offset,
             compare_to_zero,
         );
         self.state.lock().set_host_conditional_rendering(
-            backend.hcr_resolve_buffer,
+            backend.hcr_resolve_buffer.handle(),
             0,
             if is_equal {
                 vk::ConditionalRenderingFlagsEXT::empty()

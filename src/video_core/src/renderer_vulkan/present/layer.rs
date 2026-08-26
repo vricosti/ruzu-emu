@@ -578,7 +578,7 @@ impl Layer {
         let allocator = unsafe { self.memory_allocator.as_ref() };
         self.buffer = Some(
             allocator
-                .create_owned_buffer(&ci, MemoryUsage::Upload)
+                .create_buffer(&ci, MemoryUsage::Upload)
                 .expect("Failed to create Vulkan layer staging buffer"),
         );
     }

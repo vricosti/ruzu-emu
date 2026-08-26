@@ -59,7 +59,9 @@ use super::update_descriptor::ComputePassDescriptorQueue;
 use crate::vulkan_common::vulkan_device::{
     query_device_memory_info, query_device_memory_usage, Device, DeviceMemoryInfo, FormatType,
 };
-use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, AllocatedImage, MemoryAllocator, MemoryUsage,
+};
 use crate::vulkan_common::vulkan_wrapper::{
     PIPELINE_STAGE_GRAPHICS_COMPUTE, PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
 };
@@ -167,7 +169,7 @@ pub struct Image {
     pub normal_stencil_view: vk::ImageView,
     pub scale_framebuffer: Option<BlitFramebufferInfo>,
     pub normal_framebuffer: Option<BlitFramebufferInfo>,
-    pub compute_unswizzle_buffer: vk::Buffer,
+    pub compute_unswizzle_buffer: Option<AllocatedBuffer>,
     pub compute_unswizzle_buffer_size: vk::DeviceSize,
     pub allocation_tick: u64,
 }
@@ -213,7 +215,7 @@ impl Image {
             normal_stencil_view: vk::ImageView::null(),
             scale_framebuffer: None,
             normal_framebuffer: None,
-            compute_unswizzle_buffer: vk::Buffer::null(),
+            compute_unswizzle_buffer: None,
             compute_unswizzle_buffer_size: 0,
             allocation_tick: 0,
         })
@@ -238,11 +240,6 @@ impl Image {
             if let Some(scaled_image) = self.scaled_image.as_ref() {
                 runtime.erase_resolve_shadow(scaled_image.handle());
             }
-        }
-        if self.compute_unswizzle_buffer != vk::Buffer::null() {
-            unsafe { runtime.memory_allocator.as_ref() }
-                .destroy_buffer(self.compute_unswizzle_buffer);
-            self.compute_unswizzle_buffer = vk::Buffer::null();
         }
         unsafe {
             for view in self.storage_image_views.drain(..) {
@@ -331,7 +328,7 @@ impl Image {
         let blocks_y = u64::from(self.base().info.size.height.div_ceil(4));
         let blocks_z = u64::from(max_slices.min(self.base().info.size.depth));
         let required_size = blocks_x * blocks_y * blocks_z * block_bytes;
-        if self.compute_unswizzle_buffer != vk::Buffer::null()
+        if self.compute_unswizzle_buffer.is_some()
             && required_size <= self.compute_unswizzle_buffer_size
         {
             return true;
@@ -355,12 +352,7 @@ impl Image {
                 return false;
             }
         };
-        if self.compute_unswizzle_buffer != vk::Buffer::null() {
-            runtime
-                .memory_allocator()
-                .destroy_buffer(self.compute_unswizzle_buffer);
-        }
-        self.compute_unswizzle_buffer = buffer;
+        self.compute_unswizzle_buffer = Some(buffer);
         self.compute_unswizzle_buffer_size = required_size.max(1);
         true
     }
@@ -1823,7 +1815,7 @@ pub struct TextureCacheRuntime {
     shader_stencil_export_supported: bool,
     resolution: common::settings::ResolutionScalingInfo,
     view_formats: Vec<Vec<vk::Format>>,
-    buffers: [vk::Buffer; Self::INDEXING_SLOTS],
+    buffers: [Option<AllocatedBuffer>; Self::INDEXING_SLOTS],
     device_memory_info: DeviceMemoryInfo,
     sentenced_resources: Vec<SentencedVkResource>,
     pending_msaa_images: Vec<(u64, AllocatedImage)>,
@@ -1939,7 +1931,7 @@ impl TextureCacheRuntime {
             shader_stencil_export_supported,
             resolution: common::settings::values().resolution_info.clone(),
             view_formats: vec![Vec::new(); crate::surface::MAX_PIXEL_FORMAT as usize],
-            buffers: [vk::Buffer::null(); Self::INDEXING_SLOTS],
+            buffers: std::array::from_fn(|_| None),
             device_memory_info,
             sentenced_resources: Vec::new(),
             pending_msaa_images: Vec::new(),
@@ -2167,7 +2159,11 @@ impl TextureCacheRuntime {
                 image.aspect_mask(),
                 &image.base().info,
                 image.base().guest_size_bytes as usize,
-                image.compute_unswizzle_buffer,
+                image
+                    .compute_unswizzle_buffer
+                    .as_ref()
+                    .expect("compute unswizzle buffer was allocated")
+                    .handle(),
                 image.compute_unswizzle_buffer_size,
                 map.buffer,
                 map.offset,
@@ -2229,9 +2225,8 @@ impl TextureCacheRuntime {
     fn get_temporary_buffer(&mut self, needed_size: usize) -> Option<vk::Buffer> {
         let needed_size = needed_size.max(1);
         let level = (usize::BITS - (needed_size - 1).leading_zeros()) as usize;
-        let buffer = *self.buffers.get(level)?;
-        if buffer != vk::Buffer::null() {
-            return Some(buffer);
+        if let Some(buffer) = self.buffers.get(level)?.as_ref() {
+            return Some(buffer.handle());
         }
 
         let new_size = needed_size.checked_next_power_of_two()? as vk::DeviceSize;
@@ -2259,8 +2254,9 @@ impl TextureCacheRuntime {
                 return None;
             }
         };
-        self.buffers[level] = buffer;
-        Some(buffer)
+        let handle = buffer.handle();
+        self.buffers[level] = Some(buffer);
+        Some(handle)
     }
 
     /// Port of `TextureCacheRuntime::GetOrCreateResolveShadow`.

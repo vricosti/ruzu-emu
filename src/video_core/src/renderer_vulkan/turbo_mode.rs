@@ -13,7 +13,9 @@ use ash::vk;
 use super::shader_util::build_shader;
 use crate::host_shaders::spirv_shaders::VULKAN_TURBO_MODE_COMP_SPV;
 use crate::vulkan_common::vulkan_device::Device;
-use crate::vulkan_common::vulkan_memory_allocator::{MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
+};
 use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
 const TURBO_BUFFER_SIZE: u64 = 2 * 1024 * 1024;
@@ -28,7 +30,7 @@ struct TurboState {
 struct TurboResources {
     allocator: MemoryAllocator,
     device: Device,
-    buffer: vk::Buffer,
+    buffer: Option<AllocatedBuffer>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
@@ -60,7 +62,7 @@ impl TurboResources {
         let mut resources = Self {
             allocator,
             device,
-            buffer: vk::Buffer::null(),
+            buffer: None,
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_set: vk::DescriptorSet::null(),
@@ -82,9 +84,11 @@ impl TurboResources {
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
-        self.buffer = self
-            .allocator
-            .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)?;
+        self.buffer = Some(
+            self
+                .allocator
+                .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)?,
+        );
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -178,11 +182,16 @@ impl TurboResources {
 
     fn dispatch(&self) -> Result<(), vk::Result> {
         let dld = self.device.get_logical();
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("turbo buffer must be initialized")
+            .handle();
         unsafe {
             dld.reset_fences(&[self.fence])?;
 
             let descriptor_buffer_info = [vk::DescriptorBufferInfo {
-                buffer: self.buffer,
+                buffer,
                 offset: 0,
                 range: vk::WHOLE_SIZE,
             }];
@@ -199,7 +208,7 @@ impl TurboResources {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
                 .build();
             dld.begin_command_buffer(self.command_buffer, &begin_info)?;
-            dld.cmd_fill_buffer(self.command_buffer, self.buffer, 0, vk::WHOLE_SIZE, 0);
+            dld.cmd_fill_buffer(self.command_buffer, buffer, 0, vk::WHOLE_SIZE, 0);
             dld.cmd_bind_descriptor_sets(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -254,6 +263,7 @@ impl Drop for TurboResources {
                 dld.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             }
         }
+        self.buffer.take();
     }
 }
 

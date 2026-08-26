@@ -17140,3 +17140,65 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: Ash owns the callback ABI and Rust reads the callback data in place. A focused regression
   now pins every platform-selected ignored message ID, in addition to message-type priority.
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- `ash` 0.37 predates `VK_KHR_maintenance5` and `VK_KHR_maintenance6`; Ruzu therefore owns
+  ABI-compatible feature/property payloads locally and retains their queried answers as booleans
+  after logical-device creation. Maintenance 7/8 names remain owned by `vulkan.rs`, matching the
+  fallback definitions in Eden's `vulkan.h`.
+- The extension-selection and suitability policies are mechanically extracted into file-local
+  functions so promotion rules, mandatory capabilities, and MoltenVK fallbacks can be tested
+  without constructing a physical device.
+- Ruzu additionally enables `VK_KHR_portability_subset` when advertised because MoltenVK requires
+  applications to enable it; this platform requirement is represented by `ash` rather than Eden's
+  current device-extension macros.
+
+### Unintentional differences (to fix)
+
+- Resolved: the feature/extension inventory now includes Vulkan memory model, image robustness,
+  maintenance 1–4 and 6–8, and ASTC decode mode, with Eden's API-version promotion rules,
+  suitability filtering, accessors, and logical-device feature-chain lifetime.
+- Resolved: suitability now checks Eden's exact mandatory feature set, leaves 8/16-bit storage in
+  the recommended/optional sets, applies only Eden's four MoltenVK fallbacks, and reports an
+  unsuitable device while continuing device creation as upstream does.
+- Resolved: optimal ASTC support now requires every upstream sampled-image, linear-filter, and
+  transfer feature bit for all 28 LDR formats; the accessor returns that computed result.
+- Resolved: `VK_KHR_robustness2` name preference and Radeon GPU Profiler detection now follow
+  Eden's extension/tooling paths.
+
+### Missing items
+
+- Android/AArch64 still lacks Eden's AdrenoTools BCn driver patch and `OverrideBcnFormats` path.
+  This requires the Android-only debug setting, API-level query, and AdrenoTools BCn ABI rather
+  than a safe local edit to the host-independent device path.
+
+### Binary layout verification
+
+- PASS: focused tests verify the locally declared maintenance5/6 payload sizes, alignments,
+  feature offsets, and Vulkan structure-type values on both 32-bit and 64-bit pointer layouts.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- The file-local `is_ldr_astc_format` predicate operates on Vulkan's contiguous LDR ASTC enum
+  range; this is the Rust counterpart of Eden's `IsLdrAstcFormat` helper used by the image-view
+  constructor.
+
+### Unintentional differences (to fix)
+
+- Resolved: LDR ASTC image views now prepend `VkImageViewASTCDecodeModeEXT` with
+  `VK_FORMAT_R8G8B8A8_UNORM` when the extension is enabled, while preserving Eden's following
+  `VkImageViewUsageCreateInfo` node and conditional ordering.
+
+### Missing items
+
+- The audited ASTC decode-mode image-view path is complete; broader texture-cache parity remains
+  tracked by its dedicated reports.
+
+### Binary layout verification
+
+- PASS: `ash` owns both Vulkan `pNext` payload layouts; the focused test verifies the exact LDR
+  ASTC range boundary and rejects HDR ASTC formats.

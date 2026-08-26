@@ -3570,14 +3570,22 @@ impl TextureCacheRuntime {
                 range.layer_count = layer_count;
             }
             let mut usage_info = vk::ImageViewUsageCreateInfo::builder().usage(usage).build();
-            let view_info = vk::ImageViewCreateInfo::builder()
+            let mut astc_decode_mode = vk::ImageViewASTCDecodeModeEXT::builder()
+                .decode_mode(vk::Format::R8G8B8A8_UNORM)
+                .build();
+            let mut view_info_builder = vk::ImageViewCreateInfo::builder()
                 .push_next(&mut usage_info)
                 .image(image.handle())
                 .view_type(image_view_type_from_texture_type(texture_type))
                 .format(format)
                 .components(components)
-                .subresource_range(range)
-                .build();
+                .subresource_range(range);
+            if self.vulkan_device().is_ext_astc_decode_mode_supported()
+                && is_ldr_astc_format(format)
+            {
+                view_info_builder = view_info_builder.push_next(&mut astc_decode_mode);
+            }
+            let view_info = view_info_builder.build();
             unsafe { self.device.create_image_view(&view_info, None) }
         };
 
@@ -6613,6 +6621,15 @@ mod tests {
     }
 
     #[test]
+    fn ldr_astc_format_range_matches_upstream() {
+        assert!(is_ldr_astc_format(vk::Format::ASTC_4X4_UNORM_BLOCK));
+        assert!(is_ldr_astc_format(vk::Format::ASTC_8X8_SRGB_BLOCK));
+        assert!(is_ldr_astc_format(vk::Format::ASTC_12X12_SRGB_BLOCK));
+        assert!(!is_ldr_astc_format(vk::Format::R8G8B8A8_UNORM));
+        assert!(!is_ldr_astc_format(vk::Format::ASTC_4X4_SFLOAT_BLOCK_EXT));
+    }
+
+    #[test]
     fn ranged_barrier_range_matches_upstream_min_max_layers() {
         let mut range = RangedBarrierRange::default();
 
@@ -7391,6 +7408,12 @@ fn image_view_usage_flags(
 ) -> vk::ImageUsageFlags {
     image_usage_flags(view_format_info, view_format)
         & image_usage_flags(image_format_info, image_format)
+}
+
+/// Port of upstream `IsLdrAstcFormat`.
+fn is_ldr_astc_format(format: vk::Format) -> bool {
+    (vk::Format::ASTC_4X4_UNORM_BLOCK.as_raw()..=vk::Format::ASTC_12X12_SRGB_BLOCK.as_raw())
+        .contains(&format.as_raw())
 }
 
 fn make_image_create_info(

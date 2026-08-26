@@ -18,6 +18,7 @@ use crate::gpu_logging::{get_instance, DriverType, LogLevel};
 
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
 use super::vma::VmaAllocator;
+use super::vulkan::{KHR_MAINTENANCE_7_EXTENSION_NAME, KHR_MAINTENANCE_8_EXTENSION_NAME};
 use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, VulkanError};
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,8 @@ use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, 
 /// Port of `GuestWarpSize` from `vulkan_device.h`.
 pub const GUEST_WARP_SIZE: u32 = 32;
 const ONE_GIB: u64 = 1024 * 1024 * 1024;
+const KHR_MAINTENANCE_5_EXTENSION_NAME: &str = "VK_KHR_maintenance5";
+const KHR_MAINTENANCE_6_EXTENSION_NAME: &str = "VK_KHR_maintenance6";
 
 /// Stable non-owning Rust counterpart of upstream's pervasive `const Device&`
 /// members. Renderer owners are boxed before these references are created and
@@ -99,6 +102,26 @@ impl Default for PhysicalDeviceMaintenance5FeaturesKhr {
             s_type: vk::StructureType::from_raw(1_000_470_000),
             p_next: std::ptr::null_mut(),
             maintenance5: vk::FALSE,
+        }
+    }
+}
+
+// ash 0.37 also predates VK_KHR_maintenance6. Keep the feature ABI payload in
+// the same device owner as Eden's VkPhysicalDeviceMaintenance6FeaturesKHR.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceMaintenance6FeaturesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    maintenance6: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceMaintenance6FeaturesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_545_000),
+            p_next: std::ptr::null_mut(),
+            maintenance6: vk::FALSE,
         }
     }
 }
@@ -337,10 +360,13 @@ pub struct DeviceExtensions {
     pub bit8_storage: bool,
     pub timeline_semaphore: bool,
     pub buffer_device_address: bool,
+    pub vulkan_memory_model: bool,
 
     // VK features 1.3
+    pub robust_image_access: bool,
     pub shader_demote_to_helper_invocation: bool,
     pub subgroup_size_control: bool,
+    pub maintenance4: bool,
     pub synchronization2: bool,
 
     // VK feature extensions
@@ -365,11 +391,13 @@ pub struct DeviceExtensions {
     pub pipeline_executable_properties: bool,
     pub workgroup_memory_explicit_layout: bool,
     pub maintenance5: bool,
+    pub maintenance6: bool,
     /// Diagnostic-only `VK_EXT_device_fault`, enabled through
     /// `RUZU_VK_DEVICE_FAULT` when the host exposes the feature.
     pub device_fault: bool,
 
     // Misc extensions
+    pub astc_decode_mode: bool,
     pub conditional_rendering: bool,
     pub conservative_rasterization: bool,
     pub depth_range_unrestricted: bool,
@@ -389,6 +417,11 @@ pub struct DeviceExtensions {
     pub swapchain: bool,
     pub swapchain_mutable_format: bool,
     pub image_format_list: bool,
+    pub maintenance1: bool,
+    pub maintenance2: bool,
+    pub maintenance3: bool,
+    pub maintenance7: bool,
+    pub maintenance8: bool,
     pub device_diagnostics_config: bool,
     pub geometry_shader_passthrough: bool,
     pub viewport_array2: bool,
@@ -520,6 +553,7 @@ pub struct Device {
     pub has_broken_parallel_compiling: bool,
     pub has_renderdoc: bool,
     pub has_nsight_graphics: bool,
+    pub has_radeon_gpu_profiler: bool,
     pub supports_d24_depth: bool,
     pub cant_blit_msaa: bool,
     pub must_emulate_scaled_formats: bool,
@@ -535,6 +569,7 @@ pub struct Device {
     pub dynamic_state3_alpha_to_one: bool,
     pub provoking_vertex_last_supported: bool,
     pub transform_feedback_preserves_provoking_vertex: bool,
+    pub rectangular_lines_supported: bool,
     pub smooth_lines_supported: bool,
     pub stippled_rectangular_lines_supported: bool,
     pub supports_conditional_barriers: bool,
@@ -677,12 +712,22 @@ impl Device {
             supported_extensions.contains("VK_KHR_pipeline_executable_properties");
         let has_workgroup_memory_explicit_layout =
             supported_extensions.contains("VK_KHR_workgroup_memory_explicit_layout");
-        let has_maintenance5 = supported_extensions.contains("VK_KHR_maintenance5");
+        let has_vulkan_memory_model = device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains("VK_KHR_vulkan_memory_model");
+        let has_robust_image_access = device_properties.api_version >= vk::API_VERSION_1_3
+            || supported_extensions.contains("VK_EXT_image_robustness");
+        let has_maintenance4 = device_properties.api_version >= vk::API_VERSION_1_3
+            || supported_extensions.contains("VK_KHR_maintenance4");
+        let has_maintenance5 = supported_extensions.contains(KHR_MAINTENANCE_5_EXTENSION_NAME);
+        let has_maintenance6 = supported_extensions.contains(KHR_MAINTENANCE_6_EXTENSION_NAME);
         let has_4444_formats = supported_extensions.contains("VK_EXT_4444_formats");
         let has_index_type_uint8 = supported_extensions.contains("VK_EXT_index_type_uint8");
         let has_vertex_attribute_divisor =
             supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
         let has_provoking_vertex = supported_extensions.contains("VK_EXT_provoking_vertex");
+        // Match Eden's two distinct extension fields: the feature payload is
+        // queried through VK_EXT_robustness2, while the separately tracked
+        // robustness_2 name may prefer the KHR alias below.
         let has_robustness2 = supported_extensions.contains("VK_EXT_robustness2");
         let has_device_fault = supported_extensions.contains("VK_EXT_device_fault")
             && std::env::var_os("RUZU_VK_DEVICE_FAULT").is_some();
@@ -710,6 +755,10 @@ impl Device {
             vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
         let mut timeline_semaphore_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut vulkan_memory_model_features =
+            vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+        let mut robust_image_access_features = vk::PhysicalDeviceImageRobustnessFeatures::default();
+        let mut maintenance4_features = vk::PhysicalDeviceMaintenance4Features::default();
         let mut synchronization2_features = vk::PhysicalDeviceSynchronization2Features::default();
         let mut subgroup_size_control_features =
             vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
@@ -734,6 +783,7 @@ impl Device {
         let mut workgroup_memory_explicit_layout_features =
             vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default();
         let mut maintenance5_features = PhysicalDeviceMaintenance5FeaturesKhr::default();
+        let mut maintenance6_features = PhysicalDeviceMaintenance6FeaturesKhr::default();
         let mut primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
         let mut extended_dynamic_state_features =
@@ -777,6 +827,15 @@ impl Device {
                 || supported_extensions.contains("VK_KHR_timeline_semaphore")
             {
                 features2_builder = features2_builder.push_next(&mut timeline_semaphore_features);
+            }
+            if has_vulkan_memory_model {
+                features2_builder = features2_builder.push_next(&mut vulkan_memory_model_features);
+            }
+            if has_robust_image_access {
+                features2_builder = features2_builder.push_next(&mut robust_image_access_features);
+            }
+            if has_maintenance4 {
+                features2_builder = features2_builder.push_next(&mut maintenance4_features);
             }
             if has_synchronization2 {
                 features2_builder = features2_builder.push_next(&mut synchronization2_features);
@@ -881,6 +940,12 @@ impl Device {
                     as *mut PhysicalDeviceMaintenance5FeaturesKhr)
                     .cast();
             }
+            if has_maintenance6 {
+                maintenance6_features.p_next = features2.p_next;
+                features2.p_next = (&mut maintenance6_features
+                    as *mut PhysicalDeviceMaintenance6FeaturesKhr)
+                    .cast();
+            }
             features2
         };
         unsafe {
@@ -925,6 +990,10 @@ impl Device {
             "extendedDynamicState"
         );
         log_recommended_feature!(formats_4444_features.format_a4b4g4r4, "formatA4B4G4R4");
+        log_recommended_feature!(
+            robust_image_access_features.robust_image_access,
+            "robustImageAccess"
+        );
         log_recommended_feature!(index_type_uint8_features.index_type_uint8, "indexTypeUint8");
         log_recommended_feature!(
             primitive_topology_list_restart_features.primitive_topology_list_restart,
@@ -935,14 +1004,6 @@ impl Device {
             "provokingVertexLast"
         );
         log_recommended_feature!(robustness2_features.null_descriptor, "nullDescriptor");
-        log_recommended_feature!(
-            robustness2_features.robust_buffer_access2,
-            "robustBufferAccess2"
-        );
-        log_recommended_feature!(
-            robustness2_features.robust_image_access2,
-            "robustImageAccess2"
-        );
         log_recommended_feature!(shader_float16_int8_features.shader_float16, "shaderFloat16");
         log_recommended_feature!(shader_float16_int8_features.shader_int8, "shaderInt8");
         log_recommended_feature!(
@@ -965,13 +1026,6 @@ impl Device {
             vertex_input_dynamic_state_features.vertex_input_dynamic_state,
             "vertexInputDynamicState"
         );
-        log_recommended_feature!(device_features.fill_mode_non_solid, "fillModeNonSolid");
-        log_recommended_feature!(device_features.geometry_shader, "geometryShader");
-        log_recommended_feature!(device_features.large_points, "largePoints");
-        log_recommended_feature!(device_features.shader_cull_distance, "shaderCullDistance");
-        log_recommended_feature!(device_features.tessellation_shader, "tessellationShader");
-        log_recommended_feature!(device_features.wide_lines, "wideLines");
-
         let has_push_descriptor = supported_extensions.contains("VK_KHR_push_descriptor");
         let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
         let mut push_descriptor_properties =
@@ -1021,7 +1075,13 @@ impl Device {
         let supports_timeline_semaphore = timeline_semaphore_features.timeline_semaphore != 0;
         let supports_synchronization2 =
             has_synchronization2 && synchronization2_features.synchronization2 != 0;
+        let supports_vulkan_memory_model =
+            has_vulkan_memory_model && vulkan_memory_model_features.vulkan_memory_model != 0;
+        let supports_robust_image_access =
+            has_robust_image_access && robust_image_access_features.robust_image_access != 0;
+        let supports_maintenance4 = has_maintenance4 && maintenance4_features.maintenance4 != 0;
         let supports_maintenance5 = has_maintenance5 && maintenance5_features.maintenance5 != 0;
+        let supports_maintenance6 = has_maintenance6 && maintenance6_features.maintenance6 != 0;
         let mut supports_buffer_device_address = has_buffer_device_address
             && if device_properties.api_version >= vk::API_VERSION_1_2 {
                 vulkan12_features.buffer_device_address != 0
@@ -1134,21 +1194,17 @@ impl Device {
         let suitable = device_is_suitable(
             device_properties.api_version,
             surface != vk::SurfaceKHR::null(),
+            is_mvk,
             &supported_extensions,
             &device_features,
-            &storage_16bit_features,
-            &storage_8bit_features,
             &host_query_reset_features,
             &shader_demote_features,
             &shader_draw_parameters_features,
             &variable_pointers_features,
             &device_properties.limits,
         );
-        if !suitable && !(is_mvk || is_qualcomm || is_turnip || is_arm) {
-            return Err(VulkanError::new(vk::Result::ERROR_INCOMPATIBLE_DRIVER));
-        }
         if !suitable {
-            log::warn!("Unsuitable driver, continuing anyway");
+            log::warn!("Unsuitable driver - continuing anyways");
         }
 
         let nvidia_arch = if is_nvidia {
@@ -1489,6 +1545,16 @@ impl Device {
             &supported_extensions,
             supports_device_fault,
         );
+        let robustness2_extension_name = if loaded_extensions.contains("VK_KHR_robustness2") {
+            "VK_KHR_robustness2"
+        } else {
+            "VK_EXT_robustness2"
+        };
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            robustness2_extension_name,
+            supports_null_descriptor,
+        );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
             "VK_EXT_border_color_swizzle",
@@ -1568,8 +1634,23 @@ impl Device {
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
-            "VK_KHR_maintenance5",
+            "VK_EXT_image_robustness",
+            supports_robust_image_access,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            "VK_KHR_maintenance4",
+            supports_maintenance4,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            KHR_MAINTENANCE_5_EXTENSION_NAME,
             supports_maintenance5,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            KHR_MAINTENANCE_6_EXTENSION_NAME,
+            supports_maintenance6,
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
@@ -1614,6 +1695,9 @@ impl Device {
         if !supports_descriptor_buffer {
             clear_feature_preserving_chain!(descriptor_buffer_features);
         }
+        if !supports_null_descriptor {
+            clear_feature_preserving_chain!(robustness2_features);
+        }
         if !supports_buffer_device_address {
             if device_properties.api_version >= vk::API_VERSION_1_2 {
                 vulkan12_features.buffer_device_address = vk::FALSE;
@@ -1646,6 +1730,18 @@ impl Device {
         }
         if !supports_workgroup_memory_explicit_layout {
             clear_feature_preserving_chain!(workgroup_memory_explicit_layout_features);
+        }
+        if !supports_robust_image_access {
+            clear_feature_preserving_chain!(robust_image_access_features);
+        }
+        if !supports_maintenance4 {
+            clear_feature_preserving_chain!(maintenance4_features);
+        }
+        if !supports_maintenance5 {
+            clear_feature_preserving_chain!(maintenance5_features);
+        }
+        if !supports_maintenance6 {
+            clear_feature_preserving_chain!(maintenance6_features);
         }
         if !supports_subgroup_size_control {
             clear_feature_preserving_chain!(subgroup_size_control_features);
@@ -1686,7 +1782,7 @@ impl Device {
             && !*common::settings::values()
                 .enable_compute_pipelines
                 .get_value();
-        let (has_renderdoc, has_nsight_graphics) = collect_tooling_info(
+        let (has_renderdoc, has_nsight_graphics, has_radeon_gpu_profiler) = collect_tooling_info(
             entry,
             &instance,
             physical,
@@ -1805,7 +1901,10 @@ impl Device {
                 bit8_storage: loaded_extensions.contains("VK_KHR_8bit_storage"),
                 timeline_semaphore: loaded_extensions.contains("VK_KHR_timeline_semaphore"),
                 buffer_device_address: supports_buffer_device_address,
+                vulkan_memory_model: supports_vulkan_memory_model,
+                robust_image_access: supports_robust_image_access,
                 subgroup_size_control: supports_subgroup_size_control,
+                maintenance4: supports_maintenance4,
                 synchronization2: supports_synchronization2,
                 border_color_swizzle: supports_border_color_swizzle,
                 custom_border_color: supports_custom_border_color,
@@ -1826,15 +1925,18 @@ impl Device {
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
                 provoking_vertex: supports_provoking_vertex,
                 robustness2: has_robustness2,
-                robustness_2: loaded_extensions.contains("VK_EXT_robustness2"),
+                robustness_2: loaded_extensions.contains("VK_KHR_robustness2")
+                    || loaded_extensions.contains("VK_EXT_robustness2"),
                 pipeline_executable_properties: supports_pipeline_executable_properties,
                 workgroup_memory_explicit_layout: supports_workgroup_memory_explicit_layout,
                 maintenance5: supports_maintenance5,
+                maintenance6: supports_maintenance6,
                 device_fault: supports_device_fault,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 draw_indirect_count: has_draw_indirect_count,
                 sampler_filter_minmax: supports_sampler_filter_minmax,
                 shader_float_controls: has_shader_float_controls,
+                astc_decode_mode: loaded_extensions.contains("VK_EXT_astc_decode_mode"),
                 conditional_rendering: loaded_extensions.contains("VK_EXT_conditional_rendering"),
                 conservative_rasterization: loaded_extensions
                     .contains("VK_EXT_conservative_rasterization"),
@@ -1854,6 +1956,11 @@ impl Device {
                 swapchain_mutable_format: loaded_extensions
                     .contains("VK_KHR_swapchain_mutable_format"),
                 image_format_list: loaded_extensions.contains("VK_KHR_image_format_list"),
+                maintenance1: loaded_extensions.contains("VK_KHR_maintenance1"),
+                maintenance2: loaded_extensions.contains("VK_KHR_maintenance2"),
+                maintenance3: loaded_extensions.contains("VK_KHR_maintenance3"),
+                maintenance7: loaded_extensions.contains(KHR_MAINTENANCE_7_EXTENSION_NAME),
+                maintenance8: loaded_extensions.contains(KHR_MAINTENANCE_8_EXTENSION_NAME),
                 device_diagnostics_config: loaded_extensions
                     .contains("VK_NV_device_diagnostics_config"),
                 geometry_shader_passthrough: loaded_extensions
@@ -1938,6 +2045,7 @@ impl Device {
             has_broken_parallel_compiling,
             has_renderdoc,
             has_nsight_graphics,
+            has_radeon_gpu_profiler,
             supports_d24_depth,
             cant_blit_msaa,
             must_emulate_scaled_formats,
@@ -1953,6 +2061,7 @@ impl Device {
             dynamic_state3_alpha_to_one,
             provoking_vertex_last_supported,
             transform_feedback_preserves_provoking_vertex,
+            rectangular_lines_supported: line_rasterization_features.rectangular_lines != 0,
             smooth_lines_supported: line_rasterization_features.smooth_lines != 0,
             stippled_rectangular_lines_supported: line_rasterization_features
                 .stippled_rectangular_lines
@@ -2447,7 +2556,7 @@ impl Device {
 
     /// Returns true if ASTC is natively supported.
     pub fn is_optimal_astc_supported(&self) -> bool {
-        self.device_features.texture_compression_astc_ldr != 0
+        self.is_optimal_astc_supported
     }
 
     /// Returns true if BCn is natively supported.
@@ -2470,6 +2579,13 @@ impl Device {
     /// Port of `Device::IsFloat16Supported`.
     pub fn is_float16_supported(&self) -> bool {
         self.shader_float16_supported
+    }
+
+    /// Returns true if shaders can use the Vulkan memory model.
+    ///
+    /// Port of upstream `Device::IsVulkanMemoryModelSupported`.
+    pub fn is_vulkan_memory_model_supported(&self) -> bool {
+        self.extensions.vulkan_memory_model
     }
 
     pub fn is_int8_supported(&self) -> bool {
@@ -2598,6 +2714,14 @@ impl Device {
             && self.transform_feedback_properties.transform_feedback_draw != 0
     }
 
+    pub fn is_transform_feedback_queries_supported(&self) -> bool {
+        self.extensions.transform_feedback
+            && self
+                .transform_feedback_properties
+                .transform_feedback_queries
+                != 0
+    }
+
     /// Returns true if host-side `vkResetQueryPool` is supported.
     ///
     /// Port of upstream `Device::IsHostQueryResetSupported`.
@@ -2663,7 +2787,7 @@ impl Device {
 
     /// Returns true when a known debugging tool is attached.
     pub fn has_debugging_tool_attached(&self) -> bool {
-        self.has_renderdoc || self.has_nsight_graphics
+        self.has_renderdoc || self.has_nsight_graphics || self.has_radeon_gpu_profiler
     }
 
     /// Returns true if compute pipelines can cause crashing.
@@ -2822,6 +2946,14 @@ impl Device {
         self.extensions.custom_border_color
     }
 
+    pub fn is_custom_border_colors_supported(&self) -> bool {
+        self.extensions.custom_border_color
+    }
+
+    pub fn is_custom_border_color_without_format_supported(&self) -> bool {
+        self.extensions.custom_border_color
+    }
+
     pub fn is_ext_border_color_swizzle_supported(&self) -> bool {
         self.extensions.border_color_swizzle
     }
@@ -2874,6 +3006,12 @@ impl Device {
         self.extensions.shader_stencil_export
     }
 
+    pub fn can_perform_depth_stencil_operations(&self) -> bool {
+        self.extensions.shader_stencil_export
+            || self.is_blit_depth24_stencil8_supported
+            || self.is_blit_depth32_stencil8_supported
+    }
+
     pub fn is_ext_depth_range_unrestricted_supported(&self) -> bool {
         self.extensions.depth_range_unrestricted
     }
@@ -2922,6 +3060,10 @@ impl Device {
         self.extensions.conditional_rendering
     }
 
+    pub fn is_ext_astc_decode_mode_supported(&self) -> bool {
+        self.extensions.astc_decode_mode
+    }
+
     pub fn is_ext_line_rasterization_supported(&self) -> bool {
         self.extensions.line_rasterization
     }
@@ -2942,6 +3084,22 @@ impl Device {
         self.extensions.workgroup_memory_explicit_layout
     }
 
+    pub fn is_khr_maintenance1_supported(&self) -> bool {
+        self.extensions.maintenance1
+    }
+
+    pub fn is_khr_maintenance2_supported(&self) -> bool {
+        self.extensions.maintenance2
+    }
+
+    pub fn is_khr_maintenance3_supported(&self) -> bool {
+        self.extensions.maintenance3
+    }
+
+    pub fn is_khr_maintenance4_supported(&self) -> bool {
+        self.extensions.maintenance4
+    }
+
     pub fn is_khr_maintenance5_supported(&self) -> bool {
         self.extensions.maintenance5
     }
@@ -2958,6 +3116,18 @@ impl Device {
         self.extensions.maintenance5
             && self.maintenance5_early_fragment_multisample_coverage_after_sample_counting
             && self.maintenance5_early_fragment_sample_mask_test_before_sample_counting
+    }
+
+    pub fn is_khr_maintenance6_supported(&self) -> bool {
+        self.extensions.maintenance6
+    }
+
+    pub fn is_khr_maintenance7_supported(&self) -> bool {
+        self.extensions.maintenance7
+    }
+
+    pub fn is_khr_maintenance8_supported(&self) -> bool {
+        self.extensions.maintenance8
     }
 
     pub fn is_khr_image_format_list_supported(&self) -> bool {
@@ -3036,6 +3206,10 @@ impl Device {
 
     pub fn supports_dynamic_state3_alpha_to_one_enable(&self) -> bool {
         self.dynamic_state3_alpha_to_one
+    }
+
+    pub fn supports_rectangular_lines(&self) -> bool {
+        self.rectangular_lines_supported
     }
 
     pub fn supports_smooth_lines(&self) -> bool {
@@ -3305,11 +3479,13 @@ fn initial_loaded_extensions(
         "VK_EXT_robustness2",
         "VK_EXT_transform_feedback",
         "VK_EXT_vertex_input_dynamic_state",
-        "VK_KHR_maintenance5",
+        KHR_MAINTENANCE_5_EXTENSION_NAME,
+        KHR_MAINTENANCE_6_EXTENSION_NAME,
         "VK_KHR_pipeline_executable_properties",
         "VK_KHR_workgroup_memory_explicit_layout",
     ];
     const EXTENSIONS: &[&str] = &[
+        "VK_EXT_astc_decode_mode",
         "VK_EXT_conditional_rendering",
         "VK_EXT_conservative_rasterization",
         "VK_EXT_depth_range_unrestricted",
@@ -3329,6 +3505,11 @@ fn initial_loaded_extensions(
         "VK_KHR_swapchain",
         "VK_KHR_swapchain_mutable_format",
         "VK_KHR_image_format_list",
+        "VK_KHR_maintenance1",
+        "VK_KHR_maintenance2",
+        "VK_KHR_maintenance3",
+        KHR_MAINTENANCE_7_EXTENSION_NAME,
+        KHR_MAINTENANCE_8_EXTENSION_NAME,
         "VK_NV_device_diagnostics_config",
         "VK_NV_geometry_shader_passthrough",
         "VK_NV_viewport_array2",
@@ -3346,10 +3527,13 @@ fn initial_loaded_extensions(
         "VK_KHR_8bit_storage",
         "VK_KHR_buffer_device_address",
         "VK_KHR_timeline_semaphore",
+        "VK_KHR_vulkan_memory_model",
     ];
     const FEATURES_1_3: &[&str] = &[
+        "VK_EXT_image_robustness",
         "VK_EXT_shader_demote_to_helper_invocation",
         "VK_EXT_subgroup_size_control",
+        "VK_KHR_maintenance4",
         "VK_KHR_synchronization2",
     ];
 
@@ -3373,6 +3557,12 @@ fn initial_loaded_extensions(
             }
         }
     }
+    if supported_extensions.contains("VK_KHR_robustness2") {
+        loaded.remove("VK_EXT_robustness2");
+        loaded.insert("VK_KHR_robustness2".to_string());
+    } else if supported_extensions.contains("VK_EXT_robustness2") {
+        loaded.insert("VK_EXT_robustness2".to_string());
+    }
     if enable_device_fault {
         loaded.insert("VK_EXT_device_fault".to_string());
     }
@@ -3393,10 +3583,9 @@ fn remove_extension_if_unsupported(
 fn device_is_suitable(
     api_version: u32,
     requires_swapchain: bool,
+    is_molten_vk: bool,
     extensions: &BTreeSet<String>,
     features: &vk::PhysicalDeviceFeatures,
-    storage_16bit: &vk::PhysicalDevice16BitStorageFeatures,
-    storage_8bit: &vk::PhysicalDevice8BitStorageFeatures,
     host_query_reset: &vk::PhysicalDeviceHostQueryResetFeatures,
     shader_demote: &vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures,
     shader_draw_parameters: &vk::PhysicalDeviceShaderDrawParametersFeatures,
@@ -3452,27 +3641,20 @@ fn device_is_suitable(
     macro_rules! require_feature {
         ($value:expr, $name:literal) => {
             if $value == vk::FALSE {
-                log::error!("Missing required feature {}", $name);
-                suitable = false;
+                if is_molten_vk
+                    && matches!(
+                        $name,
+                        "geometryShader" | "logicOp" | "shaderCullDistance" | "wideLines"
+                    )
+                {
+                    log::info!("MoltenVK missing feature {} - using fallback", $name);
+                } else {
+                    log::error!("Missing required feature {}", $name);
+                    suitable = false;
+                }
             }
         };
     }
-    require_feature!(
-        storage_16bit.storage_buffer16_bit_access,
-        "storageBuffer16BitAccess"
-    );
-    require_feature!(
-        storage_16bit.uniform_and_storage_buffer16_bit_access,
-        "uniformAndStorageBuffer16BitAccess"
-    );
-    require_feature!(
-        storage_8bit.storage_buffer8_bit_access,
-        "storageBuffer8BitAccess"
-    );
-    require_feature!(
-        storage_8bit.uniform_and_storage_buffer8_bit_access,
-        "uniformAndStorageBuffer8BitAccess"
-    );
     require_feature!(features.depth_bias_clamp, "depthBiasClamp");
     require_feature!(features.depth_clamp, "depthClamp");
     require_feature!(
@@ -3480,12 +3662,15 @@ fn device_is_suitable(
         "drawIndirectFirstInstance"
     );
     require_feature!(features.dual_src_blend, "dualSrcBlend");
+    require_feature!(features.fill_mode_non_solid, "fillModeNonSolid");
     require_feature!(
         features.fragment_stores_and_atomics,
         "fragmentStoresAndAtomics"
     );
+    require_feature!(features.geometry_shader, "geometryShader");
     require_feature!(features.image_cube_array, "imageCubeArray");
     require_feature!(features.independent_blend, "independentBlend");
+    require_feature!(features.large_points, "largePoints");
     require_feature!(features.logic_op, "logicOp");
     require_feature!(features.multi_draw_indirect, "multiDrawIndirect");
     require_feature!(features.multi_viewport, "multiViewport");
@@ -3494,6 +3679,7 @@ fn device_is_suitable(
     require_feature!(features.sampler_anisotropy, "samplerAnisotropy");
     require_feature!(features.sample_rate_shading, "sampleRateShading");
     require_feature!(features.shader_clip_distance, "shaderClipDistance");
+    require_feature!(features.shader_cull_distance, "shaderCullDistance");
     require_feature!(
         features.shader_image_gather_extended,
         "shaderImageGatherExtended"
@@ -3502,10 +3688,12 @@ fn device_is_suitable(
         features.shader_storage_image_write_without_format,
         "shaderStorageImageWriteWithoutFormat"
     );
+    require_feature!(features.tessellation_shader, "tessellationShader");
     require_feature!(
         features.vertex_pipeline_stores_and_atomics,
         "vertexPipelineStoresAndAtomics"
     );
+    require_feature!(features.wide_lines, "wideLines");
     require_feature!(host_query_reset.host_query_reset, "hostQueryReset");
     require_feature!(
         shader_demote.shader_demote_to_helper_invocation,
@@ -3592,20 +3780,22 @@ fn collect_tooling_info(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     tooling_info_enabled: bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     if !tooling_info_enabled {
-        return (false, false);
+        return (false, false, false);
     }
     let tools = get_physical_device_tool_properties(entry, instance, physical);
     let mut has_renderdoc = false;
     let mut has_nsight_graphics = false;
+    let mut has_radeon_gpu_profiler = false;
     for tool in tools {
         let name = unsafe { CStr::from_ptr(tool.name.as_ptr()) }.to_string_lossy();
         log::info!("Attached debugging tool: {}", name);
         has_renderdoc |= name == "RenderDoc";
         has_nsight_graphics |= name == "NVIDIA Nsight Graphics";
+        has_radeon_gpu_profiler |= name == "Radeon GPU Profiler";
     }
-    (has_renderdoc, has_nsight_graphics)
+    (has_renderdoc, has_nsight_graphics, has_radeon_gpu_profiler)
 }
 
 fn collect_format_properties(
@@ -3813,15 +4003,21 @@ fn compute_is_optimal_astc_supported(
         return false;
     }
     let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-        | vk::FormatFeatureFlags::BLIT_SRC
-        | vk::FormatFeatureFlags::BLIT_DST
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
         | vk::FormatFeatureFlags::TRANSFER_SRC
         | vk::FormatFeatureFlags::TRANSFER_DST;
     ASTC_FORMATS.iter().all(|&format| {
         let properties =
             unsafe { instance.get_physical_device_format_properties(physical, format) };
-        !(properties.optimal_tiling_features & required).is_empty()
+        astc_format_support_is_complete(properties.optimal_tiling_features, required)
     })
+}
+
+fn astc_format_support_is_complete(
+    supported: vk::FormatFeatureFlags,
+    required: vk::FormatFeatureFlags,
+) -> bool {
+    (supported & required) == required
 }
 
 fn test_depth_stencil_blits(
@@ -3855,7 +4051,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maintenance5_raw_payloads_match_vulkan_abi() {
+    fn maintenance5_and6_raw_payloads_match_vulkan_abi() {
         let pointer_size = std::mem::size_of::<*mut std::ffi::c_void>();
         assert_eq!(
             std::mem::size_of::<PhysicalDeviceMaintenance5FeaturesKhr>(),
@@ -3863,6 +4059,16 @@ mod tests {
         );
         assert_eq!(
             std::mem::offset_of!(PhysicalDeviceMaintenance5FeaturesKhr, maintenance5),
+            pointer_size * 2
+        );
+        let maintenance6 = PhysicalDeviceMaintenance6FeaturesKhr::default();
+        assert_eq!(maintenance6.s_type.as_raw(), 1_000_545_000);
+        assert_eq!(
+            std::mem::size_of::<PhysicalDeviceMaintenance6FeaturesKhr>(),
+            if pointer_size == 8 { 24 } else { 12 }
+        );
+        assert_eq!(
+            std::mem::offset_of!(PhysicalDeviceMaintenance6FeaturesKhr, maintenance6),
             pointer_size * 2
         );
         assert_eq!(
@@ -3892,6 +4098,24 @@ mod tests {
         assert_eq!(features.robust_image_access2, vk::FALSE);
         assert_eq!(features.null_descriptor, vk::TRUE);
         assert!(!configure_robustness2_features(&mut features, false));
+    }
+
+    #[test]
+    fn astc_optimal_support_requires_every_upstream_feature_bit() {
+        let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+
+        assert!(astc_format_support_is_complete(required, required));
+        assert!(!astc_format_support_is_complete(
+            required & !vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            required
+        ));
+        assert!(!astc_format_support_is_complete(
+            vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            required
+        ));
     }
 
     #[test]
@@ -3962,9 +4186,19 @@ mod tests {
             "VK_EXT_host_query_reset",
             "VK_KHR_8bit_storage",
             "VK_KHR_timeline_semaphore",
+            "VK_KHR_vulkan_memory_model",
+            "VK_EXT_image_robustness",
             "VK_EXT_shader_demote_to_helper_invocation",
             "VK_EXT_subgroup_size_control",
-            "VK_KHR_maintenance5",
+            "VK_KHR_maintenance4",
+            KHR_MAINTENANCE_5_EXTENSION_NAME,
+            KHR_MAINTENANCE_6_EXTENSION_NAME,
+            "VK_KHR_maintenance1",
+            "VK_KHR_maintenance2",
+            "VK_KHR_maintenance3",
+            "VK_KHR_maintenance7",
+            "VK_KHR_maintenance8",
+            "VK_EXT_astc_decode_mode",
             "VK_KHR_swapchain",
             "VK_EXT_filter_cubic",
             "VK_IMG_filter_cubic",
@@ -3979,9 +4213,19 @@ mod tests {
         assert!(vulkan_11.contains("VK_EXT_descriptor_indexing"));
         assert!(vulkan_11.contains("VK_KHR_8bit_storage"));
         assert!(vulkan_11.contains("VK_KHR_timeline_semaphore"));
+        assert!(vulkan_11.contains("VK_KHR_vulkan_memory_model"));
+        assert!(vulkan_11.contains("VK_EXT_image_robustness"));
         assert!(vulkan_11.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(vulkan_11.contains("VK_EXT_subgroup_size_control"));
-        assert!(vulkan_11.contains("VK_KHR_maintenance5"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance4"));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_5_EXTENSION_NAME));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_6_EXTENSION_NAME));
+        assert!(vulkan_11.contains("VK_KHR_maintenance1"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance2"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance3"));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_7_EXTENSION_NAME));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_8_EXTENSION_NAME));
+        assert!(vulkan_11.contains("VK_EXT_astc_decode_mode"));
         assert!(vulkan_11.contains("VK_EXT_filter_cubic"));
         assert!(vulkan_11.contains("VK_IMG_filter_cubic"));
         assert!(vulkan_11.contains("VK_QCOM_filter_cubic_weights"));
@@ -3991,9 +4235,19 @@ mod tests {
         assert!(!vulkan_13.contains("VK_EXT_descriptor_indexing"));
         assert!(!vulkan_13.contains("VK_KHR_8bit_storage"));
         assert!(!vulkan_13.contains("VK_KHR_timeline_semaphore"));
+        assert!(!vulkan_13.contains("VK_KHR_vulkan_memory_model"));
+        assert!(!vulkan_13.contains("VK_EXT_image_robustness"));
         assert!(!vulkan_13.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(!vulkan_13.contains("VK_EXT_subgroup_size_control"));
-        assert!(vulkan_13.contains("VK_KHR_maintenance5"));
+        assert!(!vulkan_13.contains("VK_KHR_maintenance4"));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_5_EXTENSION_NAME));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_6_EXTENSION_NAME));
+        assert!(vulkan_13.contains("VK_KHR_maintenance1"));
+        assert!(vulkan_13.contains("VK_KHR_maintenance2"));
+        assert!(vulkan_13.contains("VK_KHR_maintenance3"));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_7_EXTENSION_NAME));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_8_EXTENSION_NAME));
+        assert!(vulkan_13.contains("VK_EXT_astc_decode_mode"));
         assert!(vulkan_13.contains("VK_EXT_border_color_swizzle"));
         assert!(vulkan_13.contains("VK_EXT_custom_border_color"));
         assert!(vulkan_13.contains("VK_EXT_4444_formats"));
@@ -4002,11 +4256,21 @@ mod tests {
         assert!(vulkan_13.contains("VK_KHR_swapchain"));
     }
 
+    #[test]
+    fn khr_robustness2_is_preferred_over_the_ext_alias() {
+        let supported = ["VK_KHR_robustness2", "VK_EXT_robustness2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let loaded = initial_loaded_extensions(vk::API_VERSION_1_3, &supported, false);
+        assert!(loaded.contains("VK_KHR_robustness2"));
+        assert!(!loaded.contains("VK_EXT_robustness2"));
+    }
+
     fn suitable_device_inputs() -> (
         BTreeSet<String>,
         vk::PhysicalDeviceFeatures,
-        vk::PhysicalDevice16BitStorageFeatures,
-        vk::PhysicalDevice8BitStorageFeatures,
         vk::PhysicalDeviceHostQueryResetFeatures,
         vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures,
         vk::PhysicalDeviceShaderDrawParametersFeatures,
@@ -4028,9 +4292,12 @@ mod tests {
             depth_clamp: vk::TRUE,
             draw_indirect_first_instance: vk::TRUE,
             dual_src_blend: vk::TRUE,
+            fill_mode_non_solid: vk::TRUE,
             fragment_stores_and_atomics: vk::TRUE,
+            geometry_shader: vk::TRUE,
             image_cube_array: vk::TRUE,
             independent_blend: vk::TRUE,
+            large_points: vk::TRUE,
             logic_op: vk::TRUE,
             multi_draw_indirect: vk::TRUE,
             multi_viewport: vk::TRUE,
@@ -4039,19 +4306,12 @@ mod tests {
             sampler_anisotropy: vk::TRUE,
             sample_rate_shading: vk::TRUE,
             shader_clip_distance: vk::TRUE,
+            shader_cull_distance: vk::TRUE,
             shader_image_gather_extended: vk::TRUE,
             shader_storage_image_write_without_format: vk::TRUE,
+            tessellation_shader: vk::TRUE,
             vertex_pipeline_stores_and_atomics: vk::TRUE,
-            ..Default::default()
-        };
-        let storage_16bit = vk::PhysicalDevice16BitStorageFeatures {
-            storage_buffer16_bit_access: vk::TRUE,
-            uniform_and_storage_buffer16_bit_access: vk::TRUE,
-            ..Default::default()
-        };
-        let storage_8bit = vk::PhysicalDevice8BitStorageFeatures {
-            storage_buffer8_bit_access: vk::TRUE,
-            uniform_and_storage_buffer8_bit_access: vk::TRUE,
+            wide_lines: vk::TRUE,
             ..Default::default()
         };
         let host_query_reset = vk::PhysicalDeviceHostQueryResetFeatures {
@@ -4081,8 +4341,6 @@ mod tests {
         (
             extensions,
             features,
-            storage_16bit,
-            storage_8bit,
             host_query_reset,
             shader_demote,
             shader_draw_parameters,
@@ -4096,8 +4354,6 @@ mod tests {
         let (
             mut extensions,
             features,
-            storage_16bit,
-            storage_8bit,
             host_query_reset,
             shader_demote,
             shader_draw_parameters,
@@ -4108,10 +4364,9 @@ mod tests {
             device_is_suitable(
                 vk::API_VERSION_1_3,
                 true,
+                false,
                 extensions,
                 &features,
-                &storage_16bit,
-                &storage_8bit,
                 &host_query_reset,
                 &shader_demote,
                 &shader_draw_parameters,
@@ -4128,12 +4383,47 @@ mod tests {
     }
 
     #[test]
+    fn moltenvk_allows_only_the_four_upstream_mandatory_feature_fallbacks() {
+        let (
+            extensions,
+            mut features,
+            host_query_reset,
+            shader_demote,
+            shader_draw_parameters,
+            variable_pointers,
+            limits,
+        ) = suitable_device_inputs();
+        let check = |features: &vk::PhysicalDeviceFeatures, is_molten_vk| {
+            device_is_suitable(
+                vk::API_VERSION_1_3,
+                true,
+                is_molten_vk,
+                &extensions,
+                features,
+                &host_query_reset,
+                &shader_demote,
+                &shader_draw_parameters,
+                &variable_pointers,
+                &limits,
+            )
+        };
+
+        features.geometry_shader = vk::FALSE;
+        features.logic_op = vk::FALSE;
+        features.shader_cull_distance = vk::FALSE;
+        features.wide_lines = vk::FALSE;
+        assert!(!check(&features, false));
+        assert!(check(&features, true));
+
+        features.fill_mode_non_solid = vk::FALSE;
+        assert!(!check(&features, true));
+    }
+
+    #[test]
     fn descriptor_indexing_extension_is_mandatory_before_vulkan_1_2() {
         let (
             mut extensions,
             features,
-            storage_16bit,
-            storage_8bit,
             host_query_reset,
             shader_demote,
             shader_draw_parameters,
@@ -4144,10 +4434,9 @@ mod tests {
         assert!(device_is_suitable(
             vk::API_VERSION_1_1,
             true,
+            false,
             &extensions,
             &features,
-            &storage_16bit,
-            &storage_8bit,
             &host_query_reset,
             &shader_demote,
             &shader_draw_parameters,
@@ -4158,10 +4447,9 @@ mod tests {
         assert!(!device_is_suitable(
             vk::API_VERSION_1_1,
             true,
+            false,
             &extensions,
             &features,
-            &storage_16bit,
-            &storage_8bit,
             &host_query_reset,
             &shader_demote,
             &shader_draw_parameters,

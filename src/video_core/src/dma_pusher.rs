@@ -130,6 +130,11 @@ impl CommandHeader {
         self.raw & 0x1FFF
     }
 
+    /// Legacy 24-bit method-count view (bits 0..24).
+    pub fn method_count_(&self) -> u32 {
+        self.raw & 0x00FF_FFFF
+    }
+
     /// Subchannel (bits 13..16).
     pub fn subchannel(&self) -> u32 {
         (self.raw >> 13) & 0x7
@@ -196,7 +201,6 @@ impl CommandList {
 
 /// Constants matching upstream.
 const NON_PULLER_METHODS: u32 = 0x40;
-#[allow(dead_code)]
 const MAX_SUBCHANNELS: usize = 8;
 const MACRO_REGISTERS_START: u32 = 0xE00;
 #[allow(dead_code)]
@@ -240,6 +244,7 @@ pub struct DmaPusher {
     gpu: *const crate::gpu::Gpu,
     system: SystemRef,
     memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
+    channel_state: *mut crate::control::channel_state::ChannelState,
     puller: Puller,
     rasterizer: Option<crate::rasterizer_interface::RasterizerHandle>,
     signal_sync: bool,
@@ -271,6 +276,7 @@ impl DmaPusher {
             gpu,
             system,
             memory_manager,
+            channel_state,
             puller: Puller::new(puller_memory_manager, std::ptr::null_mut(), channel_state),
             rasterizer: None,
             signal_sync: false,
@@ -285,6 +291,7 @@ impl DmaPusher {
     /// address and make `Puller::ProcessBindMethod()` write subchannel
     /// bindings into stale storage.
     pub fn install_self_reference(&mut self) {
+        debug_assert_eq!(self.puller.channel_state_ptr(), self.channel_state);
         let self_ptr: *mut DmaPusher = self;
         self.puller.set_dma_pusher(self_ptr);
     }
@@ -477,7 +484,7 @@ impl DmaPusher {
             let command_header = commands[index];
 
             if self.dma_state.method_count > 0 {
-                self.dma_state.dma_word_offset = (index as u64) * 4;
+                self.dma_state.dma_word_offset = (index as u32).wrapping_mul(4) as u64;
                 if self.dma_state.non_incrementing {
                     let max_write =
                         std::cmp::min(index + self.dma_state.method_count as usize, commands.len())
@@ -516,7 +523,8 @@ impl DmaPusher {
                     Some(SubmissionMode::Inline) => {
                         self.dma_state.method = command_header.method();
                         self.dma_state.subchannel = command_header.subchannel();
-                        self.dma_state.dma_word_offset = (-(self.dma_state.dma_get as i64)) as u64;
+                        self.dma_state.dma_word_offset =
+                            (self.dma_state.dma_get as i64).wrapping_neg() as u64;
                         self.dispatch_method(command_header.arg_count());
                         self.dma_state.non_incrementing = true;
                         self.dma_increment_once = false;
@@ -626,6 +634,8 @@ mod tests {
 
         assert_eq!(headers[0].raw, 0x1234_5678);
         assert_eq!(headers[1].raw, 0x90AB_CDEF);
+        assert_eq!(headers[0].method_count_(), 0x34_5678);
+        assert_eq!(headers[0].method_count(), 0x1234 & 0x1FFF);
     }
 
     #[test]
@@ -741,6 +751,29 @@ mod tests {
         dma.install_self_reference();
 
         assert_eq!(dma.puller.dma_pusher_ptr_for_test(), dma_ptr);
+        assert_eq!(dma.channel_state, channel_ptr);
+    }
+
+    #[test]
+    fn inline_dma_offset_preserves_signed_minimum_bit_pattern() {
+        let mut channel_state = Box::new(ChannelState::new(12));
+        let memory_manager = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let channel_ptr: *mut ChannelState = &mut *channel_state;
+        let mut dma = DmaPusher::new(
+            std::ptr::null(),
+            SystemRef::null(),
+            memory_manager,
+            channel_ptr,
+        );
+        dma.dma_state.dma_get = 0x8000_0000_0000_0000;
+
+        dma.process_commands(&[build_command_header(
+            BufferMethods::Nop,
+            0,
+            SubmissionMode::Inline,
+        )]);
+
+        assert_eq!(dma.dma_state.dma_word_offset, 0x8000_0000_0000_0000);
     }
 
     #[test]

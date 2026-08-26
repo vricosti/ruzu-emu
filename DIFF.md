@@ -13834,3 +13834,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: `DirtyTable` is a fixed `[u8; ENGINE_REG_COUNT]` of exactly 0xE00 bytes and `DirtyTables`
   contains exactly two such arrays, matching Eden's `DirtyState::Table` and `Tables`. This is
   host-only lookup state and is not serialized.
+
+## 2026-08-26 — `src/video_core/src/dma_pusher.rs` vs Eden `src/video_core/dma_pusher.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores `System`, `MemoryManager`, and `ChannelState` through the existing non-owning or
+  synchronized handle types rather than C++ references. The embedded `Puller` retains a duplicate
+  non-owning `ChannelState` pointer because borrowing the embedded object and its complete parent
+  mutably at the same time is not representable as safe Rust; `install_self_reference` verifies
+  that both pointers identify the same upstream-owned channel state.
+- The synchronization predicate and condition variable live in an `Arc<DmaSyncState>` so Eden's
+  asynchronous fence callback can outlive the stack frame without capturing a raw `this` pointer.
+
+### Unintentional differences (to fix)
+
+- None after restoring the 24-bit `CommandHeader::method_count_` view and the explicit
+  `ChannelState` relationship on `DmaPusher`.
+- None after narrowing `index * sizeof(u32)` to `u32` before assigning `dma_word_offset`, matching
+  Eden's explicit cast, and using wrapping signed negation for the inline command's zero-address
+  offset so the two's-complement bit pattern is preserved even for `i64::MIN` in debug builds.
+
+### Missing items
+
+- None in the audited command-header, queue, dispatch, step, command-processing, state-update, or
+  subchannel-binding paths.
+
+### Binary layout verification
+
+- PASS: `CommandListHeader` is one `u64`; `CommandHeader` is one `u32`, including Eden's
+  overlapping 13-bit method, 24-bit legacy method-count, 3-bit subchannel, 13-bit argument-count,
+  and 3-bit submission-mode views. Focused tests decode the raw bit patterns and verify the 512
+  inline entries of each command-list small vector.

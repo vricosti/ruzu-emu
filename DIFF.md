@@ -13478,3 +13478,35 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests verify the 28-byte ASTC constants, 16-byte query constants, and 76-byte
   block-linear 3D constants including `destination` at offset 60; the subgroup-size chaining truth
   table is also covered.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.h` and `.cpp`
+
+### Intentional differences
+
+- `ComputePipelineRuntime` groups the three stable renderer-owned descriptor services that Eden
+  receives as constructor references. Rust stores them as `NonNull` because the pipeline is built
+  asynchronously and cached in stable boxed storage.
+- The asynchronously published Vulkan pipeline is an `Arc<Mutex<VkPipeline>>`. This lets recorded
+  scheduler closures perform Eden's late `IsBound()` check without capturing a borrow of the cache
+  entry; `is_bound` remains on `ComputePipeline` as the direct upstream counterpart.
+- `configure` receives a compute-register snapshot, a guest-memory reader, and the already-loaded
+  push-descriptor dispatch table instead of borrowing the engine, memory manager, and wrapper
+  device simultaneously. Descriptor collection and command ordering remain the same.
+
+### Unintentional differences (to fix)
+
+- None after removing the non-upstream descriptor payload early return, using the backend
+  `ImageView::buffer_size` value instead of recomputing it, restoring the retained pipeline-cache
+  member and `is_bound`, matching the relaxed build-state publication, and destroying the
+  descriptor update template before its pipeline/set layouts in Eden's RAII order.
+
+### Missing items
+
+- Eden's optional GPU logging calls for compute-pipeline creation, binding, and dispatch are not
+  present because Ruzu has not yet ported the `video_core/gpu_logging` subsystem. This does not
+  alter descriptor construction or Vulkan command emission.
+
+### Binary layout verification
+
+- N/A: `ComputePipeline` is host-only ownership/synchronization state and is never copied or
+  serialized as raw bytes. Descriptor binding order remains covered by the focused test.

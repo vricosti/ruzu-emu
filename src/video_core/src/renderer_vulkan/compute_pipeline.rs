@@ -34,7 +34,6 @@ use super::texture_cache::TextureCache;
 use super::update_descriptor::UpdateDescriptorQueue;
 use crate::engines::kepler_compute::{DispatchCall, LaunchParams};
 use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageViewInOut};
-use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
 use crate::textures::texture::texture_pair;
 use crate::vulkan_common::vulkan_device::DeviceReference;
 
@@ -86,6 +85,10 @@ unsafe impl Sync for ComputePipelineRuntime {}
 /// - `build_condvar` / `build_mutex` / `is_built` — async build synchronization
 pub struct ComputePipeline {
     device_owner: DeviceReference,
+    /// Upstream `vk::PipelineCache& pipeline_cache`. The raw handle is copied
+    /// because ash Vulkan handles are lightweight references to driver state.
+    #[allow(dead_code)]
+    pipeline_cache: vk::PipelineCache,
     guest_descriptor_queue: NonNull<UpdateDescriptorQueue>,
     descriptor_buffer_ring: NonNull<DescriptorBufferRing>,
     /// Upstream `Shader::Info info`.
@@ -95,17 +98,19 @@ pub struct ComputePipeline {
     #[allow(dead_code)]
     shader_hash: u64,
 
+    /// Number of payload entries reserved from the guest descriptor queue.
+    ///
+    /// Port of upstream `num_descriptor_entries`.
+    num_descriptor_entries: u32,
+
+    /// Uniform buffer sizes per binding (from shader info).
+    uniform_buffer_sizes: crate::buffer_cache::buffer_cache_base::ComputeUniformBufferSizes,
+
     /// SPV shader module.
     spv_module: vk::ShaderModule,
 
     /// Descriptor set layout for this pipeline.
     descriptor_set_layout: vk::DescriptorSetLayout,
-
-    /// Pipeline layout.
-    pipeline_layout: vk::PipelineLayout,
-
-    /// Descriptor update template.
-    descriptor_update_template: vk::DescriptorUpdateTemplate,
 
     /// Upstream `uses_push_descriptor` selected from device capabilities.
     uses_push_descriptor: bool,
@@ -115,16 +120,14 @@ pub struct ComputePipeline {
     /// Upstream per-pipeline descriptor-set allocator.
     descriptor_allocator: Option<DescriptorAllocator>,
 
-    /// Number of payload entries reserved from the guest descriptor queue.
-    ///
-    /// Port of upstream `num_descriptor_entries`.
-    num_descriptor_entries: u32,
+    /// Pipeline layout.
+    pipeline_layout: vk::PipelineLayout,
+
+    /// Descriptor update template.
+    descriptor_update_template: vk::DescriptorUpdateTemplate,
 
     /// The compiled compute pipeline handle.
     pipeline: Arc<Mutex<vk::Pipeline>>,
-
-    /// Uniform buffer sizes per binding (from shader info).
-    uniform_buffer_sizes: crate::buffer_cache::buffer_cache_base::ComputeUniformBufferSizes,
 
     /// Synchronization for async build.
     build_condvar: Arc<Condvar>,
@@ -331,7 +334,7 @@ impl ComputePipeline {
 
                 {
                     let _lock = build_mutex.lock().unwrap();
-                    is_built.store(true, Ordering::Release);
+                    is_built.store(true, Ordering::Relaxed);
                 }
                 // Upstream has a single scheduler waiter, whereas the Rust
                 // owner may also wait from `pipeline()` or `Drop`. Wake every
@@ -348,21 +351,22 @@ impl ComputePipeline {
 
         Some(ComputePipeline {
             device_owner: device_ref,
+            pipeline_cache,
             guest_descriptor_queue: runtime.guest_descriptor_queue,
             descriptor_buffer_ring: runtime.descriptor_buffer_ring,
             info,
             shader_hash,
+            num_descriptor_entries,
+            uniform_buffer_sizes,
             spv_module,
             descriptor_set_layout,
-            pipeline_layout,
-            descriptor_update_template,
             uses_push_descriptor,
             uses_descriptor_buffer,
             descriptor_buffer_layout,
             descriptor_allocator,
-            num_descriptor_entries,
+            pipeline_layout,
+            descriptor_update_template,
             pipeline,
-            uniform_buffer_sizes,
             build_condvar,
             build_mutex,
             is_built,
@@ -491,15 +495,6 @@ impl ComputePipeline {
             fallback_sampler,
         );
 
-        let expected = self.num_descriptor_entries as usize;
-        if descriptor_queue.pending_count() != expected {
-            log::error!(
-                "compute descriptor payload/layout mismatch: queued={} expected={}",
-                descriptor_queue.pending_count(),
-                expected
-            );
-            return false;
-        }
         if !self.is_built.load(Ordering::Relaxed) {
             let build_condvar = Arc::clone(&self.build_condvar);
             let build_mutex = Arc::clone(&self.build_mutex);
@@ -633,6 +628,11 @@ impl ComputePipeline {
         self.is_built.load(Ordering::Relaxed)
     }
 
+    /// Port of upstream `ComputePipeline::IsBound`.
+    pub fn is_bound(&self) -> bool {
+        *self.pipeline.lock().unwrap() != vk::Pipeline::null()
+    }
+
     /// Returns the pipeline handle.
     pub fn pipeline(&self) -> vk::Pipeline {
         self.wait_for_build();
@@ -685,8 +685,6 @@ impl ComputePipeline {
 struct ComputeTextureHandles {
     views: Vec<ImageViewInOut>,
     sampler_indices: Vec<u32>,
-    num_texture_buffers: usize,
-    num_image_buffers: usize,
 }
 
 trait ComputeTextureHandleDescriptor {
@@ -835,7 +833,6 @@ fn collect_texture_handles(
             });
         }
     }
-    result.num_texture_buffers = result.views.len();
     for desc in &info.image_buffer_descriptors {
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
@@ -850,7 +847,6 @@ fn collect_texture_handles(
             });
         }
     }
-    result.num_image_buffers = result.views.len() - result.num_texture_buffers;
     for desc in &info.texture_descriptors {
         for index in 0..desc.count {
             let (view, sampler) =
@@ -889,16 +885,11 @@ fn bind_compute_texture_buffer(
     is_image: bool,
     explicit_format: Option<ImageFormat>,
 ) {
-    let (gpu_addr, size, mut format) = if view.id.is_valid() && view.id != NULL_IMAGE_VIEW_ID {
-        let base = &texture_cache.base.slot_image_views[view.id];
-        (
-            base.gpu_addr,
-            crate::surface::bytes_per_block(base.format).saturating_mul(base.size.width),
-            base.format,
-        )
-    } else {
-        (0, 0, crate::surface::PixelFormat::Invalid)
-    };
+    let (gpu_addr, size, mut format) = texture_cache.image_view_buffer_info(view.id).unwrap_or((
+        0,
+        0,
+        crate::surface::PixelFormat::Invalid,
+    ));
     if let Some(explicit) = explicit_format.and_then(pixel_format_from_image_format) {
         format = explicit;
     }
@@ -914,14 +905,14 @@ impl Drop for ComputePipeline {
             if pipeline != vk::Pipeline::null() {
                 device.destroy_pipeline(pipeline, None);
             }
+            if self.descriptor_update_template != vk::DescriptorUpdateTemplate::null() {
+                device.destroy_descriptor_update_template(self.descriptor_update_template, None);
+            }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 device.destroy_pipeline_layout(self.pipeline_layout, None);
             }
             if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
                 device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            }
-            if self.descriptor_update_template != vk::DescriptorUpdateTemplate::null() {
-                device.destroy_descriptor_update_template(self.descriptor_update_template, None);
             }
             if self.spv_module != vk::ShaderModule::null() {
                 device.destroy_shader_module(self.spv_module, None);

@@ -13988,3 +13988,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: `mod.rs` now owns no class-id or subchannel representation. The canonical transparent
   `EngineID` representation and engine register layouts are verified in their owning modules.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/filters.rs` and `present/util.rs` vs Eden `src/video_core/renderer_vulkan/present/filters.{h,cpp}` and `present/util.{h,cpp}`
+
+### Intentional differences
+
+- ash 0.37 predates `VK_QCOM_filter_cubic_weights`; the Rust counterpart declares the extension's
+  four-value enum and `VkSamplerCubicWeightsCreateInfoQCOM` payload locally with the exact Vulkan
+  ABI instead of obtaining generated declarations from ash.
+- `WindowAdaptPass` is returned directly rather than through `std::unique_ptr`; ownership and
+  construction timing are unchanged.
+
+### Unintentional differences (to fix)
+
+- Restored Eden's QCOM-weighted hardware cubic path: any cubic weight now uses `VK_FILTER_CUBIC_EXT`
+  when both cubic extensions are supported, and non-Catmull-Rom modes chain the selected weight into
+  sampler creation. The shader fallback remains selected under Eden's exact condition.
+- Restored `CreateCubicSampler`'s high-level `Device` input and its linear-filter fallback when
+  `VK_EXT_filter_cubic` is unavailable.
+
+### Missing items
+
+- None in the filter factories or cubic-sampler selection and construction paths.
+
+### Binary layout verification
+
+- PASS: focused tests verify all four Vulkan enum values, structure type `1000519000`, and the
+  native-pointer-width C layout of the locally declared sampler pNext payload.

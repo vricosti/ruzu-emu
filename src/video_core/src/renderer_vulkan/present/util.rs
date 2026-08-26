@@ -11,6 +11,7 @@
 use ash::vk;
 
 use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
 
 // ---------------------------------------------------------------------------
@@ -526,14 +527,39 @@ pub fn create_nearest_neighbor_sampler(device: &ash::Device) -> vk::Sampler {
     }
 }
 
-/// Catmull-Rom subset of upstream `CreateCubicSampler`. Vulkan defines
-/// Catmull-Rom as the default cubic weights, so this path only needs
-/// `VK_EXT_filter_cubic` and does not require the QCOM pNext structure that is
-/// absent from ash 0.37.
-pub fn create_cubic_sampler(device: &ash::Device) -> vk::Sampler {
-    let sampler_ci = vk::SamplerCreateInfo::builder()
-        .mag_filter(vk::Filter::CUBIC_EXT)
-        .min_filter(vk::Filter::CUBIC_EXT)
+/// Rust counterpart of `VkCubicFilterWeightsQCOM`.
+///
+/// ash 0.37 predates `VK_QCOM_filter_cubic_weights`, so the extension enum and
+/// sampler pNext payload are declared locally with their Vulkan ABI values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum CubicFilterWeights {
+    CatmullRom = 0,
+    ZeroTangentCardinal = 1,
+    BSpline = 2,
+    MitchellNetravali = 3,
+}
+
+#[repr(C)]
+struct SamplerCubicWeightsCreateInfoQcom {
+    s_type: vk::StructureType,
+    p_next: *const std::ffi::c_void,
+    cubic_weights: CubicFilterWeights,
+}
+
+const SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM: vk::StructureType =
+    vk::StructureType::from_raw(1_000_519_000);
+
+/// Port of `CreateCubicSampler`.
+pub fn create_cubic_sampler(device: &Device, qcom_weights: CubicFilterWeights) -> vk::Sampler {
+    let filter = if device.is_ext_filter_cubic_supported() {
+        vk::Filter::CUBIC_EXT
+    } else {
+        vk::Filter::LINEAR
+    };
+    let mut sampler_ci = vk::SamplerCreateInfo::builder()
+        .mag_filter(filter)
+        .min_filter(filter)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
@@ -548,9 +574,18 @@ pub fn create_cubic_sampler(device: &ash::Device) -> vk::Sampler {
         .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
         .unnormalized_coordinates(false)
         .build();
+    let qcom_ci = SamplerCubicWeightsCreateInfoQcom {
+        s_type: SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM,
+        p_next: std::ptr::null(),
+        cubic_weights: qcom_weights,
+    };
+    if qcom_weights != CubicFilterWeights::CatmullRom {
+        sampler_ci.p_next = std::ptr::from_ref(&qcom_ci).cast();
+    }
 
     unsafe {
         device
+            .get_logical()
             .create_sampler(&sampler_ci, None)
             .expect("Failed to create cubic sampler")
     }
@@ -942,5 +977,51 @@ pub fn begin_render_pass(
         device.cmd_begin_render_pass(cmdbuf, &renderpass_bi, vk::SubpassContents::INLINE);
         device.cmd_set_viewport(cmdbuf, 0, &[viewport]);
         device.cmd_set_scissor(cmdbuf, 0, &[scissor]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CubicFilterWeights, SamplerCubicWeightsCreateInfoQcom,
+        SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM,
+    };
+
+    #[test]
+    fn qcom_cubic_weight_values_match_vulkan() {
+        assert_eq!(CubicFilterWeights::CatmullRom as i32, 0);
+        assert_eq!(CubicFilterWeights::ZeroTangentCardinal as i32, 1);
+        assert_eq!(CubicFilterWeights::BSpline as i32, 2);
+        assert_eq!(CubicFilterWeights::MitchellNetravali as i32, 3);
+        assert_eq!(
+            SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM.as_raw(),
+            1_000_519_000
+        );
+    }
+
+    #[test]
+    fn qcom_sampler_payload_matches_vulkan_c_layout() {
+        let pointer_offset = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<CubicFilterWeights>(), 4);
+        assert_eq!(
+            std::mem::align_of::<SamplerCubicWeightsCreateInfoQcom>(),
+            std::mem::align_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(SamplerCubicWeightsCreateInfoQcom, s_type),
+            0
+        );
+        assert_eq!(
+            std::mem::offset_of!(SamplerCubicWeightsCreateInfoQcom, p_next),
+            pointer_offset
+        );
+        assert_eq!(
+            std::mem::offset_of!(SamplerCubicWeightsCreateInfoQcom, cubic_weights),
+            pointer_offset + std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<SamplerCubicWeightsCreateInfoQcom>(),
+            pointer_offset * 3
+        );
     }
 }

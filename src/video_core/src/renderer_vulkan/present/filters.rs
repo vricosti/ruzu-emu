@@ -22,6 +22,8 @@ use crate::vulkan_common::vulkan_device::Device;
 use super::util;
 use super::window_adapt_pass::WindowAdaptPass;
 
+pub use super::util::CubicFilterWeights;
+
 // ---------------------------------------------------------------------------
 // Factory functions
 // ---------------------------------------------------------------------------
@@ -50,19 +52,13 @@ pub fn make_bilinear(device: &Device, frame_format: vk::Format) -> WindowAdaptPa
     WindowAdaptPass::new(device, frame_format, sampler, fragment_shader)
 }
 
-/// Rust counterpart of `VkCubicFilterWeightsQCOM`. ash 0.37 does not expose
-/// that QCOM enum or its sampler pNext structure, so only the extension-defined
-/// default Catmull-Rom weight can use the hardware sampler path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CubicFilterWeights {
-    CatmullRom,
-    ZeroTangentCardinal,
-    BSpline,
-    MitchellNetravali,
-}
-
-fn uses_hardware_cubic(filter_cubic_supported: bool, weights: CubicFilterWeights) -> bool {
-    filter_cubic_supported && weights == CubicFilterWeights::CatmullRom
+fn uses_hardware_cubic(
+    filter_cubic_supported: bool,
+    qcom_filter_cubic_weights_supported: bool,
+    weights: CubicFilterWeights,
+) -> bool {
+    filter_cubic_supported
+        && (qcom_filter_cubic_weights_supported || weights == CubicFilterWeights::CatmullRom)
 }
 
 /// Port of `MakeBicubic`.
@@ -72,8 +68,12 @@ pub fn make_bicubic(
     weights: CubicFilterWeights,
 ) -> WindowAdaptPass {
     let logical = device.get_logical();
-    if uses_hardware_cubic(device.is_ext_filter_cubic_supported(), weights) {
-        let sampler = util::create_cubic_sampler(logical);
+    if uses_hardware_cubic(
+        device.is_ext_filter_cubic_supported(),
+        device.is_qcom_filter_cubic_weights_supported(),
+        weights,
+    ) {
+        let sampler = util::create_cubic_sampler(device, weights);
         let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
             .expect("Failed to build vulkan_present.frag");
         return WindowAdaptPass::new(device, frame_format, sampler, fragment_shader);
@@ -187,17 +187,39 @@ mod tests {
     use super::{uses_hardware_cubic, CubicFilterWeights};
 
     #[test]
-    fn hardware_cubic_matches_upstream_without_qcom_weight_bindings() {
-        assert!(uses_hardware_cubic(true, CubicFilterWeights::CatmullRom));
-        assert!(!uses_hardware_cubic(false, CubicFilterWeights::CatmullRom));
+    fn hardware_cubic_matches_upstream_extension_selection() {
+        assert!(uses_hardware_cubic(
+            true,
+            false,
+            CubicFilterWeights::CatmullRom
+        ));
+        assert!(!uses_hardware_cubic(
+            false,
+            true,
+            CubicFilterWeights::CatmullRom
+        ));
         assert!(!uses_hardware_cubic(
             true,
+            false,
             CubicFilterWeights::ZeroTangentCardinal
         ));
-        assert!(!uses_hardware_cubic(true, CubicFilterWeights::BSpline));
         assert!(!uses_hardware_cubic(
             true,
+            false,
+            CubicFilterWeights::BSpline
+        ));
+        assert!(!uses_hardware_cubic(
+            true,
+            false,
             CubicFilterWeights::MitchellNetravali
         ));
+        for weights in [
+            CubicFilterWeights::CatmullRom,
+            CubicFilterWeights::ZeroTangentCardinal,
+            CubicFilterWeights::BSpline,
+            CubicFilterWeights::MitchellNetravali,
+        ] {
+            assert!(uses_hardware_cubic(true, true, weights));
+        }
     }
 }

@@ -12424,8 +12424,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Missing items
 
-- Eden's optional GPU-call logger hooks for render-pass begin/end and successful queue submission
-  are absent because Ruzu does not yet port the `video_core/gpu_logging` subsystem.
+- Resolved by the 2026-08-26 GPU-logging scheduler entry below: render-pass begin/end and successful
+  queue submissions now reach the ported logger.
 - Android performance-core placement remains part of the unported topology/ADPF prerequisite
   recorded in the `common/thread.rs` entry above. It is a no-op in Eden on Linux, Windows and macOS.
 
@@ -16361,3 +16361,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: `VkDeviceMemory` handle bits and `VkMemoryPropertyFlags` raw bits are forwarded without
   reinterpretation. A focused regression verifies the opaque handle conversion.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/scheduler.rs` GPU logging hooks vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
+
+### Intentional differences
+
+- The Rust scheduler formats Eden's render-pass diagnostic through a file-local mechanical helper
+  so its exact `renderArea=<w>x<h>, numImages=<n>` payload can be regression-tested.
+- Queue submission runs on Ruzu's Rust worker context rather than Eden's captured scheduler
+  closure; the successful-submit logger call remains under the same submission mutex and follows
+  the same master-semaphore call.
+
+### Unintentional differences (to fix)
+
+- None after restoring render-pass begin/end logging and successful `vkQueueSubmit` logging with
+  Eden's exact runtime guards, payloads, result code, and lifecycle ordering.
+
+### Missing items
+
+- None in the audited scheduler GPU-logging path. The separate Android worker-topology dependency
+  remains recorded in the earlier full scheduler audit.
+
+### Binary layout verification
+
+- N/A: scheduler diagnostics consume host-side Vulkan state and do not alter command or guest
+  payload layouts. A focused test verifies the exact render-pass log string.

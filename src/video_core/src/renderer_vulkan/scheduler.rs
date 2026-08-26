@@ -21,6 +21,7 @@ use super::master_semaphore::MasterSemaphore;
 use super::query_cache::{QueryRuntimeState, SamplesQueryState, TfbCounterState};
 use super::state_tracker::StateTracker;
 use super::texture_cache::RenderTargetFramebuffer;
+use crate::gpu_logging::{get_instance, is_active};
 use crate::texture_cache::types::NUM_RT;
 use crate::vulkan_common::vulkan_wrapper::PIPELINE_STAGE_GRAPHICS_COMPUTE;
 
@@ -28,6 +29,13 @@ pub(crate) type SubmitCallback = Arc<dyn Fn() + Send + Sync>;
 
 const COMMAND_CHUNK_CAPACITY: usize = 0x8000;
 const NO_COMMAND: usize = usize::MAX;
+
+fn render_pass_log_info(render_area: vk::Extent2D, num_images: usize) -> String {
+    format!(
+        "renderArea={}x{}, numImages={}",
+        render_area.width, render_area.height, num_images
+    )
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -552,6 +560,12 @@ impl WorkerContext {
             submit.wait_semaphore,
             submit.tick,
         );
+        if result == vk::Result::SUCCESS
+            && is_active()
+            && *common::settings::values().gpu_log_vulkan_calls.get_value()
+        {
+            get_instance().log_vulkan_call("vkQueueSubmit", "", vk::Result::SUCCESS.as_raw());
+        }
         drop(_submit_lock);
         if result == vk::Result::ERROR_DEVICE_LOST {
             self.report_device_fault();
@@ -891,6 +905,10 @@ impl Scheduler {
         self.state.renderpass = renderpass;
         self.state.framebuffer = framebuffer;
         self.state.render_area = render_area.extent;
+        if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+            get_instance()
+                .log_render_pass_begin(&render_pass_log_info(render_area.extent, num_images));
+        }
         self.record(move |cmdbuf| unsafe {
             let rp_begin = vk::RenderPassBeginInfo::builder()
                 .render_pass(renderpass)
@@ -926,6 +944,9 @@ impl Scheduler {
         // re-entering the query-cache owner through an aliased `&mut`.
         if let Some(state) = self.tfb_query_state.as_ref().cloned() {
             state.lock().close_counter(self);
+        }
+        if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+            get_instance().log_render_pass_end();
         }
         if let Some(state) = self.samples_query_state.as_ref().cloned() {
             state.lock().pause_counter(self);
@@ -1298,6 +1319,20 @@ mod tests {
         assert!(!state.rescaling_defined);
         assert!(!state.needs_state_enable_refresh);
         assert!(!state.descriptor_buffer_bound);
+    }
+
+    #[test]
+    fn render_pass_log_payload_matches_upstream() {
+        assert_eq!(
+            render_pass_log_info(
+                vk::Extent2D {
+                    width: 1280,
+                    height: 720,
+                },
+                3,
+            ),
+            "renderArea=1280x720, numImages=3"
+        );
     }
 
     #[test]

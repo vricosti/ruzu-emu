@@ -14833,3 +14833,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: `ImageBase`, `ImageMapView`, and alias vectors are process-local cache owners and are not
   copied to guest memory or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_info.rs` vs Eden `src/video_core/texture_cache/image_info.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents Eden's anonymous `block`/`pitch` union as `TilingMode`. Accessors expose zeros for
+  the inactive variant, matching the zero-initialized bytes used by every upstream constructor.
+- The file-local `fail_soft` helper implements Eden's `ASSERT`/`UNIMPLEMENTED` policy using the same
+  `use_debug_asserts` setting because Rust has no C++ assertion macro expansion.
+
+### Unintentional differences (to fix)
+
+- Resolved: invalid MSAA values now report the assertion and fall back to 1x, and unknown DMA byte
+  sizes return `PixelFormat::Invalid`, matching Eden instead of panicking unconditionally.
+- Resolved: TIC type/tiling checks and render-target/zeta dimension-control checks are fail-soft by
+  default. Invalid inputs continue through the same constructor branches as Eden.
+- Resolved: multisample width and height expansion now preserves unsigned C++ wrapping, and the
+  obsolete placeholder description for the already-ported `PixelFormat` owner was removed.
+
+### Missing items
+
+- None for the default, TIC, render-target, zeta, Fermi2D, or DMA constructors.
+
+### Binary layout verification
+
+- N/A: `ImageInfo` is a process-local descriptor and is not raw-serialized. Its Rust enum replacing
+  the anonymous union intentionally has a different host layout.

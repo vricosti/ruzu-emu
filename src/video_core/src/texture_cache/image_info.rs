@@ -11,10 +11,7 @@
 use super::types::*;
 use crate::surface::{self, SurfaceType};
 
-// ── PixelFormat placeholder ────────────────────────────────────────────
-// Upstream lives in video_core/surface.h.  Until that module is ported we
-// carry a minimal stand-in so the struct compiles.  Replace with the real
-// type once video_core::surface is available.
+// Upstream owns PixelFormat in video_core/surface.h.
 pub use super::format_lookup_table::PixelFormat;
 
 // ── Constants (from image_info.cpp) ────────────────────────────────────
@@ -27,12 +24,20 @@ fn force_pitch_flush(is_pitch_linear: bool) -> bool {
 }
 
 fn decode_msaa_mode(raw: u32, owner: &str) -> super::samples_helper::MsaaMode {
-    super::samples_helper::MsaaMode::from_raw(raw)
-        .unwrap_or_else(|| panic!("{owner}: invalid MSAA mode={raw}"))
+    match super::samples_helper::MsaaMode::from_raw(raw) {
+        Some(mode) => mode,
+        None => {
+            fail_soft(format!("{owner}: invalid MSAA mode={raw}"));
+            super::samples_helper::MsaaMode::Msaa1x1
+        }
+    }
 }
 
-fn stop_unimplemented_byte_size_to_format(bytes_per_pixel: u32) -> ! {
-    panic!("ByteSizeToFormat: unimplemented bpp={bytes_per_pixel}");
+fn fail_soft(message: String) {
+    log::error!("{message}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("{message}");
+    }
 }
 
 // ── ImageInfo ──────────────────────────────────────────────────────────
@@ -169,51 +174,45 @@ impl ImageInfo {
         info.tile_width_spacing = config.tile_width_spacing();
 
         // TextureType → ImageType + size.
-        let mut texture_type = TextureType::from_raw(config.texture_type()).unwrap_or_else(|| {
-            panic!(
-                "ImageInfo::from_tic_entry: invalid texture_type={}",
-                config.texture_type()
-            )
-        });
-        if texture_type != TextureType::Texture2D
-            && texture_type != TextureType::Texture2DNoMipmap
-            && config.is_pitch_linear()
+        let mut texture_type = TextureType::from_raw(config.texture_type());
+        if !matches!(
+            texture_type,
+            Some(TextureType::Texture2D | TextureType::Texture2DNoMipmap)
+        ) && config.is_pitch_linear()
         {
-            panic!(
+            fail_soft(format!(
                 "ImageInfo::from_tic_entry: non-2D pitch-linear TIC texture_type={}",
                 config.texture_type()
-            );
+            ));
         }
         if config.depth() > 1 || config.base_layer() != 0 {
-            texture_type = match texture_type {
+            texture_type = texture_type.map(|texture_type| match texture_type {
                 TextureType::Texture1D => TextureType::Texture1DArray,
                 TextureType::Texture2D => TextureType::Texture2DArray,
                 TextureType::TextureCubemap => TextureType::TextureCubeArray,
                 other => other,
-            };
+            });
         }
         match texture_type {
-            TextureType::Texture1D => {
-                assert_eq!(
-                    config.base_layer(),
-                    0,
-                    "ImageInfo::from_tic_entry: Texture1D base layer must be zero"
-                );
+            Some(TextureType::Texture1D) => {
+                if config.base_layer() != 0 {
+                    fail_soft(
+                        "ImageInfo::from_tic_entry: Texture1D base layer must be zero".into(),
+                    );
+                }
                 info.image_type = ImageType::E1D;
                 info.size.width = config.width();
                 info.resources.layers = 1;
             }
-            TextureType::Texture1DArray => {
+            Some(TextureType::Texture1DArray) => {
                 info.image_type = ImageType::E1D;
                 info.size.width = config.width();
                 info.resources.layers = (config.base_layer() + config.depth()) as i32;
             }
-            TextureType::Texture2D | TextureType::Texture2DNoMipmap => {
-                assert_eq!(
-                    config.depth(),
-                    1,
-                    "ImageInfo::from_tic_entry: Texture2D depth must be one"
-                );
+            Some(TextureType::Texture2D | TextureType::Texture2DNoMipmap) => {
+                if config.depth() != 1 {
+                    fail_soft("ImageInfo::from_tic_entry: Texture2D depth must be one".into());
+                }
                 info.image_type = if config.is_pitch_linear() {
                     ImageType::Linear
                 } else {
@@ -224,28 +223,27 @@ impl ImageInfo {
                 info.resources.layers = config.base_layer() as i32 + 1;
                 info.rescaleable = !config.is_pitch_linear();
             }
-            TextureType::Texture2DArray => {
+            Some(TextureType::Texture2DArray) => {
                 info.image_type = ImageType::E2D;
                 info.size.width = config.width();
                 info.size.height = config.height();
                 info.resources.layers = (config.base_layer() + config.depth()) as i32;
                 info.rescaleable = true;
             }
-            TextureType::TextureCubemap => {
-                assert_eq!(
-                    config.depth(),
-                    1,
-                    "ImageInfo::from_tic_entry: TextureCubemap depth must be one"
-                );
+            Some(TextureType::TextureCubemap) => {
+                if config.depth() != 1 {
+                    fail_soft("ImageInfo::from_tic_entry: TextureCubemap depth must be one".into());
+                }
                 info.image_type = ImageType::E2D;
                 info.size.width = config.width();
                 info.size.height = config.height();
                 info.resources.layers = config.base_layer() as i32 + 6;
             }
-            TextureType::TextureCubeArray => {
+            Some(TextureType::TextureCubeArray) => {
                 if config.load_store_hint() != 0 {
-                    panic!(
+                    fail_soft(
                         "ImageInfo::from_tic_entry: TextureCubeArray load_store_hint is not zero"
+                            .into(),
                     );
                 }
                 info.image_type = ImageType::E2D;
@@ -253,28 +251,38 @@ impl ImageInfo {
                 info.size.height = config.height();
                 info.resources.layers = (config.base_layer() + config.depth() * 6) as i32;
             }
-            TextureType::Texture3D => {
-                assert_eq!(
-                    config.base_layer(),
-                    0,
-                    "ImageInfo::from_tic_entry: Texture3D base layer must be zero"
-                );
+            Some(TextureType::Texture3D) => {
+                if config.base_layer() != 0 {
+                    fail_soft(
+                        "ImageInfo::from_tic_entry: Texture3D base layer must be zero".into(),
+                    );
+                }
                 info.image_type = ImageType::E3D;
                 info.size.width = config.width();
                 info.size.height = config.height();
                 info.size.depth = config.depth();
                 info.resources.layers = 1;
             }
-            TextureType::Texture1DBuffer => {
+            Some(TextureType::Texture1DBuffer) => {
                 info.image_type = ImageType::Buffer;
                 info.size.width = config.width();
                 info.resources.layers = 1;
             }
+            None => fail_soft(format!(
+                "ImageInfo::from_tic_entry: invalid texture_type={}",
+                config.texture_type()
+            )),
         }
 
         if info.num_samples > 1 {
-            info.size.width *= super::samples_helper::num_samples_x(msaa_mode) as u32;
-            info.size.height *= super::samples_helper::num_samples_y(msaa_mode) as u32;
+            info.size.width = info
+                .size
+                .width
+                .wrapping_mul(super::samples_helper::num_samples_x(msaa_mode) as u32);
+            info.size.height = info
+                .size
+                .height
+                .wrapping_mul(super::samples_helper::num_samples_y(msaa_mode) as u32);
         }
 
         if info.image_type != ImageType::Linear {
@@ -326,10 +334,12 @@ impl ImageInfo {
         };
 
         if is_pitch_linear {
-            assert!(
-                !dim_control_define_depth_size,
-                "ImageInfo::from_render_target_info: pitch-linear dim_control must define array size"
-            );
+            if dim_control_define_depth_size {
+                fail_soft(
+                    "ImageInfo::from_render_target_info: pitch-linear dim_control must define array size"
+                        .into(),
+                );
+            }
             let pitch = config.width;
             info.image_type = ImageType::Linear;
             info.tiling = TilingMode::PitchLinear(pitch);
@@ -394,10 +404,12 @@ impl ImageInfo {
         };
 
         if is_pitch_linear {
-            assert!(
-                !dim_control_define_depth_size,
-                "ImageInfo::from_zeta_info: pitch-linear dim_control must define array size"
-            );
+            if dim_control_define_depth_size {
+                fail_soft(
+                    "ImageInfo::from_zeta_info: pitch-linear dim_control must define array size"
+                        .into(),
+                );
+            }
             info.image_type = ImageType::Linear;
             info.tiling = TilingMode::PitchLinear(
                 config
@@ -414,10 +426,12 @@ impl ImageInfo {
         });
         if dim_control_define_depth_size {
             let array_size_is_one = ((config.depth >> 16) & 1) != 0;
-            assert!(
-                array_size_is_one,
-                "ImageInfo::from_zeta_info: 3D zeta size dim_control must be ArraySizeIsOne"
-            );
+            if !array_size_is_one {
+                fail_soft(
+                    "ImageInfo::from_zeta_info: 3D zeta size dim_control must be ArraySizeIsOne"
+                        .into(),
+                );
+            }
             info.image_type = ImageType::E3D;
             info.size.depth = config.depth & 0xFFFF;
         } else {
@@ -552,7 +566,12 @@ pub fn byte_size_to_format(bytes_per_pixel: u32) -> PixelFormat {
         4 => PixelFormat::A8B8G8R8Uint,
         8 => PixelFormat::R16G16B16A16Uint,
         16 => PixelFormat::R32G32B32A32Uint,
-        _ => stop_unimplemented_byte_size_to_format(bytes_per_pixel),
+        _ => {
+            fail_soft(format!(
+                "ByteSizeToFormat: unimplemented bpp={bytes_per_pixel}"
+            ));
+            PixelFormat::Invalid
+        }
     }
 }
 
@@ -699,8 +718,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ImageInfo::from_render_target_info: invalid MSAA mode=15")]
-    fn render_target_invalid_msaa_mode_is_fatal_like_upstream() {
+    fn render_target_invalid_msaa_mode_uses_upstream_fallback() {
         let render_target = RenderTargetInfo {
             address: 0x5000_0000,
             width: 1280,
@@ -712,12 +730,14 @@ mod tests {
             base_layer: 0,
         };
 
-        let _ = ImageInfo::from_render_target_info(&render_target, 15);
+        assert_eq!(
+            ImageInfo::from_render_target_info(&render_target, 15).num_samples,
+            1
+        );
     }
 
     #[test]
-    #[should_panic(expected = "ImageInfo::from_zeta_info: invalid MSAA mode=15")]
-    fn zeta_invalid_msaa_mode_is_fatal_like_upstream() {
+    fn zeta_invalid_msaa_mode_uses_upstream_fallback() {
         let zeta = ZetaInfo {
             enabled: true,
             address: 0x6000_0000,
@@ -729,12 +749,11 @@ mod tests {
             depth: 1,
         };
 
-        let _ = ImageInfo::from_zeta_info(&zeta, 15);
+        assert_eq!(ImageInfo::from_zeta_info(&zeta, 15).num_samples, 1);
     }
 
     #[test]
-    #[should_panic(expected = "pitch-linear dim_control must define array size")]
-    fn render_target_pitch_linear_depth_dim_control_is_fatal_like_upstream() {
+    fn render_target_pitch_linear_depth_dim_control_is_fail_soft_like_upstream() {
         let render_target = RenderTargetInfo {
             address: 0x5000_0000,
             width: 256,
@@ -746,12 +765,13 @@ mod tests {
             base_layer: 0,
         };
 
-        let _ = ImageInfo::from_render_target_info(&render_target, 0);
+        let info = ImageInfo::from_render_target_info(&render_target, 0);
+        assert_eq!(info.image_type, ImageType::Linear);
+        assert_eq!(info.pitch(), 256);
     }
 
     #[test]
-    #[should_panic(expected = "pitch-linear dim_control must define array size")]
-    fn zeta_pitch_linear_depth_dim_control_is_fatal_like_upstream() {
+    fn zeta_pitch_linear_depth_dim_control_is_fail_soft_like_upstream() {
         let zeta = ZetaInfo {
             enabled: true,
             address: 0x6000_0000,
@@ -763,12 +783,12 @@ mod tests {
             depth: 1,
         };
 
-        let _ = ImageInfo::from_zeta_info(&zeta, 0);
+        let info = ImageInfo::from_zeta_info(&zeta, 0);
+        assert_eq!(info.image_type, ImageType::Linear);
     }
 
     #[test]
-    #[should_panic(expected = "3D zeta size dim_control must be ArraySizeIsOne")]
-    fn zeta_3d_without_array_size_one_is_fatal_like_upstream() {
+    fn zeta_3d_without_array_size_one_is_fail_soft_like_upstream() {
         let zeta = ZetaInfo {
             enabled: true,
             address: 0x6000_0000,
@@ -780,7 +800,9 @@ mod tests {
             depth: 4,
         };
 
-        let _ = ImageInfo::from_zeta_info(&zeta, 0);
+        let info = ImageInfo::from_zeta_info(&zeta, 0);
+        assert_eq!(info.image_type, ImageType::E3D);
+        assert_eq!(info.size.depth, 4);
     }
 
     #[test]
@@ -884,11 +906,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid texture_type=15")]
-    fn tic_entry_invalid_texture_type_is_fatal_like_upstream() {
+    fn tic_entry_invalid_texture_type_is_fail_soft_like_upstream() {
         let tic = tic_for_validation(15, TicHeaderVersion::BlockLinear, 1, 0, 0);
 
-        let _ = ImageInfo::from_tic_entry(&tic);
+        let info = ImageInfo::from_tic_entry(&tic);
+        assert_eq!(info.image_type, ImageType::E1D);
+        assert_eq!(
+            info.size,
+            Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1
+            }
+        );
     }
 
     #[test]
@@ -912,8 +942,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid MSAA mode=15")]
-    fn tic_entry_invalid_msaa_mode_is_fatal_like_upstream() {
+    fn tic_entry_invalid_msaa_mode_uses_upstream_fallback() {
         let mut tic = tic_for_validation(
             TextureType::Texture2D as u32,
             TicHeaderVersion::BlockLinear,
@@ -923,12 +952,11 @@ mod tests {
         );
         tic.raw[3] = (15u64) << 40;
 
-        let _ = ImageInfo::from_tic_entry(&tic);
+        assert_eq!(ImageInfo::from_tic_entry(&tic).num_samples, 1);
     }
 
     #[test]
-    #[should_panic(expected = "non-2D pitch-linear TIC")]
-    fn tic_entry_non_2d_pitch_linear_is_fatal_like_upstream() {
+    fn tic_entry_non_2d_pitch_linear_is_fail_soft_like_upstream() {
         let tic = tic_for_validation(
             TextureType::Texture3D as u32,
             TicHeaderVersion::Pitch,
@@ -937,11 +965,11 @@ mod tests {
             0,
         );
 
-        let _ = ImageInfo::from_tic_entry(&tic);
+        assert_eq!(ImageInfo::from_tic_entry(&tic).image_type, ImageType::E3D);
     }
 
     #[test]
-    fn tic_entry_type_validation_guards_are_fatal_like_upstream() {
+    fn tic_entry_type_validation_guards_are_fail_soft_like_upstream() {
         let cases = [
             (
                 TextureType::TextureCubeArray as u32,
@@ -959,7 +987,7 @@ mod tests {
             ),
         ];
 
-        for (texture_type, depth, base_layer, load_store_hint, expected) in cases {
+        for (texture_type, depth, base_layer, load_store_hint, _expected) in cases {
             let tic = tic_for_validation(
                 texture_type,
                 TicHeaderVersion::BlockLinear,
@@ -967,17 +995,7 @@ mod tests {
                 base_layer,
                 load_store_hint,
             );
-            let panic =
-                std::panic::catch_unwind(|| ImageInfo::from_tic_entry(&tic)).expect_err(expected);
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("<non-string panic>");
-            assert!(
-                message.contains(expected),
-                "expected panic containing `{expected}`, got `{message}`"
-            );
+            let _ = ImageInfo::from_tic_entry(&tic);
         }
     }
 
@@ -1107,8 +1125,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ByteSizeToFormat: unimplemented bpp=3")]
-    fn byte_size_to_format_unknown_bpp_is_fatal_like_upstream() {
-        let _ = byte_size_to_format(3);
+    fn byte_size_to_format_unknown_bpp_uses_upstream_fallback() {
+        assert_eq!(byte_size_to_format(3), PixelFormat::Invalid);
     }
 }

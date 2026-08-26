@@ -16894,3 +16894,50 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this module embeds text sources and defines no binary payload. The generated SPIR-V owner
   has its own magic-word coverage; a focused test pins the complete ten-source registry here.
+
+## 2026-08-26 — `src/video_core/src/host1x/vic.rs` vs Eden `src/video_core/host1x/vic.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the frame queue and GMMU manager through `Arc` handles instead of inheriting
+  `CDmaPusher` and retaining `Host1x&`; the same queue lookup, memory operations, close-on-drop,
+  and method-index semantics remain in the VIC owner.
+- Rust executes Eden's scalar conversion paths on every host rather than duplicating its optional
+  SSE4.1 branches. VIC's valid intermediate components are ten-bit values, for which the scalar
+  and SIMD paths produce identical pixels; this avoids architecture-specific unsafe intrinsics.
+- FFmpeg plane pointers are exposed as checked Rust slices, invalid register indices are ignored,
+  and malformed rectangle ranges are skipped instead of reproducing C++ out-of-bounds access.
+  Valid frame and method inputs retain Eden's arithmetic and ordering.
+- The two simultaneous YUV `GpuGuestMemoryScoped<SafeWrite>` destinations use independently owned
+  Rust fallback storage because one mutable scratch buffer cannot safely back both live objects.
+  Direct-span access, reverse destruction/writeback order, and safe GPU invalidation match Eden;
+  the single-destination ABGR paths use Eden's corresponding swizzle or luma scratch backup.
+- The unused C++ surface-offset spans are omitted from the private read-method signatures; Eden
+  does not read them in any progressive or interlaced path.
+
+### Unintentional differences (to fix)
+
+- None after replacing the five `Vec` workspaces with Eden's `ScratchBuffer` owner and exact
+  `resize` versus `resize_destructive` choices.
+- None after removing the non-upstream per-frame timing trace and the Rust-only
+  `write_single_plane`/`write_plane_pair` helper boundaries.
+- None after restoring fail-soft behavior for unsupported formats, fatal behavior for impossible
+  block kinds, the original output-format argument, and Eden's interlaced chroma-height bound.
+- None after restoring `Vic::Method` to Eden's byte-offset values, performing the same word-index
+  multiplication at dispatch, and naming every register range exposed by `VicRegisters`.
+- None after restoring the final odd-width YUV iteration and passing one-byte elements—not
+  two-byte chroma texels—to the block-linear chroma swizzle, exactly as Eden does.
+- None after restoring Eden's scoped safe-write guest-memory paths, including direct-span writes
+  and preservation of untouched pitch padding; YUV pitch retains the explicit luma-then-chroma
+  overwrite order used for overlapping guest mappings.
+
+### Missing items
+
+- None in the audited VIC registers/configuration structures, execution flow, progressive and
+  interlaced reads, blend/color conversion, pitch output, or block-linear output.
+
+### Binary layout verification
+
+- PASS: compile-time checks cover every raw VIC structure size; focused tests additionally pin
+  `Pixel`, all `ConfigStruct` member offsets, and the byte offsets of the used VIC registers. A
+  block-linear YUV regression test verifies Eden's one-byte chroma swizzle element contract.

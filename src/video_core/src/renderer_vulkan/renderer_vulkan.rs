@@ -419,8 +419,7 @@ impl RendererVulkan {
             .get_value()
             && device.should_boost_clocks()
         {
-            let turbo_mode =
-                TurboMode::new(&instance.entry, &instance.instance, device.get_physical())?;
+            let turbo_mode = TurboMode::new(&instance)?;
             scheduler.register_on_submit(Some(turbo_mode.submit_callback()));
             Some(turbo_mode)
         } else {

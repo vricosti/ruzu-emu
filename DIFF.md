@@ -184,10 +184,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- `TurboMode` moves a separately owned `TurboResources` bundle into its worker thread and exposes
-  an `Arc` callback to `Scheduler`; upstream captures the containing object from a `std::jthread`.
-  The device, workload, 100 ms idle predicate, queue-submit notification, and destruction ordering
-  are unchanged.
+- `TurboMode` keeps its dedicated device and allocator in a separately owned `TurboResources`
+  bundle and exposes an `Arc` callback to `Scheduler`; upstream stores those two owners directly
+  in `TurboMode` and captures the containing object from a `std::jthread`. The remaining workload
+  resources are initialized by the worker, matching upstream; see the 2026-08-26 follow-up below.
 - `TextureCacheRuntime` receives `cant_blit_msaa` during construction instead of retaining the full
   Vulkan `Device` wrapper. It uses the same predicate as upstream `Image::NeedsScaleHelper` and the
   same color or combined depth/stencil helper blits.
@@ -16730,3 +16730,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests pin the 4-byte `StreamOutLayout` register representation and its four byte
   fields, the 12-byte `TransformFeedbackLayout` field order, the 560-byte
   `TransformFeedbackState`, and the fixed 256-entry runtime varying extent.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/turbo_mode.rs` and `renderer_vulkan.rs` vs Eden `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}` and `renderer_vulkan.cpp`
+
+### Intentional differences
+
+- Rust represents `std::jthread` stop-token ownership with an `AtomicBool`, condition-variable
+  notification, and an explicit join in `Drop`. The scheduler callback retains only the shared
+  notification state instead of capturing `this`, avoiding a dangling Rust reference while
+  preserving Eden's submission timestamp update.
+- Fallible Vulkan setup or dispatch in the worker is logged and ends that worker. Eden's Vulkan
+  wrappers throw from `Run`; an uncaught C++ worker exception would terminate the process. This is
+  the Rust `Result` error-propagation adaptation rather than a workload-order change.
+- Android calls the same external `adrenotools_set_turbo` C ABI through a conditional Rust link
+  declaration instead of including the C header.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's constructor boundary: the dedicated device and allocator are made
+  before spawning, while the buffer, descriptors, shader, pipeline, fence, command pool, and
+  command buffer are initialized inside the worker's `run` method.
+- None after using the shared `create_device` owner and its configured physical-device selection,
+  removing the extra explicit command-buffer reset and device-idle wait, and restoring the reverse
+  declaration destruction order for the descriptor layout and pool.
+- None after porting the Android/AArch64 enable-on-work and disable-on-exit calls; Android on other
+  architectures retains Eden's wait loop without creating the desktop Vulkan workload.
+
+### Missing items
+
+- None in the audited constructor, queue notification, worker workload, idle predicate, Android
+  switch, stop request, or resource lifecycle.
+
+### Binary layout verification
+
+- N/A: this slice owns host synchronization state and Vulkan handles; it defines no guest-visible
+  or raw-serialized payload.

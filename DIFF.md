@@ -15863,3 +15863,45 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: Vulkan fences and scheduler synchronization handles are host-only owners and are not raw
   guest payloads.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/samples_helper.rs` and `image_info.rs` vs Eden `src/video_core/texture_cache/samples_helper.h` and `image_info.cpp`
+
+### Intentional differences
+
+- Invalid raw MSAA values follow Ruzu's existing fail-soft assertion policy before selecting
+  `Msaa1x1`; valid modes are passed to the helpers without conversion.
+
+### Unintentional differences (to fix)
+
+- Resolved: `samples_helper.rs` no longer owns a duplicate `MsaaMode` enum left from the early
+  texture-port scaffold. It consumes `textures::texture::MsaaMode`, matching Eden's include and
+  type ownership, and `image_info.rs` decodes directly to that canonical type.
+
+### Missing items
+
+- None in sample-count or sample-dimension conversion.
+
+### Binary layout verification
+
+- PASS: the canonical `MsaaMode` remains `repr(u32)` with every Eden discriminant unchanged;
+  focused tests exercise all eleven valid modes through all three sample helpers.
+
+## 2026-08-26 — `src/video_core/src/lib.rs` module tree vs Eden `src/video_core`
+
+### Intentional differences
+
+- Rust uses `lib.rs` module declarations in place of C++ build-system source lists.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the unused root `swapchain.rs` phase-one stub and its module declaration. Eden
+  has no root `video_core/swapchain.*`; the implemented swapchain remains owned by
+  `renderer_vulkan/swapchain.rs`.
+
+### Missing items
+
+- None introduced by removing the unreachable scaffold.
+
+### Binary layout verification
+
+- N/A: the removed type was unused host-only placeholder state.

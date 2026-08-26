@@ -10,6 +10,7 @@
 
 use super::types::*;
 use crate::surface::{self, SurfaceType};
+use crate::textures::texture::MsaaMode;
 
 // Upstream owns PixelFormat in video_core/surface.h.
 pub use super::format_lookup_table::PixelFormat;
@@ -23,12 +24,12 @@ fn force_pitch_flush(is_pitch_linear: bool) -> bool {
     is_pitch_linear && !*common::settings::values().use_reactive_flushing.get_value()
 }
 
-fn decode_msaa_mode(raw: u32, owner: &str) -> super::samples_helper::MsaaMode {
-    match super::samples_helper::MsaaMode::from_raw(raw) {
+fn decode_msaa_mode(raw: u32, owner: &str) -> MsaaMode {
+    match MsaaMode::from_raw(raw) {
         Some(mode) => mode,
         None => {
             fail_soft(format!("{owner}: invalid MSAA mode={raw}"));
-            super::samples_helper::MsaaMode::Msaa1x1
+            MsaaMode::Msaa1x1
         }
     }
 }

@@ -1277,6 +1277,23 @@ fn test_call_multi_method_launch_executes_immediately() {
 }
 
 #[test]
+fn test_call_multi_method_honors_amount() {
+    let mut eng = new_test_engine();
+    let method = 0x100;
+
+    eng.call_multi_method(method, &[0x1111_1111, 0x2222_2222], 1, 2);
+
+    assert_eq!(eng.regs[method as usize], 0x1111_1111);
+}
+
+#[test]
+#[should_panic(expected = "MaxwellDMA launch interrupt type must be NONE")]
+fn test_launch_rejects_interrupt_requests() {
+    let mut eng = new_test_engine();
+    eng.call_method(LAUNCH_DMA, 1 << LAUNCH_INTERRUPT_TYPE_SHIFT, true);
+}
+
+#[test]
 fn test_dma_blocklinear_invalid_depth_reports_and_continues_like_upstream() {
     let mut eng = new_test_engine();
 

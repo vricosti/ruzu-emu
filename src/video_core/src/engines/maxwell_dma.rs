@@ -154,6 +154,9 @@ const LAUNCH_SEMAPHORE_TYPE_MASK: u32 = 0x3;
 const LAUNCH_SEMAPHORE_TYPE_NONE: u32 = 0;
 const LAUNCH_SEMAPHORE_TYPE_RELEASE_ONE_WORD: u32 = 1;
 const LAUNCH_SEMAPHORE_TYPE_RELEASE_FOUR_WORD: u32 = 2;
+const LAUNCH_INTERRUPT_TYPE_SHIFT: u32 = 5;
+const LAUNCH_INTERRUPT_TYPE_MASK: u32 = 0x3;
+const LAUNCH_INTERRUPT_TYPE_NONE: u32 = 0;
 const LAUNCH_SRC_MEMORY_LAYOUT_PITCH: u32 = 1 << 7;
 const LAUNCH_DST_MEMORY_LAYOUT_PITCH: u32 = 1 << 8;
 const LAUNCH_MULTI_LINE_ENABLE: u32 = 1 << 9;
@@ -212,11 +215,20 @@ impl MaxwellDMA {
         &mut self,
         method: u32,
         args: &[u32],
-        _amount: u32,
-        _methods_pending: u32,
+        amount: u32,
+        methods_pending: u32,
     ) {
-        for &arg in args {
-            self.call_method(method, arg, false);
+        assert!(
+            args.len() >= amount as usize,
+            "MaxwellDMA::call_multi_method needs {amount} arguments, got {}",
+            args.len()
+        );
+        for i in 0..amount {
+            self.call_method(
+                method,
+                args[i as usize],
+                methods_pending.wrapping_sub(i) <= 1,
+            );
         }
     }
 
@@ -281,6 +293,10 @@ impl MaxwellDMA {
 
     fn launch_semaphore_type(&self) -> u32 {
         (self.launch_dma() >> LAUNCH_SEMAPHORE_TYPE_SHIFT) & LAUNCH_SEMAPHORE_TYPE_MASK
+    }
+
+    fn launch_interrupt_type(&self) -> u32 {
+        (self.launch_dma() >> LAUNCH_INTERRUPT_TYPE_SHIFT) & LAUNCH_INTERRUPT_TYPE_MASK
     }
 
     fn launch_multi_line_enable(&self) -> bool {
@@ -806,6 +822,11 @@ impl MaxwellDMA {
     }
 
     fn launch_immediate(&mut self) {
+        assert_eq!(
+            self.launch_interrupt_type(),
+            LAUNCH_INTERRUPT_TYPE_NONE,
+            "MaxwellDMA launch interrupt type must be NONE"
+        );
         if self.execute_multi_line_pitch_to_pitch() {
             return;
         }

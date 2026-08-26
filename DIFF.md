@@ -15311,3 +15311,30 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS: focused tests verify every opcode/method-address field and the native `u32` dump payload.
   `JitState` remains 56 bytes on x86-64 with the two pointer slots, eight registers, and carry flag
   at the same offsets as Eden; only the meaning of the second pointer is the documented adaptation.
+
+## 2026-08-26 — `src/video_core/src/engines/maxwell_dma.rs` vs Eden `src/video_core/engines/maxwell_dma.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents the register union as a zero-initialized 0x800-word array plus typed accessors.
+  DMA fallback writes are collected as `PendingWrite` values because the Rust engine boundary does
+  not expose Eden's scoped guest-memory guards; destination data is read first where the upstream
+  cached-write guard preserves bytes outside the copied subrectangle.
+
+### Unintentional differences (to fix)
+
+- Resolved: `call_multi_method` now consumes exactly `amount` words and derives `is_last_call` from
+  the wrapping unsigned `methods_pending - i <= 1` expression used by Eden.
+- Resolved: launching DMA now rejects non-`NONE` interrupt types before selecting or executing a
+  copy path, matching the assertion at the head of Eden's `Launch`.
+
+### Missing items
+
+- None in the launch dispatch, pitch/block-linear copy algorithms, accelerated paths, semaphore
+  release, method sink handling, or register decoding exercised by this engine.
+
+### Binary layout verification
+
+- PASS: the register storage is exactly 0x800 `u32` words; every typed register base used by the
+  implementation is derived from the byte offset asserted in Eden's `Regs` definition. Rust does
+  not serialize a host `MaxwellDMA` object or expose its object layout to guest memory.

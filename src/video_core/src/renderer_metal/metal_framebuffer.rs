@@ -401,7 +401,7 @@ mod tests {
             SlotId { index: 1 },
             0x1000,
         ));
-        let view = MetalImageView::new(NonNull::from(base.as_mut()), &image).unwrap();
+        let view = MetalImageView::new(NonNull::from(base.as_mut()), &view_info, &image).unwrap();
         let mut colors = [None; NUM_RT];
         colors[2] = Some(&view);
         let framebuffer = MetalFramebuffer::new(
@@ -454,7 +454,7 @@ mod tests {
             SlotId { index: 2 },
             0x2000,
         ));
-        let view = MetalImageView::new(NonNull::from(base.as_mut()), &image).unwrap();
+        let view = MetalImageView::new(NonNull::from(base.as_mut()), &view_info, &image).unwrap();
         let framebuffer = MetalFramebuffer::new(
             [None; NUM_RT],
             Some(&view),

@@ -739,7 +739,6 @@ fn run_boot(
                         // `Gpu` drops the renderer before its shader notifier.
                         unsafe { gpu.shader_notify_handle() },
                         &window_info,
-                        drawable_size,
                         Arc::clone(&shown_state),
                         Arc::clone(&framebuffer_layout),
                         frame_displayed_notify,

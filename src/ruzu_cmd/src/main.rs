@@ -1206,7 +1206,6 @@ fn main() {
                             // `Gpu` drops the renderer before its shader notifier.
                             unsafe { gpu.shader_notify_handle() },
                             window_info,
-                            *drawable_size,
                             Arc::clone(shown_state),
                             Arc::clone(framebuffer_layout),
                             frame_displayed_notify,
@@ -1217,7 +1216,7 @@ fn main() {
                         .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
                     )
                 }
-                "metal" => {
+                common::settings_enums::RendererBackend::Metal => {
                     #[cfg(target_os = "macos")]
                     {
                         let Some((window_info, _, shown_state, framebuffer_layout)) =

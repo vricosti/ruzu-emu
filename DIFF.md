@@ -18319,7 +18319,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: frontend strings only. The two focused `running_title_*` regressions pass, and a real
   Windows Release launch logged and displayed `Luigi's Mansion 3 (64-bit) | 1.4.0`.
-
 ## 2026-08-30 — `src/audio_core/src/sink/sink_stream.rs` vs Eden `src/audio_core/sink/sink_stream.{h,cpp}`
 
 ### Intentional differences
@@ -19085,3 +19084,53 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: the ARM64 state layout is unchanged; only accessors and `Deref` views were added. Existing
   ARM64 layout assertions still cover offsets and total size.
+- N/A: this changes host-side synchronization only and does not alter guest-visible audio payloads.
+## 2026-08-27 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs` vs Eden/Dynarmic A64 host backends
+
+### Intentional differences
+
+- Rust uses a private `A64JitStateHostAccess` trait to expose the state fields needed by the
+  architecture-neutral core diagnostics. The implementation selects Dynarmic's native Arm64 or
+  x64 state type at compile time; it does not merge or reinterpret their distinct layouts.
+- The x64 alternate signal-stack registration remains confined to x64 hosts. Dynarmic's Arm64
+  backend does not own the x64 exception-handler module.
+
+### Unintentional differences (to fix)
+
+- None. The previous unconditional dependency on the x64 backend has been removed from the
+  Apple-Silicon build.
+
+### Missing items
+
+- None in the host-specific A64 context snapshot and signal-stack integration exercised here.
+
+### Binary layout verification
+
+- PASS: the core now consumes each backend's native `A64JitState`; the context snapshot regression
+  test passes against the active Arm64 layout without casting through the x64 state type.
+
+## 2026-08-27 — `src/video_core/src/renderer_metal` vs Eden video-core cache contracts
+
+### Intentional differences
+
+- Eden has no native Metal renderer. The Metal implementation remains a ruzu-owned backend while
+  implementing the same common buffer-cache, texture-cache, and rasterizer contracts as Eden's
+  OpenGL and Vulkan backends.
+- Metal stores a pending vertex binding for later encoder application rather than recording a
+  Vulkan command or issuing an immediate OpenGL bind.
+
+### Unintentional differences (to fix)
+
+- None in this build-integration slice. Image-view creation now receives the common
+  `ImageViewInfo`, vertex binding implements the current common runtime interface, and all legacy
+  primitive topologies map to the matching Metal topology class.
+
+### Missing items
+
+- The broader direct-MSL backend parity work remains tracked by its owning implementation slices;
+  this entry only covers adaptation to the current Eden-derived video-core interfaces.
+
+### Binary layout verification
+
+- N/A: these changes alter host-side API ownership and Metal state only; no guest payload or disk
+  cache representation changes.

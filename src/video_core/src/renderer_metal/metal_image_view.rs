@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::surface::{get_format_type, PixelFormat, SurfaceType};
 use crate::texture_cache::image_view_base::ImageViewBase;
-use crate::texture_cache::image_view_info::SwizzleSource;
+use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
 use crate::texture_cache::types::ImageViewType;
 
 use super::metal_format::surface_format;
@@ -49,6 +49,7 @@ pub struct MetalImageView {
 impl MetalImageView {
     pub fn new(
         base: NonNull<ImageViewBase>,
+        info: &ImageViewInfo,
         image: &MetalImage,
     ) -> Result<Self, MetalImageViewError> {
         let view = unsafe { base.as_ref() };
@@ -58,17 +59,18 @@ impl MetalImageView {
         let render_format = surface_format(view.format)
             .ok_or(MetalImageViewError::UnsupportedFormat(view.format))?
             .pixel_format;
-        let aspect = image_view_aspect(view);
+        let aspect = image_view_aspect(view, info);
         let format = aspect_format(view.format, aspect, render_format);
         let levels = ns_range(view.range.base.level, view.range.extent.levels);
         let slices = ns_range(view.range.base.layer, view.range.extent.layers);
-        let mut sampled_swizzle = if view.is_render_target() {
+        let swizzle = [info.x_source, info.y_source, info.z_source, info.w_source];
+        let mut sampled_swizzle = if info.is_render_target() {
             identity_swizzle()
         } else {
-            swizzle_channels(view.swizzle)
+            swizzle_channels(swizzle)
         };
-        if aspect != MetalImageAspect::Color && !view.is_render_target() {
-            let mut sources = view.swizzle;
+        if aspect != MetalImageAspect::Color && !info.is_render_target() {
+            let mut sources = swizzle;
             sources.iter_mut().for_each(|source| {
                 if *source == SwizzleSource::G as u8 {
                     *source = SwizzleSource::R as u8;
@@ -147,7 +149,7 @@ impl MetalImageView {
             ImageViewType::Buffer => return Err(MetalImageViewError::BufferViewRequiresBuffer),
         };
 
-        let render_target = if view.is_render_target() && render_format != format {
+        let render_target = if info.is_render_target() && render_format != format {
             let source = if image.image_type() == crate::texture_cache::types::ImageType::E3D
                 && sampled_render_target.textureType() != MTLTextureType::Type3D
             {
@@ -266,8 +268,8 @@ enum MetalImageAspect {
     DepthStencil,
 }
 
-fn image_view_aspect(view: &ImageViewBase) -> MetalImageAspect {
-    if view.is_render_target() {
+fn image_view_aspect(view: &ImageViewBase, info: &ImageViewInfo) -> MetalImageAspect {
+    if info.is_render_target() {
         return match get_format_type(view.format) {
             SurfaceType::Depth => MetalImageAspect::Depth,
             SurfaceType::Stencil => MetalImageAspect::Stencil,
@@ -275,8 +277,7 @@ fn image_view_aspect(view: &ImageViewBase) -> MetalImageAspect {
             _ => MetalImageAspect::Color,
         };
     }
-    let any_r = view
-        .swizzle
+    let any_r = [info.x_source, info.y_source, info.z_source, info.w_source]
         .iter()
         .any(|source| *source == SwizzleSource::R as u8);
     match view.format {
@@ -433,7 +434,7 @@ mod tests {
             SlotId { index: 1 },
             0x1000,
         ));
-        let view = MetalImageView::new(NonNull::from(base.as_mut()), &image).unwrap();
+        let view = MetalImageView::new(NonNull::from(base.as_mut()), &view_info, &image).unwrap();
         assert!(view.handle(TextureType::Color2D).is_some());
         assert!(view.handle(TextureType::ColorArray2D).is_some());
         assert_eq!(
@@ -468,7 +469,7 @@ mod tests {
             SlotId { index: 1 },
             0x1000,
         ));
-        let view = MetalImageView::new(NonNull::from(base.as_mut()), &image).unwrap();
+        let view = MetalImageView::new(NonNull::from(base.as_mut()), &view_info, &image).unwrap();
         assert_eq!(
             view.depth_view().unwrap().pixelFormat(),
             MTLPixelFormat::Depth32Float_Stencil8

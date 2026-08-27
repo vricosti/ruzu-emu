@@ -144,7 +144,7 @@ impl RendererBase for RendererMetal {
     }
 
     fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
-        vec![0; crate::capture::tiled_size() as usize]
+        vec![0; crate::capture::TILED_SIZE as usize]
     }
 
     fn read_rasterizer(&self) -> *mut dyn RasterizerInterface {

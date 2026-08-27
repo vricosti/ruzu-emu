@@ -17,6 +17,7 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::PixelFormat;
 use crate::texture_cache::image_base::ImageBase;
 use crate::texture_cache::image_view_base::ImageViewBase;
+use crate::texture_cache::image_view_info::ImageViewInfo;
 use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::{
     DescriptorSyncRegs, ImageViewInOut, TextureCacheBase as CommonTextureCache, TextureCacheParams,
@@ -411,6 +412,7 @@ impl TextureCacheParams for MetalTextureCacheParams {
     fn create_image_view(
         _runtime: Option<&mut Self::Runtime>,
         view_id: ImageViewId,
+        info: &ImageViewInfo,
         base: NonNull<ImageViewBase>,
         image: Option<&Self::Image>,
     ) -> Self::ImageView {
@@ -423,6 +425,7 @@ impl TextureCacheParams for MetalTextureCacheParams {
         MetalCachedImageView::Image(
             MetalImageView::new(
                 base,
+                info,
                 image.expect("non-buffer Metal image view requires its parent image"),
             )
             .unwrap_or_else(|error| panic!("Metal image-view construction failed: {error}")),

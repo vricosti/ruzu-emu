@@ -664,6 +664,25 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         });
     }
 
+    fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        let Some(binding) = self.vertex_bindings.get_mut(index as usize) else {
+            return;
+        };
+        *binding = Some(MetalVertexBinding {
+            buffer: buffer.handle(),
+            offset: offset as usize,
+            size: size as usize,
+            stride: stride as usize,
+        });
+    }
+
     fn bind_vertex_buffers(&mut self, bindings: &HostBindings, buffers: &mut SlotVector<Buffer>) {
         for (slot, buffer_id) in bindings.buffer_ids.iter().enumerate() {
             let target = bindings.min_index as usize + slot;

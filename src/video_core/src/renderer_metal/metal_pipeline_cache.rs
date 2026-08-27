@@ -34,7 +34,7 @@ use shader_recompiler::{backend::bindings::Bindings, RuntimeInfo};
 use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::{
-    ComputeUniformBufferSizes, UniformBufferSizes, NUM_STAGES,
+    ComputeUniformBufferSizes, UniformBufferSizes, NUM_GRAPHICS_UNIFORM_BUFFERS, NUM_STAGES,
 };
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::{
@@ -46,7 +46,7 @@ use crate::rasterizer_interface::{
 };
 use crate::renderer_vulkan::fixed_pipeline_state::DynamicFeatures;
 use crate::renderer_vulkan::fixed_pipeline_state::FixedPipelineState;
-use crate::renderer_vulkan::graphics_pipeline::{buffer_cache_metadata, GraphicsPipelineKey};
+use crate::renderer_vulkan::graphics_pipeline::GraphicsPipelineKey;
 use crate::renderer_vulkan::pipeline_cache::{
     translate_graphics_stages_from_environments_with_features, RuntimeInfoDeviceFeatures,
     TranslatedGraphicsShader, NUM_GRAPHICS_STAGES,
@@ -72,6 +72,19 @@ const SPIRV_1_5: u32 = 0x0001_0500;
 const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
 const METAL_MAX_USER_CLIP_DISTANCES: u32 = 8;
 const CACHE_VERSION: u32 = 1;
+
+fn buffer_cache_metadata(
+    stage_infos: &[ShaderInfo; NUM_GRAPHICS_STAGES],
+) -> ([u32; NUM_STAGES as usize], UniformBufferSizes) {
+    let mut masks = [0u32; NUM_STAGES as usize];
+    let mut sizes = [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
+    for stage in 0..NUM_STAGES as usize {
+        let info = &stage_infos[stage];
+        masks[stage] = info.constant_buffer_mask;
+        sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
+    }
+    (masks, sizes)
+}
 
 #[cfg(feature = "metal-spirv-validation")]
 fn validate_direct_msl_enabled() -> bool {
@@ -1604,11 +1617,18 @@ fn metal_blend_factor(factor: BlendFactor) -> MTLBlendFactor {
 fn metal_topology_class(topology: PrimitiveTopology) -> MTLPrimitiveTopologyClass {
     match topology {
         PrimitiveTopology::Points | PrimitiveTopology::Patches => MTLPrimitiveTopologyClass::Point,
+        PrimitiveTopology::LegacyPoints => MTLPrimitiveTopologyClass::Point,
         PrimitiveTopology::Lines
         | PrimitiveTopology::LineLoop
         | PrimitiveTopology::LineStrip
         | PrimitiveTopology::LinesAdjacency
-        | PrimitiveTopology::LineStripAdjacency => MTLPrimitiveTopologyClass::Line,
+        | PrimitiveTopology::LineStripAdjacency
+        | PrimitiveTopology::LegacyIndexedLines
+        | PrimitiveTopology::LegacyLines
+        | PrimitiveTopology::LegacyLineStrip
+        | PrimitiveTopology::LegacyIndexedLineStrip
+        | PrimitiveTopology::LegacyLinesImm
+        | PrimitiveTopology::LegacyIndexedLines2 => MTLPrimitiveTopologyClass::Line,
         PrimitiveTopology::Triangles
         | PrimitiveTopology::TriangleStrip
         | PrimitiveTopology::TriangleFan
@@ -1616,7 +1636,15 @@ fn metal_topology_class(topology: PrimitiveTopology) -> MTLPrimitiveTopologyClas
         | PrimitiveTopology::QuadStrip
         | PrimitiveTopology::Polygon
         | PrimitiveTopology::TrianglesAdjacency
-        | PrimitiveTopology::TriangleStripAdjacency => MTLPrimitiveTopologyClass::Triangle,
+        | PrimitiveTopology::TriangleStripAdjacency
+        | PrimitiveTopology::LegacyIndexedTriangles
+        | PrimitiveTopology::LegacyTriangles
+        | PrimitiveTopology::LegacyTriangleStrip
+        | PrimitiveTopology::LegacyIndexedTriangleStrip
+        | PrimitiveTopology::LegacyTriangleFan
+        | PrimitiveTopology::LegacyIndexedTriangleFan
+        | PrimitiveTopology::LegacyTriangleFanImm
+        | PrimitiveTopology::LegacyIndexedTriangles2 => MTLPrimitiveTopologyClass::Triangle,
     }
 }
 
@@ -1989,6 +2017,18 @@ mod tests {
         assert_eq!(
             metal_topology_class(PrimitiveTopology::Patches),
             MTLPrimitiveTopologyClass::Point
+        );
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::LegacyPoints),
+            MTLPrimitiveTopologyClass::Point
+        );
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::LegacyIndexedLineStrip),
+            MTLPrimitiveTopologyClass::Line
+        );
+        assert_eq!(
+            metal_topology_class(PrimitiveTopology::LegacyIndexedTriangles2),
+            MTLPrimitiveTopologyClass::Triangle
         );
     }
 

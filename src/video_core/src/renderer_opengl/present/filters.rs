@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/present/filters.h and filters.cpp
+//! Port of Eden's video_core/renderer_opengl/present/filters.h and filters.cpp
 //!
 //! Factory functions for creating window adapt passes with different scaling filters.
 //! Each filter creates a WindowAdaptPass configured with the appropriate sampler

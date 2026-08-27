@@ -20,10 +20,10 @@ use crate::engines::maxwell_3d::{
     PRIMITIVE_RESTART_BASE, RASTERIZE_ENABLE, SCISSOR_BASE, SCISSOR_STRIDE, SLOPE_SCALE_DEPTH_BIAS,
     STENCIL_BACK_FUNC_MASK, STENCIL_BACK_MASK, STENCIL_BACK_OP_BASE, STENCIL_BACK_REF,
     STENCIL_ENABLE, STENCIL_FRONT_FUNC_MASK, STENCIL_FRONT_MASK, STENCIL_FRONT_OP_BASE,
-    STENCIL_FRONT_REF, STENCIL_TWO_SIDE_ENABLE, VERTEX_ATTRIB_BASE, VERTEX_STREAM_BASE,
-    VERTEX_STREAM_INSTANCE_BASE, VERTEX_STREAM_STRIDE, VIEWPORT_BASE, VIEWPORT_CLIP_CONTROL,
-    VIEWPORT_SCALE_OFFSET_ENABLED, VIEWPORT_STRIDE, VP_TRANSFORM_BASE, VP_TRANSFORM_STRIDE,
-    WINDOW_ORIGIN,
+    STENCIL_FRONT_REF, STENCIL_TWO_SIDE_ENABLE, SURFACE_CLIP_BASE, VERTEX_ATTRIB_BASE,
+    VERTEX_STREAM_BASE, VERTEX_STREAM_INSTANCE_BASE, VERTEX_STREAM_STRIDE, VIEWPORT_BASE,
+    VIEWPORT_CLIP_CONTROL, VIEWPORT_SCALE_OFFSET_ENABLED, VIEWPORT_STRIDE, VP_TRANSFORM_BASE,
+    VP_TRANSFORM_STRIDE, WINDOW_ORIGIN,
 };
 use std::ptr::NonNull;
 
@@ -101,8 +101,64 @@ pub mod dirty {
     pub const LAST: u8 = VIEWPORT_SWIZZLES + 1;
 }
 
-/// Total number of dirty flags.
-const NUM_FLAGS: usize = dirty::LAST as usize;
+/// Backing store for dirty flags — a simple boolean array.
+/// Port of `Tegra::Engines::Maxwell3D::DirtyState::Flags`.
+pub type DirtyFlags = [bool; 256];
+
+fn make_invalidation_flags() -> DirtyFlags {
+    let mut flags = [false; 256];
+    for flag in [
+        dirty::VIEWPORTS,
+        dirty::SCISSORS,
+        dirty::DEPTH_BIAS,
+        dirty::BLEND_CONSTANTS,
+        dirty::DEPTH_BOUNDS,
+        dirty::STENCIL_PROPERTIES,
+        dirty::STENCIL_REFERENCE,
+        dirty::STENCIL_WRITE_MASK,
+        dirty::STENCIL_COMPARE,
+        dirty::LINE_WIDTH,
+        dirty::CULL_MODE,
+        dirty::DEPTH_BOUNDS_ENABLE,
+        dirty::DEPTH_TEST_ENABLE,
+        dirty::DEPTH_WRITE_ENABLE,
+        dirty::DEPTH_COMPARE_OP,
+        dirty::FRONT_FACE,
+        dirty::STENCIL_OP,
+        dirty::STENCIL_TEST_ENABLE,
+        dirty::RASTERIZER_DISCARD_ENABLE,
+        dirty::VERTEX_BUFFERS,
+        dirty::VERTEX_INPUT,
+        dirty::STATE_ENABLE,
+        dirty::PRIMITIVE_RESTART_ENABLE,
+        dirty::DEPTH_BIAS_ENABLE,
+        dirty::LOGIC_OP_ENABLE,
+        dirty::DEPTH_CLAMP_ENABLE,
+        dirty::ALPHA_TO_COVERAGE_ENABLE,
+        dirty::ALPHA_TO_ONE_ENABLE,
+        dirty::LINE_RASTERIZATION_MODE,
+        dirty::LOGIC_OP,
+        dirty::BLENDING,
+        dirty::COLOR_MASK,
+        dirty::BLEND_EQUATIONS,
+        dirty::BLEND_ENABLE,
+        dirty::CONSERVATIVE_RASTERIZATION_MODE,
+        dirty::LINE_STIPPLE_ENABLE,
+        dirty::LINE_STIPPLE_PARAMS,
+    ] {
+        flags[flag as usize] = true;
+    }
+    for index in dirty::VERTEX_BUFFER_0..=dirty::VERTEX_BUFFER_31 {
+        flags[index as usize] = true;
+    }
+    for index in dirty::VERTEX_ATTRIBUTE_0..=dirty::VERTEX_ATTRIBUTE_31 {
+        flags[index as usize] = true;
+    }
+    for index in dirty::VERTEX_BINDING_0..=dirty::VERTEX_BINDING_31 {
+        flags[index as usize] = true;
+    }
+    flags
+}
 
 fn set(tables: &mut DirtyTables, table: usize, offset: u32, flag: u8) {
     tables[table][offset as usize] = flag;
@@ -119,6 +175,12 @@ fn setup_dirty_viewports(tables: &mut DirtyTables) {
         &mut tables[0],
         VIEWPORT_BASE as usize,
         16 * VIEWPORT_STRIDE as usize,
+        dirty::VIEWPORTS,
+    );
+    fill_block(
+        &mut tables[1],
+        SURFACE_CLIP_BASE as usize,
+        2,
         dirty::VIEWPORTS,
     );
     set(tables, 0, VIEWPORT_SCALE_OFFSET_ENABLED, dirty::VIEWPORTS);
@@ -316,10 +378,6 @@ fn setup_dirty_vertex_bindings(tables: &mut DirtyTables) {
     }
 }
 
-/// Backing store for dirty flags — a simple boolean array.
-/// Port of `Tegra::Engines::Maxwell3D::DirtyState::Flags`.
-pub type DirtyFlags = [bool; 256];
-
 // ---------------------------------------------------------------------------
 // StencilProperties
 // ---------------------------------------------------------------------------
@@ -356,21 +414,12 @@ pub struct StateTracker {
 }
 
 impl StateTracker {
-    /// Create a new state tracker with all flags dirty.
+    /// Create a state tracker with Eden's clean default flags and command-buffer mask.
     pub fn new() -> Self {
-        let mut flags = [false; 256];
-        let mut invalidation_flags = [false; 256];
-
-        // Start with all Vulkan-specific flags dirty
-        for i in 0..NUM_FLAGS {
-            flags[i] = true;
-            invalidation_flags[i] = true;
-        }
-
         Self {
-            flags,
+            flags: [false; 256],
             channel_flags: None,
-            invalidation_flags,
+            invalidation_flags: make_invalidation_flags(),
             current_topology: None,
             bound_channel_id: None,
             two_sided_stencil: false,
@@ -398,6 +447,22 @@ impl StateTracker {
         }
         self.current_topology = None;
         self.stencil_reset = true;
+    }
+
+    /// Applies Eden's command-buffer invalidation mask to a draw-scoped dirty
+    /// flag mirror.
+    ///
+    /// Upstream mutates the bound Maxwell dirty flags directly. The Rust draw
+    /// path temporarily mirrors those flags to avoid aliasing the register
+    /// view while a pipeline is configured. If configuration flushes the
+    /// scheduler, the new command buffer still needs the same dynamic-state
+    /// invalidation applied to that mirror before the draw is recorded.
+    pub fn apply_command_buffer_invalidation(&self, flags: &mut DirtyFlags) {
+        for (flag, &invalidate) in flags.iter_mut().zip(&self.invalidation_flags) {
+            if invalidate {
+                *flag = true;
+            }
+        }
     }
 
     /// Port of `StateTracker::InvalidateState`.
@@ -479,6 +544,11 @@ impl StateTracker {
     /// Port of `StateTracker::InvalidateScissors`.
     pub fn invalidate_scissors(&mut self) {
         self.active_flags_mut()[dirty::SCISSORS as usize] = true;
+    }
+
+    /// Port of `StateTracker::InvalidateStateEnableFlag`.
+    pub fn invalidate_state_enable_flag(&mut self) {
+        self.active_flags_mut()[dirty::STATE_ENABLE as usize] = true;
     }
 
     // -- Exchange helper (read-and-clear) --
@@ -744,20 +814,65 @@ mod tests {
     use crate::control::channel_state::ChannelState;
 
     #[test]
-    fn test_new_all_dirty() {
+    fn new_matches_eden_default_flags_and_invalidation_mask() {
         let tracker = StateTracker::new();
         assert_eq!(dirty::FIRST, crate::dirty_flags::flags::LAST_COMMON_ENTRY);
         assert_eq!(dirty::VERTEX_INPUT, dirty::FIRST + 1);
-        assert!(tracker.flags[dirty::VIEWPORTS as usize]);
-        assert!(tracker.flags[dirty::SCISSORS as usize]);
-        assert!(tracker.flags[dirty::VERTEX_INPUT as usize]);
+        assert!(tracker.flags.iter().all(|&flag| !flag));
+
+        assert_eq!(
+            tracker
+                .invalidation_flags
+                .iter()
+                .filter(|&&flag| flag)
+                .count(),
+            133
+        );
+        for included in [
+            dirty::VIEWPORTS,
+            dirty::SCISSORS,
+            dirty::VERTEX_BUFFERS,
+            dirty::VERTEX_BUFFER_0,
+            dirty::VERTEX_BUFFER_31,
+            dirty::VERTEX_ATTRIBUTE_0,
+            dirty::VERTEX_ATTRIBUTE_31,
+            dirty::VERTEX_BINDING_0,
+            dirty::VERTEX_BINDING_31,
+            dirty::LINE_STIPPLE_PARAMS,
+        ] {
+            assert!(tracker.invalidation_flags[included as usize]);
+        }
+        for excluded in [
+            dirty::RENDER_TARGETS,
+            dirty::COLOR_BUFFER_0,
+            dirty::COLOR_BUFFER_7,
+            dirty::ZETA_BUFFER,
+            dirty::RESCALE_VIEWPORTS,
+            dirty::RESCALE_SCISSORS,
+            dirty::DEPTH_BIAS_GLOBAL,
+            dirty::VIEWPORT_SWIZZLES,
+        ] {
+            assert!(!tracker.invalidation_flags[excluded as usize]);
+        }
     }
 
     #[test]
     fn test_touch_clears_flag() {
         let mut tracker = StateTracker::new();
+        tracker.invalidate_viewports();
         assert!(tracker.touch_viewports());
         assert!(!tracker.touch_viewports());
+    }
+
+    #[test]
+    fn invalidate_state_enable_flag_marks_only_the_group_flag() {
+        let mut tracker = StateTracker::new();
+        assert!(!tracker.touch_state_enable());
+
+        tracker.invalidate_state_enable_flag();
+
+        assert!(tracker.touch_state_enable());
+        assert!(!tracker.touch_state_enable());
     }
 
     #[test]
@@ -773,8 +888,21 @@ mod tests {
     }
 
     #[test]
+    fn command_buffer_invalidation_reaches_draw_scoped_flag_mirror() {
+        let tracker = StateTracker::new();
+        let mut flags = [false; 256];
+
+        tracker.apply_command_buffer_invalidation(&mut flags);
+
+        assert!(flags[dirty::VERTEX_INPUT as usize]);
+        assert!(flags[dirty::VIEWPORTS as usize]);
+        assert!(flags[dirty::PRIMITIVE_RESTART_ENABLE as usize]);
+    }
+
+    #[test]
     fn test_touch_does_not_affect_others() {
         let mut tracker = StateTracker::new();
+        tracker.invalidate_state();
         tracker.touch_viewports();
         assert!(!tracker.flags[dirty::VIEWPORTS as usize]);
         assert!(tracker.flags[dirty::SCISSORS as usize]);
@@ -812,6 +940,7 @@ mod tests {
     #[test]
     fn test_touch_blend_constants() {
         let mut tracker = StateTracker::new();
+        tracker.invalidate_state();
         assert!(tracker.touch_blend_constants());
         assert!(!tracker.touch_blend_constants());
     }
@@ -833,6 +962,8 @@ mod tests {
 
         let tables = channel.maxwell_3d.as_ref().unwrap().dirty_tables();
         assert_eq!(tables[0][VP_TRANSFORM_BASE as usize], dirty::VIEWPORTS);
+        assert_eq!(tables[1][SURFACE_CLIP_BASE as usize], dirty::VIEWPORTS);
+        assert_eq!(tables[1][SURFACE_CLIP_BASE as usize + 1], dirty::VIEWPORTS);
         assert_eq!(tables[1][WINDOW_ORIGIN as usize], dirty::VIEWPORTS);
         assert_eq!(tables[0][SCISSOR_BASE as usize], dirty::SCISSORS);
         assert_eq!(tables[0][DEPTH_BIAS as usize], dirty::DEPTH_BIAS);

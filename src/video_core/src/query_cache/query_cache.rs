@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/query_cache.h
+//! Port of Eden's `src/video_core/query_cache/query_cache.h`.
 //!
 //! Contains the shared streamer owners `GuestStreamer` and `StubStreamer`, the
 //! guest sync payload `SyncValuesStruct`, and `QueryCacheBaseImpl`, the inner

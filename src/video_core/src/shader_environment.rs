@@ -13,10 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(test)]
+use crate::engines::const_buffer_info::ConstBufferInfo;
+#[cfg(test)]
 use crate::engines::kepler_compute::ConstBufferConfig;
 use crate::engines::kepler_compute::KeplerCompute;
-#[cfg(test)]
-use crate::engines::maxwell_3d::ConstBufferBinding;
 use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, SamplerBinding, ShaderStageType};
 use crate::memory_manager::MemoryManager;
 use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
@@ -51,10 +51,9 @@ const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
 /// Upstream: `GenericEnvironment::TryFindSize` line 252.
 const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
 
-/// Maxwell EXIT instruction used by open-source guest drivers to terminate a
-/// shader without the proprietary driver's self-branch sentinel.
-///
-/// Upstream: `GenericEnvironment::TryFindSize` in `shader_environment.cpp`.
+/// Maxwell EXIT instruction used as the shader tail on non-proprietary
+/// drivers. Upstream deliberately ignores this marker for proprietary-driver
+/// shaders, which keep using the self-branch sentinels above.
 const EXIT_VALUE: u64 = 0xE30000000007000F;
 
 /// GPU-memory reader callback shape: read `bytes.len()` bytes starting at the
@@ -223,6 +222,17 @@ pub struct GenericEnvironment {
     gpu_read: Option<GpuMemoryReader>,
 }
 
+/// Rust counterpart of accessing the `GenericEnvironment` base subobject
+/// through an upstream `Shader::Environment&`.
+///
+/// The concrete owner must remain available for virtual environment reads;
+/// reducing it to `&mut GenericEnvironment` would lose the graphics/compute
+/// callbacks required by the Maxwell control-flow analyzer.
+pub trait GenericEnvironmentOwner {
+    fn generic_environment(&self) -> &GenericEnvironment;
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment;
+}
+
 impl GenericEnvironment {
     pub fn new() -> Self {
         Self {
@@ -266,12 +276,6 @@ impl GenericEnvironment {
     #[cfg(test)]
     pub fn with_gpu_read(mut self, reader: GpuMemoryReader) -> Self {
         self.gpu_read = Some(reader);
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_proprietary_driver(mut self, is_proprietary_driver: bool) -> Self {
-        self.is_proprietary_driver = is_proprietary_driver;
         self
     }
 
@@ -366,37 +370,11 @@ impl GenericEnvironment {
     pub fn analyze(&mut self) -> Option<u64> {
         let size = match self.try_find_size() {
             Some(size) => size,
-            None => {
-                if std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some() {
-                    let first_words: Vec<String> = self
-                        .code
-                        .iter()
-                        .take(8)
-                        .map(|word| format!("{word:016X}"))
-                        .collect();
-                    eprintln!(
-                        "[SHADER_ANALYZE] try_find_size_failed program_base=0x{:X} start=0x{:X} cached_words={} first_words=[{}]",
-                        self.program_base,
-                        self.start_address,
-                        self.code.len(),
-                        first_words.join(","),
-                    );
-                }
-                return None;
-            }
+            None => return None,
         };
         self.cached_lowest = self.start_address;
         self.cached_highest = self.start_address + size as u32;
         let bytes = self.code_bytes(size as usize);
-        if std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some() {
-            eprintln!(
-                "[SHADER_ANALYZE] try_find_size_ok program_base=0x{:X} start=0x{:X} size=0x{:X} cached_size=0x{:X}",
-                self.program_base,
-                self.start_address,
-                size,
-                self.cached_size_bytes(),
-            );
-        }
         Some(common::cityhash::city_hash64(bytes))
     }
 
@@ -433,17 +411,6 @@ impl GenericEnvironment {
             for index in (0..TRY_FIND_SIZE_BLOCK_BYTES).step_by(INST_SIZE) {
                 let inst = self.code[words_offset + index / INST_SIZE];
                 if inst == SELF_BRANCH_A || inst == SELF_BRANCH_B {
-                    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-                        let matched_byte_offset = offset + index;
-                        eprintln!(
-                            "[TRY_FIND_SIZE] sentinel matched at byte_offset=0x{:X} word_index={} sentinel=0x{:016X} (start_address=0x{:X} program_base=0x{:X})",
-                            matched_byte_offset,
-                            words_offset + index / INST_SIZE,
-                            inst,
-                            self.start_address,
-                            self.program_base,
-                        );
-                    }
                     return Some((offset + index) as u64);
                 }
                 if !self.is_proprietary_driver && inst == EXIT_VALUE {
@@ -663,7 +630,7 @@ pub struct GraphicsEnvironment {
 #[cfg(test)]
 #[derive(Clone, Copy)]
 struct GraphicsEnvironmentDetachedState {
-    const_buffers: [ConstBufferBinding; 18],
+    const_buffers: [ConstBufferInfo; 18],
     tex_header_pool_addr: u64,
     tex_header_pool_limit: u32,
     sampler_binding: SamplerBinding,
@@ -678,19 +645,11 @@ impl GraphicsEnvironment {
             file_backed: false,
             #[cfg(test)]
             detached_state: GraphicsEnvironmentDetachedState {
-                const_buffers: [ConstBufferBinding::default(); 18],
+                const_buffers: [ConstBufferInfo::default(); 18],
                 tex_header_pool_addr: 0,
                 tex_header_pool_limit: 0,
                 sampler_binding: SamplerBinding::Independently,
             },
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_generic_environment_for_test(base: GenericEnvironment) -> Self {
-        Self {
-            base,
-            ..Self::new()
         }
     }
 
@@ -764,15 +723,6 @@ impl GraphicsEnvironment {
             }
             env.base.local_memory_size = env.base.sph.local_memory_size() as u32
                 + env.base.sph.shader_local_memory_crs_size();
-            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-                eprintln!(
-                    "[SHADER_HEADER] stage={:?} address=0x{:X} raw={:08X?} local=0x{:X}",
-                    env.base.stage,
-                    program_base + start_address as u64,
-                    &env.base.sph.raw[..5],
-                    env.base.local_memory_size,
-                );
-            }
         }
         env
     }
@@ -799,10 +749,7 @@ impl GraphicsEnvironment {
     }
 
     #[cfg(test)]
-    fn graphics_const_buffer_binding_for_test(
-        &self,
-        cbuf_index: u32,
-    ) -> Option<ConstBufferBinding> {
+    fn graphics_const_buffer_binding_for_test(&self, cbuf_index: u32) -> Option<ConstBufferInfo> {
         unsafe { self.maxwell3d.as_ref() }
             .and_then(|maxwell3d| {
                 maxwell3d
@@ -865,17 +812,6 @@ impl GraphicsEnvironment {
             "GraphicsEnvironment::read_cbuf_value: disabled cbuf {} for stage {}",
             cbuf_index, self.stage_index
         );
-        if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-            eprintln!(
-                "[SHADER_CBUF_READ] stage_index={} cbuf={} offset=0x{:X} addr=0x{:X} size=0x{:X} enabled={}",
-                self.stage_index,
-                cbuf_index,
-                cbuf_offset,
-                binding.address,
-                binding.size,
-                binding.enabled,
-            );
-        }
         let mut value = 0u32;
         if cbuf_offset < binding.size {
             value = self.base.read_u32(binding.address + cbuf_offset as u64);
@@ -1001,7 +937,7 @@ impl GraphicsEnvironment {
     }
 
     #[cfg(test)]
-    fn set_detached_const_buffer_binding(&mut self, index: usize, binding: ConstBufferBinding) {
+    fn set_detached_const_buffer_binding(&mut self, index: usize, binding: ConstBufferInfo) {
         self.detached_state.const_buffers[index] = binding;
         self.maxwell3d = std::ptr::null();
     }
@@ -1104,6 +1040,16 @@ impl shader_recompiler::environment::Environment for GraphicsEnvironment {
     }
 }
 
+impl GenericEnvironmentOwner for GraphicsEnvironment {
+    fn generic_environment(&self) -> &GenericEnvironment {
+        GraphicsEnvironment::generic_environment(self)
+    }
+
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        GraphicsEnvironment::generic_environment_mut(self)
+    }
+}
+
 /// Compute shader environment.
 pub struct ComputeEnvironment {
     base: GenericEnvironment,
@@ -1134,6 +1080,22 @@ impl ComputeEnvironment {
             kepler_compute: std::ptr::null(),
             file_backed: false,
             #[cfg(test)]
+            detached_state: ComputeEnvironmentDetachedState {
+                const_buffer_enable_mask: 0,
+                const_buffers: [ConstBufferConfig::default(); 8],
+                tic_address: 0,
+                tic_limit: 0,
+                linked_tsc: false,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_generic_environment_for_test(base: GenericEnvironment) -> Self {
+        Self {
+            base,
+            kepler_compute: std::ptr::null(),
+            file_backed: false,
             detached_state: ComputeEnvironmentDetachedState {
                 const_buffer_enable_mask: 0,
                 const_buffers: [ConstBufferConfig::default(); 8],
@@ -1410,6 +1372,16 @@ impl shader_recompiler::environment::Environment for ComputeEnvironment {
 
     fn is_proprietary_driver(&self) -> bool {
         self.base.is_proprietary_driver
+    }
+}
+
+impl GenericEnvironmentOwner for ComputeEnvironment {
+    fn generic_environment(&self) -> &GenericEnvironment {
+        ComputeEnvironment::generic_environment(self)
+    }
+
+    fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        ComputeEnvironment::generic_environment_mut(self)
     }
 }
 
@@ -2335,24 +2307,26 @@ mod tests {
     }
 
     #[test]
-    fn try_find_size_stops_after_exit_for_non_proprietary_driver() {
+    fn try_find_size_stops_after_exit_on_non_proprietary_driver() {
         let program_base: u64 = 0x2_1000_0000;
-        let exit_offset = 0x98;
+        let exit_offset = 0x88;
         let (reader, log) = make_mock_gpu_with_sentinel(program_base, exit_offset, EXIT_VALUE);
         let mut env = GenericEnvironment::new()
             .with_gpu_read(reader)
             .with_program(program_base, 0);
 
-        let size = env.try_find_size().expect("EXIT must terminate the shader");
+        let size = env
+            .try_find_size()
+            .expect("EXIT must terminate this shader");
         assert_eq!(size as usize, exit_offset + INST_SIZE);
         assert_eq!(log.lock().unwrap().as_slice(), &[(program_base, 0x1000)]);
     }
 
     #[test]
-    fn try_find_size_ignores_exit_for_proprietary_driver() {
+    fn try_find_size_ignores_exit_on_proprietary_driver() {
         let program_base: u64 = 0x2_2000_0000;
         let exit_offset = 0x80;
-        let sentinel_offset = 0x180;
+        let sentinel_offset = 0x100;
         let mut backing = vec![0u8; TRY_FIND_SIZE_BLOCK_BYTES];
         backing[exit_offset..exit_offset + INST_SIZE].copy_from_slice(&EXIT_VALUE.to_le_bytes());
         backing[sentinel_offset..sentinel_offset + INST_SIZE]
@@ -2360,7 +2334,10 @@ mod tests {
         let backing = Arc::new(backing);
         let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
             let offset = (gpu_addr - program_base) as usize;
-            dst.copy_from_slice(&backing[offset..offset + dst.len()]);
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                dst[..end - offset].copy_from_slice(&backing[offset..end]);
+            }
         });
         let mut env = GenericEnvironment::new()
             .with_gpu_read(reader)
@@ -2369,7 +2346,7 @@ mod tests {
 
         assert_eq!(
             env.try_find_size()
-                .expect("self branch must terminate the shader") as usize,
+                .expect("self branch must terminate this shader") as usize,
             sentinel_offset
         );
     }
@@ -2562,10 +2539,10 @@ mod tests {
             .with_program(gpu_base, 0);
         env.set_detached_const_buffer_binding(
             0,
-            ConstBufferBinding {
-                enabled: true,
+            ConstBufferInfo {
                 address: gpu_base,
                 size: 0x1000,
+                enabled: true,
             },
         );
 

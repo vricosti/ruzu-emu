@@ -9,168 +9,7 @@
 // `video_core/surface.h`. Re-exported here so the texture_cache modules that
 // already import it from this file keep resolving.
 pub use crate::surface::PixelFormat;
-
-// ── ComponentType placeholder ──────────────────────────────────────────
-// Upstream: Tegra::Texture::ComponentType
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum ComponentType {
-    Snorm = 1,
-    Unorm = 2,
-    Sint = 3,
-    Uint = 4,
-    Float = 7,
-}
-
-impl ComponentType {
-    pub fn from_raw(value: u32) -> Option<Self> {
-        match value {
-            1 => Some(Self::Snorm),
-            2 => Some(Self::Unorm),
-            3 => Some(Self::Sint),
-            4 => Some(Self::Uint),
-            7 => Some(Self::Float),
-            _ => None,
-        }
-    }
-}
-
-// ── TextureFormat placeholder ──────────────────────────────────────────
-// Upstream: Tegra::Texture::TextureFormat
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum TextureFormat {
-    R32G32B32A32 = 0x01,
-    R32G32B32 = 0x02,
-    R16G16B16A16 = 0x03,
-    R32G32 = 0x04,
-    R32B24G8 = 0x05,
-    ETC2_RGB = 0x06,
-    X8B8G8R8 = 0x07,
-    A8B8G8R8 = 0x08,
-    A2B10G10R10 = 0x09,
-    ETC2_RGB_PTA = 0x0a,
-    ETC2_RGBA = 0x0b,
-    R16G16 = 0x0c,
-    G8R24 = 0x0d,
-    G24R8 = 0x0e,
-    R32 = 0x0f,
-    BC6H_S16 = 0x10,
-    BC6H_U16 = 0x11,
-    A4B4G4R4 = 0x12,
-    A5B5G5R1 = 0x13,
-    A1B5G5R5 = 0x14,
-    B5G6R5 = 0x15,
-    B6G5R5 = 0x16,
-    BC7U = 0x17,
-    G8R8 = 0x18,
-    EAC = 0x19,
-    EACX2 = 0x1a,
-    R16 = 0x1b,
-    Y8_VIDEO = 0x1c,
-    R8 = 0x1d,
-    G4R4 = 0x1e,
-    R1 = 0x1f,
-    E5B9G9R9 = 0x20,
-    B10G11R11 = 0x21,
-    G8B8G8R8 = 0x22,
-    B8G8R8G8 = 0x23,
-    DXT1 = 0x24,
-    DXT23 = 0x25,
-    DXT45 = 0x26,
-    DXN1 = 0x27,
-    DXN2 = 0x28,
-    Z24S8 = 0x29,
-    X8Z24 = 0x2a,
-    S8Z24 = 0x2b,
-    Z32 = 0x2f,
-    Z32X24S8 = 0x30,
-    Z16 = 0x3a,
-    Astc2d4x4 = 0x40,
-    Astc2d5x5 = 0x41,
-    Astc2d6x6 = 0x42,
-    Astc2d8x8 = 0x44,
-    Astc2d10x10 = 0x45,
-    Astc2d12x12 = 0x46,
-    Astc2d5x4 = 0x50,
-    Astc2d6x5 = 0x51,
-    Astc2d8x6 = 0x52,
-    Astc2d10x8 = 0x53,
-    Astc2d12x10 = 0x54,
-    Astc2d8x5 = 0x55,
-    Astc2d10x5 = 0x56,
-    Astc2d10x6 = 0x57,
-}
-
-impl TextureFormat {
-    pub fn from_raw(value: u32) -> Option<Self> {
-        match value {
-            0x01 => Some(Self::R32G32B32A32),
-            0x02 => Some(Self::R32G32B32),
-            0x03 => Some(Self::R16G16B16A16),
-            0x04 => Some(Self::R32G32),
-            0x05 => Some(Self::R32B24G8),
-            0x06 => Some(Self::ETC2_RGB),
-            0x07 => Some(Self::X8B8G8R8),
-            0x08 => Some(Self::A8B8G8R8),
-            0x09 => Some(Self::A2B10G10R10),
-            0x0a => Some(Self::ETC2_RGB_PTA),
-            0x0b => Some(Self::ETC2_RGBA),
-            0x0c => Some(Self::R16G16),
-            0x0d => Some(Self::G8R24),
-            0x0e => Some(Self::G24R8),
-            0x0f => Some(Self::R32),
-            0x10 => Some(Self::BC6H_S16),
-            0x11 => Some(Self::BC6H_U16),
-            0x12 => Some(Self::A4B4G4R4),
-            0x13 => Some(Self::A5B5G5R1),
-            0x14 => Some(Self::A1B5G5R5),
-            0x15 => Some(Self::B5G6R5),
-            0x16 => Some(Self::B6G5R5),
-            0x17 => Some(Self::BC7U),
-            0x18 => Some(Self::G8R8),
-            0x19 => Some(Self::EAC),
-            0x1a => Some(Self::EACX2),
-            0x1b => Some(Self::R16),
-            0x1c => Some(Self::Y8_VIDEO),
-            0x1d => Some(Self::R8),
-            0x1e => Some(Self::G4R4),
-            0x1f => Some(Self::R1),
-            0x20 => Some(Self::E5B9G9R9),
-            0x21 => Some(Self::B10G11R11),
-            0x22 => Some(Self::G8B8G8R8),
-            0x23 => Some(Self::B8G8R8G8),
-            0x24 => Some(Self::DXT1),
-            0x25 => Some(Self::DXT23),
-            0x26 => Some(Self::DXT45),
-            0x27 => Some(Self::DXN1),
-            0x28 => Some(Self::DXN2),
-            0x29 => Some(Self::Z24S8),
-            0x2a => Some(Self::X8Z24),
-            0x2b => Some(Self::S8Z24),
-            0x2f => Some(Self::Z32),
-            0x30 => Some(Self::Z32X24S8),
-            0x3a => Some(Self::Z16),
-            0x40 => Some(Self::Astc2d4x4),
-            0x41 => Some(Self::Astc2d5x5),
-            0x42 => Some(Self::Astc2d6x6),
-            0x44 => Some(Self::Astc2d8x8),
-            0x45 => Some(Self::Astc2d10x10),
-            0x46 => Some(Self::Astc2d12x12),
-            0x50 => Some(Self::Astc2d5x4),
-            0x51 => Some(Self::Astc2d6x5),
-            0x52 => Some(Self::Astc2d8x6),
-            0x53 => Some(Self::Astc2d10x8),
-            0x54 => Some(Self::Astc2d12x10),
-            0x55 => Some(Self::Astc2d8x5),
-            0x56 => Some(Self::Astc2d10x5),
-            0x57 => Some(Self::Astc2d10x6),
-            _ => None,
-        }
-    }
-}
+pub use crate::textures::texture::{ComponentType, TextureFormat};
 
 // ── Hash function ──────────────────────────────────────────────────────
 
@@ -342,32 +181,32 @@ pub fn pixel_format_from_texture_info_raw(
         x if x == h!(TF::Z32X24S8, FLOAT, UINT, UNORM, UNORM) => PixelFormat::D32FloatS8Uint,
         x if x == h!(TF::R32B24G8, FLOAT, UINT, UNORM, UNORM) => PixelFormat::D32FloatS8Uint,
         // Compressed
-        x if x == h_uni!(TF::DXT1, UNORM) => PixelFormat::Bc1RgbaUnorm,
-        x if x == h_uni!(TF::DXT1, UNORM, srgb) => PixelFormat::Bc1RgbaSrgb,
-        x if x == h_uni!(TF::DXT23, UNORM) => PixelFormat::Bc2Unorm,
-        x if x == h_uni!(TF::DXT23, UNORM, srgb) => PixelFormat::Bc2Srgb,
-        x if x == h_uni!(TF::DXT45, UNORM) => PixelFormat::Bc3Unorm,
-        x if x == h_uni!(TF::DXT45, UNORM, srgb) => PixelFormat::Bc3Srgb,
-        x if x == h_uni!(TF::DXN1, UNORM) => PixelFormat::Bc4Unorm,
-        x if x == h_uni!(TF::DXN1, SNORM) => PixelFormat::Bc4Snorm,
-        x if x == h_uni!(TF::DXN2, UNORM) => PixelFormat::Bc5Unorm,
-        x if x == h_uni!(TF::DXN2, SNORM) => PixelFormat::Bc5Snorm,
-        x if x == h_uni!(TF::BC7U, UNORM) => PixelFormat::Bc7Unorm,
-        x if x == h_uni!(TF::BC7U, UNORM, srgb) => PixelFormat::Bc7Srgb,
-        x if x == h_uni!(TF::BC6H_S16, FLOAT) => PixelFormat::Bc6hSfloat,
-        x if x == h_uni!(TF::BC6H_U16, FLOAT) => PixelFormat::Bc6hUfloat,
+        x if x == h_uni!(TF::Dxt1, UNORM) => PixelFormat::Bc1RgbaUnorm,
+        x if x == h_uni!(TF::Dxt1, UNORM, srgb) => PixelFormat::Bc1RgbaSrgb,
+        x if x == h_uni!(TF::Dxt23, UNORM) => PixelFormat::Bc2Unorm,
+        x if x == h_uni!(TF::Dxt23, UNORM, srgb) => PixelFormat::Bc2Srgb,
+        x if x == h_uni!(TF::Dxt45, UNORM) => PixelFormat::Bc3Unorm,
+        x if x == h_uni!(TF::Dxt45, UNORM, srgb) => PixelFormat::Bc3Srgb,
+        x if x == h_uni!(TF::Dxn1, UNORM) => PixelFormat::Bc4Unorm,
+        x if x == h_uni!(TF::Dxn1, SNORM) => PixelFormat::Bc4Snorm,
+        x if x == h_uni!(TF::Dxn2, UNORM) => PixelFormat::Bc5Unorm,
+        x if x == h_uni!(TF::Dxn2, SNORM) => PixelFormat::Bc5Snorm,
+        x if x == h_uni!(TF::Bc7u, UNORM) => PixelFormat::Bc7Unorm,
+        x if x == h_uni!(TF::Bc7u, UNORM, srgb) => PixelFormat::Bc7Srgb,
+        x if x == h_uni!(TF::Bc6hS16, FLOAT) => PixelFormat::Bc6hSfloat,
+        x if x == h_uni!(TF::Bc6hU16, FLOAT) => PixelFormat::Bc6hUfloat,
         // ETC2
-        x if x == h_uni!(TF::ETC2_RGB, UNORM) => PixelFormat::Etc2RgbUnorm,
-        x if x == h_uni!(TF::ETC2_RGB_PTA, UNORM) => PixelFormat::Etc2RgbPtaUnorm,
-        x if x == h_uni!(TF::ETC2_RGBA, UNORM) => PixelFormat::Etc2RgbaUnorm,
-        x if x == h_uni!(TF::ETC2_RGB, UNORM, srgb) => PixelFormat::Etc2RgbSrgb,
-        x if x == h_uni!(TF::ETC2_RGB_PTA, UNORM, srgb) => PixelFormat::Etc2RgbPtaSrgb,
-        x if x == h_uni!(TF::ETC2_RGBA, UNORM, srgb) => PixelFormat::Etc2RgbaSrgb,
+        x if x == h_uni!(TF::Etc2Rgb, UNORM) => PixelFormat::Etc2RgbUnorm,
+        x if x == h_uni!(TF::Etc2RgbPta, UNORM) => PixelFormat::Etc2RgbPtaUnorm,
+        x if x == h_uni!(TF::Etc2Rgba, UNORM) => PixelFormat::Etc2RgbaUnorm,
+        x if x == h_uni!(TF::Etc2Rgb, UNORM, srgb) => PixelFormat::Etc2RgbSrgb,
+        x if x == h_uni!(TF::Etc2RgbPta, UNORM, srgb) => PixelFormat::Etc2RgbPtaSrgb,
+        x if x == h_uni!(TF::Etc2Rgba, UNORM, srgb) => PixelFormat::Etc2RgbaSrgb,
         // EAC
-        x if x == h_uni!(TF::EAC, UNORM) => PixelFormat::EacR11Unorm,
-        x if x == h_uni!(TF::EAC, SNORM) => PixelFormat::EacR11Snorm,
-        x if x == h_uni!(TF::EACX2, UNORM) => PixelFormat::EacR11G11Unorm,
-        x if x == h_uni!(TF::EACX2, SNORM) => PixelFormat::EacR11G11Snorm,
+        x if x == h_uni!(TF::Eac, UNORM) => PixelFormat::EacR11Unorm,
+        x if x == h_uni!(TF::Eac, SNORM) => PixelFormat::EacR11Snorm,
+        x if x == h_uni!(TF::Eacx2, UNORM) => PixelFormat::EacR11G11Unorm,
+        x if x == h_uni!(TF::Eacx2, SNORM) => PixelFormat::EacR11G11Snorm,
         // ASTC
         x if x == h_uni!(TF::Astc2d4x4, UNORM) => PixelFormat::Astc2d4x4Unorm,
         x if x == h_uni!(TF::Astc2d4x4, UNORM, srgb) => PixelFormat::Astc2d4x4Srgb,
@@ -404,6 +243,21 @@ pub fn pixel_format_from_texture_info_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_hash_matches_upstream_bit_placement() {
+        assert_eq!(
+            format_hash(
+                TextureFormat::A8B8G8R8 as u32,
+                ComponentType::Snorm as u32,
+                ComponentType::Unorm as u32,
+                ComponentType::Sint as u32,
+                ComponentType::Float as u32,
+                true,
+            ),
+            1 | (1 << 1) | (2 << 4) | (3 << 7) | (7 << 10) | (0x08 << 13),
+        );
+    }
 
     #[test]
     fn known_texture_format_mapping_still_matches_upstream_table() {
@@ -450,6 +304,24 @@ mod tests {
             PixelFormat::A8B8G8R8Unorm,
         );
     }
+
+    #[test]
+    fn canonical_force_fp16_components_reach_upstream_fallback() {
+        for component in [ComponentType::SnormForceFp16, ComponentType::UnormForceFp16] {
+            assert_eq!(
+                pixel_format_from_texture_info(
+                    TextureFormat::A8B8G8R8,
+                    component,
+                    component,
+                    component,
+                    component,
+                    false,
+                ),
+                PixelFormat::A8B8G8R8Unorm,
+            );
+        }
+    }
+
     // The ten ETC2/EAC entries upstream's `PixelFormatFromTextureInfo` maps.
     // Note upstream's ordering quirk: `ETC2_RGB_PTA` (0x0a) precedes
     // `ETC2_RGBA` (0x0b) in the switch, and EAC has no sRGB variant.
@@ -461,43 +333,43 @@ mod tests {
         use ComponentType::{Snorm, Unorm};
 
         assert_eq!(
-            uni(TextureFormat::ETC2_RGB, Unorm, false),
+            uni(TextureFormat::Etc2Rgb, Unorm, false),
             PixelFormat::Etc2RgbUnorm
         );
         assert_eq!(
-            uni(TextureFormat::ETC2_RGB_PTA, Unorm, false),
+            uni(TextureFormat::Etc2RgbPta, Unorm, false),
             PixelFormat::Etc2RgbPtaUnorm
         );
         assert_eq!(
-            uni(TextureFormat::ETC2_RGBA, Unorm, false),
+            uni(TextureFormat::Etc2Rgba, Unorm, false),
             PixelFormat::Etc2RgbaUnorm
         );
         assert_eq!(
-            uni(TextureFormat::ETC2_RGB, Unorm, true),
+            uni(TextureFormat::Etc2Rgb, Unorm, true),
             PixelFormat::Etc2RgbSrgb
         );
         assert_eq!(
-            uni(TextureFormat::ETC2_RGB_PTA, Unorm, true),
+            uni(TextureFormat::Etc2RgbPta, Unorm, true),
             PixelFormat::Etc2RgbPtaSrgb
         );
         assert_eq!(
-            uni(TextureFormat::ETC2_RGBA, Unorm, true),
+            uni(TextureFormat::Etc2Rgba, Unorm, true),
             PixelFormat::Etc2RgbaSrgb
         );
         assert_eq!(
-            uni(TextureFormat::EAC, Unorm, false),
+            uni(TextureFormat::Eac, Unorm, false),
             PixelFormat::EacR11Unorm
         );
         assert_eq!(
-            uni(TextureFormat::EAC, Snorm, false),
+            uni(TextureFormat::Eac, Snorm, false),
             PixelFormat::EacR11Snorm
         );
         assert_eq!(
-            uni(TextureFormat::EACX2, Unorm, false),
+            uni(TextureFormat::Eacx2, Unorm, false),
             PixelFormat::EacR11G11Unorm
         );
         assert_eq!(
-            uni(TextureFormat::EACX2, Snorm, false),
+            uni(TextureFormat::Eacx2, Snorm, false),
             PixelFormat::EacR11G11Snorm
         );
     }

@@ -37,6 +37,10 @@ fn main() {
     let avutil = pkg_config::Config::new()
         .probe("libavutil")
         .expect("libavutil is required for video_core FFmpeg decoding");
+    let libva = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux" | "freebsd") => pkg_config::Config::new().probe("libva").ok(),
+        _ => None,
+    };
 
     let mut build = cc::Build::new();
     build.file("src/host1x/ffmpeg/ffmpeg_shim.c");
@@ -47,6 +51,12 @@ fn main() {
         .chain(avutil.include_paths.iter())
     {
         build.include(path);
+    }
+    if let Some(libva) = &libva {
+        build.define("LIBVA_FOUND", None);
+        for path in &libva.include_paths {
+            build.include(path);
+        }
     }
     build.compile("ruzu_video_core_ffmpeg_shim");
 
@@ -110,6 +120,12 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ),
         ("FULL_SCREEN_TRIANGLE_VERT_SPV", "full_screen_triangle.vert"),
         ("BLIT_COLOR_FLOAT_FRAG_SPV", "blit_color_float.frag"),
+        ("BLIT_COLOR_MSAA_FRAG_SPV", "blit_color_msaa.frag"),
+        ("BLIT_DEPTH_MSAA_FRAG_SPV", "blit_depth_msaa.frag"),
+        (
+            "BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV",
+            "blit_depth_stencil_msaa.frag",
+        ),
         (
             "VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV",
             "vulkan_blit_depth_stencil.frag",

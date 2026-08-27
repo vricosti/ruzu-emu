@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/
+//! Port of Eden's `src/video_core/query_cache/`.
 //!
 //! GPU query cache subsystem. Manages hardware query counters (occlusion,
 //! primitives generated, etc.), caching their results and synchronizing

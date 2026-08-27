@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of video_core/engines/draw_manager.h and draw_manager.cpp
+//! Port of the `DrawManager` declaration in video_core/engines/maxwell_3d.h
+//! and its implementation in video_core/engines/draw_manager.cpp.
 //!
 //! The DrawManager handles draw call dispatch for the Maxwell 3D engine.
 //! It processes method writes for begin/end draws, inline index buffers,
 //! instanced draws, and draw textures.
 
 use crate::dirty_flags::flags as Dirty;
+use crate::engines::const_buffer_info::ConstBufferInfo;
 use crate::engines::maxwell_3d::{
-    ConstBufferBinding, DrawCall, Maxwell3D, RenderTargetInfo, RtControlInfo, ShaderStageType,
-    CLEAR_SURFACE, DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE,
-    IB_OFF_COUNT, IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT,
-    INDEX_BUFFER32_FIRST, INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
+    DrawCall, Maxwell3D, RenderTargetInfo, RtControlInfo, ShaderStageType, CLEAR_SURFACE,
+    DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT,
+    IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
+    INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
     NUM_SHADER_STAGES, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
     VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
@@ -25,57 +27,11 @@ use std::ptr::NonNull;
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
 
-// ── Type aliases matching upstream using declarations ────────────────────────
-
-// In upstream these are `using PrimitiveTopologyControl = Maxwell3D::Regs::...`.
-// We use re-exports / newtypes. For now, define the needed types locally to
-// preserve file-level self-containment, matching const_buffer_info.h pattern.
-
-/// Primitive topology control mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum PrimitiveTopologyControl {
-    #[default]
-    UseInBeginMethods = 0,
-    UseSeparateState = 1,
-}
-
-impl PrimitiveTopologyControl {
-    pub fn from_raw(raw: u32) -> Self {
-        match raw {
-            1 => Self::UseSeparateState,
-            _ => Self::UseInBeginMethods,
-        }
-    }
-}
-
-// `PrimitiveTopology` is the upstream-faithful enum from
-// `engines::maxwell_3d` (matching `Maxwell3D::Regs::PrimitiveTopology`).
-// Re-exported here so existing imports of
-// `engines::draw_manager::PrimitiveTopology` continue to resolve.
-pub use crate::engines::maxwell_3d::PrimitiveTopology;
-
-/// Topology override values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum PrimitiveTopologyOverride {
-    #[default]
-    None = 0,
-    Points = 1,
-    Lines = 2,
-    LineStrip = 3,
-}
-
-impl PrimitiveTopologyOverride {
-    pub fn from_raw(raw: u32) -> Self {
-        match raw {
-            1 => Self::Points,
-            2 => Self::Lines,
-            3 => Self::LineStrip,
-            _ => Self::None,
-        }
-    }
-}
+// Upstream stores these enums in `Maxwell3D::Regs`; re-export them from the
+// Rust counterpart so existing draw-manager consumers retain their imports.
+pub use crate::engines::maxwell_3d::{
+    PrimitiveTopology, PrimitiveTopologyControl, PrimitiveTopologyOverride,
+};
 
 /// Port of `DrawManager::UpdateTopology()` as a pure owner-local helper.
 ///
@@ -90,7 +46,7 @@ pub fn resolve_draw_topology(
     match primitive_topology_control {
         PrimitiveTopologyControl::UseInBeginMethods => {}
         PrimitiveTopologyControl::UseSeparateState => match topology_override {
-            PrimitiveTopologyOverride::None => {}
+            PrimitiveTopologyOverride::None if topology_override_raw == 0 => {}
             PrimitiveTopologyOverride::Points => {
                 draw_topology = PrimitiveTopology::Points;
             }
@@ -100,16 +56,10 @@ pub fn resolve_draw_topology(
             PrimitiveTopologyOverride::LineStrip => {
                 draw_topology = PrimitiveTopology::LineStrip;
             }
+            _ => {
+                draw_topology = PrimitiveTopology::from_raw(topology_override_raw);
+            }
         },
-    }
-
-    if primitive_topology_control == PrimitiveTopologyControl::UseSeparateState
-        && topology_override != PrimitiveTopologyOverride::None
-        && topology_override != PrimitiveTopologyOverride::Points
-        && topology_override != PrimitiveTopologyOverride::Lines
-        && topology_override != PrimitiveTopologyOverride::LineStrip
-    {
-        draw_topology = PrimitiveTopology::from_raw(topology_override_raw);
     }
 
     draw_topology
@@ -167,10 +117,9 @@ impl IndexBufferSmall {
 
 /// Trait providing access to Maxwell3D state needed by DrawManager.
 ///
-/// Upstream DrawManager holds a raw `Maxwell3D*` pointer and accesses
-/// `maxwell3d->regs`, `maxwell3d->dirty.flags`, `maxwell3d->rasterizer`,
-/// and `maxwell3d->ShouldExecute()`. In Rust, we use a trait to avoid
-/// circular dependencies.
+/// Upstream DrawManager methods receive a `Maxwell3D&` and access its
+/// registers, dirty flags, rasterizer, and `ShouldExecute()`. Rust uses a
+/// trait for that same per-call relationship.
 pub trait Maxwell3DAccess {
     /// Whether conditional rendering allows execution.
     /// Upstream: `maxwell3d->ShouldExecute()`.
@@ -355,6 +304,11 @@ pub trait Maxwell3DAccess {
     /// Read `regs.framebuffer_srgb`.
     fn framebuffer_srgb(&self) -> bool {
         false
+    }
+
+    /// Read the raw `regs.user_clip_enable` mask.
+    fn user_clip_enable_raw(&self) -> u32 {
+        0
     }
 
     /// Read `regs.surface_clip.height`.
@@ -599,11 +553,7 @@ pub trait Maxwell3DAccess {
     fn program_base_address(&self) -> u64;
 
     /// Read one constant-buffer binding.
-    fn const_buffer_binding(
-        &self,
-        stage: usize,
-        slot: usize,
-    ) -> crate::engines::maxwell_3d::ConstBufferBinding;
+    fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferInfo;
 
     /// Read vertex attribute info for one attribute slot.
     fn vertex_attrib_info(&self, index: u32) -> crate::engines::maxwell_3d::VertexAttribInfo;
@@ -693,7 +643,7 @@ pub struct Maxwell3DDrawRegisters {
     pub index_buffer_gpu_addr: u64,
     pub index_buffer_gpu_addr_end: u64,
     pub render_targets: Maxwell3DRenderTargets,
-    pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    pub cb_bindings: [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     pub vertex_streams: [crate::engines::maxwell_3d::VertexStreamInfo; 32],
     pub vertex_stream_instances: [u32; 32],
     pub vertex_stream_limits: [VertexStreamLimit; 32],
@@ -742,6 +692,7 @@ pub struct Maxwell3DDrawRegisters {
     pub viewport_scale_offset_enabled: bool,
     pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
     pub framebuffer_srgb: bool,
+    pub user_clip_enable_raw: u32,
     pub depth_mode: crate::engines::maxwell_3d::DepthMode,
     pub dirty_flags: [bool; 256],
     pub color_masks: [crate::engines::maxwell_3d::ColorMaskInfo; 8],
@@ -802,6 +753,7 @@ impl Default for Maxwell3DDrawRegisters {
             viewport_scale_offset_enabled: false,
             surface_clip: Default::default(),
             framebuffer_srgb: false,
+            user_clip_enable_raw: 0,
             depth_mode: crate::engines::maxwell_3d::DepthMode::ZeroToOne,
             dirty_flags: [false; 256],
             color_masks: Default::default(),
@@ -887,6 +839,7 @@ impl Maxwell3DDrawRegisters {
             viewport_scale_offset_enabled: maxwell3d.viewport_scale_offset_enabled(),
             surface_clip: maxwell3d.surface_clip_info(),
             framebuffer_srgb: maxwell3d.framebuffer_srgb(),
+            user_clip_enable_raw: maxwell3d.user_clip_enable_raw(),
             depth_mode: maxwell3d.depth_stencil_info().depth_mode,
             dirty_flags: *maxwell3d.dirty_flags(),
             color_masks: std::array::from_fn(|i| maxwell3d.color_mask_info(i)),
@@ -969,6 +922,7 @@ impl Maxwell3DDrawRegisters {
             viewport_scale_offset_enabled: draw.viewport_scale_offset_enabled,
             surface_clip: draw.surface_clip,
             framebuffer_srgb: false,
+            user_clip_enable_raw: 0,
             depth_mode: draw.depth_stencil.depth_mode,
             dirty_flags: draw.dirty_flags,
             color_masks: draw.color_masks,
@@ -1251,7 +1205,7 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn cb_bindings(&self) -> [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES] {
+    pub fn cb_bindings(&self) -> [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
@@ -1260,7 +1214,7 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferBinding {
+    pub fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferInfo {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.const_buffer_binding(stage, slot),
             Maxwell3DDrawSource::Snapshot(registers) => registers.cb_bindings[stage][slot],
@@ -1687,6 +1641,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.framebuffer_srgb(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.framebuffer_srgb,
+        }
+    }
+
+    pub fn user_clip_enable_raw(&self) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.user_clip_enable_raw(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.user_clip_enable_raw,
         }
     }
 
@@ -2335,10 +2296,9 @@ pub struct IndirectParams {
 
 /// Manages draw call processing for the Maxwell 3D engine.
 ///
-/// Corresponds to the C++ `DrawManager` class. In the C++ code this holds a
-/// raw pointer to `Maxwell3D`; in Rust we use the `Maxwell3DAccess` trait
-/// for the methods that need register/rasterizer access, while keeping
-/// draw state here.
+/// Corresponds to the C++ `DrawManager` class. Rust uses the
+/// `Maxwell3DAccess` trait where Eden passes `Maxwell3D&`, while keeping the
+/// same draw state in this owner.
 pub struct DrawManager {
     pub draw_state: DrawState,
     pub draw_texture_state: DrawTextureState,
@@ -2504,9 +2464,6 @@ impl DrawManager {
     /// Process a method call that may trigger draw operations.
     ///
     /// Corresponds to `DrawManager::ProcessMethodCall`.
-    /// Stubbed — full implementation requires access to Maxwell3D registers to decode
-    /// MAXWELL3D_REG_INDEX values (clear_surface, draw.begin/end, index_buffer32_*, etc.)
-    /// Upstream: DrawManager::ProcessMethodCall() in video_core/engines/draw_manager.cpp
     pub fn process_method_call(
         &mut self,
         method: u32,
@@ -2523,7 +2480,7 @@ impl DrawManager {
                 self.draw_state.draw_indexed = true;
             }
             INDEX_BUFFER32_SUBSEQUENT | INDEX_BUFFER16_SUBSEQUENT | INDEX_BUFFER8_SUBSEQUENT => {
-                self.draw_state.instance_count += 1;
+                self.draw_state.instance_count = self.draw_state.instance_count.wrapping_add(1);
                 self.draw_index_small(argument, maxwell3d);
             }
             INDEX_BUFFER32_FIRST | INDEX_BUFFER16_FIRST | INDEX_BUFFER8_FIRST => {
@@ -2577,7 +2534,7 @@ impl DrawManager {
         if self.draw_state.draw_mode != DrawMode::Instance || self.draw_state.instance_count == 0 {
             return;
         }
-        let instance_count = self.draw_state.instance_count + 1;
+        let instance_count = self.draw_state.instance_count.wrapping_add(1);
         self.draw_end(instance_count, true, maxwell3d);
         self.draw_state.instance_count = 0;
     }
@@ -2620,9 +2577,9 @@ impl DrawManager {
             self.draw_state.instance_count = 1;
         }
 
-        self.draw_state.base_instance = self.draw_state.instance_count - 1;
+        self.draw_state.base_instance = self.draw_state.instance_count.wrapping_sub(1);
         self.draw_state.draw_mode = DrawMode::Instance;
-        self.draw_state.instance_count += 1;
+        self.draw_state.instance_count = self.draw_state.instance_count.wrapping_add(1);
         self.process_draw(false, 1, maxwell3d);
     }
 
@@ -2700,6 +2657,39 @@ impl DrawManager {
         self.draw_state.draw_mode = DrawMode::InlineIndex;
     }
 
+    /// Append a batch of packed inline indices.
+    ///
+    /// Corresponds to the bulk `DrawManager::SetInlineIndexBuffer` overload.
+    pub fn set_inline_index_buffer_multi(&mut self, method: u32, base_start: &[u32]) {
+        let index_buffer = &mut self.draw_state.inline_index_draw_indexes;
+        match method {
+            DRAW_INLINE_INDEX => {
+                index_buffer.extend_from_slice(bytemuck::cast_slice(base_start));
+            }
+            INLINE_INDEX_2X16_EVEN => {
+                index_buffer.reserve(base_start.len() * 2 * std::mem::size_of::<u32>());
+                for &word in base_start {
+                    let indexes = [word & 0xFFFF, word >> 16];
+                    index_buffer.extend_from_slice(bytemuck::cast_slice(&indexes));
+                }
+            }
+            INLINE_INDEX_4X8_INDEX0 => {
+                index_buffer.reserve(base_start.len() * 4 * std::mem::size_of::<u32>());
+                for &word in base_start {
+                    let indexes = [
+                        word & 0xFF,
+                        (word >> 8) & 0xFF,
+                        (word >> 16) & 0xFF,
+                        word >> 24,
+                    ];
+                    index_buffer.extend_from_slice(bytemuck::cast_slice(&indexes));
+                }
+            }
+            _ => {}
+        }
+        self.draw_state.draw_mode = DrawMode::InlineIndex;
+    }
+
     /// Handle draw-begin register write.
     ///
     /// Corresponds to `DrawManager::DrawBegin`.
@@ -2711,7 +2701,7 @@ impl DrawManager {
             self.draw_state.instance_count = 0;
             self.draw_state.draw_mode = DrawMode::General;
         } else if is_subsequent {
-            self.draw_state.instance_count += 1;
+            self.draw_state.instance_count = self.draw_state.instance_count.wrapping_add(1);
             self.draw_state.draw_mode = DrawMode::Instance;
         }
 
@@ -2935,6 +2925,30 @@ mod tests {
     }
 
     #[test]
+    fn bulk_inline_indices_match_upstream_native_word_layout() {
+        let mut manager = DrawManager::new();
+        manager.set_inline_index_buffer_multi(DRAW_INLINE_INDEX, &[0x4433_2211, 0x8877_6655]);
+        assert_eq!(
+            manager.draw_state.inline_index_draw_indexes,
+            bytemuck::cast_slice::<u32, u8>(&[0x4433_2211, 0x8877_6655])
+        );
+
+        manager.draw_state.inline_index_draw_indexes.clear();
+        manager.set_inline_index_buffer_multi(INLINE_INDEX_2X16_EVEN, &[0x4433_2211]);
+        assert_eq!(
+            manager.draw_state.inline_index_draw_indexes,
+            bytemuck::cast_slice::<u32, u8>(&[0x2211, 0x4433])
+        );
+
+        manager.draw_state.inline_index_draw_indexes.clear();
+        manager.set_inline_index_buffer_multi(INLINE_INDEX_4X8_INDEX0, &[0x4433_2211]);
+        assert_eq!(
+            manager.draw_state.inline_index_draw_indexes,
+            bytemuck::cast_slice::<u32, u8>(&[0x11, 0x22, 0x33, 0x44])
+        );
+    }
+
+    #[test]
     fn resolve_draw_topology_uses_separate_state_override() {
         let resolved = resolve_draw_topology(
             PrimitiveTopology::TriangleStrip,
@@ -2943,6 +2957,89 @@ mod tests {
             PrimitiveTopologyOverride::Lines as u32,
         );
         assert_eq!(resolved, PrimitiveTopology::Lines);
+    }
+
+    #[test]
+    fn resolve_draw_topology_preserves_all_upstream_override_values() {
+        let cases = [
+            (
+                PrimitiveTopologyOverride::Triangles,
+                PrimitiveTopology::Triangles,
+            ),
+            (
+                PrimitiveTopologyOverride::TriangleStrip,
+                PrimitiveTopology::TriangleStrip,
+            ),
+            (
+                PrimitiveTopologyOverride::LinesAdjacency,
+                PrimitiveTopology::LinesAdjacency,
+            ),
+            (
+                PrimitiveTopologyOverride::LineStripAdjacency,
+                PrimitiveTopology::LineStripAdjacency,
+            ),
+            (
+                PrimitiveTopologyOverride::TrianglesAdjacency,
+                PrimitiveTopology::TrianglesAdjacency,
+            ),
+            (
+                PrimitiveTopologyOverride::TriangleStripAdjacency,
+                PrimitiveTopology::TriangleStripAdjacency,
+            ),
+            (
+                PrimitiveTopologyOverride::Patches,
+                PrimitiveTopology::Patches,
+            ),
+        ];
+
+        for (topology_override, expected) in cases {
+            assert_eq!(
+                resolve_draw_topology(
+                    PrimitiveTopology::Points,
+                    PrimitiveTopologyControl::UseSeparateState,
+                    topology_override,
+                    topology_override as u32,
+                ),
+                expected
+            );
+        }
+
+        assert_eq!(
+            resolve_draw_topology(
+                PrimitiveTopology::Points,
+                PrimitiveTopologyControl::UseSeparateState,
+                PrimitiveTopologyOverride::from_raw(6),
+                6,
+            ),
+            PrimitiveTopology::TriangleFan
+        );
+
+        let legacy_cases = [
+            PrimitiveTopologyOverride::LegacyPoints,
+            PrimitiveTopologyOverride::LegacyIndexedLines,
+            PrimitiveTopologyOverride::LegacyIndexedTriangles,
+            PrimitiveTopologyOverride::LegacyLines,
+            PrimitiveTopologyOverride::LegacyLineStrip,
+            PrimitiveTopologyOverride::LegacyIndexedLineStrip,
+            PrimitiveTopologyOverride::LegacyTriangles,
+            PrimitiveTopologyOverride::LegacyTriangleStrip,
+            PrimitiveTopologyOverride::LegacyIndexedTriangleStrip,
+            PrimitiveTopologyOverride::LegacyTriangleFan,
+            PrimitiveTopologyOverride::LegacyIndexedTriangleFan,
+            PrimitiveTopologyOverride::LegacyTriangleFanImm,
+            PrimitiveTopologyOverride::LegacyLinesImm,
+            PrimitiveTopologyOverride::LegacyIndexedTriangles2,
+            PrimitiveTopologyOverride::LegacyIndexedLines2,
+        ];
+        for topology_override in legacy_cases {
+            let resolved = resolve_draw_topology(
+                PrimitiveTopology::Points,
+                PrimitiveTopologyControl::UseSeparateState,
+                topology_override,
+                topology_override as u32,
+            );
+            assert_eq!(resolved as u32, topology_override as u32);
+        }
     }
 
     #[test]

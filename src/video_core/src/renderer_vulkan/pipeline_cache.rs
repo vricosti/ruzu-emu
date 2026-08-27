@@ -23,6 +23,8 @@ use common::thread_worker::ThreadWorker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::draw_manager::Maxwell3DDrawView;
+use crate::engines::maxwell_3d::{ComparisonOp, PrimitiveTopology, VertexAttribType};
+use crate::gpu_logging::{dump_spirv_shader, get_instance, get_shader_stage_name, is_active};
 use crate::rasterizer_interface::{
     DiskResourceLoadCallback, DiskResourceLoadStop, LoadCallbackStage,
 };
@@ -30,23 +32,33 @@ use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache
 use crate::shader_environment::{
     load_pipelines, serialize_pipeline, ComputeEnvironment, FileEnvironment,
 };
+use crate::surface::{
+    is_pixel_format_integer, is_pixel_format_signed_integer, pixel_format_from_render_target_format,
+};
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference, NvidiaArchitecture};
 use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::frontend::control_flow::FlowBlock;
+use shader_recompiler::frontend::translate_program::{
+    convert_legacy_to_generic, generate_geometry_passthrough, merge_dual_vertex_programs,
+};
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::ir::basic_block::Block;
 use shader_recompiler::ir::instruction::Inst;
+use shader_recompiler::ir::program::Program;
+use shader_recompiler::ir::types::OutputTopology;
 use shader_recompiler::object_pool::ObjectPool;
-use shader_recompiler::{Profile, RuntimeInfo};
+use shader_recompiler::runtime_info::{
+    AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
+};
+use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::{CompiledShader, Profile, RuntimeInfo, ShaderStage};
 
 use super::buffer_cache::VulkanCommonBufferCache;
 use super::compute_pipeline::{ComputePipeline, ComputePipelineRuntime};
 use super::descriptor_buffer::DescriptorBufferRing;
 use super::descriptor_pool::DescriptorPool;
-use super::fixed_pipeline_state::{DynamicFeatures, FixedPipelineState};
-use super::graphics_pipeline::{
-    GraphicsPipeline, GraphicsPipelineCache, GraphicsPipelineKey, GraphicsPipelineRuntime,
-};
+use super::fixed_pipeline_state::{DynamicFeatures, FixedPipelineState, VertexAttribute};
+use super::graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey, GraphicsPipelineRuntime};
 use super::pipeline_statistics::PipelineStatistics;
 
 use super::render_pass_cache::RenderPassCache;
@@ -299,6 +311,670 @@ fn dump_failed_graphics_environments(
         environments.envs[stage]
             .generic_environment_mut()
             .dump(pipeline_hash, shader_hash);
+    }
+}
+
+fn maxwell_to_output_topology(topology: PrimitiveTopology) -> OutputTopology {
+    match topology {
+        PrimitiveTopology::Points => OutputTopology::PointList,
+        PrimitiveTopology::LineStrip => OutputTopology::LineStrip,
+        _ => OutputTopology::TriangleStrip,
+    }
+}
+
+fn cast_attribute_type(attribute: VertexAttribute) -> AttributeType {
+    if !attribute.is_enabled() {
+        return AttributeType::Disabled;
+    }
+    match VertexAttribType::from_raw(attribute.attrib_type()) {
+        VertexAttribType::Invalid => AttributeType::Disabled,
+        VertexAttribType::SNorm | VertexAttribType::UNorm | VertexAttribType::Float => {
+            AttributeType::Float
+        }
+        VertexAttribType::SInt => AttributeType::SignedInt,
+        VertexAttribType::UInt => AttributeType::UnsignedInt,
+        VertexAttribType::UScaled => AttributeType::UnsignedScaled,
+        VertexAttribType::SScaled => AttributeType::SignedScaled,
+    }
+}
+
+fn attribute_type(state: &FixedPipelineState, index: usize) -> AttributeType {
+    match state.dynamic_attribute_type(index) {
+        0 => AttributeType::Disabled,
+        1 => AttributeType::Float,
+        2 => AttributeType::SignedInt,
+        3 => AttributeType::UnsignedInt,
+        _ => AttributeType::Disabled,
+    }
+}
+
+fn maxwell_to_compare_function(op: ComparisonOp) -> CompareFunction {
+    match op {
+        ComparisonOp::Never => CompareFunction::Never,
+        ComparisonOp::Less => CompareFunction::Less,
+        ComparisonOp::Equal => CompareFunction::Equal,
+        ComparisonOp::LessEqual => CompareFunction::LessThanEqual,
+        ComparisonOp::Greater => CompareFunction::Greater,
+        ComparisonOp::NotEqual => CompareFunction::NotEqual,
+        ComparisonOp::GreaterEqual => CompareFunction::GreaterThanEqual,
+        ComparisonOp::Always => CompareFunction::Always,
+    }
+}
+
+fn fill_transform_feedback_runtime_info(info: &mut RuntimeInfo, state: &FixedPipelineState) {
+    let (varyings, count) =
+        crate::transform_feedback::make_transform_feedback_varyings(&state.xfb_state);
+    info.xfb_varyings = varyings;
+    info.xfb_count = count;
+}
+
+/// Port of `MakeRuntimeInfo` in Eden `vk_pipeline_cache.cpp`.
+#[derive(Clone, Copy)]
+struct RuntimeInfoDeviceFeatures {
+    transform_feedback: bool,
+    molten_vk: bool,
+}
+
+fn make_runtime_info_with_features(
+    programs: &[Option<Program>; NUM_PROGRAMS],
+    key: &GraphicsPipelineKey,
+    program: &Program,
+    previous_program: Option<&Program>,
+    device_features: RuntimeInfoDeviceFeatures,
+) -> RuntimeInfo {
+    let state = &key.fixed_state;
+    let mut info = RuntimeInfo::default();
+    if let Some(previous_program) = previous_program {
+        info.previous_stage_stores = previous_program.info.stores.clone();
+        info.previous_stage_legacy_stores_mapping =
+            previous_program.info.legacy_stores_mapping.clone();
+        if previous_program.is_geometry_passthrough {
+            for (stores, passthrough) in info
+                .previous_stage_stores
+                .mask
+                .iter_mut()
+                .zip(previous_program.info.passthrough.mask)
+            {
+                *stores |= passthrough;
+            }
+        }
+    } else {
+        info.previous_stage_stores.mask.fill(u64::MAX);
+    }
+
+    let has_geometry = key.unique_hashes[4] != 0
+        && programs[4]
+            .as_ref()
+            .is_some_and(|geometry| !geometry.is_geometry_passthrough);
+    let point_size = f32::from_bits(state.point_size);
+    match program.stage {
+        ShaderStage::VertexB => {
+            if !has_geometry {
+                if state.topology() == PrimitiveTopology::Points {
+                    info.fixed_state_point_size = Some(point_size);
+                }
+                if state.xfb_enabled() {
+                    if device_features.transform_feedback {
+                        fill_transform_feedback_runtime_info(&mut info, state);
+                    } else {
+                        log::warn!(
+                            "XFB requested in pipeline key but device lacks VK_EXT_transform_feedback; ignoring XFB decorations"
+                        );
+                    }
+                }
+                info.convert_depth_mode = state.ndc_minus_one_to_one();
+            }
+            for (index, fixed_attribute) in state.attributes.iter().copied().enumerate() {
+                info.generic_input_types[index] = if state.dynamic_vertex_input() {
+                    attribute_type(state, index)
+                } else {
+                    cast_attribute_type(fixed_attribute)
+                };
+            }
+        }
+        ShaderStage::TessellationEval => {
+            info.tess_clockwise = state.tessellation_clockwise();
+            info.tess_primitive = match state.tessellation_primitive() {
+                0 => TessPrimitive::Isolines,
+                1 => TessPrimitive::Triangles,
+                2 => TessPrimitive::Quads,
+                _ => TessPrimitive::Triangles,
+            };
+            info.tess_spacing = match state.tessellation_spacing() {
+                0 => TessSpacing::Equal,
+                1 => TessSpacing::FractionalOdd,
+                2 => TessSpacing::FractionalEven,
+                _ => TessSpacing::Equal,
+            };
+        }
+        ShaderStage::Geometry => {
+            if program.output_topology == OutputTopology::PointList {
+                info.fixed_state_point_size = Some(point_size);
+            }
+            if state.xfb_enabled() {
+                if device_features.transform_feedback {
+                    fill_transform_feedback_runtime_info(&mut info, state);
+                } else {
+                    log::warn!(
+                        "XFB requested in pipeline key but device lacks VK_EXT_transform_feedback; ignoring XFB decorations"
+                    );
+                }
+            }
+            info.convert_depth_mode = state.ndc_minus_one_to_one();
+        }
+        ShaderStage::Fragment => {
+            info.alpha_test_func = Some(maxwell_to_compare_function(state.alpha_test_func()));
+            info.alpha_test_reference = f32::from_bits(state.alpha_test_ref);
+            info.dual_source_blend = state.attachment0_dual_source_blend();
+            if device_features.molten_vk {
+                for (index, &format) in state.color_formats.iter().enumerate() {
+                    if format == 0 {
+                        info.frag_color_types[index] = AttributeType::Float;
+                        continue;
+                    }
+                    let pixel_format = pixel_format_from_render_target_format(format as u32);
+                    info.frag_color_types[index] = if is_pixel_format_signed_integer(pixel_format) {
+                        AttributeType::SignedInt
+                    } else if is_pixel_format_integer(pixel_format) {
+                        AttributeType::UnsignedInt
+                    } else {
+                        AttributeType::Float
+                    };
+                }
+            }
+        }
+        _ => {}
+    }
+
+    info.input_topology = match state.topology() {
+        PrimitiveTopology::Points => InputTopology::Points,
+        PrimitiveTopology::Lines | PrimitiveTopology::LineLoop | PrimitiveTopology::LineStrip => {
+            InputTopology::Lines
+        }
+        PrimitiveTopology::LinesAdjacency | PrimitiveTopology::LineStripAdjacency => {
+            InputTopology::LinesAdjacency
+        }
+        PrimitiveTopology::TrianglesAdjacency | PrimitiveTopology::TriangleStripAdjacency => {
+            InputTopology::TrianglesAdjacency
+        }
+        PrimitiveTopology::Triangles
+        | PrimitiveTopology::TriangleStrip
+        | PrimitiveTopology::TriangleFan
+        | PrimitiveTopology::Quads
+        | PrimitiveTopology::QuadStrip
+        | PrimitiveTopology::Polygon
+        | PrimitiveTopology::Patches => InputTopology::Triangles,
+        _ => InputTopology::Points,
+    };
+    info.force_early_z = state.early_z();
+    info.y_negate = state.y_negate();
+    info
+}
+
+fn make_runtime_info(
+    programs: &[Option<Program>; NUM_PROGRAMS],
+    key: &GraphicsPipelineKey,
+    program: &Program,
+    previous_program: Option<&Program>,
+    device: &Device,
+) -> RuntimeInfo {
+    make_runtime_info_with_features(
+        programs,
+        key,
+        program,
+        previous_program,
+        RuntimeInfoDeviceFeatures {
+            transform_feedback: device.is_ext_transform_feedback_supported(),
+            molten_vk: device.is_molten_vk(),
+        },
+    )
+}
+
+fn graphics_environment_is_present(
+    environments: &GraphicsEnvironments,
+    program_index: usize,
+) -> bool {
+    environments
+        .env_ptrs
+        .iter()
+        .flatten()
+        .any(|&index| index == program_index)
+}
+
+/// Port of the translation and SPIR-V-emission body of
+/// `PipelineCache::CreateGraphicsPipeline`.
+pub(super) fn compile_graphics_stages_from_environments(
+    device: &Device,
+    profile: &Profile,
+    host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey,
+    environments: &mut GraphicsEnvironments,
+) -> Option<[Option<CompiledShader>; 5]> {
+    let uses_vertex_a = key.unique_hashes[0] != 0;
+    let uses_vertex_b = key.unique_hashes[1] != 0;
+    if !uses_vertex_b {
+        return None;
+    }
+
+    let pipeline_hash = key.hash_value();
+    let dump_guest_shaders = *common::settings::values().dump_guest_shaders.get_value();
+    let mut programs: [Option<Program>; NUM_PROGRAMS] = std::array::from_fn(|_| None);
+    let mut layer_source_program: Option<usize> = None;
+
+    for program_index in 0..NUM_PROGRAMS {
+        let is_emulated_stage = layer_source_program.is_some() && program_index == 4;
+        if key.unique_hashes[program_index] == 0 && is_emulated_stage {
+            let source = programs[layer_source_program?].as_ref()?.clone();
+            programs[program_index] = Some(generate_geometry_passthrough(
+                host_info,
+                &source,
+                maxwell_to_output_topology(key.fixed_state.topology()),
+            ));
+            continue;
+        }
+        if key.unique_hashes[program_index] == 0
+            || !graphics_environment_is_present(environments, program_index)
+        {
+            continue;
+        }
+
+        let env = &mut environments.envs[program_index];
+        if env.generic_environment().cached_code_slice().is_empty()
+            && env.generic_environment_mut().analyze().is_none()
+        {
+            return None;
+        }
+        let code = env
+            .generic_environment()
+            .cached_instruction_slice()
+            .to_vec();
+        if code.is_empty() {
+            return None;
+        }
+        let cfg_offset = env.generic_environment().cached_instruction_start();
+        let mut program =
+            shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                &code, cfg_offset, env, host_info,
+            );
+        if uses_vertex_a && program_index == 1 {
+            let mut vertex_a = programs[0].take()?;
+            program = merge_dual_vertex_programs(&mut vertex_a, &mut program, env);
+        }
+        if dump_guest_shaders {
+            env.generic_environment_mut()
+                .dump(pipeline_hash, key.unique_hashes[program_index]);
+        }
+        if program.info.requires_layer_emulation {
+            layer_source_program = Some(program_index);
+        }
+        programs[program_index] = Some(program);
+    }
+
+    let mut bindings = Bindings::default();
+    let mut compiled_stages: [Option<CompiledShader>; 5] = std::array::from_fn(|_| None);
+    let mut previous_stage_index: Option<usize> = None;
+    let first_program = if uses_vertex_a && uses_vertex_b { 1 } else { 0 };
+    for program_index in first_program..NUM_PROGRAMS {
+        let is_emulated_stage = layer_source_program.is_some() && program_index == 4;
+        if key.unique_hashes[program_index] == 0 && !is_emulated_stage {
+            continue;
+        }
+        if program_index == 0 {
+            return None;
+        }
+
+        let runtime_info = {
+            let program = programs[program_index].as_ref()?;
+            let previous_program = previous_stage_index.and_then(|index| programs[index].as_ref());
+            make_runtime_info(&programs, key, program, previous_program, device)
+        };
+        let program = programs[program_index].as_mut()?;
+        convert_legacy_to_generic(program, &runtime_info);
+        let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+            program,
+            profile,
+            &runtime_info,
+            &mut bindings,
+        );
+        compiled_stages[program_index - 1] = Some(CompiledShader {
+            spirv_words,
+            info: program.info.clone(),
+            stage: program.stage,
+        });
+        previous_stage_index = Some(program_index);
+    }
+    compiled_stages[0].as_ref()?;
+    Some(compiled_stages)
+}
+
+fn shader_stage_for_program(program_index: usize) -> Option<ShaderStage> {
+    match program_index {
+        0 => Some(ShaderStage::VertexA),
+        1 => Some(ShaderStage::VertexB),
+        2 => Some(ShaderStage::TessellationControl),
+        3 => Some(ShaderStage::TessellationEval),
+        4 => Some(ShaderStage::Geometry),
+        5 => Some(ShaderStage::Fragment),
+        _ => None,
+    }
+}
+
+fn two_mut<T>(slice: &mut [T], lhs: usize, rhs: usize) -> Option<(&mut T, &mut T)> {
+    if lhs == rhs || lhs >= slice.len() || rhs >= slice.len() {
+        return None;
+    }
+    if lhs < rhs {
+        let (left, right) = slice.split_at_mut(rhs);
+        Some((&mut left[lhs], &mut right[0]))
+    } else {
+        let (left, right) = slice.split_at_mut(lhs);
+        Some((&mut right[0], &mut left[rhs]))
+    }
+}
+
+/// Disk-environment entry point for the same upstream
+/// `PipelineCache::CreateGraphicsPipeline` body.
+pub(super) fn compile_graphics_stages_from_file_environments(
+    device: &Device,
+    profile: &Profile,
+    host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey,
+    environments: &mut [FileEnvironment],
+) -> Option<[Option<CompiledShader>; 5]> {
+    let uses_vertex_a = key.unique_hashes[0] != 0;
+    let uses_vertex_b = key.unique_hashes[1] != 0;
+    if !uses_vertex_b {
+        return None;
+    }
+
+    let pipeline_hash = key.hash_value();
+    let dump_guest_shaders = *common::settings::values().dump_guest_shaders.get_value();
+    let mut programs: [Option<Program>; NUM_PROGRAMS] = std::array::from_fn(|_| None);
+    let mut layer_source_program: Option<usize> = None;
+
+    for program_index in 0..NUM_PROGRAMS {
+        let is_emulated_stage = layer_source_program.is_some() && program_index == 4;
+        if key.unique_hashes[program_index] == 0 && is_emulated_stage {
+            let source = programs[layer_source_program?].as_ref()?.clone();
+            programs[program_index] = Some(generate_geometry_passthrough(
+                host_info,
+                &source,
+                maxwell_to_output_topology(key.fixed_state.topology()),
+            ));
+            continue;
+        }
+        if key.unique_hashes[program_index] == 0 {
+            continue;
+        }
+        let stage = shader_stage_for_program(program_index)?;
+        let env_index = environments
+            .iter()
+            .position(|environment| environment.shader_stage() == stage)?;
+        let env = &mut environments[env_index];
+        let code = env.cached_instruction_slice().to_vec();
+        if code.is_empty() {
+            return None;
+        }
+        let cfg_offset = env.cached_instruction_start();
+        let mut program =
+            shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                &code, cfg_offset, env, host_info,
+            );
+        if uses_vertex_a && program_index == 1 {
+            let vertex_a_index = environments
+                .iter()
+                .position(|environment| environment.shader_stage() == ShaderStage::VertexA)?;
+            let vertex_b_index = env_index;
+            let (_, vertex_b) = two_mut(environments, vertex_a_index, vertex_b_index)?;
+            let mut vertex_a = programs[0].take()?;
+            program = merge_dual_vertex_programs(&mut vertex_a, &mut program, vertex_b);
+        }
+        if dump_guest_shaders {
+            environments[env_index].dump(pipeline_hash, key.unique_hashes[program_index]);
+        }
+        if program.info.requires_layer_emulation {
+            layer_source_program = Some(program_index);
+        }
+        programs[program_index] = Some(program);
+    }
+
+    let mut bindings = Bindings::default();
+    let mut compiled_stages: [Option<CompiledShader>; 5] = std::array::from_fn(|_| None);
+    let mut previous_stage_index: Option<usize> = None;
+    let first_program = if uses_vertex_a && uses_vertex_b { 1 } else { 0 };
+    for program_index in first_program..NUM_PROGRAMS {
+        let is_emulated_stage = layer_source_program.is_some() && program_index == 4;
+        if key.unique_hashes[program_index] == 0 && !is_emulated_stage {
+            continue;
+        }
+        if program_index == 0 {
+            return None;
+        }
+        let runtime_info = {
+            let program = programs[program_index].as_ref()?;
+            let previous_program = previous_stage_index.and_then(|index| programs[index].as_ref());
+            make_runtime_info(&programs, key, program, previous_program, device)
+        };
+        let program = programs[program_index].as_mut()?;
+        convert_legacy_to_generic(program, &runtime_info);
+        let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+            program,
+            profile,
+            &runtime_info,
+            &mut bindings,
+        );
+        compiled_stages[program_index - 1] = Some(CompiledShader {
+            spirv_words,
+            info: program.info.clone(),
+            stage: program.stage,
+        });
+        previous_stage_index = Some(program_index);
+    }
+    compiled_stages[0].as_ref()?;
+    Some(compiled_stages)
+}
+
+fn stage_infos_from_compiled(compiled_stages: &[Option<CompiledShader>; 5]) -> [ShaderInfo; 5] {
+    std::array::from_fn(|index| {
+        compiled_stages[index]
+            .as_ref()
+            .map(|compiled| compiled.info.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// Rust lifetime adapter for the state captured by Eden
+/// `PipelineCache::CreateGraphicsPipeline` worker jobs. Translation and shader
+/// module creation remain owned by this file.
+struct GraphicsPipelineBuilder {
+    device_owner: DeviceReference,
+    profile: Profile,
+    host_info: HostTranslateInfo,
+}
+
+impl GraphicsPipelineBuilder {
+    fn new(device: &Device, profile: Profile, host_info: HostTranslateInfo) -> Self {
+        Self {
+            device_owner: DeviceReference::new(device),
+            profile,
+            host_info,
+        }
+    }
+
+    fn clone_for_disk_worker(&self) -> Self {
+        Self {
+            device_owner: self.device_owner,
+            profile: self.profile.clone(),
+            host_info: self.host_info.clone(),
+        }
+    }
+
+    fn build_from_environments(
+        &mut self,
+        pipeline_cache: vk::PipelineCache,
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
+        environments: &mut GraphicsEnvironments,
+        key: &GraphicsPipelineKey,
+        worker: &ThreadWorker,
+        runtime: GraphicsPipelineRuntime,
+        pipeline_statistics: Option<Arc<PipelineStatistics>>,
+    ) -> Option<GraphicsPipeline> {
+        let compiled_stages = compile_graphics_stages_from_environments(
+            self.device_owner.get(),
+            &self.profile,
+            &self.host_info,
+            key,
+            environments,
+        )?;
+        self.build_pipeline(
+            pipeline_cache,
+            shader_notify,
+            key,
+            compiled_stages,
+            Some(worker),
+            runtime,
+            pipeline_statistics,
+        )
+    }
+
+    fn build_from_file_environments(
+        &mut self,
+        pipeline_cache: vk::PipelineCache,
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
+        environments: &mut [FileEnvironment],
+        key: &GraphicsPipelineKey,
+        runtime: GraphicsPipelineRuntime,
+        pipeline_statistics: Option<Arc<PipelineStatistics>>,
+    ) -> Option<GraphicsPipeline> {
+        match catch_shader_exception(|| {
+            let compiled_stages = compile_graphics_stages_from_file_environments(
+                self.device_owner.get(),
+                &self.profile,
+                &self.host_info,
+                key,
+                environments,
+            )?;
+            self.build_pipeline(
+                pipeline_cache,
+                shader_notify,
+                key,
+                compiled_stages,
+                None,
+                runtime,
+                pipeline_statistics,
+            )
+        }) {
+            Ok(pipeline) => pipeline,
+            Err(reason) => {
+                log::error!(
+                    "Skipping cached graphics pipeline 0x{:016X}: {}",
+                    key.hash_value(),
+                    reason
+                );
+                None
+            }
+        }
+    }
+
+    fn build_pipeline(
+        &self,
+        pipeline_cache: vk::PipelineCache,
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
+        key: &GraphicsPipelineKey,
+        compiled_stages: [Option<CompiledShader>; 5],
+        worker: Option<&ThreadWorker>,
+        runtime: GraphicsPipelineRuntime,
+        pipeline_statistics: Option<Arc<PipelineStatistics>>,
+    ) -> Option<GraphicsPipeline> {
+        let shader_modules = self.create_shader_modules(key, &compiled_stages)?;
+        let pipeline = match GraphicsPipeline::new_unbuilt(
+            self.device_owner,
+            pipeline_cache,
+            shader_notify,
+            key,
+            stage_infos_from_compiled(&compiled_stages),
+            shader_modules,
+            false,
+            runtime,
+        ) {
+            Some(pipeline) => pipeline,
+            None => {
+                self.destroy_shader_modules(shader_modules);
+                return None;
+            }
+        };
+        if let Some(worker) = worker {
+            pipeline.queue_make_pipeline(worker, runtime, shader_notify, pipeline_statistics);
+        } else {
+            pipeline.finish_build_sync(
+                unsafe { runtime.render_pass_cache() },
+                pipeline_statistics.as_deref(),
+            );
+            shader_notify.mark_shader_complete();
+        }
+        Some(pipeline)
+    }
+
+    fn create_shader_modules(
+        &self,
+        key: &GraphicsPipelineKey,
+        compiled_stages: &[Option<CompiledShader>; 5],
+    ) -> Option<[vk::ShaderModule; 5]> {
+        let mut modules = [vk::ShaderModule::null(); 5];
+        for (index, compiled) in compiled_stages.iter().enumerate() {
+            let Some(compiled) = compiled else {
+                continue;
+            };
+            self.device_owner.get().save_shader(&compiled.spirv_words);
+            let create_info = vk::ShaderModuleCreateInfo::builder()
+                .code(&compiled.spirv_words)
+                .build();
+            modules[index] = match unsafe {
+                self.device_owner
+                    .get()
+                    .get_logical()
+                    .create_shader_module(&create_info, None)
+            } {
+                Ok(module) => module,
+                Err(error) => {
+                    log::warn!("Failed to create graphics shader module: {error:?}");
+                    self.destroy_shader_modules(modules);
+                    return None;
+                }
+            };
+            let unique_hash = key.unique_hashes[index + 1];
+            let should_log = is_active();
+            let should_dump = *common::settings::values().gpu_log_shader_dumps.get_value();
+            if should_log || should_dump {
+                let shader_name = shader_log_name(unique_hash, get_shader_stage_name(index));
+                if should_log {
+                    let shader_info = shader_log_info(unique_hash, compiled.spirv_words.len());
+                    get_instance().log_shader_compilation(&shader_name, &shader_info);
+                }
+                if should_dump {
+                    dump_spirv_shader(unique_hash, &compiled.spirv_words);
+                }
+            }
+            if self.device_owner.get().has_debugging_tool_attached() {
+                self.device_owner
+                    .get()
+                    .set_shader_module_name(modules[index], &format!("Shader {unique_hash:016x}"));
+            }
+        }
+        Some(modules)
+    }
+
+    fn destroy_shader_modules(&self, modules: [vk::ShaderModule; 5]) {
+        for module in modules {
+            if module != vk::ShaderModule::null() {
+                unsafe {
+                    self.device_owner
+                        .get()
+                        .get_logical()
+                        .destroy_shader_module(module, None);
+                }
+            }
+        }
     }
 }
 
@@ -569,6 +1245,17 @@ fn compute_key_to_cache_bytes(key: &ComputePipelineCacheKey) -> Vec<u8> {
     bytes
 }
 
+fn shader_log_name(unique_hash: u64, stage_name: &str) -> String {
+    format!("shader_{unique_hash:016x}_{stage_name}")
+}
+
+fn shader_log_info(unique_hash: u64, spirv_word_count: usize) -> String {
+    format!(
+        "SPIR-V size: {} bytes, hash: {unique_hash:016x}",
+        spirv_word_count * std::mem::size_of::<u32>()
+    )
+}
+
 /// Compute half of upstream `PipelineCache::CreateComputePipeline` between
 /// CFG/environment construction and `BuildShader`.
 fn compile_compute_program(
@@ -600,17 +1287,7 @@ fn compile_compute_program(
         );
         program.shared_memory_size = max_shared_memory;
     }
-    shader_recompiler::frontend::translate_program::convert_legacy_to_generic(
-        &mut program,
-        &runtime_info,
-    );
-    let mut bindings = Bindings::default();
-    let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
-        &program,
-        profile,
-        &runtime_info,
-        &mut bindings,
-    );
+    let spirv_words = shader_recompiler::backend::emit_spirv(&program, profile, &runtime_info);
     shader_recompiler::CompiledShader {
         spirv_words,
         info: program.info,
@@ -670,6 +1347,18 @@ where
         .code(&compiled.spirv_words)
         .build();
     let spv_module = unsafe { device.create_shader_module(&create_info, None).ok()? };
+    let should_log = is_active();
+    let should_dump = *common::settings::values().gpu_log_shader_dumps.get_value();
+    if should_log || should_dump {
+        let shader_name = shader_log_name(key.unique_hash, "compute");
+        if should_log {
+            let shader_info = shader_log_info(key.unique_hash, compiled.spirv_words.len());
+            get_instance().log_shader_compilation(&shader_name, &shader_info);
+        }
+        if should_dump {
+            dump_spirv_shader(key.unique_hash, &compiled.spirv_words);
+        }
+    }
     if vulkan_device.has_debugging_tool_attached() {
         vulkan_device
             .set_shader_module_name(spv_module, &format!("Shader {:016x}", key.unique_hash));
@@ -795,7 +1484,7 @@ pub struct PipelineCache {
     compute_runtime: ComputePipelineRuntime,
     profile: Profile,
     host_info: HostTranslateInfo,
-    graphics_pipeline_cache: GraphicsPipelineCache,
+    graphics_pipeline_builder: GraphicsPipelineBuilder,
     // Upstream stores nullable unique_ptr values in a node-stable map. `None`
     // is the negative-cache entry left by a failed creation, and `Box` keeps
     // transition/current pointers stable across HashMap growth.
@@ -811,10 +1500,12 @@ pub struct PipelineCache {
     vulkan_pipeline_cache_filename: PathBuf,
     vulkan_pipeline_cache: vk::PipelineCache,
 
-    // Upstream's node-based cache keeps returned `ComputePipeline*` stable.
-    // Box each Rust value so HashMap growth cannot move the pipeline owner.
+    // Upstream's node-based cache keeps returned `ComputePipeline*` stable and
+    // retains a null unique_ptr after a failed build. `None` preserves that
+    // negative-cache entry; `Box` keeps successful pipelines stable across
+    // HashMap growth.
     compute_cache:
-        HashMap<ComputePipelineCacheKey, Box<ComputePipeline>, BuildUnorderedDenseHasher>,
+        HashMap<ComputePipelineCacheKey, Option<Box<ComputePipeline>>, BuildUnorderedDenseHasher>,
     /// Upstream `Common::ThreadWorker workers`, owned by `PipelineCache`.
     ///
     /// This is the required owner for disk-cache rebuild jobs and asynchronous
@@ -893,7 +1584,24 @@ impl PipelineCache {
             has_provoking_vertex_tf_preserve: vulkan_device
                 .supports_transform_feedback_provoking_vertex_preservation(),
         };
-        let mut pipeline_cache = PipelineCache {
+        if vulkan_device.get_max_vertex_input_attributes() < 32 {
+            log::warn!(
+                "maxVertexInputAttributes is too low: {} < 32",
+                vulkan_device.get_max_vertex_input_attributes()
+            );
+        }
+        if vulkan_device.get_max_vertex_input_bindings() < 32 {
+            log::warn!(
+                "maxVertexInputBindings is too low: {} < 32",
+                vulkan_device.get_max_vertex_input_bindings()
+            );
+        }
+        log::info!(
+            "DynamicState setting value: {}",
+            *common::settings::values().dyna_state.get_value() as u32
+        );
+
+        let pipeline_cache = PipelineCache {
             device_owner: DeviceReference::new(vulkan_device),
             device: device.clone(),
             descriptor_pool: NonNull::from(&mut *descriptor_pool),
@@ -912,13 +1620,18 @@ impl PipelineCache {
                 render_pass_cache,
             ),
             compute_runtime: ComputePipelineRuntime::new(
+                &mut *scheduler,
                 &mut *guest_descriptor_queue,
                 &mut *descriptor_buffer_ring,
                 &mut *descriptor_pool,
             ),
             profile: profile.clone(),
             host_info: host_info.clone(),
-            graphics_pipeline_cache: GraphicsPipelineCache::new(vulkan_device, profile, host_info),
+            graphics_pipeline_builder: GraphicsPipelineBuilder::new(
+                vulkan_device,
+                profile,
+                host_info,
+            ),
             graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
@@ -936,11 +1649,6 @@ impl PipelineCache {
                 1,
                 "VkPipelineSerialization".to_string(),
             ),
-        };
-        pipeline_cache.vulkan_pipeline_cache = if use_vulkan_pipeline_cache {
-            pipeline_cache.create_empty_vulkan_pipeline_cache()
-        } else {
-            vk::PipelineCache::null()
         };
         pipeline_cache
     }
@@ -1010,6 +1718,7 @@ impl PipelineCache {
             workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
         };
         if !self.compute_cache.contains_key(&key) {
+            self.compute_cache.insert(key, None);
             let gpu_memory = shared_cache.current_gpu_memory()?;
             let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
             env.generic_environment_mut().set_cached_size(shader_size);
@@ -1023,12 +1732,16 @@ impl PipelineCache {
                     serialize_pipeline(&key_bytes, &[&generic_env], &filename, CACHE_VERSION);
                 });
             }
-            self.compute_cache.insert(key, Box::new(pipeline));
+            *self
+                .compute_cache
+                .get_mut(&key)
+                .expect("new compute cache entry disappeared") = Some(Box::new(pipeline));
         }
         self.compute_cache
             .get_mut(&key)
+            .and_then(Option::as_deref_mut)
             .map(|pipeline| CurrentComputePipeline {
-                pipeline_owner: NonNull::from(pipeline.as_mut()),
+                pipeline_owner: NonNull::from(pipeline),
             })
     }
 
@@ -1058,7 +1771,10 @@ impl PipelineCache {
     where
         E: shader_recompiler::environment::Environment,
     {
-        let worker = self.use_asynchronous_shaders.then_some(&self.workers);
+        // Eden always builds runtime compute pipelines on the pipeline worker.
+        // `use_asynchronous_shaders` controls whether callers wait for the
+        // result, not where Vulkan performs the build.
+        let worker = Some(&self.workers);
         build_compute_pipeline(
             self.device_owner,
             &self.profile,
@@ -1130,28 +1846,15 @@ impl PipelineCache {
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
         let pipeline = match catch_shader_exception(|| {
-            if self.use_asynchronous_shaders {
-                self.graphics_pipeline_cache
-                    .build_pipeline_keyed_from_environments_async(
-                        pipeline_cache,
-                        self.shader_notify,
-                        &mut environments,
-                        key,
-                        &self.workers,
-                        self.graphics_runtime,
-                        None,
-                    )
-            } else {
-                self.graphics_pipeline_cache
-                    .build_pipeline_keyed_from_environments(
-                        pipeline_cache,
-                        self.shader_notify,
-                        &mut environments,
-                        key,
-                        self.graphics_runtime,
-                        None,
-                    )
-            }
+            self.graphics_pipeline_builder.build_from_environments(
+                pipeline_cache,
+                self.shader_notify,
+                &mut environments,
+                key,
+                &self.workers,
+                self.graphics_runtime,
+                None,
+            )
         }) {
             Ok(Some(pipeline)) => pipeline,
             Ok(None) => return None,
@@ -1309,7 +2012,7 @@ impl PipelineCache {
                 skipped.set(skipped.get() + 1);
                 continue;
             }
-            let mut builder = self.graphics_pipeline_cache.clone_for_disk_worker();
+            let mut builder = self.graphics_pipeline_builder.clone_for_disk_worker();
             let vulkan_pipeline_cache = self.vulkan_pipeline_cache;
             let shader_notify = self.shader_notify;
             let graphics_runtime = self.graphics_runtime;
@@ -1320,7 +2023,7 @@ impl PipelineCache {
             let statistics = pipeline_statistics.clone();
             self.workers.queue_stateless_work(move || {
                 let mut envs = envs;
-                match builder.build_pipeline_keyed_from_file_environments(
+                match builder.build_from_file_environments(
                     vulkan_pipeline_cache,
                     shader_notify,
                     &mut envs,
@@ -1356,7 +2059,7 @@ impl PipelineCache {
                     if self.compute_cache.contains_key(&key) {
                         skipped_count += 1;
                     } else {
-                        self.compute_cache.insert(key, Box::new(pipeline));
+                        self.compute_cache.insert(key, Some(Box::new(pipeline)));
                         built += 1;
                     }
                 }
@@ -1489,13 +2192,144 @@ impl Drop for PipelineCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::const_buffer_info::ConstBufferInfo;
     use crate::engines::maxwell_3d::{
         AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ComparisonOp,
-        ConstBufferBinding, CullFace, DepthMode, DepthStencilInfo, DrawCall, FrontFace,
-        IndexFormat, LogicOpInfo, PolygonMode, PrimitiveTopology, RasterizerInfo, RenderTargetInfo,
-        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
-        ZetaInfo,
+        CullFace, DepthMode, DepthStencilInfo, DrawCall, FrontFace, IndexFormat, LogicOpInfo,
+        PolygonMode, PrimitiveTopology, RasterizerInfo, RenderTargetInfo, RtControlInfo,
+        SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo, ZetaInfo,
     };
+
+    fn program_slots_with(
+        program_index: usize,
+        program: Program,
+    ) -> [Option<Program>; NUM_PROGRAMS] {
+        let mut programs = std::array::from_fn(|_| None);
+        programs[program_index] = Some(program);
+        programs
+    }
+
+    #[test]
+    fn runtime_info_fragment_color_types_are_moltenvk_only() {
+        let mut fixed_state = FixedPipelineState::default();
+        fixed_state.color_formats[0] = crate::gpu::RenderTargetFormat::R32Uint as u8;
+        let key = GraphicsPipelineKey {
+            unique_hashes: [0, 1, 0, 0, 0, 1],
+            fixed_state,
+        };
+        let fragment = Program::new(ShaderStage::Fragment);
+        let programs = program_slots_with(5, fragment);
+
+        let native = make_runtime_info_with_features(
+            &programs,
+            &key,
+            programs[5].as_ref().unwrap(),
+            None,
+            RuntimeInfoDeviceFeatures {
+                transform_feedback: false,
+                molten_vk: false,
+            },
+        );
+        assert_eq!(native.frag_color_types[0], AttributeType::Float);
+
+        let molten_vk = make_runtime_info_with_features(
+            &programs,
+            &key,
+            programs[5].as_ref().unwrap(),
+            None,
+            RuntimeInfoDeviceFeatures {
+                transform_feedback: false,
+                molten_vk: true,
+            },
+        );
+        assert_eq!(molten_vk.frag_color_types[0], AttributeType::UnsignedInt);
+    }
+
+    #[test]
+    fn runtime_info_geometry_point_size_uses_program_output_topology() {
+        let mut fixed_state = FixedPipelineState::default();
+        fixed_state.point_size = 2.5f32.to_bits();
+        let key = GraphicsPipelineKey {
+            unique_hashes: [0, 1, 0, 0, 1, 0],
+            fixed_state,
+        };
+        let mut geometry = Program::new(ShaderStage::Geometry);
+        geometry.output_topology = OutputTopology::PointList;
+        let programs = program_slots_with(4, geometry);
+        let runtime_info = make_runtime_info_with_features(
+            &programs,
+            &key,
+            programs[4].as_ref().unwrap(),
+            None,
+            RuntimeInfoDeviceFeatures {
+                transform_feedback: false,
+                molten_vk: false,
+            },
+        );
+        assert_eq!(runtime_info.fixed_state_point_size, Some(2.5));
+    }
+
+    #[test]
+    fn runtime_info_uses_complete_fixed_pipeline_key() {
+        let mut fixed_state = FixedPipelineState::default();
+        fixed_state.set_topology(PrimitiveTopology::Points);
+        fixed_state.set_ndc_minus_one_to_one(true);
+        fixed_state.set_early_z(true);
+        fixed_state.set_y_negate(true);
+        fixed_state.point_size = 1.5f32.to_bits();
+        fixed_state.set_alpha_test_func(ComparisonOp::Greater);
+        fixed_state.alpha_test_ref = 0.25f32.to_bits();
+        fixed_state.set_attachment0_dual_source_blend(true);
+        fixed_state.set_tessellation_primitive(2);
+        fixed_state.set_tessellation_spacing(1);
+        fixed_state.set_tessellation_clockwise(true);
+        let key = GraphicsPipelineKey {
+            unique_hashes: [0, 1, 0, 1, 0, 1],
+            fixed_state,
+        };
+        let features = RuntimeInfoDeviceFeatures {
+            transform_feedback: false,
+            molten_vk: false,
+        };
+
+        let vertex_programs = program_slots_with(1, Program::new(ShaderStage::VertexB));
+        let vertex = make_runtime_info_with_features(
+            &vertex_programs,
+            &key,
+            vertex_programs[1].as_ref().unwrap(),
+            None,
+            features,
+        );
+        assert_eq!(vertex.fixed_state_point_size, Some(1.5));
+        assert!(vertex.convert_depth_mode);
+        assert!(vertex.force_early_z);
+        assert!(vertex.y_negate);
+        assert_eq!(vertex.input_topology, InputTopology::Points);
+
+        let tess_programs = program_slots_with(3, Program::new(ShaderStage::TessellationEval));
+        let tess = make_runtime_info_with_features(
+            &tess_programs,
+            &key,
+            tess_programs[3].as_ref().unwrap(),
+            None,
+            features,
+        );
+        assert_eq!(tess.tess_primitive, TessPrimitive::Quads);
+        assert_eq!(tess.tess_spacing, TessSpacing::FractionalOdd);
+        assert!(tess.tess_clockwise);
+
+        let fragment_programs = program_slots_with(5, Program::new(ShaderStage::Fragment));
+        let fragment = make_runtime_info_with_features(
+            &fragment_programs,
+            &key,
+            fragment_programs[5].as_ref().unwrap(),
+            None,
+            features,
+        );
+        assert_eq!(fragment.alpha_test_func, Some(CompareFunction::Greater));
+        assert_eq!(fragment.alpha_test_reference, 0.25);
+        assert!(fragment.dual_source_blend);
+    }
 
     #[test]
     fn broken_parallel_shader_compiling_uses_one_worker() {
@@ -1622,7 +2456,7 @@ mod tests {
             line_anti_alias_enable: false,
             line_stipple: Default::default(),
             program_base_address: 0,
-            cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
+            cb_bindings: [[ConstBufferInfo::default(); 18]; 5],
             vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); 8],
@@ -1679,6 +2513,23 @@ mod tests {
     #[test]
     fn cache_version_matches_upstream_wire_format() {
         assert_eq!(CACHE_VERSION, 18);
+    }
+
+    #[test]
+    fn gpu_shader_log_payloads_match_upstream_format() {
+        let hash = 0x0123_4567_89ab_cdef;
+        assert_eq!(
+            shader_log_name(hash, "geometry"),
+            "shader_0123456789abcdef_geometry"
+        );
+        assert_eq!(
+            shader_log_name(hash, "compute"),
+            "shader_0123456789abcdef_compute"
+        );
+        assert_eq!(
+            shader_log_info(hash, 12),
+            "SPIR-V size: 48 bytes, hash: 0123456789abcdef"
+        );
     }
 
     #[test]
@@ -1886,6 +2737,25 @@ mod tests {
 
         let product = (key.hash_value() as u128) * 0x9e37_79b9_7f4a_7c15_u128;
         assert_eq!(hasher.finish(), (product as u64) ^ (product >> 64) as u64);
+    }
+
+    #[test]
+    fn compute_cache_can_retain_upstream_negative_entry() {
+        let key = ComputePipelineCacheKey {
+            unique_hash: 0x1234,
+            shared_memory_size: 0x20,
+            workgroup_size: [1, 2, 3],
+        };
+        let mut cache: HashMap<
+            ComputePipelineCacheKey,
+            Option<Box<ComputePipeline>>,
+            BuildUnorderedDenseHasher,
+        > = HashMap::default();
+
+        cache.insert(key, None);
+
+        assert!(cache.contains_key(&key));
+        assert!(matches!(cache.get(&key), Some(None)));
     }
 
     #[test]

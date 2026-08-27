@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/renderer_opengl.h and renderer_opengl.cpp
+//! Port of Eden's video_core/renderer_opengl/renderer_opengl.h and renderer_opengl.cpp
 //!
 //! OpenGL GPU renderer — provides an alternative backend to Vulkan.
 //!
@@ -27,7 +27,7 @@ use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::present::{PRESENT_FILTERS_FOR_APPLET_CAPTURE, PRESENT_FILTERS_FOR_DISPLAY};
 use crate::rasterizer_interface::RasterizerInterface;
-use crate::renderer_base::{RendererBase, RendererBaseData};
+use crate::renderer_base::{update_current_framebuffer_layout, RendererBase, RendererBaseData};
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use ruzu_core::frontend::graphics_context::GraphicsContext;
 
@@ -122,7 +122,7 @@ pub enum OpenGLError {
     MissingExtension(String),
 }
 
-/// Main OpenGL renderer, corresponding to zuyu's `RendererOpenGL`.
+/// Main OpenGL renderer, corresponding to Eden's `RendererOpenGL`.
 ///
 /// Owns the device info, state tracker, blit screen pipeline, rasterizer,
 /// graphics context, and base renderer data.
@@ -157,6 +157,10 @@ pub struct RendererOpenGL {
     /// OpenGL resources above.
     /// Upstream: `std::unique_ptr<Core::Frontend::GraphicsContext> context` in RendererBase.
     context: Box<dyn GraphicsContext + Send>,
+    /// Frontend-owned equivalent of
+    /// `render_window.CreateSharedContext()`. Shader workers and the GPU CPU
+    /// thread each request independent shared contexts from this same owner.
+    shared_context_factory: gl_shader_context::SharedContextFactory,
 }
 
 // The renderer and its OpenGL-owned state move to, then remain on, the render
@@ -177,7 +181,7 @@ impl RendererOpenGL {
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
         strict_context_required: bool,
         mut context: Box<dyn GraphicsContext + Send>,
-        shared_context_factory: Option<gl_shader_context::SharedContextFactory>,
+        shared_context_factory: gl_shader_context::SharedContextFactory,
         framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
         frame_end_notify: Arc<dyn Fn() + Send + Sync>,
         frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
@@ -185,6 +189,9 @@ impl RendererOpenGL {
     where
         F: FnMut(&'static str) -> *const std::os::raw::c_void,
     {
+        // The upstream RendererBase constructor refreshes the live layout
+        // before the RendererOpenGL constructor body initializes GL state.
+        update_current_framebuffer_layout(&framebuffer_layout);
         context.make_current();
 
         // Load GL function pointers
@@ -228,7 +235,7 @@ impl RendererOpenGL {
             device_memory,
             Arc::clone(&program_manager),
             state_tracker.as_mut(),
-            shared_context_factory,
+            Some(Arc::clone(&shared_context_factory)),
             shader_notify,
         ));
         rasterizer.set_device_memory_reader(Arc::clone(&device_memory_reader));
@@ -334,6 +341,7 @@ impl RendererOpenGL {
             base_data: RendererBaseData::new(),
             framebuffer_layout,
             context,
+            shared_context_factory,
         })
     }
 
@@ -366,14 +374,14 @@ impl RendererOpenGL {
     /// 8. context->SwapBuffers()
     /// 9. render_window.OnFrameDisplayed()
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
+        if framebuffers.is_empty() {
+            return;
+        }
+
         // Upstream reads `emu_window.GetFramebufferLayout()` for every
         // composite. The frontend updates this shared value on each resize.
         let framebuffer_layout = framebuffer_layout_for_present(&self.framebuffer_layout);
         self.context.make_current();
-
-        if framebuffers.is_empty() {
-            return;
-        }
 
         self.render_applet_capture_layer(framebuffers);
         self.render_screenshot(framebuffers);
@@ -524,6 +532,10 @@ impl RendererBase for RendererOpenGL {
         &mut *self.context as *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext
     }
 
+    fn create_shared_context(&self) -> Box<dyn GraphicsContext + Send> {
+        (self.shared_context_factory)()
+    }
+
     fn composite(&mut self, layers: &[FramebufferConfig]) {
         self.composite_impl(layers);
     }
@@ -565,7 +577,7 @@ impl RendererBase for RendererOpenGL {
 
     fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
         use crate::capture;
-        let tiled_size = capture::tiled_size() as usize;
+        let tiled_size = capture::TILED_SIZE as usize;
         let mut out = vec![0u8; tiled_size];
 
         unsafe {
@@ -642,7 +654,7 @@ impl RendererBase for RendererOpenGL {
     }
 
     fn refresh_base_settings(&mut self) {
-        crate::renderer_base::update_current_framebuffer_layout(&self.framebuffer_layout);
+        update_current_framebuffer_layout(&self.framebuffer_layout);
     }
 
     fn is_screenshot_pending(&self) -> bool {

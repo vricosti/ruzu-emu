@@ -33,20 +33,12 @@ pub const BYTES_PER_PIXEL: u32 = 4;
 pub const TILED_WIDTH: u32 = LINEAR_WIDTH;
 
 /// Tiled height aligned to block parameters.
-pub fn tiled_height() -> u32 {
-    align_up_log2(LINEAR_HEIGHT, BLOCK_HEIGHT + BLOCK_DEPTH + BPP_LOG2)
-}
+pub const TILED_HEIGHT: u32 =
+    common::alignment::align_up_log2(LINEAR_HEIGHT as u64, BLOCK_HEIGHT + BLOCK_DEPTH + BPP_LOG2)
+        as u32;
 
 /// Total tiled capture size in bytes.
-pub fn tiled_size() -> u32 {
-    TILED_WIDTH * tiled_height() * (1 << BPP_LOG2)
-}
-
-/// Align `value` up by `align_log2` bits (matching Common::AlignUpLog2).
-fn align_up_log2(value: u32, align_log2: u32) -> u32 {
-    let mask = (1u32 << align_log2) - 1;
-    (value + mask) & !mask
-}
+pub const TILED_SIZE: u32 = TILED_WIDTH * TILED_HEIGHT * (1 << BPP_LOG2);
 
 /// Upstream `VideoCore::Capture::Layout`.
 pub const LAYOUT: ruzu_core::frontend::framebuffer_layout::FramebufferLayout =
@@ -80,6 +72,7 @@ mod tests {
             (0, 0, LINEAR_WIDTH, LINEAR_HEIGHT)
         );
         assert!(!LAYOUT.is_srgb);
-        assert_eq!(tiled_size(), TILED_WIDTH * tiled_height() * (1 << BPP_LOG2));
+        assert_eq!(TILED_HEIGHT, 768);
+        assert_eq!(TILED_SIZE, TILED_WIDTH * TILED_HEIGHT * (1 << BPP_LOG2));
     }
 }

@@ -11,9 +11,10 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
+use crate::engines::const_buffer_info::ConstBufferInfo;
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::SurfaceClipInfo;
-use crate::engines::maxwell_3d::{ConstBufferBinding, Maxwell3D, MAX_CB_SLOTS};
+use crate::engines::maxwell_3d::{Maxwell3D, MAX_CB_SLOTS, NUM_TRANSFORM_FEEDBACK_BUFFERS};
 use crate::memory_manager::MemoryManager;
 use crate::renderer_opengl::gl_shader_context::Context as ShaderContext;
 use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
@@ -43,9 +44,6 @@ const MAX_IMAGES: u32 = 8;
 
 /// Number of shader stages (vertex, tess control, tess eval, geometry, fragment).
 pub const NUM_STAGES: usize = 5;
-
-/// Number of transform feedback buffers.
-const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Stride of each XFB attribute entry (token, count, attrib).
 const XFB_ENTRY_STRIDE: usize = 3;
@@ -318,11 +316,12 @@ pub struct GraphicsPipeline {
 
     key: GraphicsPipelineKey,
 
-    /// Per-stage GLSL source produced by the recompiler. Stages with no shader
-    /// leave the corresponding entry as `None`.
+    /// One-shot per-stage GLSL source staging. `start_program_build` moves the
+    /// array into the build task, matching Eden's move-captured constructor
+    /// lambda. Stages with no shader leave the corresponding entry as `None`.
     glsl_sources: [Option<String>; NUM_STAGES],
 
-    /// Per-stage SPIR-V binaries produced by the recompiler.
+    /// One-shot per-stage SPIR-V staging, consumed with `glsl_sources`.
     spirv_sources: [Option<Vec<u32>>; NUM_STAGES],
 
     program_backend: GraphicsProgramBackend,
@@ -667,9 +666,9 @@ impl GraphicsPipeline {
         let mut gl_samplers = [0u32; MAX_TEXTURES as usize];
         let mut views_it = 0usize;
         let mut samplers_it = 0usize;
-        let mut texture_binding = 0usize;
-        let mut image_binding = 0usize;
-        let mut sampler_binding = 0usize;
+        let mut texture_binding = 0i32;
+        let mut image_binding = 0i32;
+        let mut sampler_binding = 0i32;
         for stage in 0..NUM_STAGES {
             if self.configure_spec.enabled_stage(stage) {
                 self.prepare_stage(
@@ -700,13 +699,13 @@ impl GraphicsPipeline {
                 );
             }
             unsafe {
-                gl::BindTextures(0, texture_binding as i32, textures.as_ptr());
-                gl::BindSamplers(0, sampler_binding as i32, gl_samplers.as_ptr());
+                gl::BindTextures(0, texture_binding, textures.as_ptr());
+                gl::BindSamplers(0, sampler_binding, gl_samplers.as_ptr());
             }
         }
         if image_binding != 0 {
             unsafe {
-                gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
+                gl::BindImageTextures(0, image_binding, images.as_ptr());
             }
         }
         if buffer_cache.any_buffer_uploaded {
@@ -751,11 +750,13 @@ impl GraphicsPipeline {
                 self.uniform_buffer_sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
                 self.num_texture_buffers[stage] = num_descriptors(&info.texture_buffer_descriptors);
                 self.num_image_buffers[stage] = num_descriptors(&info.image_buffer_descriptors);
-                num_textures +=
-                    self.num_texture_buffers[stage] + num_descriptors(&info.texture_descriptors);
-                num_images +=
-                    self.num_image_buffers[stage] + num_descriptors(&info.image_descriptors);
-                num_storage_buffers += num_descriptors(&info.storage_buffers_descriptors);
+                num_textures = num_textures.wrapping_add(self.num_texture_buffers[stage]);
+                num_images = num_images.wrapping_add(self.num_image_buffers[stage]);
+                num_textures =
+                    num_textures.wrapping_add(num_descriptors(&info.texture_descriptors));
+                num_images = num_images.wrapping_add(num_descriptors(&info.image_descriptors));
+                num_storage_buffers = num_storage_buffers
+                    .wrapping_add(num_descriptors(&info.storage_buffers_descriptors));
                 self.writes_global_memory |= info
                     .storage_buffers_descriptors
                     .iter()
@@ -767,10 +768,10 @@ impl GraphicsPipeline {
                 self.base_uniform_bindings[stage + 1] = self.base_uniform_bindings[stage];
                 self.base_storage_bindings[stage + 1] = self.base_storage_bindings[stage];
                 if let Some(info) = infos[stage].as_ref() {
-                    self.base_uniform_bindings[stage + 1] +=
-                        num_descriptors(&info.constant_buffer_descriptors);
-                    self.base_storage_bindings[stage + 1] +=
-                        num_descriptors(&info.storage_buffers_descriptors);
+                    self.base_uniform_bindings[stage + 1] = self.base_uniform_bindings[stage + 1]
+                        .wrapping_add(num_descriptors(&info.constant_buffer_descriptors));
+                    self.base_storage_bindings[stage + 1] = self.base_storage_bindings[stage + 1]
+                        .wrapping_add(num_descriptors(&info.storage_buffers_descriptors));
                 }
             }
         }
@@ -803,7 +804,7 @@ impl GraphicsPipeline {
         stage: usize,
         buffer_cache: &mut OpenGLBufferCache,
         texture_cache: &mut OpenGLTextureCache,
-        cbufs: &[ConstBufferBinding; MAX_CB_SLOTS],
+        cbufs: &[ConstBufferInfo; MAX_CB_SLOTS],
         gpu_memory: &MemoryManager,
         via_header_index: bool,
         views: &mut [ImageViewInOut; (MAX_TEXTURES + MAX_IMAGES) as usize],
@@ -969,13 +970,9 @@ impl GraphicsPipeline {
                 add_buffer!(desc, true, desc.is_written);
             }
         }
-        for desc in &info.texture_descriptors {
-            *views_it += desc.count as usize;
-        }
+        *views_it += num_descriptors(&info.texture_descriptors) as usize;
         if self.configure_spec.has_images() {
-            for desc in &info.image_descriptors {
-                *views_it += desc.count as usize;
-            }
+            *views_it += num_descriptors(&info.image_descriptors) as usize;
         }
     }
 
@@ -995,18 +992,19 @@ impl GraphicsPipeline {
         textures: &mut [u32; MAX_TEXTURES as usize],
         images: &mut [u32; MAX_IMAGES as usize],
         gl_samplers: &mut [u32; MAX_TEXTURES as usize],
-        texture_binding: &mut usize,
-        image_binding: &mut usize,
-        sampler_binding: &mut usize,
+        texture_binding: &mut i32,
+        image_binding: &mut i32,
+        sampler_binding: &mut i32,
     ) {
         buffer_cache.set_image_pointers(
-            textures[*texture_binding..].as_mut_ptr(),
-            images[*image_binding..].as_mut_ptr(),
+            textures[*texture_binding as usize..].as_mut_ptr(),
+            images[*image_binding as usize..].as_mut_ptr(),
         );
         buffer_cache.bind_host_stage_buffers(stage);
 
-        *texture_binding += self.num_texture_buffers[stage] as usize;
-        *image_binding += self.num_image_buffers[stage] as usize;
+        *texture_binding =
+            (*texture_binding as u32).wrapping_add(self.num_texture_buffers[stage]) as i32;
+        *image_binding = (*image_binding as u32).wrapping_add(self.num_image_buffers[stage]) as i32;
         *views_it += self.num_texture_buffers[stage] as usize;
         *views_it += self.num_image_buffers[stage] as usize;
 
@@ -1022,7 +1020,7 @@ impl GraphicsPipeline {
         if self.configure_spec.has_texture_buffers() {
             for desc in &info.texture_buffer_descriptors {
                 for _ in 0..desc.count {
-                    gl_samplers[*sampler_binding] = 0;
+                    gl_samplers[*sampler_binding as usize] = 0;
                     *sampler_binding += 1;
                 }
             }
@@ -1034,7 +1032,8 @@ impl GraphicsPipeline {
                 let image_view = texture_cache
                     .get_image_view(view_id)
                     .expect("filled sampled-image view must exist");
-                textures[*texture_binding] = image_view.handle_for_texture_type(desc.texture_type);
+                textures[*texture_binding as usize] =
+                    image_view.handle_for_texture_type(desc.texture_type);
                 if texture_cache.image_view_is_rescaling(view_id) {
                     texture_scaling_mask |= 1u32 << stage_texture_binding;
                 }
@@ -1045,7 +1044,7 @@ impl GraphicsPipeline {
                     .get_sampler(samplers[*samplers_it])
                     .expect("filled sampled-image sampler must exist");
                 *samplers_it += 1;
-                gl_samplers[*sampler_binding] =
+                gl_samplers[*sampler_binding as usize] =
                     if sampler.has_added_anisotropy() && !image_view.supports_anisotropy() {
                         sampler.handle_with_default_anisotropy()
                     } else {
@@ -1063,7 +1062,7 @@ impl GraphicsPipeline {
                         let image_id = texture_cache.base.slot_image_views[view_id].image_id;
                         texture_cache.base.mark_modification_by_id(image_id);
                     }
-                    images[*image_binding] = texture_cache
+                    images[*image_binding as usize] = texture_cache
                         .get_image_view_mut(view_id)
                         .expect("filled storage-image view must exist")
                         .storage_view(desc.texture_type, desc.format);
@@ -1169,10 +1168,15 @@ impl GraphicsPipeline {
         force_context_flush: bool,
     ) {
         self.is_built = false;
+        // Eden move-captures both source arrays into the one-shot build task.
+        // Do the same here so compiled pipelines do not retain shader source
+        // strings and SPIR-V words for their complete cache lifetime.
+        let sources = std::mem::take(&mut self.glsl_sources);
+        let spirv_sources = std::mem::take(&mut self.spirv_sources);
         let Some(worker) = worker else {
             let build = build_programs(
-                &self.glsl_sources,
-                &self.spirv_sources,
+                &sources,
+                &spirv_sources,
                 self.program_backend,
                 force_context_flush,
             );
@@ -1184,8 +1188,6 @@ impl GraphicsPipeline {
             return;
         };
 
-        let sources = self.glsl_sources.clone();
-        let spirv_sources = self.spirv_sources.clone();
         let backend = self.program_backend;
         let shader_notify = self.shader_notify;
         let slot: AsyncBuildSlot = Arc::new((Mutex::new(None), Condvar::new()));
@@ -1281,7 +1283,7 @@ impl GraphicsPipeline {
         self.num_xfb_buffers_active = 0;
         for feedback in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
             let layout = self.key.xfb_state.layouts[feedback];
-            if layout.stride != layout.varying_count * 4 {
+            if layout.stride != layout.varying_count.wrapping_mul(4) {
                 log::error!(
                     "OpenGL transform feedback stride padding is not implemented: stride={} varying_count={}",
                     layout.stride,
@@ -1455,7 +1457,8 @@ fn transform_feedback_enum(location: u32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout};
+    use crate::engines::maxwell_3d::StreamOutLayout;
+    use crate::transform_feedback::TransformFeedbackLayout;
     use shader_recompiler::shader_info::StorageBufferDescriptor;
     use std::io::Write;
 
@@ -1598,6 +1601,51 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_descriptor_counts_preserve_upstream_u32_wrapping() {
+        let mut first = ShaderInfo::default();
+        first
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: u32::MAX,
+                is_written: false,
+            });
+        let mut second = ShaderInfo::default();
+        second
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 2,
+                is_written: false,
+            });
+        let infos = [Some(first), Some(second), None, None, None];
+
+        let mut pipeline = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        pipeline.program_backend = GraphicsProgramBackend::Glasm;
+        pipeline.max_glasm_storage_buffer_blocks = 1;
+        pipeline.apply_shader_infos(&infos);
+
+        assert_eq!(pipeline.base_storage_bindings[1], u32::MAX);
+        assert_eq!(pipeline.base_storage_bindings[2], 1);
+        assert!(pipeline.use_storage_buffers);
+    }
+
+    #[test]
+    fn program_build_consumes_source_staging_like_upstream_move_capture() {
+        let mut pipeline = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        pipeline.glsl_sources[0] = Some(String::new());
+        pipeline.spirv_sources[1] = Some(Vec::new());
+
+        pipeline.start_program_build(None, false);
+
+        assert!(pipeline.glsl_sources.iter().all(Option::is_none));
+        assert!(pipeline.spirv_sources.iter().all(Option::is_none));
+        assert!(pipeline.is_built);
+    }
+
+    #[test]
     fn configure_spec_selection_matches_upstream_find_spec_order() {
         let vertex_only: [Option<ShaderInfo>; NUM_STAGES] =
             [Some(ShaderInfo::default()), None, None, None, None];
@@ -1660,7 +1708,7 @@ mod tests {
         key.xfb_state.layouts[0].varying_count = 5;
         key.xfb_state.layouts[0].stride = 0x20;
         key.xfb_state.varyings[0][0] =
-            crate::transform_feedback::StreamOutLayout::from_raw(0x0403_0201);
+            crate::engines::maxwell_3d::StreamOutLayout::from_raw(0x0403_0201);
 
         let size = key.size();
         let bytes = unsafe {
@@ -1695,7 +1743,7 @@ mod tests {
         key.xfb_state.layouts[0].varying_count = 4;
         key.xfb_state.layouts[0].stride = 16;
         key.xfb_state.varyings[0][0] =
-            crate::transform_feedback::StreamOutLayout::from_raw(0x2422_2120);
+            crate::engines::maxwell_3d::StreamOutLayout::from_raw(0x2422_2120);
 
         let mut pipeline = GraphicsPipeline::new_for_test(key, None);
         pipeline.generate_transform_feedback_state();
@@ -1711,7 +1759,7 @@ mod tests {
         key.set_xfb_enabled(true);
         key.xfb_state.layouts[0].varying_count = 1;
         key.xfb_state.layouts[0].stride = 4;
-        key.xfb_state.varyings[0][0] = crate::transform_feedback::StreamOutLayout::from_raw(0);
+        key.xfb_state.varyings[0][0] = crate::engines::maxwell_3d::StreamOutLayout::from_raw(0);
         let infos: [Option<ShaderInfo>; NUM_STAGES] = Default::default();
 
         let disabled = GraphicsPipeline::new_for_test_with_sources(

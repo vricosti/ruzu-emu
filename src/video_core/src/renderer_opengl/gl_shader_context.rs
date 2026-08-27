@@ -46,6 +46,15 @@ impl Default for ShaderPools {
     }
 }
 
+impl Drop for ShaderPools {
+    fn drop(&mut self) {
+        // C++ destroys members in reverse declaration order. Empty the owned
+        // objects in that same dependency order before Rust subsequently
+        // releases the now-empty pool allocations in declaration order.
+        self.release_contents();
+    }
+}
+
 /// Per-worker shared OpenGL context and shader allocation pools.
 pub struct Context {
     gl_context: Box<dyn GraphicsContext + Send>,
@@ -72,5 +81,49 @@ impl Drop for Context {
             ManuallyDrop::drop(&mut self.pools);
         }
         self.gl_context.done_current();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingContext {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl GraphicsContext for RecordingContext {
+        fn make_current(&mut self) {
+            self.events.lock().unwrap().push("make_current");
+        }
+
+        fn done_current(&mut self) {
+            self.events.lock().unwrap().push("done_current");
+        }
+    }
+
+    impl Drop for RecordingContext {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("drop_context");
+        }
+    }
+
+    #[test]
+    fn context_releases_current_scope_before_destroying_gl_context() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let factory: SharedContextFactory = Arc::new(move || {
+            Box::new(RecordingContext {
+                events: Arc::clone(&factory_events),
+            })
+        });
+
+        drop(Context::new(&factory));
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["make_current", "done_current", "drop_context"]
+        );
     }
 }

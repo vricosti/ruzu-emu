@@ -70,11 +70,6 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
         library_paths.push(bundle_dir.join("Contents/Frameworks/libMoltenVK.dylib"));
     }
 
-    // Non-bundled ruzu-cmd development fallback on macOS. Use the same
-    // MoltenVK as the Eden source-of-truth build so renderer comparisons do
-    // not mix driver versions.
-    library_paths.extend(local_eden_bundle_paths());
-
     let mut errors = Vec::<String>::new();
     for library_path in library_paths {
         if !library_path.exists() {
@@ -110,15 +105,6 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
             Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED))
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn local_eden_bundle_paths() -> Vec<std::path::PathBuf> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Vec::new();
-    };
-    let root = std::path::PathBuf::from(home).join("Dev/emulators/eden/build/bin/eden.app");
-    vec![root.join("Contents/Frameworks/libMoltenVK.dylib")]
 }
 
 #[cfg(target_os = "macos")]

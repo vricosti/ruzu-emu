@@ -20,9 +20,6 @@ use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register layout constants ───────────────────────────────────────────────
 
-/// Total number of registers in the KeplerMemory register file.
-pub const NUM_REGS: usize = 0x7F;
-
 /// Register offset for the upload register block (matches `ASSERT_REG_POSITION(upload, 0x60)`).
 const UPLOAD_REG_OFFSET: usize = 0x60;
 
@@ -42,19 +39,23 @@ const DATA_REG: usize = 0x6D;
 
 /// KeplerMemory engine register file.
 #[derive(Clone)]
+#[repr(C)]
 pub struct Regs {
-    pub reg_array: [u32; NUM_REGS],
+    pub reg_array: [u32; 0x7F],
 }
 
 impl Default for Regs {
     fn default() -> Self {
         Self {
-            reg_array: [0u32; NUM_REGS],
+            reg_array: [0u32; Self::NUM_REGS],
         }
     }
 }
 
 impl Regs {
+    /// Total number of registers in the KeplerMemory register file.
+    pub const NUM_REGS: usize = 0x7F;
+
     /// Read the upload registers from the register array.
     pub fn upload(&self) -> engine_upload::Registers {
         engine_upload::Registers {
@@ -86,14 +87,14 @@ impl Regs {
 /// Corresponds to the C++ `KeplerMemory` class which inherits `EngineInterface`.
 pub struct KeplerMemory {
     pub regs: Regs,
-    pub upload_state: engine_upload::State,
-    pub interface_state: EngineInterfaceState,
+    upload_state: engine_upload::State,
+    interface_state: EngineInterfaceState,
 }
 
 impl KeplerMemory {
     /// Create a new KeplerMemory engine.
     ///
-    /// Corresponds to upstream `KeplerMemory(Core::System&, MemoryManager&)`.
+    /// Corresponds to upstream `KeplerMemory(MemoryManager&)`.
     /// Rust stores the upstream `MemoryManager&` owner in `upload_state`.
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
@@ -110,14 +111,9 @@ impl KeplerMemory {
     /// Corresponds to `KeplerMemory::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         self.upload_state.bind_rasterizer(rasterizer);
-        // Reset and configure execution mask
         self.interface_state.execution_mask.fill(false);
-        if EXEC_REG < self.interface_state.execution_mask.len() {
-            self.interface_state.execution_mask[EXEC_REG] = true;
-        }
-        if DATA_REG < self.interface_state.execution_mask.len() {
-            self.interface_state.execution_mask[DATA_REG] = true;
-        }
+        self.interface_state.execution_mask[EXEC_REG] = true;
+        self.interface_state.execution_mask[DATA_REG] = true;
     }
 
     fn process_upload_word(&mut self, data: u32, is_last_call: bool) {
@@ -137,7 +133,7 @@ impl KeplerMemory {
     pub fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
         let method_idx = method as usize;
         assert!(
-            method_idx < NUM_REGS,
+            method_idx < Regs::NUM_REGS,
             "Invalid KeplerMemory register, increase the size of the Regs structure"
         );
 
@@ -176,7 +172,7 @@ impl KeplerMemory {
                     self.call_method(
                         method,
                         base_start[i as usize],
-                        methods_pending.saturating_sub(i) <= 1,
+                        methods_pending.wrapping_sub(i) <= 1,
                     );
                 }
             }
@@ -190,9 +186,7 @@ impl KeplerMemory {
         let sink: Vec<(u32, u32)> = self.interface_state.method_sink.drain(..).collect();
         for (method, value) in sink {
             let method_idx = method as usize;
-            if method_idx < NUM_REGS {
-                self.regs.reg_array[method_idx] = value;
-            }
+            self.regs.reg_array[method_idx] = value;
         }
     }
 }
@@ -223,6 +217,10 @@ impl EngineInterface for KeplerMemory {
         KeplerMemory::consume_sink_impl(self);
     }
 
+    fn has_pending_methods(&self) -> bool {
+        !self.interface_state.method_sink.is_empty()
+    }
+
     fn execution_mask(&self) -> &[bool] {
         &self.interface_state.execution_mask
     }
@@ -247,6 +245,15 @@ impl EngineInterface for KeplerMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_owner_layout_matches_upstream() {
+        assert_eq!(std::mem::size_of::<Regs>(), Regs::NUM_REGS * 4);
+        assert_eq!(std::mem::align_of::<Regs>(), 4);
+        assert_eq!(UPLOAD_REG_OFFSET, 0x60);
+        assert_eq!(EXEC_REG, 0x6c);
+        assert_eq!(DATA_REG, 0x6d);
+    }
 
     #[test]
     fn data_register_writes_through_memory_manager() {
@@ -278,6 +285,15 @@ mod tests {
             .map(0x10000, 0x8000_0000, 0x1000, 0, false);
 
         let mut engine = KeplerMemory::new(Arc::clone(&memory_manager));
+        let syncpoints = Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let mut rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        let upload_memory_manager = Arc::clone(&memory_manager);
+        rasterizer.set_inline_upload_callback(move |address, copy_size, memory| {
+            upload_memory_manager
+                .lock()
+                .write_block(address, &memory[..copy_size]);
+        });
+        engine.bind_rasterizer(&rasterizer);
 
         engine.call_method(UPLOAD_REG_OFFSET as u32, 4, true);
         engine.call_method((UPLOAD_REG_OFFSET + 1) as u32, 1, true);

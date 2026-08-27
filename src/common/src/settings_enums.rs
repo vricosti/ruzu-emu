@@ -293,6 +293,17 @@ settings_enum! {
     }
 }
 
+settings_enum! {
+    /// Upstream `Settings::GpuLogLevel`.
+    pub enum GpuLogLevel {
+        Off,
+        Errors,
+        Standard,
+        Verbose,
+        All,
+    }
+}
+
 /// Upstream `Settings::RendererBackend`.
 ///
 /// The Rust identifiers follow Rust casing, while the canonical strings retain

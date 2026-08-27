@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/bank_base.h
+//! Port of Eden's `src/video_core/query_cache/bank_base.h`.
 //!
 //! Provides the base bank allocation type (`BankBase`) and a pool manager (`BankPool`)
 //! used by the query cache to manage slots for host queries.
@@ -48,7 +48,7 @@ impl BankBase {
     /// Reset the bank to its initial state for reuse.
     pub fn reset(&mut self) {
         self.current_slot = 0;
-        self.references.store(0, Ordering::Relaxed);
+        self.references.store(0, Ordering::SeqCst);
         self.bank_size = self.base_bank_size;
     }
 
@@ -86,7 +86,7 @@ impl BankBase {
 
     /// Returns true if the bank is closed and has no remaining references.
     pub fn is_dead(&self) -> bool {
-        self.is_closed() && self.references.load(Ordering::Relaxed) == 0
+        self.is_closed() && self.references.load(Ordering::SeqCst) == 0
     }
 }
 
@@ -125,49 +125,31 @@ impl<B: BankLike> BankPool<B> {
         }
     }
 
-    /// Whether `reserve_bank` will recycle the front bank instead of calling
-    /// its builder.
-    ///
-    /// Rust-only: upstream's builder can throw, so `ReserveBank` needs no such
-    /// hint, while `reserve_bank`'s builder cannot fail. Callers that allocate
-    /// fallible GPU resources use this to build the replacement before the
-    /// borrow starts. It reports exactly the condition `reserve_bank` tests.
-    pub fn can_recycle_front(&self) -> bool {
-        self.bank_indices
-            .front()
-            .is_some_and(|&front_idx| self.bank_pool[front_idx].is_dead())
-    }
-
     /// Reserve a bank from the pool, recycling a dead one if possible.
     /// If no dead bank is available, `builder` is called to construct a new one.
     ///
     /// Maps to C++ `BankPool::ReserveBank`.
-    pub fn reserve_bank<F>(&mut self, builder: F) -> usize
+    pub fn reserve_bank<F, E>(&mut self, builder: F) -> Result<usize, E>
     where
-        F: FnOnce(&mut VecDeque<B>, usize),
+        F: FnOnce(&mut VecDeque<B>, usize) -> Result<(), E>,
     {
         if let Some(&front_idx) = self.bank_indices.front() {
             if self.bank_pool[front_idx].is_dead() {
                 let new_index = self.bank_indices.pop_front().unwrap();
                 self.bank_pool[new_index].reset();
                 self.bank_indices.push_back(new_index);
-                return new_index;
+                return Ok(new_index);
             }
         }
         let new_index = self.bank_pool.len();
-        builder(&mut self.bank_pool, new_index);
+        builder(&mut self.bank_pool, new_index)?;
         self.bank_indices.push_back(new_index);
-        new_index
+        Ok(new_index)
     }
 
     /// Get a mutable reference to a bank by index.
     pub fn get_bank(&mut self, index: usize) -> &mut B {
         &mut self.bank_pool[index]
-    }
-
-    /// Get an immutable reference to a bank by index.
-    pub fn get_bank_ref(&self, index: usize) -> &B {
-        &self.bank_pool[index]
     }
 
     /// Return the total number of banks in the pool.
@@ -214,20 +196,26 @@ mod tests {
         assert!(bank.is_dead());
     }
 
-    /// `can_recycle_front` must report exactly what `reserve_bank` tests, or a
-    /// caller that pre-builds a replacement bank would build the wrong number.
     #[test]
-    fn can_recycle_front_matches_reserve_bank() {
+    fn reserve_bank_only_calls_builder_when_no_dead_bank_exists() {
         let mut pool: BankPool<BankBase> = BankPool::new();
-        assert!(!pool.can_recycle_front());
 
-        let first = pool.reserve_bank(|queue, _index| queue.push_back(BankBase::new(1)));
+        let first = pool
+            .reserve_bank(|queue, _index| {
+                queue.push_back(BankBase::new(1));
+                Ok::<(), ()>(())
+            })
+            .unwrap();
         assert_eq!(pool.bank_count(), 1);
 
         // The only bank is still open, so nothing can be recycled and
         // `reserve_bank` must build a second one.
-        assert!(!pool.can_recycle_front());
-        let second = pool.reserve_bank(|queue, _index| queue.push_back(BankBase::new(1)));
+        let second = pool
+            .reserve_bank(|queue, _index| {
+                queue.push_back(BankBase::new(1));
+                Ok::<(), ()>(())
+            })
+            .unwrap();
         assert_ne!(first, second);
         assert_eq!(pool.bank_count(), 2);
 
@@ -235,9 +223,18 @@ mod tests {
         let bank = pool.get_bank(first);
         let (_, _) = bank.reserve();
         assert!(bank.is_dead());
-        assert!(pool.can_recycle_front());
-        let recycled = pool.reserve_bank(|_queue, _index| panic!("builder must not run"));
+        let recycled: Result<usize, ()> =
+            pool.reserve_bank(|_queue, _index| panic!("builder must not run"));
+        let recycled = recycled.unwrap();
         assert_eq!(recycled, first);
         assert_eq!(pool.bank_count(), 2);
+    }
+
+    #[test]
+    fn reserve_bank_propagates_builder_failure_without_indexing_a_bank() {
+        let mut pool: BankPool<BankBase> = BankPool::new();
+        let result = pool.reserve_bank(|_queue, _index| Err("creation failed"));
+        assert_eq!(result, Err("creation failed"));
+        assert_eq!(pool.bank_count(), 0);
     }
 }

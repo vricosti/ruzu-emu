@@ -592,7 +592,27 @@ fn nvidia_driver_major_version(gl_version: &str) -> i32 {
     let version_major = driver_version
         .split_once('.')
         .map_or(driver_version, |(major, _)| major);
-    version_major.parse().unwrap_or(0)
+    atoi_prefix(version_major)
+}
+
+/// Parse the same numeric prefix accepted by the `std::atoi` call in Eden.
+fn atoi_prefix(value: &str) -> i32 {
+    let value = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value),
+    };
+    let digit_count = digits
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count == 0 {
+        return 0;
+    }
+    let parsed = digits[..digit_count].parse::<i64>().unwrap_or(0);
+    (if negative { -parsed } else { parsed }) as i32
 }
 
 fn normalized_vendor_name(vendor_name: &str) -> &str {
@@ -631,6 +651,9 @@ mod tests {
     #[test]
     fn nvidia_driver_version_parser_matches_upstream_substr_and_atoi() {
         assert_eq!(nvidia_driver_major_version("4.6.0 NVIDIA 495.44"), 495);
+        assert_eq!(nvidia_driver_major_version("4.6.0 NVIDIA  550beta.2"), 550);
+        assert_eq!(nvidia_driver_major_version("4.6.0 NVIDIA +560rc.1"), 560);
         assert_eq!(nvidia_driver_major_version("xxxxxxxxxxxxxinvalid.1"), 0);
+        assert_eq!(atoi_prefix("-2147483648suffix"), i32::MIN);
     }
 }

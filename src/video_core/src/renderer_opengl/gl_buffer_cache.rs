@@ -309,10 +309,10 @@ impl Buffer {
                 return v.texture.handle;
             }
         }
-        let gl_format = super::maxwell_to_gl::get_format_tuple(format).internal_format;
-        let texture_format = get_texture_buffer_format(gl_format);
         let mut texture = OGLTexture::new();
         texture.create(gl::TEXTURE_BUFFER);
+        let gl_format = super::maxwell_to_gl::get_format_tuple(format).internal_format;
+        let texture_format = get_texture_buffer_format(gl_format);
         let texture_handle = texture.handle;
         unsafe {
             gl::TextureBufferRange(
@@ -512,7 +512,9 @@ impl BufferCacheRuntime {
 
         const HALF_GIB: u64 = 512 * 1024 * 1024;
         let device_access_memory = if device.can_report_memory_usage() {
-            device.get_current_dedicated_video_memory() + HALF_GIB
+            device
+                .get_current_dedicated_video_memory()
+                .wrapping_add(HALF_GIB)
         } else {
             2 * 1024 * 1024 * 1024
         };
@@ -724,7 +726,7 @@ impl BufferCacheRuntime {
                 buffer_address_range(
                     GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV,
                     index,
-                    buffer.host_gpu_addr() + u64::from(offset),
+                    buffer.host_gpu_addr().wrapping_add(u64::from(offset)),
                     size as isize,
                 );
             } else {
@@ -913,8 +915,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 buffer_address_range(
                     GL_ELEMENT_ARRAY_ADDRESS_NV,
                     0,
-                    buffer.host_gpu_addr() + u64::from(offset),
-                    common::alignment::align_up(u64::from(size), 4) as isize,
+                    buffer.host_gpu_addr().wrapping_add(u64::from(offset)),
+                    common::alignment::align_up(u64::from(size), 4) as u32 as isize,
                 );
             }
         } else {
@@ -927,6 +929,17 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn index_offset(&self) -> usize {
         BufferCacheRuntime::index_offset(self)
+    }
+
+    fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        BufferCacheRuntime::bind_vertex_buffer(self, index, buffer, offset, size, stride);
     }
 
     /// Port of upstream `BufferCacheRuntime::BindVertexBuffers`
@@ -955,8 +968,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 unsafe {
                     buffer_address_range(
                         GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV,
-                        bindings.min_index + index as u32,
-                        buffer.host_gpu_addr() + bindings.offsets[index],
+                        bindings.min_index.wrapping_add(index as u32),
+                        buffer.host_gpu_addr().wrapping_add(bindings.offsets[index]),
                         bindings.sizes[index] as isize,
                     );
                 }
@@ -1019,7 +1032,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             return;
         }
         let base_binding = self.graphics_base_uniform_bindings[stage];
-        let binding = base_binding + binding_index;
+        let binding = base_binding.wrapping_add(binding_index);
         unsafe {
             gl::BindBufferRange(
                 gl::UNIFORM_BUFFER,
@@ -1058,7 +1071,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     ) {
         if self.use_storage_buffers {
             let base_binding = self.graphics_base_storage_bindings[stage];
-            let binding = base_binding + binding_index;
+            let binding = base_binding.wrapping_add(binding_index);
             unsafe {
                 gl::BindBufferRange(
                     gl::SHADER_STORAGE_BUFFER,
@@ -1070,7 +1083,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             }
         } else {
             let ssbo = BindlessSSBO {
-                address: buffer.host_gpu_addr() + u64::from(offset),
+                address: buffer.host_gpu_addr().wrapping_add(u64::from(offset)),
                 length: size as i32,
                 padding: 0,
             };
@@ -1088,7 +1101,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             unsafe {
                 program_local_parameters(
                     PROGRAM_LUT[stage],
-                    PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE + binding_index,
+                    PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE.wrapping_add(binding_index),
                     1,
                     (&ssbo as *const BindlessSSBO).cast(),
                 );
@@ -1241,7 +1254,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             }
         } else {
             let ssbo = BindlessSSBO {
-                address: buffer.host_gpu_addr() + u64::from(offset),
+                address: buffer.host_gpu_addr().wrapping_add(u64::from(offset)),
                 length: size as i32,
                 padding: 0,
             };
@@ -1259,7 +1272,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             unsafe {
                 program_local_parameters(
                     GL_COMPUTE_PROGRAM_NV,
-                    PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE + binding,
+                    PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE.wrapping_add(binding),
                     1,
                     (&ssbo as *const BindlessSSBO).cast(),
                 );
@@ -1294,7 +1307,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             return;
         }
         let base_binding = self.graphics_base_uniform_bindings[stage];
-        let binding = base_binding + binding_index;
+        let binding = base_binding.wrapping_add(binding_index);
         unsafe {
             gl::BindBufferRange(gl::UNIFORM_BUFFER, binding, handle, 0, size as isize);
         }
@@ -1338,7 +1351,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             let span = std::slice::from_raw_parts_mut(mapped_ptr, size as usize);
             write(span);
             let base_binding = self.graphics_base_uniform_bindings[stage];
-            let binding = base_binding + binding_index;
+            let binding = base_binding.wrapping_add(binding_index);
             gl::BindBufferRange(
                 gl::UNIFORM_BUFFER,
                 binding,
@@ -1415,6 +1428,16 @@ mod tests {
     #[test]
     fn bindless_ssbo_layout() {
         assert_eq!(std::mem::size_of::<BindlessSSBO>(), 16);
+    }
+
+    #[test]
+    fn unsigned_address_and_index_size_arithmetic_matches_cpp_widths() {
+        assert_eq!(u64::MAX.wrapping_add(1), 0);
+        assert_eq!(u32::MAX.wrapping_add(1), 0);
+        assert_eq!(
+            common::alignment::align_up(u64::from(u32::MAX), 4) as u32,
+            0
+        );
     }
 
     #[test]

@@ -8,14 +8,12 @@
 //!   - FlatAllocator64, used for upstream `FlatAllocator<DAddr, 0, 34>`
 
 use std::fmt::{Debug, UpperHex};
-use std::ops::{Add, Sub};
 use std::sync::Mutex;
 
-pub trait FlatVa:
-    Copy + Debug + UpperHex + Ord + PartialEq + Add<Output = Self> + Sub<Output = Self>
-{
+pub trait FlatVa: Copy + Debug + UpperHex + Ord + PartialEq {
     const ZERO: Self;
     fn wrapping_add(self, rhs: Self) -> Self;
+    fn wrapping_sub(self, rhs: Self) -> Self;
 }
 
 impl FlatVa for u32 {
@@ -24,6 +22,10 @@ impl FlatVa for u32 {
     fn wrapping_add(self, rhs: Self) -> Self {
         u32::wrapping_add(self, rhs)
     }
+
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        u32::wrapping_sub(self, rhs)
+    }
 }
 
 impl FlatVa for u64 {
@@ -31,6 +33,10 @@ impl FlatVa for u64 {
 
     fn wrapping_add(self, rhs: Self) -> Self {
         u64::wrapping_add(self, rhs)
+    }
+
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        u64::wrapping_sub(self, rhs)
     }
 }
 
@@ -66,7 +72,7 @@ impl<VaType: FlatVa> FlatAddressSpaceMapBool<VaType> {
     }
 
     fn map_locked(&mut self, virt: VaType, size: VaType) {
-        let virt_end = virt + size;
+        let virt_end = virt.wrapping_add(size);
 
         assert!(
             virt_end <= self.va_limit,
@@ -130,7 +136,7 @@ impl<VaType: FlatVa> FlatAddressSpaceMapBool<VaType> {
         _original_end_succ: usize,
         size: VaType,
     ) {
-        let virt_end = virt + size;
+        let virt_end = virt.wrapping_add(size);
 
         let mut start_succ_idx = block_end_succ_idx;
         while start_succ_idx > 0 && self.blocks[start_succ_idx - 1].virt >= virt {
@@ -158,7 +164,7 @@ impl<VaType: FlatVa> FlatAddressSpaceMapBool<VaType> {
     }
 
     fn unmap_locked(&mut self, virt: VaType, size: VaType) {
-        let virt_end = virt + size;
+        let virt_end = virt.wrapping_add(size);
 
         assert!(
             virt_end <= self.va_limit,
@@ -227,7 +233,7 @@ impl<VaType: FlatVa> FlatAddressSpaceMapBool<VaType> {
         let start_pred_idx = if idx > 0 { idx - 1 } else { 0 };
         let start_succ_idx = start_pred_idx + 1;
 
-        let virt_end = virt + size;
+        let virt_end = virt.wrapping_add(size);
         if start_succ_idx < self.blocks.len() && self.blocks[start_succ_idx].virt > virt_end {
             panic!("Unsorted block in AS map");
         }
@@ -323,7 +329,9 @@ impl<VaType: FlatVa> FlatAllocatorBool<VaType> {
                 let mut pred = pred_idx;
                 let mut succ = succ_idx;
                 while succ < self.inner.blocks.len() {
-                    let gap = self.inner.blocks[succ].virt - self.inner.blocks[pred].virt;
+                    let gap = self.inner.blocks[succ]
+                        .virt
+                        .wrapping_sub(self.inner.blocks[pred].virt);
                     if gap >= size && !self.inner.blocks[pred].mapped {
                         alloc_start = Some(self.inner.blocks[pred].virt);
                         break;
@@ -332,7 +340,7 @@ impl<VaType: FlatVa> FlatAllocatorBool<VaType> {
                     succ += 1;
 
                     if succ == self.inner.blocks.len() {
-                        let end = self.inner.blocks[pred].virt + size;
+                        let end = self.inner.blocks[pred].virt.wrapping_add(size);
                         if end >= self.inner.blocks[pred].virt && end <= self.va_limit {
                             alloc_start = Some(self.inner.blocks[pred].virt);
                         }
@@ -342,7 +350,7 @@ impl<VaType: FlatVa> FlatAllocatorBool<VaType> {
         }
 
         if let Some(start) = alloc_start {
-            self.current_linear_alloc_end = start + size;
+            self.current_linear_alloc_end = start.wrapping_add(size);
             self.inner.map_locked(start, size);
             Some(start)
         } else {
@@ -355,7 +363,9 @@ impl<VaType: FlatVa> FlatAllocatorBool<VaType> {
             let mut succ = 2;
 
             while succ < self.inner.blocks.len() {
-                let gap = self.inner.blocks[succ].virt - self.inner.blocks[pred].virt;
+                let gap = self.inner.blocks[succ]
+                    .virt
+                    .wrapping_sub(self.inner.blocks[pred].virt);
                 if gap >= size && !self.inner.blocks[pred].mapped {
                     break;
                 }
@@ -428,6 +438,14 @@ mod tests {
         // After freeing, next linear alloc continues from where it left off
         let a2 = alloc.allocate(0x1000).unwrap();
         assert_eq!(a2, 0x2000);
+    }
+
+    #[test]
+    fn test_flat_allocator_skips_fixed_mapping() {
+        let mut alloc = FlatAllocator64::new(0x1000, (1u64 << 34) - 1);
+        alloc.allocate_fixed(0x2000, 0x1000);
+
+        assert_eq!(alloc.allocate(0x2000), Some(0x3000));
     }
 
     #[test]

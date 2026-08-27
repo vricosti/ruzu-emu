@@ -25,6 +25,8 @@ pub enum WindowSystemType {
     Cocoa,
     #[cfg(target_os = "android")]
     Android,
+    #[cfg(target_os = "haiku")]
+    Xcb,
     #[cfg(target_os = "linux")]
     X11,
     #[cfg(target_os = "linux")]
@@ -36,14 +38,7 @@ pub enum WindowSystemType {
 // ---------------------------------------------------------------------------
 
 /// Port of `AreExtensionsSupported` from `vulkan_instance.cpp`.
-fn are_extensions_supported(entry: &ash::Entry, required: &[CString]) -> bool {
-    let properties = match vulkan_wrapper::enumerate_instance_extension_properties(entry) {
-        Some(props) => props,
-        None => {
-            log::error!("Failed to query extension properties");
-            return false;
-        }
-    };
+fn are_extensions_supported(properties: &[vk::ExtensionProperties], required: &[CString]) -> bool {
     for ext in required {
         let found = properties.iter().any(|prop| {
             let name = unsafe { CStr::from_ptr(prop.extension_name.as_ptr()) };
@@ -66,7 +61,7 @@ fn are_extensions_supported(entry: &ash::Entry, required: &[CString]) -> bool {
 
 /// Port of `RequiredExtensions` from `vulkan_instance.cpp`.
 fn required_extensions(
-    entry: &ash::Entry,
+    properties: &[vk::ExtensionProperties],
     window_type: WindowSystemType,
     enable_validation: bool,
 ) -> Vec<CString> {
@@ -86,6 +81,10 @@ fn required_extensions(
         WindowSystemType::Android => {
             extensions.push(CString::new("VK_KHR_android_surface").unwrap());
         }
+        #[cfg(target_os = "haiku")]
+        WindowSystemType::Xcb => {
+            extensions.push(CString::new("VK_KHR_xcb_surface").unwrap());
+        }
         #[cfg(target_os = "linux")]
         WindowSystemType::X11 => {
             extensions.push(CString::new("VK_KHR_xlib_surface").unwrap());
@@ -103,14 +102,14 @@ fn required_extensions(
     #[cfg(target_os = "macos")]
     {
         let portability = CString::new("VK_KHR_portability_enumeration").unwrap();
-        if are_extensions_supported(entry, &[portability.clone()]) {
+        if are_extensions_supported(properties, &[portability.clone()]) {
             extensions.push(portability);
         }
     }
 
     if enable_validation {
         let debug_utils = CString::new("VK_EXT_debug_utils").unwrap();
-        if are_extensions_supported(entry, &[debug_utils.clone()]) {
+        if are_extensions_supported(properties, &[debug_utils.clone()]) {
             extensions.push(debug_utils);
         }
     }
@@ -178,6 +177,22 @@ pub fn create_instance(
     window_type: WindowSystemType,
     enable_validation: bool,
 ) -> Result<Instance, VulkanError> {
+    // Keep a single extension snapshot for both optional-extension probing and
+    // final validation. Some drivers have returned different sets across two
+    // consecutive enumerations, which can otherwise reject a valid launch.
+    let extension_properties = vulkan_wrapper::enumerate_instance_extension_properties(&entry)
+        .ok_or_else(|| {
+            log::error!("Failed to query instance extension properties");
+            VulkanError::new(vk::Result::ERROR_EXTENSION_NOT_PRESENT)
+        })?;
+    let extensions = required_extensions(&extension_properties, window_type, enable_validation);
+    if !are_extensions_supported(&extension_properties, &extensions) {
+        return Err(VulkanError::new(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
+    }
+
+    let mut layer_list = layers(enable_validation);
+    remove_unavailable_layers(&entry, &mut layer_list);
+
     let available = vulkan_wrapper::available_version(&entry);
     if available < required_version {
         log::error!(
@@ -190,33 +205,53 @@ pub fn create_instance(
         return Err(VulkanError::new(vk::Result::ERROR_INCOMPATIBLE_DRIVER));
     }
 
-    let extensions = required_extensions(&entry, window_type, enable_validation);
-    if !are_extensions_supported(&entry, &extensions) {
-        return Err(VulkanError::new(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
-    }
-
-    let mut layer_list = layers(enable_validation);
-    remove_unavailable_layers(&entry, &mut layer_list);
-
     let layer_ptrs: Vec<*const std::os::raw::c_char> =
         layer_list.iter().map(|s| s.as_ptr()).collect();
     let ext_ptrs: Vec<*const std::os::raw::c_char> =
         extensions.iter().map(|s| s.as_ptr()).collect();
 
-    let app_name = CString::new("ruzu Emulator").unwrap();
-    let engine_name = CString::new("ruzu Emulator").unwrap();
-    let app_info = vk::ApplicationInfo::builder()
-        .application_name(&app_name)
-        .application_version(vk::make_api_version(0, 0, 1, 0))
-        .engine_name(&engine_name)
-        .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::API_VERSION_1_3)
-        .build();
+    Instance::create(entry, available, &layer_ptrs, &ext_ptrs)
+}
 
-    #[cfg(target_os = "macos")]
-    let flags = vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-    #[cfg(not(target_os = "macos"))]
-    let flags = vk::InstanceCreateFlags::empty();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Instance::create(entry, &app_info, &layer_ptrs, &ext_ptrs, flags)
+    fn extension_property(name: &CStr) -> vk::ExtensionProperties {
+        let mut property = vk::ExtensionProperties::default();
+        for (destination, source) in property
+            .extension_name
+            .iter_mut()
+            .zip(name.to_bytes_with_nul())
+        {
+            *destination = *source as std::os::raw::c_char;
+        }
+        property
+    }
+
+    #[test]
+    fn optional_and_final_extension_checks_share_the_supplied_snapshot() {
+        let surface = CString::new("VK_KHR_surface").unwrap();
+        let debug_utils = CString::new("VK_EXT_debug_utils").unwrap();
+        let properties = [
+            extension_property(&surface),
+            extension_property(&debug_utils),
+        ];
+
+        let extensions = required_extensions(&properties, WindowSystemType::Headless, true);
+        assert_eq!(extensions, vec![debug_utils]);
+        assert!(are_extensions_supported(&properties, &extensions));
+    }
+
+    #[cfg(target_os = "haiku")]
+    #[test]
+    fn haiku_requests_xcb_and_common_surface_extensions() {
+        let xcb = CString::new("VK_KHR_xcb_surface").unwrap();
+        let surface = CString::new("VK_KHR_surface").unwrap();
+        let properties = [extension_property(&xcb), extension_property(&surface)];
+
+        let extensions = required_extensions(&properties, WindowSystemType::Xcb, false);
+        assert_eq!(extensions, vec![xcb, surface]);
+        assert!(are_extensions_supported(&properties, &extensions));
+    }
 }

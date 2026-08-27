@@ -1,32 +1,37 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of `zuyu/src/video_core/vulkan_common/vma.h` and
-//! `zuyu/src/video_core/vulkan_common/vma.cpp`.
+//! Port of Eden's `src/video_core/vulkan_common/vma.h` binding owner.
 //!
-//! The upstream files configure and compile the Vulkan Memory Allocator (VMA) C library
-//! with dynamic Vulkan function loading (`VMA_STATIC_VULKAN_FUNCTIONS 0`,
-//! `VMA_DYNAMIC_VULKAN_FUNCTIONS 1`). The `.cpp` file defines `VMA_IMPLEMENTATION`
-//! to trigger compilation of VMA within the translation unit.
+//! Eden configures AMD Vulkan Memory Allocator with static Vulkan symbols disabled and dynamic
+//! loading enabled. Its frontend translation units define `VMA_IMPLEMENTATION`. The Rust port
+//! delegates compilation and bindings to `vk-mem`: that crate disables both VMA loaders and
+//! passes the complete Ash Vulkan function table explicitly. Both integrations avoid a static
+//! Vulkan-library dependency, but their function-routing mechanisms intentionally differ.
 //!
-//! The Rust port uses `vk-mem`, which wraps the same AMD Vulkan Memory Allocator
-//! implementation as upstream. This module owns the binding choice while
-//! [`super::vulkan_memory_allocator`] owns Eden's higher-level allocation policy.
-
-// The upstream VMA configuration constants, preserved for documentation:
-//
-// VMA_STATIC_VULKAN_FUNCTIONS  = 0  (do not link Vulkan statically)
-// VMA_DYNAMIC_VULKAN_FUNCTIONS = 1  (resolve Vulkan functions at runtime)
+//! [`super::vulkan_device`] owns allocator creation and Eden's allocator flags, while
+//! [`super::vulkan_memory_allocator`] owns the higher-level allocation policy.
 
 use std::sync::{Arc, Mutex};
 
-/// Rust ownership wrapper for upstream's opaque `VmaAllocator` handle.
+/// Rust ownership wrapper for Eden's opaque `VmaAllocator` handle.
 ///
-/// Eden creates VMA with `VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`;
-/// the mutex provides that external synchronization in Rust.
+/// `vulkan_device` sets `VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT` through `vk-mem`'s
+/// matching flag. This mutex supplies the external synchronization required by that mode.
 pub type VmaAllocator = Arc<Mutex<vk_mem::Allocator>>;
 
-pub type VmaAllocation = vk_mem::Allocation;
-pub type VmaAllocationInfo = vk_mem::AllocationInfo;
-pub type VmaAllocationCreateInfo = vk_mem::AllocationCreateInfo;
-pub type VmaMemoryUsage = vk_mem::MemoryUsage;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn allocator_owner_is_shareable_and_externally_lockable() {
+        assert_send_sync::<VmaAllocator>();
+
+        let alias: Option<VmaAllocator> = None;
+        let canonical: Option<Arc<Mutex<vk_mem::Allocator>>> = alias;
+        assert!(canonical.is_none());
+    }
+}

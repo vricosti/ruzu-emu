@@ -5,10 +5,10 @@ use super::*;
 use crate::texture_cache::image_view_info::SwizzleSource;
 use std::sync::{Mutex, MutexGuard};
 
-static ASTC_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock_astc_settings() -> MutexGuard<'static, ()> {
-    ASTC_SETTINGS_LOCK.lock().unwrap()
+    SETTINGS_LOCK.lock().unwrap()
 }
 
 #[test]
@@ -52,6 +52,57 @@ fn texture_cache_gl_owners_start_empty_without_a_context() {
 }
 
 #[test]
+fn image_scaling_reads_live_resolution_state() {
+    use crate::renderer_opengl::gl_shader_manager::ProgramManager;
+    use crate::renderer_opengl::gl_staging_buffer_pool::make_shared_staging_buffer_pool;
+
+    let _lock = SETTINGS_LOCK.lock().unwrap();
+    let previous = common::settings::values().resolution_info.clone();
+    struct ResolutionRestore(common::settings::ResolutionScalingInfo);
+    impl Drop for ResolutionRestore {
+        fn drop(&mut self) {
+            common::settings::values_mut().resolution_info = self.0.clone();
+        }
+    }
+    let _restore = ResolutionRestore(previous);
+
+    let program_manager = ProgramManager::new_shared_for_test();
+    let mut state_tracker = StateTracker::new();
+    let mut runtime = Box::new(TextureCacheRuntime::new_for_test(
+        false,
+        false,
+        program_manager,
+        &mut state_tracker,
+        make_shared_staging_buffer_pool(),
+    ));
+    let mut base = ImageBase::new(
+        ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        },
+        0,
+        0,
+    );
+    let mut image = Image::new(&mut base);
+    image.runtime = Some(NonNull::from(runtime.as_mut()));
+    image.gl_format = gl::RGBA;
+    image.gl_type = gl::UNSIGNED_BYTE;
+
+    common::settings::values_mut().resolution_info.active = false;
+    assert!(!image.scale_up(&mut base, true));
+
+    common::settings::values_mut().resolution_info.active = true;
+    assert!(image.scale_up(&mut base, true));
+    assert!(base.flags.contains(ImageFlagBits::RESCALED));
+}
+
+#[test]
 fn texture_cache_materializes_upstream_null_image_view_slot() {
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::renderer_opengl::gl_shader_manager::ProgramManager;
@@ -74,7 +125,7 @@ fn texture_cache_materializes_upstream_null_image_view_slot() {
     let null_view = cache
         .get_image_view(NULL_IMAGE_VIEW_ID)
         .expect("upstream reserves a constructed OpenGL null image view at slot zero");
-    assert_eq!(null_view.views, [0; NUM_TEXTURE_TYPES]);
+    assert_eq!(null_view.views, [0; NUM_TEXTURE_TYPES as usize]);
     assert_eq!(null_view.default_handle(), 0);
 }
 
@@ -246,26 +297,23 @@ fn typed_image_view_keeps_inherited_base_address_across_slot_growth() {
         format: info.format,
         ..ImageViewInfo::default()
     };
-    let view_id = cache
-        .slot_image_views
-        .insert(ImageViewSlot::pending(ImageViewBase::new_buffer(
-            &info,
-            &view_info,
-            0x1234_0000,
-        )));
+    let view_id = cache.slot_image_views.insert(ImageViewSlot::pending(
+        view_info,
+        ImageViewBase::new_buffer(&info, &view_info, 0x1234_0000),
+    ));
     let base = std::ptr::NonNull::from(cache.slot_image_views[view_id].base.as_mut());
-    cache.slot_image_views[view_id].backend =
-        Some(ImageView::from_buffer_base(base, [0; NUM_TEXTURE_TYPES]));
+    cache.slot_image_views[view_id].backend = Some(ImageView::from_buffer_base(
+        base,
+        &view_info,
+        [0; NUM_TEXTURE_TYPES as usize],
+    ));
     let expected = cache.slot_image_views[view_id].base.as_ref() as *const ImageViewBase;
 
     for index in 0..256u64 {
-        cache
-            .slot_image_views
-            .insert(ImageViewSlot::pending(ImageViewBase::new_buffer(
-                &info,
-                &view_info,
-                0x2000_0000 + index * 0x1000,
-            )));
+        cache.slot_image_views.insert(ImageViewSlot::pending(
+            view_info,
+            ImageViewBase::new_buffer(&info, &view_info, 0x2000_0000 + index * 0x1000),
+        ));
     }
 
     assert_eq!(
@@ -304,7 +352,7 @@ fn buffer_image_view_materializes_upstream_buffer_size() {
     };
     let mut base = ImageViewBase::new_buffer(&info, &view_info, 0x1234_0000);
     let base_ptr = std::ptr::NonNull::from(&mut base);
-    let view = ImageView::from_buffer_base(base_ptr, [0; NUM_TEXTURE_TYPES]);
+    let view = ImageView::from_buffer_base(base_ptr, &view_info, [0; NUM_TEXTURE_TYPES as usize]);
 
     assert_eq!(view.pixel_format(), PixelFormat::A8B8G8R8Unorm);
     assert_eq!(
@@ -392,9 +440,27 @@ fn select_astc_format_follows_recompression_setting() {
 
 #[test]
 fn astc_upload_flags_follow_upstream_policy() {
+    use crate::renderer_opengl::gl_shader_manager::ProgramManager;
+    use crate::renderer_opengl::gl_staging_buffer_pool::make_shared_staging_buffer_pool;
     use common::settings_enums::{AstcDecodeMode, AstcRecompression};
 
     let _lock = lock_astc_settings();
+
+    let mut state_tracker = StateTracker::new();
+    let runtime_without_astc = TextureCacheRuntime::new_for_test(
+        false,
+        false,
+        ProgramManager::new_shared_for_test(),
+        &mut state_tracker,
+        make_shared_staging_buffer_pool(),
+    );
+    let runtime_with_astc = TextureCacheRuntime::new_for_test(
+        false,
+        true,
+        ProgramManager::new_shared_for_test(),
+        &mut state_tracker,
+        make_shared_staging_buffer_pool(),
+    );
 
     struct AstcSettingsRestore {
         decode: AstcDecodeMode,
@@ -433,10 +499,10 @@ fn astc_upload_flags_follow_upstream_policy() {
             .astc_recompression
             .set_value(AstcRecompression::Uncompressed);
     }
-    assert!(can_be_decoded_async(false, &info));
-    assert!(!can_be_accelerated(false, &info));
+    assert!(can_be_decoded_async(&runtime_without_astc, &info));
+    assert!(!can_be_accelerated(&runtime_without_astc, &info));
     let mut async_image = ImageBase::new(info.clone(), 0, 0);
-    TextureCache::apply_backend_image_flags_for_test(&mut async_image, false);
+    TextureCache::apply_backend_image_flags_for_test(&mut async_image, &runtime_without_astc);
     assert!(async_image
         .flags
         .contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
@@ -451,10 +517,10 @@ fn astc_upload_flags_follow_upstream_policy() {
             .astc_recompression
             .set_value(AstcRecompression::Uncompressed);
     }
-    assert!(!can_be_decoded_async(false, &info));
-    assert!(can_be_accelerated(false, &info));
+    assert!(!can_be_decoded_async(&runtime_without_astc, &info));
+    assert!(can_be_accelerated(&runtime_without_astc, &info));
     let mut accelerated_image = ImageBase::new(info.clone(), 0, 0);
-    TextureCache::apply_backend_image_flags_for_test(&mut accelerated_image, false);
+    TextureCache::apply_backend_image_flags_for_test(&mut accelerated_image, &runtime_without_astc);
     assert!(!accelerated_image
         .flags
         .contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
@@ -465,11 +531,11 @@ fn astc_upload_flags_follow_upstream_policy() {
     common::settings::values_mut()
         .astc_recompression
         .set_value(AstcRecompression::Bc1);
-    assert!(!can_be_accelerated(false, &info));
-    assert!(!can_be_decoded_async(true, &info));
-    assert!(!can_be_accelerated(true, &info));
+    assert!(!can_be_accelerated(&runtime_without_astc, &info));
+    assert!(!can_be_decoded_async(&runtime_with_astc, &info));
+    assert!(!can_be_accelerated(&runtime_with_astc, &info));
     let mut native_image = ImageBase::new(info, 0, 0);
-    TextureCache::apply_backend_image_flags_for_test(&mut native_image, true);
+    TextureCache::apply_backend_image_flags_for_test(&mut native_image, &runtime_with_astc);
     assert!(!native_image
         .flags
         .contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
@@ -492,6 +558,15 @@ fn decode_swizzle_matches_upstream_sources() {
             SwizzleSource::R,
             SwizzleSource::R,
             SwizzleSource::OneFloat,
+        ])
+    );
+    assert_eq!(
+        decode_swizzle([1, 2, 3, 4]),
+        Some([
+            SwizzleSource::Invalid,
+            SwizzleSource::R,
+            SwizzleSource::G,
+            SwizzleSource::B,
         ])
     );
     assert_eq!(decode_swizzle([u8::MAX; 4]), None);
@@ -632,7 +707,7 @@ fn image_view_parent_guard_accepts_slice_effective_full_range() {
 }
 
 #[test]
-fn image_view_info_render_target_sentinel_is_preserved_for_backend_materialization() {
+fn image_view_info_render_target_sentinel_is_preserved_outside_image_view_base() {
     use crate::texture_cache::format_lookup_table::PixelFormat;
     use crate::texture_cache::image_info::ImageInfo;
     use crate::texture_cache::image_view_base::ImageViewBase;
@@ -656,9 +731,8 @@ fn image_view_info_render_target_sentinel_is_preserved_for_backend_materializati
         PixelFormat::A8B8G8R8Unorm,
         SubresourceRange::default(),
     );
-    let mut base = ImageViewBase::new(&view_info, &image_info, image_id, 0x1000);
-    assert!(base.is_render_target());
-    assert_eq!(base.swizzle, [u8::MAX; 4]);
-    let view = ImageView::new(&mut base);
-    assert!(view.base().is_render_target());
+    let base = ImageViewBase::new(&view_info, &image_info, image_id, 0x1000);
+    let slot =
+        crate::texture_cache::texture_cache_base::ImageViewSlot::<()>::pending(view_info, base);
+    assert!(slot.info.is_render_target());
 }

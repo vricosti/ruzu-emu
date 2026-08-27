@@ -6,6 +6,7 @@
 //! AMD FidelityFX Super Resolution (FSR) 1.0 upscaling pass.
 
 use ash::vk;
+use std::ptr::NonNull;
 
 use super::util;
 use crate::fsr::{fsr_easu_con_offset, fsr_rcas_con};
@@ -16,7 +17,8 @@ use crate::host_shaders::spirv_shaders::{
 };
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
-use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
+use crate::vulkan_common::vulkan_device::Device;
+use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator};
 
 // ---------------------------------------------------------------------------
 // FSR stage enum
@@ -25,13 +27,13 @@ use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 /// Port of `FSR::FsrStage` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
-pub enum FsrStage {
+enum FsrStage {
     Easu = 0,
     Rcas = 1,
 }
 
 /// Total number of FSR stages.
-pub const MAX_FSR_STAGE: usize = 2;
+const MAX_FSR_STAGE: usize = 2;
 
 /// Port of FSR push constants (4x4 u32 array).
 type PushConstants = [u32; 4 * 4];
@@ -41,11 +43,11 @@ type PushConstants = [u32; 4 * 4];
 // ---------------------------------------------------------------------------
 
 /// Port of `FSR::Images` inner struct.
-pub struct FsrImages {
-    pub descriptor_sets: Vec<vk::DescriptorSet>,
-    pub images: [vk::Image; MAX_FSR_STAGE],
-    pub image_views: [vk::ImageView; MAX_FSR_STAGE],
-    pub framebuffers: [vk::Framebuffer; MAX_FSR_STAGE],
+struct FsrImages {
+    descriptor_sets: Vec<vk::DescriptorSet>,
+    images: [AllocatedImage; MAX_FSR_STAGE],
+    image_views: [vk::ImageView; MAX_FSR_STAGE],
+    framebuffers: [vk::Framebuffer; MAX_FSR_STAGE],
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +59,7 @@ pub struct FsrImages {
 /// Two-pass (EASU + RCAS) FidelityFX Super Resolution upscaling.
 pub struct Fsr {
     device: ash::Device,
+    memory_allocator: NonNull<MemoryAllocator>,
     image_count: usize,
     extent: vk::Extent2D,
     images_ready: bool,
@@ -77,14 +80,14 @@ pub struct Fsr {
 impl Fsr {
     /// Port of `FSR::FSR`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         allocator: &MemoryAllocator,
         image_count: usize,
         extent: vk::Extent2D,
-        supports_float16: bool,
     ) -> Self {
         let mut fsr = Fsr {
-            device,
+            device: device.get_logical().clone(),
+            memory_allocator: NonNull::from(allocator),
             image_count,
             extent,
             images_ready: false,
@@ -101,42 +104,35 @@ impl Fsr {
             sampler: vk::Sampler::null(),
         };
 
-        fsr.create_images(allocator);
-        fsr.create_render_passes();
-        fsr.create_sampler();
-        fsr.create_shaders(supports_float16);
-        fsr.create_descriptor_pool();
-        fsr.create_descriptor_set_layout();
-        fsr.create_descriptor_sets();
-        fsr.create_pipeline_layouts();
-        fsr.create_pipelines();
+        fsr.create_images(device);
+        fsr.create_render_passes(device);
+        fsr.create_sampler(device);
+        fsr.create_shaders(device);
+        fsr.create_descriptor_pool(device);
+        fsr.create_descriptor_set_layout(device);
+        fsr.create_descriptor_sets(device);
+        fsr.create_pipeline_layouts(device);
+        fsr.create_pipelines(device);
         fsr
     }
 
     /// Port of `FSR::CreateImages`.
-    fn create_images(&mut self, allocator: &MemoryAllocator) {
+    fn create_images(&mut self, device: &Device) {
+        let allocator = unsafe { self.memory_allocator.as_ref() };
         self.dynamic_images.reserve_exact(self.image_count);
         for _ in 0..self.image_count {
-            let easu_image = util::create_wrapped_image(
-                &self.device,
-                allocator,
-                self.extent,
-                vk::Format::R16G16B16A16_SFLOAT,
-            );
-            let rcas_image = util::create_wrapped_image(
-                &self.device,
-                allocator,
-                self.extent,
-                vk::Format::R16G16B16A16_SFLOAT,
-            );
+            let easu_image =
+                util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
+            let rcas_image =
+                util::create_wrapped_image(allocator, self.extent, vk::Format::R16G16B16A16_SFLOAT);
             let easu_view = util::create_wrapped_image_view(
-                &self.device,
-                easu_image,
+                device,
+                easu_image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
             let rcas_view = util::create_wrapped_image_view(
-                &self.device,
-                rcas_image,
+                device,
+                rcas_image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
             self.dynamic_images.push(FsrImages {
@@ -149,22 +145,22 @@ impl Fsr {
     }
 
     /// Port of `FSR::CreateRenderPasses`.
-    fn create_render_passes(&mut self) {
+    fn create_render_passes(&mut self, device: &Device) {
         self.renderpass = util::create_wrapped_render_pass(
-            &self.device,
+            device,
             vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
         );
 
         for images in &mut self.dynamic_images {
             images.framebuffers[FsrStage::Easu as usize] = util::create_wrapped_framebuffer(
-                &self.device,
+                device,
                 self.renderpass,
                 images.image_views[FsrStage::Easu as usize],
                 self.extent,
             );
             images.framebuffers[FsrStage::Rcas as usize] = util::create_wrapped_framebuffer(
-                &self.device,
+                device,
                 self.renderpass,
                 images.image_views[FsrStage::Rcas as usize],
                 self.extent,
@@ -173,15 +169,15 @@ impl Fsr {
     }
 
     /// Port of `FSR::CreateSampler`.
-    fn create_sampler(&mut self) {
-        self.sampler = util::create_bilinear_sampler(&self.device);
+    fn create_sampler(&mut self, device: &Device) {
+        self.sampler = util::create_bilinear_sampler(device);
     }
 
     /// Port of `FSR::CreateShaders`.
-    fn create_shaders(&mut self, supports_float16: bool) {
-        self.vert_shader = build_shader(&self.device, VULKAN_FIDELITYFX_FSR_VERT_SPV)
+    fn create_shaders(&mut self, device: &Device) {
+        self.vert_shader = build_shader(device.get_logical(), VULKAN_FIDELITYFX_FSR_VERT_SPV)
             .expect("Failed to build vulkan_fidelityfx_fsr.vert");
-        let (easu_spv, rcas_spv, easu_name, rcas_name) = if supports_float16 {
+        let (easu_spv, rcas_spv, easu_name, rcas_name) = if device.is_float16_supported() {
             (
                 VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV,
                 VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV,
@@ -196,44 +192,48 @@ impl Fsr {
                 "vulkan_fidelityfx_fsr_rcas_fp32.frag",
             )
         };
-        self.easu_shader = build_shader(&self.device, easu_spv)
+        self.easu_shader = build_shader(device.get_logical(), easu_spv)
             .unwrap_or_else(|_| panic!("Failed to build {easu_name}"));
-        self.rcas_shader = build_shader(&self.device, rcas_spv)
+        self.rcas_shader = build_shader(device.get_logical(), rcas_spv)
             .unwrap_or_else(|_| panic!("Failed to build {rcas_name}"));
     }
 
     /// Port of `FSR::CreateDescriptorPool`.
-    fn create_descriptor_pool(&mut self) {
+    fn create_descriptor_pool(&mut self, device: &Device) {
         // EASU: 1 descriptor
         // RCAS: 1 descriptor
         // 2 descriptors, 2 descriptor sets per invocation
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            &self.device,
-            2 * self.image_count as u32,
-            2 * self.image_count as u32,
+            device,
+            2 * self.image_count,
+            2 * self.image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
     }
 
     /// Port of `FSR::CreateDescriptorSetLayout`.
-    fn create_descriptor_set_layout(&mut self) {
+    fn create_descriptor_set_layout(&mut self, device: &Device) {
         self.descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            &self.device,
+            device,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
     }
 
     /// Port of `FSR::CreateDescriptorSets`.
-    fn create_descriptor_sets(&mut self) {
+    fn create_descriptor_sets(&mut self, device: &Device) {
         let layouts = vec![self.descriptor_set_layout; MAX_FSR_STAGE];
         for images in &mut self.dynamic_images {
-            images.descriptor_sets =
-                util::create_wrapped_descriptor_sets(&self.device, self.descriptor_pool, &layouts);
+            images.descriptor_sets = util::create_wrapped_descriptor_sets(
+                device.get_logical(),
+                self.descriptor_pool,
+                &layouts,
+            );
         }
     }
 
     /// Port of `FSR::CreatePipelineLayouts`.
-    fn create_pipeline_layouts(&mut self) {
+    fn create_pipeline_layouts(&mut self, device: &Device) {
         let push_constant_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::FRAGMENT,
             offset: 0,
@@ -245,23 +245,24 @@ impl Fsr {
             .push_constant_ranges(std::slice::from_ref(&push_constant_range))
             .build();
         self.pipeline_layout = unsafe {
-            self.device
+            device
+                .get_logical()
                 .create_pipeline_layout(&pipeline_layout_ci, None)
                 .expect("Failed to create FSR pipeline layout")
         };
     }
 
     /// Port of `FSR::CreatePipelines`.
-    fn create_pipelines(&mut self) {
+    fn create_pipelines(&mut self, device: &Device) {
         self.easu_pipeline = util::create_wrapped_pipeline(
-            &self.device,
+            device,
             self.renderpass,
             self.pipeline_layout,
             self.vert_shader,
             self.easu_shader,
         );
         self.rcas_pipeline = util::create_wrapped_pipeline(
-            &self.device,
+            device,
             self.renderpass,
             self.pipeline_layout,
             self.vert_shader,
@@ -270,7 +271,12 @@ impl Fsr {
     }
 
     /// Port of `FSR::UpdateDescriptorSets`.
-    fn update_descriptor_sets(&self, image_view: vk::ImageView, image_index: usize) {
+    fn update_descriptor_sets(
+        &self,
+        device: &Device,
+        image_view: vk::ImageView,
+        image_index: usize,
+    ) {
         let images = &self.dynamic_images[image_index];
         let mut image_infos = Vec::with_capacity(2);
         let mut updates = Vec::new();
@@ -293,20 +299,23 @@ impl Fsr {
         ));
 
         unsafe {
-            self.device.update_descriptor_sets(&updates, &[]);
+            device.get_logical().update_descriptor_sets(&updates, &[]);
         }
     }
 
     /// Port of `FSR::UploadImages`.
-    fn upload_images(&mut self, scheduler: &mut Scheduler) {
+    fn upload_images(&mut self, device: &Device, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
         self.images_ready = true;
 
-        let images: Vec<[vk::Image; MAX_FSR_STAGE]> =
-            self.dynamic_images.iter().map(|imgs| imgs.images).collect();
-        let device = self.device.clone();
+        let images: Vec<[vk::Image; MAX_FSR_STAGE]> = self
+            .dynamic_images
+            .iter()
+            .map(|imgs| [imgs.images[0].handle(), imgs.images[1].handle()])
+            .collect();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| {
             for image in images {
                 util::clear_color_image(&device, cmdbuf, image[FsrStage::Easu as usize]);
@@ -322,6 +331,7 @@ impl Fsr {
     /// output image view.
     pub fn draw(
         &mut self,
+        device: &Device,
         scheduler: &mut Scheduler,
         image_index: usize,
         source_image: vk::Image,
@@ -331,8 +341,8 @@ impl Fsr {
     ) -> vk::ImageView {
         let images = &self.dynamic_images[image_index];
 
-        let easu_image = images.images[FsrStage::Easu as usize];
-        let rcas_image = images.images[FsrStage::Rcas as usize];
+        let easu_image = images.images[FsrStage::Easu as usize].handle();
+        let rcas_image = images.images[FsrStage::Rcas as usize].handle();
         let easu_descriptor_set = images.descriptor_sets[FsrStage::Easu as usize];
         let rcas_descriptor_set = images.descriptor_sets[FsrStage::Rcas as usize];
         let easu_framebuffer = images.framebuffers[FsrStage::Easu as usize];
@@ -378,11 +388,11 @@ impl Fsr {
         let (rcas_con0, _) = rcas_con.split_at_mut(4);
         fsr_rcas_con(rcas_con0.try_into().unwrap(), sharpening);
 
-        self.upload_images(scheduler);
-        self.update_descriptor_sets(source_image_view, image_index);
+        self.upload_images(device, scheduler);
+        self.update_descriptor_sets(device, source_image_view, image_index);
 
-        scheduler.request_outside_renderpass();
-        let device = self.device.clone();
+        scheduler.request_outside_render_pass_operation_context();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| unsafe {
             util::transition_image_layout(
                 &device,

@@ -3,19 +3,36 @@
 
 //! Port of `vk_turbo_mode.h` / `vk_turbo_mode.cpp`.
 
+#[cfg(not(target_os = "android"))]
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "android"))]
 use ash::vk;
 
+#[cfg(not(target_os = "android"))]
+use super::renderer_vulkan::create_device;
+#[cfg(not(target_os = "android"))]
 use super::shader_util::build_shader;
+#[cfg(not(target_os = "android"))]
 use crate::host_shaders::spirv_shaders::VULKAN_TURBO_MODE_COMP_SPV;
+#[cfg(not(target_os = "android"))]
 use crate::vulkan_common::vulkan_device::Device;
-use crate::vulkan_common::vulkan_memory_allocator::{MemoryAllocator, MemoryUsage};
-use crate::vulkan_common::vulkan_wrapper::VulkanError;
+#[cfg(not(target_os = "android"))]
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
+};
+use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+#[link(name = "adrenotools")]
+unsafe extern "C" {
+    fn adrenotools_set_turbo(enable: bool);
+}
+
+#[cfg(not(target_os = "android"))]
 const TURBO_BUFFER_SIZE: u64 = 2 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -25,10 +42,11 @@ struct TurboState {
     stop_requested: AtomicBool,
 }
 
+#[cfg(not(target_os = "android"))]
 struct TurboResources {
     allocator: MemoryAllocator,
     device: Device,
-    buffer: vk::Buffer,
+    buffer: Option<AllocatedBuffer>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
@@ -42,25 +60,18 @@ struct TurboResources {
 
 // All Vulkan handles in this owner belong to its dedicated logical device and
 // are moved to, then exclusively used by, the turbo thread.
+#[cfg(not(target_os = "android"))]
 unsafe impl Send for TurboResources {}
 
+#[cfg(not(target_os = "android"))]
 impl TurboResources {
-    fn new(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> Result<Self, VulkanError> {
-        let device = Device::new(
-            entry,
-            instance.clone(),
-            physical_device,
-            vk::SurfaceKHR::null(),
-        )?;
+    fn new(instance: &Instance) -> Result<Self, VulkanError> {
+        let device = create_device(instance, vk::SurfaceKHR::null())?;
         let allocator = MemoryAllocator::new(&device);
-        let mut resources = Self {
+        Ok(Self {
             allocator,
             device,
-            buffer: vk::Buffer::null(),
+            buffer: None,
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_set: vk::DescriptorSet::null(),
@@ -70,9 +81,7 @@ impl TurboResources {
             fence: vk::Fence::null(),
             command_pool: vk::CommandPool::null(),
             command_buffer: vk::CommandBuffer::null(),
-        };
-        resources.initialize()?;
-        Ok(resources)
+        })
     }
 
     fn initialize(&mut self) -> Result<(), VulkanError> {
@@ -82,9 +91,10 @@ impl TurboResources {
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
-        self.buffer = self
-            .allocator
-            .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)?;
+        self.buffer = Some(
+            self.allocator
+                .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)?,
+        );
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -178,11 +188,16 @@ impl TurboResources {
 
     fn dispatch(&self) -> Result<(), vk::Result> {
         let dld = self.device.get_logical();
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("turbo buffer must be initialized")
+            .handle();
         unsafe {
             dld.reset_fences(&[self.fence])?;
 
             let descriptor_buffer_info = [vk::DescriptorBufferInfo {
-                buffer: self.buffer,
+                buffer,
                 offset: 0,
                 range: vk::WHOLE_SIZE,
             }];
@@ -194,12 +209,11 @@ impl TurboResources {
                 .build()];
             dld.update_descriptor_sets(&descriptor_write, &[]);
 
-            dld.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
             let begin_info = vk::CommandBufferBeginInfo::builder()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
                 .build();
             dld.begin_command_buffer(self.command_buffer, &begin_info)?;
-            dld.cmd_fill_buffer(self.command_buffer, self.buffer, 0, vk::WHOLE_SIZE, 0);
+            dld.cmd_fill_buffer(self.command_buffer, buffer, 0, vk::WHOLE_SIZE, 0);
             dld.cmd_bind_descriptor_sets(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -227,11 +241,11 @@ impl TurboResources {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl Drop for TurboResources {
     fn drop(&mut self) {
         let dld = self.device.get_logical();
         unsafe {
-            dld.device_wait_idle().ok();
             if self.command_pool != vk::CommandPool::null() {
                 dld.destroy_command_pool(self.command_pool, None);
             }
@@ -247,13 +261,14 @@ impl Drop for TurboResources {
             if self.shader != vk::ShaderModule::null() {
                 dld.destroy_shader_module(self.shader, None);
             }
-            if self.descriptor_pool != vk::DescriptorPool::null() {
-                dld.destroy_descriptor_pool(self.descriptor_pool, None);
-            }
             if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
                 dld.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                dld.destroy_descriptor_pool(self.descriptor_pool, None);
+            }
         }
+        self.buffer.take();
     }
 }
 
@@ -264,21 +279,25 @@ pub struct TurboMode {
 }
 
 impl TurboMode {
-    pub fn new(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> Result<Self, VulkanError> {
-        let resources = TurboResources::new(entry, instance, physical_device)?;
+    pub fn new(instance: &Instance) -> Result<Self, VulkanError> {
+        #[cfg(not(target_os = "android"))]
+        let resources = TurboResources::new(instance)?;
+        #[cfg(target_os = "android")]
+        let _ = instance;
         let state = Arc::new(TurboState {
             submission_time: Mutex::new(Instant::now()),
             submission_cv: Condvar::new(),
             stop_requested: AtomicBool::new(false),
         });
         let thread_state = Arc::clone(&state);
-        let thread_handle = std::thread::Builder::new()
-            .name("TurboMode".to_string())
+        let thread_builder = std::thread::Builder::new().name("TurboMode".to_string());
+        #[cfg(not(target_os = "android"))]
+        let thread_handle = thread_builder
             .spawn(move || Self::run(thread_state, resources))
+            .expect("Failed to spawn TurboMode thread");
+        #[cfg(target_os = "android")]
+        let thread_handle = thread_builder
+            .spawn(move || Self::run(thread_state))
             .expect("Failed to spawn TurboMode thread");
         Ok(Self {
             state,
@@ -286,8 +305,23 @@ impl TurboMode {
         })
     }
 
-    fn run(state: Arc<TurboState>, resources: TurboResources) {
+    fn run(
+        state: Arc<TurboState>,
+        #[cfg(not(target_os = "android"))] mut resources: TurboResources,
+    ) {
+        #[cfg(not(target_os = "android"))]
+        if let Err(error) = resources.initialize() {
+            log::error!("TurboMode Vulkan initialization failed: {error:?}");
+            return;
+        }
+
         while !state.stop_requested.load(Ordering::Acquire) {
+            #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+            unsafe {
+                adrenotools_set_turbo(true);
+            }
+
+            #[cfg(not(target_os = "android"))]
             if let Err(error) = resources.dispatch() {
                 log::error!("TurboMode Vulkan submission failed: {error:?}");
                 return;
@@ -299,6 +333,11 @@ impl TurboMode {
             {
                 submission_time = state.submission_cv.wait(submission_time).unwrap();
             }
+        }
+
+        #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+        unsafe {
+            adrenotools_set_turbo(false);
         }
     }
 
@@ -336,11 +375,13 @@ mod tests {
 
     #[test]
     fn constants_match_upstream() {
+        #[cfg(not(target_os = "android"))]
         assert_eq!(TURBO_BUFFER_SIZE, 2 * 1024 * 1024);
         assert_eq!(IDLE_TIMEOUT, Duration::from_millis(100));
     }
 
     #[test]
+    #[cfg(not(target_os = "android"))]
     #[ignore = "requires a Vulkan-capable host"]
     fn creates_submits_and_destroys_turbo_workload() {
         let entry = open_library().expect("Vulkan loader");
@@ -351,18 +392,7 @@ mod tests {
             false,
         )
         .expect("headless Vulkan instance");
-        let physical_device = unsafe {
-            instance
-                .instance
-                .enumerate_physical_devices()
-                .expect("physical devices")
-                .into_iter()
-                .next()
-                .expect("at least one physical device")
-        };
-
-        let turbo_mode = TurboMode::new(&instance.entry, &instance.instance, physical_device)
-            .expect("turbo workload resources");
+        let turbo_mode = TurboMode::new(&instance).expect("turbo workload resources");
         turbo_mode.queue_submitted();
         std::thread::sleep(Duration::from_millis(20));
         drop(turbo_mode);

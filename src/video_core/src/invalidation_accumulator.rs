@@ -19,9 +19,7 @@ const ATOMICITY_MASK: u64 = !(ATOMICITY_SIZE_MASK as u64);
 /// Accumulates invalidation ranges, merging adjacent entries aligned to 32-byte boundaries.
 pub struct InvalidationAccumulator {
     start_address: GPUVAddr,
-    last_collection: GPUVAddr,
     accumulated_size: usize,
-    has_collected: bool,
     buffer: Vec<(VAddr, usize)>,
 }
 
@@ -29,78 +27,105 @@ impl InvalidationAccumulator {
     pub fn new() -> Self {
         Self {
             start_address: 0,
-            last_collection: 0,
             accumulated_size: 0,
-            has_collected: false,
             buffer: Vec::new(),
         }
     }
 
     /// Add an invalidation range. Merges with the current range if adjacent.
     pub fn add(&mut self, mut address: GPUVAddr, mut size: usize) {
-        // Fast path: if the range is already covered
-        if address >= self.start_address && address + size as u64 <= self.last_collection {
+        let end_address = self
+            .start_address
+            .wrapping_add(self.accumulated_size as u64);
+        if address >= self.start_address && address.wrapping_add(size as u64) <= end_address {
             return;
         }
 
-        // Align size and address to atomicity boundary
-        size = ((address as usize + size + ATOMICITY_SIZE_MASK) & !ATOMICITY_SIZE_MASK)
-            - address as usize;
+        size = (address
+            .wrapping_add(size as u64)
+            .wrapping_add(ATOMICITY_SIZE_MASK as u64)
+            & ATOMICITY_MASK)
+            .wrapping_sub(address) as usize;
         address &= ATOMICITY_MASK;
 
-        let reset_values = |this: &mut Self| {
-            if this.has_collected {
-                this.buffer
-                    .push((this.start_address, this.accumulated_size));
+        if self.start_address == 0 {
+            self.start_address = address;
+            self.accumulated_size = size;
+        } else if address != end_address {
+            self.buffer
+                .push((self.start_address, self.accumulated_size));
+            self.start_address = address;
+            self.accumulated_size = size;
+        } else {
+            self.accumulated_size = self.accumulated_size.wrapping_add(size);
+        }
+    }
+
+    /// Invoke a callback for every accumulated range, then reset the accumulator.
+    /// Returns whether any range was invalidated.
+    pub fn invalidate_all<F: FnMut(VAddr, usize)>(&mut self, mut func: F) -> bool {
+        if self.start_address > 0 {
+            for &(address, size) in &self.buffer {
+                func(address, size);
             }
-            this.start_address = address;
-            this.accumulated_size = size;
-            this.last_collection = address + size as u64;
-        };
-
-        if !self.has_collected {
-            reset_values(self);
-            self.has_collected = true;
-            return;
+            func(self.start_address, self.accumulated_size);
+            self.buffer.clear();
+            self.start_address = 0;
+            self.accumulated_size = 0;
+            return true;
         }
-
-        if address != self.last_collection {
-            reset_values(self);
-            return;
-        }
-
-        self.accumulated_size += size;
-        self.last_collection += size as u64;
-    }
-
-    /// Clear all accumulated ranges.
-    pub fn clear(&mut self) {
-        self.buffer.clear();
-        self.start_address = 0;
-        self.last_collection = 0;
-        self.has_collected = false;
-    }
-
-    /// Returns true if any invalidation has been accumulated.
-    pub fn any_accumulated(&self) -> bool {
-        self.has_collected
-    }
-
-    /// Invoke a callback for each accumulated range.
-    pub fn callback<F: FnMut(VAddr, usize)>(&mut self, mut func: F) {
-        if !self.has_collected {
-            return;
-        }
-        self.buffer
-            .push((self.start_address, self.accumulated_size));
-        for &(address, size) in &self.buffer {
-            func(address, size);
-        }
+        false
     }
 }
 
 impl Default for InvalidationAccumulator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InvalidationAccumulator;
+
+    #[test]
+    fn adjacent_ranges_merge_and_invalidate_all_resets() {
+        let mut accumulator = InvalidationAccumulator::new();
+        accumulator.add(0x1000, 0x20);
+        accumulator.add(0x1020, 0x20);
+
+        let mut ranges = Vec::new();
+        assert!(accumulator.invalidate_all(|address, size| ranges.push((address, size))));
+        assert_eq!(ranges, vec![(0x1000, 0x40)]);
+        assert!(!accumulator.invalidate_all(|_, _| unreachable!()));
+    }
+
+    #[test]
+    fn disjoint_ranges_preserve_insertion_order() {
+        let mut accumulator = InvalidationAccumulator::new();
+        accumulator.add(0x1010, 1);
+        accumulator.add(0x2010, 1);
+
+        let mut ranges = Vec::new();
+        assert!(accumulator.invalidate_all(|address, size| ranges.push((address, size))));
+        assert_eq!(ranges, vec![(0x1000, 0x10), (0x2000, 0x10)]);
+    }
+
+    #[test]
+    fn zero_start_address_matches_upstream_empty_sentinel() {
+        let mut accumulator = InvalidationAccumulator::new();
+        accumulator.add(0, 1);
+
+        assert!(!accumulator.invalidate_all(|_, _| unreachable!()));
+    }
+
+    #[test]
+    fn range_arithmetic_wraps_like_unsigned_cpp() {
+        let mut accumulator = InvalidationAccumulator::new();
+        accumulator.add(u64::MAX - 15, 32);
+
+        let mut ranges = Vec::new();
+        assert!(accumulator.invalidate_all(|address, size| ranges.push((address, size))));
+        assert_eq!(ranges, vec![(u64::MAX - 31, 48)]);
     }
 }

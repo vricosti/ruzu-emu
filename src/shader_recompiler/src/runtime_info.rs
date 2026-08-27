@@ -99,7 +99,7 @@ pub struct TransformFeedbackVarying {
 ///
 /// Contains pipeline state that affects shader compilation but is not
 /// part of the shader binary itself.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuntimeInfo {
     /// Input attribute types for vertex shaders.
     pub generic_input_types: [AttributeType; 32],
@@ -136,7 +136,7 @@ pub struct RuntimeInfo {
     pub glasm_use_storage_buffers: bool,
 
     /// Transform feedback state for each varying.
-    pub xfb_varyings: Vec<TransformFeedbackVarying>,
+    pub xfb_varyings: [TransformFeedbackVarying; 256],
     /// Number of transform feedback varyings.
     pub xfb_count: u32,
 
@@ -145,4 +145,47 @@ pub struct RuntimeInfo {
 
     /// Whether attachment 0 uses dual-source blending.
     pub dual_source_blend: bool,
+}
+
+impl Default for RuntimeInfo {
+    fn default() -> Self {
+        Self {
+            generic_input_types: [AttributeType::default(); 32],
+            previous_stage_stores: VaryingState::default(),
+            previous_stage_legacy_stores_mapping: BTreeMap::new(),
+            convert_depth_mode: false,
+            force_early_z: false,
+            tess_primitive: TessPrimitive::default(),
+            tess_spacing: TessSpacing::default(),
+            tess_clockwise: false,
+            input_topology: InputTopology::default(),
+            fixed_state_point_size: None,
+            alpha_test_func: None,
+            alpha_test_reference: 0.0,
+            y_negate: false,
+            glasm_use_storage_buffers: false,
+            xfb_varyings: [TransformFeedbackVarying::default(); 256],
+            xfb_count: 0,
+            frag_color_types: [AttributeType::default(); 8],
+            dual_source_blend: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_feedback_storage_matches_eden_fixed_extent() {
+        let info = RuntimeInfo::default();
+
+        assert_eq!(info.xfb_varyings.len(), 256);
+        assert_eq!(info.xfb_count, 0);
+        assert!(info.xfb_varyings.iter().all(|varying| varying.buffer == 0
+            && varying.stream == 0
+            && varying.stride == 0
+            && varying.offset == 0
+            && varying.components == 0));
+    }
 }

@@ -286,6 +286,8 @@ impl ComponentType {
 #[repr(u32)]
 pub enum SwizzleSource {
     Zero = 0,
+    /// Raw TIC value not named by the hardware documentation.
+    Invalid = 1,
     R = 2,
     G = 3,
     B = 4,
@@ -298,6 +300,7 @@ impl SwizzleSource {
     pub fn from_raw(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::Zero),
+            1 => Some(Self::Invalid),
             2 => Some(Self::R),
             3 => Some(Self::G),
             4 => Some(Self::B),

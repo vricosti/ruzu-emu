@@ -200,7 +200,7 @@ impl StagingBufferPool {
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
-        let allocation = memory_allocator.create_owned_buffer(&stream_ci, MemoryUsage::Stream)?;
+        let allocation = memory_allocator.create_buffer(&stream_ci, MemoryUsage::Stream)?;
         assert!(
             !allocation.mapped_ptr().is_null(),
             "Stream buffer must be host visible"
@@ -543,7 +543,7 @@ impl StagingBufferPool {
         // rasterizer and its staging pool, matching upstream's reference member.
         let memory_allocator = unsafe { self.memory_allocator.as_ref() };
         let allocation = memory_allocator
-            .create_owned_buffer(&buf_info, usage)
+            .create_buffer(&buf_info, usage)
             .ok()?;
         let buffer = allocation.handle();
         let mapped = allocation.mapped_ptr();

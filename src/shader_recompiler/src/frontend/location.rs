@@ -31,11 +31,14 @@ impl Location {
             "initial_offset={} is not a multiple of 8",
             initial_offset
         );
-        let mut loc = Self {
-            offset: initial_offset,
-        };
+        let mut loc = Self { offset: initial_offset };
         loc.align();
         loc
+    }
+
+    /// Create a location for an absolute branch target.
+    pub fn with_offset(&self, offset: u32) -> Self {
+        Self::new(offset)
     }
 
     /// Create a virtual location (offset by VIRTUAL_BIAS).
@@ -97,33 +100,34 @@ impl Location {
 
 impl Default for Location {
     fn default() -> Self {
-        Self { offset: 0xcccccccc }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Location;
-
-    #[test]
-    fn program_header_end_uses_the_absolute_schedule_grid() {
-        let mut location = Location::new(0x50);
-
-        assert_eq!(location.offset(), 0x50);
-        location.step();
-        assert_eq!(location.offset(), 0x58);
-        location.step();
-        assert_eq!(location.offset(), 0x68);
-    }
-
-    #[test]
-    fn constructor_skips_an_absolute_schedule_word() {
-        assert_eq!(Location::new(0x60).offset(), 0x68);
+        Self {
+            offset: 0xcccccccc,
+        }
     }
 }
 
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:04x}", self.offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduling_grid_is_anchored_at_absolute_offset_zero() {
+        let mut location = Location::new(0x850);
+        assert_eq!(location.offset(), 0x850);
+        location.step();
+        assert_eq!(location.offset(), 0x858);
+        location.step();
+        assert_eq!(location.offset(), 0x868);
+    }
+
+    #[test]
+    fn constructor_skips_an_absolute_scheduling_word() {
+        assert_eq!(Location::new(0x860).offset(), 0x868);
     }
 }

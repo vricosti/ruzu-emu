@@ -12,22 +12,24 @@ use std::sync::Arc;
 /// Control methods for the Host1x control channel.
 ///
 /// Port of `Tegra::Host1x::Control::Method`.
-#[repr(u32)]
+/// A transparent newtype preserves the raw value reaching Eden's `default`
+/// switch arm without constructing an invalid Rust enum discriminant.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    WaitSyncpt = 0x8,
-    LoadSyncptPayload32 = 0x4e,
-    WaitSyncpt32 = 0x50,
-}
+pub struct Method(u32);
 
+#[allow(non_upper_case_globals)]
 impl Method {
-    pub fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            0x8 => Some(Method::WaitSyncpt),
-            0x4e => Some(Method::LoadSyncptPayload32),
-            0x50 => Some(Method::WaitSyncpt32),
-            _ => None,
-        }
+    pub const WaitSyncpt: Self = Self(0x8);
+    pub const LoadSyncptPayload32: Self = Self(0x4e);
+    pub const WaitSyncpt32: Self = Self(0x50);
+
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
     }
 }
 
@@ -58,6 +60,9 @@ impl Control {
             Method::WaitSyncpt | Method::WaitSyncpt32 => {
                 self.execute(argument);
             }
+            _ => {
+                log::error!("Unimplemented Control method 0x{:X}", method.raw());
+            }
         }
     }
 
@@ -71,5 +76,25 @@ impl Control {
             self.syncpoint_value
         );
         self.syncpoint_manager.wait_host(data, self.syncpoint_value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_preserves_known_and_unknown_raw_values() {
+        assert_eq!(std::mem::size_of::<Method>(), 4);
+        assert_eq!(Method::WaitSyncpt.raw(), 0x8);
+        assert_eq!(Method::LoadSyncptPayload32.raw(), 0x4e);
+        assert_eq!(Method::WaitSyncpt32.raw(), 0x50);
+        assert_eq!(Method::from_raw(0x123).raw(), 0x123);
+
+        let mut control = Control::new(Arc::new(SyncpointManager::new()));
+        control.process_method(Method::from_raw(0x123), 99);
+        assert_eq!(control.syncpoint_value, 0);
+        control.process_method(Method::LoadSyncptPayload32, 99);
+        assert_eq!(control.syncpoint_value, 99);
     }
 }

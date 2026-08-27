@@ -300,6 +300,11 @@ pub struct ShaderCache {
     current_pipeline: Option<GraphicsPipelineKey>,
 
     /// Upstream `ShaderWorker`, with one shared OpenGL context per worker.
+    ///
+    /// This field intentionally precedes the pipeline caches: Rust drops fields
+    /// in declaration order, whereas Eden declares `workers` last and destroys
+    /// members in reverse declaration order. Both therefore stop and join the
+    /// workers before destroying cached pipelines.
     workers: Option<StatefulThreadWorker<ShaderContext>>,
     context_factory: Option<SharedContextFactory>,
     /// Non-owning upstream `VideoCore::ShaderNotify&`.
@@ -710,11 +715,14 @@ impl ShaderCache {
         }
 
         let key = self.graphics_key;
-        self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
 
-        if self.graphics_cache.contains_key(&key) {
-            let pipeline = self.graphics_cache.get_mut(&key).unwrap().as_deref_mut()?;
+        if self.current_pipeline == Some(key) {
+            let pipeline = self
+                .graphics_cache
+                .get_mut(&key)
+                .and_then(Option::as_deref_mut)
+                .expect("current OpenGL pipeline must remain owned by graphics_cache");
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
         self.current_graphics_pipeline_slow_path(shared_cache)
@@ -753,11 +761,11 @@ impl ShaderCache {
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
         let key = self.graphics_key;
-        self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
 
         if self.graphics_cache.contains_key(&key) {
             let pipeline = self.graphics_cache.get_mut(&key).unwrap().as_deref_mut()?;
+            self.current_pipeline = Some(key);
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
         self.graphics_cache.insert(key, None);
@@ -766,6 +774,7 @@ impl ShaderCache {
             self.graphics_cache.insert(key, Some(Box::new(pipeline)));
         }
         let inserted = self.graphics_cache.get_mut(&key)?.as_deref_mut()?;
+        self.current_pipeline = Some(key);
         let result = Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, inserted);
         result
     }
@@ -1086,18 +1095,7 @@ impl ShaderCache {
                 if !use_assembly_shaders && key.xfb_enabled() {
                     let (varyings, count) =
                         transform_feedback::make_transform_feedback_varyings(&key.xfb_state);
-                    info.xfb_varyings = varyings
-                        .iter()
-                        .map(
-                            |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
-                                buffer: varying.buffer,
-                                stream: varying.stream,
-                                stride: varying.stride,
-                                offset: varying.offset,
-                                components: varying.components,
-                            },
-                        )
-                        .collect();
+                    info.xfb_varyings = varyings;
                     info.xfb_count = count;
                 }
             }
@@ -1283,14 +1281,6 @@ impl ShaderCache {
     }
 }
 
-impl Drop for ShaderCache {
-    fn drop(&mut self) {
-        if let Some(workers) = self.workers.as_ref() {
-            workers.wait_for_requests();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1398,6 +1388,32 @@ mod tests {
             .compute_cache
             .get(&ComputePipelineKey::default())
             .is_some_and(Option::is_none));
+    }
+
+    #[test]
+    fn negative_graphics_entry_does_not_replace_the_current_pipeline() {
+        let mut cache = ShaderCache::new_for_test();
+        let previous_key = GraphicsPipelineKey {
+            unique_hashes: [1, 0, 0, 0, 0, 0],
+            ..GraphicsPipelineKey::default()
+        };
+        let failed_key = GraphicsPipelineKey {
+            unique_hashes: [0, 2, 0, 0, 0, 0],
+            ..GraphicsPipelineKey::default()
+        };
+        cache.graphics_cache.insert(
+            previous_key,
+            Some(Box::new(GraphicsPipeline::new_for_test(previous_key, None))),
+        );
+        cache.current_pipeline = Some(previous_key);
+        cache.graphics_key = failed_key;
+        cache.graphics_cache.insert(failed_key, None);
+
+        let mut shared_cache = SharedShaderCache::default();
+        assert!(cache
+            .current_graphics_pipeline_slow_path(&mut shared_cache)
+            .is_none());
+        assert_eq!(cache.current_pipeline, Some(previous_key));
     }
 
     #[test]

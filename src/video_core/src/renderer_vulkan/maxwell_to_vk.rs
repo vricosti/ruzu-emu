@@ -537,7 +537,14 @@ pub mod sampler {
 
     /// Port of `Sampler::WrapMode`.
     pub fn wrap_mode(
-        is_nvidia: bool,
+        _device: &Device,
+        wrap: WrapMode,
+        tex_filter: TextureFilter,
+    ) -> vk::SamplerAddressMode {
+        wrap_mode_impl(wrap, tex_filter)
+    }
+
+    pub(super) fn wrap_mode_impl(
         wrap: WrapMode,
         tex_filter: TextureFilter,
     ) -> vk::SamplerAddressMode {
@@ -546,28 +553,16 @@ pub mod sampler {
             WrapMode::Mirror => vk::SamplerAddressMode::MIRRORED_REPEAT,
             WrapMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
             WrapMode::Border => vk::SamplerAddressMode::CLAMP_TO_BORDER,
-            WrapMode::Clamp => {
-                if is_nvidia {
-                    // Nvidia's Vulkan driver defaults to GL_CLAMP on invalid enumerations,
-                    // we can hack this by sending an invalid enumeration.
-                    vk::SamplerAddressMode::from_raw(0xcafe)
-                } else {
-                    // Upstream TODO(Rodrigo): Emulate GL_CLAMP properly on other vendors
-                    match tex_filter {
-                        TextureFilter::Nearest => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                        TextureFilter::Linear => vk::SamplerAddressMode::CLAMP_TO_BORDER,
-                    }
-                }
-            }
+            WrapMode::Clamp => match tex_filter {
+                TextureFilter::Nearest => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                TextureFilter::Linear => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+            },
             WrapMode::MirrorOnceClampToEdge => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
             WrapMode::MirrorOnceBorder => {
                 log::warn!("Unimplemented wrap mode MirrorOnceBorder, using MirrorClampToEdge");
                 vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE
             }
-            WrapMode::MirrorOnceClampOgl => {
-                log::warn!("Unimplemented wrap mode MirrorOnceClampOgl, using MirrorClampToEdge");
-                vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE
-            }
+            WrapMode::MirrorOnceClampOgl => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
         }
     }
 
@@ -739,6 +734,10 @@ pub fn primitive_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology 
             );
             vk::PrimitiveTopology::TRIANGLE_FAN
         }
+        invalid => {
+            log::error!("Unimplemented topology={invalid:?}");
+            vk::PrimitiveTopology::POINT_LIST
+        }
     }
 }
 
@@ -747,7 +746,7 @@ pub fn primitive_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology 
 /// Converts Maxwell vertex attribute type + size to the corresponding Vulkan format.
 /// Note: The `must_emulate_scaled_formats` parameter mirrors the device query
 /// from upstream `device.MustEmulateScaledFormats()`.
-pub fn vertex_format(
+fn vertex_format_raw(
     must_emulate_scaled_formats: bool,
     mut attrib_type: VertexAttribType,
     size: VertexAttribSize,
@@ -866,6 +865,19 @@ pub fn vertex_format(
     format
 }
 
+pub fn vertex_format(
+    device: &Device,
+    attrib_type: VertexAttribType,
+    size: VertexAttribSize,
+) -> vk::Format {
+    let format = vertex_format_raw(device.must_emulate_scaled_formats(), attrib_type, size);
+    device.get_supported_format(
+        format,
+        vk::FormatFeatureFlags::VERTEX_BUFFER,
+        FormatType::Buffer,
+    )
+}
+
 /// Port of `MaxwellToVK::ComparisonOp`.
 pub fn comparison_op(comparison: ComparisonOp) -> vk::CompareOp {
     match comparison {
@@ -969,6 +981,13 @@ pub fn polygon_mode(mode: PolygonMode) -> vk::PolygonMode {
 pub fn swizzle_source(swizzle: SwizzleSource) -> vk::ComponentSwizzle {
     match swizzle {
         SwizzleSource::Zero => vk::ComponentSwizzle::ZERO,
+        SwizzleSource::Invalid => {
+            log::error!("Unimplemented swizzle source={swizzle:?}");
+            if *common::settings::values().use_debug_asserts.get_value() {
+                panic!("Unimplemented swizzle source={swizzle:?}");
+            }
+            vk::ComponentSwizzle::default()
+        }
         SwizzleSource::R => vk::ComponentSwizzle::R,
         SwizzleSource::G => vk::ComponentSwizzle::G,
         SwizzleSource::B => vk::ComponentSwizzle::B,
@@ -1259,7 +1278,7 @@ mod tests {
 
     #[test]
     fn test_vertex_format_float_r32g32b32a32() {
-        let fmt = vertex_format(
+        let fmt = vertex_format_raw(
             false,
             VertexAttribType::Float,
             VertexAttribSize::R32G32B32A32,
@@ -1269,15 +1288,27 @@ mod tests {
 
     #[test]
     fn test_vertex_format_uint_r8() {
-        let fmt = vertex_format(false, VertexAttribType::UInt, VertexAttribSize::R8);
+        let fmt = vertex_format_raw(false, VertexAttribType::UInt, VertexAttribSize::R8);
         assert_eq!(fmt, vk::Format::R8_UINT);
     }
 
     #[test]
     fn test_vertex_format_emulate_scaled() {
         // When must_emulate_scaled_formats is true, SScaled becomes SInt
-        let fmt = vertex_format(true, VertexAttribType::SScaled, VertexAttribSize::R16);
+        let fmt = vertex_format_raw(true, VertexAttribType::SScaled, VertexAttribSize::R16);
         assert_eq!(fmt, vk::Format::R16_SINT);
+    }
+
+    #[test]
+    fn clamp_wrap_uses_filter_on_all_vendors_like_upstream() {
+        assert_eq!(
+            sampler::wrap_mode_impl(WrapMode::Clamp, TextureFilter::Nearest),
+            vk::SamplerAddressMode::CLAMP_TO_EDGE
+        );
+        assert_eq!(
+            sampler::wrap_mode_impl(WrapMode::Clamp, TextureFilter::Linear),
+            vk::SamplerAddressMode::CLAMP_TO_BORDER
+        );
     }
 
     #[test]

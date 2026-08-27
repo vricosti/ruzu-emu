@@ -15,15 +15,29 @@ use crate::host1x::nvdec_common::VideoCodec;
 const AV_NUM_DATA_POINTERS: usize = 8;
 
 mod ffi {
-    use libc::{c_int, c_uchar, c_void, uintptr_t};
+    use libc::{c_char, c_int, c_uchar, c_void, uintptr_t};
 
     pub type RuzuFfmpegDecoder = c_void;
     pub type RuzuFfmpegHardwareContext = c_void;
     pub type AVFrame = c_void;
 
     extern "C" {
-        pub fn ruzu_ffmpeg_decoder_create(codec: u64) -> *mut RuzuFfmpegDecoder;
-        pub fn ruzu_ffmpeg_decoder_open(decoder: *mut RuzuFfmpegDecoder) -> c_int;
+        pub fn ruzu_ffmpeg_decoder_create(
+            codec: u64,
+            prefer_mediacodec: c_int,
+        ) -> *mut RuzuFfmpegDecoder;
+        pub fn ruzu_ffmpeg_decoder_name(decoder: *const RuzuFfmpegDecoder) -> *const c_char;
+        #[cfg(target_os = "android")]
+        pub fn ruzu_ffmpeg_decoder_set_dimensions(
+            decoder: *mut RuzuFfmpegDecoder,
+            width: c_int,
+            height: c_int,
+        );
+        pub fn ruzu_ffmpeg_decoder_open(
+            decoder: *mut RuzuFfmpegDecoder,
+            extradata: *const c_uchar,
+            extradata_size: uintptr_t,
+        ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_destroy(decoder: *mut RuzuFfmpegDecoder);
         pub fn ruzu_ffmpeg_hardware_context_create() -> *mut RuzuFfmpegHardwareContext;
         pub fn ruzu_ffmpeg_hardware_context_destroy(hardware: *mut RuzuFfmpegHardwareContext);
@@ -36,6 +50,11 @@ mod ffi {
             out: *mut c_int,
             out_capacity: uintptr_t,
         ) -> uintptr_t;
+        pub fn ruzu_ffmpeg_preferred_device_types(
+            out: *mut c_int,
+            out_capacity: uintptr_t,
+        ) -> uintptr_t;
+        pub fn ruzu_ffmpeg_device_type_name(device_type: c_int) -> *const c_char;
         pub fn ruzu_ffmpeg_decoder_send_packet(
             decoder: *mut RuzuFfmpegDecoder,
             data: *const c_uchar,
@@ -46,14 +65,25 @@ mod ffi {
         pub fn ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(
             decoder: *mut RuzuFfmpegDecoder,
         ) -> *mut AVFrame;
-        pub fn ruzu_ffmpeg_hardware_initialize_for_decoder(
+        pub fn ruzu_ffmpeg_hardware_initialize_with_type(
             hardware: *mut RuzuFfmpegHardwareContext,
+            device_type: c_int,
+        ) -> c_int;
+        pub fn ruzu_ffmpeg_hardware_last_error(hardware: *const RuzuFfmpegHardwareContext)
+            -> c_int;
+        pub fn ruzu_ffmpeg_hardware_vaapi_vendor_name(
+            hardware: *const RuzuFfmpegHardwareContext,
+            device_type: c_int,
+        ) -> *const c_char;
+        pub fn ruzu_ffmpeg_decoder_initialize_hardware(
             decoder: *mut RuzuFfmpegDecoder,
-            codec: u64,
+            hardware: *const RuzuFfmpegHardwareContext,
+            pixel_format: c_int,
         ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_last_error(decoder: *const RuzuFfmpegDecoder) -> c_int;
         pub fn ruzu_ffmpeg_error_is_eof_or_again(error: c_int) -> c_int;
-        pub fn ruzu_ffmpeg_error_string(errnum: c_int, out: *mut i8, out_size: uintptr_t);
+        pub fn ruzu_ffmpeg_error_string(errnum: c_int, out: *mut c_char, out_size: uintptr_t);
+        pub fn ruzu_ffmpeg_frame_create() -> *mut AVFrame;
         pub fn ruzu_ffmpeg_frame_destroy(frame: *mut AVFrame);
         pub fn ruzu_ffmpeg_frame_width(frame: *const AVFrame) -> c_int;
         pub fn ruzu_ffmpeg_frame_height(frame: *const AVFrame) -> c_int;
@@ -61,11 +91,12 @@ mod ffi {
         pub fn ruzu_ffmpeg_frame_stride(frame: *const AVFrame, plane: c_int) -> c_int;
         pub fn ruzu_ffmpeg_frame_plane(frame: *const AVFrame, plane: c_int) -> *const c_uchar;
         pub fn ruzu_ffmpeg_frame_interlaced(frame: *const AVFrame) -> c_int;
+        pub fn ruzu_ffmpeg_frame_is_hardware_decoded(frame: *const AVFrame) -> c_int;
     }
 }
 
 fn av_error(ret: i32) -> String {
-    let mut buffer = [0i8; 128];
+    let mut buffer = [0 as libc::c_char; 128];
     unsafe {
         ffi::ruzu_ffmpeg_error_string(ret, buffer.as_mut_ptr(), buffer.len());
         CStr::from_ptr(buffer.as_ptr())
@@ -74,19 +105,41 @@ fn av_error(ret: i32) -> String {
     }
 }
 
+fn device_type_name(device_type: u32) -> String {
+    unsafe {
+        CStr::from_ptr(ffi::ruzu_ffmpeg_device_type_name(device_type as i32))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn query_device_types(
+    query: unsafe extern "C" fn(*mut libc::c_int, libc::uintptr_t) -> libc::uintptr_t,
+) -> Vec<u32> {
+    let count = unsafe { query(std::ptr::null_mut(), 0) };
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let mut types = vec![0i32; count as usize];
+    let written = unsafe { query(types.as_mut_ptr(), types.len()) };
+    types.truncate(written.min(types.len()) as usize);
+    types.into_iter().map(|value| value as u32).collect()
+}
+
 /// Wraps an AVPacket — a container for compressed bitstream data.
 ///
 /// Port of `FFmpeg::Packet`.
-pub struct Packet {
-    data: Vec<u8>,
+pub struct Packet<'a> {
+    data: &'a [u8],
     pts: i64,
     dts: i64,
 }
 
-impl Packet {
-    pub fn new(data: &[u8]) -> Self {
+impl<'a> Packet<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
         Self {
-            data: data.to_vec(),
+            data,
             pts: i64::MIN,
             dts: i64::MIN,
         }
@@ -108,7 +161,7 @@ pub struct Frame {
 impl Frame {
     pub fn new() -> Self {
         Self {
-            raw: std::ptr::null_mut(),
+            raw: unsafe { ffi::ruzu_ffmpeg_frame_create() },
         }
     }
 
@@ -165,7 +218,7 @@ impl Frame {
     }
 
     pub fn is_hardware_decoded(&self) -> bool {
-        false
+        unsafe { ffi::ruzu_ffmpeg_frame_is_hardware_decoded(self.raw.cast_const()) != 0 }
     }
 }
 
@@ -192,18 +245,27 @@ impl Default for Frame {
 /// Port of `FFmpeg::Decoder`.
 pub struct Decoder {
     codec: VideoCodec,
+    prefer_mediacodec: bool,
 }
 
 impl Decoder {
     pub fn new(codec: VideoCodec) -> Self {
-        Self { codec }
+        #[cfg(target_os = "android")]
+        let prefer_mediacodec = *common::settings::values().nvdec_emulation.get_value()
+            == common::settings_enums::NvdecEmulation::Gpu;
+        #[cfg(not(target_os = "android"))]
+        let prefer_mediacodec = false;
+        Self {
+            codec,
+            prefer_mediacodec,
+        }
     }
 
     pub fn supports_decoding_on_device(&self, device_type: u32) -> Option<i32> {
         let mut pix_fmt = -1;
         let supported = unsafe {
             ffi::ruzu_ffmpeg_decoder_supports_decoding_on_device(
-                self.codec as u64,
+                self.codec.raw(),
                 device_type as i32,
                 &mut pix_fmt,
             )
@@ -227,16 +289,37 @@ impl HardwareContext {
     }
 
     pub fn get_supported_device_types() -> Vec<u32> {
-        let count = unsafe { ffi::ruzu_ffmpeg_supported_device_types(std::ptr::null_mut(), 0) };
-        if count == 0 {
-            return Vec::new();
-        }
+        query_device_types(ffi::ruzu_ffmpeg_supported_device_types)
+    }
 
-        let mut types = vec![0i32; count as usize];
-        let written =
-            unsafe { ffi::ruzu_ffmpeg_supported_device_types(types.as_mut_ptr(), types.len()) };
-        types.truncate(written.min(types.len()) as usize);
-        types.into_iter().map(|value| value as u32).collect()
+    fn get_preferred_device_types() -> Vec<u32> {
+        query_device_types(ffi::ruzu_ffmpeg_preferred_device_types)
+    }
+
+    fn initialize_with_type(&mut self, device_type: u32) -> bool {
+        if self.raw.is_null() {
+            return false;
+        }
+        let name = device_type_name(device_type);
+        let result =
+            unsafe { ffi::ruzu_ffmpeg_hardware_initialize_with_type(self.raw, device_type as i32) };
+        if result == 0 {
+            let error = unsafe { ffi::ruzu_ffmpeg_hardware_last_error(self.raw.cast_const()) };
+            log::debug!("av_hwdevice_ctx_create({name}) failed: {}", av_error(error));
+            return false;
+        }
+        if result < 0 {
+            log::debug!("Skipping VDPAU impersonated VAAPI driver");
+            return false;
+        }
+        let vendor_name = unsafe {
+            ffi::ruzu_ffmpeg_hardware_vaapi_vendor_name(self.raw.cast_const(), device_type as i32)
+        };
+        if !vendor_name.is_null() {
+            let vendor_name = unsafe { CStr::from_ptr(vendor_name) }.to_string_lossy();
+            log::debug!("Using VAAPI driver: {vendor_name}");
+        }
+        true
     }
 
     pub fn initialize_for_decoder(
@@ -244,22 +327,27 @@ impl HardwareContext {
         decoder_context: &mut DecoderContext,
         decoder: &Decoder,
     ) -> bool {
-        if self.raw.is_null() || decoder_context.raw.is_null() {
-            return false;
+        let supported_types = Self::get_supported_device_types();
+        for device_type in Self::get_preferred_device_types() {
+            let name = device_type_name(device_type);
+            if !supported_types.contains(&device_type) {
+                log::debug!("{name} explicitly unsupported");
+                continue;
+            }
+            if !self.initialize_with_type(device_type) {
+                continue;
+            }
+            if let Some(pixel_format) = decoder.supports_decoding_on_device(device_type) {
+                log::info!("Using {name} GPU decoder");
+                decoder_context.initialize_hardware_decoder(self, pixel_format);
+                return true;
+            }
+            log::debug!(
+                "{} decoder does not support device type {name}",
+                decoder_context.decoder_name()
+            );
         }
-        let initialized = unsafe {
-            ffi::ruzu_ffmpeg_hardware_initialize_for_decoder(
-                self.raw,
-                decoder_context.raw,
-                decoder.codec as u64,
-            )
-        } != 0;
-        if initialized {
-            log::info!("Using FFmpeg GPU decoding");
-        } else {
-            log::info!("Hardware decoding is disabled due to implementation issues, using CPU.");
-        }
-        initialized
+        false
     }
 }
 
@@ -288,7 +376,12 @@ pub struct DecoderContext {
 
 impl DecoderContext {
     pub fn new(decoder: &Decoder) -> Self {
-        let raw = unsafe { ffi::ruzu_ffmpeg_decoder_create(decoder.codec as u64) };
+        let raw = unsafe {
+            ffi::ruzu_ffmpeg_decoder_create(
+                decoder.codec.raw(),
+                i32::from(decoder.prefer_mediacodec),
+            )
+        };
         if raw.is_null() {
             log::error!(
                 "FFmpeg::DecoderContext::new: failed to allocate codec {:?}",
@@ -301,16 +394,21 @@ impl DecoderContext {
         }
     }
 
-    pub fn initialize_hardware_decoder(&mut self, _context: &HardwareContext, _hw_pix_fmt: i32) {
-        // The Rust shim applies the upstream hw_device_ctx/get_format/pix_fmt
-        // side effects inside HardwareContext::initialize_for_decoder.
+    pub fn initialize_hardware_decoder(&mut self, context: &HardwareContext, hw_pix_fmt: i32) {
+        if self.raw.is_null() || context.raw.is_null() {
+            return;
+        }
+        unsafe {
+            ffi::ruzu_ffmpeg_decoder_initialize_hardware(self.raw, context.raw, hw_pix_fmt);
+        }
     }
 
-    pub fn open_context(&mut self, _decoder: &Decoder) -> bool {
+    pub fn open_context(&mut self, _decoder: &Decoder, extradata: &[u8]) -> bool {
         if self.raw.is_null() {
             return false;
         }
-        let ret = unsafe { ffi::ruzu_ffmpeg_decoder_open(self.raw) };
+        let ret =
+            unsafe { ffi::ruzu_ffmpeg_decoder_open(self.raw, extradata.as_ptr(), extradata.len()) };
         if ret < 0 {
             log::error!(
                 "FFmpeg::DecoderContext::open_context: avcodec_open2 error: {}",
@@ -318,21 +416,21 @@ impl DecoderContext {
             );
             return false;
         }
-        log::info!("Using FFmpeg software decoding");
+        log::info!("Using decoder {}", self.decoder_name());
         true
     }
 
-    pub fn send_packet(&mut self, _packet: &Packet) -> bool {
+    pub fn send_packet(&mut self, packet: &Packet<'_>) -> bool {
         if self.raw.is_null() {
             return false;
         }
         let ret = unsafe {
             ffi::ruzu_ffmpeg_decoder_send_packet(
                 self.raw,
-                _packet.data.as_ptr(),
-                _packet.data.len(),
-                _packet.pts,
-                _packet.dts,
+                packet.data.as_ptr(),
+                packet.data.len(),
+                packet.pts,
+                packet.dts,
             )
         };
         if ret < 0 && unsafe { ffi::ruzu_ffmpeg_error_is_eof_or_again(ret) } == 0 {
@@ -366,6 +464,27 @@ impl DecoderContext {
     pub fn using_decode_order(&self) -> bool {
         self.decode_order
     }
+
+    fn decoder_name(&self) -> String {
+        if self.raw.is_null() {
+            return String::new();
+        }
+        unsafe {
+            CStr::from_ptr(ffi::ruzu_ffmpeg_decoder_name(self.raw.cast_const()))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn set_dimensions(&mut self, dimensions: FrameDimensions) {
+        if self.raw.is_null() {
+            return;
+        }
+        unsafe {
+            ffi::ruzu_ffmpeg_decoder_set_dimensions(self.raw, dimensions.width, dimensions.height);
+        }
+    }
 }
 
 unsafe impl Send for DecoderContext {}
@@ -397,6 +516,54 @@ pub struct FrameOffsets {
 pub struct FrameDimensions {
     pub width: i32,
     pub height: i32,
+}
+
+#[cfg(target_os = "android")]
+fn find_nal_start_code(data: &[u8], index: usize) -> usize {
+    if index + 3 < data.len()
+        && data[index] == 0
+        && data[index + 1] == 0
+        && data[index + 2] == 0
+        && data[index + 3] == 1
+    {
+        return 4;
+    }
+    if index + 2 < data.len() && data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1 {
+        return 3;
+    }
+    0
+}
+
+#[cfg(target_os = "android")]
+fn extract_h264_parameter_set_extradata(packet: &[u8]) -> Vec<u8> {
+    let mut extradata = Vec::new();
+    let mut index = 0;
+    while index < packet.len() {
+        let start_code_size = find_nal_start_code(packet, index);
+        if start_code_size == 0 {
+            index += 1;
+            continue;
+        }
+        let nal_start = index + start_code_size;
+        if nal_start >= packet.len() {
+            break;
+        }
+        let nal_type = packet[nal_start] & 0x1f;
+
+        let mut next = nal_start + 1;
+        while next < packet.len() && find_nal_start_code(packet, next) == 0 {
+            next += 1;
+        }
+
+        if nal_type == 7 || nal_type == 8 {
+            extradata.extend_from_slice(&[0, 0, 0, 1]);
+            extradata.extend_from_slice(&packet[nal_start..next]);
+        } else if nal_type == 1 || nal_type == 5 {
+            break;
+        }
+        index = next;
+    }
+    extradata
 }
 
 /// A decoded frame paired with the guest offsets of the packet that produced it.
@@ -438,29 +605,70 @@ impl DecodeApi {
 
     pub fn initialize(&mut self, codec: VideoCodec) -> bool {
         self.reset();
-        let decoder = Decoder::new(codec);
-        let mut decoder_context = DecoderContext::new(&decoder);
-        if decoder_context.raw.is_null() {
+        self.decoder = Some(Decoder::new(codec));
+        self.decoder_context =
+            Some(DecoderContext::new(self.decoder.as_ref().expect(
+                "decoder was emplaced immediately before its context",
+            )));
+        if self
+            .decoder_context
+            .as_ref()
+            .is_none_or(|context| context.raw.is_null())
+        {
+            self.reset();
             return false;
         }
-        if *common::settings::values().nvdec_emulation.get_value()
-            == common::settings_enums::NvdecEmulation::Gpu
+
+        #[cfg(target_os = "android")]
+        let decoder_name = self
+            .decoder_context
+            .as_ref()
+            .expect("decoder context exists")
+            .decoder_name();
+        #[cfg(target_os = "android")]
+        let is_mediacodec = matches!(
+            decoder_name.as_str(),
+            "h264_mediacodec" | "vp8_mediacodec" | "vp9_mediacodec"
+        );
+        #[cfg(not(target_os = "android"))]
+        let is_mediacodec = false;
+
+        if !is_mediacodec
+            && *common::settings::values().nvdec_emulation.get_value()
+                == common::settings_enums::NvdecEmulation::Gpu
         {
             let mut hardware_context = HardwareContext::new();
-            if hardware_context.initialize_for_decoder(&mut decoder_context, &decoder) {
-                self.hardware_context = Some(hardware_context);
+            hardware_context.initialize_for_decoder(
+                self.decoder_context
+                    .as_mut()
+                    .expect("decoder context exists"),
+                self.decoder.as_ref().expect("decoder exists"),
+            );
+            self.hardware_context = Some(hardware_context);
+        }
+
+        #[cfg(target_os = "android")]
+        {
+            self.defer_android_mediacodec_open = is_mediacodec;
+            self.needs_h264_extradata = decoder_name == "h264_mediacodec";
+            if self.defer_android_mediacodec_open {
+                return true;
             }
         }
-        let initialized = decoder_context.open_context(&decoder);
+
+        let initialized = self
+            .decoder_context
+            .as_mut()
+            .expect("decoder context exists")
+            .open_context(self.decoder.as_ref().expect("decoder exists"), &[]);
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
-            &[4, 1, codec as u64, initialized as u64, 0],
+            &[4, 1, codec.raw(), initialized as u64, 0],
         );
         if !initialized {
+            self.reset();
             return false;
         }
-        self.decoder = Some(decoder);
-        self.decoder_context = Some(decoder_context);
         self.opened = true;
         true
     }
@@ -479,25 +687,67 @@ impl DecodeApi {
     pub fn using_decode_order(&self) -> bool {
         self.decoder_context
             .as_ref()
-            .map_or(false, |ctx| ctx.using_decode_order())
+            .expect("DecodeApi must be initialized before UsingDecodeOrder")
+            .using_decode_order()
     }
 
     pub fn send_packet(
         &mut self,
         packet_data: &[u8],
         offsets: FrameOffsets,
-        _dimensions: Option<FrameDimensions>,
+        dimensions: Option<FrameDimensions>,
     ) -> bool {
+        #[cfg(not(target_os = "android"))]
+        let _ = dimensions;
+
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
             &[4, 2, 0, 0, packet_data.len() as u64],
         );
         if !self.opened {
-            return false;
+            let extradata = Vec::new();
+
+            #[cfg(target_os = "android")]
+            let extradata = {
+                if self.defer_android_mediacodec_open {
+                    let Some(dimensions) = dimensions else {
+                        return true;
+                    };
+                    self.decoder_context
+                        .as_mut()
+                        .expect("deferred decoder context must exist")
+                        .set_dimensions(dimensions);
+                }
+
+                if self.needs_h264_extradata {
+                    let extradata = extract_h264_parameter_set_extradata(packet_data);
+                    if extradata.is_empty() {
+                        return true;
+                    }
+                    extradata
+                } else {
+                    extradata
+                }
+            };
+
+            let decoder = self
+                .decoder
+                .as_ref()
+                .expect("DecodeApi must be initialized before SendPacket");
+            let decoder_context = self
+                .decoder_context
+                .as_mut()
+                .expect("DecodeApi must be initialized before SendPacket");
+            if !decoder_context.open_context(decoder, &extradata) {
+                self.reset();
+                return false;
+            }
+            self.opened = true;
         }
-        let Some(decoder_context) = self.decoder_context.as_mut() else {
-            return false;
-        };
+        let decoder_context = self
+            .decoder_context
+            .as_mut()
+            .expect("DecodeApi must be initialized before SendPacket");
         if !offsets.hidden {
             self.pending_offsets.push_back(offsets);
         }
@@ -509,7 +759,11 @@ impl DecodeApi {
 
     pub fn receive_frame(&mut self) -> Option<DecodedFrame> {
         let _ = common::trace::emit(common::trace::cat::HOST1X_VIDEO, &[4, 3, 0, 0, 0]);
-        let frame = self.decoder_context.as_mut()?.receive_frame()?;
+        let frame = self
+            .decoder_context
+            .as_mut()
+            .expect("DecodeApi must be initialized before ReceiveFrame")
+            .receive_frame()?;
         let offsets = self.pending_offsets.pop_front().unwrap_or_default();
         Some(DecodedFrame { frame, offsets })
     }
@@ -530,10 +784,12 @@ mod tests {
     #[test]
     fn default_frame_exposes_empty_planes_and_strides() {
         let frame = Frame::new();
+        assert!(!frame.raw.is_null());
         assert_eq!(frame.get_strides(), [0; AV_NUM_DATA_POINTERS]);
         assert!(frame.get_planes().iter().all(|ptr| ptr.is_null()));
         assert!(frame.get_plane(0).is_null());
         assert!(frame.get_data(0).is_null());
+        assert!(!frame.is_hardware_decoded());
     }
 
     #[test]
@@ -586,5 +842,45 @@ mod tests {
         for device_type in HardwareContext::get_supported_device_types() {
             let _ = decoder.supports_decoding_on_device(device_type);
         }
+    }
+
+    #[test]
+    fn preferred_hardware_decoder_order_matches_eden_for_the_target() {
+        let names = HardwareContext::get_preferred_device_types()
+            .into_iter()
+            .map(device_type_name)
+            .collect::<Vec<_>>();
+
+        #[cfg(target_os = "windows")]
+        let expected = ["cuda", "d3d11va", "dxva2", "d3d12va", "vulkan"];
+        #[cfg(target_os = "freebsd")]
+        let expected = ["vaapi", "vdpau", "drm", "vulkan"];
+        #[cfg(target_vendor = "apple")]
+        let expected = ["videotoolbox", "vulkan"];
+        #[cfg(target_os = "android")]
+        let expected = ["mediacodec", "vulkan"];
+        #[cfg(all(
+            unix,
+            not(target_os = "freebsd"),
+            not(target_vendor = "apple"),
+            not(target_os = "android")
+        ))]
+        let expected = ["cuda", "vaapi", "vdpau", "vulkan"];
+        #[cfg(not(any(target_os = "windows", unix)))]
+        let expected = ["vulkan"];
+
+        assert_eq!(names, expected);
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn h264_parameter_set_extradata_matches_eden_annex_b_scan() {
+        let packet = [
+            0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 4, 0, 0, 1, 0x65, 5,
+        ];
+        assert_eq!(
+            extract_h264_parameter_set_extradata(&packet),
+            [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 4]
+        );
     }
 }

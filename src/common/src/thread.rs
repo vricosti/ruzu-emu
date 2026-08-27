@@ -18,36 +18,102 @@ pub enum ThreadPriority {
 }
 
 /// Set the current thread's scheduling priority.
-/// On Linux, uses pthread_setschedparam with SCHED_OTHER.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn lowest_allowed_nice() -> i32 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut limit) } != 0 {
+        return 0;
+    }
+    if limit.rlim_cur >= 40 {
+        -20
+    } else {
+        20 - limit.rlim_cur as i32
+    }
+}
+
+/// Preferred CPU placement for worker threads.
+///
+/// Port of upstream `Common::ThreadPlacement`. On non-Android hosts the
+/// placement helpers are no-ops, while non-default placement still lowers the
+/// worker priority exactly as `StatefulThreadWorker` does upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ThreadPlacement {
+    Default = 0,
+    Background = 1,
+    Efficiency = 2,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn nice_value_for_priority(priority: ThreadPriority) -> i32 {
+    const NICE_AUDIO: i32 = -16;
+    const NICE_URGENT_DISPLAY: i32 = -8;
+    const NICE_DISPLAY: i32 = -4;
+    const NICE_DEFAULT: i32 = 0;
+    const NICE_BACKGROUND: i32 = 10;
+
+    let wanted = match priority {
+        ThreadPriority::Low => NICE_BACKGROUND,
+        ThreadPriority::Normal => NICE_DEFAULT,
+        ThreadPriority::High => NICE_DISPLAY,
+        ThreadPriority::VeryHigh => NICE_URGENT_DISPLAY,
+        ThreadPriority::Critical => NICE_AUDIO,
+    };
+    wanted.max(NICE_DEFAULT.min(lowest_allowed_nice()))
+}
+
+/// Port of upstream `Common::SetCurrentThreadPriority`.
 pub fn set_current_thread_priority(new_priority: ThreadPriority) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        unsafe {
-            let this_thread = libc::pthread_self();
-            let scheduling_type = libc::SCHED_OTHER;
-            let max_prio = libc::sched_get_priority_max(scheduling_type);
-            let min_prio = libc::sched_get_priority_min(scheduling_type);
-            let level = std::cmp::max(new_priority as u32 + 1, 4);
-
-            let priority = if max_prio > min_prio {
-                min_prio + ((max_prio - min_prio) * level as i32) / 4
-            } else {
-                min_prio - ((min_prio - max_prio) * level as i32) / 4
-            };
-
-            // libc exposes additional sporadic-server fields on musl. Match
-            // upstream's C initialization while remaining ABI-compatible with
-            // both glibc and musl layouts.
-            let mut params: libc::sched_param = std::mem::zeroed();
-            params.sched_priority = priority;
-            libc::pthread_setschedparam(this_thread, scheduling_type, &params);
+        let nice_value = nice_value_for_priority(new_priority);
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice_value) } != 0 {
+            log::debug!(
+                "Could not set thread nice value to {nice_value}: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
+            THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        let windows_priority = match new_priority {
+            ThreadPriority::Low => THREAD_PRIORITY_BELOW_NORMAL,
+            ThreadPriority::Normal => THREAD_PRIORITY_NORMAL,
+            ThreadPriority::High => THREAD_PRIORITY_ABOVE_NORMAL,
+            ThreadPriority::VeryHigh => THREAD_PRIORITY_HIGHEST,
+            ThreadPriority::Critical => THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        SetThreadPriority(GetCurrentThread(), windows_priority);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "haiku"))
+    ))]
+    unsafe {
+        let max_priority = libc::sched_get_priority_max(libc::SCHED_OTHER);
+        let min_priority = libc::sched_get_priority_min(libc::SCHED_OTHER);
+        if max_priority > min_priority {
+            let level = (new_priority as u32).min(4);
+            let mut params: libc::sched_param = std::mem::zeroed();
+            params.sched_priority =
+                min_priority + ((max_priority - min_priority) * level as i32) / 4;
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &params);
+        }
+    }
+
+    #[cfg(not(any(windows, unix, target_os = "linux", target_os = "android")))]
     {
         let _ = new_priority;
-        // No-op on unsupported platforms
     }
 }
 
@@ -82,6 +148,26 @@ pub fn set_current_thread_name(name: &str) {
         let _ = name;
     }
 }
+
+/// Port of upstream `Common::SetCurrentThreadToPerformanceCores`.
+///
+/// Eden only changes affinity in its Android implementation; Android JNI and
+/// ADPF integration are excluded from this Rust port, so other hosts take the
+/// same no-op branch.
+pub fn set_current_thread_to_performance_cores() {}
+
+/// Port of upstream `Common::SetCurrentThreadToEfficiencyCores`.
+///
+/// Eden only changes affinity in its Android implementation. Android JNI and
+/// ADPF integration are excluded from this Rust port, so supported desktop
+/// hosts take the same no-op branch.
+pub fn set_current_thread_to_efficiency_cores() {}
+
+/// Port of upstream `Common::SetCurrentThreadToBackgroundWork`.
+pub fn set_current_thread_to_background_work() {}
+
+/// Port of upstream `Common::SetCurrentThreadToAllCores`.
+pub fn set_current_thread_to_all_cores() {}
 
 /// An event that can be set and waited on, matching the C++ Common::Event.
 pub struct Event {
@@ -219,5 +305,23 @@ mod tests {
     #[test]
     fn test_set_thread_name() {
         set_current_thread_name("test_thread");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn nice_values_match_upstream_and_respect_rlimit() {
+        let lowest = lowest_allowed_nice();
+        let expected = |wanted: i32| wanted.max(0.min(lowest));
+        assert_eq!(nice_value_for_priority(ThreadPriority::Low), expected(10));
+        assert_eq!(nice_value_for_priority(ThreadPriority::Normal), expected(0));
+        assert_eq!(nice_value_for_priority(ThreadPriority::High), expected(-4));
+        assert_eq!(
+            nice_value_for_priority(ThreadPriority::VeryHigh),
+            expected(-8)
+        );
+        assert_eq!(
+            nice_value_for_priority(ThreadPriority::Critical),
+            expected(-16)
+        );
     }
 }

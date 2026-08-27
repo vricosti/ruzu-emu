@@ -11,7 +11,10 @@ use super::fxaa::FXAA;
 use super::present_uniforms::{make_orthographic_matrix, ScreenRectVertex};
 use super::smaa::SMAA;
 
-use crate::framebuffer_config::{self, AndroidPixelFormat, FramebufferConfig, RectF};
+use common::math_util::Rectangle;
+use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
+
+use crate::framebuffer_config::{self, FramebufferConfig};
 use crate::present::{AntiAliasing, PresentFilters, ScalingFilter};
 use crate::renderer_base::DeviceMemoryReader;
 use crate::renderer_opengl::gl_blit_screen::FramebufferTextureInfo;
@@ -36,6 +39,13 @@ enum AntiAlias {
     None,
     Fxaa(FXAA),
     Smaa(SMAA),
+}
+
+#[inline]
+fn framebuffer_address(framebuffer: &FramebufferConfig) -> u64 {
+    framebuffer
+        .address
+        .wrapping_add(u64::from(framebuffer.offset))
 }
 
 /// A presentation layer.
@@ -181,7 +191,7 @@ impl Layer {
                     crop,
                 );
                 texture = fsr_texture;
-                crop = RectF {
+                crop = Rectangle {
                     left: 0.0,
                     top: 0.0,
                     right: 1.0,
@@ -239,7 +249,7 @@ impl Layer {
         &mut self,
         framebuffer: &FramebufferConfig,
     ) -> FramebufferTextureInfo {
-        let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
+        let framebuffer_addr = framebuffer_address(framebuffer);
 
         let rasterizer = unsafe {
             self.rasterizer
@@ -261,7 +271,7 @@ impl Layer {
         };
 
         let pixel_format =
-            crate::surface::pixel_format_from_gpu_pixel_format(framebuffer.pixel_format.0);
+            crate::surface::pixel_format_from_gpu_pixel_format(framebuffer.pixel_format);
         let bytes_per_pixel = crate::surface::bytes_per_block(pixel_format);
 
         // Calculate tiled buffer size.
@@ -330,30 +340,30 @@ impl Layer {
         self.framebuffer_texture.pixel_format = framebuffer.pixel_format;
 
         let pixel_format =
-            crate::surface::pixel_format_from_gpu_pixel_format(framebuffer.pixel_format.0);
+            crate::surface::pixel_format_from_gpu_pixel_format(framebuffer.pixel_format);
         let bytes_per_pixel = crate::surface::bytes_per_block(pixel_format);
 
-        let (internal_format, gl_format, gl_type, bytes_per_pixel) =
-            match framebuffer.pixel_format.0 {
-                1 => (
-                    gl::RGBA8,
-                    gl::RGBA,
-                    gl::UNSIGNED_INT_8_8_8_8_REV,
-                    bytes_per_pixel,
-                ),
-                4 => (
-                    gl::RGB565,
-                    gl::RGB,
-                    gl::UNSIGNED_SHORT_5_6_5,
-                    bytes_per_pixel,
-                ),
-                _ => (
-                    gl::RGBA8,
-                    gl::RGBA,
-                    gl::UNSIGNED_INT_8_8_8_8_REV,
-                    bytes_per_pixel,
-                ),
-            };
+        let (internal_format, gl_format, gl_type, bytes_per_pixel) = match framebuffer.pixel_format
+        {
+            AndroidPixelFormat::Rgba8888 => (
+                gl::RGBA8,
+                gl::RGBA,
+                gl::UNSIGNED_INT_8_8_8_8_REV,
+                bytes_per_pixel,
+            ),
+            AndroidPixelFormat::Rgb565 => (
+                gl::RGB565,
+                gl::RGB,
+                gl::UNSIGNED_SHORT_5_6_5,
+                bytes_per_pixel,
+            ),
+            _ => (
+                gl::RGBA8,
+                gl::RGBA,
+                gl::UNSIGNED_INT_8_8_8_8_REV,
+                bytes_per_pixel,
+            ),
+        };
 
         self.framebuffer_texture.gl_format = gl_format;
         self.framebuffer_texture.gl_type = gl_type;
@@ -423,5 +433,16 @@ mod tests {
         let _: &OGLTexture = &info.resource;
         let _: AndroidPixelFormat = info.pixel_format;
         assert!(std::mem::needs_drop::<TextureInfo>());
+    }
+
+    #[test]
+    fn framebuffer_address_preserves_upstream_unsigned_wraparound() {
+        let framebuffer = FramebufferConfig {
+            address: u64::MAX,
+            offset: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(framebuffer_address(&framebuffer), 0);
     }
 }

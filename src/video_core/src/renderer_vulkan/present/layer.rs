@@ -7,18 +7,23 @@
 //! image suitable for composition, applying anti-aliasing and FSR as needed.
 
 use ash::vk;
+use common::math_util::Rectangle;
+use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::framebuffer_config::{normalize_crop, AndroidPixelFormat, FramebufferConfig, RectF};
+use crate::framebuffer_config::{normalize_crop, FramebufferConfig};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-use crate::present::{PresentFilters, ScalingFilter};
+use crate::present::{AntiAliasing, PresentFilters, ScalingFilter};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::RasterizerVulkan;
 use crate::textures::decoders;
-use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_device::Device;
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, AllocatedImage, MemoryAllocator, MemoryUsage,
+};
 
-use super::anti_alias_pass::{AntiAliasPass, NoAa};
+use super::anti_alias_pass::AntiAliasPass;
 use super::fsr::Fsr;
 use super::fxaa::Fxaa;
 use super::present_push_constants::{
@@ -34,49 +39,69 @@ use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 // ---------------------------------------------------------------------------
 
 /// Port of anonymous `GetBytesPerPixel` helper.
-fn get_bytes_per_pixel(pixel_format: AndroidPixelFormat) -> u32 {
-    match pixel_format.0 {
-        1 | 2 | 5 => 4,
-        4 => 2,
-        _ => {
-            log::warn!("Unknown framebuffer pixel format: {}", pixel_format.0);
-            4
-        }
-    }
+fn get_bytes_per_pixel(framebuffer: &FramebufferConfig) -> u32 {
+    crate::surface::bytes_per_block(crate::surface::pixel_format_from_gpu_pixel_format(
+        framebuffer.pixel_format,
+    ))
 }
 
 /// Port of anonymous `GetSizeInBytes` helper.
-fn get_size_in_bytes(stride: u32, height: u32, pixel_format: AndroidPixelFormat) -> u64 {
-    stride as u64 * height as u64 * get_bytes_per_pixel(pixel_format) as u64
+fn get_size_in_bytes(framebuffer: &FramebufferConfig) -> u64 {
+    (framebuffer.stride as u64)
+        .wrapping_mul(framebuffer.height as u64)
+        .wrapping_mul(get_bytes_per_pixel(framebuffer) as u64)
 }
 
 /// Port of anonymous `GetFormat` helper.
-fn get_vk_format(pixel_format: AndroidPixelFormat) -> vk::Format {
-    match pixel_format.0 {
-        1 | 2 => vk::Format::A8B8G8R8_UNORM_PACK32,
-        4 => vk::Format::R5G6B5_UNORM_PACK16,
-        5 => vk::Format::B8G8R8A8_UNORM,
+fn get_vk_format(framebuffer: &FramebufferConfig) -> vk::Format {
+    match framebuffer.pixel_format {
+        AndroidPixelFormat::Rgba8888 | AndroidPixelFormat::Rgbx8888 => {
+            vk::Format::A8B8G8R8_UNORM_PACK32
+        }
+        AndroidPixelFormat::Rgb565 => vk::Format::R5G6B5_UNORM_PACK16,
+        AndroidPixelFormat::Bgra8888 => vk::Format::B8G8R8A8_UNORM,
         _ => {
-            log::warn!("Unknown framebuffer pixel format: {}", pixel_format.0);
+            let message = format!(
+                "Unknown framebuffer pixel format: {}",
+                framebuffer.pixel_format as u32
+            );
+            log::error!("{message}");
+            if *common::settings::values().use_debug_asserts.get_value() {
+                panic!("{message}");
+            }
             vk::Format::A8B8G8R8_UNORM_PACK32
         }
     }
 }
 
-/// Simplified anti-aliasing setting matching upstream `Settings::AntiAliasing`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum AntiAliasingSetting {
-    None = 0,
-    Fxaa = 1,
-    Smaa = 2,
-}
-
-/// Rust counterpart of upstream's `std::variant<std::monostate, FSR, SGSR>`.
+/// Rust counterpart of upstream's `std::variant<std::monostate, SGSR, FSR>`.
 enum SuperResolutionFilter {
     None,
-    Fsr(Fsr),
     Sgsr(Sgsr),
+    Fsr(Fsr),
+}
+
+/// Rust counterpart of upstream's `std::variant<std::monostate, FXAA, SMAA>`.
+enum AntiAlias {
+    None,
+    Fxaa(Fxaa),
+    Smaa(Smaa),
+}
+
+/// Rust counterpart of the `SCOPE_EXIT` updating `resource_ticks` in
+/// `Layer::ConfigureDraw`.
+struct ResourceTickGuard {
+    scheduler: NonNull<Scheduler>,
+    resource_tick: NonNull<u64>,
+}
+
+impl Drop for ResourceTickGuard {
+    fn drop(&mut self) {
+        let tick = unsafe { self.scheduler.as_ref() }.current_tick();
+        unsafe {
+            *self.resource_tick.as_mut() = tick;
+        }
+    }
 }
 
 /// Port of `Layer` class.
@@ -95,15 +120,15 @@ pub struct Layer {
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
 
-    buffer: Option<MappedBuffer>,
-    raw_images: Vec<vk::Image>,
+    buffer: Option<AllocatedBuffer>,
+    raw_images: Vec<AllocatedImage>,
     raw_image_views: Vec<vk::ImageView>,
     raw_width: u32,
     raw_height: u32,
-    pixel_format: Option<AndroidPixelFormat>,
+    pixel_format: AndroidPixelFormat,
 
-    anti_alias_setting: AntiAliasingSetting,
-    anti_alias: Box<dyn AntiAliasPass>,
+    anti_alias_setting: AntiAliasing,
+    anti_alias: AntiAlias,
 
     sr_filter: SuperResolutionFilter,
     resource_ticks: Vec<u64>,
@@ -112,7 +137,7 @@ pub struct Layer {
 impl Layer {
     /// Port of `Layer::Layer`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         allocator: &MemoryAllocator,
         scheduler: &mut Scheduler,
         device_memory: &Arc<MaxwellDeviceMemoryManager>,
@@ -120,10 +145,9 @@ impl Layer {
         output_size: vk::Extent2D,
         layout: vk::DescriptorSetLayout,
         filters: &'static PresentFilters,
-        supports_float16: bool,
     ) -> Self {
         let mut layer = Layer {
-            device,
+            device: device.get_logical().clone(),
             memory_allocator: NonNull::from(allocator),
             scheduler: NonNull::from(&mut *scheduler),
             device_memory: Arc::clone(device_memory),
@@ -136,32 +160,28 @@ impl Layer {
             raw_image_views: Vec::new(),
             raw_width: 0,
             raw_height: 0,
-            pixel_format: None,
-            anti_alias_setting: AntiAliasingSetting::None,
-            anti_alias: Box::new(NoAa),
+            pixel_format: AndroidPixelFormat::NoFormat,
+            anti_alias_setting: AntiAliasing::None,
+            anti_alias: AntiAlias::None,
             sr_filter: SuperResolutionFilter::None,
             resource_ticks: Vec::new(),
         };
 
-        layer.create_descriptor_pool();
-        layer.create_descriptor_sets(layout);
+        layer.create_descriptor_pool(device);
+        layer.create_descriptor_sets(device, layout);
         layer.sr_filter = match (filters.get_scaling_filter)() {
-            ScalingFilter::Fsr => SuperResolutionFilter::Fsr(Fsr::new(
-                layer.device.clone(),
-                allocator,
-                image_count,
-                output_size,
-                supports_float16,
-            )),
+            ScalingFilter::Fsr => {
+                SuperResolutionFilter::Fsr(Fsr::new(device, allocator, image_count, output_size))
+            }
             ScalingFilter::Sgsr => SuperResolutionFilter::Sgsr(Sgsr::new(
-                layer.device.clone(),
+                device,
                 allocator,
                 image_count,
                 output_size,
                 false,
             )),
             ScalingFilter::SgsrEdge => SuperResolutionFilter::Sgsr(Sgsr::new(
-                layer.device.clone(),
+                device,
                 allocator,
                 image_count,
                 output_size,
@@ -173,113 +193,29 @@ impl Layer {
     }
 
     /// Port of `Layer::CreateDescriptorPool`.
-    fn create_descriptor_pool(&mut self) {
+    fn create_descriptor_pool(&mut self, device: &Device) {
         self.descriptor_pool = util::create_wrapped_descriptor_pool(
-            &self.device,
-            self.image_count as u32,
-            self.image_count as u32,
+            device,
+            self.image_count,
+            self.image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
     }
 
     /// Port of `Layer::CreateDescriptorSets`.
-    fn create_descriptor_sets(&mut self, layout: vk::DescriptorSetLayout) {
+    fn create_descriptor_sets(&mut self, device: &Device, layout: vk::DescriptorSetLayout) {
         let layouts = vec![layout; self.image_count];
-        self.descriptor_sets =
-            util::create_wrapped_descriptor_sets(&self.device, self.descriptor_pool, &layouts);
+        self.descriptor_sets = util::create_wrapped_descriptor_sets(
+            device.get_logical(),
+            self.descriptor_pool,
+            &layouts,
+        );
     }
 
     /// Port of `Layer::ConfigureDraw`.
-    ///
-    /// Prepares push constants and descriptor set for drawing this layer.
-    /// Applies anti-aliasing and FSR if configured.
     pub fn configure_draw(
         &mut self,
-        out_push_constants: &mut PresentPushConstants,
-        out_descriptor_set: &mut vk::DescriptorSet,
-        sampler: vk::Sampler,
-        image_index: usize,
-        source_image: vk::Image,
-        source_image_view: vk::ImageView,
-        scaled_width: u32,
-        scaled_height: u32,
-        layout: &FramebufferLayout,
-        crop_rect: RectF,
-    ) {
-        let mut current_image = source_image;
-        let mut current_view = source_image_view;
-        let scheduler = unsafe { self.scheduler.as_mut() };
-
-        // Apply anti-aliasing
-        self.anti_alias.draw(
-            scheduler,
-            image_index,
-            &mut current_image,
-            &mut current_view,
-        );
-
-        // Apply the selected super-resolution pass, matching upstream's FSR /
-        // SGSR variant. Both passes consume the guest crop and publish a full
-        // normalized output image to the window-adapt pass.
-        let mut effective_crop = crop_rect;
-        let render_extent = vk::Extent2D {
-            width: scaled_width,
-            height: scaled_height,
-        };
-        let crop = [
-            crop_rect.left,
-            crop_rect.top,
-            crop_rect.right,
-            crop_rect.bottom,
-        ];
-        let filtered_view = match &mut self.sr_filter {
-            SuperResolutionFilter::None => None,
-            SuperResolutionFilter::Fsr(fsr) => Some(fsr.draw(
-                scheduler,
-                image_index,
-                current_image,
-                current_view,
-                render_extent,
-                crop,
-            )),
-            SuperResolutionFilter::Sgsr(sgsr) => Some(sgsr.draw(
-                scheduler,
-                image_index,
-                current_image,
-                current_view,
-                render_extent,
-                crop,
-            )),
-        };
-        if let Some(filtered_view) = filtered_view {
-            current_view = filtered_view;
-            effective_crop = RectF {
-                left: 0.0,
-                top: 0.0,
-                right: 1.0,
-                bottom: 1.0,
-            };
-        }
-
-        // Set matrix data
-        Self::set_matrix_data(out_push_constants, layout);
-
-        // Set vertex data
-        Self::set_vertex_data(out_push_constants, layout, &effective_crop);
-
-        // Update descriptor set
-        self.update_descriptor_set(current_view, sampler, image_index);
-        *out_descriptor_set = self.descriptor_sets[image_index];
-    }
-
-    /// Port-facing subset of `Layer::ConfigureDraw`.
-    ///
-    /// This follows upstream's raw-image path when `rasterizer.AccelerateDisplay`
-    /// is not available in the Rust Vulkan backend yet. It prepares the same
-    /// push constants and descriptor set, but the guest-memory upload into the
-    /// raw image remains a separate `UpdateRawImage` parity step.
-    pub fn configure_draw_from_framebuffer(
-        &mut self,
+        device: &Device,
         out_push_constants: &mut PresentPushConstants,
         out_descriptor_set: &mut vk::DescriptorSet,
         rasterizer: &mut RasterizerVulkan,
@@ -303,69 +239,109 @@ impl Layer {
         let scaled_height = texture_info
             .as_ref()
             .map_or(texture_height, |info| info.scaled_height);
+        let use_accelerated = texture_info.is_some();
 
-        self.refresh_resources(framebuffer);
-        self.set_anti_alias_pass();
-        let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_outside_renderpass();
-        if let Some(tick) = self.resource_ticks.get(image_index).copied() {
-            scheduler.wait(tick);
+        self.refresh_resources(device, framebuffer);
+        self.set_anti_alias_pass(device);
+
+        {
+            let scheduler = unsafe { self.scheduler.as_mut() };
+            scheduler.request_outside_render_pass_operation_context();
+            scheduler.wait(self.resource_ticks[image_index]);
         }
-        if texture_info.is_none() {
+        let _resource_tick_guard = ResourceTickGuard {
+            scheduler: self.scheduler,
+            resource_tick: NonNull::from(&mut self.resource_ticks[image_index]),
+        };
+        if !use_accelerated {
             self.update_raw_image(framebuffer, image_index);
         }
 
-        let (source_image, source_image_view) = texture_info.as_ref().map_or_else(
+        let (mut source_image, mut source_image_view) = texture_info.as_ref().map_or_else(
             || {
                 (
-                    self.raw_images[image_index],
+                    self.raw_images[image_index].handle(),
                     self.raw_image_views[image_index],
                 )
             },
             |info| (info.image, info.image_view),
         );
-        let crop_rect = normalize_crop(framebuffer, texture_width, texture_height);
 
-        self.configure_draw(
-            out_push_constants,
-            out_descriptor_set,
-            sampler,
-            image_index,
-            source_image,
-            source_image_view,
-            scaled_width,
-            scaled_height,
-            layout,
-            crop_rect,
-        );
-        if image_index < self.resource_ticks.len() {
-            self.resource_ticks[image_index] = unsafe { self.scheduler.as_ref() }.current_tick();
+        let scheduler = unsafe { self.scheduler.as_mut() };
+
+        match &mut self.anti_alias {
+            AntiAlias::Fxaa(fxaa) => fxaa.draw(
+                device,
+                scheduler,
+                image_index,
+                &mut source_image,
+                &mut source_image_view,
+            ),
+            AntiAlias::Smaa(smaa) => smaa.draw(
+                device,
+                scheduler,
+                image_index,
+                &mut source_image,
+                &mut source_image_view,
+            ),
+            AntiAlias::None => {}
         }
+
+        let mut crop_rect = normalize_crop(framebuffer, texture_width, texture_height);
+        let render_extent = vk::Extent2D {
+            width: scaled_width,
+            height: scaled_height,
+        };
+        let crop = [
+            crop_rect.left,
+            crop_rect.top,
+            crop_rect.right,
+            crop_rect.bottom,
+        ];
+        let filtered_view = match &mut self.sr_filter {
+            SuperResolutionFilter::None => None,
+            SuperResolutionFilter::Fsr(fsr) => Some(fsr.draw(
+                device,
+                scheduler,
+                image_index,
+                source_image,
+                source_image_view,
+                render_extent,
+                crop,
+            )),
+            SuperResolutionFilter::Sgsr(sgsr) => Some(sgsr.draw(
+                device,
+                scheduler,
+                image_index,
+                source_image,
+                source_image_view,
+                render_extent,
+                crop,
+            )),
+        };
+        if let Some(filtered_view) = filtered_view {
+            source_image_view = filtered_view;
+            crop_rect = Rectangle::new(0.0, 0.0, 1.0, 1.0);
+        }
+
+        self.set_matrix_data(device, out_push_constants, layout);
+        self.set_vertex_data(device, out_push_constants, layout, &crop_rect);
+
+        self.update_descriptor_set(device, source_image_view, sampler, image_index);
+        *out_descriptor_set = self.descriptor_sets[image_index];
     }
 
     fn update_raw_image(&mut self, framebuffer: &FramebufferConfig, image_index: usize) {
         let image_offset = self.get_raw_image_offset(framebuffer, image_index);
-        let linear_size = get_size_in_bytes(
-            framebuffer.stride,
-            framebuffer.height,
-            framebuffer.pixel_format,
-        );
-        let Some(buffer) = self.buffer.as_mut() else {
-            return;
-        };
+        let linear_size = get_size_in_bytes(framebuffer);
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("Layer staging buffer must exist after RefreshResources");
         let end = image_offset.wrapping_add(linear_size) as usize;
         let mapped = buffer.mapped_slice_mut();
-        if end > mapped.len() {
-            log::error!(
-                "Vulkan Layer::UpdateRawImage staging range out of bounds offset={} size={} len={}",
-                image_offset,
-                linear_size,
-                mapped.len()
-            );
-            return;
-        }
 
-        let bytes_per_pixel = get_bytes_per_pixel(framebuffer.pixel_format);
+        let bytes_per_pixel = get_bytes_per_pixel(framebuffer);
         const BLOCK_HEIGHT_LOG2: u32 = 4;
         let tiled_size = decoders::calculate_size(
             true,
@@ -394,8 +370,8 @@ impl Layer {
             buffer.flush();
         }
 
-        let image = self.raw_images[image_index];
-        let staging_buffer = buffer.buffer();
+        let image = self.raw_images[image_index].handle();
+        let staging_buffer = buffer.handle();
         let image_width = framebuffer.width;
         let image_height = framebuffer.height;
         let device = self.device.clone();
@@ -481,12 +457,23 @@ impl Layer {
     }
 
     /// Port of `Layer::SetMatrixData`.
-    fn set_matrix_data(data: &mut PresentPushConstants, layout: &FramebufferLayout) {
+    fn set_matrix_data(
+        &self,
+        _device: &Device,
+        data: &mut PresentPushConstants,
+        layout: &FramebufferLayout,
+    ) {
         data.modelview_matrix = make_orthographic_matrix(layout.width as f32, layout.height as f32);
     }
 
     /// Port of `Layer::SetVertexData`.
-    fn set_vertex_data(data: &mut PresentPushConstants, layout: &FramebufferLayout, crop: &RectF) {
+    fn set_vertex_data(
+        &self,
+        _device: &Device,
+        data: &mut PresentPushConstants,
+        layout: &FramebufferLayout,
+        crop: &Rectangle<f32>,
+    ) {
         let x = layout.screen.left as f32;
         let y = layout.screen.top as f32;
         let w = layout.screen.get_width() as f32;
@@ -501,6 +488,7 @@ impl Layer {
     /// Port of `Layer::UpdateDescriptorSet`.
     fn update_descriptor_set(
         &self,
+        device: &Device,
         image_view: vk::ImageView,
         sampler: vk::Sampler,
         image_index: usize,
@@ -525,26 +513,20 @@ impl Layer {
         };
 
         unsafe {
-            self.device.update_descriptor_sets(&[sampler_write], &[]);
+            device
+                .get_logical()
+                .update_descriptor_sets(&[sampler_write], &[]);
         }
     }
 
     /// Port of `Layer::CalculateBufferSize`.
     fn calculate_buffer_size(&self, framebuffer: &FramebufferConfig) -> u64 {
-        get_size_in_bytes(
-            framebuffer.stride,
-            framebuffer.height,
-            framebuffer.pixel_format,
-        ) * self.image_count as u64
+        get_size_in_bytes(framebuffer).wrapping_mul(self.image_count as u64)
     }
 
     /// Port of `Layer::GetRawImageOffset`.
     fn get_raw_image_offset(&self, framebuffer: &FramebufferConfig, image_index: usize) -> u64 {
-        get_size_in_bytes(
-            framebuffer.stride,
-            framebuffer.height,
-            framebuffer.pixel_format,
-        ) * image_index as u64
+        get_size_in_bytes(framebuffer).wrapping_mul(image_index as u64)
     }
 
     /// Port of `Layer::ReleaseRawImages`.
@@ -553,16 +535,7 @@ impl Layer {
         for tick in self.resource_ticks.iter().copied() {
             scheduler.wait(tick);
         }
-        unsafe {
-            for image_view in &mut self.raw_image_views {
-                if *image_view != vk::ImageView::null() {
-                    self.device.destroy_image_view(*image_view, None);
-                    *image_view = vk::ImageView::null();
-                }
-            }
-        }
         self.raw_images.clear();
-        self.raw_image_views.clear();
         self.buffer = None;
     }
 
@@ -570,10 +543,10 @@ impl Layer {
     ///
     /// Recreates raw images and staging buffer if the framebuffer dimensions
     /// or pixel format have changed.
-    pub fn refresh_resources(&mut self, framebuffer: &FramebufferConfig) {
-        if Some(framebuffer.pixel_format) == self.pixel_format
-            && framebuffer.width == self.raw_width
+    pub fn refresh_resources(&mut self, device: &Device, framebuffer: &FramebufferConfig) {
+        if framebuffer.width == self.raw_width
             && framebuffer.height == self.raw_height
+            && framebuffer.pixel_format == self.pixel_format
             && !self.raw_images.is_empty()
         {
             return;
@@ -581,36 +554,16 @@ impl Layer {
 
         self.raw_width = framebuffer.width;
         self.raw_height = framebuffer.height;
-        self.pixel_format = Some(framebuffer.pixel_format);
-        self.anti_alias_setting = AntiAliasingSetting::None;
-        self.anti_alias = Box::new(NoAa);
+        self.pixel_format = framebuffer.pixel_format;
+        self.anti_alias = AntiAlias::None;
 
         self.release_raw_images();
-
-        self.create_staging_buffer(framebuffer);
-
-        // Create raw images
-        let format = get_vk_format(framebuffer.pixel_format);
-        let extent = vk::Extent2D {
-            width: framebuffer.width,
-            height: framebuffer.height,
-        };
-        self.resource_ticks.resize(self.image_count, 0);
-        self.raw_images.resize(self.image_count, vk::Image::null());
-        self.raw_image_views
-            .resize(self.image_count, vk::ImageView::null());
-
-        let allocator = unsafe { self.memory_allocator.as_ref() };
-        for i in 0..self.image_count {
-            self.raw_images[i] =
-                util::create_wrapped_image(&self.device, allocator, extent, format);
-            self.raw_image_views[i] =
-                util::create_wrapped_image_view(&self.device, self.raw_images[i], format);
-        }
+        self.create_staging_buffer(device, framebuffer);
+        self.create_raw_images(device, framebuffer);
     }
 
     /// Port of `Layer::CreateStagingBuffer`.
-    fn create_staging_buffer(&mut self, framebuffer: &FramebufferConfig) {
+    fn create_staging_buffer(&mut self, _device: &Device, framebuffer: &FramebufferConfig) {
         let size = self.calculate_buffer_size(framebuffer);
         let ci = vk::BufferCreateInfo::builder()
             .size(size)
@@ -623,56 +576,63 @@ impl Layer {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         let allocator = unsafe { self.memory_allocator.as_ref() };
-        self.buffer = match allocator.create_mapped_buffer(&ci, MemoryUsage::Upload) {
-            Ok(buffer) => Some(buffer),
-            Err(err) => {
-                log::error!("Failed to create Vulkan layer staging buffer: {}", err);
-                None
-            }
-        };
+        self.buffer = Some(
+            allocator
+                .create_buffer(&ci, MemoryUsage::Upload)
+                .expect("Failed to create Vulkan layer staging buffer"),
+        );
     }
 
-    /// Port-facing subset of `Layer::SetAntiAliasPass`.
-    fn set_anti_alias_pass(&mut self) {
-        let requested = match (self.filters.get_anti_aliasing)() {
-            crate::present::AntiAliasing::None => AntiAliasingSetting::None,
-            crate::present::AntiAliasing::Fxaa => AntiAliasingSetting::Fxaa,
-            crate::present::AntiAliasing::Smaa => AntiAliasingSetting::Smaa,
+    /// Port of `Layer::CreateRawImages`.
+    fn create_raw_images(&mut self, device: &Device, framebuffer: &FramebufferConfig) {
+        let format = get_vk_format(framebuffer);
+        let extent = vk::Extent2D {
+            width: framebuffer.width,
+            height: framebuffer.height,
         };
-        if self.anti_alias_setting == requested {
+        self.resource_ticks.resize(self.image_count, 0);
+        self.raw_image_views
+            .resize(self.image_count, vk::ImageView::null());
+
+        let allocator = unsafe { self.memory_allocator.as_ref() };
+        self.raw_images.reserve_exact(self.image_count);
+        for image_index in 0..self.image_count {
+            let image = util::create_wrapped_image(allocator, extent, format);
+            if self.raw_image_views[image_index] != vk::ImageView::null() {
+                unsafe {
+                    device
+                        .get_logical()
+                        .destroy_image_view(self.raw_image_views[image_index], None);
+                }
+            }
+            self.raw_image_views[image_index] =
+                util::create_wrapped_image_view(device, image.handle(), format);
+            self.raw_images.push(image);
+        }
+    }
+
+    /// Port of `Layer::SetAntiAliasPass`.
+    fn set_anti_alias_pass(&mut self, device: &Device) {
+        let requested = (self.filters.get_anti_aliasing)();
+        if !matches!(self.anti_alias, AntiAlias::None) && self.anti_alias_setting == requested {
             return;
         }
 
         let allocator = unsafe { self.memory_allocator.as_ref() };
         self.anti_alias_setting = requested;
+        let resolution = common::settings::values().resolution_info.clone();
+        let extent = vk::Extent2D {
+            width: resolution.scale_up_u32(self.raw_width),
+            height: resolution.scale_up_u32(self.raw_height),
+        };
         self.anti_alias = match requested {
-            AntiAliasingSetting::None => Box::new(NoAa),
-            AntiAliasingSetting::Fxaa => {
-                let resolution = common::settings::values().resolution_info.clone();
-                let extent = vk::Extent2D {
-                    width: resolution.scale_up_u32(self.raw_width),
-                    height: resolution.scale_up_u32(self.raw_height),
-                };
-                Box::new(Fxaa::new(
-                    self.device.clone(),
-                    allocator,
-                    self.image_count,
-                    extent,
-                ))
+            AntiAliasing::Fxaa => {
+                AntiAlias::Fxaa(Fxaa::new(device, allocator, self.image_count, extent))
             }
-            AntiAliasingSetting::Smaa => {
-                let resolution = common::settings::values().resolution_info.clone();
-                let extent = vk::Extent2D {
-                    width: resolution.scale_up_u32(self.raw_width),
-                    height: resolution.scale_up_u32(self.raw_height),
-                };
-                Box::new(Smaa::new(
-                    self.device.clone(),
-                    allocator,
-                    self.image_count,
-                    extent,
-                ))
+            AntiAliasing::Smaa => {
+                AntiAlias::Smaa(Smaa::new(device, allocator, self.image_count, extent))
             }
+            AntiAliasing::None => AntiAlias::None,
         };
     }
 }
@@ -681,6 +641,13 @@ impl Drop for Layer {
     /// Port of `Layer::~Layer` plus explicit destruction for raw Vulkan handles.
     fn drop(&mut self) {
         self.release_raw_images();
+        unsafe {
+            for image_view in self.raw_image_views.drain(..) {
+                if image_view != vk::ImageView::null() {
+                    self.device.destroy_image_view(image_view, None);
+                }
+            }
+        }
         if self.descriptor_pool != vk::DescriptorPool::null() {
             unsafe {
                 self.device
@@ -688,5 +655,51 @@ impl Drop for Layer {
             }
             self.descriptor_pool = vk::DescriptorPool::null();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framebuffer(pixel_format: AndroidPixelFormat) -> FramebufferConfig {
+        FramebufferConfig {
+            pixel_format,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn framebuffer_formats_match_eden() {
+        assert_eq!(
+            get_vk_format(&framebuffer(AndroidPixelFormat::Rgba8888)),
+            vk::Format::A8B8G8R8_UNORM_PACK32
+        );
+        assert_eq!(
+            get_vk_format(&framebuffer(AndroidPixelFormat::Rgbx8888)),
+            vk::Format::A8B8G8R8_UNORM_PACK32
+        );
+        assert_eq!(
+            get_vk_format(&framebuffer(AndroidPixelFormat::Rgb565)),
+            vk::Format::R5G6B5_UNORM_PACK16
+        );
+        assert_eq!(
+            get_vk_format(&framebuffer(AndroidPixelFormat::Bgra8888)),
+            vk::Format::B8G8R8A8_UNORM
+        );
+    }
+
+    #[test]
+    fn framebuffer_byte_size_preserves_unsigned_wrapping() {
+        let framebuffer = FramebufferConfig {
+            stride: u32::MAX,
+            height: u32::MAX,
+            pixel_format: AndroidPixelFormat::Rgba8888,
+            ..Default::default()
+        };
+        let expected = (u32::MAX as u64)
+            .wrapping_mul(u32::MAX as u64)
+            .wrapping_mul(4);
+        assert_eq!(get_size_in_bytes(&framebuffer), expected);
     }
 }

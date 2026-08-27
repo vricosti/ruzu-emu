@@ -6,8 +6,8 @@
 //!
 //! Defines the Maxwell device memory traits and the device memory manager type
 //! alias. In C++ this instantiates `Core::DeviceMemoryManager<MaxwellDeviceTraits>`;
-//! in Rust this file owns the current SMMU-backed subset while the full
-//! physical-base-relative device-address table model is still being ported.
+//! in Rust this file owns the Maxwell specialization and its dense counterparts
+//! for the upstream device and physical-address tables.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -25,6 +25,10 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 ///
 /// Port of `MaxwellDeviceTraits::device_virtual_bits`.
 pub const DEVICE_VIRTUAL_BITS: usize = 34;
+
+/// Public device-memory-manager capabilities owned by the upstream template.
+pub const HAS_FLUSH_INVALIDATION: bool = true;
+pub const AS_BITS: u32 = DEVICE_VIRTUAL_BITS as u32;
 
 /// Page size constants matching `core/memory.h:YUZU_PAGEBITS` /
 /// `YUZU_PAGESIZE`. ruzu's `common::types::PAGE_SIZE` is 0x1000.
@@ -647,10 +651,6 @@ impl SmmuRegisteredProcesses {
     }
 }
 
-fn align_smmu_size(size: usize) -> u64 {
-    ((size as u64) + SMMU_PAGE_SIZE - 1) & !(SMMU_PAGE_SIZE - 1)
-}
-
 /// Implement the texture-cache `GpuMemoryReader` adapter so descriptor
 /// tables can read TIC/TSC entries directly via `smmu_read_block`. The
 /// texture cache holds an `Arc<MaxwellDeviceMemoryManager>`, so passing
@@ -828,7 +828,7 @@ impl MaxwellDeviceMemoryManager {
             .unwrap_or(1)
             .max(1) as usize;
 
-        if (continuity_pages << SMMU_PAGE_BITS) < size.saturating_add(subbits) {
+        if (continuity_pages << SMMU_PAGE_BITS) < size.wrapping_add(subbits) {
             return std::ptr::null_mut();
         }
         self.get_pointer_mut(src_addr)
@@ -837,6 +837,20 @@ impl MaxwellDeviceMemoryManager {
     /// Const variant of `get_span`.
     pub fn get_span_const(&self, src_addr: DAddr, size: usize) -> *const u8 {
         self.get_span(src_addr, size) as *const u8
+    }
+
+    /// Return the physical-memory offset represented by a device address.
+    ///
+    /// Port of `DeviceMemoryManager<Traits>::GetPhysicalRawAddressFromDAddr`.
+    pub fn smmu_get_physical_raw_address_from_daddr(&self, d_address: DAddr) -> u64 {
+        let subbits = d_address & (SMMU_PAGE_SIZE - 1);
+        let compressed_physical = self
+            .smmu_compressed_physical_ptr
+            .load(d_address >> SMMU_PAGE_BITS);
+        if compressed_physical == 0 {
+            return 0;
+        }
+        (u64::from(compressed_physical - 1) << SMMU_PAGE_BITS).wrapping_add(subbits)
     }
 
     /// Install or replace the test fallback `MarkRegionCaching` callback.
@@ -856,20 +870,34 @@ impl MaxwellDeviceMemoryManager {
     }
 
     /// Allocate `size` bytes of device-virtual address space. Returns a
-    /// device address. Aligned up to `SMMU_PAGE_SIZE` and reserved through
-    /// a reusable allocator.
+    /// device address reserved through a reusable allocator.
     ///
     /// Port of `Core::DeviceMemoryManager<MaxwellDeviceTraits>::Allocate`.
     pub fn smmu_allocate(&self, size: usize) -> DAddr {
-        let aligned_size = align_smmu_size(size);
-        if aligned_size == 0 {
-            return 0;
-        }
         self.smmu_allocator
             .lock()
             .unwrap()
-            .allocate(aligned_size)
+            .allocate(size as u64)
             .unwrap_or(0)
+    }
+
+    /// Reserve a fixed device-virtual address range.
+    ///
+    /// Port of `Core::DeviceMemoryManager<MaxwellDeviceTraits>::AllocateFixed`.
+    pub fn smmu_allocate_fixed(&self, d_address: DAddr, size: usize) {
+        self.smmu_allocator
+            .lock()
+            .unwrap()
+            .allocate_fixed(d_address, size as u64);
+    }
+
+    /// Return whether a virtual range fits in the Maxwell device address space.
+    ///
+    /// Port of `DeviceMemoryManagerAllocator::IsInBounds<pin_area>`; Eden's
+    /// current implementation does not vary with `pin_area` either.
+    pub fn smmu_is_in_bounds<const PIN_AREA: bool>(address: u64, size: u64) -> bool {
+        let _ = PIN_AREA;
+        address.wrapping_add(size) <= (1u64 << DEVICE_VIRTUAL_BITS)
     }
 
     /// Register an nvdrv process memory interface and return an ASID.
@@ -911,14 +939,10 @@ impl MaxwellDeviceMemoryManager {
     ///
     /// Port of `Core::DeviceMemoryManager<MaxwellDeviceTraits>::Free`.
     pub fn smmu_free(&self, d_address: DAddr, size: usize) {
-        let aligned_size = align_smmu_size(size);
-        if d_address == 0 {
-            return;
-        }
         self.smmu_allocator
             .lock()
             .unwrap()
-            .free(d_address, aligned_size);
+            .free(d_address, size as u64);
     }
 
     /// Install an SMMU mapping and record upstream CPU-backing metadata.
@@ -1284,7 +1308,7 @@ impl MaxwellDeviceMemoryManager {
         &self,
         host_ptr: *const u8,
         scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
-        mut operation: F,
+        operation: F,
     ) -> usize
     where
         F: FnMut(DAddr),
@@ -1294,12 +1318,30 @@ impl MaxwellDeviceMemoryManager {
         }
 
         let host_address = host_ptr as usize;
-        let subbits = (host_address & (SMMU_PAGE_SIZE as usize - 1)) as DAddr;
         let Some(compressed_physical) =
             self.smmu_registered_compressed_physical_for_host_address(host_address)
         else {
             return 0;
         };
+        let physical_address = (u64::from(compressed_physical - 1) << SMMU_PAGE_BITS)
+            .wrapping_add((host_address & (SMMU_PAGE_SIZE as usize - 1)) as u64);
+        self.smmu_apply_op_on_physical_address(physical_address, scratch, operation)
+    }
+
+    /// Apply `operation` to every device address aliasing a physical address.
+    ///
+    /// Port of upstream `DeviceMemoryManager<Traits>::ApplyOpOnPAddr`.
+    pub fn smmu_apply_op_on_physical_address<F>(
+        &self,
+        physical_address: u64,
+        scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
+        mut operation: F,
+    ) -> usize
+    where
+        F: FnMut(DAddr),
+    {
+        let physical_page = (physical_address >> SMMU_PAGE_BITS) as u32;
+        let subbits = physical_address & (SMMU_PAGE_SIZE - 1);
         // Upstream `ApplyOpOnPAddr` reads the single-alias entry directly and
         // only serializes the multi-alias gather.  The Rust reverse table has
         // its own mutex, so taking `mapping_guard` here is both redundant and
@@ -1314,18 +1356,9 @@ impl MaxwellDeviceMemoryManager {
             .smmu_reverse_mappings
             .lock()
             .unwrap()
-            .gather_device_pages_for_apply(compressed_physical - 1, scratch);
+            .gather_device_pages_for_apply(physical_page, scratch);
 
         if let Some(device_page) = single_page {
-            if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
-                && (0xA6C01..0xA7C01).contains(&device_page)
-            {
-                eprintln!(
-                    "[SMMU_CPU_WRITE_ALIAS] host=0x{host_address:X} physical_page=0x{:X} device=0x{:X}",
-                    compressed_physical - 1,
-                    (u64::from(device_page) << SMMU_PAGE_BITS) + subbits
-                );
-            }
             operation((u64::from(device_page) << SMMU_PAGE_BITS) + subbits);
             return 1;
         }
@@ -1594,12 +1627,6 @@ impl MaxwellDeviceMemoryManager {
 
     /// Forward `DeviceMemoryManager::InvalidateRegion` to its bound device interface.
     pub fn smmu_invalidate_region(&self, d_address: DAddr, size: usize) {
-        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
-            && d_address < 0xA7C0_1000
-            && d_address.saturating_add(size as u64) > 0xA6C0_1000
-        {
-            eprintln!("[SMMU_DEVICE_WRITE_INVALIDATE] device=0x{d_address:X} size=0x{size:X}");
-        }
         let invalidate_region = self.invalidate_region.lock().unwrap().clone();
         if let Some(callback) = invalidate_region {
             callback(d_address, size);
@@ -1676,10 +1703,6 @@ impl MaxwellDeviceMemoryManager {
     ///   atomic fetch-add semantics. Upstream comment: "Assume delta is
     ///   either -1 or 1" — same here.
     pub fn update_pages_cached_count(&self, addr: DAddr, size: usize, delta: i32) {
-        if size == 0 {
-            return;
-        }
-
         let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
         self.update_pages_cached_count_no_lock(addr, size, delta);
     }
@@ -1697,9 +1720,10 @@ impl MaxwellDeviceMemoryManager {
         let mut coalesced = Vec::with_capacity(sorted.len());
         let (mut current_addr, mut current_size) = sorted[0];
         for &(next_addr, next_size) in &sorted[1..] {
-            if current_addr + current_size as u64 >= next_addr {
-                let end = (current_addr + current_size as u64).max(next_addr + next_size as u64);
-                current_size = (end - current_addr) as usize;
+            let current_end = current_addr.wrapping_add(current_size as u64);
+            if current_end >= next_addr {
+                let end = current_end.max(next_addr.wrapping_add(next_size as u64));
+                current_size = end.wrapping_sub(current_addr) as usize;
             } else {
                 coalesced.push((current_addr, current_size));
                 current_addr = next_addr;
@@ -1710,9 +1734,12 @@ impl MaxwellDeviceMemoryManager {
 
         let lock_begin = coalesced[0].0;
         let &(last_addr, last_size) = coalesced.last().expect("coalesced ranges are not empty");
-        let lock_end = last_addr + last_size as u64;
-        let _counter_guard =
-            ScopedRangeLock::new(&self.cached_pages_guard, lock_begin, lock_end - lock_begin);
+        let lock_end = last_addr.wrapping_add(last_size as u64);
+        let _counter_guard = ScopedRangeLock::new(
+            &self.cached_pages_guard,
+            lock_begin,
+            lock_end.wrapping_sub(lock_begin),
+        );
 
         for &(addr, size) in &coalesced {
             self.update_pages_cached_count_no_lock(addr, size, delta);
@@ -1722,26 +1749,9 @@ impl MaxwellDeviceMemoryManager {
     /// Port of upstream
     /// `Core::DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock`.
     fn update_pages_cached_count_no_lock(&self, addr: DAddr, size: usize, delta: i32) {
-        if size == 0 {
-            return;
-        }
-
         let page_begin = addr >> PAGE_BITS;
-        let page_end = (addr + size as u64 + PAGE_SIZE - 1) >> PAGE_BITS;
-        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
-            && addr < 0xA7C0_1000
-            && addr.saturating_add(size as u64) > 0xA6C0_1000
-        {
-            let first = self.smmu_extract_cpu_backing(page_begin);
-            let target = self.smmu_extract_cpu_backing(0xA77D_7000 >> PAGE_BITS);
-            eprintln!(
-                "[SMMU_TRACK_ALIAS] device=0x{addr:X} size=0x{size:X} delta={delta} first_asid={} first_vpage=0x{:X} target_asid={} target_vpage=0x{:X}",
-                first.asid,
-                first.virtual_page,
-                target.asid,
-                target.virtual_page
-            );
-        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let page_end = addr.wrapping_add(size as u64).wrapping_add(PAGE_SIZE - 1) >> PAGE_BITS;
 
         // Pending-batch tracking for grouped MarkRegionCaching calls.
         // `uncache_*` accumulates pages that just transitioned to count==0.
@@ -2210,17 +2220,41 @@ mod tests {
     }
 
     #[test]
-    fn smmu_free_uses_flat_allocator_linear_pass_before_reuse() {
+    fn smmu_allocate_and_free_preserve_exact_sizes() {
         let mgr = MaxwellDeviceMemoryManager::default();
-        let first = mgr.smmu_allocate(0x1000);
-        let second = mgr.smmu_allocate(0x1000);
+        let first = mgr.smmu_allocate(0x800);
+        let second = mgr.smmu_allocate(0x800);
 
-        mgr.smmu_free(first, 0x1000);
+        mgr.smmu_free(first, 0x800);
         let third = mgr.smmu_allocate(0x800);
 
         assert_eq!(first, SMMU_BASE);
-        assert_eq!(second, SMMU_BASE + 0x1000);
-        assert_eq!(third, SMMU_BASE + 0x2000);
+        assert_eq!(second, SMMU_BASE + 0x800);
+        assert_eq!(third, SMMU_BASE + 0x1000);
+    }
+
+    #[test]
+    fn smmu_allocate_fixed_reserves_the_range() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        mgr.smmu_allocate_fixed(SMMU_BASE + 0x1000, 0x1000);
+
+        // The alternative policy never returns an address overlapping the
+        // fixed range, even when the linear allocation straddles its start.
+        let address = mgr.smmu_allocate(0x2000);
+
+        assert_eq!(address, SMMU_BASE + 0x2000);
+    }
+
+    #[test]
+    fn smmu_allocator_bounds_match_the_upstream_max_device_area() {
+        assert!(MaxwellDeviceMemoryManager::smmu_is_in_bounds::<false>(
+            1u64 << DEVICE_VIRTUAL_BITS,
+            0,
+        ));
+        assert!(!MaxwellDeviceMemoryManager::smmu_is_in_bounds::<true>(
+            (1u64 << DEVICE_VIRTUAL_BITS) - 1,
+            2,
+        ));
     }
 
     #[test]
@@ -2827,6 +2861,8 @@ mod tests {
             3
         );
         assert_eq!(mgr.get_pointer(0x8000), mapped as *mut u8);
+        assert_eq!(mgr.smmu_get_physical_raw_address_from_daddr(0x8080), 0x2080);
+        assert_eq!(mgr.smmu_get_physical_raw_address_from_daddr(0x9000), 0);
         assert_eq!(mgr.smmu_reverse_device_pages_for_test(mapped), vec![0x8]);
 
         let mut addresses = Vec::new();
@@ -2835,6 +2871,12 @@ mod tests {
             mgr.smmu_apply_op_on_host_pointer(unsafe { mapped.add(0x80) }, &mut scratch, |addr| {
                 addresses.push(addr)
             });
+        assert_eq!(count, 1);
+        assert_eq!(addresses, vec![0x8080]);
+
+        addresses.clear();
+        let count = mgr
+            .smmu_apply_op_on_physical_address(0x2080, &mut scratch, |addr| addresses.push(addr));
         assert_eq!(count, 1);
         assert_eq!(addresses, vec![0x8080]);
     }

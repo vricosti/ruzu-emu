@@ -121,6 +121,24 @@ struct ComputeTextureBindings {
     samplers: SmallVec<[SamplerId; MAX_TEXTURES as usize]>,
 }
 
+impl ComputeTextureBindings {
+    fn push_view(&mut self, view: ImageViewInOut) {
+        assert!(
+            self.views.len() < (MAX_TEXTURES + MAX_IMAGES) as usize,
+            "ComputePipeline image-view bindings exceed Eden's static_vector capacity"
+        );
+        self.views.push(view);
+    }
+
+    fn push_sampler(&mut self, sampler: SamplerId) {
+        assert!(
+            self.samplers.len() < MAX_TEXTURES as usize,
+            "ComputePipeline sampler bindings exceed Eden's static_vector capacity"
+        );
+        self.samplers.push(sampler);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ComputePipelineInfoState {
     uniform_buffer_sizes: ComputeUniformBufferSizes,
@@ -385,7 +403,7 @@ impl ComputePipeline {
             for index in 0..desc.count {
                 let (tic_index, _) =
                     Self::read_handle(qmd, desc, index, via_header_index, &mut read_u32);
-                result.views.push(ImageViewInOut {
+                result.push_view(ImageViewInOut {
                     index: tic_index,
                     ..Default::default()
                 });
@@ -393,7 +411,7 @@ impl ComputePipeline {
         }
         for desc in &info.image_buffer_descriptors {
             Self::add_image_handles(
-                &mut result.views,
+                &mut result,
                 qmd,
                 desc,
                 false,
@@ -406,17 +424,17 @@ impl ComputePipeline {
             for index in 0..desc.count {
                 let (tic_index, tsc_index) =
                     Self::read_handle(qmd, desc, index, via_header_index, &mut read_u32);
-                result.views.push(ImageViewInOut {
+                result.push_view(ImageViewInOut {
                     index: tic_index,
                     ..Default::default()
                 });
-                result.samplers.push(get_sampler_id(tsc_index));
+                result.push_sampler(get_sampler_id(tsc_index));
             }
         }
 
         for desc in &info.image_descriptors {
             Self::add_image_handles(
-                &mut result.views,
+                &mut result,
                 qmd,
                 desc,
                 desc.is_written,
@@ -438,8 +456,9 @@ impl ComputePipeline {
 
         let num_texture_buffers = num_descriptors(&info.texture_buffer_descriptors);
         let num_image_buffers = num_descriptors(&info.image_buffer_descriptors);
-        let num_textures = num_texture_buffers + num_descriptors(&info.texture_descriptors);
-        let num_images = num_image_buffers + num_descriptors(&info.image_descriptors);
+        let num_textures =
+            num_texture_buffers.wrapping_add(num_descriptors(&info.texture_descriptors));
+        let num_images = num_image_buffers.wrapping_add(num_descriptors(&info.image_descriptors));
         if num_textures > MAX_TEXTURES {
             // Eden's ASSERT reports this invariant and continues. The fixed
             // binding arrays below preserve the same hard capacity.
@@ -619,16 +638,17 @@ impl ComputePipeline {
             buffer_cache.any_buffer_uploaded = false;
         }
 
-        let mut views_index = (self.num_texture_buffers + self.num_image_buffers) as usize;
+        let mut views_index =
+            (self.num_texture_buffers as usize).wrapping_add(self.num_image_buffers as usize);
         let mut sampler_index = 0usize;
-        let mut sampler_binding = 0usize;
-        let mut texture_binding = self.num_texture_buffers as usize;
-        let mut image_binding = self.num_image_buffers as usize;
+        let mut sampler_binding = 0i32;
+        let mut texture_binding = self.num_texture_buffers as i32;
+        let mut image_binding = self.num_image_buffers as i32;
         let mut texture_scaling_mask = 0u32;
 
         for desc in &self.info.texture_buffer_descriptors {
             for _ in 0..desc.count {
-                gl_samplers[sampler_binding] = 0;
+                gl_samplers[sampler_binding as usize] = 0;
                 sampler_binding += 1;
             }
         }
@@ -639,7 +659,7 @@ impl ComputePipeline {
                 let image_view = texture_cache
                     .get_image_view(view_id)
                     .expect("FillImageViews must publish every compute texture view");
-                textures[texture_binding] = image_view.handle(desc.texture_type as usize);
+                textures[texture_binding as usize] = image_view.handle(desc.texture_type as usize);
                 if texture_cache.image_view_is_rescaling(view_id) {
                     texture_scaling_mask |= 1u32 << texture_binding;
                 }
@@ -651,7 +671,7 @@ impl ComputePipeline {
                     .expect("GetSamplerId must publish every compute sampler");
                 let use_fallback =
                     sampler.has_added_anisotropy() && !image_view.supports_anisotropy();
-                gl_samplers[sampler_binding] = if use_fallback {
+                gl_samplers[sampler_binding as usize] = if use_fallback {
                     sampler.handle_with_default_anisotropy()
                 } else {
                     sampler.handle()
@@ -674,7 +694,8 @@ impl ComputePipeline {
                 let image_view = texture_cache
                     .get_image_view_mut(view_id)
                     .expect("FillImageViews must preserve every compute image view");
-                images[image_binding] = image_view.storage_view(desc.texture_type, desc.format);
+                images[image_binding as usize] =
+                    image_view.storage_view(desc.texture_type, desc.format);
                 if texture_cache.image_view_is_rescaling(view_id) {
                     image_scaling_mask |= 1u32 << image_binding;
                 }
@@ -718,11 +739,11 @@ impl ComputePipeline {
                         "ComputePipeline::Configure texture binding count {texture_binding} differs from sampler binding count {sampler_binding}"
                     );
                 }
-                gl::BindTextures(0, texture_binding as i32, textures.as_ptr());
-                gl::BindSamplers(0, sampler_binding as i32, gl_samplers.as_ptr());
+                gl::BindTextures(0, texture_binding, textures.as_ptr());
+                gl::BindSamplers(0, sampler_binding, gl_samplers.as_ptr());
             }
             if image_binding != 0 {
-                gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
+                gl::BindImageTextures(0, image_binding, images.as_ptr());
             }
         }
     }
@@ -779,7 +800,7 @@ impl ComputePipeline {
     }
 
     fn add_image_handles(
-        views: &mut SmallVec<[ImageViewInOut; MAX_TEXTURES as usize + MAX_IMAGES as usize]>,
+        bindings: &mut ComputeTextureBindings,
         qmd: &LaunchParams,
         desc: &impl ComputeHandleDescriptor,
         blacklist: bool,
@@ -787,7 +808,7 @@ impl ComputePipeline {
         read_u32: &mut impl FnMut(u64) -> u32,
     ) {
         for index in 0..desc.count() {
-            views.push(ImageViewInOut {
+            bindings.push_view(ImageViewInOut {
                 index: Self::read_handle(qmd, desc, index, via_header_index, read_u32).0,
                 blacklist,
                 ..Default::default()

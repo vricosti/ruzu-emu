@@ -184,10 +184,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- `TurboMode` moves a separately owned `TurboResources` bundle into its worker thread and exposes
-  an `Arc` callback to `Scheduler`; upstream captures the containing object from a `std::jthread`.
-  The device, workload, 100 ms idle predicate, queue-submit notification, and destruction ordering
-  are unchanged.
+- `TurboMode` keeps its dedicated device and allocator in a separately owned `TurboResources`
+  bundle and exposes an `Arc` callback to `Scheduler`; upstream stores those two owners directly
+  in `TurboMode` and captures the containing object from a `std::jthread`. The remaining workload
+  resources are initialized by the worker, matching upstream; see the 2026-08-26 follow-up below.
 - `TextureCacheRuntime` receives `cant_blit_msaa` during construction instead of retaining the full
   Vulkan `Device` wrapper. It uses the same predicate as upstream `Image::NeedsScaleHelper` and the
   same color or combined depth/stencil helper blits.
@@ -197,7 +197,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The turbo compute shader is byte-for-byte identical to upstream. This slice introduces no
   guest-visible raw-memory structure.
 
-## 2026-08-09 — `src/video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `vp9_types.h`
+## 2026-08-09 — `src/video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `src/video_core/host1x/codec_types.h`
 
 ### Intentional differences
 
@@ -472,9 +472,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- `DescriptorAllocator` clones share allocator state through `Arc<Mutex<_>>` so Rust's `Send +
-  'static` scheduler closures can perform Eden's descriptor-set commit on the worker. The resource
-  pool, bank, layout and tick-based reuse remain shared by the same compute-pass owner.
+- Deferred `Send + 'static` scheduler closures retain a non-owning
+  `DescriptorAllocatorReference`, the Rust counterpart of Eden's captured `this`. The allocator
+  itself remains uniquely owned and move-only; its mutable resource-pool state is mutex-protected.
 - Raw descriptor payload pointers are wrapped in a `Send` newtype. The queue owns one fixed
   allocation for the renderer lifetime, and its frame ring waits for the worker before recycling a
   slice, matching Eden's recorded `const DescriptorUpdateEntry*` lifetime.
@@ -786,8 +786,8 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- `BankPool::can_recycle_front` exposes the exact predicate used by `ReserveBank` so the Vulkan
-  caller can construct fallible resources before entering Rust's infallible builder closure.
+- `BankPool::ReserveBank` returns `Result` so a fallible Rust resource constructor can replace a
+  C++ builder that propagates allocation failures through exceptions.
 - The file was normalized from CRLF to LF while formatting the new implementation and tests.
 
 ### Unintentional differences (to fix)
@@ -1428,8 +1428,8 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- Rust stores active transform-feedback entries in a `Vec`; Eden uses a fixed 256-entry array.
-  `xfb_count` remains the authoritative bound in both implementations.
+- At the time of this review, Rust stored active transform-feedback entries in a `Vec`; this was
+  restored to Eden's fixed 256-entry array by the 2026-08-26 transform-feedback parity pass below.
 
 ### Unintentional differences (to fix)
 
@@ -2416,7 +2416,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: this is host-global scalar state and is not serialized or copied to guest memory.
 
-## 2026-08-21 — macro dumping in `src/video_core/src/macro_engine/macro_engine.rs` vs Eden `src/video_core/macro.{h,cpp}`
+## 2026-08-21 — macro dumping in `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}`
 
 ### Intentional differences
 
@@ -4419,11 +4419,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- Eden reports `MemoryCommit`, image, and buffer allocations/deallocations through `GPULogger` when
-  GPU memory tracking is active. Ruzu does not yet have the corresponding GPU logging subsystem.
-- Ruzu's raw-handle `create_image`, `create_buffer`, and `create_mapped_buffer` compatibility paths
-  still use dedicated Vulkan allocations. Eden returns owning VMA-backed `vk::Image`/`vk::Buffer`
-  wrappers; `create_owned_buffer` already uses VMA but the remaining callers have not all migrated.
+- Resolved by the 2026-08-26 allocator passes recorded below: all image and buffer factories now
+  return VMA-backed owners, and GPU allocation tracking is wired to the ported logger.
 
 ## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_data_processing.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (masked shifts)
 
@@ -4468,13 +4465,37 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   it does not retain Eden's inner `config_mutex`; the cache owners must provide any cross-thread
   synchronization around the complete `ChannelSetupCaches` value.
 
-## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/ffmpeg.rs` and `ffmpeg_shim.c` vs `src/video_core/host1x/ffmpeg.h` and `.cpp`
+## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c}` and `src/video_core/build.rs` vs `src/video_core/host1x/ffmpeg.{h,cpp}`
 
 ### Intentional differences
 
 - The native C shim retains Eden's `DecoderContext::m_decoder` codec pointer inside
   `RuzuFfmpegDecoder`; the Rust wrapper therefore does not duplicate that codec or hold a
   self-referential borrow into `DecodeApi::decoder`.
+- Rust's `Packet<'a>` borrows the compressed byte span directly while the C shim creates and frees
+  the temporary `AVPacket` around `avcodec_send_packet`. This preserves Eden's non-owning packet
+  data lifetime without exposing FFmpeg structure layouts through Rust FFI.
+- `AVFrame`, `AVCodecContext`, `AVBufferRef`, and FFmpeg enum constants remain owned by the native
+  shim. Rust accessors copy pointer arrays/strides rather than returning C array pointers, while the
+  backing `AVFrame` and all ownership/destruction remain identical.
+- `build.rs` probes libva on Linux and FreeBSD to define Eden's optional `LIBVA_FOUND` path; other
+  targets compile the same non-libva branch selected by Eden's build configuration.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's complete platform-specific preferred-device lists, GPU pixel-format
+  reselection, hardware initialization ownership, Android MediaCodec selection/deferred open/H.264
+  parameter-set extradata, Android low-delay flags, decoder-open reset behavior, allocated default
+  frames, hardware-frame detection, and optional VDPAU-over-VAAPI rejection.
+
+### Missing items
+
+- None in the FFmpeg packet/frame/decoder/hardware-context/decode-API slice.
+
+### Binary layout verification
+
+- N/A: all libav structures are allocated and accessed by the C shim compiled against the active
+  FFmpeg headers; Rust exchanges only opaque pointers, primitive values, and borrowed byte spans.
 
 ## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs `src/video_core/renderer_vulkan/present/fsr.h` and `.cpp`
 
@@ -4503,8 +4524,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   allocator is owned by the enclosing Vulkan renderer and a lifetime borrow would make its `Layer`
   storage self-referential. The pointer is consumed only by `CreateImages` and `UploadImages`, at
   the same lifecycle points as Eden.
-- The raw `ash::Device` is retained by `Smaa` because the local `AntiAliasPass::draw` trait does not
-  receive Eden's `Device&`; resource selection and command ordering are unchanged.
+- The raw `ash::Device` is retained by `Smaa` to destroy its raw Vulkan handles in `Drop`. Runtime
+  draw/update/upload operations receive Eden's high-level `Device&` through `AntiAliasPass::draw`.
 
 ## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/layer.rs` vs `src/video_core/renderer_vulkan/present/layer.h` and `.cpp`
 
@@ -4533,9 +4554,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Intentional differences
 
-- Rust omits Eden's `last_index_count` and `immediate_buffer_capacity` members. Neither member is
-  read or updated upstream: indirect draw state is held by the channel bindings, while
-  `ScratchBuffer::resize_destructive` manages the immediate allocation capacity internally.
+- Rust omits Eden's `last_index_count`, `current_buffer`, and `immediate_buffer_capacity` members.
+  None is read or updated upstream: indirect draw state is held by the channel bindings, async
+  staging ownership uses the queued optionals directly, and `ScratchBuffer::resize_destructive`
+  manages the immediate allocation capacity internally.
 
 ## 2026-08-21 — `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs `src/core/device_memory_manager.h` and `.inc` (`UpdatePagesCachedBatch`)
 
@@ -4544,9 +4566,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu exposes the batch operation through its `DeviceTracker` trait so the generic Rust word
   manager can call the concrete `MaxwellDeviceMemoryManager`; Eden's C++ template parameter calls
   that concrete method directly.
-- Ruzu's public single-range path returns before acquiring a range lock when `size == 0`. Eden
-  still acquires a zero-length lock and reads the initial CPU-backing entry, but performs no page
-  counter update or caching callback.
+
+### Unintentional differences (to fix)
+
+- Resolved on 2026-08-26: the public single-range path no longer returns early when `size == 0`;
+  it now constructs Eden's zero-length range guard and executes the acquire/read setup without a
+  page-counter update or caching callback.
 
 ## 2026-08-21 — `src/video_core/src/buffer_cache/word_manager.rs` vs `src/video_core/buffer_cache/word_manager.h`
 
@@ -4557,16 +4582,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   would only retain dead code.
 - The Rust callback adapter uses `Option<bool>` to represent Eden's compile-time distinction
   between callbacks returning `bool` and callbacks returning `void`.
-- A null tracker is tolerated by the default/empty Rust manager and discards collected ranges;
-  Eden's default constructor also leaves `tracker` null, but invoking a notifying mutation on that
-  object would dereference it.
 
-### Unintentional differences (to fix)
+### Resolved differences
 
 - Eden's `size_bytes` is a template parameter and its five tracking channels occupy one fixed
-  `std::array`. Ruzu stores `size_bytes` at runtime and uses separate stack-or-heap channel views.
-  Restoring that structural/layout parity requires changing the manager-pool type graph and is
-  outside this local batching slice.
+  `std::array`. The 2026-08-26 parity pass replaced Ruzu's runtime-sized stack-or-heap storage with
+  the compile-time-sized inline storage recorded in the later entry below.
+- The 2026-08-26 parity pass also stopped silently discarding notifications from a default manager
+  with a null tracker; an invalid notifying use now fails explicitly.
 
 ## 2026-08-22 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs `src/video_core/vulkan_common/vulkan_debug_callback.h` and `.cpp`
 
@@ -4578,8 +4601,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Missing items
 
-- Eden additionally forwards validation messages to `GPU::Logging::GPULogger` when Vulkan-call
-  logging is active. Ruzu does not yet have that GPU logging subsystem.
+- Resolved by the 2026-08-26 GPU-logging parity pass recorded below: validation messages are now
+  forwarded when Vulkan-call logging is active.
 
 ## 2026-08-22 — `src/core/src/device_memory_manager.rs` vs `src/core/device_memory_manager.h` and `.inc`
 
@@ -6831,8 +6854,8 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Intentional differences
 - Eden indexes the `Regs::reg_array` union member directly. Rust derives the same word pointer
-  from the enclosing `#[repr(C)] RegsStorageRaw` address, avoiding an unsafe union-field
-  projection required by Rust 1.89 while preserving the exact offset and contiguous storage.
+  from the `#[repr(C)] RegsUnionRaw` address, avoiding an unsafe union-field projection required
+  by Rust 1.89 while preserving the exact offset, size, and contiguous storage.
 
 ### Unintentional differences (to fix)
 - None in this compiler-compatibility slice.
@@ -6841,9 +6864,50 @@ vs Eden `display_list.h` and `layer_list.h`
 - None in this compiler-compatibility slice.
 
 ### Binary layout verification
-- PASS: existing tests verify that `RegsStorageRaw::regs` is at offset zero, the runtime tail
-  begins after `NUM_REGS_WORDS`, the total size is `ENGINE_REG_COUNT * 4`, and the word view spans
-  both regions contiguously.
+- PASS: tests verify that `RegsRaw` and `RegsUnionRaw` are exactly
+  `Regs::NUM_REGS * sizeof(u32) == 0x960` bytes and that the word view spans exactly that union.
+
+## 2026-08-26 — Fermi2D raw-register and blit parity
+
+Rust files:
+- `src/video_core/src/engines/fermi_2d.rs`
+- `src/video_core/src/engines/sw_blitter/blitter.rs`
+- `src/video_core/src/texture_cache/image_info.rs`
+- `src/video_core/src/renderer_vulkan/blit_image.rs`
+- `src/video_core/src/renderer_vulkan/texture_cache.rs`
+
+Eden files:
+- `src/video_core/engines/fermi_2d.{h,cpp}`
+- `src/video_core/engines/sw_blitter/blitter.cpp`
+- `src/video_core/texture_cache/image_info.cpp`
+- `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
+- `src/video_core/renderer_vulkan/vk_texture_cache.cpp`
+
+### Intentional differences
+- `Surface::format` and `Surface::linear` use raw `u32` storage, and `Operation` is a transparent
+  `u32` newtype. C++ enums can retain arbitrary register bit patterns; constructing an invalid Rust
+  enum discriminant would be undefined behavior. The raw Rust representations preserve every bit,
+  keep the same four-byte ABI, and expose the upstream named values as constants.
+- Rust checks the length of the slice passed to `call_multi_method`; Eden receives an unchecked
+  pointer whose caller contract guarantees `amount` readable words.
+
+### Unintentional differences (to fix)
+- None after this correction. Unknown surface formats, memory layouts, and operations are no longer
+  normalized; all five `UNIMPLEMENTED_IF_MSG` checks now use Eden's fail-soft policy; the complete
+  blit calculation uses the same wraparound bit patterns and ordering; and the spurious deferred
+  `pending_blit` state has been removed. The register union is no longer extended with Maxwell's
+  `0xE00`-word register count, and `Blit` now requires the rasterizer binding that Eden dereferences
+  before selecting the software fallback.
+
+### Missing items
+- None in the Fermi2D register/blit slice.
+
+### Binary layout verification
+- PASS: `Operation` is 4 bytes, `Surface` is `0x28`, `Config` is `0x2c`, `ActiveRegsRaw` is `0x6e0`,
+  the upstream register union is exactly `0x960`, and tests verify every asserted register offset
+  plus the exact union word count.
+- PASS: Vulkan's `BlitImagePipelineKey` now owns the upstream Fermi2D `Operation` type rather than a
+  duplicate renderer-local enum; the representation remains one 32-bit word.
 
 ## 2026-08-22 — `src/video_core/build.rs` vs Eden root `CMakeLists.txt`
 
@@ -12190,3 +12254,5530 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 - N/A: the change affects Vulkan stage masks only. The focused regression test verifies the exact
   two-element transfer-stage wait array used by the production submit.
+## 2026-08-25 — `src/shader_recompiler/src/frontend/{location,control_flow,maxwell_opcodes}.rs` and `pipeline_cache.rs` vs Eden Maxwell frontend
+
+### Intentional differences
+- Rust materializes Eden's `maxwell.inc` macro table once through `OnceLock`. The 280 names,
+  encodings, source order, and first-match decode rule are identical to upstream.
+- Rust converts absolute Maxwell `Location` ranges to indices into a cached instruction slice.
+  The slice's absolute base offset is therefore carried into materialization so scheduling words
+  are skipped on Eden's absolute 32-byte grid.
+
+### Unintentional differences (to fix)
+- The code-slice-only OpenGL helpers still build their CFG with the older relative-word builder;
+  the environment-owned Vulkan path now uses the upstream absolute `Location` path.
+
+### Missing items
+- Direct ownership parity for upstream `Translate(Environment&, IR::Block*, location_begin,
+  location_end)` remains part of the wider shader translation refactor.
+
+### Binary layout verification
+- N/A: these files decode and translate instructions without defining a serialized payload.
+  Regression tests cover non-zero scheduling-grid phases and the upstream opcode collisions.
+
+## 2026-08-25 — `src/video_core/src/{shader_environment,shader_cache}.rs` vs Eden `shader_environment.{h,cpp}` and `shader_cache.{h,cpp}`
+
+### Intentional differences
+- `GenericEnvironmentOwner` represents C++ base-subobject access without erasing the concrete
+  graphics or compute environment required by virtual resource callbacks.
+
+### Unintentional differences (to fix)
+- None in the reviewed shader-size and slow cache-analysis paths.
+
+### Missing items
+- None in `TryFindSize` termination or `ShaderCache::MakeShaderInfo` CFG ownership.
+
+### Binary layout verification
+- PASS: the existing serialized environment layout is unchanged. Tests verify the non-proprietary
+  EXIT terminator and the proprietary-driver self-branch behavior separately.
+
+## 2026-08-25 — Vulkan shader/rasterizer invalidation and compute-cache parity
+
+### Intentional differences
+- Ruzu mirrors Maxwell dirty flags for a draw while Eden's state tracker points directly at live
+  flags. When pipeline configuration rotates the command buffer, Ruzu reapplies Eden's
+  invalidation mask to that draw-scoped mirror.
+- `Option<Box<ComputePipeline>>` represents Eden's stable node-owned pointer and its null negative
+  cache entry without moving successful pipelines when the Rust hash map grows.
+
+### Unintentional differences (to fix)
+- Graphics-pipeline translation and runtime-info construction remain owned by
+  `graphics_pipeline.rs` instead of the upstream `vk_pipeline_cache.cpp` counterpart.
+- Runtime graphics pipeline construction remains conditional on the asynchronous-shader setting,
+  while Eden always submits compilation to its worker pool and controls only whether the caller
+  waits.
+
+### Missing items
+- The graphics-pipeline ownership and runtime-info parity slice, including MoltenVK-only fragment
+  color types, geometry passthrough/layer emulation, geometry point size, and the device XFB guard.
+
+### Binary layout verification
+- PASS: pipeline key serialization is unchanged. Focused tests cover negative compute-cache state,
+  draw-scoped invalidation, image capability collection, and zero-register vector accesses.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/{pipeline_cache,graphics_pipeline}.rs` vs Eden `vk_pipeline_cache.{h,cpp}` and `vk_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+- `GraphicsPipelineBuilder` is a Rust lifetime adapter for the state captured by Eden's pipeline
+  worker jobs. Shader translation, `MakeRuntimeInfo`, SPIR-V emission, module creation, and layer
+  emulation remain owned by `pipeline_cache.rs`; Vulkan graphics-pipeline construction remains
+  owned by `graphics_pipeline.rs`.
+- Rust stores the six translated programs as `Option<Program>` because `Program` has no inert
+  default value. Eden uses a default-constructed `std::array<Program, 6>`; the same populated slots
+  participate in runtime-info construction and emission.
+- Disk environments are collected before worker submission to satisfy the Rust parser callback's
+  borrow boundaries. Existing cache entries are skipped before submission rather than by
+  `try_emplace` inside the worker; the resulting positive and negative runtime cache states are
+  unchanged.
+- Android's configurable pipeline-worker count is not applicable to the currently supported
+  desktop targets; non-Android worker-count selection matches Eden.
+
+### Unintentional differences (to fix)
+- None in the reviewed runtime-info, graphics/compute translation, pipeline build scheduling, or
+  negative-cache paths.
+
+### Missing items
+- None in the ownership, behavior, or GPU shader-logging slice covered by the two parity reports.
+
+### Binary layout verification
+- PASS: compute and graphics pipeline cache keys and their serialized byte encodings are unchanged.
+  The ownership move only relocates implementation logic. Focused tests cover MoltenVK-only color
+  types, geometry point size, transform-feedback capability guards, geometry passthrough state,
+  negative compute entries, and fixed-state serialization.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust centralizes Eden's duplicated graphics/compute shader-name and shader-info formatting in
+  two file-local helpers so the exact payload contract is directly testable. Both hooks remain in
+  the matching pipeline-cache owner.
+
+### Unintentional differences (to fix)
+
+- None after passing every successfully emitted graphics SPIR-V module to `Device::save_shader`,
+  then logging and optionally dumping graphics and compute SPIR-V only after successful Vulkan
+  shader-module creation, with independent `is_active` and `gpu_log_shader_dumps` guards, and
+  restoring Eden's graphics shader-module debug names after those hooks.
+
+### Missing items
+
+- None in the shader save/log/dump lifecycle owned by `PipelineCache`.
+
+### Binary layout verification
+
+- PASS: pipeline cache keys and their serialized encodings are unchanged; the added operations
+  consume emitted SPIR-V words without modifying them.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+- Rust splits construction from synchronous or worker-backed Vulkan pipeline completion so the
+  worker owns an immutable snapshot instead of capturing a movable `this`. The shader build
+  notification still begins at graphics-pipeline construction and completes from the selected
+  build path.
+- Scheduler pipeline identity uses the stable Rust `GraphicsPipeline` address through a raw
+  identity handle; this is the direct counterpart of Eden tracking `GraphicsPipeline*`.
+
+### Unintentional differences (to fix)
+- None in the reviewed construction, vertex-input, runtime-info, geometry-passthrough, pipeline
+  configuration, bind-order, or GPU-logging paths. `MarkShaderBuilding` is now owned by the Rust
+  graphics pipeline constructor counterpart instead of `pipeline_cache.rs`.
+
+### Missing items
+- None in `GraphicsPipeline`.
+
+### Binary layout verification
+- PASS: no serialized or raw-copied layout changed. The correction only moves notification
+  ownership across the existing constructor boundary.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+
+- Rust moves Eden's two inline `fmt::format` expressions into file-local formatting helpers so
+  their exact payloads can be covered without constructing Vulkan objects. The helpers remain in
+  the matching pipeline owner file; logger access uses the process-wide singleton functions.
+
+### Unintentional differences (to fix)
+
+- None after logging a graphics bind only when the scheduler changes pipeline and Eden's Vulkan
+  call logging guard is enabled, and logging successful graphics-pipeline creation with the exact
+  shader-stage and color-attachment counts after publishing the created handle and before
+  collecting pipeline statistics, in Eden's lifecycle order.
+
+### Missing items
+
+- None in the GPU-logging hooks owned by `GraphicsPipeline`.
+
+### Binary layout verification
+
+- N/A: the change adds host-side logging calls without modifying pipeline keys, Vulkan create
+  structures, descriptor payloads, or serialized data.
+
+## 2026-08-26 — `src/video_core/src/host1x/{host1x,nvdec}.rs` vs Eden `src/video_core/host1x/host1x.{h,cpp}` and `nvdec.cpp`
+
+### Intentional differences
+- Rust stores active Host1x devices in a `HashMap` of `CDmaPusher` owners instead of Eden's fixed
+  array of `Nvdec`/`Vic` variants. Each pusher owns the same concrete processor and dropping an
+  entry performs the corresponding device destructor lifecycle.
+- `Arc<Frame>` and a mutex-protected Rust `HashMap`/`VecDeque` replace `shared_ptr<Frame>` and the
+  mutex-protected C++ containers while preserving the per-FD `FrameDevice` boundary.
+
+### Unintentional differences (to fix)
+- None in the reviewed Host1x aggregation and frame-queue paths. Presentation and decode queues
+  are now capped at Eden's 100 and 200 entries, presentation retrieval is constant-time, NVDEC
+  destruction closes its frame device, and unsupported channel dispatch is handled only by the
+  upstream default branch.
+
+### Missing items
+- None in this Host1x aggregation slice.
+
+### Binary layout verification
+- N/A: these containers and device owners are host-only and are not raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/codecs/h264.rs` vs Eden `src/video_core/host1x/codecs/h264.{h,cpp}` and `codec_types.h`
+
+### Intentional differences
+- The Rust decoder trait returns an owned `Vec<u8>` from `compose_frame`; Eden returns a span into
+  `frame_scratch`. This avoids retaining a borrow into the decoder while the shared decode path
+  queries offsets and mutably drives `DecodeApi`; the generated byte sequence is identical.
+- Guest-memory reads use the Rust `MemoryManager` slice API. Its boolean result is currently
+  unconditionally true, while Eden's corresponding operation returns `void` and zero-fills
+  unmapped pages.
+- Eden's unused `scan_scratch` member is omitted; both implementations use the same immutable
+  4x4 and 8x8 zig-zag orders directly.
+
+### Unintentional differences (to fix)
+- None in the reviewed context layout, bitfield extraction, SPS/PPS construction, scaling-list
+  order, Exp-Golomb encoding, frame-header insertion, or output-offset calculations.
+
+### Missing items
+- None in this H.264 decoder slice.
+
+### Binary layout verification
+- PASS: `Offset`, `H264ParameterSet`, `DpbEntry`, `DisplayParam`, and
+  `H264DecoderContext` retain Eden's sizes and field offsets. Focused tests also verify signed and
+  unsigned bitfield extraction from the raw 64-bit parameter word.
+
+## 2026-08-25 — `src/video_core/src/query_cache/query_stream.rs` vs Eden `src/video_core/query_cache/query_stream.h`
+
+### Intentional differences
+- Rust represents Eden's virtual base class as `StreamerInterfaceBase` plus the
+  `StreamerInterface` trait; both dependency masks remain owned by that base state.
+
+### Unintentional differences (to fix)
+- None. Fixed the inherited yuzu behavior where `get_dependent_mask` returned
+  `dependence_mask`; it now returns Eden's distinct `dependent_mask`.
+
+### Missing items
+- None in the reviewed streamer base and simple-streamer owner.
+
+### Binary layout verification
+- N/A: the streamer state is internal and is not serialized or copied as a raw payload.
+  The focused regression test verifies both directions of the dependency relationship.
+
+## 2026-08-25 — `src/video_core/src/engines/puller.rs` vs Eden `src/video_core/engines/puller.{h,cpp}`
+
+### Intentional differences
+- Rust passes `true` to `RasterizerInterface::release_fences` because the Rust interface exposes
+  the force argument explicitly; Eden's puller calls its argument-less wrapper.
+- Raw engine identifiers are represented by the transparent `EngineID` newtype so unsupported
+  values retain Eden's `static_cast<EngineID>` bit pattern.
+
+### Unintentional differences (to fix)
+- None in the corrected semaphore-trigger path. An unsatisfied `AcquireEqual`, `AcquireGequal`, or
+  `AcquireMask` now releases fences once and returns, matching Eden's single-pass
+  `do { ... } while (false)` control flow instead of busy-waiting in the puller thread.
+
+### Missing items
+- None in the reviewed bind, dispatch, fence, and semaphore paths. `NV01_TIMER` now binds and
+  dispatches through its matching engine counterpart.
+
+### Binary layout verification
+- PASS: `PullerRegs` remains a 0x800-word register array and all typed accessors retain Eden's
+  asserted word offsets. The focused regression test verifies the one-pass acquire state changes.
+
+## 2026-08-25 — `src/video_core/src/engines/engine_interface.rs` vs Eden `src/video_core/engines/engine_interface.h`
+
+### Intentional differences
+- Rust extracts the inherited fields into `EngineInterfaceState` and exposes
+  `has_pending_methods` to preserve Eden's guarded `ConsumeSink` behavior across trait objects.
+- `EngineHandle` retains Eden's non-owning engine-pointer semantics for Rust fat pointers.
+
+### Unintentional differences (to fix)
+- None. Restored `Nv01Timer = 0` and the exact discriminants of all following `EngineTypes`.
+- None. `consume_sink` now calls `consume_sink_impl` only when the method sink is non-empty, as
+  Eden does.
+
+### Missing items
+- None in the reviewed interface and shared state.
+
+### Binary layout verification
+- N/A: this interface state is not serialized or copied as a raw payload. A focused test verifies
+  every `EngineTypes` discriminant.
+
+## 2026-08-25 — `src/video_core/src/engines/nv01_timer.rs` vs Eden `src/video_core/engines/nv01_timer.h`
+
+### Intentional differences
+- The ignored `MemoryManager&` constructor argument is accepted as an `Arc<Mutex<MemoryManager>>`
+  to match the existing Rust engine construction boundary; neither implementation stores it.
+- Inherited `EngineInterface` fields live in `EngineInterfaceState` because Rust has no field
+  inheritance.
+
+### Unintentional differences (to fix)
+- None. Single and multi-method calls only log their arguments, and `consume_sink_impl` remains an
+  intentional no-op exactly like Eden.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- PASS: `Regs` is exactly 0x48 bytes and is deterministically zero-initialized. A focused layout
+  test verifies its size.
+
+## 2026-08-25 — `src/video_core/src/control/channel_state.rs` vs Eden `src/video_core/control/channel_state.{h,cpp}`
+
+### Intentional differences
+- Eden's optional `Payload` is represented by individually boxed optional engines and a boxed DMA
+  pusher so their addresses remain stable for non-owning engine handles.
+- Maxwell3D guest-memory and tick callbacks are Rust adapters required by the flattened owner.
+
+### Unintentional differences (to fix)
+- None. `init` now creates the NV01 timer and calls the file-owned NVK default-subchannel helper,
+  binding 3D/compute/2D/copy to subchannels 0/1/3/4 in Eden's order.
+
+### Missing items
+- None in the reviewed payload construction, default binding, and rasterizer-binding lifecycle.
+
+### Binary layout verification
+- N/A: `ChannelState` is an internal owner and is not serialized or copied as an upstream C++
+  payload. A focused test verifies every NVK default binding and the deliberately empty M2MF slot.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/state_tracker.rs` vs Eden `src/video_core/renderer_vulkan/vk_state_tracker.{h,cpp}`
+
+### Intentional differences
+- Rust stores the bound channel's live dirty-flag array through `NonNull` and keeps an owned
+  fallback array, preserving Eden's non-owning `Flags*` lifecycle.
+- `apply_command_buffer_invalidation` applies Eden's mask to the draw-scoped Rust flag mirror when
+  pipeline configuration rotates the command buffer.
+
+### Unintentional differences (to fix)
+- Fixed `SetupDirtyViewports`: both `surface_clip` words in table 1 now map to `Viewports`.
+- Fixed `MakeInvalidationFlags`: command-buffer invalidation now contains exactly Eden's 37 named
+  flags plus all 32 vertex-buffer, vertex-attribute, and vertex-binding flags; render targets,
+  rescale flags, global depth bias, and viewport swizzles remain untouched.
+- Fixed constructor state: the fallback flags now start clear like Eden's `default_flags{}` instead
+  of starting with every known flag dirty.
+- Restored the header-owned `invalidate_state_enable_flag` operation for scheduler pipeline-state
+  transitions.
+
+### Missing items
+- None in the reviewed table setup, invalidation mask, channel binding, and touch/check methods.
+
+### Binary layout verification
+- N/A: dirty flags are internal boolean lookup arrays rather than serialized payloads. Focused
+  tests verify the 133-bit invalidation mask and both surface-clip table entries.
+
+## 2026-08-25 — `src/common/src/thread.rs` vs Eden `src/common/thread.{h,cpp}` (`SetCurrentThreadPriority` prerequisite)
+
+### Intentional differences
+
+- Rust reports a failed Linux/Android `setpriority` call through `std::io::Error`; Eden formats the
+  same operating-system error through `GetLastErrorMsg`.
+- Unsupported non-Unix/non-Windows targets retain a no-op fallback. Eden has a dedicated Haiku
+  priority mapping which is not a supported Ruzu build target.
+
+### Unintentional differences (to fix)
+
+- None in the Linux, Windows, or generic POSIX priority mapping covered by this prerequisite.
+
+### Missing items
+
+- Android's topology-policy registration (`RememberCurrentThreadNice`) and the related
+  performance/efficiency-core policy subsystem are not ported. They are outside the Linux worker
+  priority prerequisite and depend on Eden's Android-only topology/ADPF infrastructure.
+- Pre-existing thread-name, Event, Barrier, and topology-policy differences are outside this
+  focused prerequisite review.
+
+### Binary layout verification
+
+- N/A: thread-priority selection has no serialized or guest-visible structure.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
+
+### Intentional differences
+
+- Rust implements Eden's polymorphic in-place `TypedCommand` list as a typed header plus `FnOnce`
+  payload in the same 0x8000-byte arena. Payload alignment, FIFO execution, destruction, arena
+  reuse, overflow dispatch, and submission marking retain the upstream contracts.
+- The worker queue uses `Arc`, mutexes and condition variables with an explicit in-flight count
+  instead of C++ `jthread` stop tokens and an execution mutex. `wait_worker` still waits for both an
+  empty queue and completion of the executing chunk; `Drop` drains work before requesting stop.
+- Query-cache interactions use independently locked shared states rather than Eden's non-owning
+  `QueryCache*`, preserving `CounterReset`, streaming-counter close, sample pause and conditional
+  rendering order without creating aliased mutable Rust references.
+- `StateTracker` is installed after fallible renderer construction and is therefore held as an
+  optional non-owning pointer. Runtime construction installs it before scheduler recording begins.
+- `request_renderpass_raw` is a Rust-only adapter for helper-owned Vulkan framebuffers which do not
+  have an upstream texture-cache `Framebuffer` object. The ordinary `request_renderpass` path owns
+  Eden's deferred-clear behavior.
+- Rust exposes separate convenience methods for C++ default arguments (`flush`,
+  `flush_with_signal`, `flush_with_semaphores`, `finish`, `finish_with_semaphores`). All forward to
+  the same signal/wait semaphore ordering as Eden.
+- Command buffers are explicitly reset before `vkBeginCommandBuffer`; Eden relies on Vulkan's
+  implicit reset when beginning an executable command buffer from a resettable pool.
+- `Scheduler::new` propagates `MasterSemaphore` and initial command-pool construction failures as
+  `vk::Result`; Eden propagates the equivalent Vulkan wrapper exceptions from its constructor.
+
+### Unintentional differences (to fix)
+
+- None in scheduler state ownership, render-pass state lifetime, deferred clears, pipeline-state
+  transitions, worker submission, signal/wait semaphore forwarding, flush/finish ordering, or
+  frame pacing after this correction.
+
+### Missing items
+
+- Resolved by the 2026-08-26 GPU-logging scheduler entry below: render-pass begin/end and successful
+  queue submissions now reach the ported logger.
+- Android performance-core placement remains part of the unported topology/ADPF prerequisite
+  recorded in the `common/thread.rs` entry above. It is a no-op in Eden on Linux, Windows and macOS.
+
+### Binary layout verification
+
+- N/A: scheduler state and command chunks are host-only and are never serialized or exposed to the
+  guest. Focused tests verify the 0x8000-byte arena limit, command alignment/order/destruction,
+  semaphore payloads, exact `Scheduler::State` defaults, and extended-dynamic-state transitions.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` (`UsesExtendedDynamicState` prerequisite)
+
+### Intentional differences
+
+- The recorded bind closure loads the eventual Vulkan pipeline handle from Rust's shared async
+  build cell after its build wait. Eden captures `this` and reads its `vk::Pipeline` member at the
+  same execution point.
+
+### Unintentional differences (to fix)
+
+- None in `UsesExtendedDynamicState` or the `ConfigureDraw` scheduler identity update: Rust now
+  passes the stable `GraphicsPipeline` object even while its Vulkan handle is still being built.
+
+### Missing items
+
+- Broader `graphics_pipeline.rs` parity findings are handled by its dedicated
+  `bugs/eden-parity/graphics_pipeline.md` review rather than this scheduler prerequisite.
+
+### Binary layout verification
+
+- N/A: no serialized pipeline-key or guest-visible structure changed in this prerequisite.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/master_semaphore.rs` vs Eden `src/video_core/renderer_vulkan/vk_master_semaphore.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the fence-thread state in `Arc` and replaces `atomic::wait/notify_one` with a
+  condition variable paired with the same free-fence mutex. The GPU tick is stored while holding
+  that mutex, so the predicate check and notification cannot lose progress.
+- Core Vulkan 1.3 and `VK_KHR_synchronization2` have distinct ash dispatch paths; Eden's device
+  wrapper selects the corresponding core or extension function behind `Submit2`.
+- Construction returns `Result<Self, vk::Result>` instead of throwing. Partial timeline semaphore
+  and fence allocations are explicitly destroyed before returning an error, matching C++ RAII.
+- Rust gives its two helper threads diagnostic names; Eden leaves these particular thread names to
+  the operating system.
+
+### Unintentional differences (to fix)
+
+- None after restoring fixed-size synchronization2 submit arrays, fatal handling for non-timeout
+  debug/fence wait failures, and destruction of a checked-out fence when queue submission fails.
+
+### Missing items
+
+- The focused unit test verifies file-owned constants. Timeline and fence submissions require a
+  real Vulkan device and remain covered only by renderer integration/runtime validation.
+
+### Binary layout verification
+
+- N/A: `MasterSemaphore` owns host Vulkan synchronization objects and exposes no serialized or
+  guest-visible raw-memory payload.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/resource_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_resource_pool.{h,cpp}`
+
+### Intentional differences
+
+- `MasterSemaphore&` is retained as `Arc<MasterSemaphore>` so cloned Rust descriptor allocators can
+  safely share the scheduler-owned timeline without a self-referential lifetime.
+- `try_commit_resource` is the `Result` counterpart of Eden's exception-propagating
+  `CommitResource`; its fallible grow path preserves Eden's resize-before-`Allocate` ordering.
+
+### Unintentional differences (to fix)
+
+- None after removing the external-tick variants and restoring Eden's failed-search sequence:
+  query `KnownGpuTick`, call `Refresh`, query `KnownGpuTick` again, and only then grow the pool.
+- None in search order, committed-tick assignment, overflow growth, or hint advancement.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the pool stores host-only resource indices and timeline ticks. A focused test verifies that
+  the fallible Rust grow path publishes the resized tick range before invoking allocation, as
+  Eden's `Grow` does.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` and descriptor-commit call sites vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.{h,cpp}` (`ResourcePool` prerequisite)
+
+### Intentional differences
+
+- `ResourcePool` retains an `Arc` to the scheduler's `MasterSemaphore` instead of Eden's raw
+  pointer. Each `DescriptorPool::allocator*` overload receives the scheduler explicitly and clones
+  that same semaphore into the newly returned allocator.
+- Vulkan allocation failures use `Result<_, vk::Result>` instead of C++ exceptions.
+
+### Unintentional differences (to fix)
+
+- None in descriptor resource retirement after this prerequisite: `DescriptorAllocator::commit`
+  now delegates tick acquisition and refresh to `ResourcePool`, matching Eden instead of using a
+  stale pair of ticks captured by individual draw-recording call sites.
+
+### Missing items
+
+- Broader descriptor-pool findings remain owned by its dedicated `bugs/eden-parity` report.
+
+### Binary layout verification
+
+- N/A: this prerequisite changes host ownership and resource-retirement timing only.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/command_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_command_pool.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `vk::CommandPool` and `vk::CommandBuffers` wrappers are represented by an ash handle and
+  `Vec<vk::CommandBuffer>`; `Drop` explicitly destroys every successfully created pool.
+- `CommandPool::commit` returns `Result` so Vulkan wrapper exceptions propagate through
+  `Scheduler::new`; failures during worker rotation remain fatal at the scheduler worker boundary.
+
+### Unintentional differences (to fix)
+
+- Fixed partial-allocation lifetime: an empty pool entry is now published before Vulkan creation,
+  matching Eden's `pools.emplace_back()`, so a pool handle is retained and destroyed if command
+  buffer allocation fails.
+- Fixed error propagation: pool creation and command-buffer allocation no longer panic through
+  `expect`; they return the original `vk::Result` like Eden's wrapper exception.
+
+### Missing items
+
+- None in construction, allocation, commit indexing, or destruction.
+
+### Binary layout verification
+
+- N/A: command-pool entries are host Vulkan resources, not raw-copied or serialized payloads. The
+  focused test verifies the empty entry state that precedes Vulkan allocation.
+
+## 2026-08-25 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.{h,cpp}`
+
+### Intentional differences
+
+- Descriptor banks use `Box` for Eden's `unique_ptr` address stability and allocators retain a
+  non-owning `NonNull` pointer. Rust adds mutexes around the bank and allocator state so deferred
+  `Send + 'static` scheduler commands can perform Eden's captured-`this` operations safely; the
+  read-search/write-insert critical sections and lack of a second search after lock promotion
+  remain identical.
+- Vulkan wrappers are raw ash handles owned and destroyed by `DescriptorPool::drop`; allocation
+  failures propagate as `vk::Result` rather than exceptions.
+
+### Unintentional differences (to fix)
+
+- Restored the file-owned `accumulate` and `make_bank_info` helpers and the single-`ShaderInfo`
+  allocator overload instead of flattening their logic into `allocator_for_infos`.
+- Restored `DescriptorAllocator::allocate` as the owner of set-vector growth.
+- Fixed bank publication order: `bank_infos` and `banks` are both extended before `allocate_pool`,
+  matching Eden and preserving their index invariant even when Vulkan creation fails.
+- Descriptor count accumulation and pool-size multiplication now retain Eden's unsigned wrapping
+  bit patterns in checked Rust builds.
+- Removed the Rust-only successful-bank debug log; Eden's helper returns without emitting a log.
+- Restored Eden's explicit `Device` and `Scheduler` parameters on all three allocator overloads;
+  `DescriptorPool` no longer owns the master semaphore.
+- Restored move-only allocator ownership and `Box`-stable banks instead of sharing both through
+  `Arc` clones.
+
+### Missing items
+
+- None in the bank-info helpers, allocator overloads, pool allocation/retry, bank selection, or
+  descriptor resource commit path.
+
+### Binary layout verification
+
+- N/A: bank metadata is consumed field-wise and Vulkan descriptor structures are built through ash,
+  not serialized by raw memory copy. Focused tests cover all-field superset comparison,
+  multi-shader accumulation, and unsigned wrapping.
+
+## 2026-08-25 — `src/video_core/src/delayed_destruction_ring.rs` vs Eden `src/video_core/delayed_destruction_ring.h`
+
+### Intentional differences
+
+- `new`/`Default` explicitly construct the array through `std::array::from_fn`; Eden obtains the
+  same zero-indexed empty vectors from C++ default member construction.
+- Rust consumes `T` in `push`, matching Eden's rvalue-reference plus `std::move` contract.
+
+### Unintentional differences (to fix)
+
+- Replaced the heap-allocated outer `Vec<Vec<T>>` with `[Vec<T>; TICKS_TO_DESTROY]`, directly
+  matching Eden's `std::array<std::vector<T>, TICKS_TO_DESTROY>` storage and allocation behavior.
+- Restored conditional copy support with `Clone`, corresponding to the implicitly copyable C++
+  template whenever `T` itself is copyable.
+
+### Missing items
+
+- None in construction, tick advancement, slot clearing, move-push, or copy behavior.
+
+### Binary layout verification
+
+- N/A: this host-only generic container is not raw-copied or serialized. Focused tests verify the
+  const-generic outer size and destruction after exactly one complete ring traversal.
+
+## 2026-08-25 — `src/video_core/src/fence_manager.rs` vs Eden `src/video_core/fence_manager.h`
+
+### Intentional differences
+
+- Rust represents Eden's derived fence-manager virtual methods with call-site closures. The async
+  release thread therefore stores `PopAsyncFlushes` as a pre-operation and obtains host waiting
+  through `FenceBase::wait_for_fence`; both execute at the same points as Eden's virtual calls.
+- The fence queue, pending operations, and uncommitted operations share an `Arc<Mutex<_>>` so the
+  worker can own them safely. The async signal path keeps this mutex locked for Eden's complete
+  `guard.lock()` interval, from moving uncommitted operations through queuing, publication, and
+  the optional command flush.
+
+### Unintentional differences (to fix)
+
+- Fixed the async guard interval: no worker can observe or consume a fence between extraction of
+  its operations and publication of the matching queue entry.
+- Fixed synchronous release ordering: pending operations are moved and run while the fence stays
+  at the queue front; the fence is removed only after the operations complete.
+- Removed the Rust-only boolean return values from `signal_reference`, `signal_fence`, and
+  `signal_sync_point`; Eden's methods return `void` and no caller consumed those values.
+
+### Missing items
+
+- Eden calls `SetCurrentThreadToPerformanceCores` in the async worker. It is a no-op on the current
+  Linux target, while its Android behavior depends on the still-unported topology/ADPF subsystem
+  already recorded in the `common/thread.rs` audit entry.
+
+### Binary layout verification
+
+- N/A: fence-manager queues and callbacks are host-only and are neither raw-copied nor serialized.
+  Focused tests verify the async guard interval and synchronous queue lifetime.
+
+## 2026-08-26 — `src/video_core/src/surface.rs` vs Eden `src/video_core/surface.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses Eden's macro-generated `DefaultBlockWidth`, `DefaultBlockHeight`, and
+  `BitsPerBlock` switches as three format-indexed arrays in the same file. An exhaustive audit
+  verifies all 112 names, positions, widths, heights, and bit sizes against
+  `PIXEL_FORMAT_LIST`.
+- The three guest-format conversion functions accept raw `u32` values. This preserves Eden's
+  ability to receive an out-of-range enum bit pattern without constructing an invalid Rust enum.
+- Eden's fail-soft assertion optionally executes a debugger trap; Rust logs the same failure and
+  panics when `use_debug_asserts` is enabled because a portable Rust debugger trap is unavailable.
+- Eden's duplicate `PixelFormat` sentinel aliases are module constants in Rust because Rust enums
+  reject duplicate discriminants. They remain owned by `surface.rs` and have the same values.
+- `IsViewCompatible` and `IsCopyCompatible` remain in `compatible_formats.rs`, the counterpart of
+  Eden's owning `compatible_formats.cpp`; call sites address that owner directly because Rust
+  modules do not separately reproduce Eden's enclosing `VideoCore::Surface` namespace.
+
+### Unintentional differences (to fix)
+
+- None after restoring `PixelFormat::Invalid = 255`, 32-bit `SurfaceType`/`SurfaceTarget`
+  representation, `SurfaceTargetFromTextureType`, `HasAlpha`, fail-soft conversion and
+  `GetFormatType` handling, and ASTC recompression-aware transcoded sizes.
+- None after removing the misplaced compatibility wrappers from `surface.rs` and routing their
+  callers to the file-owning `compatible_formats.rs` module.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: focused tests verify 32-bit enum sizes, sentinel discriminants 112 and 255, and all three
+  112-entry property table lengths. The exhaustive source comparison verifies every table value
+  and enum position against Eden's `PIXEL_FORMAT_LIST`.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/blit_{color,depth,depth_stencil}_msaa.frag` vs Eden `src/video_core/host_shaders/blit_{color,depth,depth_stencil}_msaa.frag`
+
+### Intentional differences
+
+- Rust's `build.rs` generates the SPIR-V word slices consumed by `ash`; Eden's CMake rules generate
+  C++ headers. Both invoke `glslangValidator` for the same GLSL source files and SPIR-V 1.3 target.
+
+### Unintentional differences (to fix)
+
+- None after restoring all three missing MSAA blit shader sources and registering their generated
+  modules with the Vulkan shader build and validation test.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: each Rust GLSL source is byte-for-byte identical to Eden's source, and the focused test
+  verifies that all three generated modules begin with the SPIR-V magic word.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/blit_image.rs` vs Eden `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
+
+### Intentional differences
+
+- `BlitImageView` and `BlitFramebufferInfo` are copyable snapshots of the exact `ImageView` and
+  `Framebuffer` fields captured by Eden's deferred scheduler lambdas. This keeps the Rust closures
+  owned and `'static` without moving image or framebuffer owners.
+- Vulkan wrapper exceptions are represented by `Result`/boolean failure propagation. Raw ash
+  handles are destroyed explicitly in `Drop`, in the reverse dependency order supplied by Eden's
+  RAII members.
+- Eden's fail-soft assertions optionally trap a debugger. Rust logs the same condition and panics
+  when `use_debug_asserts` is enabled.
+
+### Unintentional differences (to fix)
+
+- None after restoring `BlitColorMSAA`, `ResolveDepthStencil`, both matching pipeline builders,
+  their keys/caches/shader modules, and the exact source-image shader-read barrier.
+- None after restoring MoltenVK primitive-restart state, stencil-export-dependent module creation,
+  depth/stencil pipeline state, empty color attachment state for depth targets, and the original
+  conversion-pipeline method ownership.
+- None after moving descriptor allocation/update into the recorded command, using
+  `SHADER_READ_ONLY_OPTIMAL` for the explicit-image transition, and retaining `CurrentTick` for
+  deferred MSAA resources.
+- None after fixing MSAA resource destruction to release the framebuffer before its attachment
+  views, matching reverse C++ field destruction and Vulkan lifetime requirements.
+
+### Missing items
+
+- None in the class interface, file-owned helpers, pipeline keys, shader modules, pipeline caches,
+  conversion paths, clear paths, or MSAA copy/resolve paths.
+
+### Binary layout verification
+
+- PASS: focused tests verify `PushConstants` is 16 bytes with fields at offsets 0 and 8, and
+  `MSAACopyPushConstants` is 24 bytes with fields at offsets 0, 8, and 16. Pipeline keys are
+  host-only field-wise cache keys and are not raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` blit integration vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust's existing scale-helper implementation separates color and depth/stencil bodies while both
+  remain owned by `texture_cache.rs`; their selection, regions, sample scaling, framebuffer state,
+  and blit calls now follow Eden's single `Image::BlitScaleHelper` method.
+- Scheduler-facing calls pass `BlitImageView`/`BlitFramebufferInfo` snapshots rather than C++
+  references, preserving the same handles, formats, ranges, extents, sample count, and stencil
+  capability across deferred recording.
+
+### Unintentional differences (to fix)
+
+- None after wiring the restored color-MSAA and depth/stencil-resolve branches in Eden's order and
+  applying the same `SamplesLog2` adjustment to scale-helper regions and framebuffer extents.
+- None after restoring `ImageView::{depth_view,stencil_view,color_view}` as the owners of lazy
+  auxiliary-view creation; helper blits no longer receive null depth/stencil handles.
+- None after restoring Eden's fail-soft validation flow and exact
+  graphics/compute/transfer pipeline-stage masks in `TextureCacheRuntime::BlitImage`.
+- None after making every multisampled color image use the scale helper and clearing `Rescaled`
+  when no supported depth/stencil helper path exists.
+
+### Missing items
+
+- None in the `BlitImage`, `BlitScaleHelper`, `NeedsScaleHelper`, or lazy auxiliary-view slice
+  exercised by `BlitImageHelper`.
+
+### Binary layout verification
+
+- N/A: the integration passes host Vulkan handles and field-wise snapshots; no payload in this
+  slice is raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/accelerated_swizzle.rs` vs Eden `src/video_core/texture_cache/accelerated_swizzle.{h,cpp}`
+
+### Intentional differences
+
+- The implicit padding introduced by C++ `alignas(16)` members is represented by explicit,
+  zero-initialized Rust fields so the full compute-shader payload is deterministic.
+- `Common::AlignUpLog2` accepts the tile width through its Rust `u64` API and converts the result
+  back to the upstream `u32` payload type.
+
+### Unintentional differences (to fix)
+
+- Fixed: the module duplicated `GOB_SIZE_*` constants owned by `textures/decoders`; it now imports
+  the matching constants just as Eden imports them from `textures/decoders.h`.
+- Fixed: local copies of `AlignUpLog2`, `DivCeilLog2`, and `BytesPerBlock` wrappers have been
+  removed in favor of the same owning modules used by Eden.
+
+### Missing items
+
+- None: both parameter payloads and both 2D/3D parameter constructors are present.
+
+### Binary layout verification
+
+- PASS: focused tests verify every field offset, alignment, and total size (64 bytes/alignment 16
+  for the 2D payload; 56 bytes/alignment 4 for the 3D payload), plus representative 2D and 3D
+  formulas against Eden's expected values.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/anti_alias_pass.rs` vs Eden `src/video_core/renderer_vulkan/present/anti_alias_pass.h`
+
+### Intentional differences
+
+- Rust uses a trait for Eden's abstract base class; the single virtual `Draw` contract and mutable
+  image/view outputs remain identical.
+
+### Unintentional differences (to fix)
+
+- Fixed: `draw` now receives `&Device` before `&mut Scheduler`, matching Eden's full virtual
+  signature instead of relying on a device retained by each implementation.
+- Fixed: the invented `NoAa` implementation was removed; Eden represents a disabled pass as
+  `std::monostate`, now mirrored by the `AntiAlias::None` variant in `layer.rs`.
+
+### Missing items
+
+- None: the virtual destructor role is provided by Rust concrete-value destruction and the
+  complete `Draw` interface is present.
+
+### Binary layout verification
+
+- N/A: this is a virtual interface and does not define a copied or serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/{fxaa,smaa}.rs` Draw integration vs Eden `src/video_core/renderer_vulkan/present/{fxaa,smaa}.{h,cpp}`
+
+### Intentional differences
+
+- The passes retain a cloned raw `ash::Device` for explicit destruction of Vulkan handles; Eden's
+  wrapper members carry that destruction context through RAII.
+
+### Unintentional differences (to fix)
+
+- Fixed: `Draw`, `UpdateDescriptorSets`, and `UploadImages` now consume the high-level `Device&`
+  passed by the caller, in the same ownership and call order as Eden.
+
+### Missing items
+
+- None in the anti-alias interface integration slice.
+
+### Binary layout verification
+
+- N/A: this slice changes host references and Vulkan calls, not a raw-copied payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/layer.rs` and `renderer_vulkan/blit_screen.rs` anti-alias wiring vs Eden `src/video_core/renderer_vulkan/present/layer.{h,cpp}` and `renderer_vulkan/vk_blit_screen.cpp`
+
+### Intentional differences
+
+- Vulkan wrapper handles are still represented by raw ash handles with explicit Rust destruction.
+
+### Unintentional differences (to fix)
+
+- Fixed: `Layer` now receives and forwards Eden's high-level `Device&` from `BlitScreen` through
+  `ConfigureDraw`, `SetAntiAliasPass`, and the selected pass's `Draw` call.
+- Fixed: anti-alias storage now mirrors `std::variant<std::monostate, FXAA, SMAA>` with a concrete
+  Rust enum instead of heap-allocating a trait object and inventing a no-op pass.
+- Fixed: the unchanged-setting fast path now also requires a non-empty pass, matching Eden's
+  `!holds_alternative<std::monostate>` condition.
+
+### Missing items
+
+- None in the anti-alias selection and dispatch slice.
+
+### Binary layout verification
+
+- N/A: the variants are host-only owners and are neither raw-copied nor serialized.
+
+## 2026-08-26 — `src/video_core/src/textures/astc.rs` vs Eden `src/video_core/textures/astc.{h,cpp}`
+
+### Intentional differences
+
+- `IntegerEncodedValue` stores the mutually exclusive trit/quint payload in one Rust field rather
+  than a C++ union. `IntegerEncodedVector` uses 256 inline `SmallVec` entries; valid blocks remain
+  inline and are limited to at most 64 weight values and 32 color values before decoding.
+- Borrow-checker adaptations return endpoint pairs and transferred signed values rather than
+  mutating two aliased output references. The formulas and update order remain unchanged.
+- `OutputBitStream` advances `bits_written`, making Eden's declared bit-capacity guard effective.
+  Eden currently never increments that member; none of its callers reads it, and all valid writes
+  fit in the same 128-bit endpoint buffer.
+- Worker closures carry checked `Send` pointer wrappers because the shared Rust worker queue owns
+  `'static` jobs. `decompress` waits after every depth slice, so the input/output borrows remain
+  alive exactly as long as Eden's captured spans and no input copy is made.
+- Rust skips undersized compressed input blocks and out-of-range output rows rather than allowing
+  `span::subspan`/`memcpy` to access invalid memory. Valid texture buffers take the identical path.
+
+### Unintentional differences (to fix)
+
+- None after restoring all six HDR endpoint modes, HDR interpolation and half-float conversion,
+  the 64-weight and 24..96 packed-bit validations, first-byte start-offset semantics, the missing
+  `Pixel` methods and depth-reduction branch, common `divide_up` ownership, and inline integer
+  sequence storage.
+
+### Missing items
+
+- None in `astc.h`/`astc.cpp`: every class, structure, table, helper, endpoint mode, validation,
+  block decoder path, and public decompression entry point has a Rust counterpart.
+
+### Binary layout verification
+
+- N/A: ASTC helper structures are internal algorithm state and are not raw-copied or serialized.
+  Eden-oracle corpus tests instead verify the HDR mode 7/mode 11 arithmetic and all finite
+  nonnegative half-float conversions bit-for-bit.
+
+## 2026-08-26 — `src/video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
+
+### Intentional differences
+
+- C++ template constraints are represented by the local `BankLike` trait. A fallible builder
+  returns `Result`, the Rust equivalent of an exception escaping Eden's `ReserveBank`.
+- C++ default arguments for reference counts remain explicit arguments at Rust call sites.
+
+### Unintentional differences (to fix)
+
+- None after removing the invented `can_recycle_front` preflight and unused immutable accessor.
+  The fallible builder now runs inside the exact non-recycling branch before the index is queued.
+- None after matching the implicit sequentially-consistent atomic store/load used by Eden's
+  `references = 0` and `references == 0`; explicit add/close operations remain relaxed.
+
+### Missing items
+
+- None for `BankBase` or `BankPool`.
+
+### Binary layout verification
+
+- N/A: the banks and pool are host-only types and are neither raw-copied nor serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/query_cache.rs` bank reservation integration vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
+
+### Intentional differences
+
+- Vulkan construction failures propagate as `vk::Result`; Eden propagates wrapper exceptions.
+  Samples banks remain `Arc`-owned as documented by the broader query-cache audit.
+
+### Unintentional differences (to fix)
+
+- None after constructing a new samples bank directly from `BankPool::reserve_bank`'s builder,
+  matching Eden's branch and eliminating the separate preflight/panic invariant.
+
+### Missing items
+
+- None in the bank-reservation integration changed by this slice. Broader samples-streamer debt
+  remains tracked in its existing query-cache audit entry.
+
+### Binary layout verification
+
+- N/A: this slice changes host ownership and error propagation only.
+
+## 2026-08-26 — `src/video_core/src/textures/bcn.rs` vs Eden `src/video_core/textures/bcn.{h,cpp}`
+
+### Intentional differences
+
+- Worker closures carry checked `Send` pointer wrappers because Rust's shared worker queue owns
+  `'static` jobs. `compress_bcn` waits after every depth slice, so the captured input/output spans
+  remain alive for exactly Eden's worker lifetime and each job writes a distinct compressed row.
+- Rust validates the input and output span lengths before exposing their pointers to worker jobs;
+  Eden relies on its callers to satisfy the same buffer-size precondition and would otherwise
+  access outside the spans.
+- The C `stb_dxt` shim fixes the mode to `STB_DXT_NORMAL`, preserving the two direct Eden calls
+  without exposing the C++ implementation through Rust FFI.
+
+### Unintentional differences (to fix)
+
+- None after restoring one queued task per compressed row, `WaitForRequests` after each depth
+  slice, the stack-owned 64-byte texel block, and `Common::DivideUp` ownership.
+
+### Missing items
+
+- None: the generic BC compressor and both public BC1/BC3 entry points are present.
+
+### Binary layout verification
+
+- N/A: compression state is local algorithm data. Focused tests verify multi-row/multi-plane
+  output placement and Eden's BC1 alpha-threshold boundary.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present_manager.rs` vs Eden `src/video_core/renderer_vulkan/vk_present_manager.{h,cpp}`
+
+### Intentional differences
+
+- Eden passes stable `Frame*` values through its presentation queue. Rust keeps each owning
+  `Frame` in its unavailable pool slot and queues a copy of only the handles consumed by the
+  present thread; the same index returns to the free queue after presentation.
+- The present-thread state is held in an `Arc` context rather than borrowing the enclosing
+  renderer. Swapchain image count and view format are cached atomically because the upstream
+  renderer reads them concurrently without taking `PresentManager::swapchain_mutex`, whereas the
+  Rust swapchain itself is protected by a mutex.
+- Frame images use `AllocatedImage` ownership and a non-owning stable allocator pointer. Resource
+  replacement explicitly destroys framebuffer and views before releasing the old image, avoiding
+  a Vulkan-invalid dependency order that raw C++ wrapper assignment can transiently create.
+- Android surface recreation and performance-core policy retain their platform branches, but the
+  excluded Android JNI/ADPF implementation is not built. The current non-LSFG build takes Eden's
+  `CanStoreToFrame == false` branch.
+
+### Unintentional differences (to fix)
+
+- Fixed both submit wait stages to `TRANSFER`, matching the copy/blit command buffer.
+- Fixed frame creation flags and usage to include `MUTABLE_FORMAT | EXTENDED_USAGE` and
+  `TRANSFER_SRC | TRANSFER_DST | COLOR_ATTACHMENT | SAMPLED`, with the storage-view path retained.
+- Fixed the pre-copy source stages to Eden's graphics/compute/transfer set.
+- Restored `Frame::index`, `Frame::storage_view`, `MaxExtraFrames`, present-thread naming,
+  high-priority selection, performance-core call, and the `MAX_FRAMES_IN_FLIGHT` owner/name.
+- Fixed frame-image allocation ownership, current swapchain-format selection during recreation,
+  device-loss reporting, non-surface error propagation, and surface-loss retries across both
+  swapchain recreation and the copy path.
+- Fixed destruction order so the present thread stops before frames are released and every frame
+  releases fence, semaphore, framebuffer, views, then image before the command pool.
+
+### Missing items
+
+- Optional `HAS_LSFG` frame-generation scheduling is not enabled in Ruzu; all non-LSFG
+  `PresentManager` behavior is present.
+
+### Binary layout verification
+
+- N/A: `Frame` is a host Vulkan-resource owner, not a raw-copied or serialized payload. Focused
+  tests verify its upstream defaults, the seven-frame cap, copy/blit extents, and snapshot handle
+  identity without moving image ownership.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/blit_screen.rs` vs Eden `src/video_core/renderer_vulkan/vk_blit_screen.{h,cpp}`
+
+### Intentional differences
+
+- C++ reference members are explicit call dependencies in Rust to avoid a self-referential
+  `RendererVulkan`. The present-manager-owned path uses a frame index and a same-file mechanical
+  `draw_layers` tail so no mutable frame borrow aliases the manager during recreation.
+- `WindowAdaptPass` uses `Option` for Eden's nullable `unique_ptr`; Vulkan construction failures
+  panic at the same points where Eden's wrapper throws.
+
+### Unintentional differences (to fix)
+
+- Removed the invented `BlitFrame` snapshot and restored mutable `Frame` recreation on every
+  `presentation_recreate_required` path, including capture and applet frames.
+- Restored `PrepareFrame`, `std::list<Layer>` ownership through `LinkedList`, Eden's concrete
+  nearest-neighbor initial filter, and `image_index = 0` after every resource or framebuffer
+  rebuild.
+- Restored the full-layout `CreateFramebuffer` interface and use of the caller's high-level
+  `Device` in `WaitIdle` and framebuffer creation.
+- Moved pipeline selection, push-constant/descriptor allocation, layer configuration, and draw
+  recording back to `present/window_adapt_pass.rs`, their upstream owner.
+
+### Missing items
+
+- None in `vk_blit_screen.h`/`.cpp`; `PrepareFrame` is present even though the optional LSFG caller
+  is not built.
+
+### Binary layout verification
+
+- N/A: `FramebufferTextureInfo` is field-wise host state and presentation objects are not
+  serialized. A focused test verifies every constructor default used by the first resource update.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/window_adapt_pass.rs` and `present/filters.rs` vs Eden `src/video_core/renderer_vulkan/present/window_adapt_pass.{h,cpp}`
+
+### Intentional differences
+
+- Construction helpers return their newly created handle because Rust cannot call mutating methods
+  on a partially initialized value. The helper names, ownership, call order, and inputs match Eden.
+- Raw ash handles retain a cloned logical-device dispatch table and are destroyed explicitly in
+  reverse C++ member order.
+
+### Unintentional differences (to fix)
+
+- Restored `Draw` ownership of blend-pipeline selection, `ConfigureDraw`, push constants,
+  descriptor sets, and command recording; `BlitScreen` no longer preconfigures this state.
+- Restored the high-level `Device&` constructor interface and the five upstream-owned creation
+  helper boundaries instead of flattening them into `new`.
+- Removed the invented public sampler accessor; Eden exposes only descriptor-set layout and render
+  pass accessors.
+
+### Missing items
+
+- None in the constructor, creation helpers, draw path, accessors, or resource destruction.
+
+### Binary layout verification
+
+- N/A: the pass owns host Vulkan handles. Existing tests verify the complete background-color
+  normalization used by its clear command.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and `renderer_vulkan.rs` frame ownership integration vs Eden `src/video_core/renderer_vulkan/present/util.{h,cpp}` and `renderer_vulkan.cpp`
+
+### Intentional differences
+
+- `create_wrapped_image_allocation` is the owning Rust return form of Eden's `vk::Image`; it shares
+  the exact `CreateWrappedImage` create-info owner with the legacy raw-handle form.
+- Rust explicitly destroys and nulls the local/app-capture framebuffer and view before the owning
+  image drops. Eden obtains the same reverse resource order from wrapper destructors.
+
+### Unintentional differences (to fix)
+
+- Restored zero-initialized `Frame` dimensions in `RenderToBuffer` and
+  `RenderAppletCaptureLayer`, so the first `DrawToFrame` performs Eden's presentation-frame
+  recreation rather than bypassing it.
+- Replaced allocator-retained raw images in those frames with per-frame owning allocations, so
+  recreation and local-frame destruction release the replaced images instead of leaking them.
+- Updated all `BlitScreen` construction, framebuffer, draw, and present-manager construction calls
+  to the restored ownership and lifecycle interfaces.
+
+### Missing items
+
+- None in the frame-creation and presentation integration changed by this slice.
+
+### Binary layout verification
+
+- N/A: this integration changes Vulkan ownership and call ordering, not guest-visible or serialized
+  data.
+
+## 2026-08-26 — `src/common/src/thread.rs` vs Eden `src/common/thread.{h,cpp}` (`SetCurrentThreadToPerformanceCores` integration)
+
+### Intentional differences
+
+- The function is a no-op on the current Linux, Windows, and macOS targets exactly like Eden's
+  non-Android branch. Android ADPF/topology policy remains excluded by the project's documented
+  platform exceptions.
+
+### Unintentional differences (to fix)
+
+- Restored the named function so presentation and other worker owners can keep Eden's explicit
+  thread-policy call sites instead of omitting them.
+
+### Missing items
+
+- Android's ADPF session and core-group implementation is not built.
+
+### Binary layout verification
+
+- N/A: thread placement has no raw-copied or serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/buffer_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust's common-cache trait names the three concrete handle combinations for `CopyBuffer` and
+  supplies the mapped-uniform-buffer span through a callback. They preserve Eden's destination,
+  source, staging ownership, descriptor insertion, and command ordering without returning a borrow
+  tied simultaneously to the runtime and staging pool.
+- `DeviceReference` and stable `NonNull` service pointers represent Eden's reference members, and
+  the two anonymous quad-index subclasses are represented by topology-keyed state plus same-file
+  generation helpers. Method and constant ownership remains in `buffer_cache.rs`.
+- The unused, default-constructed `MemoryCommit` member left in Eden's anonymous
+  `QuadIndexBuffer` is omitted; allocation ownership already resides in Eden's `vk::Buffer` and
+  Ruzu's corresponding `AllocatedBuffer`, and neither implementation reads that extra member.
+- Ash exposes raw Vulkan handles rather than Eden's owning `vk::Buffer`; the allocation itself is
+  retained by `AllocatedBuffer`, and its views are explicitly destroyed before that allocation.
+
+### Unintentional differences (to fix)
+
+- None after restoring the host-visible direct-write/flush path, null transform-feedback fallback,
+  both single-buffer binding methods, `Quad LUT` debug name, native-endian LUT writes, upstream
+  allocation/replacement order, and the no-op behavior for non-quad topologies.
+
+### Missing items
+
+- None in `Buffer`, the quad-index hierarchy, `BufferCacheRuntime`, or `BufferCacheParams`.
+
+### Binary layout verification
+
+- N/A: this file owns host Vulkan resources and command parameters rather than raw-copied or
+  serialized structs. Focused tests verify LUT byte generation, index-type thresholds, null-binding
+  ranges, usage flags, and the restored single-binding API signatures.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden `src/video_core/vulkan_common/vulkan_wrapper.{h,cpp}` (`AllocatedBuffer` integration)
+
+### Intentional differences
+
+- Eden's `vk::Buffer` combines the Vulkan handle and VMA allocation in its wrapper layer. Ash has
+  no owning buffer wrapper, so the existing `AllocatedBuffer` in the allocator module owns the same
+  VMA allocation and provides the mapped-memory operations required by `vk_buffer_cache.cpp`.
+- VMA calls are serialized through the allocator mutex because Ruzu creates VMA for external
+  synchronization; Eden stores and calls its opaque allocator handle directly.
+
+### Unintentional differences (to fix)
+
+- None in the added `IsHostVisible`, mutable `Mapped`, and `Flush` equivalents: visibility follows
+  `pMappedData`, the span covers the requested buffer size, and non-coherent memory is flushed from
+  offset zero through `VK_WHOLE_SIZE` while preserving Eden's ignored VMA return value.
+
+### Missing items
+
+- None required by the buffer-cache host-visible LUT path. Other wrapper/allocator coverage remains
+  tracked by the dedicated Vulkan wrapper and memory-allocator audits.
+
+### Binary layout verification
+
+- N/A: `AllocatedBuffer` is an owning host wrapper and is never copied or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/buffer_base.rs` vs Eden `src/video_core/buffer_cache/buffer_base.h`
+
+### Intentional differences
+
+- Eden's `VAddr` and `DAddr` are both aliases of `u64`. Ruzu retains its existing `VAddr` alias for
+  the private CPU address and spells the public cached device-address field as `u64`, preserving
+  the same type identity, value, visibility, and bit pattern without introducing another local
+  address alias.
+- Eden's class-static page constants are module constants in the corresponding Rust file. The
+  owner, values, and visibility remain local to `buffer_base.rs`.
+
+### Unintentional differences (to fix)
+
+- None after restoring public `cpu_addr_cached`, initializing it in both constructors, consuming it
+  in `SynchronizeBuffer`, and using wrapping unsigned additions in `is_in_bounds`.
+
+### Missing items
+
+- None in `BufferFlagBits`, `NullBufferParams`, `BufferBase` state, constructors, or methods.
+
+### Binary layout verification
+
+- N/A: `BufferBase` is neither raw-copied nor serialized. Its state order follows Eden
+  conceptually, and focused tests verify all flag bit patterns, constructor defaults, cached
+  address state, boundary arithmetic, LRU state, stream score, preemptive flag, and write tick.
+## 2026-08-26 — buffer-cache base contract and backend adapters vs Eden buffer-cache headers/runtimes
+
+### Intentional differences
+
+- Eden relies on C++ template duck typing for the backend runtime, buffer, async allocation, and
+  memory tracker. Rust makes those contracts explicit with traits; the concrete device tracker is
+  the second `BufferCache` type parameter because `MemoryTrackerBase` itself is a Rust generic.
+- `HostBindings` retains slot identifiers instead of C++ `Buffer*` values, then resolves the
+  backend buffers from the same slot vector at the runtime boundary. This avoids retaining Rust
+  references across cache mutations while preserving binding order and values.
+- `TextureBufferBinding::default` initializes `format` to `PixelFormat::Invalid`; Eden's implicit
+  default construction leaves that member indeterminate until a valid binding is assigned. Rust
+  cannot safely represent an uninitialized enum, and no binding path consumes the sentinel format.
+- Vulkan's common trait receives the concrete cached `Buffer` and forwards its native handle to
+  the existing `VkBuffer`-shaped runtime method. This is the Rust equivalent of Eden's
+  `if constexpr` branch calling `buffer.Handle()`; OpenGL forwards the buffer object directly.
+- The private `BufferCache` storage and its private constants remain beside the method bodies in
+  `buffer_cache.rs`. A sibling-module struct would require widening every private field merely so
+  Rust could implement the upstream methods; shared types and runtime interfaces remain owned by
+  `buffer_cache_base.rs`.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's single-vertex-buffer runtime contract and the inline overlap-ID
+  storage.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS (not ABI-shared): these host-only cache structures are not serialized or copied as raw
+  bytes. Focused tests verify enum values, default sentinels, inline capacities, and the restored
+  runtime method signature.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
+
+### Intentional differences
+
+- The page table is a boxed fixed-size array instead of an inline `std::array`. Its length and
+  indexing contract match Eden, while boxing avoids constructing and moving a multi-megabyte Rust
+  cache object on the host stack.
+- GPU/device-memory owners are optional boxed Rust interfaces rather than C++ references and raw
+  pointers. Missing-owner guards are restricted to states Eden's production lifecycle does not
+  enter.
+- Resolver/reader variants, explicit temporary collections, and temporary field extraction split
+  mutable borrows that C++ can hold simultaneously. Range order, copy order, and mutations match
+  the owning Eden methods.
+- Garbage collection first records the same eligible LRU identifiers and then deletes them in the
+  same order. Eden deletes inside the LRU callback; Rust cannot mutate the slot vector while that
+  callback holds the LRU borrow, and buffer deletion does not affect selection of later LRU items.
+- Eden's overlapping `std::copy_n` calls are undefined by the C++ standard. The current GCC 13.3
+  libstdc++ specialization lowers this trivially-copyable array operation to `memmove`; Rust's
+  reverse shift reproduces its observed `[0, old0, old1, ...]` result deterministically.
+- `ImmediateBufferWithData` falls back to a guest-memory read if the direct base pointer is absent.
+  Eden would form a non-empty span from a null pointer for that invalid lifecycle state; Rust does
+  not construct an invalid slice.
+- The non-Android Rust frontend always uses Eden's optimized vertex-buffer batching path. Eden's
+  alternate unoptimized path is selected only by an Android-specific setting.
+
+### Unintentional differences (to fix)
+
+- None after restoring the reusable inline upload-copy collection, fixed page-table shape, scratch
+  resize semantics, granular null-pointer upload behavior, picked-overlap lifetime, wrapping
+  unsigned address arithmetic, synchronous download behavior, streamed-uniform rebinding, and
+  index/vertex usage tracking.
+
+### Missing items
+
+- None for the supported desktop buffer-cache path. Eden's three unread members
+  (`last_index_count`, `current_buffer`, and `immediate_buffer_capacity`) remain intentionally
+  omitted as recorded above.
+
+### Binary layout verification
+
+- N/A: `BufferCache` is host-only state and is never raw-copied or serialized. Focused tests verify
+  the fixed page-table length, inline `SmallVec` capacities, enum/runtime contracts, range
+  arithmetic, upload/download behavior, binding usage, and overlap/tick lifecycle ordering.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/memory_tracker_base.rs` vs Eden `src/video_core/buffer_cache/memory_tracker_base.h`
+
+### Intentional differences
+
+- Rust stores stable `(pool_index, slot_index)` locations instead of raw `Manager*` values. Each
+  32-manager batch is a boxed fixed array, so its elements stay at stable addresses while the
+  outer collection grows, and every lookup resolves the same manager selected by Eden.
+- The fixed top-tier array is boxed to avoid placing it on the Rust object stack; its compile-time
+  length and indexing contract match Eden's `std::array`.
+- `cached_cpu_write` records page identifiers during manager iteration and inserts them afterward
+  to split simultaneous mutable borrows of the manager pool and cached-page set. The same page IDs
+  are inserted into an unordered set.
+- Both page iterators detect an index beyond the 34-bit tracked address space, emit a rate-limited
+  diagnostic, and stop. Eden indexes its fixed array out of bounds in that invalid state, which is
+  undefined behavior; valid device-address ranges follow the same iteration path.
+
+### Unintentional differences (to fix)
+
+- None after restoring fixed-size top-tier/pool storage, explicit FIFO free-manager ordering, and
+  wrapping unsigned address composition.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the tracker is host-only state and is not raw-copied or serialized. Focused tests verify the
+  4096-entry top tier, 32-manager pool batches, FIFO slot order, normal queries, and out-of-range
+  handling.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/usage_tracker.rs` vs Eden `src/video_core/buffer_cache/usage_tracker.h`
+
+### Intentional differences
+
+- Eden's `~u64{0} >> (64 - num_bits)` has undefined C++ behavior when `num_bits == 0`.
+  GCC 13.3 on the supported x86-64 host lowers the variable shift to the hardware modulo-64
+  operation, yielding an all-ones mask. Rust spells out that conservative over-marking explicitly
+  so sub-64-byte and zero-length ranges do not panic or silently become no-ops.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's effective conservative mask for sub-granule ranges and preserving
+  unsigned wrapping before page calculation.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: `UsageTracker` is host-only state. Focused tests cover empty, single-page, cross-page,
+  reset, sub-64-byte, and zero-length range behavior.
+
+## 2026-08-26 — `src/video_core/src/buffer_cache/word_manager.rs` vs Eden `src/video_core/buffer_cache/word_manager.h`
+
+### Intentional differences
+
+- Stable Rust cannot use `Type::Max * DivCeil(SIZE_BYTES, BYTES_PER_WORD)` directly as a generic
+  array length. Ruzu stores the same fixed inline words as `[[u64; STACK_WORDS]; Type::Max]` and
+  validates that `STACK_WORDS` equals Eden's compile-time `num_words`; arrays remain contiguous in
+  the same type-major, word-minor order and no heap allocation occurs.
+- Mutable operations obtain raw pointers to separate tracking channels because Rust cannot hold
+  the overlapping mutable slice borrows that Eden expresses as independent `std::span` values.
+- The callback adapter uses `Option<bool>` for Eden's compile-time distinction between callbacks
+  returning `bool` and callbacks returning `void`.
+- Eden's unused `NotifyRasterizer` legacy helper remains omitted. Every active mutation path in
+  both trees uses `CollectChangedRanges` followed by the batched `ApplyCollectedRanges` operation.
+- Applying ranges through a default manager without a tracker fails explicitly. Eden would
+  dereference its null default tracker in this invalid lifecycle state; valid managers behave
+  identically.
+
+### Unintentional differences (to fix)
+
+- None after restoring `size_bytes` as a const generic, the fixed inline five-channel storage,
+  `Type::Max`, associated `NUM_WORDS`, upstream field order, and unsigned wrapping arithmetic.
+
+### Missing items
+
+- None on active paths; only the dead `NotifyRasterizer` helper is intentionally omitted above.
+
+### Binary layout verification
+
+- PASS for the host-only manager layout: `#[repr(C)]` fixes Eden's `heap`, tracker pointer, and
+  CPU-address field order; nested fixed arrays are contiguous without padding between channels,
+  and focused tests verify the enum representation, channel order, inline size, word count, and
+  constructor tail mask. The structure is not serialized or raw-copied across an ABI boundary.
+
+## 2026-08-26 — `src/video_core/src/capture.rs` vs Eden `src/video_core/capture.h`
+
+### Intentional differences
+
+- Ruzu's shared `align_up_log2` accepts and returns `u64`, so the `u32` framebuffer height is
+  widened for the constant evaluation and narrowed after alignment. The result and unsigned bit
+  pattern match Eden's templated `Common::AlignUpLog2` call.
+
+### Unintentional differences (to fix)
+
+- None after restoring `TILED_HEIGHT` and `TILED_SIZE` as compile-time constants owned by
+  `capture.rs`, using the common alignment helper, and making all three renderer consumers use the
+  shared tiled-size constant. This also fixes the null renderer's former unaligned
+  `1280 * 720 * 4` allocation; Eden allocates `1280 * 768 * 4` bytes.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: this file owns constants and a normal `FramebufferLayout` value; it defines no raw-copied
+  or serialized payload. Focused tests verify the aligned height, tiled size, pixel format, and
+  complete framebuffer layout.
+
+## 2026-08-26 — `src/video_core/src/cdma_pusher.rs` vs Eden `src/video_core/cdma_pusher.h` and `.cpp`
+
+### Intentional differences
+
+- Eden uses virtual inheritance for each device's `ProcessMethod`; Ruzu stores the corresponding
+  `ProcessMethodHook` trait object. NvDec and Vic install their concrete processors, and the call
+  remains owned by the CDMA pusher's `SetMethod1` path.
+- Ruzu keeps the worker-owned parser/register state behind mutexes because the pusher is shared
+  through `Arc`; its condition variable plus explicit stop flag and joined thread reproduce the
+  `std::jthread` wait, stop, and destruction ordering.
+- The core/video bridge materializes a safe-read command list into an owned vector before enqueue,
+  whereas Eden's `CpuGuestMemory` may retain a direct guest span when contiguous. This avoids a
+  borrowed, self-referential guest-memory view crossing the Rust worker-thread boundary; normal
+  submitted command buffers are immutable after submission, so command order and contents match.
+- Ruzu diagnoses and skips a THI register index beyond `NUM_REGS`. Eden indexes the fixed register
+  array out of bounds for such an invalid command, which is undefined behavior; valid methods use
+  the identical register write and dispatch sequence.
+
+### Unintentional differences (to fix)
+
+- None after replacing lossy enum conversions with transparent raw-value-preserving
+  `ChClassId`/Control-method wrappers. Unknown class IDs now remain in parser state, and unknown
+  Control methods reach the same unimplemented/default path instead of being mapped to `NoClass`
+  or silently discarded.
+
+### Missing items
+
+- None in the CDMA parser, worker lifecycle, Control dispatch, THI register actions, or virtual
+  device dispatch used by NvDec and Vic.
+
+### Binary layout verification
+
+- PASS: focused tests verify the 4-byte command header, every header bit field and submission-mode
+  value, the 4-byte class identifier including unknown raw values, all THI method offsets, and the
+  0x80-byte THI register array.
+
+## 2026-08-26 — `src/video_core/src/host1x/control.rs` vs Eden `src/video_core/host1x/control.h` and `.cpp`
+
+### Intentional differences
+
+- `Control` owns the shared syncpoint manager rather than receiving the parent `Host1x&` on each
+  method call. This avoids a parent/device reference cycle while preserving the same manager and
+  wait operation.
+- `Method` is a transparent `u32` newtype rather than a Rust enum so Eden's default switch arm can
+  safely receive arbitrary values produced by `Control::Method(raw)`.
+
+### Unintentional differences (to fix)
+
+- None after forwarding unknown raw methods to the unimplemented diagnostic path instead of
+  dropping them in `CDmaPusher::execute_command`.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `Method` remains four bytes, and focused tests verify all three constants plus preservation
+  of an unknown raw method value.
+
+## 2026-08-26 — `src/video_core/src/control/channel_state_cache.rs` vs Eden `src/video_core/control/channel_state_cache.h`, `.cpp`, and `.inc`
+
+### Intentional differences
+
+- Rust stores each payload in a `Box` inside the deque so the active payload address remains stable
+  when `VecDeque` reallocates; Eden obtains the same stability directly from `std::deque<P>`.
+- Rust retains GPU memory through `Arc<Mutex<MemoryManager>>` where Eden stores non-owning
+  references and pointers. Engine references remain stable raw addresses because their owning
+  `ChannelState` boxes outlive registered cache entries.
+- Rust's `&mut self` mutation methods replace Eden's internal `config_mutex`; cache owners provide
+  cross-thread synchronization around the complete cache object.
+- The derived `OnGPUASRegister(map_id)` virtual call is a one-argument closure so a texture cache
+  can mutably borrow its page-table storage beside `channel_caches`. Its argument and call point
+  match Eden.
+- Reusing a free payload slot drops the previous Rust value before replacement. Eden uses placement
+  construction in the occupied deque slot; Rust cannot safely begin a second object lifetime
+  without ending the first one.
+
+### Unintentional differences (to fix)
+
+- None after restoring the actual GPU-memory owner in `AddressSpaceRef`, `GetFromID`, and the bound
+  cache state. The previous port retained and returned only `MemoryManager::get_id()`, despite Eden
+  storing and returning `MemoryManager*`.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the cache is host-only state and is neither raw-copied nor serialized. Focused tests verify
+  stable payload addresses, FIFO slot reuse bookkeeping, once-per-address-space registration, and
+  pointer identity of the retained GPU-memory owner.
+
+## 2026-08-26 — removed `src/video_core/src/command_processor.rs` and `gpu_context.rs` vs Eden `src/video_core/dma_pusher.{h,cpp}` and `gpu_thread.{h,cpp}`
+
+### Intentional differences
+
+- None. These two Rust-only files had no upstream owner and no production caller.
+
+### Unintentional differences (to fix)
+
+- None after removing the second GPFIFO parser and its sole `GpuContext` owner. The live Ruzu path
+  now has one owner chain, matching Eden: the GPU thread schedules a channel command list and that
+  channel's `DmaPusher` parses and dispatches it through `Puller` and bound engine interfaces.
+
+### Missing items
+
+- None introduced by the removal. `dma_pusher.rs`, `gpu_thread.rs`, and `control/scheduler.rs`
+  remain the active counterparts of Eden's submission path.
+
+### Binary layout verification
+
+- N/A: the removed types were private host-side duplicate state. The live `CommandListHeader` and
+  `CommandHeader` layouts remain owned and tested in `dma_pusher.rs`.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (obsolete GPFIFO batch path)
+
+### Intentional differences
+
+- None in this removal slice.
+
+### Unintentional differences (to fix)
+
+- None after removing the unused fixed-size color/depth framebuffer, mapped readback buffer,
+  private render pass, resize/readback helpers, and `render_draw_calls` batch entry point. Eden's
+  rasterizer renders directly into texture-cache-owned guest render targets and owns none of those
+  resources. Ruzu's live `RasterizerInterface` path does the same.
+
+### Missing items
+
+- None introduced by this removal.
+
+### Binary layout verification
+
+- N/A: only dead host-side Vulkan resources and methods were removed.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pass.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.h` and `.cpp`
+
+### Intentional differences
+
+- Rust retains Eden's `const Device&` through `DeviceReference`, whose pointee is owned in stable
+  boxed renderer storage. Recorded commands clone only the logical ash dispatch table; capability
+  decisions remain owned by `Device`.
+- `ComputePass::new` passes Eden's explicit device and scheduler arguments through to
+  `DescriptorPool::allocator`. A shared scheduler borrow is sufficient because allocator creation
+  only obtains the scheduler's master semaphore.
+- ASTC and 3D-unswizzle entry points receive decomposed image handles/state because mutably
+  borrowing the texture-cache runtime and one of its slot-map images simultaneously is not safe in
+  Rust. Image initialization exchange, compute-unswizzle-buffer allocation, and storage-view lookup
+  remain performed by the texture-cache owner immediately before these calls.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's local conditional-rendering extension guard, `Device` ownership,
+  optional required-subgroup-size `pNext`, shader-save notification, ASTC descriptor-template
+  update path, exact ASTC pipeline stage masks and buffer ranges, and assertion behavior for invalid
+  ASTC/3D-unswizzle inputs.
+- None after leaving `descriptor_allocator` empty when `templates` is empty and restoring
+  constructor-failure cleanup plus reverse member-destruction order for Vulkan resources.
+
+### Missing items
+
+- None in the six compute passes defined by the matching upstream files.
+
+### Binary layout verification
+
+- PASS: focused tests verify the 28-byte ASTC constants, 16-byte query constants, and 76-byte
+  block-linear 3D constants including `destination` at offset 60; the subgroup-size chaining truth
+  table is also covered.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.h` and `.cpp`
+
+### Intentional differences
+
+- `ComputePipelineRuntime` groups the scheduler and three stable renderer-owned descriptor
+  services that Eden receives as constructor references. Rust stores them as `NonNull` because the
+  pipeline is built asynchronously and cached in stable boxed storage.
+- The asynchronously published Vulkan pipeline is an `Arc<Mutex<VkPipeline>>`. This lets recorded
+  scheduler closures perform Eden's late `IsBound()` check without capturing a borrow of the cache
+  entry; `is_bound` remains on `ComputePipeline` as the direct upstream counterpart.
+- `configure` receives a compute-register snapshot, a guest-memory reader, and the already-loaded
+  push-descriptor dispatch table instead of borrowing the engine, memory manager, and wrapper
+  device simultaneously. Descriptor collection and command ordering remain the same.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's compute-pipeline creation and bind GPU-logging hooks, removing the
+  non-upstream descriptor payload early return, using the backend
+  `ImageView::buffer_size` value instead of recomputing it, restoring the retained pipeline-cache
+  member and `is_bound`, matching the relaxed build-state publication, and destroying the
+  descriptor update template before its pipeline/set layouts in Eden's RAII order.
+
+### Missing items
+
+- None in `ComputePipeline`. Compute dispatch logging remains owned by the Vulkan rasterizer, as in
+  Eden, and is covered by its separate parity entry.
+
+### Binary layout verification
+
+- N/A: `ComputePipeline` is host-only ownership/synchronization state and is never copied or
+  serialized as raw bytes. Descriptor binding order remains covered by the focused test.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.h` and `.cpp`
+
+### Intentional differences
+
+- Rust calls the same process-wide GPU logger through free functions returning the singleton;
+  Eden spells the access as `GPU::Logging::GPULogger::GetInstance()`.
+
+### Unintentional differences (to fix)
+
+- None after logging successful compute-pipeline creation immediately before statistics
+  collection and logging compute-pipeline binding after the asynchronous build wait and before
+  descriptor data preparation, with Eden's exact activation and Vulkan-call setting guards.
+
+### Missing items
+
+- None in the GPU-logging hooks owned by `ComputePipeline`.
+
+### Binary layout verification
+
+- N/A: the change only adds calls around existing Vulkan pipeline lifecycle points and does not
+  alter any raw-copied or serialized structure.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/compute_shaders.rs` and compute `.comp` files vs Eden `src/video_core/host_shaders/*.comp`
+
+### Intentional differences
+
+- Eden's CMake build generates one C++ source-string header for each non-Vulkan-only shader and a
+  SPIR-V header for each non-OpenGL-only shader. Rust exposes runtime GLSL with `include_str!` and
+  compiles Vulkan SPIR-V in `build.rs`; both paths now read the same upstream-owned `.comp` files.
+- `block_linear_unswizzle_3d_bcn.comp` has a final newline in the Rust tree while Eden's file ends
+  immediately after the closing brace. Its GLSL token stream and behavior are identical.
+
+### Unintentional differences (to fix)
+
+- None after replacing duplicated embedded strings with the source files, restoring the missing
+  query-prefix assignment, restoring both conditional-render comparison modes, and replacing the
+  Vulkan-only 3D BCN rewrite with Eden's complete Vulkan/OpenGL source.
+
+### Missing items
+
+- None among the sixteen compute shaders audited for this module. The six OpenGL runtime sources
+  that previously existed only as duplicated Rust strings now have their matching `.comp` files.
+
+### Binary layout verification
+
+- N/A: these are text shader sources. A normalized byte comparison verifies every source against
+  Eden, and focused tests cover the three previously drifted semantic expressions.
+
+## 2026-08-26 — `src/video_core/src/engines/const_buffer_info.rs` vs Eden `src/video_core/engines/const_buffer_info.h`
+
+### Intentional differences
+
+- Rust applies `repr(C)` explicitly and derives value traits; Eden receives the equivalent natural
+  C++ aggregate layout and value-initializes the containing Maxwell state.
+- `Maxwell3D::process_cb_bind` rejects a shader-slot value outside the 18-entry array. Eden uses
+  unchecked `std::array::operator[]`; preserving that undefined behavior would be unsound in Rust.
+
+### Unintentional differences (to fix)
+
+- None after removing the differently ordered `ConstBufferBinding` duplicate from `maxwell_3d.rs`
+  and using the upstream-owned `ConstBufferInfo` throughout Maxwell state, draw snapshots, shader
+  environments, and both renderer pipelines.
+- None after making a disabled bind retain the current address and size before disabling the slot,
+  matching Eden's `ProcessCBBind` update order instead of replacing the whole entry with defaults.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `ConstBufferInfo` is 16 bytes with alignment 8; `address`, `size`, and `enabled` are at
+  offsets 0, 8, and 12 respectively. Focused tests also verify value-initialized defaults.
+
+## 2026-08-26 — `src/video_core/src/control/scheduler.rs` vs Eden `src/video_core/control/scheduler.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores the channel map inside the mutex that represents Eden's `scheduling_guard`, rather
+  than keeping the map and mutex as separate fields.
+- A channel is retained as `Arc<Mutex<ChannelState>>` instead of `shared_ptr<ChannelState>`. The
+  per-channel lock provides Rust's required synchronization while the map lock is still released
+  before DMA push and dispatch, preserving Eden's global-lock scope.
+- Missing channels and uninitialized DMA pushers panic through `expect`; these correspond to Eden's
+  assertion and required initialized `payload` invariant.
+
+### Unintentional differences (to fix)
+
+- None after replacing `HashMap::insert` with entry insertion. Declaring a duplicate channel now
+  preserves the first entry like Eden's `unordered_dense::map::emplace` instead of replacing it.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: scheduler state is host-only synchronization and ownership state.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/decode_bc.rs` vs Eden `src/video_core/texture_cache/decode_bc.h` and `.cpp`
+
+### Intentional differences
+
+- Rust reaches Eden's vendored C++ `bc_decoder` through thin `extern "C"` functions in
+  `src/video_core/src/textures/bcn_shim.cpp`; every wrapper delegates directly to the matching
+  `bcn::DecodeBc1` through `bcn::DecodeBc7` function without owning decode behavior.
+- The shared Rust traversal uses a closure in place of Eden's function-valued template parameter,
+  and splits signed and unsigned decoder signatures at the FFI boundary. The format dispatch,
+  constants, loop nesting, offsets, and decoder arguments are unchanged.
+- Rust returns for zero extents or undersized input/output spans instead of performing pointer
+  arithmetic outside a span or dividing by a zero block width. Valid `BufferImageCopy` inputs take
+  the same path as Eden.
+
+### Unintentional differences (to fix)
+
+- None after removing the custom BC1 through BC5 implementations and routing every BC format to
+  the same `bc_decoder` revision vendored by Eden. Unsigned offset arithmetic now also preserves
+  Eden's `u32` wraparound behavior.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the API transforms compressed byte spans into decoded byte spans and does not serialize a
+  host struct. The C ABI uses pointer, `size_t`, and `bool` arguments matching `bc_decoder.h`.
+
+## 2026-08-26 — `src/common/src/alignment.rs` and `div_ceil.rs` vs Eden `src/common/alignment.h` and `div_ceil.h`
+
+### Intentional differences
+
+- Rust exposes fixed `u64`, `u32`, and `usize` functions instead of C++ constrained function
+  templates. The selected integer width is explicit at each call site and preserves the same
+  arithmetic width.
+- Signed alignment has a separate Rust entry point; it performs Eden's conversion through the
+  corresponding unsigned width before converting the result back.
+- Eden's unused `AlignmentAllocator` C++ container adapter has no standalone Rust type. Rust
+  allocation sites that need stronger alignment request it through `std::alloc::Layout`; Eden has
+  no source-tree consumer of this adapter to map here.
+
+### Unintentional differences (to fix)
+
+- None after spelling every unsigned intermediate that can overflow with wrapping arithmetic.
+  Debug builds now retain C++ unsigned behavior instead of panicking before the caller observes the
+  wrapped result.
+- None after removing the invented `is_4kb_aligned` convenience function. Its only consumer now
+  calls the upstream-owned `is_aligned` operation with the shared guest page-size constant.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: these files contain integer functions and no raw-memory data structures.
+
+## 2026-08-26 — `src/video_core/src/textures/decoders.rs` vs Eden `src/video_core/textures/decoders.h` and `.cpp`
+
+### Intentional differences
+
+- Rust slice checks skip a copy whose source or destination range is outside the supplied span.
+  Eden indexes the span and calls `memcpy`, which is undefined for the same invalid range; valid
+  texture spans use the same offsets and copy sizes.
+- Eden's `ASSERT_MSG` for an unsupported bytes-per-pixel value is represented by `panic!`.
+- The eight C++ `BPP_CASE` macro expansions are written as explicit Rust match arms.
+
+### Unintentional differences (to fix)
+
+- None after removing the dead `SwizzleTable`/`make_swizzle_table` API that has no counterpart in
+  Eden, restoring const-generic `TO_LINEAR`, `BYTES_PER_PIXEL`, mask, and increment parameters, and
+  using the upstream-owned `common` alignment/division helpers.
+- None after preserving the wrapping behavior of every upstream `u32` offset, size, and coordinate
+  calculation in debug builds.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: the module copies byte spans and owns no serialized structure. Focused tests exercise every
+  BPP dispatch arm, GOB offsets, overflow behavior, and Eden's non-power-of-two subrectangle
+  overlap semantics.
+
+## 2026-08-26 — `src/audio_core/src/renderer/memory/pool_mapper.rs` vs Eden `src/audio_core/renderer/memory/pool_mapper.cpp`
+
+### Intentional differences
+
+- Ruzu obtains the 4 KiB guest-page value from `common::PAGE_SIZE_U64`; Eden names the same value
+  `Core::Memory::YUZU_PAGESIZE`. This avoids introducing a dependency on a C++ memory-header
+  boundary while retaining the shared constant rather than a literal.
+
+### Unintentional differences (to fix)
+
+- None after `PoolMapper::update` began calling the upstream-owned generic `is_aligned` helper for
+  both the address and size instead of an invented 4 KiB-specific wrapper.
+
+### Missing items
+
+- None for this alignment validation path.
+
+### Binary layout verification
+
+- N/A: this change only selects the validation helper and does not alter `MemoryPoolInfo` payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/descriptor_buffer.rs` vs Eden `src/video_core/renderer_vulkan/vk_descriptor_buffer.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores the same non-owning device relationship as a `DeviceReference`, because a C++
+  reference cannot be stored directly without making every renderer type lifetime-parameterized.
+  The renderer parent retains ownership and destroys the ring first.
+- Vulkan allocation failures use `Result<VulkanError>` instead of constructor exceptions.
+- The raw mapped pointers make the ring non-`Send` by inference. The explicit `Send` implementation
+  records Eden's GPU-thread ownership contract; mutation still requires exclusive access.
+
+### Unintentional differences (to fix)
+
+- None after failure of the host-visible or host-coherent checks clears only `chunks`, exactly as
+  Eden does. Address/host vectors and capacity metadata are no longer reset by an invented
+  `disable` helper.
+- None after replacing the file-local alignment functions with the upstream-owned `common`
+  operations and preserving unsigned wrapping in address, cursor, index, and generation updates.
+- None after removing the public `device()` accessor, which has no upstream counterpart.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: `Allocation` is returned within Rust and is not copied to a Vulkan or guest-memory payload;
+  its pointer, offset, chunk, and generation values correspond field-for-field to Eden.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` and descriptor-allocation call sites vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.h` and `.cpp`
+
+### Intentional differences
+
+- Eden's `vk::DescriptorPool` wrapper destroys each handle through RAII. Ruzu currently stores raw
+  ash handles, so `DescriptorPool` retains a non-owning `DeviceReference` and destroys them in
+  `Drop`.
+- Rust uses `Result<_, vk::Result>` for Vulkan failures and mutexes for state reached by deferred
+  `Send + 'static` scheduler commands. `DescriptorAllocatorReference` is the non-owning counterpart
+  of Eden's scheduler lambdas capturing `this`.
+- Allocator methods accept a shared scheduler borrow because they only call the logically const
+  `get_master_semaphore`; Eden spells the parameter as a non-const reference.
+
+### Unintentional differences (to fix)
+
+- None after restoring slice-based `make_bank_info`, explicit device/scheduler arguments on every
+  allocator overload, and the absence of a master-semaphore member on `DescriptorPool`.
+- None after making `DescriptorAllocator` uniquely owned and move-only again, storing banks in
+  address-stable boxes, and replacing owning allocator clones with non-owning deferred-command
+  references.
+- None after `ComputePass` stopped creating an allocator for an empty descriptor-template list and
+  began cleaning partially created Vulkan resources in Eden's reverse member order.
+
+### Missing items
+
+- None in descriptor counting, pool construction/retry, bank selection/publication, resource
+  commit, or the audited allocator call sites.
+
+### Binary layout verification
+
+- N/A: descriptor metadata is consumed field-wise and Vulkan structures are built through ash.
+  Focused tests cover all-field superset matching, multi-shader accumulation, unsigned wrapping,
+  and bank address stability across outer-vector growth.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/descriptor_table.rs` and Maxwell3D TIC/TSC accessors vs Eden `src/video_core/texture_cache/descriptor_table.h` and `src/video_core/engines/maxwell_3d.{h,cpp}`
+
+### Intentional differences
+
+- Rust accepts a `GpuMemoryReader` trait object where Eden's `read` accepts a concrete
+  `Tegra::MemoryManager` reference. Channel-specific texture-cache state can therefore pass either
+  its direct memory manager or the backend-independent SMMU reader without changing descriptor
+  table behavior.
+- `read_with` is the Rust overload used by call sites that own a locked channel memory manager;
+  both read paths execute the same owner-local descriptor-cache logic.
+- Rust initializes descriptor storage through `T::default()` before exposing its bytes to the
+  memory reader. Eden default-constructs the `std::pair<T, bool>` storage before
+  `ReadBlockUnsafe`; the supported POD descriptor types accept every overwritten bit pattern.
+
+### Unintentional differences (to fix)
+
+- None after deleting the duplicate root-level descriptor table, keeping the implementation in
+  Eden's `texture_cache` owner, restoring Eden's public field order, removing invented cached/limit
+  accessors, and using the common `DivCeil` counterpart.
+- None after removing Maxwell3D's invented cached TIC/TSC tables and synchronization method.
+  `get_tic_entry` and `get_tsc_entry` now directly read a 32-byte `TicEntry`/`TscEntry` from the
+  register-selected pool, matching Eden's method ownership, return type, address calculation, and
+  lack of change-detection state.
+
+### Missing items
+
+- None in `DescriptorTable<T>::Synchronize`, `Invalidate`, `Read`, or `Refresh`, or in the audited
+  Maxwell3D TIC/TSC accessors.
+
+### Binary layout verification
+
+- PASS: `TicEntry` and `TscEntry` are `#[repr(C)]` wrappers over `[u64; 4]` with compile-time
+  0x20-byte size assertions, matching Eden's two descriptor payloads. `DescriptorTable<T>` itself
+  is host-only cache state and is not serialized or copied as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/dirty_flags.rs` vs Eden `src/video_core/dirty_flags.h` and `.cpp`
+
+### Intentional differences
+
+- Rust spells Eden's unnamed `u8` enum as module constants and the two `std::pair<u8, u8>` results
+  as `(u8, u8)` tuples.
+- Rust names the register-structure word counts explicitly because it cannot apply C++ `sizeof`
+  to the separately modeled Maxwell register fields. Each count was checked against Eden's field
+  type and static size assertions.
+
+### Unintentional differences (to fix)
+
+- None after `SetupDirtyVertexBuffers` began passing the 64-word size of the complete
+  `vertex_stream_limits` array on every iteration. This deliberately preserves Eden's overlapping
+  fills and their 62-word table-1 spill past the array instead of substituting the more plausible
+  two-word element size.
+- None after marking only `zeta_size.width` and `zeta_size.height`; the depth/dimension-control word
+  is no longer dirtied by this common setup.
+- None after porting the previously missing constexpr `GetDirtyFlagsForMethod` with Eden's literal
+  constants, branch order, boundary rules, and overlapping ranges.
+- None after restoring fixed-size `Regs::NUM_REGS` tables and removing `fill_block`'s silent
+  out-of-range truncation, which had no counterpart in Eden's fixed `std::array` implementation.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `DirtyTable` is a fixed `[u8; ENGINE_REG_COUNT]` of exactly 0xE00 bytes and `DirtyTables`
+  contains exactly two such arrays, matching Eden's `DirtyState::Table` and `Tables`. This is
+  host-only lookup state and is not serialized.
+
+## 2026-08-26 — `src/video_core/src/dma_pusher.rs` vs Eden `src/video_core/dma_pusher.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores `System`, `MemoryManager`, and `ChannelState` through the existing non-owning or
+  synchronized handle types rather than C++ references. The embedded `Puller` retains a duplicate
+  non-owning `ChannelState` pointer because borrowing the embedded object and its complete parent
+  mutably at the same time is not representable as safe Rust; `install_self_reference` verifies
+  that both pointers identify the same upstream-owned channel state.
+- The synchronization predicate and condition variable live in an `Arc<DmaSyncState>` so Eden's
+  asynchronous fence callback can outlive the stack frame without capturing a raw `this` pointer.
+
+### Unintentional differences (to fix)
+
+- None after restoring the 24-bit `CommandHeader::method_count_` view and the explicit
+  `ChannelState` relationship on `DmaPusher`.
+- None after narrowing `index * sizeof(u32)` to `u32` before assigning `dma_word_offset`, matching
+  Eden's explicit cast, and using wrapping signed negation for the inline command's zero-address
+  offset so the two's-complement bit pattern is preserved even for `i64::MIN` in debug builds.
+
+### Missing items
+
+- None in the audited command-header, queue, dispatch, step, command-processing, state-update, or
+  subchannel-binding paths.
+
+### Binary layout verification
+
+- PASS: `CommandListHeader` is one `u64`; `CommandHeader` is one `u32`, including Eden's
+  overlapping 13-bit method, 24-bit legacy method-count, 3-bit subchannel, 13-bit argument-count,
+  and 3-bit submission-mode views. Focused tests decode the raw bit patterns and verify the 512
+  inline entries of each command-list small vector.
+
+## 2026-08-26 — Draw-manager and topology consumers vs Eden `src/video_core/engines/draw_manager.cpp`, `maxwell_3d.h/.cpp`, and renderer counterparts
+
+### Intentional differences
+
+- Rust passes Maxwell3D access through the `Maxwell3DAccess` trait where each Eden method receives
+  `Maxwell3D&`. This preserves the per-call relationship without creating overlapping mutable
+  borrows between the engine and its embedded draw manager.
+- The bulk inline-index overload accepts a `&[u32]`; the slice length is Eden's `amount`, and
+  `bytemuck::cast_slice` preserves the same native in-memory word representation used by Eden's
+  `reinterpret_cast` and `memcpy` paths.
+- Test builds retain compatibility draw snapshots before invoking the rasterizer. This state is
+  absent from production builds and exists only for renderer-independent regression assertions.
+- C++ permits the explicit override-enum to primitive-enum cast to retain `Legacy*` discriminants
+  that `PrimitiveTopology` does not declare. Rust cannot hold an undeclared enum discriminant
+  safely, so its `PrimitiveTopology` declares representation-only `Legacy*` variants with the same
+  `u32` values. OpenGL/Vulkan conversion, pipeline runtime info, query counting, and depth-bias
+  consumers retain Eden's respective invalid/default handling for those values.
+
+### Unintentional differences (to fix)
+
+- None after porting the bulk `SetInlineIndexBuffer` overload and
+  `Maxwell3D::ProcessInlineIndexMultiData`, including the one-time last-word Shadow RAM/dirty update
+  and the per-word fallback when Shadow RAM is in Replay mode.
+- None after restoring all declared `PrimitiveTopologyOverride` values in their `maxwell_3d.rs`
+  owner and making `UpdateTopology` execute Eden's default raw-topology conversion. Overrides such
+  as triangles, adjacency topologies, patches, and legacy values are no longer silently converted
+  to `None` or `Triangles`.
+- None after using wrapping `u32` arithmetic for instance accumulation, deferred-draw count, and
+  base-instance subtraction, matching C++ unsigned arithmetic in debug and release builds.
+
+### Missing items
+
+- None in the audited DrawManager state, method dispatch, direct/indirect draw, inline-index,
+  topology-override, clear, or draw-texture paths.
+
+### Binary layout verification
+
+- N/A: draw-manager state is host-only and is consumed field-wise. The topology-control,
+  topology-override, and representation-preserving primitive-topology enums are `#[repr(u32)]`;
+  focused tests cover every modern and legacy override bit pattern plus each packed bulk
+  inline-index representation.
+
+## 2026-08-26 — `src/video_core/src/engines/engine_upload.rs` vs Eden `src/video_core/engines/engine_upload.{h,cpp}`
+
+### Intentional differences
+- Eden stores a `Registers&` inside `Upload::State`. Rust passes the owning engine's register view
+  to each entry point to avoid a movable self-referential engine; every owner constructs that view
+  immediately before the same Eden call boundary.
+- `Common::ScratchBuffer<u8>` is represented by reusable `Vec<u8>` storage. The block-linear
+  `GpuGuestMemoryScoped<SafeReadCachedWrite>` lifecycle is expressed as an ordered
+  `read_block`/swizzle/`write_block_cached` sequence while holding the Rust memory-manager owner.
+- Runtime `MemoryManager&` and `RasterizerInterface*` ownership is represented by
+  `Arc<Mutex<MemoryManager>>` and `RasterizerHandle`; the optional memory-manager state exists only
+  for reduced `cfg(test)` Maxwell fixtures.
+- Invalid short upload input panics at Rust slice construction rather than invoking Eden's C++
+  out-of-bounds behavior. Valid command streams use the same line slices.
+
+### Unintentional differences (to fix)
+- Resolved: `ProcessExec`, word accumulation, and linear destination calculations now use wrapping
+  unsigned arithmetic matching Eden's `u32`/`GPUVAddr` operations in debug and release builds.
+- Resolved: single-word accumulation now uses native byte order, matching Eden's `memcpy` from the
+  host `u32`, instead of forcing little-endian bytes.
+- Resolved: the linear path no longer depends on the unrelated memory-manager owner, silently skips
+  short lines, or falls back to a direct memory write when the required rasterizer is absent.
+
+### Missing items
+- None in the reviewed register helpers, transfer state machine, linear upload, or block-linear
+  swizzle path.
+
+### Binary layout verification
+- PASS: `Registers` and `DestRegisters` are `repr(C)` and focused tests verify their complete Eden
+  sizes, alignments, and field offsets (`0x30` and `0x28` bytes respectively).
+
+## 2026-08-26 — `src/video_core/src/engines/mod.rs` vs Eden `src/video_core/engines/`
+
+### Intentional differences
+- Rust requires `mod.rs` to declare the source modules; Eden expresses the same source membership
+  through its C++ build files and includes.
+- The legacy standalone `inline_to_memory` fixture remains visible only under `cfg(test)` until its
+  dedicated parity report is reviewed; production uses Eden's `KeplerMemory` plus `Upload::State`.
+
+### Unintentional differences (to fix)
+- Resolved: removed the duplicate `ClassId` enum. The canonical class identifiers remain in
+  `puller.rs`, matching Eden's `EngineID` ownership in `puller.h`.
+- Resolved: removed the invented `SubChannel` enum. In particular, Rust no longer labels subchannel
+  2 as inline-to-memory when Eden explicitly reserves it for the unexposed M2MF engine; the NVK
+  default bindings remain owned by `control/channel_state.rs` at 0, 1, 3, and 4.
+- Resolved: removed the production `Engine` dispatcher trait, which had no runtime consumer and no
+  Eden counterpart. Register-write and deferred-write helpers needed by native Rust tests now live
+  in their concrete engine owners under `cfg(test)`.
+- Resolved: `engines/mod.rs` no longer owns the shared `ENGINE_REG_COUNT` or `PendingWrite`
+  compatibility payload. Maxwell3D and MaxwellDMA now own their distinct upstream register counts
+  and their local deferred-write integration payloads.
+
+### Missing items
+- None among Eden's engine source-module declarations.
+
+### Binary layout verification
+- N/A: `mod.rs` now owns no class-id or subchannel representation. The canonical transparent
+  `EngineID` representation and engine register layouts are verified in their owning modules.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/filters.rs` and `present/util.rs` vs Eden `src/video_core/renderer_vulkan/present/filters.{h,cpp}` and `present/util.{h,cpp}`
+
+### Intentional differences
+
+- ash 0.37 predates `VK_QCOM_filter_cubic_weights`; the Rust counterpart declares the extension's
+  four-value enum and `VkSamplerCubicWeightsCreateInfoQCOM` payload locally with the exact Vulkan
+  ABI instead of obtaining generated declarations from ash.
+- `WindowAdaptPass` is returned directly rather than through `std::unique_ptr`; ownership and
+  construction timing are unchanged.
+
+### Unintentional differences (to fix)
+
+- Restored Eden's QCOM-weighted hardware cubic path: any cubic weight now uses `VK_FILTER_CUBIC_EXT`
+  when both cubic extensions are supported, and non-Catmull-Rom modes chain the selected weight into
+  sampler creation. The shader fallback remains selected under Eden's exact condition.
+- Restored `CreateCubicSampler`'s high-level `Device` input and its linear-filter fallback when
+  `VK_EXT_filter_cubic` is unavailable.
+
+### Missing items
+
+- None in the filter factories or cubic-sampler selection and construction paths.
+
+### Binary layout verification
+
+- PASS: focused tests verify all four Vulkan enum values, structure type `1000519000`, and the
+  native-pointer-width C layout of the locally declared sampler pNext payload.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/format_lookup_table.rs` and `texture_cache/util.rs` vs Eden `src/video_core/texture_cache/format_lookup_table.{h,cpp}` and `texture_cache/util.cpp`
+
+### Intentional differences
+
+- TIC accessors currently expose their packed fields as `u32`, so the raw lookup entry point keeps
+  those bit patterns until the canonical enum-based public function is reached. Both paths feed the
+  same upstream hash and fallback table.
+- Unknown tuples use an error log followed by `A8B8G8R8_UNORM`, matching Eden's
+  `UNIMPLEMENTED_MSG` plus explicit fallback without relying on C++ logging macros.
+
+### Unintentional differences (to fix)
+
+- Removed the duplicate `TextureFormat` and incomplete `ComponentType` declarations from the lookup
+  table. The function now consumes the canonical types owned by `textures/texture.rs`, matching
+  Eden's ownership in `textures/texture.h`.
+- Restored `SNORM_FORCE_FP16` and `UNORM_FORCE_FP16` flow through `PixelFormatFromTIC`: unsupported
+  tuples now reach Eden's logged `A8B8G8R8_UNORM` fallback instead of returning `Invalid` early.
+
+### Missing items
+
+- None: an automated source-table comparison found the same 111 hash-to-pixel-format entries on
+  both sides.
+
+### Binary layout verification
+
+- PASS: the canonical component and texture enums are `repr(u32)` with upstream discriminants, and
+  a focused non-uniform hash test verifies every component shift plus the sRGB bit.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/formatter.rs` vs Eden `src/video_core/texture_cache/formatter.{h,cpp}`
+
+### Intentional differences
+
+- Rust implements `Display` instead of `fmt::formatter` specializations and gives the three C++
+  `Name` overloads distinct snake-case names. Their ownership and formatted output are unchanged.
+
+### Unintentional differences (to fix)
+
+- Resolved: every one of Eden's 112 `PIXEL_FORMAT_LIST` entries now returns its exact enumerator
+  spelling instead of valid ASTC, BC sRGB, ETC2, EAC, and packed formats falling through to
+  `Invalid`.
+- Resolved: image-view addresses now use lower-case hexadecimal digits, matching Eden's `{:#x}`
+  formatting used by the already-correct image formatter.
+
+### Missing items
+
+- None in the reviewed pixel-format, image-type, extent, image, image-view, or render-target
+  formatters.
+
+### Binary layout verification
+
+- N/A: this file only creates text and does not define or serialize binary payloads.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/fragment_shaders.rs` and `host_shaders/*.frag` vs Eden `src/video_core/host_shaders/CMakeLists.txt` and `host_shaders/*.frag`
+
+### Intentional differences
+
+- Eden generates C++ string headers from each GLSL file with CMake. Rust uses `include_str!` on the
+  same per-shader files, while `build.rs` separately compiles the Vulkan-compatible sources to
+  SPIR-V. This preserves one authoritative source per shader without generated Rust source headers.
+- Rust exposes source constants for Vulkan-only shaders as well; Eden skips only their generated
+  string headers because its Vulkan backend consumes the generated SPIR-V headers directly.
+
+### Unintentional differences (to fix)
+
+- Resolved: replaced 37 manually copied string literals with direct file embedding. The stale
+  bicubic, Gaussian-comment, and depth/stencil-blit copies can no longer disagree with the shader
+  files compiled by the build.
+- Resolved: synchronized `present_bicubic.frag` with Eden's Catmull-Rom implementation and restored
+  the unsigned stencil sampler plus explicit integer conversion in
+  `vulkan_blit_depth_stencil.frag`.
+- Resolved: restored the four OpenGL shader files that existed only as Rust string literals and the
+  seven fragment-source constants omitted from the old module. All 44 Eden fragment shader files
+  now have one matching file and one embedded Rust constant.
+
+### Missing items
+
+- None among Eden's 44 fragment-shader source files.
+
+### Binary layout verification
+
+- N/A: GLSL is embedded as text; the existing build step validates and compiles every applicable
+  source to SPIR-V.
+
+## 2026-08-26 — `src/video_core/src/framebuffer_config.rs` and framebuffer bridge consumers vs Eden `src/video_core/framebuffer_config.{h,cpp}`
+
+### Intentional differences
+
+- The `core`/`video_core` crate dependency direction requires a small `gpu_core::FramebufferConfig`
+  bridge. It now forwards Eden's canonical `PixelFormat`, `BufferTransformFlags`, and
+  `Rectangle<i32>` unchanged; only `BlendMode` remains mirrored across the crate boundary.
+- Rust logs unsupported residual transform bits with `warn!`, corresponding to Eden's
+  `UNIMPLEMENTED_MSG`, then continues with the same normalized coordinates.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the local pixel-format, transform-flag, and rectangle replacements. The
+  framebuffer descriptor and all OpenGL, Vulkan, null-renderer, surface, and texture-cache
+  consumers now use their canonical upstream-owned types.
+- Resolved: a crop rectangle whose width or height is zero now falls back to the framebuffer
+  dimensions even when it is not located at the origin, matching `Common::Rectangle::IsEmpty`.
+- Resolved: `PixelFormatFromGPUPixelFormat` now accepts the canonical Android `PixelFormat` instead
+  of an untyped `u32`; downstream conversions no longer unwrap and reconstruct its raw value.
+
+### Missing items
+
+- None in `FramebufferConfig` or `NormalizeCrop`.
+
+### Binary layout verification
+
+- N/A: `FramebufferConfig` is passed as a typed in-process descriptor rather than serialized by a
+  raw memory copy. Its canonical pixel-format enum remains `repr(u32)` and rectangle field order is
+  owned by `common::math_util::Rectangle`.
+
+## 2026-08-26 — `src/video_core/src/fsr.rs` vs Eden `src/video_core/fsr.{h,cpp}`
+
+### Intentional differences
+
+- Rust fixed-size array references replace C array parameters, while preserving their four-word
+  shape and mutation order.
+- `f32::to_bits` is the direct Rust equivalent of Eden's `std::bit_cast<u32>`.
+
+### Unintentional differences (to fix)
+
+- Resolved: RCAS sharpening now uses `(-sharpness).exp2()`, the direct equivalent of Eden's
+  `std::exp2f(-sharpness)`, instead of routing the same mathematical expression through `powf`.
+
+### Missing items
+
+- None: both 512-entry half-conversion tables and all EASU/RCAS constant-generation operations
+  match Eden.
+
+### Binary layout verification
+
+- PASS: focused tests compare all sixteen EASU output words and representative RCAS/packed-half
+  words bit-for-bit against values produced by the Eden C++ expressions.
+
+## 2026-08-26 — Vulkan `present/{fxaa,fsr,smaa}.rs` vs Eden `renderer_vulkan/present/{fxaa,fsr,smaa}.{h,cpp}`
+
+### Intentional differences
+
+- Rust passes the render-pass initial layout explicitly because Rust has no default function
+  arguments; the selected value now equals Eden's `CreateWrappedRenderPass` default.
+- Raw Vulkan handles are destroyed explicitly in `Drop`, corresponding to Eden's RAII wrappers.
+
+### Unintentional differences (to fix)
+
+- Resolved: FXAA, FSR, and all three SMAA render passes now start in `GENERAL` with attachment
+  `LOAD`, matching Eden. They no longer opt into `UNDEFINED`/`DONT_CARE`, which Eden reserves here
+  for the explicitly different window-adaptation pass.
+
+### Missing items
+
+- None in the reviewed FXAA pass; the same local render-pass mismatch identified by the report was
+  also corrected in its FSR and SMAA peers.
+
+### Binary layout verification
+
+- N/A: the correction changes Vulkan attachment state and does not define or serialize a binary
+  payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_blit_screen.rs` vs Eden `src/video_core/renderer_opengl/gl_blit_screen.{h,cpp}`
+
+### Intentional differences
+
+- Non-owning C++ references are represented by renderer-owned raw pointers/handles because the
+  referenced Rust objects must remain heap-stable while `RendererOpenGL` owns `BlitScreen`.
+- `current_window_adapt` is optional until the first pass is created; Eden's default enum value is
+  observationally irrelevant while its `window_adapt` pointer is null.
+- `GL_ALPHA_TEST` is declared locally because the generated core-profile Rust GL bindings omit this
+  compatibility enumerator that Eden still disables.
+
+### Unintentional differences (to fix)
+
+- Resolved: when an existing window-adaptation pass no longer matches the configured scaling
+  filter, Rust now performs Eden's second callback read before selecting the replacement pass. It
+  no longer reuses the value read for the early-return comparison.
+
+### Missing items
+
+- None in `FramebufferTextureInfo`, `BlitScreen::DrawScreen`, or
+  `BlitScreen::CreateWindowAdapt`.
+
+### Binary layout verification
+
+- N/A: the framebuffer texture metadata is an in-process typed descriptor and is not serialized by
+  raw memory copy in this path.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_buffer_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_buffer_cache.{h,cpp}`
+
+### Intentional differences
+
+- The common C++ buffer-cache template is expressed through Rust traits, while all OpenGL runtime
+  methods and constants remain owned by this matching backend file.
+- The staging pool is a shared synchronized owner and the device is a non-owning stable pointer,
+  adapting Eden's references to the renderer's Rust ownership graph. A context-free constructor is
+  compiled only for unit tests.
+- Optional NV extension entry points are loaded explicitly because the generated GL bindings do not
+  expose them; their signatures and call sites match Eden.
+- Explicit `Drop` ordering mirrors reverse C++ member destruction for GL resource wrappers.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Buffer::view` now creates its texture before translating the surface format, matching
+  Eden's allocation and failure ordering.
+- Resolved: GPU-address, binding-index, program-parameter-index, and initial memory-budget additions
+  now preserve C++ unsigned wrapping instead of panicking in debug Rust on overflow.
+- Resolved: unified index-buffer size alignment is truncated back to Eden's `u32` result before it
+  is converted to `GLsizeiptr`.
+
+### Missing items
+
+- None in `Buffer`, `BufferCacheRuntime`, `BindlessSSBO`, or `BufferCacheParams`; every public and
+  private upstream runtime operation has a corresponding Rust owner in this file.
+
+### Binary layout verification
+
+- PASS: `BindlessSSBO` remains a 16-byte `repr(C)` payload (`u64`, `i32`, `i32`), matching Eden's
+  four-`GLuint` static assertion. Focused tests also cover the unsigned-width alignment edge.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_compute_pipeline.rs` vs Eden `src/video_core/renderer_opengl/gl_compute_pipeline.{h,cpp}`
+
+### Intentional differences
+
+- Stable non-owning pointers and synchronized shared owners adapt Eden's references and raw
+  `MemoryManager*` to the renderer's Rust ownership graph; `SetEngine` still replaces both live
+  channel objects before `Configure` uses them.
+- `Configure` is split into file-local helpers so Rust can release the GPU-memory guard before
+  `FillImageViews` borrows the texture cache. The helpers retain Eden's operation order and remain
+  owned by the matching compute-pipeline file.
+- `SmallVec` supplies the inline storage of Eden's `static_vector`; checked insertion prevents its
+  heap-spill capability from changing the upstream fixed-capacity invariant.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Shader::NumDescriptors` and the constructor's combined texture/image counts now use
+  wrapping `u32` addition, preserving C++ unsigned arithmetic instead of panicking in debug Rust.
+- Resolved: sampler, texture, and image binding counters now use signed 32-bit `GLsizei` semantics
+  through indexing, scaling-mask shifts, and the final OpenGL calls.
+- Resolved: compute descriptor views and samplers can no longer grow beyond Eden's 80- and
+  64-element `static_vector` capacities.
+
+### Missing items
+
+- None in `ComputePipelineKey`, `ComputePipeline`, `Configure`, or `WaitForBuild`.
+
+### Binary layout verification
+
+- PASS: `ComputePipelineKey` is `repr(C)`, 24 bytes, with offsets 0/8/12 and no padding; hashing
+  and cache serialization cover the same complete byte representation as Eden.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_device.rs` vs Eden `src/video_core/renderer_opengl/gl_device.{h,cpp}`
+
+### Intentional differences
+
+- Construction returns `Result` instead of throwing and receives the frontend's already-computed
+  strict-context flag because the Qt `EmuWindow` owner is outside the `video_core` crate.
+- The Rust GL bindings do not expose GLAD's extension booleans, so the matching flags are derived
+  from Eden's copied extension-name list. The same extension names and conjunctions are used.
+- A null `glGetString` result becomes an empty owned string rather than constructing a C++ string
+  from a null pointer; valid OpenGL contexts follow the identical path.
+
+### Unintentional differences (to fix)
+
+- Resolved: NVIDIA's GLSL-workaround version parser now preserves `std::atoi` prefix semantics,
+  including leading whitespace/signs and suffixes after the numeric major version. It no longer
+  silently returns zero merely because the major-version substring has a non-numeric suffix.
+
+### Missing items
+
+- None: all device limits, vendor predicates, extension flags, driver quirks, shader probes,
+  public capability queries, and dedicated-memory reporting are present.
+
+### Binary layout verification
+
+- N/A: `Device` is a private in-process capability object and is never serialized or copied as a
+  raw upstream payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_graphics_pipeline.rs` vs Eden `src/video_core/renderer_opengl/gl_graphics_pipeline.{h,cpp}`
+
+### Intentional differences
+
+- Eden's constructor-selected `ConfigureImpl<Spec>` function pointer is represented by a private
+  `ConfigureSpec` enum. Selection order, enabled stages, descriptor-family gates, and the complete
+  configure operation order remain identical.
+- Stable non-owning pointers and a synchronized completed-build slot adapt Eden's references and
+  worker lambda without letting a Rust worker mutate a partially constructed object. Program and
+  fence publication still precede `MarkShaderComplete`, and synchronous/parallel fence creation
+  follows the same conditions.
+- Maxwell register data is borrowed through the renderer's live draw view and the GPU-memory guard
+  is released before `FillImageViews`; this preserves Eden's descriptor snapshot and cache-lock
+  ordering within the Rust ownership graph.
+- Absent stages use `Option<Shader::Info>` instead of Eden's default-constructed `Shader::Info`;
+  the selected configure specialization excludes those stages, so their descriptor state is never
+  consumed.
+- Rust zero-initializes fixed OpenGL-handle staging arrays because safe Rust cannot expose
+  partially initialized arrays. Like Eden, every OpenGL call consumes only the populated prefix.
+
+### Unintentional differences (to fix)
+
+- Resolved: GLSL strings and SPIR-V vectors are now moved into the one-shot program-build task and
+  released after compilation, rather than cloned and retained for every cached pipeline's entire
+  lifetime.
+- Resolved: cumulative descriptor totals, base uniform/storage bindings, and transform-feedback
+  stride arithmetic now preserve Eden's unsigned `u32` wrapping semantics in debug builds.
+- Resolved: global sampler, texture, and image binding counters now retain OpenGL's signed 32-bit
+  `GLsizei` representation through pointer selection, array indexing, and final bind calls.
+- Resolved: per-stage view traversal now advances by the wrapped `Shader::NumDescriptors` result,
+  rather than independently summing descriptor counts in host `usize` arithmetic.
+
+### Missing items
+
+- None in `GraphicsPipelineKey`, constructor metadata, `ConfigureImpl`, transform feedback,
+  asynchronous program construction, `WaitForBuild`, or `IsBuilt`.
+
+### Binary layout verification
+
+- PASS: `GraphicsPipelineKey` is `repr(C)`, 624 bytes, with the same 52-byte no-XFB hash prefix;
+  `TransformFeedbackState` is 560 bytes and raw cache round trips cover the complete XFB key.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_rasterizer.rs` vs Eden `src/video_core/renderer_opengl/gl_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- Heap-stable cache owners and non-owning pointers replace Eden's reference members; declaration
+  order makes the DMA borrower drop before both cache owners.
+- GPU ticks, GPU-cache invalidation, and guest-memory access cross the renderer ownership boundary
+  through installed callbacks. Calls remain at Eden's corresponding rasterizer lifecycle points.
+- Draw, clear, texture-draw, and indirect-draw register access uses scoped engine snapshots so Rust
+  can release engine locks before cache operations; each snapshot contains the same state Eden reads.
+- `BeginTransformFeedback` and `EndTransformFeedback` are associated methods without a `self`
+  receiver because their snapshot arguments avoid borrowing the whole rasterizer while the shader
+  cache lends a pipeline; they remain owned by `RasterizerOpenGL` as in Eden.
+- Query-cache operations receive the current `AnyCommandQueued` value explicitly instead of storing
+  a self-reference from `QueryCache` back into `RasterizerOpenGL`.
+- `StateTracker::release_channel` clears Rust's borrowed dirty-flag pointer before its channel owner
+  can be destroyed. Eden retains a raw pointer and relies on a subsequent bind before reuse.
+
+### Unintentional differences (to fix)
+
+- Resolved: `OnCacheInvalidation` now calls `ShaderCache::invalidate_region`, including
+  `RemovePendingShaders`, instead of the deferred `on_cache_invalidation` path. This matches Eden
+  and prevents stale shader lookup entries after a cache invalidation notification.
+- Resolved: the private, currently uncalled `SyncClipEnabled` method and its
+  `last_clip_distance_mask` state are restored, including the shader-dirty gate, guest enable mask,
+  change suppression, and eight OpenGL clip-distance enables. Eden's unimplemented
+  `SyncClipCoef` placeholder also retains a same-owner diagnostic counterpart.
+
+### Missing items
+
+- None among the public rasterizer operations, OpenGL state synchronization methods, transform
+  feedback lifecycle, channel lifecycle, or DMA acceleration methods.
+
+### Binary layout verification
+
+- PASS: Eden's unused header-level `BindlessSSBO` duplicate is not materialized here. The active
+  payload owned by `gl_buffer_cache.cpp` maps to the 16-byte `gl_buffer_cache.rs::BindlessSSBO`
+  with a size regression test; no `RasterizerOpenGL` state is raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/engines/{draw_manager,maxwell_3d}.rs` support for Eden `src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+
+- Ruzu's draw-time register view uses a `Maxwell3DAccess` method and a snapshot field to expose
+  Eden's direct `maxwell3d->regs.user_clip_enable.raw` read to the renderer.
+
+### Unintentional differences (to fix)
+
+- Resolved: draw views now carry the raw user-clip enable mask required by the restored
+  `RasterizerOpenGL::SyncClipEnabled` owner.
+
+### Missing items
+
+- None for the user-clip register access required by this rasterizer parity slice.
+
+### Binary layout verification
+
+- N/A: `Maxwell3DDrawRegisters` is a typed in-process snapshot and is never raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_resource_manager.rs` vs Eden `src/video_core/renderer_opengl/gl_resource_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust `Drop` replaces every C++ destructor and naturally releases the destination's previous
+  resource on assignment. Eden's `OGLPipeline` move-assignment uniquely omits `Release`; reproducing
+  that leak would violate Rust assignment semantics rather than observable OpenGL ownership intent.
+- A mechanical macro emits wrappers whose create/delete signatures are identical. Wrappers with
+  distinct behavior (`OGLTexture`, shader/program objects, syncs, framebuffers, and queries) remain
+  explicit in this upstream-owned file.
+- The `gl` bindings do not expose `glDeleteProgramsARB`; the optional entry point is loaded beside
+  the other GLASM functions in `gl_shader_util.rs`, while `OGLAssemblyProgram::release` retains the
+  resource lifecycle here.
+
+### Unintentional differences (to fix)
+
+- Resolved: `OGLSync::is_signaled` now reproduces Eden's always-on fail-soft assertion for
+  `GL_WAIT_FAILED`, including fatal behavior when `use_debug_asserts` is enabled, before applying
+  the same `status != GL_TIMEOUT_EXPIRED` completion test.
+
+### Missing items
+
+- None; all thirteen Eden OpenGL resource owners and their distinct create/release operations are
+  present.
+
+### Binary layout verification
+
+- N/A: these wrappers own process-local OpenGL handles and are never raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_shader_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_cache.{h,cpp}`
+
+### Intentional differences
+
+- Cache owners, the program manager, state tracker, context factory, and shader notification use
+  stable Rust handles/pointers in place of Eden reference members. Disk workers compile through a
+  temporary cache facade and return completed pipelines to the renderer thread instead of mutating
+  the live cache through a captured `this` pointer.
+- Disk entries are collected before scheduling so `load_pipelines` can keep safe borrowed callbacks;
+  the same compute-then-graphics work is queued, progress begins at `(0, total)`, and completed
+  pipelines are inserted after the cancellation-aware wait.
+- The Rust recompiler owns indexed IR blocks and instructions in each `Program`; consequently the
+  OpenGL `ShaderPools` objects preserve worker-context lifecycle but are not allocation owners as
+  Eden's pointer-based IR pools are.
+- The renderer path may disable asynchronous compilation when the frontend supplies no shareable GL
+  context factory. Eden always receives an `EmuWindow` capable of constructing its worker contexts.
+
+### Unintentional differences (to fix)
+
+- Resolved: `CurrentGraphicsPipeline` now uses `current_pipeline` as Eden's actual fast path instead
+  of performing a hash-map lookup on every unchanged draw.
+- Resolved: `CurrentGraphicsPipelineSlowPath` updates `current_pipeline` only after obtaining a
+  non-null pipeline. A cached or newly compiled failure no longer replaces the prior current
+  pipeline key.
+- Resolved: `ShaderCache` destruction now relies on declaration-order worker destruction, which
+  requests stop and joins before cached pipelines are dropped. The removed custom `Drop` first
+  drained every queued compile, unlike Eden's default destructor.
+- Verified already correct: both graphics and compute maps retain `None` entries after compilation
+  failure, matching Eden's `try_emplace` negative-cache behavior.
+- Verified already correct: runtime graphics compilation supplies workers only when
+  `use_asynchronous_shaders` is true. Unlike Vulkan's cache, Eden's OpenGL cache does not always
+  build runtime pipelines on the pool.
+
+### Missing items
+
+- None among cache-key construction, negative caching, runtime pipeline selection, disk loading,
+  shader translation/emission, progress reporting, or worker lifecycle.
+
+### Binary layout verification
+
+- PASS: compute and graphics keys are read, hashed, and serialized through their complete `repr(C)`
+  byte layouts; their dedicated pipeline modules retain size/layout regression tests.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_shader_context.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_context.h`
+
+### Intentional differences
+
+- A frontend-supplied `SharedContextFactory` replaces Eden's direct `EmuWindow::CreateSharedContext`
+  call, preserving one independently owned shared GL context per shader worker.
+- `Context::Drop` explicitly controls the self-referential lifetime that Eden expresses with
+  `GraphicsContext::Scoped`: pools are destroyed while the context is current, `DoneCurrent` runs,
+  then the boxed context is destroyed.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ShaderPools::Drop` now releases live flow blocks, IR blocks, and instructions in Eden's
+  reverse-member destruction order. Automatic Rust field destruction previously visited the three
+  pools in declaration order.
+
+### Missing items
+
+- None; `ShaderPools`, `Context`, their capacities, release ordering, and shared-context lifecycle
+  are present.
+
+### Binary layout verification
+
+- N/A: contexts and object pools are process-local allocation owners and are never raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
+
+### Intentional differences
+
+- `Mutex<Option<Box<dyn GraphicsContext + Send>>>` replaces Eden's thread-confined
+  `unique_ptr<GraphicsContext>` while preserving lazy construction and GPU ownership.
+- The renderer exposes shared-context construction through the split-crate `RendererBase` trait;
+  Eden reaches the same frontend owner through `RendererBase::GetRenderWindow()`.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Gpu::obtain_context` and `Gpu::release_context` now reproduce Eden's lazy shared-context
+  creation, `MakeCurrent`, and `DoneCurrent` lifecycle. The CPU context was previously absent.
+- Resolved: `RequestComposite` now counts and registers the exact fence vector supplied by its
+  caller. The removed negative-ID filter changed Eden's invalid-input behavior and counter size.
+
+### Missing items
+
+- `ReleaseChannel` remains deliberately unimplemented exactly as in Eden.
+
+### Binary layout verification
+
+- N/A: `Gpu` is a process-local orchestrator and is never raw-serialized.
+
+## 2026-08-26 — `src/core/src/{cpu_manager.rs,gpu_core.rs}` vs Eden `src/core/cpu_manager.cpp` and `src/video_core/gpu.h`
+
+### Intentional differences
+
+- `GpuCoreInterface` bridges the crate boundary that Eden does not have. Its context methods forward
+  directly to the concrete GPU owner.
+- Context acquisition skips only null-system unit-test kernels; an initialized system still
+  requires a GPU exactly where Eden dereferences `system.GPU()`.
+
+### Unintentional differences (to fix)
+
+- Resolved: the synchronous single-core CPU thread now calls `obtain_context` after the GPU barrier,
+  at the same point and under the same `!is_async_gpu && !is_multicore` condition as Eden.
+
+### Missing items
+
+- None for the `CpuManager::RunThread` graphics-context handoff.
+
+### Binary layout verification
+
+- N/A: these interfaces and thread owners are not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/{renderer_base.rs,renderer_opengl/renderer_opengl.rs}` vs Eden `src/video_core/renderer_base.h` and `src/video_core/renderer_opengl/renderer_opengl.{h,cpp}`
+
+### Intentional differences
+
+- The frontend-provided `SharedContextFactory` is retained by `RendererOpenGL` in place of Eden's
+  retained `EmuWindow&`; both create a fresh shared context per request.
+- Non-OpenGL renderers inherit a no-op graphics context, matching their frontend dummy-context
+  behavior without adding backend-specific state.
+
+### Unintentional differences (to fix)
+
+- Resolved: OpenGL shared-context creation is now non-optional at renderer construction and remains
+  available to `GPU::ObtainContext`, rather than being consumed solely by shader workers.
+
+### Missing items
+
+- None for shared-context creation used by the GPU CPU thread.
+
+### Binary layout verification
+
+- N/A: renderer traits, contexts, and factories are process-local owners.
+
+## 2026-08-26 — `src/common/src/address_space.rs` vs Eden `src/common/address_space.{h,inc}` (`FlatAllocator` prerequisite)
+
+### Intentional differences
+
+- Rust specializes the generic address-space template as `FlatAllocatorBool<u32/u64>` for the two
+  allocator instantiations used by Ruzu. Mutex ownership and bool-backed block storage remain local
+  to this specialization.
+
+### Unintentional differences (to fix)
+
+- Resolved: the linear fixed-block search now uses Eden's literal
+  `gap < size || predecessor.Mapped()` selection condition. The former Rust predicate selected a
+  conventional free gap instead, changing the address returned when a request straddled a fixed
+  mapping.
+- Resolved: all guest-VA additions and subtractions in the bool-backed map/allocator now use
+  explicit wrapping operations, preserving the unsigned C++ bit patterns in debug builds.
+
+### Missing items
+
+- None for the bool-backed `FlatAllocator` operations used by the Maxwell device memory manager.
+
+### Binary layout verification
+
+- PASS: allocator blocks are process-local and not raw-serialized; their ordered `(virt, mapped)`
+  state and mutation order match the corresponding upstream specialization.
+
+## 2026-08-26 — `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs Eden `src/core/device_memory_manager.{h,inc}` and `src/video_core/host1x/gpu_device_memory_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust owns the active Maxwell specialization in `video_core/host1x` because moving the generic
+  implementation into the `core` crate would introduce the existing `core`/`video_core` dependency
+  cycle. Dense Rust tables replace Eden's reserved `VirtualBuffer` arrays, and atomics protect the
+  shared translation cache used through `Arc`.
+- Host pointers are range-checked against the captured device-memory allocation before indexing the
+  dense physical table. Eden relies on the invariant that every pointer belongs to that allocation;
+  the Rust check prevents an invalid pointer from becoming an out-of-bounds table access.
+- Test-only host-pointer mapping and callbacks support reduced fixtures. Runtime ASID mappings use
+  registered process memory and the same physical-base-relative encoding as Eden.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Allocate` and `Free` now forward the exact byte size to `FlatAllocator` instead of
+  silently rounding to 4 KiB, and `Free` no longer ignores address zero.
+- Resolved: the missing `AllocateFixed`, `ApplyOpOnPAddr`,
+  `GetPhysicalRawAddressFromDAddr`, `HAS_FLUSH_INVALIDATION`, and `AS_BITS` API pieces are present;
+  buffer-cache code consumes `AS_BITS` from its upstream owner instead of duplicating `34`.
+- Resolved: `UpdatePagesCachedCountNoLock` executes Eden's acquire fence before reading backing
+  metadata, including for a zero-size request. Range coalescing and span bounds now preserve
+  unsigned wrapping arithmetic.
+- Resolved: the module no longer describes the dense physical/device table implementation as an
+  unfinished SMMU subset.
+
+### Missing items
+
+- None for the instantiated Maxwell manager API and allocator helpers.
+
+### Binary layout verification
+
+- PASS: the device table stores one `u32` compressed physical value and the cached-page table one
+  atomic `u8` per device page, matching Eden's element widths and zero/one initialization. These
+  process-local tables are not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/gpu_thread.rs` and `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu_thread.{h,cpp}` and `src/video_core/gpu.cpp`
+
+### Intentional differences
+
+- `Arc<AtomicBool>` plus explicit queue/condition-variable wakeups implement the stop-token portion
+  of Eden's `std::jthread`; `ThreadManager::shutdown` joins before renderer and scheduler teardown.
+- Rust retains stable rasterizer, GPU, graphics-context, and scheduler handles across the spawned
+  closure because those owners cross Rust trait/crate boundaries. Eden captures references to the
+  same owners directly.
+- `last_fence` is atomic for shared Rust access, although every mutation remains serialized by
+  `write_lock` exactly as in Eden. The worker body is a same-file helper rather than an inline
+  closure so it can borrow the shared synchronization state safely.
+
+### Unintentional differences (to fix)
+
+- Resolved: `SynchState` now owns the upstream `BoundedSPSCQueue`; the removed MPSC wrapper had an
+  extra producer mutex despite `write_lock` already serializing producers.
+- Resolved: `is_async` remains owned only by `Gpu` and is passed to every thread-manager operation,
+  matching Eden's method signatures and avoiding duplicated mode state.
+- Resolved: stop now wakes a caller blocked on a fence, the wait predicate observes the stop flag,
+  and the worker checks stop immediately after `PopWait` before dispatching the returned command.
+- Resolved: the worker calls `SetCurrentThreadToPerformanceCores`, requires the renderer context and
+  rasterizer installed by `StartThread`, and treats both `monostate` and the non-queued combined
+  flush/invalidate command as assertion failures.
+- Resolved: fence increment uses unsigned wrapping semantics and the non-upstream GPU-thread profile,
+  submit timing, trace emissions, CLI environment switch, and dump hooks were removed from the hot
+  path.
+
+### Missing items
+
+- None for the command variants, public operations, worker dispatch, fence synchronization, or
+  stop/join lifecycle.
+
+### Binary layout verification
+
+- N/A: command enums and synchronization owners are process-local and are not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/codecs/vp9.rs` vs Eden `src/video_core/host1x/codecs/vp9.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the range encoder bytes directly in a `Vec<u8>` instead of wrapping Eden's
+  `Common::Stream`; indexed carry propagation preserves the same seek/peek/write order.
+- `DecoderImpl::compose_frame` returns an owned `Vec<u8>` across the Rust trait boundary instead of
+  Eden's span into `frame_scratch`; header and payload concatenation order is unchanged.
+
+### Unintentional differences (to fix)
+
+- Resolved: probability remapping and range normalization now use Eden's literal arithmetic and
+  `countl_zero` formulas. The removed `MAP_LUT` and `NORM_LUT` constants had no upstream owner and
+  obscured the bitstream comparison.
+- Resolved: unsigned range arithmetic and bit extraction preserve Eden's `u32` wrapping and shift
+  semantics explicitly, including in debug builds.
+
+### Missing items
+
+- None for VP9 header composition, probability/context updates, segmentation, frame buffering, or
+  range/bitstream encoding.
+
+### Binary layout verification
+
+- N/A: this file consumes the raw NVDEC layouts owned and verified in `vp9_types.rs`; its encoder
+  state and output vectors are process-local.
+
+## 2026-08-26 — `src/video_core/src/host1x/sync_manager.rs` vs Eden `src/video_core/host1x/sync_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses Eden's default `SyncptIncr(..., done = false)` constructor argument explicitly at
+  its two call sites and uses `Vec::drain` for the same completed-prefix erase operation.
+- The upstream `increment_lock` member is retained but intentionally remains unacquired, matching
+  the current Eden implementation rather than inventing synchronization behavior.
+
+### Unintentional differences (to fix)
+
+- Resolved: the previously missing `SyncptIncr` and `SyncptIncrManager` owners now live in the
+  corresponding `host1x/sync_manager.rs` module. Handle allocation, ordered completion, guest/host
+  increment order, and prefix erasure follow Eden literally.
+
+### Missing items
+
+- None for `SyncptIncr` or `SyncptIncrManager`.
+
+### Binary layout verification
+
+- PASS: `SyncptIncr` is `repr(C)`, size 16, alignment 4, with its four fields at offsets 0, 4, 8,
+  and 12. It is process-local and is not raw-serialized.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/mod.rs` and source exports vs Eden `src/video_core/host_shaders/`
+
+### Intentional differences
+
+- Rust groups source strings by shader stage and generates Vulkan SPIR-V from `build.rs`; Eden's
+  CMake helpers generate C++ headers. The source files passed to the compilers are the same.
+- Three copied shader files retain a final newline absent from Eden. GLSL parsing and generated
+  instructions are unaffected.
+
+### Unintentional differences (to fix)
+
+- Resolved: vertex shaders and `opengl_smaa.glsl` are no longer duplicated as large Rust raw
+  strings. Their exported constants now use `include_str!`, like the compute and fragment exports,
+  so each upstream shader has a single auditable source owner.
+- Resolved: `opengl_present.vert` now exists beside the other shader sources instead of living only
+  inside `vertex_shaders.rs`.
+
+### Missing items
+
+- None from Eden's runtime `.comp`, `.frag`, `.vert`, or `.glsl` source inventory.
+
+### Binary layout verification
+
+- N/A: GLSL sources are text; Vulkan modules are validated separately by the generated-SPIR-V
+  tests.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_base.rs` vs Eden `src/video_core/texture_cache/image_base.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses `Vec` for Eden's inline-capacity `small_vector` slice metadata. Element ordering and
+  lookup behavior are unchanged; only small-allocation strategy differs.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ImageBase::null` now retains the in-class `CPU_MODIFIED` default exactly like Eden's
+  empty `NullImageParams` constructor.
+- Resolved: `layer_mip_offset` now follows C++ usual arithmetic conversions for its mixed
+  `s32`/`u32` division and remainder. Offsets with bit 31 set no longer take the signed Rust path.
+- Resolved: the missing `has_scaled` accessor is present, address/range calculations preserve
+  unsigned wrapping, and alias block rounding uses the upstream-owned common `div_ceil` helper.
+
+### Missing items
+
+- None for flags, constructors, subresource lookup, view tracking, overlap state, or alias-copy
+  generation.
+
+### Binary layout verification
+
+- N/A: `ImageBase`, `ImageMapView`, and alias vectors are process-local cache owners and are not
+  copied to guest memory or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_info.rs` vs Eden `src/video_core/texture_cache/image_info.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents Eden's anonymous `block`/`pitch` union as `TilingMode`. Accessors expose zeros for
+  the inactive variant, matching the zero-initialized bytes used by every upstream constructor.
+- The file-local `fail_soft` helper implements Eden's `ASSERT`/`UNIMPLEMENTED` policy using the same
+  `use_debug_asserts` setting because Rust has no C++ assertion macro expansion.
+
+### Unintentional differences (to fix)
+
+- Resolved: invalid MSAA values now report the assertion and fall back to 1x, and unknown DMA byte
+  sizes return `PixelFormat::Invalid`, matching Eden instead of panicking unconditionally.
+- Resolved: TIC type/tiling checks and render-target/zeta dimension-control checks are fail-soft by
+  default. Invalid inputs continue through the same constructor branches as Eden.
+- Resolved: multisample width and height expansion now preserves unsigned C++ wrapping, and the
+  obsolete placeholder description for the already-ported `PixelFormat` owner was removed.
+
+### Missing items
+
+- None for the default, TIC, render-target, zeta, Fermi2D, or DMA constructors.
+
+### Binary layout verification
+
+- N/A: `ImageInfo` is a process-local descriptor and is not raw-serialized. Its Rust enum replacing
+  the anonymous union intentionally has a different host layout.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_view_base.rs` vs Eden `src/video_core/texture_cache/image_view_base.{h,cpp}`
+
+### Intentional differences
+
+- Rust's split base/backend slot retains the constructor's `ImageViewInfo` beside, rather than
+  inside, `ImageViewBase` so an OpenGL or Vulkan backend view can be rematerialized after its
+  derived payload is released. Eden constructs the derived object directly from the same info and
+  therefore does not need this Rust-only lifetime adapter.
+- The file-local `fail_soft` helper implements Eden's `ASSERT_MSG` policy through the same
+  `use_debug_asserts` setting because Rust has no C++ assertion macro expansion.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ImageViewBase` no longer owns non-upstream swizzle bytes or an `is_render_target`
+  helper. OpenGL and Vulkan constructors now consume `ImageViewInfo` directly, preserving Eden's
+  method and state ownership.
+- Resolved: compatibility and buffer-type assertions are fail-soft by default and run after base
+  initialization, in the same lifecycle position as Eden.
+- Resolved: Vulkan framebuffer subresource ranges use the base view format's full aspect mask;
+  descriptor swizzle affects only initial Vulkan image-view creation, as in Eden.
+- Resolved: depth/stencil component swizzles now replace unsupported integer/float `ONE` sources
+  with `ZERO`, guarded by the same maintenance5 property as Eden.
+
+### Missing items
+
+- None for constructors, flags, buffer detection, or anisotropy support.
+
+### Binary layout verification
+
+- N/A: `ImageViewBase` and the Rust slot wrapper are process-local cache objects and are not copied
+  to guest memory or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` maintenance5 prerequisite vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- The workspace's ash 0.37 bindings predate `VK_KHR_maintenance5`, so its feature and property
+  payloads are declared locally with their Vulkan ABI structure-type values. They remain in the
+  corresponding device owner and participate in the same feature/property `pNext` chains.
+- Rust retains the four maintenance5 property answers as booleans after physical-device discovery
+  instead of retaining a self-referential raw property-chain node inside `Device`.
+
+### Unintentional differences (to fix)
+
+- Resolved: maintenance5 is queried, suitability-filtered, enabled on the logical device, and
+  exposed through the upstream `IsKhrMaintenance5Supported`, `SupportsPolygonModePointSize`,
+  `SupportsDepthStencilSwizzleOne`, and `SupportsEarlyFragmentTests` counterparts.
+
+### Missing items
+
+- None for the maintenance5 feature, queried properties, extension state, or accessors required by
+  the texture-cache view constructor.
+
+### Binary layout verification
+
+- PASS: the local feature payload is 24 bytes on 64-bit hosts (12 on 32-bit), and the property
+  payload is 40 bytes on 64-bit hosts (32 on 32-bit), with `depthStencilSwizzleOneSupport` at the
+  Vulkan ABI offset. Focused tests verify these sizes and offsets.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/image_view_info.rs` vs Eden `src/video_core/texture_cache/image_view_info.{h,cpp}`
+
+### Intentional differences
+
+- Rust decodes the stored swizzle byte through the canonical enum instead of C++ `static_cast`.
+  The unnamed three-bit TIC value is represented explicitly as `SwizzleSource::Invalid`, while
+  bytes outside the TIC range report Eden's fail-soft assertion and use that same invalid path.
+- The file-local `fail_soft` helper implements Eden's `ASSERT` policy through the shared
+  `use_debug_asserts` setting because Rust has no C++ assertion macro expansion.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the duplicate file-local `SwizzleSource`; `ImageViewInfo` now re-exports and
+  returns the canonical type owned by `textures/texture.rs`, matching Eden's ownership.
+- Resolved: the missing `Texture1DArray` height assertion is present, all constructor assertions
+  are fail-soft by default, and invalid texture types retain the already-initialized default view
+  type instead of panicking unconditionally.
+- Resolved: mip-count subtraction and cube-array layer multiplication preserve C++ unsigned
+  wrapping instead of overflowing under Rust debug arithmetic.
+
+### Missing items
+
+- None for constructors, swizzle access, render-target detection, or TIC type promotion.
+
+### Binary layout verification
+
+- PASS: `ImageViewInfo` is 28 bytes with alignment 4; focused tests verify field offsets 0, 4, 8,
+  24, and 27, preserving the unique object representation consumed by cache keys.
+
+## 2026-08-26 — `src/video_core/src/textures/texture.rs` swizzle prerequisite vs Eden `src/video_core/textures/texture.h`
+
+### Intentional differences
+
+- Rust names raw TIC value 1 `Invalid` so the safe enum can represent every value of Eden's
+  three-bit `SwizzleSource` bitfield. Eden leaves that value unnamed but C++ enum casts still carry
+  it to backend validation.
+
+### Unintentional differences (to fix)
+
+- Resolved: `SwizzleSource::from_raw` no longer rejects the representable raw value 1 before the
+  texture-cache and backend validation paths can reproduce Eden's behavior.
+
+### Missing items
+
+- None for `SwizzleSource` discriminants or raw decoding.
+
+### Binary layout verification
+
+- PASS: `SwizzleSource` remains `repr(u32)` and all upstream named discriminants remain unchanged.
+
+## 2026-08-26 — backend invalid-swizzle handling vs Eden `renderer_{opengl,vulkan}/{gl_texture_cache,maxwell_to_vk}.cpp`
+
+### Intentional differences
+
+- Rust spells Eden's fall-through assertion branches as explicit `SwizzleSource::Invalid` match
+  arms because exhaustive matching is required for the safe enum.
+
+### Unintentional differences (to fix)
+
+- Resolved: invalid OpenGL swizzles now report and return `GL_NONE`; invalid Vulkan swizzles report
+  and return the zero-initialized `VkComponentSwizzle`, matching Eden's fallback results.
+
+### Missing items
+
+- None for the invalid component-swizzle fallback paths touched by this prerequisite.
+
+### Binary layout verification
+
+- N/A: these functions translate an enum into backend API constants and serialize no payload.
+
+## 2026-08-26 — removed `src/video_core/src/engines/inline_to_memory.rs` vs Eden engine ownership
+
+### Intentional differences
+
+- None. Eden has no `engines/inline_to_memory.{h,cpp}` owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the test-only `InlineToMemory` engine and its module declaration. It duplicated
+  A140/P2MF state behind a Rust-only register engine, and its block-linear mode incorrectly fell
+  back to a pitched linear write.
+- Verified: runtime A140 single- and multi-method dispatch already targets `KeplerMemory`, whose
+  matching `engine_upload::State` owner performs Eden's linear rasterizer upload or block-linear
+  `swizzle_subrect` path.
+
+### Missing items
+
+- None introduced by the removal; the upstream-owned implementation remains in
+  `engines/{kepler_memory,engine_upload}.rs`.
+
+### Binary layout verification
+
+- N/A: the removed type was test-only and was neither guest-visible nor serialized.
+
+## 2026-08-26 — `src/video_core/src/invalidation_accumulator.rs` vs Eden `src/video_core/invalidation_accumulator.h`
+
+### Intentional differences
+
+- `MemoryManager::flush_caching` temporarily moves the accumulator out of `self` so its callback
+  can inspect the remaining memory-manager state without overlapping Rust borrows. Callback order,
+  accumulator reset, and subsequent rasterizer invalidation remain identical to Eden.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the Rust-only `has_collected` and `last_collection` state. Address zero is once
+  again Eden's empty sentinel, including its loss of an invalidation range aligned to zero.
+- Resolved: restored the single `invalidate_all` operation that invokes buffered ranges, invokes
+  the current range, clears all state, and returns the upstream boolean in that exact order.
+- Resolved: range-end, alignment, and accumulated-size arithmetic now wraps as unsigned C++
+  arithmetic rather than panicking on Rust debug overflow.
+- Resolved: `MemoryManager::flush_caching` consumes the unified API instead of relying on the
+  non-upstream `any_accumulated`/`callback`/`clear` protocol.
+
+### Missing items
+
+- None for range accumulation, adjacency merging, callback ordering, reset, or return state.
+
+### Binary layout verification
+
+- N/A: the accumulator is a process-local owner and is not copied to guest memory or serialized.
+
+## 2026-08-26 — `src/video_core/src/engines/kepler_compute.rs` vs Eden `src/video_core/engines/kepler_compute.{h,cpp}`
+
+### Intentional differences
+
+- Rust reads the raw 0x100-byte QMD into `LaunchParamsLayout`, then exposes decoded bitfields
+  through `LaunchParams`; Eden overlays bitfields directly on its raw struct. The raw read size,
+  offsets, and every exposed field are unchanged.
+- The rasterizer receives a synchronous `DispatchCall` snapshot of the current engine state.
+  Re-reading the same engine through the channel's raw pointer while `call_method` holds `&mut
+  KeplerCompute` would create forbidden Rust aliasing; all snapshot fields come from Eden's
+  engine-owned registers immediately before the call.
+- The upload state receives an owner-local register snapshot instead of retaining a
+  self-referential pointer into `regs`. Method bounds are checked before Rust array access rather
+  than relying on C++'s asserted indexing contract.
+
+### Unintentional differences (to fix)
+
+- Resolved: `get_tic_entry` and `get_tsc_entry` are compiled as runtime-private methods instead of
+  existing only in test builds. Their pool offset arithmetic now preserves unsigned wrapping.
+
+### Missing items
+
+- None for register ownership, QMD fields, upload tracking, indirect-compute detection, launch,
+  sink consumption, or TIC/TSC reads.
+
+### Binary layout verification
+
+- PASS: the register array contains exactly 0xCF8 words; `LaunchParamsLayout` is 0x100 bytes and
+  compile-time assertions verify the upstream program, grid, shared-memory, block, constant-buffer
+  mask, and constant-buffer table offsets.
+
+## 2026-08-26 — `src/video_core/src/engines/kepler_memory.rs` vs Eden `src/video_core/engines/kepler_memory.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps the 0x7F-word register storage as a `repr(C)` array and mechanically materializes an
+  `engine_upload::Registers` snapshot. This avoids retaining Eden's self-referential
+  `Upload::State` reference into the owning register union while preserving every field offset.
+- Rust checks the method index before array access; Eden asserts the contract and then indexes the
+  C++ array. Valid command-stream behavior is identical.
+
+### Unintentional differences (to fix)
+
+- Resolved: `NUM_REGS` is owned by `Regs`, matching Eden, and the upload/interface implementation
+  state is private rather than exposed as public engine state.
+- Resolved: `bind_rasterizer` directly resets and sets the two constant execution-mask positions,
+  and sink consumption no longer silently drops out-of-range methods.
+- Resolved: the default multi-method path uses wrapping `u32` subtraction for
+  `methods_pending - i`, matching C++ instead of saturating at zero.
+
+### Missing items
+
+- None for register layout, rasterizer binding, upload execution/data handling, multi-method
+  dispatch, or deferred sink consumption.
+
+### Binary layout verification
+
+- PASS: `Regs` is 0x1FC bytes with alignment 4, and focused tests verify the upload, exec, and data
+  word positions 0x60, 0x6C, and 0x6D.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/layer.rs` vs Eden `src/video_core/renderer_vulkan/present/layer.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains Eden's allocator and scheduler references as `NonNull` and the shared device-memory
+  owner as `Arc`; the enclosing renderer owns all three longer than every `Layer`.
+- Scheduler closures copy the command's Vulkan handles instead of capturing `this`, because Rust
+  requires queued closures to be `'static`. `resource_ticks` still waits for every such command
+  before any corresponding allocation is released.
+- Raw Ash image views and the descriptor pool are destroyed explicitly. `AllocatedImage` and
+  `AllocatedBuffer` provide the RAII ownership that Eden obtains from its Vulkan wrappers.
+
+### Unintentional differences (to fix)
+
+- Resolved: the two Rust draw entry points were merged back into the single upstream-owned
+  `configure_draw`, and every helper again receives the high-level `Device` at the same boundary as
+  Eden.
+- Resolved: framebuffer helpers now receive `FramebufferConfig`, use unsigned wrapping arithmetic,
+  preserve Eden's fail-soft unknown-format fallback, and the canonical settings `AntiAliasing`
+  enum owns the cached setting.
+- Resolved: `create_raw_images` is a separate Layer method again. Raw images and the staging buffer
+  now own VMA allocations and are released after Eden's per-image tick waits instead of remaining
+  retained by the global allocator.
+- Resolved: refresh no longer clears `anti_alias_setting`; it resets only the anti-alias variant,
+  and raw image views retain Eden's replacement/destructor lifetime rather than being cleared by
+  `release_raw_images`.
+- Resolved: a scope guard updates the resource tick on every exit from `configure_draw`, including
+  panic unwinding, matching Eden's `SCOPE_EXIT` lifecycle.
+
+### Missing items
+
+- None in Layer construction, draw configuration, resource refresh/release, staging upload,
+  anti-alias selection, push constants, descriptor updates, or tick ordering.
+
+### Binary layout verification
+
+- N/A: Layer owns host-side Vulkan resources and does not serialize its Rust representation.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs Eden `src/video_core/renderer_vulkan/present/fsr.{h,cpp}`
+
+### Intentional differences
+
+- The retained allocator reference is represented by `NonNull<MemoryAllocator>`, and a raw Ash
+  device is retained only to destroy raw non-image Vulkan handles in `Drop`.
+- Queued commands copy image handles and the logical device rather than borrowing the FSR object;
+  `UploadImages` still finishes before returning and Layer's resource tick protects draw commands.
+
+### Unintentional differences (to fix)
+
+- Resolved: construction, all creation helpers, `upload_images`, `update_descriptor_sets`, and
+  `draw` receive Eden's high-level `Device`; shader capability selection is owned by
+  `create_shaders` again.
+- Resolved: EASU and RCAS images are owning VMA allocations, so their lifetime follows the FSR
+  object instead of the global allocator.
+- Resolved: the stage enum, count, and per-image resources are private like Eden's nested members.
+
+### Missing items
+
+- None in the two-pass FSR construction, upload, descriptor, push-constant, or draw path.
+
+### Binary layout verification
+
+- N/A: push constants remain the fixed `[u32; 16]` payload; the remaining state is host-only.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/sgsr.rs` vs Eden `src/video_core/renderer_vulkan/present/sgsr.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the allocator reference as `NonNull` and the logical Ash device solely for explicit
+  raw-handle destruction. Command closures copy handles to satisfy the scheduler's `'static`
+  contract.
+
+### Unintentional differences (to fix)
+
+- Resolved: `draw`, `upload_images`, and `update_descriptor_sets` receive the high-level `Device`
+  and use its logical handle at runtime.
+- Resolved: SGSR images are owning VMA allocations and both upstream-owned `memory_allocator` and
+  `edge_dir` state are retained instead of being discarded after construction.
+- Resolved: `Drop` now releases per-image framebuffers, views, allocations, and descriptor-handle
+  storage before sampler, render pass, pipeline, shaders, layouts, and descriptor pool, matching
+  the effective reverse declaration order of Eden's RAII members.
+
+### Missing items
+
+- Eden declares but does not define or call `Initialize`; there is no executable method to port.
+
+### Binary layout verification
+
+- N/A: the seven-word push-constant array is unchanged and host object layout is not serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/fxaa.rs` vs Eden `src/video_core/renderer_vulkan/present/fxaa.{h,cpp}`
+
+### Intentional differences
+
+- Rust explicitly destroys raw framebuffers, views, pipelines, layouts, shaders, sampler, and
+  render pass; owning images then release through VMA. The retained Ash device exists only for
+  that `Drop` implementation.
+- Queued commands copy raw handles rather than borrowing the pass across the scheduler boundary.
+
+### Unintentional differences (to fix)
+
+- Resolved: the constructor and all creation helpers receive Eden's high-level `Device` rather
+  than a stored raw device.
+- Resolved: every per-frame FXAA image owns its VMA allocation and is released when the pass is
+  replaced by Layer.
+
+### Missing items
+
+- None in FXAA creation, upload, descriptor update, draw, or resource ownership.
+
+### Binary layout verification
+
+- N/A: FXAA owns host Vulkan handles and has no serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/smaa.rs` vs Eden `src/video_core/renderer_vulkan/present/smaa.{h,cpp}`
+
+### Intentional differences
+
+- Eden's allocator reference is retained as `NonNull`; the raw Ash device is retained only for
+  explicit destruction of non-image Vulkan handles. Scheduler closures copy handles instead of
+  borrowing `self`.
+
+### Unintentional differences (to fix)
+
+- Resolved: the constructor and all creation helpers receive the high-level `Device`, matching
+  Eden's ownership boundary.
+- Resolved: both static lookup images and all three dynamic images per frame own VMA allocations;
+  replacing the SMAA pass now releases them with the pass.
+- Resolved: SMAA's nested enums, counts, and `Images` structure are private like upstream.
+
+### Missing items
+
+- None in SMAA image creation/upload, its three render passes, descriptor wiring, or draw order.
+
+### Binary layout verification
+
+- N/A: SMAA owns host Vulkan handles and does not serialize its Rust object representation.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden presentation utilities and `vulkan_memory_allocator.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents Eden's move-only `vk::Image` and `vk::Buffer` wrappers as `AllocatedImage` and
+  `AllocatedBuffer`, retaining the externally synchronized VMA allocator in `Arc<Mutex<_>>`.
+- Allocation failures return `VulkanError`; presentation helpers convert them to the same fatal
+  construction failure that Eden obtains from `vk::Check` exceptions.
+
+### Unintentional differences (to fix)
+
+- Resolved: `create_owned_image` now uses VMA with `WITHIN_BUDGET`,
+  `AUTO_PREFER_DEVICE`, and preferred `DEVICE_LOCAL`, exactly matching Eden's `CreateImage`
+  allocation policy.
+- Resolved: the allocator-retained raw-image compatibility path was removed. The single
+  `create_wrapped_image` helper now returns the owning image wrapper used by presentation frames
+  and passes.
+- Resolved: Layer staging and `upload_image` staging use the VMA-backed owning buffer path instead
+  of dedicated Vulkan allocations.
+- Resolved: `transition_image_layout` uses Eden's graphics-and-compute stage mask on both sides of
+  the barrier instead of the broader `ALL_COMMANDS` mask.
+
+### Missing items
+
+- GPU allocation/deallocation logging remains unavailable because Ruzu has not ported Eden's GPU
+  logging subsystem; this does not alter allocation policy or resource lifetime.
+
+### Binary layout verification
+
+- N/A: the wrappers own host Vulkan/VMA handles and are not copied to guest memory or disk.
+
+## 2026-08-26 — `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses inline `macro_hle`, `macro_interpreter`, and x86-64-only `macro_jit_x64` scopes inside
+  the single physical `macro.rs` counterpart. They provide conditional compilation and name
+  scoping without moving any upstream-owned implementation into another source file.
+- `AnyCachedMacro::execute` receives the active `Maxwell3D` as a non-owning raw pointer,
+  corresponding to Eden's non-null reference. The pointer is never retained by an HLE,
+  interpreter, or JIT cache entry; this permits the enclosing Maxwell owner to pass itself through
+  Rust's enum dispatch.
+- The JIT state's second pointer addresses Maxwell's boxed register array instead of storing Eden's
+  `Core::System*`. Rust cannot emit a stable member offset into a non-`repr(C)` `Maxwell3D`; method
+  sends use the engine's owner-local system bridge, while register reads remain direct native
+  indexed loads.
+- Invalid macro-code and parameter indexing terminates through Rust bounds checks after reporting
+  the corresponding assertion. Eden's fail-soft assertion would otherwise continue into invalid
+  C++ span access, which has no defined behavior to preserve.
+
+### Unintentional differences (to fix)
+
+- Resolved: the former `macro_engine/` split and duplicate root `macro_interpreter.rs` were
+  consolidated into the single counterpart of Eden's `macro.h`/`macro.cpp`.
+- Resolved: `AnyCachedMacro` is one Rust enum mirroring Eden's `std::variant`; `CacheInfo` no longer
+  stores two boxed programs plus a discriminator, and `get_hle_program` is again a free function
+  rather than state owned by `MacroEngine`.
+- Resolved: cached HLE, interpreter, and JIT programs receive the current Maxwell owner on every
+  execution instead of retaining callbacks or the first engine pointer seen at compilation.
+- Resolved: HLE clear depth, transform-feedback byte-count draws, refreshed-topology fallbacks,
+  wrapping indirect sizes, replacement attributes, and cleanup ordering now follow the matching
+  `HLE_*::Execute`/`Fallback` implementations.
+- Resolved: interpreter assertions use Eden's fail-soft policy for validly recoverable cases, and
+  the x86-64 emitter follows Eden's optimizer, delay-slot, method-send, and parameter-fetch paths.
+
+### Missing items
+
+- None in the macro instruction representation, HLE table and implementations, interpreter,
+  x86-64 JIT, cache dispatch, rebased upload lookup, or macro dumping.
+
+### Binary layout verification
+
+- PASS: focused tests verify every opcode/method-address field and the native `u32` dump payload.
+  `JitState` remains 56 bytes on x86-64 with the two pointer slots, eight registers, and carry flag
+  at the same offsets as Eden; only the meaning of the second pointer is the documented adaptation.
+
+## 2026-08-26 — `src/video_core/src/engines/maxwell_dma.rs` vs Eden `src/video_core/engines/maxwell_dma.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents the register union as a zero-initialized 0x800-word array plus typed accessors.
+  DMA fallback writes are collected as `PendingWrite` values because the Rust engine boundary does
+  not expose Eden's scoped guest-memory guards; destination data is read first where the upstream
+  cached-write guard preserves bytes outside the copied subrectangle.
+
+### Unintentional differences (to fix)
+
+- Resolved: `call_multi_method` now consumes exactly `amount` words and derives `is_last_call` from
+  the wrapping unsigned `methods_pending - i <= 1` expression used by Eden.
+- Resolved: launching DMA now rejects non-`NONE` interrupt types before selecting or executing a
+  copy path, matching the assertion at the head of Eden's `Launch`.
+
+### Missing items
+
+- None in the launch dispatch, pitch/block-linear copy algorithms, accelerated paths, semaphore
+  release, method sink handling, or register decoding exercised by this engine.
+
+### Binary layout verification
+
+- PASS: the register storage is exactly 0x800 `u32` words; every typed register base used by the
+  implementation is derived from the byte offset asserted in Eden's `Regs` definition. Rust does
+  not serialize a host `MaxwellDMA` object or expose its object layout to guest memory.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/maxwell_to_gl.rs` vs Eden `src/video_core/renderer_opengl/maxwell_to_gl.h`
+
+### Intentional differences
+
+- Rust conversion functions accept the raw register `u32` encodings where the C++ signatures use
+  scoped enum types; every accepted discriminant and fallback result remains the same.
+- The mirror-clamp extension path queries the current OpenGL extension list once through the loaded
+  bindings instead of reading glad's generated `GL_EXT_texture_mirror_clamp` global.
+
+### Unintentional differences (to fix)
+
+- Resolved: `front_face` now accepts Eden's `0x900`/`0x901` Maxwell encodings instead of unrelated
+  compact values.
+- Resolved: `cull_face` now accepts Eden's `0x404`/`0x405`/`0x408` Maxwell encodings.
+- Resolved: floating-point `Size_R16_G16_B16` vertex attributes (`0x05`) now map to
+  `GL_HALF_FLOAT` together with the other three 16-bit floating formats.
+
+### Missing items
+
+- None: all 102 `SURFACE_FORMAT_LIST` entries and every conversion function in the upstream header
+  were compared against the Rust counterpart.
+
+### Binary layout verification
+
+- N/A: this file maps guest register values to host OpenGL enums and exposes no raw-memory payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/maxwell_to_vk.rs` vs Eden `src/video_core/renderer_vulkan/maxwell_to_vk.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses normalized typed Maxwell enums after raw register decoding; Eden's conversion
+  functions accept the corresponding C++ scoped enums directly.
+- `primitive_topology` omits Eden's unused `Device` parameter. The sampler and vertex-format paths
+  retain the device reference because it is part of their upstream ownership and behavior.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Sampler::wrap_mode` no longer sends the invalid `0xcafe` address mode on Nvidia.
+  `Clamp` selects edge for nearest filtering and border for linear filtering on every driver.
+- Resolved: `MirrorOnceClampOGL` returns mirror-clamp-to-edge without an extra warning.
+- Resolved: `vertex_format` again owns the `Device` lookup and always calls
+  `get_supported_format` with `VERTEX_BUFFER` and `FormatType::Buffer`; static and dynamic vertex
+  input creation now both pass their live device owner.
+- Resolved: the obsolete Nvidia and scaled-format snapshots were removed from the texture-cache
+  and rasterizer constructors once those decisions returned to the upstream-owned `Device` paths.
+
+### Missing items
+
+- None in the 112-entry surface-format mapping, transcoding policy, sampler conversions, vertex
+  format table, or remaining Maxwell-to-Vulkan enum conversions.
+
+### Binary layout verification
+
+- N/A: the module returns Vulkan handles/enums and does not copy its Rust structures as raw data.
+
+## 2026-08-26 — `src/video_core/src/memory_manager.rs` vs Eden `src/video_core/memory_manager.{h,cpp}`
+
+### Intentional differences
+
+- The Rust owner graph keeps the device-memory manager in an `Arc` and places the page-table
+  implementation behind the public `MemoryManager` adapter used by channel mutexes. Eden stores
+  direct references and a raw rasterizer pointer in one C++ class.
+- Rasterizer notifications may be deferred by the nvdrv adapter and replayed after releasing the
+  memory-manager mutex. This preserves Eden's effective lock ordering while avoiding the Rust
+  CPU/GPU-thread ABBA cycle.
+- `for_each_mapped_device_segment` is a mechanical borrow-checker adapter around Eden's nested
+  `MemoryOperation` calls. It invokes the rasterizer immediately, in the same page order and with
+  the same chunk sizes; it does not allocate or merge ranges.
+
+### Unintentional differences (to fix)
+
+- Resolved: `FlushRegion`, `InvalidateRegion`, and `IsMemoryDirty` no longer coalesce physically
+  adjacent small pages through `GetSubmappedRangeImpl`; each mapped page produces the same
+  rasterizer call as Eden, and dirty checking stops on the first positive result.
+- Resolved: the continuous-big-page branch of `IsGranularRange` uses Eden's exact
+  `(page_index & big_page_mask) + size` calculation.
+- Resolved: `GetID` and `ModifyGPUMemory` now read the same identifier stored by the actual page
+  table owner instead of maintaining separate outer and inner identifiers.
+- Resolved: `HAS_FLUSH_INVALIDATION` is owned by `MemoryManager`, and the guest-memory adapter
+  references that constant instead of duplicating the literal.
+
+### Missing items
+
+- No upstream public operation is missing after auditing map/sparse-map/unmap, address translation,
+  scalar and block access, range queries, cache invalidation, copy, page-kind/layout queries, and
+  span access.
+
+### Binary layout verification
+
+- N/A: the page tables and range maps are internal host data structures and are not serialized or
+  copied across an ABI boundary.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/nsight_aftermath_tracker.rs` vs Eden `src/video_core/vulkan_common/nsight_aftermath_tracker.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu has no `HAS_NSIGHT_AFTERMATH` build configuration or proprietary NVIDIA SDK bindings, so it
+  implements Eden's header-only unsupported-build path. The SDK-enabled DLL loading, callbacks,
+  shader dumps, crash dumps, and JSON decoding remain platform tooling outside this build.
+
+### Unintentional differences (to fix)
+
+- Resolved: the unsupported-build tracker is now stateless like Eden's `#ifndef
+  HAS_NSIGHT_AFTERMATH` class instead of retaining an unused mutex and initialization flag.
+- Resolved: the non-upstream `is_initialized` method was removed, and the module documentation now
+  names the Eden source tree.
+
+### Missing items
+
+- The proprietary `HAS_NSIGHT_AFTERMATH` implementation is unavailable; the no-SDK constructor,
+  destructor, and `SaveShader` behavior are present.
+
+### Binary layout verification
+
+- N/A: the stub is not passed through a C ABI and stores no state.
+
+## 2026-08-26 — removed `src/video_core/src/renderer_null/null_backend.rs`; factory comparison with Eden `src/video_core/video_core.{h,cpp}`
+
+### Intentional differences
+
+- Eden's anonymous `CreateRenderer` owns backend selection inside `video_core.cpp`. Ruzu's frontend
+  constructs the platform graphics context and concrete renderer before binding it through
+  `video_core::video_core::create_gpu`, because the `video_core` crate does not depend on the SDL/GTK
+  window implementation.
+
+### Unintentional differences (to fix)
+
+- Resolved: the unused `NullBackend`, `BackendType`, and generic `GpuBackend` abstraction was
+  removed. It had no Eden file or call site and duplicated the real `RendererBase` factory path.
+- Resolved: `renderer_null/mod.rs` now only dispatches the two upstream-owned null renderer modules
+  and names the Eden source tree.
+
+### Missing items
+
+- The null selection arm itself is present in the frontend renderer factory and constructs
+  `renderer_null::RendererNull`; no separate null-backend object exists upstream.
+
+### Binary layout verification
+
+- N/A: the removed marker type and trait carried no ABI payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_null/null_rasterizer.rs` vs Eden `src/video_core/renderer_null/null_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu stores the syncpoint manager and a GPU-tick callback instead of Eden's `Tegra::GPU&`,
+  following the existing Rust renderer ownership boundary while preserving the two uses of that
+  reference: `GetTicks()` and Host1x syncpoint increments.
+- Test-only inline-upload and surface-copy controls exercise callers without changing production
+  behavior; non-test builds retain Eden's no-op upload and unconditional successful surface copy.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Query` now writes through the currently bound channel's `MemoryManager`, in Eden's
+  ticks-then-payload order, instead of routing GPU addresses through a global raw-pointer
+  translation callback and the CPU-address guest-memory writer.
+- Resolved: the null draw, texture draw, clear, and compute-dispatch paths are true no-ops without
+  extra trace logging, and `LoadDiskResources` is explicitly implemented by its upstream owner.
+- Resolved: flush-area alignment uses wrapping unsigned arithmetic like C++, stale source-tree
+  references were corrected, and duplicate parameterless DMA image helpers were removed.
+
+### Missing items
+
+- None among the `AccelerateDMA` and `RasterizerNull` overrides declared by Eden.
+
+### Binary layout verification
+
+- N/A: these renderer objects and callbacks are host-only and are not raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/nvdec_common.rs` vs Eden `src/video_core/host1x/nvdec_common.h`
+
+### Intentional differences
+
+- Rust exposes the anonymous C++ register union as one `repr(C)` `u64` array plus named constants
+  and accessors. This avoids unsafe union reads while retaining every named field's exact slot and
+  the complete raw register view used by method dispatch.
+- `VideoCodec` is a transparent `u64` newtype with upstream-named associated constants rather than
+  a Rust enum, because the guest register may contain an unnamed value that C++ preserves through
+  `static_cast`.
+
+### Unintentional differences (to fix)
+
+- Resolved: unknown codec values are no longer collapsed to `None`; their complete 64-bit pattern
+  reaches NVDEC and FFmpeg callers unchanged.
+- Resolved: `ControlParams` owns all five upstream bitfields, and constants/accessors now cover
+  every named NVDEC register, including the H.264, VP8, HVEC, and VP9 scratch-buffer fields that
+  were previously absent from the Rust surface.
+
+### Missing items
+
+- None from `VideoCodec`, `Offset`, `control_params`, or the named `NvdecRegisters` fields.
+
+### Binary layout verification
+
+- PASS: `VideoCodec`, `ControlParams`, and `Offset` are each 8 bytes; `NvdecRegisters` is 0xBC0
+  bytes with 8-byte alignment, and tests verify every named register index from 0x80 through 0x177.
+
+## 2026-08-26 — `src/video_core/src/host1x/nvdec.rs` vs Eden `src/video_core/host1x/nvdec.{h,cpp}`
+
+### Intentional differences
+
+- The Rust Host1x owner supplies `Arc` handles for the frame queue and memory manager instead of a
+  C++ `Host1x&`; `ProcessMethodHook` replaces `CDmaPusher` inheritance. Construction and `Drop`
+  still open and close the same frame-queue identifier.
+- Eden's inherited `Decoder::Decode()` is represented by the decoder-owned Rust free function
+  invoked with each concrete codec variant; the decode implementation remains owned by
+  `host1x/codecs/decoder.rs`.
+
+### Unintentional differences (to fix)
+
+- Resolved: the decoder is again a concrete H264/VP8/VP9/None sum type matching Eden's
+  `std::variant`, and `Execute` dispatches each alternative explicitly and reports the monostate.
+- Resolved: the unused `wait_needed` state and non-upstream 32 ms execution delay were removed;
+  only Eden's 8 ms delay for disabled NVDEC emulation remains.
+- Resolved: per-frame trace instrumentation absent from Eden was removed, and raw unknown codec
+  values are preserved by the corrected `nvdec_common` representation.
+
+### Missing items
+
+- None among construction/destruction, `ProcessMethod`, `CreateDecoder`, `Execute`, and
+  `GetSyncpoint`.
+
+### Binary layout verification
+
+- N/A: `Nvdec` is a host-side polymorphic engine object and is not copied through a guest or C ABI.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/pipeline_helper.rs` vs Eden `src/video_core/renderer_vulkan/pipeline_helper.h`
+
+### Intentional differences
+
+- `DeviceReference` provides the stable non-owning device relationship represented by Eden's
+  `const Device*`, and Rust `Vec` replaces the inline-capacity `small_vector` owners.
+- A missing sampler or image-view slot falls back to the renderer's null resources because Rust's
+  typed slot API exposes lookup failure explicitly; valid descriptor paths follow Eden's handle
+  selection and cursor order.
+
+### Unintentional differences (to fix)
+
+- Resolved: rescaling/render-area constants and layouts are no longer duplicated in
+  `pipeline_helper.rs`. The helper and the graphics/compute consumers now use the definitions owned
+  by `shader_recompiler/backend/spirv/emit_spirv.rs`, matching Eden's `using` declarations.
+- Verified: descriptor type order, descriptor-buffer writes, layout/template flags, push-constant
+  range sizing, image/sampler fallback selection, modification tracking, and rescaling bit packing
+  retain the upstream order and conditions.
+
+### Missing items
+
+- None among the inline helpers, descriptor layout builder, rescaling/render-area state, or image
+  descriptor push path.
+
+### Binary layout verification
+
+- PASS: tests verify the upstream-owned `RescalingLayout` size/alignment (32/16 bytes),
+  `RenderAreaLayout` size (16 bytes), and offsets 0/24/0 used by Vulkan push constants.
+
+## 2026-08-26 — `src/video_core/src/pte_kind.rs` vs Eden `src/video_core/pte_kind.h`
+
+### Intentional differences
+
+- Rust uses a transparent `u8` newtype rather than an enum so raw PTE values remain representable;
+  every named constant and `is_pitch_kind` still maps directly to Eden.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed thirteen named kinds absent from Eden and restored Eden's exact names for
+  `C32_MS2_2CRA`, `C64_MS2_2CRA`, and `SMASKED_MESSAGE`.
+
+### Missing items
+
+- None: all 233 Eden enumerators and `IsPitchKind` are present.
+
+### Binary layout verification
+
+- PASS: `PteKind` is `repr(transparent)` over `u8`; focused tests cover the sparse corrected values
+  and pitch-kind predicate.
+
+## 2026-08-26 — `src/video_core/src/query_cache/query_cache_base.rs` vs Eden `src/video_core/query_cache/query_cache_base.h` and `query_cache.h`
+
+### Intentional differences
+
+- C++ template dependencies are represented by bound Rust trait-object owners; counter, cache,
+  conditional-rendering, and async-flush ordering remains in `QueryCacheBase`.
+
+### Unintentional differences (to fix)
+
+- Resolved: address calculations and query accumulation now retain Eden's unsigned wrapping
+  behavior in debug builds instead of relying on Rust's overflow-checked `+`.
+- Resolved: query-cache module headers now identify the actual Eden source counterparts rather
+  than the stale pre-fork project name.
+
+### Missing items
+
+- The generic lifecycle hooks are present. The Vulkan samples streamer still needs to be wired
+  through the complete `PresyncWrites`/`SyncWrites` lifecycle in its owning backend file.
+
+### Binary layout verification
+
+- PASS: `QueryLocation` remains a 32-bit packed value with a 27-bit query id and 5-bit stream id;
+  the new regression test verifies wrapping accumulation at the `u64` boundary.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/query_cache.rs`, `vk_rasterizer.rs`, and `query_cache/query_cache_base.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}` and `query_cache/query_cache.h`
+
+### Intentional differences
+
+- Vulkan query banks and reports use `Arc` ownership so fence-thread callbacks cannot outlive a
+  bank. Samples reports materialize Eden's bank chain as ordered spans; transform-feedback reports
+  retain a persistently mapped per-bank readback mirror instead of a movable staging-pool slice.
+- The shared query-cache owner exposes the three mechanical WFI phases separately. This lets the
+  Vulkan-owned streamers join the single Eden barrier pair without storing a pointer to the movable
+  Rust rasterizer; `notify_wfi` itself still performs the original phase order unchanged.
+
+### Unintentional differences (to fix)
+
+- Resolved: samples queries now implement Eden's complete pending-sync lifecycle, accumulation
+  checkpoints, reset operations, current-query replication, amendment carry, ordered bank resolve,
+  mobile-driver guard, and post-presync history abandonment.
+- Resolved: the accumulation buffer has Eden's transfer-source usage and is cleared during streamer
+  construction; repeated WFI operations no longer recopy an unbounded history.
+- Resolved: transform-feedback counters now participate in WFI guest-buffer synchronization and
+  async host readback, while primitive queries reuse Eden's last byte-count query and stride when
+  one exists.
+- Resolved: `QueryCacheRuntime` again owns all Vulkan streamers, the conditional-rendering resolve
+  buffer is created on unsupported hosts with only the supported usage flags, and guest-generated
+  and host-buffer sync values share the same page grouping logic.
+
+### Missing items
+
+- A live Vulkan query-pool validation remains necessary because unit tests cannot execute recorded
+  device commands.
+
+### Binary layout verification
+
+- N/A: the corrected query bookkeeping and synchronization payloads are host-only Rust structures;
+  no raw guest or cache serialization layout changed.
+
+## 2026-08-26 — `src/video_core/src/rasterizer_interface.rs` vs Eden `src/video_core/rasterizer_interface.h` and `rasterizer_download_area.h`
+
+### Intentional differences
+
+- Rust passes draw, clear, indirect-draw, and compute snapshots through the trait because the
+  current backend ownership graph does not retain Eden's mutable engine pointers.
+- Query-type arguments remain raw `u32` values so every five-bit hardware report value, including
+  values without a named Rust enum variant, preserves its upstream bit pattern.
+
+### Unintentional differences (to fix)
+
+- Resolved: the rasterizer interface no longer owns a duplicate download-area structure with the
+  corrected spelling `preemptive`; it re-exports the single type owned by
+  `rasterizer_download_area.rs`, including Eden's `preemtive` field spelling.
+- Resolved: `Maxwell3D::process_counter_reset` now maps all four clear-report values to Eden's exact
+  query types instead of sending unrelated numeric counter identifiers.
+
+### Missing items
+
+- None in the rasterizer virtual surface or counter-reset mapping.
+
+### Binary layout verification
+
+- PASS: every rasterizer backend now returns the same `RasterizerDownloadArea` owner with Eden's
+  `u64`, `u64`, `bool` field order; the structure is not copied as a raw guest payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/render_pass_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_render_pass_cache.{h,cpp}`
+
+### Intentional differences
+
+- Vulkan creation failures use `Result` instead of C++ exceptions, and raw `VkRenderPass` handles
+  are destroyed explicitly by `Drop` rather than by Eden's move-only wrapper.
+- Rust uses `HashMap` and growable attachment vectors in place of
+  `ankerl::unordered_dense::map` and `boost::container::static_vector`; key equality and attachment
+  ordering are unchanged and these containers are not externally observable.
+
+### Unintentional differences (to fix)
+
+- Resolved: a render-pass key is now inserted before Vulkan creation. A failed creation leaves a
+  cached null handle, so later lookups return null without retrying, matching Eden's
+  `try_emplace`-before-`CreateRenderPass` lifecycle.
+
+### Missing items
+
+- None in render-pass keying, attachment/reference construction, resolve handling, self-dependency,
+  or cache lifecycle.
+
+### Binary layout verification
+
+- N/A: `RenderPassKey` and cached Vulkan handles are host-only and are not serialized or copied to
+  guest memory.
+
+## 2026-08-26 — `src/video_core/src/renderer_null/renderer_null.rs` vs Eden `src/video_core/renderer_null/renderer_null.{h,cpp}` and `renderer_base.{h,cpp}`
+
+### Intentional differences
+
+- The Rust renderer receives `Arc` callbacks for `GPU::RendererFrameEndNotify` and
+  `EmuWindow::OnFrameDisplayed`, plus the frontend's shared framebuffer layout, instead of retaining
+  mutable references across the renderer/GPU/window ownership cycle.
+
+### Unintentional differences (to fix)
+
+- Resolved: non-empty Null composites now notify frame end and then frame displayed in Eden's exact
+  order; they no longer increment `RendererBase::m_current_frame` or emit a backend-only trace.
+- Resolved: Null construction and `refresh_base_settings` recalculate the live framebuffer layout,
+  and screenshot requests use the inherited base lifecycle instead of immediately reporting
+  failure.
+
+### Missing items
+
+- None in `RendererNull` construction, composite, capture-buffer, vendor, rasterizer access, or
+  inherited renderer-base behavior.
+
+### Binary layout verification
+
+- N/A: renderer state and frontend callback owners are host-only and are not raw guest payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/renderer_opengl.rs` vs Eden `src/video_core/renderer_opengl/renderer_opengl.{h,cpp}` and `renderer_base.cpp`
+
+### Intentional differences
+
+- Rust owns the device, tracker, rasterizer, presentation passes, and context through heap-stable
+  owners and non-owning pointers instead of C++ references; declaration order preserves Eden's
+  effective reverse destruction order.
+- The frontend layout and frame notifications use shared state and callbacks to avoid retaining
+  mutable GPU/window references across the Rust ownership cycle. The callback order remains
+  `RendererFrameEndNotify`, rasterizer tick, swap, then `OnFrameDisplayed`.
+- Construction releases the current context after GL resources are initialized so it can be moved
+  to the renderer thread; Eden's frontend transfers its context through the C++ window owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: OpenGL construction now performs the inherited `RendererBase` framebuffer-layout
+  refresh before entering the backend constructor body.
+- Resolved: an empty composite now returns before reading frontend layout state or making the GL
+  context current, matching Eden's first operation in `Composite`.
+
+### Missing items
+
+- None in construction, composition, telemetry, screenshot rendering, applet capture, debug
+  handling, or inherited base-renderer behavior.
+
+### Binary layout verification
+
+- N/A: the renderer owners, GL handles, and frontend callbacks are host-only and are not serialized
+  or copied as guest payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/present/layer.rs` vs Eden `src/video_core/renderer_opengl/present/layer.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the heap-stable rasterizer through a non-owning pointer and reads device memory
+  through the renderer-owned callback, replacing Eden's two C++ references without moving layer
+  behavior out of its upstream owner.
+- `AntiAlias` represents Eden's `variant<monostate, FXAA, SMAA>`, while `Option<FSR>` represents
+  its optional FSR owner; Rust field order preserves the effective C++ destruction order.
+
+### Unintentional differences (to fix)
+
+- Resolved: the fallback display path now computes `framebuffer.address + framebuffer.offset` with
+  unsigned wraparound. It no longer panics in debug builds where Eden's `DAddr` arithmetic wraps.
+
+### Missing items
+
+- None in render-target preparation, accelerated-display fallback, framebuffer unswizzling/upload,
+  anti-alias selection, FSR application, or presentation vertex construction.
+
+### Binary layout verification
+
+- N/A: `Layer` and `TextureInfo` are host-side GL owners. `ScreenRectVertex`, the buffer payload
+  emitted by this file, is verified separately against Eden's four-`GLfloat` layout.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/renderer_vulkan.rs` vs Eden `src/video_core/renderer_vulkan/renderer_vulkan.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses explicit heap-stable Vulkan owners, shared surface/swapchain synchronization, frontend
+  callbacks, and `Drop` in place of Eden's reference members and `vk::` RAII wrappers. Field and
+  explicit cleanup order preserve Eden's dependent-resource teardown.
+- `current_framebuffer_layout_for_present` reconciles the frontend layout with the cached WSI
+  extent without blocking on the present thread; this is the existing Rust/MoltenVK ownership
+  adaptation and does not change the surrounding `Composite` lifecycle order.
+
+### Unintentional differences (to fix)
+
+- Resolved: construction now performs Eden's inherited `RendererBase` layout refresh first and
+  initializes the swapchain from that live layout rather than a separate drawable-size argument.
+- Resolved: `Composite` now renders screenshots and obtains its render frame before requesting the
+  outside-render-pass context and reading presentation layout/swapchain state, matching Eden's
+  ordering.
+- Resolved: applet-layer rendering now requests an outside-render-pass operation context after
+  lazy frame creation and before `DrawToFrame`.
+- Resolved: screenshots retain the complete requested framebuffer layout instead of replacing its
+  screen rectangle, and their byte-size multiplication preserves Eden's unsigned `u32` wraparound.
+
+### Missing items
+
+- Eden's optional `HAS_LSFG` frame-generation path is not built or exposed by Ruzu.
+
+### Binary layout verification
+
+- N/A: this file owns host Vulkan objects and frontend callbacks; capture pixel buffers use the
+  separately verified capture constants and texture swizzle implementation.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/fence_manager.rs`, `scheduler.rs`, and `vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_fence_manager.{h,cpp}`
+
+### Intentional differences
+
+- Each Rust fence retains a clone of the scheduler-owned semaphore handle for thread-safe
+  `IsFree` and `Wait`, while Eden retains a `Scheduler&`. `Queue` receives the live mutable
+  scheduler because the complete Rust scheduler is owned by and moves with the rasterizer.
+
+### Unintentional differences (to fix)
+
+- Resolved: `InnerFence::queue` now captures `Scheduler::current_tick` and flushes in that order;
+  this behavior no longer belongs to `RasterizerVulkan`.
+- Resolved: `InnerFence::is_signaled` and `InnerFence::wait` now own the scheduler synchronization
+  queries, and the Vulkan fence-manager overrides delegate directly to the inner fence.
+- Resolved: the Rust-only public `wait_tick` and `is_stubbed` accessors were removed after their
+  rasterizer-side callers were eliminated.
+
+### Missing items
+
+- None in Vulkan fence creation, queuing, completion checks, or waiting.
+
+### Binary layout verification
+
+- N/A: Vulkan fences and scheduler synchronization handles are host-only owners and are not raw
+  guest payloads.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/samples_helper.rs` and `image_info.rs` vs Eden `src/video_core/texture_cache/samples_helper.h` and `image_info.cpp`
+
+### Intentional differences
+
+- Invalid raw MSAA values follow Ruzu's existing fail-soft assertion policy before selecting
+  `Msaa1x1`; valid modes are passed to the helpers without conversion.
+
+### Unintentional differences (to fix)
+
+- Resolved: `samples_helper.rs` no longer owns a duplicate `MsaaMode` enum left from the early
+  texture-port scaffold. It consumes `textures::texture::MsaaMode`, matching Eden's include and
+  type ownership, and `image_info.rs` decodes directly to that canonical type.
+
+### Missing items
+
+- None in sample-count or sample-dimension conversion.
+
+### Binary layout verification
+
+- PASS: the canonical `MsaaMode` remains `repr(u32)` with every Eden discriminant unchanged;
+  focused tests exercise all eleven valid modes through all three sample helpers.
+
+## 2026-08-26 — `src/video_core/src/lib.rs` module tree vs Eden `src/video_core`
+
+### Intentional differences
+
+- Rust uses `lib.rs` module declarations in place of C++ build-system source lists.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the unused root `swapchain.rs` phase-one stub and its module declaration. Eden
+  has no root `video_core/swapchain.*`; the implemented swapchain remains owned by
+  `renderer_vulkan/swapchain.rs`.
+- Resolved: removed the isolated root `shader/{mod,decoder,interpreter}.rs` software-interpreter
+  prototype and its only consumer, the unused root `rasterizer.rs` CPU-renderer prototype. Neither
+  had runtime callers or an Eden counterpart; configured rendering remains owned by the mirrored
+  OpenGL, Vulkan, and Null backends, and Maxwell shader translation by `shader_recompiler`.
+- Resolved: removed the unused root `swizzle.rs` CPU detiling prototype. Eden has no matching root
+  module, and Ruzu's live GOB paths remain owned by the mirrored `textures/decoders.rs` and
+  `texture_cache/accelerated_swizzle.rs` modules.
+- Resolved: removed the unused root `syncpoint.rs` prototype. Eden owns this functionality only in
+  `host1x/syncpoint_manager.{h,cpp}`, and every live Ruzu caller already uses the corresponding
+  `host1x/syncpoint_manager.rs` implementation.
+
+### Missing items
+
+- None introduced by removing the unreachable scaffold.
+
+### Binary layout verification
+
+- N/A: the removed types were unused host-only placeholder state.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden `src/video_core/vulkan_common/vulkan_memory_allocator.{h,cpp}` (remaining buffer paths)
+
+### Intentional differences
+
+- Rust exposes `AllocatedBuffer` instead of Eden's move-only `vk::Buffer` wrapper; it owns the VMA
+  allocation and destroys buffer plus allocation together.
+- Rust owners call `AllocatedBuffer::handle()` when ash requires a raw `VkBuffer`; the owning
+  wrapper remains in the same query, texture, turbo, staging, cache, or presentation object that
+  owns Eden's move-only `vk::Buffer`.
+- Rust retains Eden's `[[maybe_unused]] MemoryUsagePropertyFlags` helper and allocator-owned device
+  state with local dead-code annotations because ash/VMA wrappers carry the handles used at runtime.
+
+### Unintentional differences (to fix)
+
+- Resolved: raw-handle buffers now use VMA `create_buffer` with `WITHIN_BUDGET`, the same
+  usage/mapping flags, memory-type mask, preferred flags, and ANV stream workaround as Eden.
+- Resolved: persistently mapped upload/download buffers now reuse the VMA-owning buffer path;
+  flush and invalidate operate on the VMA allocation instead of dedicated `VkDeviceMemory`.
+- Resolved: raw-handle destruction and allocator teardown call VMA `destroy_buffer` rather than
+  pairing `vkDestroyBuffer` with a dedicated `vkFreeMemory` allocation.
+- Resolved: removed the allocator-global retained-buffer registry. `MemoryAllocator::create_buffer`
+  now has one canonical owning return type, and every VMA allocation is destroyed by the field that
+  owns the corresponding buffer lifecycle.
+- Resolved: renamed the VMA image factory from the Rust-only `create_owned_image` spelling to the
+  direct `create_image` counterpart of Eden's `CreateImage`.
+- Resolved: removed the Rust-only `create_mapped_buffer` factory and its extra host-visible failure
+  branch. Upload and download callers now use Eden's single `CreateBuffer` allocation path; callers
+  that require mapping consume the mapped span carried by that same owning wrapper.
+- Resolved: removed the `MappedBuffer` type alias. Device-local, upload, download, and stream
+  allocations now all visibly use the same `AllocatedBuffer` type, mirroring Eden's single
+  `vk::Buffer` owner.
+- Resolved: removed the unused `MemoryPropertyFlags` and `FindType` methods; current Eden has no
+  such allocator methods and its VMA paths do not call them.
+
+### Missing items
+
+- Resolved by the later 2026-08-26 GPU-memory logging entry.
+
+### Binary layout verification
+
+- N/A: these are host Vulkan/VMA ownership wrappers and are not serialized or guest-visible.
+
+## 2026-08-26 — Vulkan buffer owners vs Eden renderer Vulkan buffer ownership
+
+### Intentional differences
+
+- Ash command and descriptor APIs consume copied raw handles, so Ruzu extracts those handles from
+  `AllocatedBuffer` before recording closures. The owning wrapper remains in the enclosing object
+  for the same lifetime as Eden's `vk::Buffer` member.
+- `TurboResources` uses `Option<AllocatedBuffer>` during fallible staged initialization; it drops
+  the buffer explicitly after `device_wait_idle` and before the dedicated Vulkan device owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: query scan, accumulation, transform-feedback, and conditional-resolve buffers are now
+  owned by `query_cache.rs` instead of an allocator-global registry.
+- Resolved: temporary texture buffers and per-image compute-unswizzle buffers are now owned by
+  `texture_cache.rs`; image views are destroyed before the unswizzle field is released, matching
+  Eden's `Image` destruction order.
+- Resolved: turbo, staging, buffer-cache, layer, and presentation utility allocations all use the
+  canonical owning `MemoryAllocator::create_buffer` path.
+- Resolved: presentation, texture-cache, and present-manager image allocations use the canonical
+  owning `MemoryAllocator::create_image` path; no second Rust-only image factory remains.
+
+### Missing items
+
+- GPU allocation/deallocation logging remains unavailable with the unported GPU logger.
+
+### Binary layout verification
+
+- N/A: these are host-only Vulkan handles and VMA allocations, not raw-copied guest payloads.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (channel cache locking)
+
+### Intentional differences
+
+- Ruzu's texture and buffer caches use separate `parking_lot::ReentrantMutex` values. The local
+  two-lock retry helper supplies Eden's deadlock-safe `std::scoped_lock` behavior without changing
+  cache ownership or the texture-before-buffer operation order.
+- The separate Rust `StateTracker` releases its per-channel table before the channel caches are
+  erased; this owner has no direct counterpart call in Eden's rasterizer method.
+
+### Unintentional differences (to fix)
+
+- Resolved: channel creation, binding, and release now hold the buffer-cache and texture-cache
+  mutexes together around both cache operations, matching Eden's lifecycle synchronization.
+- Resolved: fallback flush areas now use the shared 0x1000 device-page constant and common
+  alignment helpers instead of a private literal. The end-address addition preserves unsigned
+  wraparound before alignment.
+
+### Missing items
+
+- Resolved by the later 2026-08-26 rasterizer GPU-logging entry.
+
+### Binary layout verification
+
+- N/A: this changes host-side locking and address alignment only.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.{h,cpp}`
+
+### Intentional differences
+
+- Ash owns dynamic-loader resolution and returns an `Entry`; Eden retains a shared
+  `Common::DynamicLibrary` and fills its dispatch table separately.
+- The Android frontend-provided driver-library path is not available in Ruzu's current frontend
+  interface.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the development-only hard-coded lookup into a separate Eden build tree on
+  macOS. Explicit `LIBVULKAN_PATH`, the active application bundle, and the system loader remain the
+  only library sources.
+
+### Missing items
+
+- Android frontend-owned driver-library injection remains unported.
+
+### Binary layout verification
+
+- N/A: this change selects a host dynamic library and does not define a shared binary payload.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`
+
+### Intentional differences
+
+- Validation messages are routed through Rust's logging facade before the GPU logger; this is the
+  Rust counterpart of Eden's standard logging macros.
+
+### Unintentional differences (to fix)
+
+- Resolved: the Android false-positive ID for `vkCmdSetLogicOpEXT` is `0x1257b492`, exactly as in
+  Eden. The previous Rust constant had dropped the final hexadecimal digit and matched a different
+  message ID.
+
+### Missing items
+
+- Resolved by the later 2026-08-26 callback entry after the GPU logger was ported.
+
+### Binary layout verification
+
+- N/A: the callback consumes Vulkan-owned ABI structures without copying or serializing them.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` vs Eden `src/video_core/vulkan_common/vulkan_instance.cpp`
+
+### Intentional differences
+
+- Rust creates the instance synchronously through ash instead of wrapping creation in
+  `std::async(...).get()`; ash owns the loader dispatch and does not expose Eden's dynamic-library
+  locking boundary.
+- Application and engine names identify Ruzu while preserving Eden's version and API metadata
+  fields.
+
+### Unintentional differences (to fix)
+
+- Resolved: optional-extension probing and final required-extension validation now consume one
+  shared enumeration snapshot, preserving Eden's protection against inconsistent consecutive
+  extension queries on affected drivers.
+- Resolved: `VkApplicationInfo::apiVersion` now receives the Vulkan version reported by the loader
+  instead of an unconditional Vulkan 1.3 value.
+- Resolved: extension discovery and validation precede the available-version check in the same
+  lifecycle order as Eden.
+
+### Missing items
+
+- None in extension selection, validation-layer filtering, version validation, or platform
+  instance flags.
+
+### Binary layout verification
+
+- N/A: Vulkan ABI payloads are constructed by ash and are not serialized by Ruzu.
+
+## 2026-08-26 — `src/video_core/src/textures/workers.rs` vs Eden `src/video_core/textures/workers.{h,cpp}` and `src/common/thread_worker.h`
+
+### Intentional differences
+
+- Rust uses `Mutex`/`Condvar`, boxed `FnOnce` jobs, and joined `std::thread` handles in place of
+  Eden's `UniqueFunction`, `condition_variable_any`, and `std::jthread` stop tokens.
+
+### Unintentional differences (to fix)
+
+- Resolved: queued texture jobs are consumed FIFO through `VecDeque::pop_front`, matching Eden's
+  `std::queue::front/pop`, instead of the previous LIFO `Vec::pop` order.
+- Resolved: completion waits compare monotonically increasing scheduled and completed counts, as
+  Eden does. This closes the interval in which the queue was empty but a removed request had not
+  yet incremented Ruzu's former active counter.
+
+### Missing items
+
+- None for the texture worker singleton, worker count, queueing, completion waits, or teardown.
+
+### Binary layout verification
+
+- N/A: work queues and closures are host-only state.
+
+## 2026-08-26 — `src/video_core/src/host1x/syncpoint_manager.rs` vs Eden `src/video_core/host1x/syncpoint_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents Eden's stable `std::list` iterators with monotonic action identifiers and returns
+  `Option<ActionHandle>` for Eden's nullable/default iterator.
+- Rust stores the action lists under the same mutex as the condition-variable guard because
+  `std::sync::Condvar` waits on a mutex guard; guest and host values remain separate atomics.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed environment-controlled syncpoint logging, stderr output, and trace events from
+  registration, increment, action dispatch, and waits. Eden performs only the synchronization and
+  callback operations in this owner.
+
+### Missing items
+
+- None in guest/host value access, action registration and deregistration, increments, readiness,
+  or blocking waits.
+
+### Binary layout verification
+
+- N/A: this is host-only synchronization state and is never copied or serialized as raw bytes.
+
+## 2026-08-26 — `src/video_core/src/shader_cache.rs` and `shader_environment.rs` vs Eden `src/video_core/shader_cache.{h,cpp}` and `shader_environment.{h,cpp}`
+
+### Intentional differences
+
+- Rust returns `Option` where Eden returns nullable pointers and uses owned `Box` values plus raw
+  stable pointers to reproduce `unique_ptr` storage ownership.
+- Rust validates missing channel owners and GPU-memory readers because these are optional during
+  isolated tests; the live renderer installs the same owners Eden keeps as references.
+
+### Unintentional differences (to fix)
+
+- Resolved: disabled and non-rasterized shader stages now clear only their unique hash and preserve
+  the cached shader-info slot, matching Eden's `RefreshStages` lifecycle.
+- Resolved: pending-removal and invalidation-page membership now enforce Eden's assertions instead
+  of silently accepting an internally inconsistent shader cache.
+- Resolved: removed the Rust-only shader-stage stall counters and shader-word/analyzer environment
+  tracing from cache refresh, registration, CFG sizing, sentinel lookup, and constant-buffer reads.
+
+### Missing items
+
+- None in the methods changed by this parity pass.
+
+### Binary layout verification
+
+- N/A: these cache entries and environments are host-owned; on-disk environment serialization was
+  not changed by this pass.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/swapchain.rs` vs Eden `src/video_core/renderer_vulkan/vk_swapchain.{h,cpp}`
+
+### Intentional differences
+
+- Eden's frame-generation override is absent because Ruzu does not port that subsystem.
+
+### Unintentional differences (to fix)
+
+- Resolved: Turbo speed mode now unlocks FIFO/FIFO-relaxed presentation and selects Mailbox or
+  Immediate when available, matching `ChooseSwapPresentMode`.
+- Resolved: unavailable Immediate mode now falls back through Mailbox before FIFO, preserving
+  Eden's ordered fallback.
+- Resolved: mutable swapchain view formats now place the selected base surface format first and
+  include the additional RGBA formats on Android.
+
+### Missing items
+
+- Frame-generation-specific presentation policy remains absent with its unported subsystem.
+
+### Binary layout verification
+
+- N/A: Vulkan create-info structures are built through `ash`; the view-format order and count now
+  match Eden on each target.
+
+## 2026-08-26 — `src/video_core/src/engines/sw_blitter/converter.rs` vs Eden `src/video_core/engines/sw_blitter/converter.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu retains the correct FP16 mantissa mask `0x03ff` when unpacking 16-bit floats. Eden uses its
+  sign mask `0x8000` a second time, which discards all ten mantissa bits; reproducing that apparent
+  copy/paste error would corrupt ordinary non-integral FP16 values.
+
+### Unintentional differences (to fix)
+
+- None identified in this focused decision.
+
+### Missing items
+
+- None introduced by retaining the correct FP16 conversion.
+
+### Binary layout verification
+
+- N/A: conversion operates on explicitly decoded scalar words rather than raw host struct copies.
+
+## 2026-08-26 — Vulkan scheduler tick consumers vs Eden `vk_scheduler.h`, `vk_texture_cache.cpp`, and `vk_query_cache.cpp`
+
+### Intentional differences
+
+- None for retrieval of the scheduler's current command-buffer tick.
+
+### Unintentional differences (to fix)
+
+- Resolved: removed the Rust-only `Scheduler::pending_tick` synonym. Texture lifetime tracking and
+  transform-feedback query-bank reservation now call `Scheduler::current_tick` directly, matching
+  Eden's `Scheduler::CurrentTick()` call sites and ownership.
+
+### Missing items
+
+- None for these tick consumers.
+
+### Binary layout verification
+
+- N/A: the change removes an API synonym and preserves the same `u64` timeline value.
+
+## 2026-08-26 — `src/video_core/src/engines/{mod,maxwell_3d,maxwell_dma}.rs`, `dirty_flags.rs`, and `macro.rs` vs Eden engine register ownership
+
+### Intentional differences
+
+- Maxwell3D and MaxwellDMA retain file-local `PendingWrite` payloads for Ruzu's deferred
+  guest-memory integration. Eden writes through engine-owned guest-memory guards instead; keeping
+  the adaptation in each concrete engine preserves the upstream ownership boundary.
+
+### Unintentional differences (to fix)
+
+- Resolved: the catch-all `engines/mod.rs` no longer owns one shared 0xE00 register count.
+  Maxwell3D owns `NUM_REGS = 0xE00`, while MaxwellDMA owns `NUM_REGS = 0x800`, exactly where and
+  with the values declared by Eden.
+- Resolved: dirty-state tables and macro register reads now refer explicitly to Maxwell3D's
+  register count instead of an engine-global constant.
+
+### Missing items
+
+- None in the reviewed register-count ownership slice.
+
+### Binary layout verification
+
+- PASS: focused tests verify that the Maxwell3D and MaxwellDMA register arrays contain 0xE00 and
+  0x800 `u32` entries respectively, matching Eden's `Regs` unions.
+
+## 2026-08-26 — `src/video_core/src/gpu_logging/*.rs` and GPU-log settings vs Eden `src/video_core/gpu_logging/*.{h,cpp}` and `common/settings{,_enums}.h`
+
+### Intentional differences
+
+- Rust uses one `OnceLock<GpuLogger>` plus internal mutexes and atomics instead of Eden's leaked
+  raw singleton pointer and independently locked mutable members. Ring-buffer, memory, extension,
+  file, and captured-state ownership remain separate, matching Eden's synchronization domains.
+- Log filenames and headers use the Ruzu product name. File and directory ownership uses
+  `std::fs` and `RuzuPath` rather than Eden's `IOFile` and `EdenPath` wrappers.
+- Rust hashes its thread identifier with `DefaultHasher`; Eden uses the implementation-defined
+  `std::hash<std::thread::id>`. The value is diagnostic only and remains a `u32` in each log entry.
+- Rust locks both statistics domains while formatting `get_statistics`. Eden locks only its memory
+  mutex while also reading the Vulkan-call counter written under a different mutex; reproducing
+  that data race would be incorrect.
+- Eden declares a private `RotateLogFile` method but provides no definition or caller. Rust omits
+  that non-executable declaration and ports the actual inline rotation performed by `Initialize`.
+- Android environment setup uses Rust's process-environment API; Qualcomm remains the same
+  explicit future-integration stub as Eden.
+
+### Unintentional differences (to fix)
+
+- None after porting logger initialization/shutdown, ring-buffer ordering, memory accounting,
+  shader dumps, pipeline/extension/render-pass logging, state snapshots, crash dumps, driver
+  stubs, and all six GPU-log settings with Eden's defaults and enum discriminants.
+
+### Missing items
+
+- Runtime Vulkan call sites are wired in their corresponding file-level audit slices; this entry
+  covers the logger subsystem and its settings prerequisite only.
+
+### Binary layout verification
+
+- N/A: logger entries and snapshots are host-only diagnostic data copied field-by-field. Focused
+  tests verify enum discriminants, shader-stage names, unit formatting, snapshot section ordering,
+  and the exact settings defaults.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` GPU logging lifecycle vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's loaded-extension owner is a `BTreeSet`, so the diagnostic extension list is sorted rather
+  than retaining Eden's vector insertion order. Classification into Qualcomm and standard groups,
+  all extension names, and the total count are unchanged.
+- Vulkan fixed-size character arrays are decoded through `CStr::to_string_lossy`; valid driver
+  strings are byte-for-byte unchanged while invalid UTF-8 is made printable for the diagnostic log.
+- Rust `Drop` calls `shutdown_gpu_logging` before automatic field destruction. This preserves
+  Eden's destructor order: logger shutdown precedes VMA allocator and logical-device destruction.
+
+### Unintentional differences (to fix)
+
+- None after restoring `initialize_gpu_logging`/`shutdown_gpu_logging`, driver classification,
+  logger feature configuration, driver/version/device metadata, extension reporting, and their
+  constructor/destructor call order.
+
+### Missing items
+
+- None in the audited `Device` GPU-logging lifecycle.
+
+### Binary layout verification
+
+- N/A: this lifecycle only reads Vulkan-owned property structures field-by-field and writes
+  host-side diagnostics.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` GPU logger routing vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`
+
+### Intentional differences
+
+- Vulkan strings must enter Ruzu's UTF-8 `str` logging interfaces. Invalid message text retains
+  the existing printable placeholder, while an invalid message-ID name falls back to Eden's
+  `VulkanDebug` generic name; valid Vulkan strings are forwarded unchanged.
+- Rust's ash callback flag types use `contains` in place of Eden's bitwise flag tests, preserving
+  Eden's Validation-before-Performance message-type priority and severity priority.
+
+### Unintentional differences (to fix)
+
+- None after restoring Vulkan validation forwarding, message-type prefixes, message-ID call names,
+  the `-1` error / `-2` warning / `0` other result mapping, and both runtime enablement guards.
+
+### Missing items
+
+- None in the audited debug-callback GPU-logging path.
+
+### Binary layout verification
+
+- PASS: the callback consumes ash's Vulkan ABI structure in place. No Vulkan payload is copied or
+  serialized, and the callback continues returning `VK_FALSE` on every path.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` GPU memory tracking vs Eden `src/video_core/vulkan_common/vulkan_memory_allocator.{h,cpp}`
+
+### Intentional differences
+
+- Eden converts opaque `VkDeviceMemory` handles with `reinterpret_cast<uintptr_t>`; ash exposes the
+  same opaque bits through `Handle::as_raw`, then Rust casts them to `usize` for the logger key.
+- Ruzu releases its externally synchronized VMA mutex immediately after retrieving allocation
+  metadata and before entering the independent GPU logger. Eden's VMA calls do not require this
+  Rust mutex, while the allocation/logging order is unchanged.
+
+### Unintentional differences (to fix)
+
+- None after restoring `MemoryCommit` allocation/deallocation tracking and VMA image/buffer
+  allocation tracking with Eden's exact enablement guards, sizes, memory handles, and flag values.
+
+### Missing items
+
+- None in the audited allocator GPU-memory logging path. As in Eden, explicit deallocation logging
+  belongs only to `MemoryCommit::Release`; the VMA-owning image and buffer wrappers do not add
+  extra logger calls during destruction.
+
+### Binary layout verification
+
+- PASS: `VkDeviceMemory` handle bits and `VkMemoryPropertyFlags` raw bits are forwarded without
+  reinterpretation. A focused regression verifies the opaque handle conversion.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/scheduler.rs` GPU logging hooks vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
+
+### Intentional differences
+
+- The Rust scheduler formats Eden's render-pass diagnostic through a file-local mechanical helper
+  so its exact `renderArea=<w>x<h>, numImages=<n>` payload can be regression-tested.
+- Queue submission runs on Ruzu's Rust worker context rather than Eden's captured scheduler
+  closure; the successful-submit logger call remains under the same submission mutex and follows
+  the same master-semaphore call.
+
+### Unintentional differences (to fix)
+
+- None after restoring render-pass begin/end logging and successful `vkQueueSubmit` logging with
+  Eden's exact runtime guards, payloads, result code, and lifecycle ordering.
+
+### Missing items
+
+- None in the audited scheduler GPU-logging path. The separate Android worker-topology dependency
+  remains recorded in the earlier full scheduler audit.
+
+### Binary layout verification
+
+- N/A: scheduler diagnostics consume host-side Vulkan state and do not alter command or guest
+  payload layouts. A focused test verifies the exact render-pass log string.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` GPU logging hooks vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's direct and indirect draws share `prepare_draw`, so the two Eden inline formatting blocks
+  are represented by file-local, call-specific helpers. They preserve method ownership and make
+  the exact call names and parameter strings directly testable.
+- Vulkan success is forwarded through ash's `vk::Result::SUCCESS.as_raw()` rather than Eden's
+  `VK_SUCCESS`; both pass the same signed integer zero to the logger.
+
+### Unintentional differences (to fix)
+
+- None after restoring direct draw, plain indirect draw, direct compute-dispatch, and transform-
+  feedback extension logging with Eden's exact branch placement and runtime guards.
+
+### Missing items
+
+- None in the audited rasterizer GPU-logging path. Matching Eden, byte-count draws, count-buffer
+  draws, and indirect compute dispatches return before the corresponding direct-path log hooks.
+
+### Binary layout verification
+
+- N/A: the hooks only format already-decoded host draw state. Focused tests verify indexed draw,
+  indirect draw, and dispatch payloads byte-for-byte against Eden's format strings.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` border-color-swizzle prerequisite vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu retains the validated extension bit and `borderColorSwizzleFromImage` bit as Rust booleans
+  after device creation rather than retaining Eden's feature-chain aggregate. The queried ash
+  payload remains in the logical-device `pNext` chain until `vkCreateDevice` returns.
+- The suitability predicate is mechanically extracted into a file-local function so all four
+  upstream requirements can be covered by a focused regression test without a Vulkan device.
+
+### Unintentional differences (to fix)
+
+- None after restoring extension discovery, feature querying, the dependency on usable custom
+  border colors and both swizzle feature bits, Qualcomm/Turnip filtering, logical-device
+  enablement, and the two upstream accessors.
+
+### Missing items
+
+- None for `VK_EXT_border_color_swizzle` capability discovery and publication.
+
+### Binary layout verification
+
+- PASS: ash owns the Vulkan ABI definition of `VkPhysicalDeviceBorderColorSwizzleFeaturesEXT`;
+  Ruzu uses that structure directly in both the physical-device query and logical-device feature
+  chains, without copying or serializing its bytes.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` sampler extension logging vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- The two inline Eden predicates are represented by a file-local fixed-size array helper so their
+  exact enablement and custom-border-before-swizzle order can be tested without constructing a
+  Vulkan sampler. Each enabled branch still queries the logger state separately, as Eden does.
+- Ruzu's validated `custom_border_color_supported` boolean combines Eden's extension,
+  `customBorderColors`, and `customBorderColorWithoutFormat` checks during device discovery.
+
+### Unintentional differences (to fix)
+
+- None after restoring `VK_EXT_custom_border_color` and `VK_EXT_border_color_swizzle` usage logs
+  in the sampler constructor, before reduction-mode conversion and exactly once per cached sampler
+  rather than once per derived Vulkan sampler handle.
+
+### Missing items
+
+- None in the audited `Sampler::Sampler` extension-usage path. The report's broader image,
+  transfer, blit, and layout-transition review remains part of the continuing texture-cache audit.
+
+### Binary layout verification
+
+- N/A: these hooks inspect host capability booleans and emit diagnostic strings; sampler create
+  structures and guest texture descriptors are unchanged. A focused test covers both guards and
+  their upstream order.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/texture_cache.rs` blit ownership vs Eden `src/video_core/texture_cache/texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses Eden's compile-time `TextureCache<P>` runtime call through a
+  `TextureCacheParams::blit_image` policy method. The common cache still owns every decision and
+  constructed object; the policy implementations only unwrap the concrete OpenGL/Vulkan objects
+  and invoke the corresponding backend runtime operation.
+- Vulkan passes copyable framebuffer state to its blit helper because Rust cannot retain Eden's
+  mutable framebuffer/view references while also borrowing the runtime. OpenGL forwards the
+  framebuffer handles and buffer masks from the common cache's typed framebuffer slots.
+- `get_framebuffer_id` is fallible for Vulkan, so common `blit_image` returns `false` if framebuffer
+  construction fails. Eden propagates the equivalent Vulkan construction failure by exception.
+
+### Unintentional differences (to fix)
+
+- None after moving `GetBlitImages`, `BlitImage`, and `RenderTargetFromImage` back into the common
+  texture-cache owner, removing the duplicated backend control flow, and making both rasterizers
+  delegate without injecting GPU-memory callbacks.
+- None after matching Eden's unmapped-address behavior: `FindImage` does not see fake CPU ranges,
+  and each failed translation followed by `InsertImage` consumes a new aligned segment of
+  `virtual_invalid_space`.
+
+### Missing items
+
+- None in the audited `GetBlitImages`, `BlitImage`, `RenderTargetFromImage`, `FindImage`, and
+  `InsertImage` slice. The rest of the large common texture-cache report remains under sequential
+  audit and is not declared complete by this entry.
+
+### Binary layout verification
+
+- N/A: the change moves host-side ownership and control flow. `Region2D`, `RenderTargets`, image
+  IDs, image-view IDs, and framebuffer IDs retain their existing layouts; no guest payload or
+  serialized cache structure changed.
+
+## 2026-08-26 — `src/common/src/thread.rs` and `thread_worker.rs` vs Eden `src/common/thread.{h,cpp}` and `thread_worker.h`
+
+### Intentional differences
+
+- Rust's `std::thread::Builder` owns thread naming instead of calling
+  `Common::SetCurrentThreadName` from inside the worker. Placement is still applied before the
+  per-thread state maker runs.
+- The Android ADPF/core-affinity bodies remain no-ops because the Android JNI integration is an
+  explicit port exception. Desktop hosts follow Eden's no-op affinity branches, while every
+  non-default placement still lowers the worker priority first.
+
+### Unintentional differences (to fix)
+
+- None after restoring `ThreadPlacement::{Default,Background,Efficiency}`, the placement-aware
+  worker constructor, Eden's low-priority ordering, and the per-placement routing.
+
+### Missing items
+
+- None in the audited `StatefulThreadWorker` placement contract on supported desktop hosts.
+
+### Binary layout verification
+
+- PASS: `ThreadPlacement` is `repr(u32)` with Eden's exact discriminants 0, 1, and 2. It is
+  host-only state and is not serialized.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/texture_cache_base.rs`, `texture_cache.rs`, and `util.rs` storage ownership vs Eden `src/video_core/texture_cache/texture_cache_base.h`, `texture_cache.{h,cpp}`, and `util.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps per-address-space GPU page tables in a `Vec` and stores stable indices in channel
+  state rather than retaining pointers into Eden's `std::deque`. The indices preserve the same
+  shared address-space ownership without self-referential Rust pointers.
+- `AsyncDecodeContext` is held by `Arc` while its queued closure runs, and its decoded bytes and
+  copy list share one mutex-protected output object. Eden retains a `unique_ptr`, passes a raw
+  pointer to the worker, and uses the mutex as the publication boundary; completion ordering and
+  object lifetime remain equivalent.
+- `sparse_views` names its inline values `ImageMapId`, because both ports insert IDs from
+  `slot_map_views`. Eden's header spells the alias `ImageViewId`; both aliases are the same
+  `SlotId`, and Eden's implementation indexes `slot_map_views` with the stored values.
+- Ruzu builds the supported desktop/non-`YUZU_LEGACY` profile, so the 4-GiB threshold and eight-
+  tick destruction rings match that Eden configuration. Eden's current CMake labels
+  `YUZU_LEGACY` Android-only, and the Android frontend is an explicit port exception.
+
+### Unintentional differences (to fix)
+
+- None after restoring `ScratchBuffer<u8>` for decoded, swizzle, and unswizzle storage;
+  `SmallVec` inline capacities 16 and 4 for sparse/decode and join state; and the dedicated
+  `Common::ThreadWorker` with `ThreadPlacement::Efficiency` for texture decoding.
+
+### Missing items
+
+- None in the audited constants, associated backend types, per-channel descriptor state, slot
+  storage, page tables, download queues, LRU/destruction state, unswizzle state, or join-cache
+  fields of `TextureCache<P>`.
+
+### Binary layout verification
+
+- N/A: these are host-side containers rather than raw guest or disk payloads. Focused tests pin
+  the upstream inline capacities, initial scratch sizes, common worker owner, and existing cache
+  lifecycle behavior.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/types.rs` vs Eden `src/video_core/texture_cache/types.h`
+
+### Intentional differences
+
+- Rust represents Eden's flag enum and generated bitwise operators with a `u32`-backed
+  `bitflags` type. Its four bit positions and combined mask remain identical.
+- C++ comparison operators are represented by the corresponding Rust equality, ordering, and
+  hashing derives where the structures expose those operations.
+
+### Unintentional differences (to fix)
+
+- None after restoring `MAX_MIP_LEVELS` from 14 to Eden's 16. This also restores the length of
+  `LevelArray` and `ImageBase::mip_level_offsets`, so levels 14 and 15 are no longer rejected or
+  omitted by the common texture-cache storage.
+
+### Missing items
+
+- None. All constants, slot-ID aliases, enumerations, flags, geometry structures, subresource
+  structures, and copy/swizzle descriptors from the upstream header are present in this owner.
+
+### Binary layout verification
+
+- PASS: focused tests pin every fixed structure's size and the field offsets of `ImageCopy`.
+  Pointer-width-specific tests pin the 64-bit layouts and field offsets of `BufferImageCopy`,
+  `BufferCopy`, and `SwizzleParameters`, plus their expected 32-bit sizes.
+
+## 2026-08-26 — `src/video_core/src/texture_cache/util.rs`, `image_base.rs`, and `texture_cache_base.rs` vs Eden `src/video_core/texture_cache/util.{h,cpp}`, `image_base.{h,cpp}`, and `texture_cache.h`
+
+### Intentional differences
+
+- `UnswizzleImage` consumes bytes already read by the common cache, and `SwizzleImage` receives
+  read/write callbacks. Eden passes `Tegra::MemoryManager` directly; the Rust split avoids holding
+  a memory-manager lock across mutable texture-cache borrows while preserving the same unsafe
+  read, read-modify-write, guest-offset, and layer ordering.
+- `is_valid_entry_with_range_valid` is a mechanical callback form used while the common cache
+  already owns the channel-memory lock; it performs Eden's address-only translation followed by
+  the exact sized-range translation in the same order.
+- Rust rejects undersized spans and mip counts that would make slice indexing out of bounds after
+  Eden's fail-soft assertion. Valid inputs retain Eden's behavior without reproducing C++ undefined
+  behavior. It also returns early for an invalid zero-byte pixel format before invoking decoders;
+  Eden relies on callers never supplying that invalid format.
+- `CommonTextureCacheParams`, the backend-neutral Rust test policy, now allocates the requested
+  mapped staging span. Eden always obtains such a span from a concrete renderer runtime; this
+  target-only policy keeps common-cache tests subject to that same contract.
+- Eden's `FixSmallVectorADL` works around a Boost/GCC 12 ADL defect. Rust has no Boost range
+  niebloids, so no equivalent compatibility copy is required.
+
+### Unintentional differences (to fix)
+
+- None after restoring `NumBlocks`, `AdjustSize`, `CalculateLevelOffset`,
+  `SwizzlePitchLinearImage`, and `SwizzleBlockLinearImage` as their upstream-owned helpers and
+  routing their callers through them.
+- None after restoring Eden's layer-size/stride calculation, 16-level bounds and error behavior,
+  linear mip-size behavior, generic alignment arithmetic, fail-soft invariants, value-initialized
+  image-view fallback, and unsigned integer bit patterns.
+- None after restoring 3D mip-depth reduction and slice bounds in overlap/subresource checks,
+  block-linear swizzle's default stride alignment of one, reusable ASTC decode scratch storage,
+  exact pitch-linear offsets, and full-span processing instead of silent truncation.
+- None after replacing heap-first `Vec` results and `ImageBase` slice storage with the upstream
+  16-element inline `SmallVec` containers.
+
+### Missing items
+
+- None in the audited `util.h`/`util.cpp` API, private helper set, image-layout calculations,
+  copy generation, conversion, swizzle/unswizzle, overlap resolution, or map-size selection.
+
+### Binary layout verification
+
+- N/A: the changed arrays and small vectors are host-side containers and are not raw-copied or
+  serialized. The copy descriptor layouts remain covered by the `types.rs` layout tests; focused
+  tests additionally pin Eden's compile-time layout-size oracles and the 16-entry inline capacity.
+
+## 2026-08-26 — `src/video_core/src/transform_feedback.rs`, `engines/maxwell_3d.rs`, and `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`, `engines/maxwell_3d.h`, and `src/shader_recompiler/runtime_info.h`
+
+### Intentional differences
+
+- Rust represents Eden's nested `TransformFeedbackState::Layout` as the top-level
+  `TransformFeedbackLayout` in the matching transform-feedback module because Rust has no nested
+  structure declarations.
+- Rust ignores an invalid transform-feedback attribute index instead of reproducing Eden's direct
+  out-of-bounds array access. Valid indices preserve Eden's assignment and maximum-count ordering.
+- Eden's `UNIMPLEMENTED_IF` diagnostics are represented by the project's fail-soft Rust helper:
+  violations are logged and become fatal only when debug assertions are enabled.
+
+### Unintentional differences (to fix)
+
+- None after moving `StreamOutLayout` and `NUM_TRANSFORM_FEEDBACK_BUFFERS` to the Maxwell 3D owner,
+  matching `Maxwell3D::Regs::StreamOutLayout` and `NumTransformFeedbackBuffers`.
+- None after removing the duplicate video-core varying type: `make_transform_feedback_varyings`
+  now returns the canonical shader-recompiler `TransformFeedbackVarying` array directly, as Eden
+  does, and the OpenGL/Vulkan consumers no longer perform field-by-field conversions.
+- None after restoring `RuntimeInfo::xfb_varyings` from a growable vector to Eden's fixed,
+  value-initialized 256-entry array and preserving unsigned wraparound in the generator arithmetic.
+
+### Missing items
+
+- None in the audited transform-feedback state, varying generator, Maxwell register owner, or
+  runtime transform-feedback fields.
+
+### Binary layout verification
+
+- PASS: focused tests pin the 4-byte `StreamOutLayout` register representation and its four byte
+  fields, the 12-byte `TransformFeedbackLayout` field order, the 560-byte
+  `TransformFeedbackState`, and the fixed 256-entry runtime varying extent.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/turbo_mode.rs` and `renderer_vulkan.rs` vs Eden `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}` and `renderer_vulkan.cpp`
+
+### Intentional differences
+
+- Rust represents `std::jthread` stop-token ownership with an `AtomicBool`, condition-variable
+  notification, and an explicit join in `Drop`. The scheduler callback retains only the shared
+  notification state instead of capturing `this`, avoiding a dangling Rust reference while
+  preserving Eden's submission timestamp update.
+- Fallible Vulkan setup or dispatch in the worker is logged and ends that worker. Eden's Vulkan
+  wrappers throw from `Run`; an uncaught C++ worker exception would terminate the process. This is
+  the Rust `Result` error-propagation adaptation rather than a workload-order change.
+- Android calls the same external `adrenotools_set_turbo` C ABI through a conditional Rust link
+  declaration instead of including the C header.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's constructor boundary: the dedicated device and allocator are made
+  before spawning, while the buffer, descriptors, shader, pipeline, fence, command pool, and
+  command buffer are initialized inside the worker's `run` method.
+- None after using the shared `create_device` owner and its configured physical-device selection,
+  removing the extra explicit command-buffer reset and device-idle wait, and restoring the reverse
+  declaration destruction order for the descriptor layout and pool.
+- None after porting the Android/AArch64 enable-on-work and disable-on-exit calls; Android on other
+  architectures retains Eden's wait loop without creating the desktop Vulkan workload.
+
+### Missing items
+
+- None in the audited constructor, queue notification, worker workload, idle predicate, Android
+  switch, stop request, or resource lifecycle.
+
+### Binary layout verification
+
+- N/A: this slice owns host synchronization state and Vulkan handles; it defines no guest-visible
+  or raw-serialized payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/update_descriptor.rs` and `graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_update_descriptor.{h,cpp}` and `vk_graphics_pipeline.cpp`
+
+### Intentional differences
+
+- Rust stores payload positions as indices into the queue-owned fixed allocation instead of raw
+  pointer fields. `upload_start: Option<usize>` preserves Eden's initial null pointer and produces
+  the same payload address after `acquire` without retaining self-referential Rust pointers.
+- The retained `const Device&` is represented by the existing non-owning `DeviceReference`.
+- `DescriptorUpdateEntry::default` zeroes the complete union storage. Eden activates a
+  one-byte `std::monostate`; deterministic Rust padding avoids exposing uninitialized bytes if a
+  payload is inspected before its selected union member is overwritten.
+- The private `acquire_with_wait` callback is a mechanical test seam for Eden's `WaitWorker` call;
+  the public `acquire` method still sets descriptor-buffer mode first and supplies the scheduler's
+  exact wait operation.
+
+### Unintentional differences (to fix)
+
+- None after restoring the null `update_data` result before the first acquire and the one-byte
+  empty union member matching `std::monostate`.
+- None after replacing the always-fatal reservation assertion with Eden's fail-soft assertion
+  policy and preserving unsigned wraparound for capacity and descriptor-address arithmetic.
+- None after removing the Rust-only `pending_count` method and graphics-pipeline assertion; Eden
+  reserves the known descriptor count but does not add this runtime instrumentation.
+
+### Missing items
+
+- None in the audited constants, union members, constructor, frame advance, acquisition/recycling,
+  descriptor-buffer selection, payload access, or image/buffer/texel append operations.
+
+### Binary layout verification
+
+- PASS: focused tests pin the empty member at 1 byte, `DescriptorAddress` at 24 bytes with offsets
+  0/8/16, and `DescriptorUpdateEntry` to the maximum member size and alignment used as Vulkan
+  update-template stride.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and presentation callers vs Eden `src/video_core/renderer_vulkan/present/util.{h,cpp}`
+
+### Intentional differences
+
+- Command-recording helpers receive raw Ash device and command-buffer handles because Rust's
+  scheduler closures own copied dispatch tables and handles instead of borrowing Eden's
+  `vk::CommandBuffer` wrapper. Barrier contents and command ordering are unchanged.
+- Vulkan objects are raw handles with explicit destruction in their presentation owners rather
+  than Eden's move-only `vk::*` wrappers. `CreateWrappedDescriptorSets` consequently also needs
+  the logical device that Eden obtains from its descriptor-pool wrapper.
+- C++ default arguments and the descriptor-layout initializer-list overload are explicit Rust
+  arguments. Callers pass Eden's default combined-image-sampler type and vertex/fragment stages;
+  the common slice implementation also accepts compute stages for the matching upstream path.
+- Small create-info builders are same-file mechanical test seams for Eden's local vectors and
+  input-assembly structure; they do not move behavior out of the `present/util.rs` owner.
+
+### Unintentional differences (to fix)
+
+- None after porting the previously absent `CreateWrappedComputePipeline` implementation.
+- None after replacing `ALL_COMMANDS` in `download_color_image` with Eden's precise
+  graphics/compute/transfer source and graphics/compute destination stage masks.
+- None after restoring MoltenVK-only primitive restart for the presentation triangle-strip
+  pipelines.
+- None after forwarding descriptor-layout stage flags, preserving explicit empty descriptor-pool
+  type lists and Eden's `size_t`-to-`u32` casts, and restoring the fail-soft capacity assertion
+  that protects descriptor-image pointers from vector reallocation.
+- None after restoring the high-level `Device` boundary for resource, sampler, descriptor, and
+  pipeline creation helpers and updating their presentation callers accordingly.
+
+### Missing items
+
+- None in the audited `present/util.h`/`.cpp` public API or file-static pipeline helper.
+
+### Binary layout verification
+
+- N/A for the Vulkan handles and create-info values changed here. Existing focused tests continue
+  to verify the locally declared QCOM sampler pNext ABI; new tests pin descriptor construction,
+  unsigned descriptor-count conversion, pointer stability, and MoltenVK input assembly state.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/util_shaders.rs` vs Eden `src/video_core/renderer_opengl/util_shaders.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the existing shared, locked `ProgramManagerHandle` instead of Eden's non-owning
+  `ProgramManager&`; the lock covers each complete utility operation and preserves the program
+  bind, dispatch, and guest-state restoration ordering.
+- Program fields are declared in Eden's reverse member order because Rust drops structure fields
+  in declaration order, while C++ destroys members in reverse declaration order. The program
+  manager handle is dropped last so every OpenGL program is released first.
+- `ImageInfo` is cloned once per operation to satisfy Rust borrowing while preserving Eden's
+  immutable snapshot. Its tagged `TilingMode` explicitly reads `block.width` for the otherwise
+  invalid block-linear pitch path, matching the first `u32` shared by Eden's anonymous union.
+- Eden's fail-soft assertion handler is represented by an error log and a panic only when
+  `use_debug_asserts` is enabled; normal execution continues after the same failed invariants.
+
+### Unintentional differences (to fix)
+
+- None after restoring Eden's fail-soft assertion policy for ASTC parameters, image-copy layer
+  invariants, non-power-of-two pitch uploads, and the invalid `StoreFormat` fallback. Ruzu had
+  logged some of these conditions without honoring `use_debug_asserts`.
+
+### Missing items
+
+- None in the audited constructor, utility operations, or `StoreFormat`. All eight compute-shader
+  source files consumed by this owner are byte-identical to Eden's current sources.
+
+### Binary layout verification
+
+- N/A: this owner passes ordinary scalar values and OpenGL handles and defines no guest-visible or
+  raw-serialized payload. Focused tests cover every `StoreFormat` mapping and its fail-soft
+  fallback.
+
+## 2026-08-26 — `src/video_core/src/host_shaders/vertex_shaders.rs` vs Eden `src/video_core/host_shaders/CMakeLists.txt` and vertex shader sources
+
+### Intentional differences
+
+- Eden generates one C++ header per GLSL source, while Rust exposes the same source text through
+  `include_str!` constants and separately compiles the Vulkan subset to SPIR-V in `build.rs`.
+
+### Unintentional differences (to fix)
+
+- None after exporting `sgsr1_shader.vert`; it was compiled by the Rust SPIR-V build path but was
+  the only one of Eden's ten vertex sources absent from the source registry.
+
+### Missing items
+
+- None: the ten vertex files listed by Eden's host-shader build are present and byte-identical,
+  and each now has a corresponding Rust source constant.
+
+### Binary layout verification
+
+- N/A: this module embeds text sources and defines no binary payload. The generated SPIR-V owner
+  has its own magic-word coverage; a focused test pins the complete ten-source registry here.
+
+## 2026-08-26 — `src/video_core/src/host1x/vic.rs` vs Eden `src/video_core/host1x/vic.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the frame queue and GMMU manager through `Arc` handles instead of inheriting
+  `CDmaPusher` and retaining `Host1x&`; the same queue lookup, memory operations, close-on-drop,
+  and method-index semantics remain in the VIC owner.
+- Rust executes Eden's scalar conversion paths on every host rather than duplicating its optional
+  SSE4.1 branches. VIC's valid intermediate components are ten-bit values, for which the scalar
+  and SIMD paths produce identical pixels; this avoids architecture-specific unsafe intrinsics.
+- FFmpeg plane pointers are exposed as checked Rust slices, invalid register indices are ignored,
+  and malformed rectangle ranges are skipped instead of reproducing C++ out-of-bounds access.
+  Valid frame and method inputs retain Eden's arithmetic and ordering.
+- The two simultaneous YUV `GpuGuestMemoryScoped<SafeWrite>` destinations use independently owned
+  Rust fallback storage because one mutable scratch buffer cannot safely back both live objects.
+  Direct-span access, reverse destruction/writeback order, and safe GPU invalidation match Eden;
+  the single-destination ABGR paths use Eden's corresponding swizzle or luma scratch backup.
+- The unused C++ surface-offset spans are omitted from the private read-method signatures; Eden
+  does not read them in any progressive or interlaced path.
+
+### Unintentional differences (to fix)
+
+- None after replacing the five `Vec` workspaces with Eden's `ScratchBuffer` owner and exact
+  `resize` versus `resize_destructive` choices.
+- None after removing the non-upstream per-frame timing trace and the Rust-only
+  `write_single_plane`/`write_plane_pair` helper boundaries.
+- None after restoring fail-soft behavior for unsupported formats, fatal behavior for impossible
+  block kinds, the original output-format argument, and Eden's interlaced chroma-height bound.
+- None after restoring `Vic::Method` to Eden's byte-offset values, performing the same word-index
+  multiplication at dispatch, and naming every register range exposed by `VicRegisters`.
+- None after restoring the final odd-width YUV iteration and passing one-byte elements—not
+  two-byte chroma texels—to the block-linear chroma swizzle, exactly as Eden does.
+- None after restoring Eden's scoped safe-write guest-memory paths, including direct-span writes
+  and preservation of untouched pitch padding; YUV pitch retains the explicit luma-then-chroma
+  overwrite order used for overlapping guest mappings.
+
+### Missing items
+
+- None in the audited VIC registers/configuration structures, execution flow, progressive and
+  interlaced reads, blend/color conversion, pitch output, or block-linear output.
+
+### Binary layout verification
+
+- PASS: compile-time checks cover every raw VIC structure size; focused tests additionally pin
+  `Pixel`, all `ConfigStruct` member offsets, and the byte offsets of the used VIC registers. A
+  block-linear YUV regression test verifies Eden's one-byte chroma swizzle element contract.
+
+## 2026-08-26 — `src/video_core/src/video_core.rs` vs Eden `src/video_core/video_core.{h,cpp}`
+
+### Intentional differences
+
+- Rust passes a renderer factory into `create_gpu` because SDL/GTK window handles and concrete
+  graphics-context construction remain frontend-owned. The factory receives the backend selected
+  from the common settings, while `video_core.rs` owns the shared lifecycle and ordering.
+- Renderer construction failures use `Result` and propagate to the frontend loading error path;
+  dropping the still-unbound `Box<Gpu>` is the Rust equivalent of Eden's logged `gpu.reset()`.
+- `RUZU_DISABLE_ASYNC_GPU` remains a diagnostic override layered onto Eden's asynchronous-GPU
+  setting. Both frontends now receive that decision from the single `create_gpu` owner.
+
+### Unintentional differences (to fix)
+
+- None after removing the unused duplicate renderer/NVDEC enums and routing both GTK and SDL
+  subsystem factories through `video_core::create_gpu`.
+- None after restoring Eden's order: update rescaling state, read NVDEC/async settings, allocate
+  the GPU, select and construct the renderer, then bind it.
+
+### Missing items
+
+- None in the shared `CreateGPU` lifecycle. Concrete window/context construction is supplied by
+  the frontends as described above.
+
+### Binary layout verification
+
+- N/A: this owner contains lifecycle functions and no raw or serialized payloads.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vk_enum_string_helper.rs` vs Eden `src/video_core/vulkan_common/vk_enum_string_helper.h` and Vulkan Utility Libraries `vk_enum_string_helper.h`
+
+### Intentional differences
+
+- Eden includes the complete generated Vulkan Utility Libraries header. Rust exposes the ten
+  wrappers already owned by this module and derives registry-known names from Ash; raw-value
+  overrides remain here for Vulkan 1.4 values and canonical aliases absent from Ash 1.3.251.
+- The Rust wrappers return owned `String` values instead of generated `const char*` values. This
+  preserves the exact observable text while allowing the registry-known portion to be assembled
+  from Ash's `Debug` names.
+
+### Unintentional differences (to fix)
+
+- None after restoring the `VK_*` prefixes, generated `Unhandled Vk*` fallbacks, lowercase ASTC
+  dimension separators, Vulkan 1.4 values, and the canonical names selected by Eden's generated
+  header.
+- None after routing Eden's production `string_VkResult` equivalents through this module in
+  `VulkanError`, `available_version`, image acquisition, and presentation diagnostics.
+
+### Missing items
+
+- None among the ten Rust wrappers or Eden's production call sites. Other enum helpers exposed by
+  the external generated C header have no callers in Eden's source tree and are not duplicated.
+
+### Binary layout verification
+
+- N/A: these functions convert transparent Vulkan integer enums to diagnostic strings and define
+  no serialized or guest-visible payload.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (clear command ordering)
+
+### Intentional differences
+
+- Optional Ash extension dispatch tables and channel GPU-memory ownership remain checked before
+  use. Eden reaches those paths through assumed-valid pointers; valid draw and render-target paths
+  issue the same commands, while invalid Rust state fails softly instead of calling a missing
+  function pointer.
+- Command-buffer invalidation and per-channel release are forwarded explicitly to Ruzu's separate
+  `StateTracker`; Eden's tracker observes the same lifecycle through scheduler and live Maxwell
+  state ownership.
+
+### Unintentional differences (to fix)
+
+- None after recording full-channel color and depth/stencil attachment clears separately and in
+  Eden's order. This also restores color-before-blit ordering when a color clear is followed by a
+  partial stencil clear.
+- None among the report's cache-invalidation, channel-locking, device-page alignment, and GPU-
+  logging findings; those corrections were already present when this report was re-audited.
+
+### Missing items
+
+- None in the report's audited rasterizer slice. The obsolete offscreen framebuffer/readback path
+  named by the report is no longer present in the current rasterizer owner.
+
+### Binary layout verification
+
+- N/A: this change only restores Vulkan command recording order and adds no binary payload.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vma.rs` vs Eden `src/video_core/vulkan_common/vma.h`
+
+### Intentional differences
+
+- Eden compiles VMA with static Vulkan symbols disabled and dynamic resolution enabled, passing
+  `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`. The `vk-mem` crate compiles the same VMA
+  implementation with both built-in loaders disabled and supplies the complete Ash function table
+  explicitly. Both avoid a static Vulkan-library dependency; the Rust binding requires the latter
+  integration and preserves the same allocator operations.
+- Eden stores an opaque `VmaAllocator` handle and promises external synchronization. Rust owns the
+  allocator through `Arc<Mutex<vk_mem::Allocator>>`; `vulkan_device.rs` sets the matching
+  `EXTERNALLY_SYNCHRONIZED` allocator flag and the mutex supplies its required serialization.
+- Eden selects the one translation unit defining `VMA_IMPLEMENTATION` in each frontend. The
+  `vk-mem` build script compiles its own `wrapper.cpp` translation unit with that definition.
+
+### Unintentional differences (to fix)
+
+- None after correcting the binding documentation and removing four unused type aliases that had
+  no counterpart in Eden's VMA configuration header.
+
+### Missing items
+
+- None in this binding/configuration owner. Allocator creation flags and block-size policy remain
+  in `vulkan_device.rs`, matching Eden's `vulkan_device.cpp`; allocation policy remains in
+  `vulkan_memory_allocator.rs`.
+
+### Binary layout verification
+
+- N/A: this module selects the external VMA binding and Rust ownership wrapper; it defines no
+  copied or serialized payload. A focused type-level test pins the shareable, externally locked
+  allocator ownership contract.
+
+## 2026-08-26 — `src/video_core/src/host1x/codecs/vp9_types.rs` vs Eden `src/video_core/host1x/codec_types.h` (VP9 section) and `src/video_core/host1x/codecs/vp9.cpp`
+
+### Intentional differences
+
+- Eden groups the raw H.264, VP9, and VP8 codec structures in one header. Rust keeps the VP9
+  portion in a codec-specific module so the decoder can import it without exposing unrelated raw
+  formats; the module documentation now names the exact upstream owner and every VP9 type remains
+  in the same order as that contiguous header section.
+- Rust uses `bitflags` for `FrameFlags`, native enums for the C++ scoped enums, and explicit byte
+  arrays for upstream padding macros. Their sizes, discriminants, offsets, and raw bytes match the
+  C++ representations.
+
+### Unintentional differences (to fix)
+
+- None found in the VP9 structures, conversions, or default probabilities. The report's reference
+  to a nonexistent `vp9_types.h` was corrected to `host1x/codec_types.h`.
+
+### Missing items
+
+- None in the audited VP9 portion. The 22 default-probability fields contain the same 1,972 bytes
+  as Eden, and both `PictureInfo::Convert` and `EntropyProbs::Convert` preserve Eden's field and
+  loop ordering.
+
+### Binary layout verification
+
+- PASS: compile-time and focused runtime checks cover enum/flag widths, all upstream size and
+  offset assertions for `Vp9FrameDimensions`, `Segmentation`, `LoopFilter`, `Vp9EntropyProbs`,
+  `PictureInfo`, and `EntropyProbs`. Regression tests cover zero-extension and flag conversion,
+  every skipped fourth coefficient, Y-mode reshaping, and the complete default-table hash.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/{mod.rs,vulkan.rs}` vs Eden `src/video_core/vulkan_common/vulkan.h`
+
+### Intentional differences
+
+- Ash owns Vulkan types, opaque handles, and dynamic function dispatch, so Eden's
+  `VK_NO_PROTOTYPES`, target-specific `VK_USE_PLATFORM_*` preprocessor selection, Windows macro
+  sanitation, and `VkSurfaceKHR_T` forward declaration have no source-level Rust counterparts.
+- Rust's `mod.rs` declares the same subsystem files instead of serving as a C++ include
+  aggregator. The actual constants owned by Eden's header live in the matching `vulkan.rs` module.
+
+### Unintentional differences (to fix)
+
+- None after adding the missing `VK_KHR_maintenance7` and `VK_KHR_maintenance8` extension-name
+  fallbacks to their upstream-equivalent owner and correcting the stale `zuyu` provenance.
+
+### Missing items
+
+- None in the header's source-owned declarations. Consumption of the provisional extension names
+  belongs to the separate `vulkan_device` parity slice.
+
+### Binary layout verification
+
+- N/A: Ash owns the Vulkan ABI declarations. The two retained values are UTF-8 extension-name
+  constants, covered by a focused exact-string regression test.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}` (report re-audit)
+
+### Intentional differences
+
+- Rust converts Vulkan C strings to UTF-8 before passing them to the `log` and GPU-logging APIs;
+  null or invalid strings receive printable fallbacks. Vulkan guarantees valid callback strings,
+  so valid calls retain Eden's exact message, ID-name, type-prefix, and priority behavior.
+- Rust's `error!` level is the closest available counterpart to Eden's `LOG_CRITICAL`; warning,
+  info, and verbose/debug levels map directly.
+
+### Unintentional differences (to fix)
+
+- None. The report's missing GPU-logger route had already been ported before this re-audit; both
+  runtime guards and the `-1` error / `-2` warning / `0` other result mapping match Eden.
+- None for the Android `0x01257b492` literal: its leading zero does not overflow or change the
+  value, and Rust's `0x1257b492` is exactly equivalent.
+
+### Missing items
+
+- None in the debug callback, false-positive filters, messenger creation flags, or RAII lifetime.
+
+### Binary layout verification
+
+- N/A: Ash owns the callback ABI and Rust reads the callback data in place. A focused regression
+  now pins every platform-selected ignored message ID, in addition to message-type priority.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- `ash` 0.37 predates `VK_KHR_maintenance5` and `VK_KHR_maintenance6`; Ruzu therefore owns
+  ABI-compatible feature/property payloads locally and retains their queried answers as booleans
+  after logical-device creation. Maintenance 7/8 names remain owned by `vulkan.rs`, matching the
+  fallback definitions in Eden's `vulkan.h`.
+- The extension-selection and suitability policies are mechanically extracted into file-local
+  functions so promotion rules, mandatory capabilities, and MoltenVK fallbacks can be tested
+  without constructing a physical device.
+- Ruzu additionally enables `VK_KHR_portability_subset` when advertised because MoltenVK requires
+  applications to enable it; this platform requirement is represented by `ash` rather than Eden's
+  current device-extension macros.
+
+### Unintentional differences (to fix)
+
+- Resolved: the feature/extension inventory now includes Vulkan memory model, image robustness,
+  maintenance 1–4 and 6–8, and ASTC decode mode, with Eden's API-version promotion rules,
+  suitability filtering, accessors, and logical-device feature-chain lifetime.
+- Resolved: suitability now checks Eden's exact mandatory feature set, leaves 8/16-bit storage in
+  the recommended/optional sets, applies only Eden's four MoltenVK fallbacks, and reports an
+  unsuitable device while continuing device creation as upstream does.
+- Resolved: optimal ASTC support now requires every upstream sampled-image, linear-filter, and
+  transfer feature bit for all 28 LDR formats; the accessor returns that computed result.
+- Resolved: `VK_KHR_robustness2` name preference and Radeon GPU Profiler detection now follow
+  Eden's extension/tooling paths.
+
+### Missing items
+
+- Android/AArch64 still lacks Eden's AdrenoTools BCn driver patch and `OverrideBcnFormats` path.
+  This requires the Android-only debug setting, API-level query, and AdrenoTools BCn ABI rather
+  than a safe local edit to the host-independent device path.
+
+### Binary layout verification
+
+- PASS: focused tests verify the locally declared maintenance5/6 payload sizes, alignments,
+  feature offsets, and Vulkan structure-type values on both 32-bit and 64-bit pointer layouts.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- The file-local `is_ldr_astc_format` predicate operates on Vulkan's contiguous LDR ASTC enum
+  range; this is the Rust counterpart of Eden's `IsLdrAstcFormat` helper used by the image-view
+  constructor.
+
+### Unintentional differences (to fix)
+
+- Resolved: LDR ASTC image views now prepend `VkImageViewASTCDecodeModeEXT` with
+  `VK_FORMAT_R8G8B8A8_UNORM` when the extension is enabled, while preserving Eden's following
+  `VkImageViewUsageCreateInfo` node and conditional ordering.
+
+### Missing items
+
+- The audited ASTC decode-mode image-view path is complete; broader texture-cache parity remains
+  tracked by its dedicated reports.
+
+### Binary layout verification
+
+- PASS: `ash` owns both Vulkan `pNext` payload layouts; the focused test verifies the exact LDR
+  ASTC range boundary and rejects HDR ASTC formats.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` Haiku prerequisite vs Eden `src/video_core/vulkan_common/vulkan_instance.{h,cpp}`
+
+### Intentional differences
+
+- Platform variants and their code are selected with Rust `cfg(target_os)` attributes instead of
+  Eden's preprocessor branches; the resulting Haiku-only branch owns the same XCB extension name.
+
+### Unintentional differences (to fix)
+
+- Resolved: `WindowSystemType::Xcb` and `VK_KHR_xcb_surface` are now present on Haiku, completing
+  the platform dispatch consumed by `vulkan_surface.rs`.
+
+### Missing items
+
+- None in the Haiku/XCB instance-extension prerequisite.
+
+### Binary layout verification
+
+- N/A: this change selects a Vulkan extension name and does not define an ABI payload.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_surface.rs` vs Eden `src/video_core/vulkan_common/vulkan_surface.{h,cpp}`
+
+### Intentional differences
+
+- Ash's XCB extension loader replaces Eden's function-pointer lookup through
+  `vkGetInstanceProcAddr`; both submit the same `VkXcbSurfaceCreateInfoKHR` fields and return the
+  same raw surface handle ownership to the caller.
+- The repeated upstream initialization error is a mechanical file-local helper so its exact
+  `VkResult` can be tested without constructing a native window or Vulkan instance.
+
+### Unintentional differences (to fix)
+
+- Resolved: the previously omitted Haiku/XCB path now forwards `display_connection` as
+  `xcb_connection_t*` and converts `render_surface` through `uintptr_t` to `xcb_window_t`.
+- Resolved: every platform creation failure now logs Eden's platform-specific message and becomes
+  `VK_ERROR_INITIALIZATION_FAILED`; successful calls returning a null surface are rejected by the
+  same final guard as upstream.
+
+### Missing items
+
+- None in the platform surface dispatch.
+
+### Binary layout verification
+
+- PASS: `ash` owns `VkXcbSurfaceCreateInfoKHR`; no locally declared or serialized payload is used.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_wrapper.rs` vs Eden `src/video_core/vulkan_common/vulkan_wrapper.{h,cpp}`
+
+### Intentional differences
+
+- Ash owns the Vulkan dispatch tables and most raw-handle method wrappers; Ruzu keeps the
+  file-owned helpers and the two top-level RAII owners that are not supplied by Ash.
+- The application and engine names use `ruzu Emulator` instead of Eden's inherited
+  `yuzu Emulator` branding. Their version fields and requested Vulkan 1.3 API now match exactly.
+- Ash 0.37 predates the HoneyKrisp and KosmicKrisp `VkDriverId` names, so the switch retains their
+  registered values 26 and 28 as named local compatibility constants.
+- Rust rejects an object name containing an interior NUL before constructing the Vulkan C string;
+  all valid names follow Eden's optional-dispatch and result-checking path.
+
+### Unintentional differences (to fix)
+
+- Resolved: object naming now loads `vkSetDebugUtilsObjectNameEXT` as a genuinely optional
+  function and returns success when absent, instead of invoking Ash's generated panic fallback.
+- Resolved: physical-device tooling properties now preserve Eden's exact two unchecked calls,
+  initial allocation length, and absence behavior rather than adding result filtering and an
+  `VK_INCOMPLETE` retry loop.
+- Resolved: `Instance::create` again owns the application-info construction and Apple portability
+  flag, pins application, engine, and API versions to 1.3.0, and rejects a created instance whose
+  `vkDestroyInstance` entry point cannot be loaded, as upstream does.
+- Resolved: `get_driver_name` is again owned by the wrapper, includes HoneyKrisp and KosmicKrisp,
+  returns Eden's exact `Nvidia` and `llvmpipe` spellings, and falls back to `driver_name`.
+
+### Missing items
+
+- None among the non-Ash helpers used by Ruzu. The upstream per-object wrapper surface is replaced
+  by Ash handles plus the renderer's typed owners rather than duplicated in this file.
+
+### Binary layout verification
+
+- PASS: Ash owns `VkApplicationInfo`, `VkInstanceCreateInfo`,
+  `VkDebugUtilsObjectNameInfoEXT`, and `VkPhysicalDeviceDriverProperties`; no replacement ABI
+  payload is declared locally.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` ownership call site vs Eden `src/video_core/vulkan_common/vulkan_instance.cpp`
+
+### Intentional differences
+
+- Extension and layer names remain owned as `CString` values until the wrapper's Vulkan call.
+
+### Unintentional differences (to fix)
+
+- Resolved: the frontend instance factory no longer owns `VkApplicationInfo` or the Apple create
+  flag; it passes Eden's `available` version argument to the matching wrapper method.
+
+### Missing items
+
+- None in the `vk::Instance::Create` call boundary.
+
+### Binary layout verification
+
+- N/A: the call site only passes borrowed name-pointer arrays and a scalar version.
+
+## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` driver-name delegation vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
+
+### Intentional differences
+
+- The Rust device retains Ash's logical-device owner and delegates file-owned wrapper behavior
+  through module functions rather than C++ member wrappers.
+- Existing infallible buffer/shader naming methods use `expect` to unwind on the same Vulkan
+  failure for which Eden's wrapper throws; the framebuffer path can return `VulkanError` directly.
+
+### Unintentional differences (to fix)
+
+- Resolved: `Device::get_driver_name` now delegates to the wrapper-owned driver-property mapping,
+  matching Eden's `Device::GetDriverName` ownership boundary.
+- Resolved: shader-module and buffer naming reuse the wrapper-owned optional dispatch helper, so a
+  missing debug-utils symbol no longer reaches Ash's panic fallback.
+
+### Missing items
+
+- None in the audited driver-name or object-name delegation paths.
+
+### Binary layout verification
+
+- N/A: these methods forward existing Ash handles and property payloads without serialization.
+
+## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/window_adapt_pass.rs` vs Eden `src/video_core/renderer_vulkan/present/window_adapt_pass.{h,cpp}`
+
+### Intentional differences
+
+- Ash raw handles plus an explicit `Drop` implementation replace Eden's move-only Vulkan wrapper
+  members. The Rust owner is established before resource creation so panic unwinding releases the
+  same successfully created resources as C++ constructor exception unwinding.
+- Rust's `LinkedList<Layer>` is the direct standard-library counterpart of Eden's
+  `std::list<Layer>` at this interface boundary.
+
+### Unintentional differences (to fix)
+
+- Resolved: construction no longer creates raw handles as unowned locals before assembling the
+  pass; every successfully created handle, including the moved sampler and fragment shader, is
+  owned and cleaned up if a later creation fails.
+- Resolved: the three presentation pipelines are assigned sequentially to the owner, so failure
+  while creating the second or third pipeline cannot leak an earlier one.
+- The report's claimed caller-side layer preconfiguration is obsolete: `draw` already owns
+  `configure_draw`, pipeline selection, command recording, and draw ordering exactly as Eden does.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: `PresentPushConstants` is `repr(C)` and exactly 128 bytes (a 64-byte matrix followed by
+  four 16-byte vectors); the complete payload is passed to Vulkan with the same vertex-stage range
+  as Eden. All Vulkan create-info layouts remain owned by Ash.
+
+## 2026-08-26 — `src/video_core/src/textures/workers.rs` vs Eden `src/video_core/textures/workers.{h,cpp}`
+
+### Intentional differences
+
+- `OnceLock` supplies Rust's function-local-static equivalent. Rust process statics are not
+  destructed during normal runtime shutdown, whereas Eden's local static destroys its `jthread`
+  pool; explicit `ThreadWorker` owners still stop and join identically, and process termination
+  reclaims the singleton threads.
+- `available_parallelism()` replaces `std::thread::hardware_concurrency()`; both clamp the reported
+  value to at least two before halving it, and the Rust error fallback therefore produces the same
+  one-worker minimum.
+- ASTC and BCN call the common port's `queue_stateless_work` adapter because Rust cannot overload
+  the stateful `queue_work` closure signature for the `StatefulThreadWorker<()>` alias.
+
+### Unintentional differences (to fix)
+
+- Resolved: `textures/workers.rs` no longer reimplements `Common::ThreadWorker`. It now owns only
+  the `ImageTranscode` singleton construction and returns the implementation owned by
+  `common/thread_worker.rs`, matching Eden's file and method boundaries.
+- The report's LIFO statement is obsolete: the common owner consumes `VecDeque::pop_front`, and a
+  single-worker regression test verifies Eden's FIFO ordering.
+- The report's BCN usage warning is obsolete: both ASTC decompression and BCN compression queue
+  one job per row/stride on this shared pool and wait after each depth plane, matching Eden.
+
+### Missing items
+
+- None in the texture worker singleton or its ASTC/BCN call sites.
+
+### Binary layout verification
+
+- N/A: the singleton contains host-only synchronization objects and boxed closures.
+
+## 2026-08-26 — `src/video_core/src/query_cache_top.rs` and `src/video_core/src/renderer_opengl/gl_query_cache.rs` vs Eden `src/video_core/query_cache.h` and `src/video_core/renderer_opengl/gl_query_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses the CRTP relationship among the legacy cache, cached query, counter stream, and
+  host counter with `LegacyCachedQuery` and `CounterHandle` traits. The shared lifecycle and
+  renderer-specific method ownership remain split at the same boundary as Eden.
+- `Arc<Mutex<_>>` replaces `shared_ptr` ownership for host counters and the OpenGL query pool, and
+  `ReentrantMutex` replaces Eden's `recursive_mutex`.
+- Rasterizer services and `AnyCommandQueued()` are passed explicitly through the Rust call sites
+  rather than retained as self-referential backend references. The values are sampled at the same
+  operations where Eden calls the rasterizer.
+- `PopAsyncFlushes` clones the front batch's scalar slot identifiers so Rust can mutate the cache
+  while preserving Eden's requirement that the original front batch remains queued throughout
+  processing.
+
+### Unintentional differences (to fix)
+
+- Resolved: `FlushAndRemoveRegion` now retains a cached-page map entry after its last query is
+  erased, matching `std::erase_if(contents, ...)` on Eden's existing map value.
+- Resolved: `PopAsyncFlushes` no longer removes a non-null batch before collecting its queries; it
+  keeps that batch at the front and pops it only after processing, matching Eden's lifecycle order.
+
+### Missing items
+
+- None in the audited legacy query-cache or OpenGL query-cache paths.
+
+### Binary layout verification
+
+- N/A: these caches contain host-only Rust/C++ ownership and synchronization objects; guest
+  writebacks explicitly serialize the same 32-bit/64-bit values and optional timestamp bytes as
+  Eden.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_staging_buffer_pool.rs` vs Eden `src/video_core/renderer_opengl/gl_staging_buffer_pool.{h,cpp}`
+
+### Intentional differences
+
+- Mapped spans retain their pointer and length as separate fields because Rust cannot store a
+  mutable slice without imposing a lifetime on the movable RAII result.
+- Rust declares GL-owning fields in C++ reverse-destruction order: allocation buffers precede
+  their sync objects, stream fences precede the stream buffer, and download buffers precede upload
+  buffers. Rust's declaration-order drop therefore matches Eden's reverse member destruction.
+- The renderer shares its single staging-pool owner through `Arc<Mutex<_>>`; allocation selection,
+  fence creation, deferred release, and stream-buffer requests remain serialized at the same owner.
+
+### Unintentional differences (to fix)
+
+- Resolved: `STREAM_BUFFER_SIZE`, `NUM_SYNCS`, `REGION_SIZE`, and `MAX_ALIGNMENT` are private
+  `StreamBuffer` associated constants again, rather than module-level constants, matching their
+  upstream class ownership.
+
+### Missing items
+
+- None in `StagingBufferMap`, `StagingBuffers`, `StreamBuffer`, or `StagingBufferPool`.
+
+### Binary layout verification
+
+- N/A: these types own host OpenGL objects and mapped host pointers and are not serialized or
+  copied as raw guest payloads. Compile-time assertions retain Eden's stream-size divisibility
+  invariants.
+
+## 2026-08-26 — OpenGL texture cache and common `CopyImage` ownership vs Eden `gl_texture_cache.{h,cpp}`, `texture_cache.{h,cpp}`, and `vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust expresses the C++ `TextureCache<P>` calls through `TextureCacheParams`; the common cache
+  owns copy selection, scaling, view construction, and framebuffer construction, while each
+  backend adapter only obtains its concrete objects and calls the matching runtime method.
+- OpenGL reads the mutex-protected live `resolution_info` value when scaling instead of retaining
+  Eden's reference into the global settings object. This preserves live settings semantics without
+  a self-referential unsynchronised pointer.
+- Vulkan framebuffer construction is fallible in Rust, so the conversion path returns if creating
+  the destination render target fails; Eden propagates the equivalent Vulkan failure by exception.
+
+### Unintentional differences (to fix)
+
+- Resolved: `TextureCache<P>::CopyImage` again belongs to the common cache. Rescaled-coordinate
+  handling, emulated-copy selection, reinterpretation, conversion-view construction, and extent
+  validation are no longer duplicated in the OpenGL and Vulkan backends.
+- Resolved: `JoinImages` preserves Eden's two distinct call paths: alias copies use common
+  `CopyImage`, while non-alias shrink copies call the runtime directly because
+  `MakeShrinkImageCopies` already applied its scaling factors.
+- Resolved: Vulkan `TextureCacheRuntime::ShouldReinterpret` checks both destination and source
+  depth/stencil formats when stencil export is unavailable, and the method is owned by the Vulkan
+  runtime rather than the generic adapter.
+- Resolved: OpenGL now uses the canonical `NUM_RT` and `Shader::NUM_TEXTURE_TYPES` owners, retains
+  Eden's file-local accelerated-format table, materializes `StorageViews` before probing it, and
+  uses unsigned wrapping arithmetic for the device-memory budget.
+
+### Missing items
+
+- None in the audited common image-copy policy or the OpenGL/Vulkan runtime operations it calls.
+
+### Binary layout verification
+
+- N/A: this slice moves host-side control flow and constant ownership; it does not serialize or
+  raw-copy any guest-visible payload.
+
+## 2026-08-26 — `src/video_core/src/shader_notify.rs` vs Eden `src/video_core/shader_notify.{h,cpp}`
+
+### Intentional differences
+
+- Rust protects Eden's four non-atomic reporting fields with a mutex because callers may query
+  progress concurrently. The two counters remain independent atomics and retain Eden's ordering.
+- `Option<Instant>` represents Eden's default-constructed `steady_clock::time_point`; the value is
+  only read after the same `completed` transition has stored a completion time.
+
+### Unintentional differences (to fix)
+
+- None after retaining `relaxed` only for Eden's two explicit initial snapshots, using fresh
+  sequentially-consistent `num_complete` loads inside both completion-state branches, and restoring
+  the default sequentially-consistent ordering of both C++ atomic pre-increments.
+
+### Missing items
+
+- None in the notification counters, completion timeout, or reporting-state lifecycle.
+
+### Binary layout verification
+
+- N/A: `ShaderNotify` is process-local synchronized state and is neither raw-copied nor serialized.
+
+## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_fence_manager.rs` vs Eden `src/video_core/renderer_opengl/gl_fence_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust composition delegates Eden's templated `GenericFenceManager` base to the common
+  `FenceManager<Fence>` owner. `Arc<Mutex<GLInnerFence>>` replaces `shared_ptr<GLInnerFence>` so
+  callback-owned fence handles can be shared safely.
+- The test-only forced-stub switch allows the common fence lifecycle to be exercised without an
+  OpenGL context and is absent from production builds.
+
+### Unintentional differences (to fix)
+
+- None after all three `GLInnerFence` state assertions use Eden's fail-soft assertion policy and
+  become fatal when `use_debug_asserts` is enabled, instead of merely logging in every mode.
+
+### Missing items
+
+- None in fence creation, queueing, signal polling, waiting, or generic-manager delegation.
+
+### Binary layout verification
+
+- N/A: the fence manager owns process-local OpenGL sync handles and callback state; no payload is
+  raw-copied or serialized.
+
+## 2026-08-26 — `src/video_core/src/host1x/codec_types.rs` vs Eden `src/video_core/host1x/codec_types.h`
+
+### Intentional differences
+
+- C++ `BitField` unions are represented by integer backing fields plus typed accessors. In
+  particular, the 64-bit H264 parameter union uses two `u32` words so the containing guest payload
+  retains Eden's four-byte alignment.
+- Rust `Vec<u8>` and deterministic zeroed `Default` implementations replace `std::vector<u8>` and
+  C++ aggregate initialization without changing guest-memory serialization.
+
+### Unintentional differences (to fix)
+
+- Resolved: the H264, VP9, and VP8 codec payload declarations, their inline conversions, and their
+  layout assertions now share the `host1x/codec_types.rs` owner matching Eden. They are no longer
+  split across `codecs/h264.rs`, `codecs/vp8.rs`, and the removed `codecs/vp9_types.rs` module.
+
+### Missing items
+
+- None in the declarations, inline conversions, or layout contracts owned by `codec_types.h`.
+
+### Binary layout verification
+
+- PASS: compile-time assertions and `raw_nvdec_layout_matches_codec_types_header` verify every
+  upstream size assertion and all upstream offset assertions for H264, VP9, and VP8 payloads.
+
+## 2026-08-27 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust splits the mutable `SamplesStreamer`/`TFBCounterStreamer` and `QueryRuntimeBackend` borrows
+  before calling `QueryCacheRuntime::sync_host_values`. Eden reaches the same runtime-owned method
+  through the streamer's stable reference to `QueryCacheRuntime`.
+
+### Unintentional differences (to fix)
+
+- Resolved: `sync_samples_writes` and `sync_tfb_writes` no longer use `Option::take` to move their
+  mutex-owning streamers out of and back into `QueryCacheRuntime`. Eden's streamers remain at stable
+  addresses inside the heap-owned `QueryCacheRuntimeImpl`; retaining the Rust streamers in place
+  prevents the fence-release thread from waiting on the abandoned address of a moved mutex.
+
+### Missing items
+
+- Live query-pool validation remains necessary for recorded Vulkan commands; the startup
+  regression was additionally exercised through five consecutive release launches.
+
+### Binary layout verification
+
+- N/A: this correction changes host-side ownership and borrowing only; no guest payload or disk
+  cache layout changes.
+
+## 2026-08-27 — `src/shader_recompiler/src/frontend/translate/{mod.rs,load_store_local_shared.rs}` and `src/shader_recompiler/src/pipeline_cache.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/{impl/impl.h,impl/load_store_local_shared.cpp,translate.cpp}`
+
+### Intentional differences
+
+- Reduced Rust instruction tests and compatibility callers may construct a `TranslatorVisitor`
+  without an `Environment`; those paths retain the explicit SPH/program fallback. Every runtime
+  environment translation supplies the upstream-owned environment reference.
+
+### Unintentional differences (to fix)
+
+- Resolved: the runtime visitor had lost Eden's `Environment& env` member, so local-memory bounds
+  used a cloned graphics program header. Compute allocations live in
+  `Environment::local_memory_size`; a zero-valued header therefore discarded valid immediate
+  `STL` writes and left their consumer buffers uninitialized.
+
+### Missing items
+
+- None in the verified runtime environment ownership, `LDL` bounds lookup, or immediate `STL`
+  bounds decision.
+
+### Binary layout verification
+
+- N/A: this correction retains shader IR writes and changes no serialized or raw-memory payload.

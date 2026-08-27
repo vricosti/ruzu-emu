@@ -50,8 +50,9 @@ impl UsageTracker {
 
     /// Mark the range `[offset, offset + size)` as used.
     pub fn track(&mut self, offset: u64, size: u64) {
-        let page = (offset as usize) >> PAGE_SHIFT;
-        let page_end = ((offset + size) as usize) >> PAGE_SHIFT;
+        let page = (offset >> PAGE_SHIFT) as usize;
+        let offset_end_u64 = offset.wrapping_add(size);
+        let page_end = (offset_end_u64 >> PAGE_SHIFT) as usize;
         if page_end < page || page_end >= self.pages.len() {
             return;
         }
@@ -62,7 +63,7 @@ impl UsageTracker {
         for i in (page + 1)..page_end {
             self.pages[i] = !0u64;
         }
-        let offset_end = (offset + size) as usize;
+        let offset_end = offset_end_u64 as usize;
         let offset_end_page_aligned = align_down(offset_end as u64, PAGE_BYTES as u64) as usize;
         Self::track_page(
             &mut self.pages,
@@ -74,8 +75,9 @@ impl UsageTracker {
 
     /// Returns true if any byte in `[offset, offset + size)` has been used.
     pub fn is_used(&self, offset: u64, size: u64) -> bool {
-        let page = (offset as usize) >> PAGE_SHIFT;
-        let page_end = ((offset + size) as usize) >> PAGE_SHIFT;
+        let page = (offset >> PAGE_SHIFT) as usize;
+        let offset_end_u64 = offset.wrapping_add(size);
+        let page_end = (offset_end_u64 >> PAGE_SHIFT) as usize;
         if page_end < page || page_end >= self.pages.len() {
             return false;
         }
@@ -90,7 +92,7 @@ impl UsageTracker {
                 return true;
             }
         }
-        let offset_end = (offset + size) as usize;
+        let offset_end = offset_end_u64 as usize;
         let offset_end_page_aligned = align_down(offset_end as u64, PAGE_BYTES as u64) as usize;
         Self::is_page_used(
             &self.pages,
@@ -108,10 +110,15 @@ impl UsageTracker {
         let offset_in_page = offset % PAGE_BYTES;
         let first_bit = offset_in_page >> BYTES_PER_BIT_SHIFT;
         let num_bits = size.min(PAGE_BYTES) >> BYTES_PER_BIT_SHIFT;
-        if num_bits == 0 {
-            return;
-        }
-        let mask = !0u64 >> (64 - num_bits);
+        // Eden shifts by 64 when `num_bits == 0`, which is undefined in C++.
+        // Its supported x86-64 compilers lower the variable shift with the
+        // hardware's modulo-64 count, producing an all-ones mask. Spell that
+        // conservative over-marking explicitly instead of under-marking.
+        let mask = if num_bits == 0 {
+            !0u64
+        } else {
+            !0u64 >> (64 - num_bits)
+        };
         pages[page] |= (!0u64 & mask) << first_bit;
     }
 
@@ -119,10 +126,11 @@ impl UsageTracker {
         let offset_in_page = offset % PAGE_BYTES;
         let first_bit = offset_in_page >> BYTES_PER_BIT_SHIFT;
         let num_bits = size.min(PAGE_BYTES) >> BYTES_PER_BIT_SHIFT;
-        if num_bits == 0 {
-            return false;
-        }
-        let mask = !0u64 >> (64 - num_bits);
+        let mask = if num_bits == 0 {
+            !0u64
+        } else {
+            !0u64 >> (64 - num_bits)
+        };
         let mask2 = (!0u64 & mask) << first_bit;
         (pages[page] & mask2) != 0
     }
@@ -144,6 +152,25 @@ mod tests {
         tracker.track(0, 64);
         assert!(tracker.is_used(0, 64));
         assert!(!tracker.is_used(64, 64));
+    }
+
+    #[test]
+    fn sub_granule_ranges_keep_edens_conservative_x64_mask() {
+        let mut tracker = UsageTracker::new(4096);
+        tracker.track(96, 1);
+
+        assert!(!tracker.is_used(0, 64));
+        assert!(tracker.is_used(64, 64));
+        assert!(tracker.is_used(4032, 1));
+    }
+
+    #[test]
+    fn zero_length_range_keeps_edens_effective_x64_mask() {
+        let mut tracker = UsageTracker::new(4096);
+        tracker.track(0, 0);
+
+        assert!(tracker.is_used(0, 1));
+        assert!(tracker.is_used(4032, 1));
     }
 
     #[test]

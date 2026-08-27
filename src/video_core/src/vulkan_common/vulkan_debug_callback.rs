@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of `zuyu/src/video_core/vulkan_common/vulkan_debug_callback.h` and
-//! `zuyu/src/video_core/vulkan_common/vulkan_debug_callback.cpp`.
+//! Port of Eden's `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`.
 //!
 //! Creates a Vulkan debug utils messenger that logs validation layer messages.
 
 use ash::vk;
 use std::ffi::CStr;
+
+use crate::gpu_logging::{get_instance, is_active};
 
 use super::vulkan_wrapper::VulkanError;
 
@@ -48,6 +49,17 @@ fn is_ignored_message_id(message_id: u32) -> bool {
     IGNORED_MESSAGE_IDS.contains(&message_id)
 }
 
+/// Port of Eden's `GetMessageTypeName` helper used by GPU logging.
+fn get_message_type_name(message_type: vk::DebugUtilsMessageTypeFlagsEXT) -> &'static str {
+    if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION) {
+        "Validation"
+    } else if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+        "Performance"
+    } else {
+        "General"
+    }
+}
+
 #[cfg(target_os = "android")]
 const IGNORED_MESSAGE_IDS: &[u32] = &[
     0xbf9cf353, // VUID-vkCmdBindVertexBuffers2-pBuffers-04111
@@ -62,7 +74,7 @@ const IGNORED_MESSAGE_IDS: &[u32] = &[
     0xb13c8036, // VUID-vkCmdSetDepthBiasEnable-None-04872
     0xdff2e5c1, // VUID-vkCmdSetRasterizerDiscardEnable-None-04871
     0x0cc85f41, // VUID-vkCmdSetPrimitiveRestartEnable-None-04866
-    0x01257b49, // VUID-vkCmdSetLogicOpEXT-None-0486
+    0x1257b492, // VUID-vkCmdSetLogicOpEXT-None-0486
     0x398e0dab, // VUID-vkCmdSetVertexInputEXT-None-04790
     0x970c11a5, // VUID-vkCmdSetColorWriteMaskEXT-*
     0x6b453f78, // VUID-vkCmdSetColorBlendEnableEXT-*
@@ -81,7 +93,7 @@ const IGNORED_MESSAGE_IDS: &[u32] = &[
 /// Port of `DebugUtilCallback` from `vulkan_debug_callback.cpp`.
 unsafe extern "system" fn debug_utils_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
@@ -110,6 +122,30 @@ unsafe extern "system" fn debug_utils_callback(
         log::info!(target: "Render_Vulkan", "{}", message);
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE) {
         log::debug!(target: "Render_Vulkan", "{}", message);
+    }
+
+    // Route Vulkan validation messages to the GPU logger, matching Eden.
+    if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+        let result_code = if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+            -1
+        } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+            -2
+        } else {
+            0
+        };
+        let call_name = if data.p_message_id_name.is_null() {
+            "VulkanDebug"
+        } else {
+            match CStr::from_ptr(data.p_message_id_name).to_str() {
+                Ok(name) => name,
+                Err(_) => "VulkanDebug",
+            }
+        };
+        get_instance().log_vulkan_call(
+            call_name,
+            &format!("{}: {}", get_message_type_name(message_type), message),
+            result_code,
+        );
     }
 
     vk::FALSE
@@ -160,14 +196,63 @@ pub fn create_debug_utils_callback(
 
 #[cfg(test)]
 mod tests {
-    use super::is_ignored_message_id;
+    use super::{get_message_type_name, is_ignored_message_id};
+    use ash::vk;
 
     #[test]
     fn known_validation_false_positive_is_ignored() {
         #[cfg(not(target_os = "android"))]
         assert!(is_ignored_message_id(0x682a878a));
         #[cfg(target_os = "android")]
-        assert!(is_ignored_message_id(0xbf9cf353));
+        {
+            assert!(is_ignored_message_id(0xbf9cf353));
+            assert!(is_ignored_message_id(0x1257b492));
+        }
         assert!(!is_ignored_message_id(0));
+    }
+
+    #[test]
+    fn complete_false_positive_table_matches_upstream() {
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(
+            super::IGNORED_MESSAGE_IDS,
+            &[
+                0x682a878a, 0x99fb7dfd, 0xe8616bf2, 0x1608dec0, 0x55362756,
+            ]
+        );
+
+        #[cfg(target_os = "android")]
+        assert_eq!(
+            super::IGNORED_MESSAGE_IDS,
+            &[
+                0xbf9cf353, 0x1093bebb, 0x9215850f, 0x86bf18dc, 0x0792ad08, 0x93e1ba4e,
+                0xac9c13c5, 0xc9a2001b, 0x8b7159a7, 0xb13c8036, 0xdff2e5c1, 0x0cc85f41,
+                0x1257b492, 0x398e0dab, 0x970c11a5, 0x6b453f78, 0xf66469d0, 0x1d43405e,
+                0x638462e8, 0xe0a2da61,
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_log_message_type_priority_matches_upstream() {
+        assert_eq!(
+            get_message_type_name(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION),
+            "Validation"
+        );
+        assert_eq!(
+            get_message_type_name(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE),
+            "Performance"
+        );
+        assert_eq!(
+            get_message_type_name(
+                vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+            ),
+            "Validation"
+        );
+        assert_eq!(
+            get_message_type_name(vk::DebugUtilsMessageTypeFlagsEXT::GENERAL),
+            "General"
+        );
     }
 }

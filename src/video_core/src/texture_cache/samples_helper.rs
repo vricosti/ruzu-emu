@@ -6,47 +6,11 @@
 //! Helpers for converting between MSAA sample counts and log2 representations,
 //! and for mapping MsaaMode enumeration values to concrete sample counts.
 
-// ── MsaaMode ───────────────────────────────────────────────────────────
-// Upstream lives in video_core/textures/texture.h (Tegra::Texture::MsaaMode).
-// Reproduced here to avoid a circular dependency until the textures crate is
-// ported.  Must stay in sync with upstream enum values.
+use crate::textures::texture::MsaaMode;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum MsaaMode {
-    Msaa1x1 = 0,
-    Msaa2x1 = 1,
-    Msaa2x2 = 2,
-    Msaa4x2 = 3,
-    Msaa4x2D3D = 4,
-    Msaa2x1D3D = 5,
-    Msaa4x4 = 6,
-    Msaa2x2Vc4 = 8,
-    Msaa2x2Vc12 = 9,
-    Msaa4x2Vc8 = 10,
-    Msaa4x2Vc24 = 11,
-}
+// ── MsaaMode ───────────────────────────────────────────────────────────
 
 // ── Public helpers ─────────────────────────────────────────────────────
-
-impl MsaaMode {
-    pub fn from_raw(value: u32) -> Option<Self> {
-        match value {
-            0 => Some(Self::Msaa1x1),
-            1 => Some(Self::Msaa2x1),
-            2 => Some(Self::Msaa2x2),
-            3 => Some(Self::Msaa4x2),
-            4 => Some(Self::Msaa4x2D3D),
-            5 => Some(Self::Msaa2x1D3D),
-            6 => Some(Self::Msaa4x4),
-            8 => Some(Self::Msaa2x2Vc4),
-            9 => Some(Self::Msaa2x2Vc12),
-            10 => Some(Self::Msaa4x2Vc8),
-            11 => Some(Self::Msaa4x2Vc24),
-            _ => None,
-        }
-    }
-}
 
 /// Returns (log2_x, log2_y) for a given sample count.
 ///
@@ -71,9 +35,9 @@ pub fn samples_log2(num_samples: i32) -> (i32, i32) {
 pub fn num_samples(msaa_mode: MsaaMode) -> i32 {
     match msaa_mode {
         MsaaMode::Msaa1x1 => 1,
-        MsaaMode::Msaa2x1 | MsaaMode::Msaa2x1D3D => 2,
+        MsaaMode::Msaa2x1 | MsaaMode::Msaa2x1D3d => 2,
         MsaaMode::Msaa2x2 | MsaaMode::Msaa2x2Vc4 | MsaaMode::Msaa2x2Vc12 => 4,
-        MsaaMode::Msaa4x2 | MsaaMode::Msaa4x2D3D | MsaaMode::Msaa4x2Vc8 | MsaaMode::Msaa4x2Vc24 => {
+        MsaaMode::Msaa4x2 | MsaaMode::Msaa4x2D3d | MsaaMode::Msaa4x2Vc8 | MsaaMode::Msaa4x2Vc24 => {
             8
         }
         MsaaMode::Msaa4x4 => 16,
@@ -87,12 +51,12 @@ pub fn num_samples_x(msaa_mode: MsaaMode) -> i32 {
     match msaa_mode {
         MsaaMode::Msaa1x1 => 1,
         MsaaMode::Msaa2x1
-        | MsaaMode::Msaa2x1D3D
+        | MsaaMode::Msaa2x1D3d
         | MsaaMode::Msaa2x2
         | MsaaMode::Msaa2x2Vc4
         | MsaaMode::Msaa2x2Vc12 => 2,
         MsaaMode::Msaa4x2
-        | MsaaMode::Msaa4x2D3D
+        | MsaaMode::Msaa4x2D3d
         | MsaaMode::Msaa4x2Vc8
         | MsaaMode::Msaa4x2Vc24
         | MsaaMode::Msaa4x4 => 4,
@@ -104,12 +68,12 @@ pub fn num_samples_x(msaa_mode: MsaaMode) -> i32 {
 /// Port of `NumSamplesY` from samples_helper.h.
 pub fn num_samples_y(msaa_mode: MsaaMode) -> i32 {
     match msaa_mode {
-        MsaaMode::Msaa1x1 | MsaaMode::Msaa2x1 | MsaaMode::Msaa2x1D3D => 1,
+        MsaaMode::Msaa1x1 | MsaaMode::Msaa2x1 | MsaaMode::Msaa2x1D3d => 1,
         MsaaMode::Msaa2x2
         | MsaaMode::Msaa2x2Vc4
         | MsaaMode::Msaa2x2Vc12
         | MsaaMode::Msaa4x2
-        | MsaaMode::Msaa4x2D3D
+        | MsaaMode::Msaa4x2D3d
         | MsaaMode::Msaa4x2Vc8
         | MsaaMode::Msaa4x2Vc24 => 2,
         MsaaMode::Msaa4x4 => 4,
@@ -130,19 +94,24 @@ mod tests {
     }
 
     #[test]
-    fn test_num_samples() {
-        assert_eq!(num_samples(MsaaMode::Msaa1x1), 1);
-        assert_eq!(num_samples(MsaaMode::Msaa2x1), 2);
-        assert_eq!(num_samples(MsaaMode::Msaa2x2), 4);
-        assert_eq!(num_samples(MsaaMode::Msaa4x2), 8);
-        assert_eq!(num_samples(MsaaMode::Msaa4x4), 16);
-    }
-
-    #[test]
-    fn test_num_samples_xy() {
-        assert_eq!(num_samples_x(MsaaMode::Msaa4x2), 4);
-        assert_eq!(num_samples_y(MsaaMode::Msaa4x2), 2);
-        assert_eq!(num_samples_x(MsaaMode::Msaa1x1), 1);
-        assert_eq!(num_samples_y(MsaaMode::Msaa1x1), 1);
+    fn every_msaa_mode_uses_the_upstream_sample_dimensions() {
+        let cases = [
+            (MsaaMode::Msaa1x1, 1, 1, 1),
+            (MsaaMode::Msaa2x1, 2, 2, 1),
+            (MsaaMode::Msaa2x1D3d, 2, 2, 1),
+            (MsaaMode::Msaa2x2, 4, 2, 2),
+            (MsaaMode::Msaa2x2Vc4, 4, 2, 2),
+            (MsaaMode::Msaa2x2Vc12, 4, 2, 2),
+            (MsaaMode::Msaa4x2, 8, 4, 2),
+            (MsaaMode::Msaa4x2D3d, 8, 4, 2),
+            (MsaaMode::Msaa4x2Vc8, 8, 4, 2),
+            (MsaaMode::Msaa4x2Vc24, 8, 4, 2),
+            (MsaaMode::Msaa4x4, 16, 4, 4),
+        ];
+        for (mode, total, x, y) in cases {
+            assert_eq!(num_samples(mode), total);
+            assert_eq!(num_samples_x(mode), x);
+            assert_eq!(num_samples_y(mode), y);
+        }
     }
 }

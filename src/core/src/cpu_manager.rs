@@ -2065,8 +2065,14 @@ impl CpuManager {
 
         // Upstream: if (!is_async_gpu && !is_multicore) { system.GPU().ObtainContext(); }
         if !is_async_gpu && !is_multicore {
-            // GPU context acquisition — requires GPU integration.
-            // When GPU is fully wired, call gpu.obtain_context() here.
+            let system = kernel.system();
+            if !system.is_null() {
+                system
+                    .get()
+                    .gpu_core()
+                    .expect("CpuManager::RunThread requires the initialized GPU")
+                    .obtain_context();
+            }
         }
 
         // Upstream:

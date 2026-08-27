@@ -27,6 +27,8 @@ use std::sync::{Arc, Once};
 
 use ash::vk;
 use ash::vk::Handle;
+use common::alignment::{align_down, align_up};
+use common::types::PAGE_SIZE_U64;
 use log::{debug, info, warn};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -38,17 +40,17 @@ use crate::buffer_cache::buffer_cache_base::{
 };
 use crate::cache_types::CacheType;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
-use crate::engines::draw_manager::{
-    DrawMode, DrawState, IndexBuffer, Maxwell3DDrawRegisters, Maxwell3DDrawView, VertexBuffer,
-};
+use crate::engines::draw_manager::Maxwell3DDrawView;
+#[cfg(test)]
+use crate::engines::draw_manager::{DrawState, Maxwell3DDrawRegisters};
 use crate::engines::kepler_compute::DispatchCall;
 #[cfg(test)]
 use crate::engines::maxwell_3d::{BlendEquation, BlendFactor, ComparisonOp, CullFace, FrontFace};
-use crate::engines::maxwell_3d::{DrawCall, PrimitiveTopology, VertexAttribType, NUM_VIEWPORTS};
+use crate::engines::maxwell_3d::{PrimitiveTopology, VertexAttribType, NUM_VIEWPORTS};
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
-use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager as GenericFenceManager;
 use crate::framebuffer_config::FramebufferConfig;
+use crate::gpu_logging::{get_instance, is_active};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
@@ -128,6 +130,55 @@ struct DrawParams {
     num_vertices: u32,
     first_index: u32,
     is_indexed: bool,
+}
+
+fn direct_draw_log_info(draw_params: DrawParams) -> (&'static str, String) {
+    if draw_params.is_indexed {
+        (
+            "vkCmdDrawIndexed",
+            format!(
+                "vertices={}, instances={}, firstIndex={}, baseVertex={}, baseInstance={}",
+                draw_params.num_vertices,
+                draw_params.num_instances,
+                draw_params.first_index,
+                draw_params.base_vertex,
+                draw_params.base_instance
+            ),
+        )
+    } else {
+        (
+            "vkCmdDraw",
+            format!(
+                "vertices={}, instances={}, firstVertex={}, firstInstance={}",
+                draw_params.num_vertices,
+                draw_params.num_instances,
+                draw_params.base_vertex,
+                draw_params.base_instance
+            ),
+        )
+    }
+}
+
+fn indirect_draw_log_info(
+    is_indexed: bool,
+    max_draw_counts: usize,
+    stride: usize,
+) -> (&'static str, String) {
+    (
+        if is_indexed {
+            "vkCmdDrawIndexedIndirect"
+        } else {
+            "vkCmdDrawIndirect"
+        },
+        format!("drawCount={}, stride={}", max_draw_counts, stride),
+    )
+}
+
+fn dispatch_log_info(dim: [u32; 3]) -> String {
+    format!(
+        "groupCountX={}, groupCountY={}, groupCountZ={}",
+        dim[0], dim[1], dim[2]
+    )
 }
 
 fn make_draw_params(draw: &Maxwell3DDrawView<'_>, instance_count: u32) -> DrawParams {
@@ -486,8 +537,6 @@ pub struct RasterizerVulkan {
     /// `ash::Device` into every command would copy its full dispatch table,
     /// unlike upstream's pointer capture through `this`.
     device: DeviceReference,
-    instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
     syncpoints: Arc<SyncpointManager>,
     /// Shared owner counterpart of upstream
     /// `Tegra::MaxwellDeviceMemoryManager& device_memory`.
@@ -543,34 +592,12 @@ pub struct RasterizerVulkan {
     render_pass_cache: Box<RenderPassCache>,
     wfi_event: vk::Event,
 
-    // Default render pass for the offscreen framebuffer
-    default_render_pass: vk::RenderPass,
-
-    // Offscreen framebuffer resources
-    offscreen_image: vk::Image,
-    offscreen_memory: vk::DeviceMemory,
-    offscreen_view: vk::ImageView,
-    offscreen_fb: vk::Framebuffer,
-    depth_image: vk::Image,
-    depth_memory: vk::DeviceMemory,
-    depth_view: vk::ImageView,
-    fb_width: u32,
-    fb_height: u32,
-
-    // Readback buffer (GPU→CPU pixel transfer)
-    readback_buffer: vk::Buffer,
-    readback_memory: vk::DeviceMemory,
-    readback_mapped: *mut u8,
-    readback_size: u64,
-
     // Upstream FlushWork checks every eighth operation and flushes at 4096.
     draw_counter: u32,
     /// Monotonic draw sequence used only by env-gated diagnostics.
     draw_sequence: u64,
     /// Draws dropped because pipeline compilation failed (diagnostic).
     draw_skipped_pipeline: u64,
-    /// Draws redirected to the offscreen framebuffer because no guest
-    /// render-target framebuffer could be resolved (diagnostic).
     driver_id: vk::DriverId,
     extended_dynamic_state_supported: bool,
     extended_dynamic_state2_supported: bool,
@@ -582,7 +609,6 @@ pub struct RasterizerVulkan {
     line_rasterization_supported: bool,
     smooth_lines_supported: bool,
     vertex_input_dynamic_state_supported: bool,
-    must_emulate_scaled_formats: bool,
     depth_bounds_supported: bool,
     supports_d24_depth: bool,
     depth_range_unrestricted: bool,
@@ -793,8 +819,6 @@ impl RasterizerVulkan {
         physical_device: vk::PhysicalDevice,
         driver_id: vk::DriverId,
         cant_blit_msaa: bool,
-        width: u32,
-        height: u32,
         depth_bounds_supported: bool,
         depth_range_unrestricted: bool,
         nv_viewport_swizzle: bool,
@@ -803,8 +827,6 @@ impl RasterizerVulkan {
         extended_dynamic_state_supported: bool,
         transform_feedback_supported: bool,
         host_query_reset_supported: bool,
-        subgroup_scan_supported: bool,
-        conditional_rendering_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_logic_op_supported: bool,
         extended_dynamic_state3_blending_supported: bool,
@@ -816,10 +838,8 @@ impl RasterizerVulkan {
         vertex_input_dynamic_state_supported: bool,
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
-        must_emulate_scaled_formats: bool,
         must_emulate_bgr565: bool,
         ext_4444_formats_supported: bool,
-        shader_stencil_export_supported: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
@@ -836,10 +856,7 @@ impl RasterizerVulkan {
         state_tracker: &mut StateTracker,
         scheduler: &mut Scheduler,
     ) -> Result<Self, RendererError> {
-        info!(
-            "RasterizerVulkan: initializing {}x{} renderer",
-            width, height
-        );
+        info!("RasterizerVulkan: initializing renderer");
         let device = vulkan_device.get_logical();
 
         // Create staging buffer pool
@@ -872,8 +889,8 @@ impl RasterizerVulkan {
         let mut blit_image = Box::new(BlitImageHelper::new(
             vulkan_device,
             scheduler,
+            state_tracker,
             descriptor_pool.as_mut(),
-            shader_stencil_export_supported,
         ));
 
         let (fallback_uniform_buffer, fallback_uniform_memory, fallback_uniform_mapped) =
@@ -949,7 +966,6 @@ impl RasterizerVulkan {
                 sampler_filter_minmax_supported,
                 vulkan_device.get_sampler_heap_budget(),
                 has_null_descriptor,
-                driver_id == vk::DriverId::NVIDIA_PROPRIETARY,
             )
             .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?,
         );
@@ -971,6 +987,7 @@ impl RasterizerVulkan {
 
         // Create query cache
         let query_cache = VulkanQueryCache::new(
+            vulkan_device,
             &instance,
             device.clone(),
             scheduler,
@@ -981,8 +998,6 @@ impl RasterizerVulkan {
             compute_pass_desc_queue.as_mut(),
             Arc::clone(&device_memory),
             driver_id,
-            subgroup_scan_supported,
-            conditional_rendering_supported,
             transform_feedback_supported,
             host_query_reset_supported,
         )
@@ -1000,33 +1015,6 @@ impl RasterizerVulkan {
                 .map_err(|e| RendererError::InitFailed(format!("wfi event: {:?}", e)))?
         };
 
-        // Create default render pass
-        let default_render_pass = create_default_render_pass(&device)?;
-
-        // Create offscreen framebuffer resources
-        let (offscreen_image, offscreen_memory, offscreen_view) =
-            create_color_attachment(&instance, physical_device, &device, width, height)?;
-        let (depth_image, depth_memory, depth_view) =
-            create_depth_attachment(&instance, physical_device, &device, width, height)?;
-
-        let offscreen_fb = create_framebuffer(
-            &device,
-            default_render_pass,
-            offscreen_view,
-            depth_view,
-            width,
-            height,
-        )?;
-
-        // Create readback buffer
-        let readback_size = (width * height * 4) as u64;
-        let (readback_buffer, readback_memory, readback_mapped) = create_host_buffer(
-            &instance,
-            physical_device,
-            &device,
-            readback_size,
-            vk::BufferUsageFlags::TRANSFER_DST,
-        )?;
         let draw_indirect_count = draw_indirect_count_supported
             .then(|| ash::extensions::khr::DrawIndirectCount::new(&instance, &device));
         let push_descriptor = push_descriptor_supported
@@ -1061,8 +1049,6 @@ impl RasterizerVulkan {
         let fence_wait_handle = scheduler.wait_handle();
         Ok(Self {
             device: DeviceReference::new(vulkan_device),
-            instance,
-            physical_device,
             syncpoints,
             device_memory,
             channel_caches: ChannelSetupCaches::new(),
@@ -1088,20 +1074,6 @@ impl RasterizerVulkan {
             fence_manager: GenericFenceManager::new(true),
             fence_backend: VkFenceBackend::new(fence_wait_handle),
             wfi_event,
-            default_render_pass,
-            offscreen_image,
-            offscreen_memory,
-            offscreen_view,
-            offscreen_fb,
-            depth_image,
-            depth_memory,
-            depth_view,
-            fb_width: width,
-            fb_height: height,
-            readback_buffer,
-            readback_memory,
-            readback_mapped,
-            readback_size,
             draw_counter: 0,
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
@@ -1116,7 +1088,6 @@ impl RasterizerVulkan {
             line_rasterization_supported,
             smooth_lines_supported,
             vertex_input_dynamic_state_supported,
-            must_emulate_scaled_formats,
             depth_bounds_supported,
             supports_d24_depth: vulkan_device.supports_d24_depth_buffer(),
             depth_range_unrestricted,
@@ -1253,10 +1224,21 @@ impl RasterizerVulkan {
                 self.fallback_sampler,
             );
         }
+        let command_buffer_tick_before_configure = self.scheduler.current_tick();
         if !gp.configure(draw.is_indexed()) {
             self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
             warn!("RasterizerVulkan: draw skipped because graphics pipeline configuration failed");
             return;
+        }
+        if self.scheduler.current_tick() != command_buffer_tick_before_configure {
+            // Eden's StateTracker points directly at the live Maxwell flags,
+            // so Scheduler::InvalidateState immediately reaches the flags
+            // consumed by UpdateDynamicStates. Ruzu uses a draw-scoped mirror
+            // during Configure to avoid aliased mutable register access. Keep
+            // that mirror in step when Configure allocates/recycles resources
+            // and flushes onto a fresh command buffer.
+            self.state_tracker
+                .apply_command_buffer_invalidation(dirty_flags);
         }
         let indirect_binding = indirect_params.map(|params| {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
@@ -1378,6 +1360,18 @@ impl RasterizerVulkan {
                         );
                     }
                 });
+                if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+                    let (call_name, log_params) = indirect_draw_log_info(
+                        params.is_indexed,
+                        params.max_draw_counts,
+                        params.stride,
+                    );
+                    get_instance().log_vulkan_call(
+                        call_name,
+                        &log_params,
+                        vk::Result::SUCCESS.as_raw(),
+                    );
+                }
             }
         } else {
             let draw_params = make_draw_params(draw, instance_count);
@@ -1407,6 +1401,10 @@ impl RasterizerVulkan {
                     );
                 });
             }
+            if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+                let (call_name, params) = direct_draw_log_info(draw_params);
+                get_instance().log_vulkan_call(call_name, &params, vk::Result::SUCCESS.as_raw());
+            }
         }
     }
 
@@ -1435,8 +1433,14 @@ impl RasterizerVulkan {
             QueryType::StreamingByteCount as u32,
             enabled,
         );
-        if enabled && tessellation_enabled {
-            warn!("Transform feedback with tessellation shaders is not implemented");
+        if enabled {
+            if is_active() {
+                get_instance()
+                    .log_extension_usage("VK_EXT_transform_feedback", "HandleTransformFeedback");
+            }
+            if tessellation_enabled {
+                warn!("Transform feedback with tessellation shaders is not implemented");
+            }
         }
     }
 
@@ -1503,7 +1507,11 @@ impl RasterizerVulkan {
             self.texture_cache.commit_async_flushes();
             self.common_buffer_cache.commit_async_flushes();
         }
-        self.query_cache.commit_async_flushes(&mut self.scheduler);
+        let this = self as *mut Self;
+        self.query_cache
+            .commit_async_flushes(&mut self.scheduler, move |operation| unsafe {
+                (*this).sync_operation(operation);
+            });
     }
 
     /// Callback adaptation of upstream `FenceManager::SignalOrdering`, which
@@ -1517,169 +1525,15 @@ impl RasterizerVulkan {
     }
 
     fn queue_fence(&mut self, fence: &mut VkFence) {
-        let is_stubbed = fence.lock().unwrap().is_stubbed();
-        let tick = if is_stubbed {
-            0
-        } else {
-            self.scheduler.flush()
-        };
-        self.fence_backend.queue_fence(fence, tick);
+        self.fence_backend.queue_fence(fence, &mut self.scheduler);
     }
 
     fn is_fence_signaled(&self, fence: &VkFence) -> bool {
-        let wait_tick = fence.lock().unwrap().wait_tick();
-        self.scheduler.is_free(wait_tick)
+        self.fence_backend.is_fence_signaled(fence)
     }
 
     fn wait_fence(&mut self, fence: &VkFence) {
-        let wait_tick = fence.lock().unwrap().wait_tick();
-        self.scheduler.wait(wait_tick);
-    }
-
-    /// Read back the offscreen framebuffer as RGBA8 pixels.
-    pub fn read_framebuffer(&mut self) -> Vec<u8> {
-        self.texture_cache.transition_layout(
-            self.offscreen_image,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageAspectFlags::COLOR,
-        );
-
-        // Copy to readback buffer
-        let region = vk::BufferImageCopy::builder()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .image_extent(vk::Extent3D {
-                width: self.fb_width,
-                height: self.fb_height,
-                depth: 1,
-            })
-            .build();
-        let device = self.device;
-        let offscreen_image = self.offscreen_image;
-        let readback_buffer = self.readback_buffer;
-        self.scheduler.record(move |cmdbuf| unsafe {
-            let device = device.get().get_logical();
-            device.cmd_copy_image_to_buffer(
-                cmdbuf,
-                offscreen_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                readback_buffer,
-                &[region],
-            );
-        });
-
-        self.texture_cache.transition_layout(
-            self.offscreen_image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageAspectFlags::COLOR,
-        );
-
-        // Submit and wait
-        self.scheduler.finish();
-
-        // Read pixels
-        let pixel_count = (self.fb_width * self.fb_height * 4) as usize;
-        let mut pixels = vec![0u8; pixel_count];
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.readback_mapped, pixels.as_mut_ptr(), pixel_count);
-        }
-        pixels
-    }
-
-    /// Render all draw calls and return the framebuffer result.
-    ///
-    /// This is the main entry point called from GpuContext::flush().
-    pub fn render_draw_calls(
-        &mut self,
-        draws: &[DrawCall],
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-        base_framebuffer: Option<Framebuffer>,
-    ) -> Option<Framebuffer> {
-        if draws.is_empty() {
-            return base_framebuffer;
-        }
-
-        let (fb_width, fb_height, gpu_va) = if let Some(ref fb) = base_framebuffer {
-            (fb.width, fb.height, fb.gpu_va)
-        } else {
-            let rt = &draws[0].render_targets[0];
-            let w = if rt.width > 0 { rt.width } else { 1280 };
-            let h = if rt.height > 0 { rt.height } else { 720 };
-            (w, h, rt.address)
-        };
-
-        if fb_width == 0 || fb_height == 0 {
-            return None;
-        }
-
-        // Resize offscreen framebuffer if needed
-        if fb_width != self.fb_width || fb_height != self.fb_height {
-            if let Err(e) = self.resize_framebuffer(fb_width, fb_height) {
-                warn!("RasterizerVulkan: failed to resize framebuffer: {}", e);
-                return base_framebuffer;
-            }
-        }
-
-        // Process each draw call individually (per-draw dispatch like zuyu)
-        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            read_gpu(gpu_va, output);
-            true
-        };
-        for draw in draws {
-            // Legacy Reden-only batch path: reconstruct the draw view which
-            // the live rasterizer receives directly from Maxwell3D.
-            let draw_state = DrawState {
-                topology: draw.topology,
-                draw_mode: DrawMode::General,
-                draw_indexed: draw.indexed,
-                base_index: draw.base_vertex as u32,
-                vertex_buffer: VertexBuffer {
-                    first: draw.vertex_first,
-                    count: draw.vertex_count,
-                },
-                index_buffer: IndexBuffer {
-                    first: draw.index_buffer_first,
-                    count: draw.index_buffer_count,
-                    format: draw.index_format,
-                },
-                base_instance: draw.base_instance,
-                instance_count: draw.instance_count,
-                inline_index_draw_indexes: draw.inline_index_data.clone(),
-            };
-            let registers = Maxwell3DDrawRegisters::from_draw_call(draw);
-            let mut draw_view =
-                Maxwell3DDrawView::with_register_snapshot(&draw_state, draw.indexed, registers);
-            let mut dirty_flags = draw.dirty_flags;
-            self.prepare_draw(
-                &mut draw_view,
-                draw.instance_count,
-                false,
-                None,
-                &mut dirty_flags,
-                read_gpu,
-                &read_gpu_unsafe,
-            );
-        }
-
-        // Read back rendered pixels
-        let pixels = self.read_framebuffer();
-
-        Some(Framebuffer {
-            gpu_va,
-            width: fb_width,
-            height: fb_height,
-            pixels,
-        })
+        self.fence_backend.wait_fence(fence);
     }
 
     // ── Dynamic state update methods ──────────────────────────────────────
@@ -2088,7 +1942,7 @@ impl RasterizerVulkan {
                     .location(index as u32)
                     .binding(binding as u32)
                     .format(maxwell_to_vk::vertex_format(
-                        self.must_emulate_scaled_formats,
+                        self.device.get(),
                         attribute.attrib_type,
                         attribute.size,
                     ))
@@ -2266,6 +2120,7 @@ impl RasterizerVulkan {
             | PrimitiveTopology::TrianglesAdjacency
             | PrimitiveTopology::TriangleStripAdjacency
             | PrimitiveTopology::Patches => rasterizer.polygon_offset_fill_enable,
+            invalid => panic!("invalid topology for depth-bias lookup: {invalid:?}"),
         };
         let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
@@ -2674,82 +2529,6 @@ impl RasterizerVulkan {
         });
     }
 
-    // ── Framebuffer resize ────────────────────────────────────────────────
-
-    fn resize_framebuffer(&mut self, new_width: u32, new_height: u32) -> Result<(), RendererError> {
-        let device = self.device.get().get_logical();
-        unsafe {
-            device.device_wait_idle().ok();
-        }
-
-        // Destroy old resources
-        unsafe {
-            device.destroy_framebuffer(self.offscreen_fb, None);
-            device.destroy_image_view(self.offscreen_view, None);
-            device.destroy_image(self.offscreen_image, None);
-            device.free_memory(self.offscreen_memory, None);
-            device.destroy_image_view(self.depth_view, None);
-            device.destroy_image(self.depth_image, None);
-            device.free_memory(self.depth_memory, None);
-            device.unmap_memory(self.readback_memory);
-            device.destroy_buffer(self.readback_buffer, None);
-            device.free_memory(self.readback_memory, None);
-        }
-
-        // Create new resources
-        let (oi, om, ov) = create_color_attachment(
-            &self.instance,
-            self.physical_device,
-            device,
-            new_width,
-            new_height,
-        )?;
-        let (di, dm, dv) = create_depth_attachment(
-            &self.instance,
-            self.physical_device,
-            device,
-            new_width,
-            new_height,
-        )?;
-        let fb = create_framebuffer(
-            device,
-            self.default_render_pass,
-            ov,
-            dv,
-            new_width,
-            new_height,
-        )?;
-
-        let readback_size = (new_width * new_height * 4) as u64;
-        let (rb, rm, rp) = create_host_buffer(
-            &self.instance,
-            self.physical_device,
-            device,
-            readback_size,
-            vk::BufferUsageFlags::TRANSFER_DST,
-        )?;
-
-        self.offscreen_image = oi;
-        self.offscreen_memory = om;
-        self.offscreen_view = ov;
-        self.depth_image = di;
-        self.depth_memory = dm;
-        self.depth_view = dv;
-        self.offscreen_fb = fb;
-        self.readback_buffer = rb;
-        self.readback_memory = rm;
-        self.readback_mapped = rp;
-        self.readback_size = readback_size;
-        self.fb_width = new_width;
-        self.fb_height = new_height;
-
-        info!(
-            "RasterizerVulkan: resized framebuffer to {}x{}",
-            new_width, new_height
-        );
-        Ok(())
-    }
-
     /// Port-facing entry point for upstream `RasterizerVulkan::AccelerateDisplay`.
     ///
     /// The texture-cache lookup body is still unported in this active rasterizer
@@ -3133,11 +2912,11 @@ impl RasterizerInterface for RasterizerVulkan {
         let can_defer_clear = ENABLE_DEFERRED_CLEAR
             && !clear_view.use_scissor()
             && clear_layer == 0
-            && !self.scheduler.is_inside_renderpass()
+            && !self.scheduler.is_render_pass_active()
             && (!use_color || color_full_channels)
             && ds_deferrable;
         if !can_defer_clear {
-            self.scheduler.request_framebuffer(&target);
+            self.scheduler.request_renderpass(&target);
         }
 
         self.query_cache.notify_segment(true);
@@ -3224,7 +3003,6 @@ impl RasterizerInterface for RasterizerVulkan {
             layer_count,
         };
         let color_attachment = ((clear_state.flags >> 6) & 0xF) as usize;
-        let mut attachments = Vec::with_capacity(2);
         if use_color && target.has_aspect_color_bit(color_attachment) {
             let format = crate::surface::pixel_format_from_render_target_format(
                 render_targets.render_targets[color_attachment].format,
@@ -3234,10 +3012,15 @@ impl RasterizerInterface for RasterizerVulkan {
                 self.scheduler
                     .defer_color_clear(&target, color_attachment as u32, clear_value);
             } else if color_full_channels {
-                attachments.push(vk::ClearAttachment {
+                let attachment = vk::ClearAttachment {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     color_attachment: color_attachment as u32,
                     clear_value,
+                };
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_clear_attachments(cmdbuf, &[attachment], &[clear_rect]);
                 });
             } else {
                 let color_mask = u8::from(use_r)
@@ -3261,6 +3044,9 @@ impl RasterizerInterface for RasterizerVulkan {
                     &dst_region,
                 );
             }
+        }
+        if !use_depth && !use_stencil {
+            return;
         }
         let mut depth_stencil_aspects = vk::ImageAspectFlags::empty();
         if target.has_aspect_depth_bit() && use_depth {
@@ -3301,7 +3087,7 @@ impl RasterizerInterface for RasterizerVulkan {
                     },
                 );
             } else {
-                attachments.push(vk::ClearAttachment {
+                let attachment = vk::ClearAttachment {
                     aspect_mask: depth_stencil_aspects,
                     color_attachment: 0,
                     clear_value: vk::ClearValue {
@@ -3310,18 +3096,14 @@ impl RasterizerInterface for RasterizerVulkan {
                             stencil: clear_state.stencil as u32,
                         },
                     },
+                };
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_clear_attachments(cmdbuf, &[attachment], &[clear_rect]);
                 });
             }
         }
-        if attachments.is_empty() {
-            return;
-        }
-
-        let device = self.device;
-        self.scheduler.record(move |cmdbuf| unsafe {
-            let device = device.get().get_logical();
-            device.cmd_clear_attachments(cmdbuf, &attachments, &[clear_rect]);
-        });
     }
 
     fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
@@ -3379,7 +3161,8 @@ impl RasterizerInterface for RasterizerVulkan {
             }
             let indirect_buffer = vk::Buffer::from_raw(raw_buffer);
             let device = self.device;
-            self.scheduler.request_outside_renderpass();
+            self.scheduler
+                .request_outside_render_pass_operation_context();
             self.scheduler.record(move |cmdbuf| unsafe {
                 if *compute_pipeline.lock().unwrap() == vk::Pipeline::null() {
                     return;
@@ -3400,7 +3183,8 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
         let barrier_device = self.device;
-        self.scheduler.request_outside_renderpass();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.scheduler.record(move |cmdbuf| unsafe {
             let barrier_device = barrier_device.get().get_logical();
             let barrier = vk::MemoryBarrier::builder()
@@ -3427,6 +3211,13 @@ impl RasterizerInterface for RasterizerVulkan {
             let device = device.get().get_logical();
             device.cmd_dispatch(cmdbuf, dim[0], dim[1], dim[2]);
         });
+        if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
+            get_instance().log_vulkan_call(
+                "vkCmdDispatch",
+                &dispatch_log_info(dim),
+                vk::Result::SUCCESS.as_raw(),
+            );
+        }
     }
 
     fn reset_counter(&mut self, query_type: u32) {
@@ -3437,8 +3228,11 @@ impl RasterizerInterface for RasterizerVulkan {
             );
             return;
         }
+        let this = self as *mut Self;
         self.query_cache
-            .counter_reset(&mut self.scheduler, query_type);
+            .counter_reset(&mut self.scheduler, query_type, move |operation| unsafe {
+                (*this).sync_operation(operation);
+            });
     }
 
     fn query(
@@ -3624,11 +3418,10 @@ impl RasterizerInterface for RasterizerVulkan {
                 return area;
             }
         }
-        const PAGE: u64 = 4096;
         RasterizerDownloadArea {
-            start_address: addr & !(PAGE - 1),
-            end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
-            preemptive: true,
+            start_address: align_down(addr, PAGE_SIZE_U64),
+            end_address: align_up(addr.wrapping_add(size), PAGE_SIZE_U64),
+            preemtive: true,
         }
     }
 
@@ -3693,7 +3486,7 @@ impl RasterizerInterface for RasterizerVulkan {
             let _buffer_guard = (*buffer_mutex).lock();
             self.common_buffer_cache.write_memory(addr, size);
         }
-        self.shader_cache.on_cache_invalidation(addr, size as usize);
+        self.shader_cache.invalidate_region(addr, size as usize);
     }
 
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
@@ -3764,11 +3557,16 @@ impl RasterizerInterface for RasterizerVulkan {
             flags |= vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT;
         }
 
-        self.query_cache.notify_wfi();
+        let this = self as *mut Self;
+        self.query_cache
+            .notify_wfi(&mut self.scheduler, move |operation| unsafe {
+                (*this).sync_operation(operation);
+            });
 
         let device = self.device;
         let event = self.wfi_event;
-        self.scheduler.request_outside_renderpass();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.scheduler.record(move |cmdbuf| unsafe {
             let device = device.get().get_logical();
             device.cmd_set_event(cmdbuf, event, flags);
@@ -3794,9 +3592,10 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn fragment_barrier(&mut self) {
         // Upstream `RasterizerVulkan::FragmentBarrier` ends the active render
-        // pass. `Scheduler::request_outside_renderpass` emits the attachment
+        // pass. `Scheduler::request_outside_render_pass_operation_context` emits the attachment
         // write barrier needed before a later texture read.
-        self.scheduler.request_outside_renderpass();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
     }
 
     fn tiled_cache_barrier(&mut self) {}
@@ -3838,8 +3637,18 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn initialize_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.create_channel(channel);
-        self.texture_cache.create_channel(channel);
-        self.common_buffer_cache.create_channel(channel);
+        {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(
+                buffer_mutex,
+                texture_mutex,
+                _buffer_guard,
+                _texture_guard
+            );
+            self.texture_cache.create_channel(channel);
+            self.common_buffer_cache.create_channel(channel);
+        }
         self.shader_cache.create_channel(channel);
         self.pipeline_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
@@ -3848,8 +3657,18 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.bind_to_channel(channel.bind_id);
-        self.texture_cache.bind_to_channel(channel.bind_id);
-        self.common_buffer_cache.bind_to_channel(channel.bind_id);
+        {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(
+                buffer_mutex,
+                texture_mutex,
+                _buffer_guard,
+                _texture_guard
+            );
+            self.texture_cache.bind_to_channel(channel.bind_id);
+            self.common_buffer_cache.bind_to_channel(channel.bind_id);
+        }
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.pipeline_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
@@ -3868,8 +3687,18 @@ impl RasterizerInterface for RasterizerVulkan {
     fn release_channel(&mut self, channel_id: i32) {
         self.state_tracker.release_channel(channel_id);
         self.channel_caches.erase_channel(channel_id);
-        self.texture_cache.erase_channel(channel_id);
-        self.common_buffer_cache.erase_channel(channel_id);
+        {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(
+                buffer_mutex,
+                texture_mutex,
+                _buffer_guard,
+                _texture_guard
+            );
+            self.texture_cache.erase_channel(channel_id);
+            self.common_buffer_cache.erase_channel(channel_id);
+        }
         self.shader_cache.erase_channel(channel_id);
         self.pipeline_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
@@ -3882,23 +3711,10 @@ impl RasterizerInterface for RasterizerVulkan {
         dst: &crate::engines::fermi_2d::Surface,
         copy_config: &crate::engines::fermi_2d::Config,
     ) -> bool {
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
-            return false;
-        };
         let texture_cache: *mut TextureCache = &mut *self.texture_cache;
         unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache).blit_image(
-                dst,
-                src,
-                copy_config,
-                |gpu_addr| mm.lock().gpu_to_cpu_address(gpu_addr),
-                |gpu_addr, out| {
-                    let guard = mm.lock();
-                    guard.read_block(gpu_addr, out);
-                    true
-                },
-            )
+            (*texture_cache).blit_image(dst, src, copy_config)
         }
     }
 
@@ -3969,26 +3785,12 @@ impl Drop for RasterizerVulkan {
         self.scheduler.clear_query_cache_state();
         let device = self.device.get().get_logical();
         unsafe {
-            device.unmap_memory(self.readback_memory);
-            device.destroy_buffer(self.readback_buffer, None);
-            device.free_memory(self.readback_memory, None);
-
             device.destroy_sampler(self.fallback_sampler, None);
             device.unmap_memory(self.fallback_uniform_memory);
             device.destroy_buffer(self.fallback_uniform_buffer, None);
             device.free_memory(self.fallback_uniform_memory, None);
 
-            device.destroy_framebuffer(self.offscreen_fb, None);
-            device.destroy_image_view(self.offscreen_view, None);
-            device.destroy_image(self.offscreen_image, None);
-            device.free_memory(self.offscreen_memory, None);
-
-            device.destroy_image_view(self.depth_view, None);
-            device.destroy_image(self.depth_image, None);
-            device.free_memory(self.depth_memory, None);
-
             device.destroy_event(self.wfi_event, None);
-            device.destroy_render_pass(self.default_render_pass, None);
         }
     }
 }
@@ -4113,249 +3915,6 @@ fn find_memory_type(
     None
 }
 
-fn create_default_render_pass(device: &ash::Device) -> Result<vk::RenderPass, RendererError> {
-    let attachments = [
-        // Color attachment (RGBA8)
-        vk::AttachmentDescription::builder()
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .build(),
-        // Depth attachment
-        vk::AttachmentDescription::builder()
-            .format(vk::Format::D32_SFLOAT)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .build(),
-    ];
-
-    let color_ref = [vk::AttachmentReference {
-        attachment: 0,
-        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    }];
-    let depth_ref = vk::AttachmentReference {
-        attachment: 1,
-        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-    };
-
-    let subpass = vk::SubpassDescription::builder()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_ref)
-        .depth_stencil_attachment(&depth_ref)
-        .build();
-
-    let dependency = vk::SubpassDependency::builder()
-        .src_subpass(vk::SUBPASS_EXTERNAL)
-        .dst_subpass(0)
-        .src_stage_mask(
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-        )
-        .dst_stage_mask(
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-        )
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        )
-        .build();
-
-    let render_pass_info = vk::RenderPassCreateInfo::builder()
-        .attachments(&attachments)
-        .subpasses(std::slice::from_ref(&subpass))
-        .dependencies(std::slice::from_ref(&dependency))
-        .build();
-
-    unsafe {
-        device
-            .create_render_pass(&render_pass_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("render pass: {:?}", e)))
-    }
-}
-
-fn create_color_attachment(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    device: &ash::Device,
-    width: u32,
-    height: u32,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), RendererError> {
-    let image_info = vk::ImageCreateInfo::builder()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::R8G8B8A8_UNORM)
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .build();
-
-    let image = unsafe {
-        device
-            .create_image(&image_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("color image: {:?}", e)))?
-    };
-
-    let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-    let mem_type = find_memory_type(
-        instance,
-        physical_device,
-        mem_reqs.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .ok_or_else(|| RendererError::InitFailed("no device-local memory".into()))?;
-
-    let alloc_info = vk::MemoryAllocateInfo::builder()
-        .allocation_size(mem_reqs.size)
-        .memory_type_index(mem_type)
-        .build();
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("color memory: {:?}", e)))?
-    };
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .map_err(|e| RendererError::InitFailed(format!("bind color: {:?}", e)))?;
-    }
-
-    let view_info = vk::ImageViewCreateInfo::builder()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(vk::Format::R8G8B8A8_UNORM)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .build();
-    let view = unsafe {
-        device
-            .create_image_view(&view_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("color view: {:?}", e)))?
-    };
-
-    Ok((image, memory, view))
-}
-
-fn create_depth_attachment(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    device: &ash::Device,
-    width: u32,
-    height: u32,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), RendererError> {
-    let image_info = vk::ImageCreateInfo::builder()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::D32_SFLOAT)
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .build();
-
-    let image = unsafe {
-        device
-            .create_image(&image_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("depth image: {:?}", e)))?
-    };
-
-    let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-    let mem_type = find_memory_type(
-        instance,
-        physical_device,
-        mem_reqs.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .ok_or_else(|| RendererError::InitFailed("no device-local memory for depth".into()))?;
-
-    let alloc_info = vk::MemoryAllocateInfo::builder()
-        .allocation_size(mem_reqs.size)
-        .memory_type_index(mem_type)
-        .build();
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("depth memory: {:?}", e)))?
-    };
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .map_err(|e| RendererError::InitFailed(format!("bind depth: {:?}", e)))?;
-    }
-
-    let view_info = vk::ImageViewCreateInfo::builder()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(vk::Format::D32_SFLOAT)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .build();
-    let view = unsafe {
-        device
-            .create_image_view(&view_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("depth view: {:?}", e)))?
-    };
-
-    Ok((image, memory, view))
-}
-
-fn create_framebuffer(
-    device: &ash::Device,
-    render_pass: vk::RenderPass,
-    color_view: vk::ImageView,
-    depth_view: vk::ImageView,
-    width: u32,
-    height: u32,
-) -> Result<vk::Framebuffer, RendererError> {
-    let attachments = [color_view, depth_view];
-    let fb_info = vk::FramebufferCreateInfo::builder()
-        .render_pass(render_pass)
-        .attachments(&attachments)
-        .width(width)
-        .height(height)
-        .layers(1)
-        .build();
-    unsafe {
-        device
-            .create_framebuffer(&fb_info, None)
-            .map_err(|e| RendererError::InitFailed(format!("framebuffer: {:?}", e)))
-    }
-}
-
 fn create_fallback_sampler(device: &ash::Device) -> Result<vk::Sampler, RendererError> {
     let sampler_info = vk::SamplerCreateInfo::builder()
         .mag_filter(vk::Filter::NEAREST)
@@ -4459,6 +4018,33 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<DeviceReference>(),
             std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn gpu_draw_and_dispatch_log_payloads_match_upstream() {
+        let indexed = DrawParams {
+            base_instance: 9,
+            num_instances: 2,
+            base_vertex: -4,
+            num_vertices: 12,
+            first_index: 3,
+            is_indexed: true,
+        };
+        assert_eq!(
+            direct_draw_log_info(indexed),
+            (
+                "vkCmdDrawIndexed",
+                "vertices=12, instances=2, firstIndex=3, baseVertex=-4, baseInstance=9".to_owned()
+            )
+        );
+        assert_eq!(
+            indirect_draw_log_info(false, 7, 20),
+            ("vkCmdDrawIndirect", "drawCount=7, stride=20".to_owned())
+        );
+        assert_eq!(
+            dispatch_log_info([8, 4, 2]),
+            "groupCountX=8, groupCountY=4, groupCountZ=2"
         );
     }
 
@@ -4589,7 +4175,6 @@ mod tests {
         use crate::engines::maxwell_3d::{
             Maxwell3D, DRAW_BEGIN, DRAW_END, SCISSOR_BASE, SURFACE_CLIP_BASE, WINDOW_ORIGIN,
         };
-        use crate::engines::Engine;
 
         let mut engine = Maxwell3D::new();
         engine.write_reg(SURFACE_CLIP_BASE, 20 << 16);

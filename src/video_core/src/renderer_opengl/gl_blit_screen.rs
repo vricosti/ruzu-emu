@@ -164,12 +164,13 @@ impl BlitScreen {
     ///
     /// Port of `BlitScreen::CreateWindowAdapt()`.
     fn create_window_adapt(&mut self) {
-        let desired = (self.filters.get_scaling_filter)();
-
-        if self.window_adapt.is_some() && self.current_window_adapt == Some(desired) {
+        if self.window_adapt.is_some()
+            && self.current_window_adapt == Some((self.filters.get_scaling_filter)())
+        {
             return;
         }
 
+        let desired = (self.filters.get_scaling_filter)();
         self.current_window_adapt = Some(desired);
         self.window_adapt = Some(match desired {
             ScalingFilter::NearestNeighbor => filters::make_nearest_neighbor(self.device),

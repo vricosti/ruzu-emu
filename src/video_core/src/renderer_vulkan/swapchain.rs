@@ -10,6 +10,7 @@ use ash::vk;
 use std::sync::{Arc, Mutex};
 
 use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::vulkan_common::vk_enum_string_helper::string_vk_result;
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
@@ -56,8 +57,9 @@ fn choose_swap_present_mode(
     has_fifo_relaxed: bool,
     vsync_mode: VSyncMode,
     use_speed_limit: bool,
+    is_turbo: bool,
 ) -> vk::PresentModeKHR {
-    let setting = if !use_speed_limit {
+    let setting = if !use_speed_limit || is_turbo {
         match vsync_mode {
             VSyncMode::Fifo | VSyncMode::FifoRelaxed => {
                 if has_mailbox {
@@ -74,13 +76,17 @@ fn choose_swap_present_mode(
         vsync_mode
     };
 
-    // Validate availability, fallback to FIFO
-    let validated = match setting {
-        VSyncMode::Mailbox if !has_mailbox => VSyncMode::Fifo,
-        VSyncMode::Immediate if !has_imm => VSyncMode::Fifo,
-        VSyncMode::FifoRelaxed if !has_fifo_relaxed => VSyncMode::Fifo,
-        other => other,
-    };
+    // Eden falls back from Immediate to Mailbox first, then to FIFO only if
+    // Mailbox is unavailable as well.
+    let mut validated = setting;
+    if validated == VSyncMode::Immediate && !has_imm {
+        validated = VSyncMode::Mailbox;
+    }
+    if (validated == VSyncMode::Mailbox && !has_mailbox)
+        || (validated == VSyncMode::FifoRelaxed && !has_fifo_relaxed)
+    {
+        validated = VSyncMode::Fifo;
+    }
 
     match validated {
         VSyncMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
@@ -109,6 +115,7 @@ fn requested_swap_present_mode(
         has_fifo_relaxed,
         vsync_mode,
         *settings.use_speed_limit.get_value(),
+        *settings.current_speed_mode.get_value() == common::settings_enums::SpeedMode::Turbo,
     )
 }
 
@@ -315,7 +322,10 @@ impl Swapchain {
                 return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
             }
             Err(result) => {
-                log::error!("vkAcquireNextImageKHR returned {:?}", result);
+                log::error!(
+                    "vkAcquireNextImageKHR returned {}",
+                    string_vk_result(result)
+                );
             }
         }
         if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
@@ -383,7 +393,7 @@ impl Swapchain {
                 return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
             }
             Err(result) => {
-                log::error!("Failed to present with error {:?}", result);
+                log::error!("Failed to present with error {}", string_vk_result(result));
             }
         }
         self.frame_index += 1;
@@ -564,7 +574,20 @@ impl Swapchain {
             create_info = create_info.image_sharing_mode(vk::SharingMode::EXCLUSIVE);
         }
 
-        let view_formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        #[cfg(not(target_os = "android"))]
+        let view_formats = [
+            self.surface_format.format,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::B8G8R8A8_SRGB,
+        ];
+        #[cfg(target_os = "android")]
+        let view_formats = [
+            self.surface_format.format,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::B8G8R8A8_SRGB,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB,
+        ];
         let mut format_list = vk::ImageFormatListCreateInfo::builder()
             .view_formats(&view_formats)
             .build();
@@ -642,6 +665,35 @@ impl Swapchain {
         let requested =
             requested_swap_present_mode(self.has_imm, self.has_mailbox, self.has_fifo_relaxed);
         self.present_mode != requested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turbo_unlocks_fifo_present_mode_like_eden() {
+        assert_eq!(
+            choose_swap_present_mode(false, true, false, VSyncMode::Fifo, true, true),
+            vk::PresentModeKHR::MAILBOX
+        );
+        assert_eq!(
+            choose_swap_present_mode(false, true, false, VSyncMode::Fifo, true, false),
+            vk::PresentModeKHR::FIFO
+        );
+    }
+
+    #[test]
+    fn unsupported_immediate_falls_back_through_mailbox() {
+        assert_eq!(
+            choose_swap_present_mode(false, true, false, VSyncMode::Immediate, false, false),
+            vk::PresentModeKHR::MAILBOX
+        );
+        assert_eq!(
+            choose_swap_present_mode(false, false, false, VSyncMode::Immediate, false, false),
+            vk::PresentModeKHR::FIFO
+        );
     }
 }
 

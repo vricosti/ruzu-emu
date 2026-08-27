@@ -644,14 +644,7 @@ fn main() {
     let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
-    let want_gpu_thread_profile = std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some();
     let want_gl_draw_stall_profile = std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_some();
-    let want_refresh_stages_stall_profile =
-        std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_some();
-    let want_make_shader_info_stall_profile =
-        std::env::var_os("RUZU_PROFILE_MAKE_SHADER_INFO_STALL").is_some();
-    let want_shader_register_stall_profile =
-        std::env::var_os("RUZU_PROFILE_SHADER_REGISTER_STALL").is_some();
     let want_rasterizer_mark_cached_stall_profile =
         std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_some();
     if want_ipc_profile
@@ -672,11 +665,7 @@ fn main() {
         || want_hwc_cache_profile
         || want_vsync_profile
         || want_submit_gpfifo_profile
-        || want_gpu_thread_profile
         || want_gl_draw_stall_profile
-        || want_refresh_stages_stall_profile
-        || want_make_shader_info_stall_profile
-        || want_shader_register_stall_profile
         || want_rasterizer_mark_cached_stall_profile
     {
         #[cfg(unix)]
@@ -691,7 +680,6 @@ fn main() {
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr2");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
-            video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_service_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
@@ -701,9 +689,6 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::diagnostics::dump("sigusr2");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
-            video_core::shader_cache::dump_refresh_stages_stall_profile();
-            video_core::shader_cache::dump_make_shader_info_stall_profile();
-            video_core::shader_cache::dump_shader_register_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
         #[cfg(unix)]
@@ -724,7 +709,6 @@ fn main() {
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("atexit");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
-            video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_service_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
@@ -734,9 +718,6 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::diagnostics::dump("atexit");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
-            video_core::shader_cache::dump_refresh_stages_stall_profile();
-            video_core::shader_cache::dump_make_shader_info_stall_profile();
-            video_core::shader_cache::dump_shader_register_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
         unsafe {
@@ -1031,8 +1012,10 @@ fn main() {
         )),
         _ => None,
     };
-    let renderer_backend_str = renderer_backend.to_string();
-
+    let null_framebuffer_layout = match &emu_window {
+        EmuWindow::Null(w) => Some(w.framebuffer_layout()),
+        _ => None,
+    };
     system.set_subsystem_factory(Box::new(move |system| {
         use std::sync::Arc;
 
@@ -1047,29 +1030,10 @@ fn main() {
         let device_memory = host1x.memory_manager().clone();
         system.set_host1x_core(Box::new(host1x));
 
-        // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
-        //
-        // Upstream flow:
-        //   auto context = emu_window.CreateSharedContext();
-        //   auto scope = context->Acquire();
-        //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
-        //   gpu->BindRenderer(renderer);
-        // `VideoCore::CreateGPU` updates the derived resolution state first.
-        // This frontend-owned factory has to retain that ordering because the
-        // renderer needs the GPU while it is being constructed.
-        {
-            let mut values = common::settings::values_mut();
-            common::settings::update_rescaling_info(&mut values);
-        }
+        // GPU (upstream core.cpp:278). `VideoCore::CreateGPU` owns the common
+        // settings, construction, failure, and renderer-binding lifecycle;
+        // this frontend supplies only the concrete window-backed renderer.
         let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
-        let use_async_gpu =
-            *common::settings::values().use_asynchronous_gpu_emulation.get_value()
-                && std::env::var_os("RUZU_DISABLE_ASYNC_GPU").is_none();
-        let use_nvdec = *common::settings::values().nvdec_emulation.get_value()
-            != common::settings_enums::NvdecEmulation::Off;
-        let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, use_nvdec));
-        gpu.set_system_ref(system_ref);
-        let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
 
         // One-time capture of a raw pointer to the process `Memory`, shared
         // by the GPU-side memory callbacks below. They run on the GPU thread
@@ -1091,9 +1055,13 @@ fn main() {
             }) as *const ruzu_core::memory::memory::Memory
         }
 
-        let renderer: Box<dyn video_core::renderer_base::RendererBase> =
-            match renderer_backend_str.as_str() {
-                "opengl" => {
+        let gpu = video_core::video_core::create_gpu(system_ref, |renderer_backend, gpu| {
+            let gpu_ptr = gpu as *const video_core::gpu::Gpu as usize;
+            let renderer: Box<dyn video_core::renderer_base::RendererBase> =
+                match renderer_backend {
+                common::settings_enums::RendererBackend::OpenGlGlsl
+                | common::settings_enums::RendererBackend::OpenGlGlasm
+                | common::settings_enums::RendererBackend::OpenGlSpirV => {
                     let window_ptr = sdl_window_ptr_usize as *mut sdl3::sys::everything::SDL_Window;
                     let context = Box::new(emu_window::emu_window_sdl3_gl::SdlGlContext::new(
                         window_ptr,
@@ -1131,7 +1099,7 @@ fn main() {
                         unsafe { gpu.shader_notify_handle() },
                         strict_gl_context_required,
                         context,
-                        Some(shared_context_factory),
+                        shared_context_factory,
                         Arc::clone(framebuffer_layout),
                         frame_end_notify,
                         frame_displayed_notify,
@@ -1187,8 +1155,8 @@ fn main() {
                     ));
                     Box::new(renderer)
                 }
-                "vulkan" => {
-                    let Some((window_info, drawable_size, shown_state, framebuffer_layout)) =
+                common::settings_enums::RendererBackend::Vulkan => {
+                    let Some((window_info, _drawable_size, shown_state, framebuffer_layout)) =
                         vulkan_window_info.as_ref()
                     else {
                         return Err(
@@ -1224,7 +1192,6 @@ fn main() {
                             // `Gpu` drops the renderer before its shader notifier.
                             unsafe { gpu.shader_notify_handle() },
                             window_info,
-                            *drawable_size,
                             Arc::clone(shown_state),
                             Arc::clone(framebuffer_layout),
                             frame_displayed_notify,
@@ -1235,11 +1202,25 @@ fn main() {
                         .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
                     )
                 }
-                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                    syncpoints.clone(),
-                )),
-            };
-        gpu.bind_renderer(renderer);
+                common::settings_enums::RendererBackend::Null => {
+                    let framebuffer_layout = null_framebuffer_layout.as_ref().ok_or_else(|| {
+                        "Null renderer selected without framebuffer layout".to_owned()
+                    })?;
+                    let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                    let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || unsafe {
+                        let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
+                        gpu_ref.renderer_frame_end_notify();
+                    });
+                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                        syncpoints.clone(),
+                        Arc::clone(framebuffer_layout),
+                        frame_displayed_notify,
+                        frame_end_notify,
+                    ))
+                }
+                };
+            Ok::<_, String>(renderer)
+        })?;
         let memory_raw_reader = memory_raw.clone();
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
             // The address handed to us is a *device address* coming from the
@@ -1388,19 +1369,6 @@ fn main() {
                 }
             }
         }));
-        // Install GPU VA → CPU VA translator on the renderer so
-        // rasterizer-side query writes (e.g. semaphore_trigger) translate
-        // GPU VAs into CPU VAs before reaching `guest_memory_writer`.
-        // addresses (the GPU VA is passed straight through).
-        //
-        // SAFETY: `gpu_ptr` points to the Box<Gpu> we're about to move
-        // into `system.set_gpu_core`. System owns the Gpu for the full
-        // emulation lifetime; the translator closure is also bound by
-        // that lifetime via the renderer. The renderer is dropped on
-        // System shutdown before the Gpu is dropped.
-        let gpu_ptr_for_translator = gpu.as_ref() as *const video_core::gpu::Gpu;
-        unsafe { gpu.install_gpu_to_cpu_translator(gpu_ptr_for_translator) };
-
         system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)

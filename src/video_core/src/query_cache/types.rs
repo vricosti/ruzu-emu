@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/query_cache/types.h
+//! Port of Eden's `src/video_core/query_cache/types.h`.
 //!
 //! Defines query types, comparison modes, reduction operations, and property flags
 //! used throughout the query cache subsystem.

@@ -25,7 +25,11 @@ use crate::texture_cache::types::{Extent3D, ImageCopy, SwizzleParameters};
 macro_rules! assert_fail_soft {
     ($condition:expr, $($message:tt)*) => {
         if !$condition {
-            log::error!($($message)*);
+            let message = format!($($message)*);
+            log::error!("{message}");
+            if *common::settings::values().use_debug_asserts.get_value() {
+                panic!("{message}");
+            }
         }
     };
 }
@@ -328,9 +332,10 @@ impl UtilShaders {
             // C++ reads the first u32 of the anonymous block/pitch union.
             TilingMode::BlockLinear(block) => block.width,
         };
-        if !bytes_per_block.is_power_of_two() {
-            log::error!("Non-power of two images are not implemented");
-        }
+        assert_fail_soft!(
+            bytes_per_block.is_power_of_two(),
+            "Non-power of two images are not implemented"
+        );
         let mut program_manager = self.program_manager.lock();
         program_manager.bind_compute_program(self.pitch_unswizzle_program.handle);
         unsafe {
@@ -561,7 +566,7 @@ pub fn store_format(bytes_per_block: u32) -> u32 {
         8 => gl::RG32UI,
         16 => gl::RGBA32UI,
         _ => {
-            log::error!("Invalid bytes_per_block: {bytes_per_block}");
+            assert_fail_soft!(false, "Invalid bytes_per_block: {bytes_per_block}");
             gl::R8UI
         }
     }
@@ -578,6 +583,7 @@ mod tests {
         assert_eq!(store_format(4), gl::R32UI);
         assert_eq!(store_format(8), gl::RG32UI);
         assert_eq!(store_format(16), gl::RGBA32UI);
+        assert_eq!(store_format(3), gl::R8UI);
     }
 
     #[test]

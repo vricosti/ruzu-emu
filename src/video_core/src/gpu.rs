@@ -18,10 +18,9 @@ use crate::shader_notify::{ShaderNotify, ShaderNotifyHandle};
 use common::settings;
 use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
-    BlendMode as CoreBlendMode, BufferTransformFlags as CoreBufferTransformFlags,
-    FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle, GpuCommandList, GpuCoreInterface,
-    GpuMemoryManagerHandle, RasterizerDownloadArea as CoreRasterizerDownloadArea,
-    RectI as CoreRectI,
+    BlendMode as CoreBlendMode, FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle,
+    GpuCommandList, GpuCoreInterface, GpuMemoryManagerHandle,
+    RasterizerDownloadArea as CoreRasterizerDownloadArea,
 };
 use ruzu_core::hle::service::nvdrv::nvdata::NvFence;
 
@@ -168,6 +167,11 @@ pub struct Gpu {
     /// Upstream: `VideoCommon::GPUThread::ThreadManager gpu_thread` in GPU::Impl.
     gpu_thread: Mutex<crate::gpu_thread::ThreadManager>,
 
+    /// Lazily-created CPU graphics context used only by synchronous
+    /// single-core execution. Upstream: `GPU::Impl::cpu_context`.
+    cpu_context:
+        Mutex<Option<Box<dyn ruzu_core::frontend::graphics_context::GraphicsContext + Send>>>,
+
     /// Registered GPU channels.
     /// Upstream: `std::unordered_map<s32, std::shared_ptr<ChannelState>> channels`.
     channels:
@@ -221,10 +225,8 @@ impl Gpu {
             shader_notify: ShaderNotify::new(),
             rasterizer: Mutex::new(None),
             scheduler: crate::control::scheduler::Scheduler::new(),
-            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(
-                SystemRef::null(),
-                is_async,
-            )),
+            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(SystemRef::null())),
+            cpu_context: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
             guest_memory_reader: Mutex::new(None),
             guest_memory_writer: Mutex::new(None),
@@ -412,43 +414,6 @@ impl Gpu {
                     .cloned()
                     .expect("guest_memory_writer just stored"),
             );
-        }
-    }
-
-    /// Install a GPU VA → CPU VA translator on the renderer. The
-    /// translator uses the GPU's currently bound channel's MemoryManager
-    /// to resolve a GPU VA. Rasterizer code (e.g. RasterizerNull::query)
-    /// uses this before calling `guest_memory_writer` so the eventual
-    /// `Memory::write_block` receives a valid CPU VA.
-    ///
-    /// `gpu_ptr` is a raw `*const Gpu` provided by the caller (typically
-    /// from `Box::as_ref()`). The caller must ensure the Gpu outlives the
-    /// renderer — this matches the existing pattern in `ruzu_cmd` where a
-    /// `*const Gpu` is captured for service callbacks (see `gpu_ptr` in
-    /// `src/ruzu_cmd/src/main.rs`).
-    ///
-    /// # Safety
-    ///
-    /// `gpu_ptr` must point to a live `Gpu` that outlives all rasterizer
-    /// invocations.
-    pub unsafe fn install_gpu_to_cpu_translator(&self, gpu_ptr: *const Gpu) {
-        let gpu_ptr_usize = gpu_ptr as usize;
-        let translator: Arc<dyn Fn(u64) -> Option<u64> + Send + Sync> =
-            Arc::new(move |gpu_va: u64| -> Option<u64> {
-                let gpu = unsafe { &*(gpu_ptr_usize as *const Gpu) };
-                let bound = *gpu.bound_channel.lock().unwrap();
-                if bound < 0 {
-                    return None;
-                }
-                let channel_arc = gpu.channels.lock().unwrap().get(&bound).cloned()?;
-                let channel = channel_arc.lock();
-                let mm_arc = channel.memory_manager.as_ref()?.clone();
-                drop(channel);
-                let result = mm_arc.lock().gpu_to_cpu_address(gpu_va);
-                result
-            });
-        if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
-            renderer.set_gpu_to_cpu_translator(translator);
         }
     }
 
@@ -682,13 +647,44 @@ impl Gpu {
         self.sync_request_cv.notify_all();
     }
 
+    /// Obtain the CPU graphics context for synchronous single-core GPU work.
+    ///
+    /// Port of `GPU::Impl::ObtainContext`: create the shared context lazily,
+    /// then make it current on the calling CPU thread.
+    pub fn obtain_context(&self) {
+        let mut cpu_context = self.cpu_context.lock().unwrap();
+        if cpu_context.is_none() {
+            let renderer = self.renderer.lock().unwrap();
+            let renderer = renderer
+                .as_ref()
+                .expect("GPU::ObtainContext requires a bound renderer");
+            *cpu_context = Some(renderer.create_shared_context());
+        }
+        cpu_context
+            .as_mut()
+            .expect("CPU context was just initialized")
+            .make_current();
+    }
+
+    /// Release the CPU graphics context from the calling thread.
+    ///
+    /// Port of `GPU::Impl::ReleaseContext`.
+    pub fn release_context(&self) {
+        self.cpu_context
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("GPU::ReleaseContext requires an obtained context")
+            .done_current();
+    }
+
     /// Push GPU command entries to be processed.
     /// Matches upstream `GPU::Impl::PushGPUEntries(s32, CommandList&&)`.
     pub fn push_gpu_entries(&self, channel: i32, entries: CommandList) {
         self.gpu_thread
             .lock()
             .unwrap()
-            .submit_list(channel, entries);
+            .submit_list(channel, entries, self.is_async);
     }
 
     /// Notify rasterizer about a CPU read.
@@ -702,12 +698,7 @@ impl Gpu {
             };
         };
 
-        let flush_area = unsafe { rasterizer.as_mut() }.get_flush_area(addr, size);
-        let mut raster_area = RasterizerDownloadArea {
-            start_address: flush_area.start_address,
-            end_address: flush_area.end_address,
-            preemtive: flush_area.preemptive,
-        };
+        let mut raster_area = unsafe { rasterizer.as_mut() }.get_flush_area(addr, size);
         if raster_area.preemtive {
             return raster_area;
         }
@@ -726,7 +717,7 @@ impl Gpu {
                 );
             }
         }));
-        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
         self.wait_for_sync_operation(fence);
         raster_area
     }
@@ -734,7 +725,10 @@ impl Gpu {
     /// Flush a region.
     /// Matches upstream `GPU::Impl::FlushRegion(DAddr, u64)`.
     pub fn flush_region(&self, addr: DAddr, size: u64) {
-        self.gpu_thread.lock().unwrap().flush_region(addr, size);
+        self.gpu_thread
+            .lock()
+            .unwrap()
+            .flush_region(addr, size, self.is_async);
     }
 
     /// Invalidate a region.
@@ -761,7 +755,7 @@ impl Gpu {
         self.gpu_thread
             .lock()
             .unwrap()
-            .flush_and_invalidate_region(addr, size);
+            .flush_and_invalidate_region(addr, size, self.is_async);
     }
 
     /// Request framebuffer compositing.
@@ -792,9 +786,8 @@ impl Gpu {
         let gpu_addr = self as *const Gpu as usize;
         let pending_fence = self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            let valid_fences: Vec<NvFence> =
-                fences.into_iter().filter(|fence| fence.id >= 0).collect();
-            if valid_fences.is_empty() {
+            let num_fences = fences.len();
+            if num_fences == 0 {
                 gpu.composite_layers(&layers);
                 return;
             }
@@ -803,14 +796,14 @@ impl Gpu {
             let Some(host1x) = system.get().host1x_core() else {
                 log::warn!(
                     "Gpu::request_composite missing host1x_core; composing without {} fences",
-                    valid_fences.len()
+                    num_fences
                 );
                 gpu.composite_layers(&layers);
                 return;
             };
 
-            let current_request_counter = gpu.allocate_request_swap_counter(valid_fences.len());
-            for fence in valid_fences {
+            let current_request_counter = gpu.allocate_request_swap_counter(num_fences);
+            for fence in fences {
                 let layers = layers.clone();
                 host1x.register_guest_action(
                     fence.id as u32,
@@ -826,7 +819,7 @@ impl Gpu {
         }));
         self.pending_composite_fence
             .store(pending_fence, Ordering::Relaxed);
-        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
     }
 
     /// Wait for registration of the previous composite request.
@@ -884,7 +877,7 @@ impl Gpu {
                 *result_clone.lock().unwrap() = renderer.get_applet_capture_buffer();
             }
         }));
-        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
         self.wait_for_sync_operation(wait_fence);
         Arc::try_unwrap(result).unwrap().into_inner().unwrap()
     }
@@ -1096,25 +1089,9 @@ impl GpuCoreInterface for Gpu {
                 width: layer.width,
                 height: layer.height,
                 stride: layer.stride,
-                pixel_format: crate::framebuffer_config::AndroidPixelFormat(layer.pixel_format),
-                transform_flags: crate::framebuffer_config::BufferTransformFlags(
-                    match layer.transform_flags {
-                        CoreBufferTransformFlags(bits) => bits,
-                    },
-                ),
-                crop_rect: match layer.crop_rect {
-                    CoreRectI {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    } => crate::framebuffer_config::RectI {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    },
-                },
+                pixel_format: layer.pixel_format,
+                transform_flags: layer.transform_flags,
+                crop_rect: layer.crop_rect,
                 blending: match layer.blending {
                     CoreBlendMode::Opaque => crate::framebuffer_config::BlendMode::Opaque,
                     CoreBlendMode::Premultiplied => {
@@ -1133,6 +1110,14 @@ impl GpuCoreInterface for Gpu {
 
     fn notify_shutdown(&self) {
         Gpu::notify_shutdown(self);
+    }
+
+    fn obtain_context(&self) {
+        Gpu::obtain_context(self);
+    }
+
+    fn release_context(&self) {
+        Gpu::release_context(self);
     }
 
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool {
@@ -1169,6 +1154,20 @@ mod tests {
         RasterizerDownloadArea, RasterizerHandle, RasterizerInterface,
     };
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+    struct RecordingGraphicsContext {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl ruzu_core::frontend::graphics_context::GraphicsContext for RecordingGraphicsContext {
+        fn make_current(&mut self) {
+            self.events.lock().unwrap().push("make_current");
+        }
+
+        fn done_current(&mut self) {
+            self.events.lock().unwrap().push("done_current");
+        }
+    }
 
     struct FakeRasterizer {
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
@@ -1239,7 +1238,7 @@ mod tests {
             RasterizerDownloadArea {
                 start_address: addr,
                 end_address: addr,
-                preemptive: true,
+                preemtive: true,
             }
         }
         fn invalidate_region(
@@ -1397,6 +1396,24 @@ mod tests {
         let counters = gpu.request_swap_counters.lock().unwrap();
         assert_eq!(counters.request_swap_counters.len(), 1);
         assert_eq!(counters.free_swap_counters.front().copied(), Some(first));
+    }
+
+    #[test]
+    fn cpu_context_matches_upstream_obtain_and_release_lifecycle() {
+        let gpu = Gpu::new(false, false);
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        *gpu.cpu_context.lock().unwrap() = Some(Box::new(RecordingGraphicsContext {
+            events: Arc::clone(&events),
+        }));
+
+        gpu.obtain_context();
+        gpu.obtain_context();
+        gpu.release_context();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["make_current", "make_current", "done_current"]
+        );
     }
 
     #[test]

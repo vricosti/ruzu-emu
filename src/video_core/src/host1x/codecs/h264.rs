@@ -6,6 +6,7 @@
 //! H.264 decoder implementation including the H264BitWriter for composing
 //! SPS/PPS headers, and the H264 decoder struct.
 
+use crate::host1x::codec_types::H264DecoderContext;
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
@@ -41,255 +42,28 @@ const ZIG_ZAG_SCAN: [u8; 16] = [
     3 + 3 * 4,
 ];
 
-// --------------------------------------------------------------------------
-// H264 Offset (32-bit, shifted by 8)
-// --------------------------------------------------------------------------
-
-/// 32-bit offset that stores a shifted address, specific to H264 codec structures.
-///
-/// Port of `Tegra::Decoders::Offset` in `h264.h`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Offset {
-    offset: u32,
-}
-
-impl Offset {
-    pub fn address(&self) -> u32 {
-        self.offset << 8
-    }
-}
-
-const _: () = assert!(std::mem::size_of::<Offset>() == 0x4);
-
-// --------------------------------------------------------------------------
-// H264ParameterSet — 0x60 bytes
-// --------------------------------------------------------------------------
-
-/// Port of `Tegra::Decoders::H264ParameterSet`.
-#[repr(C)]
-#[derive(Clone, Default)]
-pub struct H264ParameterSet {
-    pub log2_max_pic_order_cnt_lsb_minus4: i32,      // 0x00
-    pub delta_pic_order_always_zero_flag: i32,       // 0x04
-    pub frame_mbs_only_flag: i32,                    // 0x08
-    pub pic_width_in_mbs: u32,                       // 0x0C
-    pub frame_height_in_mbs: u32,                    // 0x10
-    pub surface_format: u32, // 0x14 (bitfield: tile_format, gob_height, reserved)
-    pub entropy_coding_mode_flag: u32, // 0x18
-    pub pic_order_present_flag: i32, // 0x1C
-    pub num_refidx_l0_default_active: i32, // 0x20
-    pub num_refidx_l1_default_active: i32, // 0x24
-    pub deblocking_filter_control_present_flag: i32, // 0x28
-    pub redundant_pic_cnt_present_flag: i32, // 0x2C
-    pub transform_8x8_mode_flag: u32, // 0x30
-    pub pitch_luma: u32,     // 0x34
-    pub pitch_chroma: u32,   // 0x38
-    pub luma_top_offset: Offset, // 0x3C
-    pub luma_bot_offset: Offset, // 0x40
-    pub luma_frame_offset: Offset, // 0x44
-    pub chroma_top_offset: Offset, // 0x48
-    pub chroma_bot_offset: Offset, // 0x4C
-    pub chroma_frame_offset: Offset, // 0x50
-    pub hist_buffer_size: u32, // 0x54
-    /// Bitfield union storage — stored as [u32; 2] to avoid forcing 8-byte
-    /// alignment on the containing struct (upstream C++ uses u64 BitField
-    /// inside a union, but sizeof(H264DecoderContext) == 0x2FC requires
-    /// 4-byte struct alignment).
-    pub flags_raw: [u32; 2], // 0x58 (bitfield union, logically u64)
-}
-
-const _: () = assert!(std::mem::size_of::<H264ParameterSet>() == 0x60);
-
-impl H264ParameterSet {
-    /// Reconstruct the logical u64 from the [u32; 2] storage.
-    #[inline]
-    fn flags(&self) -> u64 {
-        self.flags_raw[0] as u64 | ((self.flags_raw[1] as u64) << 32)
-    }
-
-    // Bitfield accessors for flags_raw (at offset 0x58).
-    pub fn mbaff_frame(&self) -> u64 {
-        self.flags() & 1
-    }
-    pub fn direct_8x8_inference(&self) -> u64 {
-        (self.flags() >> 1) & 1
-    }
-    pub fn weighted_pred(&self) -> u64 {
-        (self.flags() >> 2) & 1
-    }
-    pub fn constrained_intra_pred(&self) -> u64 {
-        (self.flags() >> 3) & 1
-    }
-    pub fn log2_max_frame_num_minus4(&self) -> u64 {
-        (self.flags() >> 8) & 0xF
-    }
-    pub fn chroma_format_idc(&self) -> u64 {
-        (self.flags() >> 12) & 0x3
-    }
-    pub fn pic_order_cnt_type(&self) -> u64 {
-        (self.flags() >> 14) & 0x3
-    }
-    pub fn pic_init_qp_minus26(&self) -> i64 {
-        // 6-bit signed field at bit 16
-        let raw = ((self.flags() >> 16) & 0x3F) as i64;
-        if raw & 0x20 != 0 {
-            raw | !0x3F
-        } else {
-            raw
-        }
-    }
-    pub fn chroma_qp_index_offset(&self) -> i64 {
-        // 5-bit signed field at bit 22
-        let raw = ((self.flags() >> 22) & 0x1F) as i64;
-        if raw & 0x10 != 0 {
-            raw | !0x1F
-        } else {
-            raw
-        }
-    }
-    pub fn second_chroma_qp_index_offset(&self) -> i64 {
-        // 5-bit signed field at bit 27
-        let raw = ((self.flags() >> 27) & 0x1F) as i64;
-        if raw & 0x10 != 0 {
-            raw | !0x1F
-        } else {
-            raw
-        }
-    }
-    pub fn weighted_bipred_idc(&self) -> u64 {
-        (self.flags() >> 32) & 0x3
-    }
-    pub fn curr_pic_idx(&self) -> u64 {
-        (self.flags() >> 34) & 0x7F
-    }
-    pub fn frame_number(&self) -> u64 {
-        (self.flags() >> 46) & 0xFFFF
-    }
-}
-
-// --------------------------------------------------------------------------
-// DpbEntry — 0x10 bytes
-// --------------------------------------------------------------------------
-
-/// Port of `Tegra::Decoders::DpbEntry`.
-#[repr(C)]
-#[derive(Clone, Default)]
-pub struct DpbEntry {
-    pub flags: u32,
-    pub field_order_cnt: [u32; 2],
-    pub frame_idx: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<DpbEntry>() == 0x10);
-
-// --------------------------------------------------------------------------
-// DisplayParam — 0x1C bytes
-// --------------------------------------------------------------------------
-
-/// Port of `Tegra::Decoders::DisplayParam`.
-#[repr(C)]
-#[derive(Clone, Default)]
-pub struct DisplayParam {
-    pub flags0: u32,
-    pub output_top: [i32; 2],
-    pub output_bottom: [i32; 2],
-    pub histogram_flags1: u32,
-    pub histogram_flags2: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<DisplayParam>() == 0x1C);
-
-// --------------------------------------------------------------------------
-// H264DecoderContext — 0x2FC bytes
-// --------------------------------------------------------------------------
-
-/// Port of `Tegra::Decoders::H264DecoderContext`.
-#[repr(C)]
-#[derive(Clone)]
-pub struct H264DecoderContext {
-    pub reserved0: [u32; 13],                 // 0x0000
-    pub eos: [u8; 16],                        // 0x0034
-    pub explicit_eos_present_flag: u8,        // 0x0044
-    pub hint_dump_en: u8,                     // 0x0045
-    pub _pad0: [u8; 2],                       // 0x0046
-    pub stream_len: u32,                      // 0x0048
-    pub slice_count: u32,                     // 0x004C
-    pub mbhist_buffer_size: u32,              // 0x0050
-    pub gptimer_timeout_value: u32,           // 0x0054
-    pub h264_parameter_set: H264ParameterSet, // 0x0058
-    pub curr_field_order_cnt: [i32; 2],       // 0x00B8
-    pub dpb: [DpbEntry; 16],                  // 0x00C0
-    pub weight_scale_4x4: [u8; 0x60],         // 0x01C0
-    pub weight_scale_8x8: [u8; 0x80],         // 0x0220
-    pub num_inter_view_refs_lx: [u8; 2],      // 0x02A0
-    pub reserved2: [u8; 14],                  // 0x02A2
-    pub inter_view_refidx_lx: [[i8; 16]; 2],  // 0x02B0
-    pub lossless_flags: u32,                  // 0x02D0 (bitfield)
-    pub display_param: DisplayParam,          // 0x02D4
-    pub reserved4: [u32; 3],                  // 0x02F0
-}
-
-const _: () = assert!(std::mem::size_of::<H264DecoderContext>() == 0x2FC);
-
-impl Default for H264DecoderContext {
-    fn default() -> Self {
-        // Safety: zeroed representation is valid for this C-layout struct.
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-impl H264DecoderContext {
-    pub fn qpprime_y_zero_transform_bypass_flag(&self) -> u32 {
-        (self.lossless_flags >> 1) & 1
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn h264_guest_context_layout_matches_upstream() {
-        assert_eq!(std::mem::size_of::<Offset>(), 0x4);
-        assert_eq!(std::mem::size_of::<H264ParameterSet>(), 0x60);
-        assert_eq!(std::mem::size_of::<DpbEntry>(), 0x10);
-        assert_eq!(std::mem::size_of::<DisplayParam>(), 0x1C);
-        assert_eq!(std::mem::size_of::<H264DecoderContext>(), 0x2FC);
+    fn h264_exp_golomb_output_matches_upstream_writer() {
+        let mut writer = H264BitWriter::new();
+        for value in 0..=3 {
+            writer.write_ue(value);
+        }
+        writer.end();
 
-        assert_eq!(
-            std::mem::offset_of!(H264ParameterSet, log2_max_pic_order_cnt_lsb_minus4),
-            0x00
-        );
-        assert_eq!(std::mem::offset_of!(H264ParameterSet, surface_format), 0x14);
-        assert_eq!(
-            std::mem::offset_of!(H264ParameterSet, luma_top_offset),
-            0x3C
-        );
-        assert_eq!(
-            std::mem::offset_of!(H264ParameterSet, chroma_frame_offset),
-            0x50
-        );
-        assert_eq!(std::mem::offset_of!(H264ParameterSet, flags_raw), 0x58);
+        assert_eq!(writer.get_byte_array(), &[0xA6, 0x48]);
+    }
 
-        assert_eq!(std::mem::offset_of!(H264DecoderContext, stream_len), 0x48);
-        assert_eq!(
-            std::mem::offset_of!(H264DecoderContext, h264_parameter_set),
-            0x58
-        );
-        assert_eq!(std::mem::offset_of!(H264DecoderContext, dpb), 0xC0);
-        assert_eq!(
-            std::mem::offset_of!(H264DecoderContext, weight_scale_4x4),
-            0x1C0
-        );
-        assert_eq!(
-            std::mem::offset_of!(H264DecoderContext, weight_scale_8x8),
-            0x220
-        );
-        assert_eq!(
-            std::mem::offset_of!(H264DecoderContext, display_param),
-            0x2D4
-        );
+    #[test]
+    fn h264_scaling_list_and_rbsp_stop_bit_match_upstream_writer() {
+        let mut writer = H264BitWriter::new();
+        writer.write_scaling_list(&[8; 16], 0, 16);
+        writer.end();
+
+        assert_eq!(writer.get_byte_array(), &[0xFF, 0xFF, 0x80]);
     }
 }
 
@@ -345,10 +119,10 @@ impl H264BitWriter {
 
     /// Write scaling list per H.264 spec section 7.3.2.1.1.1.
     pub fn write_scaling_list(&mut self, list: &[u8], start: usize, count: usize) {
-        let scan: Vec<u8> = if count == 16 {
-            ZIG_ZAG_SCAN[..count].to_vec()
+        let scan: &[u8] = if count == 16 {
+            &ZIG_ZAG_SCAN
         } else {
-            ZIG_ZAG_DIRECT[..count].to_vec()
+            &ZIG_ZAG_DIRECT[..count]
         };
 
         let mut last_scale: u8 = 8;

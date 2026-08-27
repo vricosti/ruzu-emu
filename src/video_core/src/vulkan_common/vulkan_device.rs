@@ -14,9 +14,15 @@ use std::ffi::{CStr, CString};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use crate::gpu_logging::{get_instance, DriverType, LogLevel};
+
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
 use super::vma::VmaAllocator;
-use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, VulkanError};
+use super::vulkan::{KHR_MAINTENANCE_7_EXTENSION_NAME, KHR_MAINTENANCE_8_EXTENSION_NAME};
+use super::vulkan_wrapper::{
+    get_driver_name, get_physical_device_tool_properties, set_object_name, LogicalDevice,
+    VulkanError,
+};
 
 // ---------------------------------------------------------------------------
 // Constants — port of constants from vulkan_device.h
@@ -27,6 +33,8 @@ use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, 
 /// Port of `GuestWarpSize` from `vulkan_device.h`.
 pub const GUEST_WARP_SIZE: u32 = 32;
 const ONE_GIB: u64 = 1024 * 1024 * 1024;
+const KHR_MAINTENANCE_5_EXTENSION_NAME: &str = "VK_KHR_maintenance5";
+const KHR_MAINTENANCE_6_EXTENSION_NAME: &str = "VK_KHR_maintenance6";
 
 /// Stable non-owning Rust counterpart of upstream's pervasive `const Device&`
 /// members. Renderer owners are boxed before these references are created and
@@ -80,6 +88,75 @@ impl Default for PhysicalDeviceDepthBiasControlFeaturesExt {
     }
 }
 
+// ash 0.37 predates VK_KHR_maintenance5. Keep its feature/property ABI
+// payloads in the upstream device owner until the workspace binding is
+// upgraded.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceMaintenance5FeaturesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    maintenance5: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceMaintenance5FeaturesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_470_000),
+            p_next: std::ptr::null_mut(),
+            maintenance5: vk::FALSE,
+        }
+    }
+}
+
+// ash 0.37 also predates VK_KHR_maintenance6. Keep the feature ABI payload in
+// the same device owner as Eden's VkPhysicalDeviceMaintenance6FeaturesKHR.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceMaintenance6FeaturesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    maintenance6: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceMaintenance6FeaturesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_545_000),
+            p_next: std::ptr::null_mut(),
+            maintenance6: vk::FALSE,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceMaintenance5PropertiesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    early_fragment_multisample_coverage_after_sample_counting: vk::Bool32,
+    early_fragment_sample_mask_test_before_sample_counting: vk::Bool32,
+    depth_stencil_swizzle_one_support: vk::Bool32,
+    polygon_mode_point_size: vk::Bool32,
+    non_strict_single_pixel_wide_lines_use_parallelogram: vk::Bool32,
+    non_strict_wide_lines_use_parallelogram: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceMaintenance5PropertiesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_470_001),
+            p_next: std::ptr::null_mut(),
+            early_fragment_multisample_coverage_after_sample_counting: vk::FALSE,
+            early_fragment_sample_mask_test_before_sample_counting: vk::FALSE,
+            depth_stencil_swizzle_one_support: vk::FALSE,
+            polygon_mode_point_size: vk::FALSE,
+            non_strict_single_pixel_wide_lines_use_parallelogram: vk::FALSE,
+            non_strict_wide_lines_use_parallelogram: vk::FALSE,
+        }
+    }
+}
+
 fn pnext_chain_has_unique_structure_types(mut next: *const std::ffi::c_void) -> bool {
     let mut structure_types = Vec::new();
     while !next.is_null() {
@@ -111,6 +188,20 @@ fn apply_descriptor_indexing_policy(features: &mut vk::PhysicalDeviceDescriptorI
     features.descriptor_binding_update_unused_while_pending = vk::FALSE;
     features.descriptor_binding_variable_descriptor_count = vk::FALSE;
     features.runtime_descriptor_array = vk::FALSE;
+}
+
+/// Mechanical extraction of the `VK_EXT_border_color_swizzle` suitability
+/// predicate from upstream `Device::RemoveUnsuitableExtensions`.
+fn border_color_swizzle_supported(
+    extension_available: bool,
+    custom_border_color_supported: bool,
+    border_color_swizzle: vk::Bool32,
+    border_color_swizzle_from_image: vk::Bool32,
+) -> bool {
+    extension_available
+        && custom_border_color_supported
+        && border_color_swizzle != vk::FALSE
+        && border_color_swizzle_from_image != vk::FALSE
 }
 
 macro_rules! clear_feature_preserving_chain {
@@ -272,13 +363,17 @@ pub struct DeviceExtensions {
     pub bit8_storage: bool,
     pub timeline_semaphore: bool,
     pub buffer_device_address: bool,
+    pub vulkan_memory_model: bool,
 
     // VK features 1.3
+    pub robust_image_access: bool,
     pub shader_demote_to_helper_invocation: bool,
     pub subgroup_size_control: bool,
+    pub maintenance4: bool,
     pub synchronization2: bool,
 
     // VK feature extensions
+    pub border_color_swizzle: bool,
     pub custom_border_color: bool,
     pub color_write_enable: bool,
     pub depth_bias_control: bool,
@@ -298,11 +393,14 @@ pub struct DeviceExtensions {
     pub vertex_input_dynamic_state: bool,
     pub pipeline_executable_properties: bool,
     pub workgroup_memory_explicit_layout: bool,
+    pub maintenance5: bool,
+    pub maintenance6: bool,
     /// Diagnostic-only `VK_EXT_device_fault`, enabled through
     /// `RUZU_VK_DEVICE_FAULT` when the host exposes the feature.
     pub device_fault: bool,
 
     // Misc extensions
+    pub astc_decode_mode: bool,
     pub conditional_rendering: bool,
     pub conservative_rasterization: bool,
     pub depth_range_unrestricted: bool,
@@ -322,6 +420,11 @@ pub struct DeviceExtensions {
     pub swapchain: bool,
     pub swapchain_mutable_format: bool,
     pub image_format_list: bool,
+    pub maintenance1: bool,
+    pub maintenance2: bool,
+    pub maintenance3: bool,
+    pub maintenance7: bool,
+    pub maintenance8: bool,
     pub device_diagnostics_config: bool,
     pub geometry_shader_passthrough: bool,
     pub viewport_array2: bool,
@@ -387,6 +490,8 @@ pub struct Device {
     pub descriptor_buffer_properties: vk::PhysicalDeviceDescriptorBufferPropertiesEXT,
     /// Raw `VkPhysicalDeviceTransformFeedbackFeaturesEXT::geometryStreams` feature bit.
     pub transform_feedback_geometry_streams_supported: bool,
+    /// Raw `VkPhysicalDeviceBorderColorSwizzleFeaturesEXT::borderColorSwizzleFromImage` bit.
+    pub border_color_swizzle_from_image_supported: bool,
 
     /// Core physical device features.
     pub device_features: vk::PhysicalDeviceFeatures,
@@ -425,6 +530,10 @@ pub struct Device {
     /// `IsSharedInt64AtomicsSupported` and `IsExtShaderAtomicInt64Supported`
     /// answer different questions.
     pub shader_shared_int64_atomics_supported: bool,
+    maintenance5_early_fragment_multisample_coverage_after_sample_counting: bool,
+    maintenance5_early_fragment_sample_mask_test_before_sample_counting: bool,
+    maintenance5_depth_stencil_swizzle_one_supported: bool,
+    maintenance5_polygon_mode_point_size_supported: bool,
     /// Feature bits from `VkPhysicalDeviceDescriptorIndexingFeatures`.
     pub descriptor_binding_partially_bound_supported: bool,
     pub sampled_image_array_non_uniform_indexing_supported: bool,
@@ -447,6 +556,7 @@ pub struct Device {
     pub has_broken_parallel_compiling: bool,
     pub has_renderdoc: bool,
     pub has_nsight_graphics: bool,
+    pub has_radeon_gpu_profiler: bool,
     pub supports_d24_depth: bool,
     pub cant_blit_msaa: bool,
     pub must_emulate_scaled_formats: bool,
@@ -462,6 +572,7 @@ pub struct Device {
     pub dynamic_state3_alpha_to_one: bool,
     pub provoking_vertex_last_supported: bool,
     pub transform_feedback_preserves_provoking_vertex: bool,
+    pub rectangular_lines_supported: bool,
     pub smooth_lines_supported: bool,
     pub stippled_rectangular_lines_supported: bool,
     pub supports_conditional_barriers: bool,
@@ -594,6 +705,7 @@ impl Device {
         let has_vertex_input_dynamic_state =
             supported_extensions.contains("VK_EXT_vertex_input_dynamic_state");
         let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
+        let has_border_color_swizzle = supported_extensions.contains("VK_EXT_border_color_swizzle");
         let has_custom_border_color = supported_extensions.contains("VK_EXT_custom_border_color");
         let has_color_write_enable = supported_extensions.contains("VK_EXT_color_write_enable");
         let has_depth_bias_control = supported_extensions.contains("VK_EXT_depth_bias_control");
@@ -603,11 +715,22 @@ impl Device {
             supported_extensions.contains("VK_KHR_pipeline_executable_properties");
         let has_workgroup_memory_explicit_layout =
             supported_extensions.contains("VK_KHR_workgroup_memory_explicit_layout");
+        let has_vulkan_memory_model = device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains("VK_KHR_vulkan_memory_model");
+        let has_robust_image_access = device_properties.api_version >= vk::API_VERSION_1_3
+            || supported_extensions.contains("VK_EXT_image_robustness");
+        let has_maintenance4 = device_properties.api_version >= vk::API_VERSION_1_3
+            || supported_extensions.contains("VK_KHR_maintenance4");
+        let has_maintenance5 = supported_extensions.contains(KHR_MAINTENANCE_5_EXTENSION_NAME);
+        let has_maintenance6 = supported_extensions.contains(KHR_MAINTENANCE_6_EXTENSION_NAME);
         let has_4444_formats = supported_extensions.contains("VK_EXT_4444_formats");
         let has_index_type_uint8 = supported_extensions.contains("VK_EXT_index_type_uint8");
         let has_vertex_attribute_divisor =
             supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
         let has_provoking_vertex = supported_extensions.contains("VK_EXT_provoking_vertex");
+        // Match Eden's two distinct extension fields: the feature payload is
+        // queried through VK_EXT_robustness2, while the separately tracked
+        // robustness_2 name may prefer the KHR alias below.
         let has_robustness2 = supported_extensions.contains("VK_EXT_robustness2");
         let has_device_fault = supported_extensions.contains("VK_EXT_device_fault")
             && std::env::var_os("RUZU_VK_DEVICE_FAULT").is_some();
@@ -635,6 +758,10 @@ impl Device {
             vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
         let mut timeline_semaphore_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut vulkan_memory_model_features =
+            vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+        let mut robust_image_access_features = vk::PhysicalDeviceImageRobustnessFeatures::default();
+        let mut maintenance4_features = vk::PhysicalDeviceMaintenance4Features::default();
         let mut synchronization2_features = vk::PhysicalDeviceSynchronization2Features::default();
         let mut subgroup_size_control_features =
             vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
@@ -643,6 +770,8 @@ impl Device {
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
         let mut descriptor_buffer_features =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+        let mut border_color_swizzle_features =
+            vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT::default();
         let mut custom_border_color_features =
             vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut color_write_enable_features =
@@ -656,6 +785,8 @@ impl Device {
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
         let mut workgroup_memory_explicit_layout_features =
             vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default();
+        let mut maintenance5_features = PhysicalDeviceMaintenance5FeaturesKhr::default();
+        let mut maintenance6_features = PhysicalDeviceMaintenance6FeaturesKhr::default();
         let mut primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
         let mut extended_dynamic_state_features =
@@ -699,6 +830,15 @@ impl Device {
                 || supported_extensions.contains("VK_KHR_timeline_semaphore")
             {
                 features2_builder = features2_builder.push_next(&mut timeline_semaphore_features);
+            }
+            if has_vulkan_memory_model {
+                features2_builder = features2_builder.push_next(&mut vulkan_memory_model_features);
+            }
+            if has_robust_image_access {
+                features2_builder = features2_builder.push_next(&mut robust_image_access_features);
+            }
+            if has_maintenance4 {
+                features2_builder = features2_builder.push_next(&mut maintenance4_features);
             }
             if has_synchronization2 {
                 features2_builder = features2_builder.push_next(&mut synchronization2_features);
@@ -749,6 +889,9 @@ impl Device {
             if has_depth_clip_control {
                 features2_builder = features2_builder.push_next(&mut depth_clip_control_features);
             }
+            if has_border_color_swizzle {
+                features2_builder = features2_builder.push_next(&mut border_color_swizzle_features);
+            }
             if has_custom_border_color {
                 features2_builder = features2_builder.push_next(&mut custom_border_color_features);
             }
@@ -792,6 +935,18 @@ impl Device {
                 depth_bias_control_features.p_next = features2.p_next;
                 features2.p_next = (&mut depth_bias_control_features
                     as *mut PhysicalDeviceDepthBiasControlFeaturesExt)
+                    .cast();
+            }
+            if has_maintenance5 {
+                maintenance5_features.p_next = features2.p_next;
+                features2.p_next = (&mut maintenance5_features
+                    as *mut PhysicalDeviceMaintenance5FeaturesKhr)
+                    .cast();
+            }
+            if has_maintenance6 {
+                maintenance6_features.p_next = features2.p_next;
+                features2.p_next = (&mut maintenance6_features
+                    as *mut PhysicalDeviceMaintenance6FeaturesKhr)
                     .cast();
             }
             features2
@@ -838,6 +993,10 @@ impl Device {
             "extendedDynamicState"
         );
         log_recommended_feature!(formats_4444_features.format_a4b4g4r4, "formatA4B4G4R4");
+        log_recommended_feature!(
+            robust_image_access_features.robust_image_access,
+            "robustImageAccess"
+        );
         log_recommended_feature!(index_type_uint8_features.index_type_uint8, "indexTypeUint8");
         log_recommended_feature!(
             primitive_topology_list_restart_features.primitive_topology_list_restart,
@@ -848,14 +1007,6 @@ impl Device {
             "provokingVertexLast"
         );
         log_recommended_feature!(robustness2_features.null_descriptor, "nullDescriptor");
-        log_recommended_feature!(
-            robustness2_features.robust_buffer_access2,
-            "robustBufferAccess2"
-        );
-        log_recommended_feature!(
-            robustness2_features.robust_image_access2,
-            "robustImageAccess2"
-        );
         log_recommended_feature!(shader_float16_int8_features.shader_float16, "shaderFloat16");
         log_recommended_feature!(shader_float16_int8_features.shader_int8, "shaderInt8");
         log_recommended_feature!(
@@ -878,13 +1029,6 @@ impl Device {
             vertex_input_dynamic_state_features.vertex_input_dynamic_state,
             "vertexInputDynamicState"
         );
-        log_recommended_feature!(device_features.fill_mode_non_solid, "fillModeNonSolid");
-        log_recommended_feature!(device_features.geometry_shader, "geometryShader");
-        log_recommended_feature!(device_features.large_points, "largePoints");
-        log_recommended_feature!(device_features.shader_cull_distance, "shaderCullDistance");
-        log_recommended_feature!(device_features.tessellation_shader, "tessellationShader");
-        log_recommended_feature!(device_features.wide_lines, "wideLines");
-
         let has_push_descriptor = supported_extensions.contains("VK_KHR_push_descriptor");
         let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
         let mut push_descriptor_properties =
@@ -895,6 +1039,7 @@ impl Device {
             vk::PhysicalDeviceTransformFeedbackPropertiesEXT::default();
         let mut descriptor_buffer_properties =
             vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
+        let mut maintenance5_properties = PhysicalDeviceMaintenance5PropertiesKhr::default();
         let mut properties2_builder = vk::PhysicalDeviceProperties2::builder()
             .push_next(&mut driver_properties)
             .push_next(&mut subgroup_properties);
@@ -917,6 +1062,12 @@ impl Device {
             properties2_builder = properties2_builder.push_next(&mut transform_feedback_properties);
         }
         let mut properties2 = properties2_builder.build();
+        if has_maintenance5 {
+            maintenance5_properties.p_next = properties2.p_next;
+            properties2.p_next = (&mut maintenance5_properties
+                as *mut PhysicalDeviceMaintenance5PropertiesKhr)
+                .cast();
+        }
         unsafe {
             instance.get_physical_device_properties2(physical, &mut properties2);
         }
@@ -927,6 +1078,13 @@ impl Device {
         let supports_timeline_semaphore = timeline_semaphore_features.timeline_semaphore != 0;
         let supports_synchronization2 =
             has_synchronization2 && synchronization2_features.synchronization2 != 0;
+        let supports_vulkan_memory_model =
+            has_vulkan_memory_model && vulkan_memory_model_features.vulkan_memory_model != 0;
+        let supports_robust_image_access =
+            has_robust_image_access && robust_image_access_features.robust_image_access != 0;
+        let supports_maintenance4 = has_maintenance4 && maintenance4_features.maintenance4 != 0;
+        let supports_maintenance5 = has_maintenance5 && maintenance5_features.maintenance5 != 0;
+        let supports_maintenance6 = has_maintenance6 && maintenance6_features.maintenance6 != 0;
         let mut supports_buffer_device_address = has_buffer_device_address
             && if device_properties.api_version >= vk::API_VERSION_1_2 {
                 vulkan12_features.buffer_device_address != 0
@@ -962,6 +1120,12 @@ impl Device {
         let mut supports_custom_border_color = has_custom_border_color
             && custom_border_color_features.custom_border_colors != 0
             && custom_border_color_features.custom_border_color_without_format != 0;
+        let mut supports_border_color_swizzle = border_color_swizzle_supported(
+            has_border_color_swizzle,
+            supports_custom_border_color,
+            border_color_swizzle_features.border_color_swizzle,
+            border_color_swizzle_features.border_color_swizzle_from_image,
+        );
         let supports_depth_bias_control = has_depth_bias_control
             && depth_bias_control_features.depth_bias_control != 0
             && depth_bias_control_features.least_representable_value_force_unorm_representation
@@ -1033,21 +1197,17 @@ impl Device {
         let suitable = device_is_suitable(
             device_properties.api_version,
             surface != vk::SurfaceKHR::null(),
+            is_mvk,
             &supported_extensions,
             &device_features,
-            &storage_16bit_features,
-            &storage_8bit_features,
             &host_query_reset_features,
             &shader_demote_features,
             &shader_draw_parameters_features,
             &variable_pointers_features,
             &device_properties.limits,
         );
-        if !suitable && !(is_mvk || is_qualcomm || is_turnip || is_arm) {
-            return Err(VulkanError::new(vk::Result::ERROR_INCOMPATIBLE_DRIVER));
-        }
         if !suitable {
-            log::warn!("Unsuitable driver, continuing anyway");
+            log::warn!("Unsuitable driver - continuing anyways");
         }
 
         let nvidia_arch = if is_nvidia {
@@ -1072,11 +1232,15 @@ impl Device {
         if is_qualcomm || is_turnip {
             log::warn!("Qualcomm and Turnip drivers have broken VK_EXT_custom_border_color");
             supports_custom_border_color = false;
+            supports_border_color_swizzle = false;
             custom_border_color_features.custom_border_colors = vk::FALSE;
             custom_border_color_features.custom_border_color_without_format = vk::FALSE;
         }
         if is_qualcomm {
             must_emulate_scaled_formats = true;
+            log::warn!("Qualcomm drivers have broken VK_EXT_border_color_swizzle");
+            border_color_swizzle_features.border_color_swizzle = vk::FALSE;
+            border_color_swizzle_features.border_color_swizzle_from_image = vk::FALSE;
             log::warn!("Qualcomm drivers have broken VK_EXT_color_write_enable");
             supports_color_write_enable = false;
             color_write_enable_features.color_write_enable = vk::FALSE;
@@ -1384,6 +1548,21 @@ impl Device {
             &supported_extensions,
             supports_device_fault,
         );
+        let robustness2_extension_name = if loaded_extensions.contains("VK_KHR_robustness2") {
+            "VK_KHR_robustness2"
+        } else {
+            "VK_EXT_robustness2"
+        };
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            robustness2_extension_name,
+            supports_null_descriptor,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            "VK_EXT_border_color_swizzle",
+            supports_border_color_swizzle,
+        );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
             "VK_EXT_custom_border_color",
@@ -1458,6 +1637,26 @@ impl Device {
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
+            "VK_EXT_image_robustness",
+            supports_robust_image_access,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            "VK_KHR_maintenance4",
+            supports_maintenance4,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            KHR_MAINTENANCE_5_EXTENSION_NAME,
+            supports_maintenance5,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            KHR_MAINTENANCE_6_EXTENSION_NAME,
+            supports_maintenance6,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
             "VK_EXT_shader_demote_to_helper_invocation",
             supports_shader_demote_to_helper_invocation,
         );
@@ -1484,6 +1683,9 @@ impl Device {
         if !supports_custom_border_color {
             clear_feature_preserving_chain!(custom_border_color_features);
         }
+        if !supports_border_color_swizzle {
+            clear_feature_preserving_chain!(border_color_swizzle_features);
+        }
         if !supports_color_write_enable {
             clear_feature_preserving_chain!(color_write_enable_features);
         }
@@ -1495,6 +1697,9 @@ impl Device {
         }
         if !supports_descriptor_buffer {
             clear_feature_preserving_chain!(descriptor_buffer_features);
+        }
+        if !supports_null_descriptor {
+            clear_feature_preserving_chain!(robustness2_features);
         }
         if !supports_buffer_device_address {
             if device_properties.api_version >= vk::API_VERSION_1_2 {
@@ -1528,6 +1733,18 @@ impl Device {
         }
         if !supports_workgroup_memory_explicit_layout {
             clear_feature_preserving_chain!(workgroup_memory_explicit_layout_features);
+        }
+        if !supports_robust_image_access {
+            clear_feature_preserving_chain!(robust_image_access_features);
+        }
+        if !supports_maintenance4 {
+            clear_feature_preserving_chain!(maintenance4_features);
+        }
+        if !supports_maintenance5 {
+            clear_feature_preserving_chain!(maintenance5_features);
+        }
+        if !supports_maintenance6 {
+            clear_feature_preserving_chain!(maintenance6_features);
         }
         if !supports_subgroup_size_control {
             clear_feature_preserving_chain!(subgroup_size_control_features);
@@ -1568,7 +1785,7 @@ impl Device {
             && !*common::settings::values()
                 .enable_compute_pipelines
                 .get_value();
-        let (has_renderdoc, has_nsight_graphics) = collect_tooling_info(
+        let (has_renderdoc, has_nsight_graphics, has_radeon_gpu_profiler) = collect_tooling_info(
             entry,
             &instance,
             physical,
@@ -1661,7 +1878,7 @@ impl Device {
             is_integrated,
         );
 
-        Ok(Self {
+        let device = Self {
             instance,
             physical,
             allocator,
@@ -1687,8 +1904,12 @@ impl Device {
                 bit8_storage: loaded_extensions.contains("VK_KHR_8bit_storage"),
                 timeline_semaphore: loaded_extensions.contains("VK_KHR_timeline_semaphore"),
                 buffer_device_address: supports_buffer_device_address,
+                vulkan_memory_model: supports_vulkan_memory_model,
+                robust_image_access: supports_robust_image_access,
                 subgroup_size_control: supports_subgroup_size_control,
+                maintenance4: supports_maintenance4,
                 synchronization2: supports_synchronization2,
+                border_color_swizzle: supports_border_color_swizzle,
                 custom_border_color: supports_custom_border_color,
                 color_write_enable: supports_color_write_enable,
                 depth_bias_control: supports_depth_bias_control,
@@ -1707,14 +1928,18 @@ impl Device {
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
                 provoking_vertex: supports_provoking_vertex,
                 robustness2: has_robustness2,
-                robustness_2: loaded_extensions.contains("VK_EXT_robustness2"),
+                robustness_2: loaded_extensions.contains("VK_KHR_robustness2")
+                    || loaded_extensions.contains("VK_EXT_robustness2"),
                 pipeline_executable_properties: supports_pipeline_executable_properties,
                 workgroup_memory_explicit_layout: supports_workgroup_memory_explicit_layout,
+                maintenance5: supports_maintenance5,
+                maintenance6: supports_maintenance6,
                 device_fault: supports_device_fault,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 draw_indirect_count: has_draw_indirect_count,
                 sampler_filter_minmax: supports_sampler_filter_minmax,
                 shader_float_controls: has_shader_float_controls,
+                astc_decode_mode: loaded_extensions.contains("VK_EXT_astc_decode_mode"),
                 conditional_rendering: loaded_extensions.contains("VK_EXT_conditional_rendering"),
                 conservative_rasterization: loaded_extensions
                     .contains("VK_EXT_conservative_rasterization"),
@@ -1734,6 +1959,11 @@ impl Device {
                 swapchain_mutable_format: loaded_extensions
                     .contains("VK_KHR_swapchain_mutable_format"),
                 image_format_list: loaded_extensions.contains("VK_KHR_image_format_list"),
+                maintenance1: loaded_extensions.contains("VK_KHR_maintenance1"),
+                maintenance2: loaded_extensions.contains("VK_KHR_maintenance2"),
+                maintenance3: loaded_extensions.contains("VK_KHR_maintenance3"),
+                maintenance7: loaded_extensions.contains(KHR_MAINTENANCE_7_EXTENSION_NAME),
+                maintenance8: loaded_extensions.contains(KHR_MAINTENANCE_8_EXTENSION_NAME),
                 device_diagnostics_config: loaded_extensions
                     .contains("VK_NV_device_diagnostics_config"),
                 geometry_shader_passthrough: loaded_extensions
@@ -1755,6 +1985,9 @@ impl Device {
             descriptor_buffer_properties,
             transform_feedback_geometry_streams_supported: transform_feedback_features
                 .geometry_streams
+                != 0,
+            border_color_swizzle_from_image_supported: border_color_swizzle_features
+                .border_color_swizzle_from_image
                 != 0,
             device_features,
             shader_float16_supported: supports_shader_float16,
@@ -1785,6 +2018,17 @@ impl Device {
             shader_output_layer_supported: vulkan12_features.shader_output_layer != 0,
             exact_depth_bias_control_supported,
             shader_shared_int64_atomics_supported,
+            maintenance5_early_fragment_multisample_coverage_after_sample_counting:
+                maintenance5_properties.early_fragment_multisample_coverage_after_sample_counting
+                    != 0,
+            maintenance5_early_fragment_sample_mask_test_before_sample_counting:
+                maintenance5_properties.early_fragment_sample_mask_test_before_sample_counting != 0,
+            maintenance5_depth_stencil_swizzle_one_supported: maintenance5_properties
+                .depth_stencil_swizzle_one_support
+                != 0,
+            maintenance5_polygon_mode_point_size_supported: maintenance5_properties
+                .polygon_mode_point_size
+                != 0,
             descriptor_binding_partially_bound_supported,
             sampled_image_array_non_uniform_indexing_supported,
             storage_image_array_non_uniform_indexing_supported,
@@ -1804,6 +2048,7 @@ impl Device {
             has_broken_parallel_compiling,
             has_renderdoc,
             has_nsight_graphics,
+            has_radeon_gpu_profiler,
             supports_d24_depth,
             cant_blit_msaa,
             must_emulate_scaled_formats,
@@ -1819,6 +2064,7 @@ impl Device {
             dynamic_state3_alpha_to_one,
             provoking_vertex_last_supported,
             transform_feedback_preserves_provoking_vertex,
+            rectangular_lines_supported: line_rasterization_features.rectangular_lines != 0,
             smooth_lines_supported: line_rasterization_features.smooth_lines != 0,
             stippled_rectangular_lines_supported: line_rasterization_features
                 .stippled_rectangular_lines
@@ -1833,7 +2079,102 @@ impl Device {
             valid_heap_memory,
             format_properties,
             nsight_aftermath_tracker: enable_nsight_aftermath.then(NsightAftermathTracker::new),
-        })
+        };
+        device.initialize_gpu_logging();
+        Ok(device)
+    }
+
+    /// Initialize Eden's optional GPU logging after the logical device and VMA
+    /// allocator are ready.
+    pub fn initialize_gpu_logging(&self) {
+        let settings = common::settings::values();
+        let log_level = LogLevel::from(*settings.gpu_log_level.get_value());
+        if log_level == LogLevel::Off {
+            return;
+        }
+
+        let driver_id = self.get_driver_id();
+        let detected_driver = if driver_id == vk::DriverId::MESA_TURNIP {
+            DriverType::Turnip
+        } else if driver_id == vk::DriverId::QUALCOMM_PROPRIETARY {
+            DriverType::Qualcomm
+        } else {
+            DriverType::Unknown
+        };
+
+        let logger = get_instance();
+        logger.initialize(log_level, detected_driver);
+        logger.enable_vulkan_call_tracking(*settings.gpu_log_vulkan_calls.get_value());
+        logger.enable_memory_tracking(*settings.gpu_log_memory_tracking.get_value());
+        logger.enable_driver_debug_info(*settings.gpu_log_driver_debug.get_value());
+        logger.set_ring_buffer_size(*settings.gpu_log_ring_buffer_size.get_value() as usize);
+
+        if !*settings.gpu_log_driver_debug.get_value() {
+            return;
+        }
+
+        let device_name = unsafe {
+            CStr::from_ptr(self.device_properties.device_name.as_ptr()).to_string_lossy()
+        };
+        let driver_name = unsafe {
+            CStr::from_ptr(self.driver_properties.driver_name.as_ptr()).to_string_lossy()
+        };
+        let driver_info = unsafe {
+            CStr::from_ptr(self.driver_properties.driver_info.as_ptr()).to_string_lossy()
+        };
+        let driver_version = self.device_properties.driver_version;
+        let api_version = self.device_properties.api_version;
+        let mut details = format!(
+            "Device: {device_name}\n\
+             Driver Name: {driver_name}\n\
+             Driver Info: {driver_info}\n\
+             Driver Version: {}.{}.{}\n\
+             Vulkan API Version: {}.{}.{}\n\
+             Driver ID: {}\n\
+             Vendor ID: {:#04x}\n\
+             Device ID: {:#04x}\n\
+             \n=== Loaded Vulkan Extensions ===\n",
+            vk::api_version_major(driver_version),
+            vk::api_version_minor(driver_version),
+            vk::api_version_patch(driver_version),
+            vk::api_version_major(api_version),
+            vk::api_version_minor(api_version),
+            vk::api_version_patch(api_version),
+            driver_id.as_raw(),
+            self.device_properties.vendor_id,
+            self.device_properties.device_id,
+        );
+
+        let (qcom_extensions, other_extensions): (Vec<_>, Vec<_>) = self
+            .loaded_extensions
+            .iter()
+            .partition(|extension| extension.contains("QCOM") || extension.contains("qcom"));
+        if !qcom_extensions.is_empty() {
+            details.push_str("\nQualcomm Proprietary Extensions:\n");
+            for extension in qcom_extensions {
+                details.push_str(&format!("  - {extension}\n"));
+            }
+        }
+        if !other_extensions.is_empty() {
+            details.push_str("\nStandard Extensions:\n");
+            for extension in other_extensions {
+                details.push_str(&format!("  - {extension}\n"));
+            }
+        }
+        details.push_str(&format!(
+            "\nTotal Extensions Loaded: {}\n",
+            self.loaded_extensions.len()
+        ));
+        logger.log_driver_debug_info(&details);
+    }
+
+    /// Shut down Eden's process-wide GPU logger before the allocator and
+    /// logical device are destroyed.
+    pub fn shutdown_gpu_logging(&self) {
+        let logger = get_instance();
+        if logger.is_initialized() {
+            logger.shutdown();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1945,27 +2286,14 @@ impl Device {
         if !self.has_debugging_tool_attached() {
             return;
         }
-        let Ok(name) = CString::new(name) else {
-            log::warn!("Refusing Vulkan shader-module name containing NUL");
-            return;
-        };
-        let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
-            self.instance
-                .get_device_proc_addr(self.logical.device.handle(), function_name.as_ptr())
-                .map_or(std::ptr::null(), |function| {
-                    function as *const std::ffi::c_void
-                })
-        });
-        let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
-            .object_type(vk::ObjectType::SHADER_MODULE)
-            .object_handle(module.as_raw())
-            .object_name(&name);
-        let result = unsafe {
-            (functions.set_debug_utils_object_name_ext)(self.logical.device.handle(), &*name_info)
-        };
-        if result != vk::Result::SUCCESS {
-            log::warn!("Failed to name Vulkan shader module: {result:?}");
-        }
+        set_object_name(
+            &self.instance,
+            &self.logical.device,
+            vk::ObjectType::SHADER_MODULE,
+            module.as_raw(),
+            name,
+        )
+        .expect("failed to name Vulkan shader module");
     }
 
     /// Rust counterpart of `vk::Buffer::SetObjectNameEXT` used by the
@@ -1974,37 +2302,21 @@ impl Device {
         if !self.has_debugging_tool_attached() {
             return;
         }
-        let Ok(name) = CString::new(name) else {
-            log::warn!("Refusing Vulkan buffer name containing NUL");
-            return;
-        };
-        let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
-            self.instance
-                .get_device_proc_addr(self.logical.device.handle(), function_name.as_ptr())
-                .map_or(std::ptr::null(), |function| {
-                    function as *const std::ffi::c_void
-                })
-        });
-        let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
-            .object_type(vk::ObjectType::BUFFER)
-            .object_handle(buffer.as_raw())
-            .object_name(&name);
-        let result = unsafe {
-            (functions.set_debug_utils_object_name_ext)(self.logical.device.handle(), &*name_info)
-        };
-        if result != vk::Result::SUCCESS {
-            log::warn!("Failed to name Vulkan buffer: {result:?}");
-        }
+        set_object_name(
+            &self.instance,
+            &self.logical.device,
+            vk::ObjectType::BUFFER,
+            buffer.as_raw(),
+            name,
+        )
+        .expect("failed to name Vulkan buffer");
     }
 
     /// Returns the name of the VkDriverId reported from Vulkan.
     ///
     /// Port of `Device::GetDriverName`.
     pub fn get_driver_name(&self) -> String {
-        if let Some(name) = driver_name_from_id(self.driver_properties.driver_id) {
-            return name.to_string();
-        }
-        self.get_vendor_name()
+        get_driver_name(&self.driver_properties)
     }
 
     /// Returns the vendor name reported from Vulkan.
@@ -2218,7 +2530,7 @@ impl Device {
 
     /// Returns true if ASTC is natively supported.
     pub fn is_optimal_astc_supported(&self) -> bool {
-        self.device_features.texture_compression_astc_ldr != 0
+        self.is_optimal_astc_supported
     }
 
     /// Returns true if BCn is natively supported.
@@ -2241,6 +2553,13 @@ impl Device {
     /// Port of `Device::IsFloat16Supported`.
     pub fn is_float16_supported(&self) -> bool {
         self.shader_float16_supported
+    }
+
+    /// Returns true if shaders can use the Vulkan memory model.
+    ///
+    /// Port of upstream `Device::IsVulkanMemoryModelSupported`.
+    pub fn is_vulkan_memory_model_supported(&self) -> bool {
+        self.extensions.vulkan_memory_model
     }
 
     pub fn is_int8_supported(&self) -> bool {
@@ -2369,6 +2688,14 @@ impl Device {
             && self.transform_feedback_properties.transform_feedback_draw != 0
     }
 
+    pub fn is_transform_feedback_queries_supported(&self) -> bool {
+        self.extensions.transform_feedback
+            && self
+                .transform_feedback_properties
+                .transform_feedback_queries
+                != 0
+    }
+
     /// Returns true if host-side `vkResetQueryPool` is supported.
     ///
     /// Port of upstream `Device::IsHostQueryResetSupported`.
@@ -2434,7 +2761,7 @@ impl Device {
 
     /// Returns true when a known debugging tool is attached.
     pub fn has_debugging_tool_attached(&self) -> bool {
-        self.has_renderdoc || self.has_nsight_graphics
+        self.has_renderdoc || self.has_nsight_graphics || self.has_radeon_gpu_profiler
     }
 
     /// Returns true if compute pipelines can cause crashing.
@@ -2593,6 +2920,22 @@ impl Device {
         self.extensions.custom_border_color
     }
 
+    pub fn is_custom_border_colors_supported(&self) -> bool {
+        self.extensions.custom_border_color
+    }
+
+    pub fn is_custom_border_color_without_format_supported(&self) -> bool {
+        self.extensions.custom_border_color
+    }
+
+    pub fn is_ext_border_color_swizzle_supported(&self) -> bool {
+        self.extensions.border_color_swizzle
+    }
+
+    pub fn is_border_color_swizzle_from_image_supported(&self) -> bool {
+        self.border_color_swizzle_from_image_supported
+    }
+
     pub fn is_ext_color_write_enable_supported(&self) -> bool {
         self.extensions.color_write_enable
     }
@@ -2635,6 +2978,12 @@ impl Device {
 
     pub fn is_ext_shader_stencil_export_supported(&self) -> bool {
         self.extensions.shader_stencil_export
+    }
+
+    pub fn can_perform_depth_stencil_operations(&self) -> bool {
+        self.extensions.shader_stencil_export
+            || self.is_blit_depth24_stencil8_supported
+            || self.is_blit_depth32_stencil8_supported
     }
 
     pub fn is_ext_depth_range_unrestricted_supported(&self) -> bool {
@@ -2685,6 +3034,10 @@ impl Device {
         self.extensions.conditional_rendering
     }
 
+    pub fn is_ext_astc_decode_mode_supported(&self) -> bool {
+        self.extensions.astc_decode_mode
+    }
+
     pub fn is_ext_line_rasterization_supported(&self) -> bool {
         self.extensions.line_rasterization
     }
@@ -2703,6 +3056,52 @@ impl Device {
 
     pub fn is_khr_workgroup_memory_explicit_layout_supported(&self) -> bool {
         self.extensions.workgroup_memory_explicit_layout
+    }
+
+    pub fn is_khr_maintenance1_supported(&self) -> bool {
+        self.extensions.maintenance1
+    }
+
+    pub fn is_khr_maintenance2_supported(&self) -> bool {
+        self.extensions.maintenance2
+    }
+
+    pub fn is_khr_maintenance3_supported(&self) -> bool {
+        self.extensions.maintenance3
+    }
+
+    pub fn is_khr_maintenance4_supported(&self) -> bool {
+        self.extensions.maintenance4
+    }
+
+    pub fn is_khr_maintenance5_supported(&self) -> bool {
+        self.extensions.maintenance5
+    }
+
+    pub fn supports_polygon_mode_point_size(&self) -> bool {
+        self.extensions.maintenance5 && self.maintenance5_polygon_mode_point_size_supported
+    }
+
+    pub fn supports_depth_stencil_swizzle_one(&self) -> bool {
+        self.extensions.maintenance5 && self.maintenance5_depth_stencil_swizzle_one_supported
+    }
+
+    pub fn supports_early_fragment_tests(&self) -> bool {
+        self.extensions.maintenance5
+            && self.maintenance5_early_fragment_multisample_coverage_after_sample_counting
+            && self.maintenance5_early_fragment_sample_mask_test_before_sample_counting
+    }
+
+    pub fn is_khr_maintenance6_supported(&self) -> bool {
+        self.extensions.maintenance6
+    }
+
+    pub fn is_khr_maintenance7_supported(&self) -> bool {
+        self.extensions.maintenance7
+    }
+
+    pub fn is_khr_maintenance8_supported(&self) -> bool {
+        self.extensions.maintenance8
     }
 
     pub fn is_khr_image_format_list_supported(&self) -> bool {
@@ -2783,6 +3182,10 @@ impl Device {
         self.dynamic_state3_alpha_to_one
     }
 
+    pub fn supports_rectangular_lines(&self) -> bool {
+        self.rectangular_lines_supported
+    }
+
     pub fn supports_smooth_lines(&self) -> bool {
         self.smooth_lines_supported
     }
@@ -2824,6 +3227,12 @@ impl Device {
     /// Port of upstream `Device::IsExt4444FormatsSupported`.
     pub fn is_ext_4444_formats_supported(&self) -> bool {
         self.format_a4b4g4r4_supported
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.shutdown_gpu_logging();
     }
 }
 
@@ -2976,34 +3385,6 @@ pub fn query_device_memory_usage(
     device_memory_usage_from_budget(&budget, &memory_info.valid_heap_memory)
 }
 
-fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {
-    match driver_id {
-        vk::DriverId::AMD_PROPRIETARY => Some("AMD"),
-        vk::DriverId::AMD_OPEN_SOURCE => Some("AMDVLK"),
-        vk::DriverId::MESA_RADV => Some("RADV"),
-        vk::DriverId::NVIDIA_PROPRIETARY => Some("NVIDIA"),
-        vk::DriverId::INTEL_PROPRIETARY_WINDOWS => Some("Intel"),
-        vk::DriverId::INTEL_OPEN_SOURCE_MESA => Some("ANV"),
-        vk::DriverId::IMAGINATION_PROPRIETARY => Some("PowerVR"),
-        vk::DriverId::QUALCOMM_PROPRIETARY => Some("Qualcomm"),
-        vk::DriverId::ARM_PROPRIETARY => Some("Mali"),
-        vk::DriverId::SAMSUNG_PROPRIETARY => Some("Xclipse"),
-        vk::DriverId::GOOGLE_SWIFTSHADER => Some("SwiftShader"),
-        vk::DriverId::BROADCOM_PROPRIETARY => Some("Broadcom"),
-        vk::DriverId::MESA_LLVMPIPE => Some("Lavapipe"),
-        vk::DriverId::MOLTENVK => Some("MoltenVK"),
-        vk::DriverId::VERISILICON_PROPRIETARY => Some("Vivante"),
-        vk::DriverId::MESA_TURNIP => Some("Turnip"),
-        vk::DriverId::MESA_V3DV => Some("V3DV"),
-        vk::DriverId::MESA_PANVK => Some("PanVK"),
-        vk::DriverId::MESA_VENUS => Some("Venus"),
-        vk::DriverId::MESA_DOZEN => Some("Dozen"),
-        vk::DriverId::MESA_NVK => Some("NVK"),
-        vk::DriverId::IMAGINATION_OPEN_SOURCE_MESA => Some("PVR"),
-        _ => None,
-    }
-}
-
 fn sampler_filter_minmax_supported(
     extension_available: bool,
     is_amd: bool,
@@ -3027,6 +3408,7 @@ fn initial_loaded_extensions(
     enable_device_fault: bool,
 ) -> BTreeSet<String> {
     const FEATURE_EXTENSIONS: &[&str] = &[
+        "VK_EXT_border_color_swizzle",
         "VK_EXT_color_write_enable",
         "VK_EXT_custom_border_color",
         "VK_EXT_depth_bias_control",
@@ -3043,10 +3425,13 @@ fn initial_loaded_extensions(
         "VK_EXT_robustness2",
         "VK_EXT_transform_feedback",
         "VK_EXT_vertex_input_dynamic_state",
+        KHR_MAINTENANCE_5_EXTENSION_NAME,
+        KHR_MAINTENANCE_6_EXTENSION_NAME,
         "VK_KHR_pipeline_executable_properties",
         "VK_KHR_workgroup_memory_explicit_layout",
     ];
     const EXTENSIONS: &[&str] = &[
+        "VK_EXT_astc_decode_mode",
         "VK_EXT_conditional_rendering",
         "VK_EXT_conservative_rasterization",
         "VK_EXT_depth_range_unrestricted",
@@ -3066,6 +3451,11 @@ fn initial_loaded_extensions(
         "VK_KHR_swapchain",
         "VK_KHR_swapchain_mutable_format",
         "VK_KHR_image_format_list",
+        "VK_KHR_maintenance1",
+        "VK_KHR_maintenance2",
+        "VK_KHR_maintenance3",
+        KHR_MAINTENANCE_7_EXTENSION_NAME,
+        KHR_MAINTENANCE_8_EXTENSION_NAME,
         "VK_NV_device_diagnostics_config",
         "VK_NV_geometry_shader_passthrough",
         "VK_NV_viewport_array2",
@@ -3083,10 +3473,13 @@ fn initial_loaded_extensions(
         "VK_KHR_8bit_storage",
         "VK_KHR_buffer_device_address",
         "VK_KHR_timeline_semaphore",
+        "VK_KHR_vulkan_memory_model",
     ];
     const FEATURES_1_3: &[&str] = &[
+        "VK_EXT_image_robustness",
         "VK_EXT_shader_demote_to_helper_invocation",
         "VK_EXT_subgroup_size_control",
+        "VK_KHR_maintenance4",
         "VK_KHR_synchronization2",
     ];
 
@@ -3110,6 +3503,12 @@ fn initial_loaded_extensions(
             }
         }
     }
+    if supported_extensions.contains("VK_KHR_robustness2") {
+        loaded.remove("VK_EXT_robustness2");
+        loaded.insert("VK_KHR_robustness2".to_string());
+    } else if supported_extensions.contains("VK_EXT_robustness2") {
+        loaded.insert("VK_EXT_robustness2".to_string());
+    }
     if enable_device_fault {
         loaded.insert("VK_EXT_device_fault".to_string());
     }
@@ -3130,10 +3529,9 @@ fn remove_extension_if_unsupported(
 fn device_is_suitable(
     api_version: u32,
     requires_swapchain: bool,
+    is_molten_vk: bool,
     extensions: &BTreeSet<String>,
     features: &vk::PhysicalDeviceFeatures,
-    storage_16bit: &vk::PhysicalDevice16BitStorageFeatures,
-    storage_8bit: &vk::PhysicalDevice8BitStorageFeatures,
     host_query_reset: &vk::PhysicalDeviceHostQueryResetFeatures,
     shader_demote: &vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures,
     shader_draw_parameters: &vk::PhysicalDeviceShaderDrawParametersFeatures,
@@ -3189,27 +3587,20 @@ fn device_is_suitable(
     macro_rules! require_feature {
         ($value:expr, $name:literal) => {
             if $value == vk::FALSE {
-                log::error!("Missing required feature {}", $name);
-                suitable = false;
+                if is_molten_vk
+                    && matches!(
+                        $name,
+                        "geometryShader" | "logicOp" | "shaderCullDistance" | "wideLines"
+                    )
+                {
+                    log::info!("MoltenVK missing feature {} - using fallback", $name);
+                } else {
+                    log::error!("Missing required feature {}", $name);
+                    suitable = false;
+                }
             }
         };
     }
-    require_feature!(
-        storage_16bit.storage_buffer16_bit_access,
-        "storageBuffer16BitAccess"
-    );
-    require_feature!(
-        storage_16bit.uniform_and_storage_buffer16_bit_access,
-        "uniformAndStorageBuffer16BitAccess"
-    );
-    require_feature!(
-        storage_8bit.storage_buffer8_bit_access,
-        "storageBuffer8BitAccess"
-    );
-    require_feature!(
-        storage_8bit.uniform_and_storage_buffer8_bit_access,
-        "uniformAndStorageBuffer8BitAccess"
-    );
     require_feature!(features.depth_bias_clamp, "depthBiasClamp");
     require_feature!(features.depth_clamp, "depthClamp");
     require_feature!(
@@ -3217,12 +3608,15 @@ fn device_is_suitable(
         "drawIndirectFirstInstance"
     );
     require_feature!(features.dual_src_blend, "dualSrcBlend");
+    require_feature!(features.fill_mode_non_solid, "fillModeNonSolid");
     require_feature!(
         features.fragment_stores_and_atomics,
         "fragmentStoresAndAtomics"
     );
+    require_feature!(features.geometry_shader, "geometryShader");
     require_feature!(features.image_cube_array, "imageCubeArray");
     require_feature!(features.independent_blend, "independentBlend");
+    require_feature!(features.large_points, "largePoints");
     require_feature!(features.logic_op, "logicOp");
     require_feature!(features.multi_draw_indirect, "multiDrawIndirect");
     require_feature!(features.multi_viewport, "multiViewport");
@@ -3231,6 +3625,7 @@ fn device_is_suitable(
     require_feature!(features.sampler_anisotropy, "samplerAnisotropy");
     require_feature!(features.sample_rate_shading, "sampleRateShading");
     require_feature!(features.shader_clip_distance, "shaderClipDistance");
+    require_feature!(features.shader_cull_distance, "shaderCullDistance");
     require_feature!(
         features.shader_image_gather_extended,
         "shaderImageGatherExtended"
@@ -3239,10 +3634,12 @@ fn device_is_suitable(
         features.shader_storage_image_write_without_format,
         "shaderStorageImageWriteWithoutFormat"
     );
+    require_feature!(features.tessellation_shader, "tessellationShader");
     require_feature!(
         features.vertex_pipeline_stores_and_atomics,
         "vertexPipelineStoresAndAtomics"
     );
+    require_feature!(features.wide_lines, "wideLines");
     require_feature!(host_query_reset.host_query_reset, "hostQueryReset");
     require_feature!(
         shader_demote.shader_demote_to_helper_invocation,
@@ -3329,20 +3726,22 @@ fn collect_tooling_info(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     tooling_info_enabled: bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     if !tooling_info_enabled {
-        return (false, false);
+        return (false, false, false);
     }
     let tools = get_physical_device_tool_properties(entry, instance, physical);
     let mut has_renderdoc = false;
     let mut has_nsight_graphics = false;
+    let mut has_radeon_gpu_profiler = false;
     for tool in tools {
         let name = unsafe { CStr::from_ptr(tool.name.as_ptr()) }.to_string_lossy();
         log::info!("Attached debugging tool: {}", name);
         has_renderdoc |= name == "RenderDoc";
         has_nsight_graphics |= name == "NVIDIA Nsight Graphics";
+        has_radeon_gpu_profiler |= name == "Radeon GPU Profiler";
     }
-    (has_renderdoc, has_nsight_graphics)
+    (has_renderdoc, has_nsight_graphics, has_radeon_gpu_profiler)
 }
 
 fn collect_format_properties(
@@ -3550,15 +3949,21 @@ fn compute_is_optimal_astc_supported(
         return false;
     }
     let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-        | vk::FormatFeatureFlags::BLIT_SRC
-        | vk::FormatFeatureFlags::BLIT_DST
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
         | vk::FormatFeatureFlags::TRANSFER_SRC
         | vk::FormatFeatureFlags::TRANSFER_DST;
     ASTC_FORMATS.iter().all(|&format| {
         let properties =
             unsafe { instance.get_physical_device_format_properties(physical, format) };
-        !(properties.optimal_tiling_features & required).is_empty()
+        astc_format_support_is_complete(properties.optimal_tiling_features, required)
     })
+}
+
+fn astc_format_support_is_complete(
+    supported: vk::FormatFeatureFlags,
+    required: vk::FormatFeatureFlags,
+) -> bool {
+    (supported & required) == required
 }
 
 fn test_depth_stencil_blits(
@@ -3592,6 +3997,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maintenance5_and6_raw_payloads_match_vulkan_abi() {
+        let pointer_size = std::mem::size_of::<*mut std::ffi::c_void>();
+        assert_eq!(
+            std::mem::size_of::<PhysicalDeviceMaintenance5FeaturesKhr>(),
+            if pointer_size == 8 { 24 } else { 12 }
+        );
+        assert_eq!(
+            std::mem::offset_of!(PhysicalDeviceMaintenance5FeaturesKhr, maintenance5),
+            pointer_size * 2
+        );
+        let maintenance6 = PhysicalDeviceMaintenance6FeaturesKhr::default();
+        assert_eq!(maintenance6.s_type.as_raw(), 1_000_545_000);
+        assert_eq!(
+            std::mem::size_of::<PhysicalDeviceMaintenance6FeaturesKhr>(),
+            if pointer_size == 8 { 24 } else { 12 }
+        );
+        assert_eq!(
+            std::mem::offset_of!(PhysicalDeviceMaintenance6FeaturesKhr, maintenance6),
+            pointer_size * 2
+        );
+        assert_eq!(
+            std::mem::size_of::<PhysicalDeviceMaintenance5PropertiesKhr>(),
+            if pointer_size == 8 { 40 } else { 32 }
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                PhysicalDeviceMaintenance5PropertiesKhr,
+                depth_stencil_swizzle_one_support
+            ),
+            pointer_size * 2 + 2 * std::mem::size_of::<vk::Bool32>()
+        );
+    }
+
+    #[test]
     fn robustness2_enables_only_null_descriptors() {
         let mut features = vk::PhysicalDeviceRobustness2FeaturesEXT {
             robust_buffer_access2: vk::TRUE,
@@ -3605,6 +4044,24 @@ mod tests {
         assert_eq!(features.robust_image_access2, vk::FALSE);
         assert_eq!(features.null_descriptor, vk::TRUE);
         assert!(!configure_robustness2_features(&mut features, false));
+    }
+
+    #[test]
+    fn astc_optimal_support_requires_every_upstream_feature_bit() {
+        let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+
+        assert!(astc_format_support_is_complete(required, required));
+        assert!(!astc_format_support_is_complete(
+            required & !vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            required
+        ));
+        assert!(!astc_format_support_is_complete(
+            vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            required
+        ));
     }
 
     #[test]
@@ -3630,8 +4087,43 @@ mod tests {
     }
 
     #[test]
+    fn border_color_swizzle_requires_extension_custom_border_color_and_both_features() {
+        assert!(border_color_swizzle_supported(
+            true,
+            true,
+            vk::TRUE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            false,
+            true,
+            vk::TRUE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            true,
+            false,
+            vk::TRUE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            true,
+            true,
+            vk::FALSE,
+            vk::TRUE
+        ));
+        assert!(!border_color_swizzle_supported(
+            true,
+            true,
+            vk::TRUE,
+            vk::FALSE
+        ));
+    }
+
+    #[test]
     fn loaded_extension_set_matches_upstream_core_promotion_rules() {
         let supported = [
+            "VK_EXT_border_color_swizzle",
             "VK_EXT_custom_border_color",
             "VK_EXT_4444_formats",
             "VK_EXT_index_type_uint8",
@@ -3640,8 +4132,19 @@ mod tests {
             "VK_EXT_host_query_reset",
             "VK_KHR_8bit_storage",
             "VK_KHR_timeline_semaphore",
+            "VK_KHR_vulkan_memory_model",
+            "VK_EXT_image_robustness",
             "VK_EXT_shader_demote_to_helper_invocation",
             "VK_EXT_subgroup_size_control",
+            "VK_KHR_maintenance4",
+            KHR_MAINTENANCE_5_EXTENSION_NAME,
+            KHR_MAINTENANCE_6_EXTENSION_NAME,
+            "VK_KHR_maintenance1",
+            "VK_KHR_maintenance2",
+            "VK_KHR_maintenance3",
+            "VK_KHR_maintenance7",
+            "VK_KHR_maintenance8",
+            "VK_EXT_astc_decode_mode",
             "VK_KHR_swapchain",
             "VK_EXT_filter_cubic",
             "VK_IMG_filter_cubic",
@@ -3656,8 +4159,19 @@ mod tests {
         assert!(vulkan_11.contains("VK_EXT_descriptor_indexing"));
         assert!(vulkan_11.contains("VK_KHR_8bit_storage"));
         assert!(vulkan_11.contains("VK_KHR_timeline_semaphore"));
+        assert!(vulkan_11.contains("VK_KHR_vulkan_memory_model"));
+        assert!(vulkan_11.contains("VK_EXT_image_robustness"));
         assert!(vulkan_11.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(vulkan_11.contains("VK_EXT_subgroup_size_control"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance4"));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_5_EXTENSION_NAME));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_6_EXTENSION_NAME));
+        assert!(vulkan_11.contains("VK_KHR_maintenance1"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance2"));
+        assert!(vulkan_11.contains("VK_KHR_maintenance3"));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_7_EXTENSION_NAME));
+        assert!(vulkan_11.contains(KHR_MAINTENANCE_8_EXTENSION_NAME));
+        assert!(vulkan_11.contains("VK_EXT_astc_decode_mode"));
         assert!(vulkan_11.contains("VK_EXT_filter_cubic"));
         assert!(vulkan_11.contains("VK_IMG_filter_cubic"));
         assert!(vulkan_11.contains("VK_QCOM_filter_cubic_weights"));
@@ -3667,8 +4181,20 @@ mod tests {
         assert!(!vulkan_13.contains("VK_EXT_descriptor_indexing"));
         assert!(!vulkan_13.contains("VK_KHR_8bit_storage"));
         assert!(!vulkan_13.contains("VK_KHR_timeline_semaphore"));
+        assert!(!vulkan_13.contains("VK_KHR_vulkan_memory_model"));
+        assert!(!vulkan_13.contains("VK_EXT_image_robustness"));
         assert!(!vulkan_13.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(!vulkan_13.contains("VK_EXT_subgroup_size_control"));
+        assert!(!vulkan_13.contains("VK_KHR_maintenance4"));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_5_EXTENSION_NAME));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_6_EXTENSION_NAME));
+        assert!(vulkan_13.contains("VK_KHR_maintenance1"));
+        assert!(vulkan_13.contains("VK_KHR_maintenance2"));
+        assert!(vulkan_13.contains("VK_KHR_maintenance3"));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_7_EXTENSION_NAME));
+        assert!(vulkan_13.contains(KHR_MAINTENANCE_8_EXTENSION_NAME));
+        assert!(vulkan_13.contains("VK_EXT_astc_decode_mode"));
+        assert!(vulkan_13.contains("VK_EXT_border_color_swizzle"));
         assert!(vulkan_13.contains("VK_EXT_custom_border_color"));
         assert!(vulkan_13.contains("VK_EXT_4444_formats"));
         assert!(vulkan_13.contains("VK_EXT_index_type_uint8"));
@@ -3676,11 +4202,21 @@ mod tests {
         assert!(vulkan_13.contains("VK_KHR_swapchain"));
     }
 
+    #[test]
+    fn khr_robustness2_is_preferred_over_the_ext_alias() {
+        let supported = ["VK_KHR_robustness2", "VK_EXT_robustness2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let loaded = initial_loaded_extensions(vk::API_VERSION_1_3, &supported, false);
+        assert!(loaded.contains("VK_KHR_robustness2"));
+        assert!(!loaded.contains("VK_EXT_robustness2"));
+    }
+
     fn suitable_device_inputs() -> (
         BTreeSet<String>,
         vk::PhysicalDeviceFeatures,
-        vk::PhysicalDevice16BitStorageFeatures,
-        vk::PhysicalDevice8BitStorageFeatures,
         vk::PhysicalDeviceHostQueryResetFeatures,
         vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures,
         vk::PhysicalDeviceShaderDrawParametersFeatures,
@@ -3702,9 +4238,12 @@ mod tests {
             depth_clamp: vk::TRUE,
             draw_indirect_first_instance: vk::TRUE,
             dual_src_blend: vk::TRUE,
+            fill_mode_non_solid: vk::TRUE,
             fragment_stores_and_atomics: vk::TRUE,
+            geometry_shader: vk::TRUE,
             image_cube_array: vk::TRUE,
             independent_blend: vk::TRUE,
+            large_points: vk::TRUE,
             logic_op: vk::TRUE,
             multi_draw_indirect: vk::TRUE,
             multi_viewport: vk::TRUE,
@@ -3713,19 +4252,12 @@ mod tests {
             sampler_anisotropy: vk::TRUE,
             sample_rate_shading: vk::TRUE,
             shader_clip_distance: vk::TRUE,
+            shader_cull_distance: vk::TRUE,
             shader_image_gather_extended: vk::TRUE,
             shader_storage_image_write_without_format: vk::TRUE,
+            tessellation_shader: vk::TRUE,
             vertex_pipeline_stores_and_atomics: vk::TRUE,
-            ..Default::default()
-        };
-        let storage_16bit = vk::PhysicalDevice16BitStorageFeatures {
-            storage_buffer16_bit_access: vk::TRUE,
-            uniform_and_storage_buffer16_bit_access: vk::TRUE,
-            ..Default::default()
-        };
-        let storage_8bit = vk::PhysicalDevice8BitStorageFeatures {
-            storage_buffer8_bit_access: vk::TRUE,
-            uniform_and_storage_buffer8_bit_access: vk::TRUE,
+            wide_lines: vk::TRUE,
             ..Default::default()
         };
         let host_query_reset = vk::PhysicalDeviceHostQueryResetFeatures {
@@ -3755,8 +4287,6 @@ mod tests {
         (
             extensions,
             features,
-            storage_16bit,
-            storage_8bit,
             host_query_reset,
             shader_demote,
             shader_draw_parameters,
@@ -3770,8 +4300,6 @@ mod tests {
         let (
             mut extensions,
             features,
-            storage_16bit,
-            storage_8bit,
             host_query_reset,
             shader_demote,
             shader_draw_parameters,
@@ -3782,10 +4310,9 @@ mod tests {
             device_is_suitable(
                 vk::API_VERSION_1_3,
                 true,
+                false,
                 extensions,
                 &features,
-                &storage_16bit,
-                &storage_8bit,
                 &host_query_reset,
                 &shader_demote,
                 &shader_draw_parameters,
@@ -3802,12 +4329,47 @@ mod tests {
     }
 
     #[test]
+    fn moltenvk_allows_only_the_four_upstream_mandatory_feature_fallbacks() {
+        let (
+            extensions,
+            mut features,
+            host_query_reset,
+            shader_demote,
+            shader_draw_parameters,
+            variable_pointers,
+            limits,
+        ) = suitable_device_inputs();
+        let check = |features: &vk::PhysicalDeviceFeatures, is_molten_vk| {
+            device_is_suitable(
+                vk::API_VERSION_1_3,
+                true,
+                is_molten_vk,
+                &extensions,
+                features,
+                &host_query_reset,
+                &shader_demote,
+                &shader_draw_parameters,
+                &variable_pointers,
+                &limits,
+            )
+        };
+
+        features.geometry_shader = vk::FALSE;
+        features.logic_op = vk::FALSE;
+        features.shader_cull_distance = vk::FALSE;
+        features.wide_lines = vk::FALSE;
+        assert!(!check(&features, false));
+        assert!(check(&features, true));
+
+        features.fill_mode_non_solid = vk::FALSE;
+        assert!(!check(&features, true));
+    }
+
+    #[test]
     fn descriptor_indexing_extension_is_mandatory_before_vulkan_1_2() {
         let (
             mut extensions,
             features,
-            storage_16bit,
-            storage_8bit,
             host_query_reset,
             shader_demote,
             shader_draw_parameters,
@@ -3818,10 +4380,9 @@ mod tests {
         assert!(device_is_suitable(
             vk::API_VERSION_1_1,
             true,
+            false,
             &extensions,
             &features,
-            &storage_16bit,
-            &storage_8bit,
             &host_query_reset,
             &shader_demote,
             &shader_draw_parameters,
@@ -3832,10 +4393,9 @@ mod tests {
         assert!(!device_is_suitable(
             vk::API_VERSION_1_1,
             true,
+            false,
             &extensions,
             &features,
-            &storage_16bit,
-            &storage_8bit,
             &host_query_reset,
             &shader_demote,
             &shader_draw_parameters,
@@ -3948,25 +4508,6 @@ mod tests {
             device_memory_usage_from_budget(&budget, &[0, 2]),
             5 * ONE_GIB
         );
-    }
-
-    #[test]
-    fn driver_name_from_id_matches_upstream_names() {
-        assert_eq!(
-            driver_name_from_id(vk::DriverId::AMD_PROPRIETARY),
-            Some("AMD")
-        );
-        assert_eq!(driver_name_from_id(vk::DriverId::MESA_RADV), Some("RADV"));
-        assert_eq!(
-            driver_name_from_id(vk::DriverId::NVIDIA_PROPRIETARY),
-            Some("NVIDIA")
-        );
-        assert_eq!(
-            driver_name_from_id(vk::DriverId::MOLTENVK),
-            Some("MoltenVK")
-        );
-        assert_eq!(driver_name_from_id(vk::DriverId::MESA_NVK), Some("NVK"));
-        assert_eq!(driver_name_from_id(vk::DriverId::from_raw(-1)), None);
     }
 
     #[test]

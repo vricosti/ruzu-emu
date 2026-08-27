@@ -24,6 +24,8 @@ use crate::texture_cache::accelerated_swizzle::{
 };
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::types::SwizzleParameters;
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
 // ---------------------------------------------------------------------------
 // Constants (from vk_compute_pass.cpp anonymous namespace)
@@ -38,6 +40,13 @@ const DISPATCH_SIZE: u32 = 1024;
 
 /// Port of `DISPATCH_SIZE` used in QueriesPrefixScanPass.
 const QUERIES_DISPATCH_SIZE: usize = 2048;
+
+fn use_setup_size(
+    subgroup_size_control_supported: bool,
+    optional_subgroup_size: Option<u32>,
+) -> bool {
+    subgroup_size_control_supported && optional_subgroup_size.is_some()
+}
 
 #[derive(Clone, Copy)]
 struct DescriptorData(*const DescriptorUpdateEntry);
@@ -203,13 +212,38 @@ const ASTC_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
 /// Owns the shader module, pipeline, pipeline layout, and descriptor
 /// allocation for a single reusable compute pass.
 pub struct ComputePass {
-    device: ash::Device,
+    device: DeviceReference,
     pub descriptor_template: vk::DescriptorUpdateTemplate,
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
-    pub descriptor_allocator: DescriptorAllocator,
+    pub descriptor_allocator: Option<DescriptorAllocator>,
     module: vk::ShaderModule,
+}
+
+unsafe fn destroy_compute_pass_resources(
+    device: &ash::Device,
+    module: vk::ShaderModule,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    descriptor_template: vk::DescriptorUpdateTemplate,
+) {
+    if module != vk::ShaderModule::null() {
+        unsafe { device.destroy_shader_module(module, None) };
+    }
+    if descriptor_set_layout != vk::DescriptorSetLayout::null() {
+        unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+    }
+    if pipeline != vk::Pipeline::null() {
+        unsafe { device.destroy_pipeline(pipeline, None) };
+    }
+    if layout != vk::PipelineLayout::null() {
+        unsafe { device.destroy_pipeline_layout(layout, None) };
+    }
+    if descriptor_template != vk::DescriptorUpdateTemplate::null() {
+        unsafe { device.destroy_descriptor_update_template(descriptor_template, None) };
+    }
 }
 
 impl ComputePass {
@@ -219,30 +253,45 @@ impl ComputePass {
     /// template, shader module, and compute pipeline from the given bindings
     /// and SPIR-V code.
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
+        scheduler: &mut Scheduler,
         descriptor_pool: &DescriptorPool,
         bindings: &[vk::DescriptorSetLayoutBinding],
         templates: &[vk::DescriptorUpdateTemplateEntry],
         bank_info: &DescriptorBankInfo,
         push_constants: &[vk::PushConstantRange],
         code: &[u32],
-        _optional_subgroup_size: Option<u32>,
+        optional_subgroup_size: Option<u32>,
     ) -> Result<Self, vk::Result> {
+        let logical = device.get_logical();
         // Create descriptor set layout
         let layout_ci = vk::DescriptorSetLayoutCreateInfo::builder()
             .bindings(bindings)
             .build();
         let descriptor_set_layout =
-            unsafe { device.create_descriptor_set_layout(&layout_ci, None)? };
-        let descriptor_allocator = descriptor_pool.allocator(descriptor_set_layout, bank_info)?;
-
+            unsafe { logical.create_descriptor_set_layout(&layout_ci, None)? };
         // Create pipeline layout
         let set_layouts = [descriptor_set_layout];
         let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::builder()
             .set_layouts(&set_layouts)
             .push_constant_ranges(push_constants)
             .build();
-        let layout = unsafe { device.create_pipeline_layout(&pipeline_layout_ci, None)? };
+        let layout = match unsafe { logical.create_pipeline_layout(&pipeline_layout_ci, None) } {
+            Ok(layout) => layout,
+            Err(error) => {
+                unsafe {
+                    destroy_compute_pass_resources(
+                        logical,
+                        vk::ShaderModule::null(),
+                        descriptor_set_layout,
+                        vk::Pipeline::null(),
+                        vk::PipelineLayout::null(),
+                        vk::DescriptorUpdateTemplate::null(),
+                    )
+                };
+                return Err(error);
+            }
+        };
 
         // Create descriptor update template
         let descriptor_template = if !templates.is_empty() {
@@ -258,32 +307,109 @@ impl ComputePass {
                 pipeline_layout: layout,
                 set: 0,
             };
-            unsafe { device.create_descriptor_update_template(&template_ci, None)? }
+            match unsafe { logical.create_descriptor_update_template(&template_ci, None) } {
+                Ok(descriptor_template) => descriptor_template,
+                Err(error) => {
+                    unsafe {
+                        destroy_compute_pass_resources(
+                            logical,
+                            vk::ShaderModule::null(),
+                            descriptor_set_layout,
+                            vk::Pipeline::null(),
+                            layout,
+                            vk::DescriptorUpdateTemplate::null(),
+                        )
+                    };
+                    return Err(error);
+                }
+            }
         } else {
             vk::DescriptorUpdateTemplate::null()
+        };
+        let descriptor_allocator = if templates.is_empty() {
+            None
+        } else {
+            match descriptor_pool.allocator(device, scheduler, descriptor_set_layout, bank_info) {
+                Ok(allocator) => Some(allocator),
+                Err(error) => {
+                    unsafe {
+                        destroy_compute_pass_resources(
+                            logical,
+                            vk::ShaderModule::null(),
+                            descriptor_set_layout,
+                            vk::Pipeline::null(),
+                            layout,
+                            descriptor_template,
+                        )
+                    };
+                    return Err(error);
+                }
+            }
         };
 
         // Create shader module and pipeline
         let (module, pipeline) = if !code.is_empty() {
             let module_ci = vk::ShaderModuleCreateInfo::builder().code(code).build();
-            let module = unsafe { device.create_shader_module(&module_ci, None)? };
+            let module = match unsafe { logical.create_shader_module(&module_ci, None) } {
+                Ok(module) => module,
+                Err(error) => {
+                    unsafe {
+                        destroy_compute_pass_resources(
+                            logical,
+                            vk::ShaderModule::null(),
+                            descriptor_set_layout,
+                            vk::Pipeline::null(),
+                            layout,
+                            descriptor_template,
+                        )
+                    };
+                    return Err(error);
+                }
+            };
+            device.save_shader(code);
 
             let main_name = std::ffi::CString::new("main").unwrap();
-            let stage_ci = vk::PipelineShaderStageCreateInfo::builder()
+            let mut subgroup_size_ci =
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::builder()
+                    .required_subgroup_size(optional_subgroup_size.unwrap_or(32))
+                    .build();
+            let mut stage_ci = vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
-                .name(&main_name)
-                .build();
+                .name(&main_name);
+            if use_setup_size(
+                device.is_ext_subgroup_size_control_supported(),
+                optional_subgroup_size,
+            ) {
+                stage_ci = stage_ci.push_next(&mut subgroup_size_ci);
+            }
+            let stage_ci = stage_ci.build();
 
             let pipeline_ci = vk::ComputePipelineCreateInfo::builder()
                 .stage(stage_ci)
                 .layout(layout)
                 .build();
 
-            let pipelines = unsafe {
-                device
-                    .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
-                    .map_err(|e| e.1)?
+            let pipelines = match unsafe {
+                logical.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+            } {
+                Ok(pipelines) => pipelines,
+                Err((pipelines, error)) => {
+                    for pipeline in pipelines {
+                        unsafe { logical.destroy_pipeline(pipeline, None) };
+                    }
+                    unsafe {
+                        destroy_compute_pass_resources(
+                            logical,
+                            module,
+                            descriptor_set_layout,
+                            vk::Pipeline::null(),
+                            layout,
+                            descriptor_template,
+                        )
+                    };
+                    return Err(error);
+                }
             };
 
             (module, pipelines[0])
@@ -292,7 +418,7 @@ impl ComputePass {
         };
 
         Ok(ComputePass {
-            device: device.clone(),
+            device: DeviceReference::new(device),
             descriptor_template,
             layout,
             pipeline,
@@ -305,16 +431,16 @@ impl ComputePass {
 
 impl Drop for ComputePass {
     fn drop(&mut self) {
+        let device = self.device.get().get_logical();
         unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_shader_module(self.module, None);
-            if self.descriptor_template != vk::DescriptorUpdateTemplate::null() {
-                self.device
-                    .destroy_descriptor_update_template(self.descriptor_template, None);
-            }
-            self.device.destroy_pipeline_layout(self.layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            destroy_compute_pass_resources(
+                device,
+                self.module,
+                self.descriptor_set_layout,
+                self.pipeline,
+                self.layout,
+                self.descriptor_template,
+            );
         }
     }
 }
@@ -336,7 +462,7 @@ pub struct Uint8Pass {
 impl Uint8Pass {
     /// Port of `Uint8Pass::Uint8Pass`.
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
         scheduler: &mut Scheduler,
         descriptor_pool: &DescriptorPool,
         staging_buffer_pool: &mut StagingBufferPool,
@@ -346,6 +472,7 @@ impl Uint8Pass {
         let templates = input_output_descriptor_template();
         let base = ComputePass::new(
             device,
+            scheduler,
             descriptor_pool,
             &bindings,
             &templates,
@@ -385,17 +512,20 @@ impl Uint8Pass {
             DescriptorData(queue.update_data())
         };
         let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
-        let descriptor_allocator = self.base.descriptor_allocator.clone();
-        scheduler.request_outside_renderpass();
-        let device = self.base.device.clone();
+        let descriptor_allocator = self
+            .base
+            .descriptor_allocator
+            .as_ref()
+            .expect("Uint8Pass requires descriptor bindings")
+            .reference();
+        scheduler.request_outside_render_pass_operation_context();
+        let device = self.base.device.get().get_logical().clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
         scheduler.record(move |cmdbuf| unsafe {
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("Uint8Pass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
@@ -444,7 +574,7 @@ pub struct QuadIndexedPass {
 impl QuadIndexedPass {
     /// Port of `QuadIndexedPass::QuadIndexedPass`.
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
         scheduler: &mut Scheduler,
         descriptor_pool: &DescriptorPool,
         staging_buffer_pool: &mut StagingBufferPool,
@@ -459,6 +589,7 @@ impl QuadIndexedPass {
         }];
         let base = ComputePass::new(
             device,
+            scheduler,
             descriptor_pool,
             &bindings,
             &templates,
@@ -510,17 +641,20 @@ impl QuadIndexedPass {
         };
         let push_constants: [u32; 3] = [base_vertex, index_shift, if is_strip { 1 } else { 0 }];
         let num_workgroups = (num_tri_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
-        let descriptor_allocator = self.base.descriptor_allocator.clone();
-        scheduler.request_outside_renderpass();
-        let device = self.base.device.clone();
+        let descriptor_allocator = self
+            .base
+            .descriptor_allocator
+            .as_ref()
+            .expect("QuadIndexedPass requires descriptor bindings")
+            .reference();
+        scheduler.request_outside_render_pass_operation_context();
+        let device = self.base.device.get().get_logical().clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
         scheduler.record(move |cmdbuf| unsafe {
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("QuadIndexedPass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
@@ -585,7 +719,7 @@ pub struct ConditionalRenderingResolvePass {
 impl ConditionalRenderingResolvePass {
     /// Port of `ConditionalRenderingResolvePass::ConditionalRenderingResolvePass`.
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
         scheduler: &mut Scheduler,
         descriptor_pool: &DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
@@ -599,6 +733,7 @@ impl ConditionalRenderingResolvePass {
         }];
         let base = ComputePass::new(
             device,
+            scheduler,
             descriptor_pool,
             &bindings,
             &templates,
@@ -624,6 +759,9 @@ impl ConditionalRenderingResolvePass {
         src_offset: u32,
         compare_to_zero: bool,
     ) {
+        if !self.base.device.get().is_ext_conditional_rendering() {
+            return;
+        }
         let compare_size = if compare_to_zero { 8 } else { 24 };
         let scheduler = unsafe { self.scheduler.as_mut() };
         let descriptor_data = unsafe {
@@ -633,11 +771,14 @@ impl ConditionalRenderingResolvePass {
             queue.add_buffer(dst_buffer, 0, std::mem::size_of::<u32>() as u64);
             DescriptorData(queue.update_data())
         };
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
-        let descriptor_allocator = self.base.descriptor_allocator.clone();
-        scheduler.request_outside_renderpass();
-        let device = self.base.device.clone();
+        let descriptor_allocator = self
+            .base
+            .descriptor_allocator
+            .as_ref()
+            .expect("ConditionalRenderingResolvePass requires descriptor bindings")
+            .reference();
+        scheduler.request_outside_render_pass_operation_context();
+        let device = self.base.device.get().get_logical().clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
@@ -646,7 +787,7 @@ impl ConditionalRenderingResolvePass {
         };
         scheduler.record(move |cmdbuf| unsafe {
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("conditional rendering descriptor allocation failed");
             let read_barrier = vk::MemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
@@ -713,18 +854,15 @@ pub struct QueriesPrefixScanPass {
     base: ComputePass,
     scheduler: NonNull<Scheduler>,
     compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
-    conditional_rendering_supported: bool,
 }
 
 impl QueriesPrefixScanPass {
     /// Port of `QueriesPrefixScanPass::QueriesPrefixScanPass`.
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
         scheduler: &mut Scheduler,
         descriptor_pool: &DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
-        subgroup_scan_supported: bool,
-        conditional_rendering_supported: bool,
     ) -> Result<Self, vk::Result> {
         let bindings = queries_scan_bindings();
         let templates = queries_scan_descriptor_template();
@@ -733,6 +871,12 @@ impl QueriesPrefixScanPass {
             offset: 0,
             size: std::mem::size_of::<QueriesPrefixScanPushConstants>() as u32,
         }];
+        let subgroup_scan_supported = device.is_subgroup_feature_supported(
+            vk::SubgroupFeatureFlags::BASIC
+                | vk::SubgroupFeatureFlags::ARITHMETIC
+                | vk::SubgroupFeatureFlags::SHUFFLE
+                | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE,
+        );
         let code = if subgroup_scan_supported {
             QUERIES_PREFIX_SCAN_SUM_COMP_SPV
         } else {
@@ -740,6 +884,7 @@ impl QueriesPrefixScanPass {
         };
         let base = ComputePass::new(
             device,
+            scheduler,
             descriptor_pool,
             &bindings,
             &templates,
@@ -752,7 +897,6 @@ impl QueriesPrefixScanPass {
             base,
             scheduler: NonNull::from(scheduler),
             compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
-            conditional_rendering_supported,
         })
     }
 
@@ -793,18 +937,22 @@ impl QueriesPrefixScanPass {
                 queue.add_buffer(accumulation_buffer, 0, std::mem::size_of::<u64>() as u64);
                 DescriptorData(queue.update_data())
             };
-            let known_gpu_tick = scheduler.known_gpu_tick();
-            let pending_tick = scheduler.pending_tick();
-            let descriptor_allocator = self.base.descriptor_allocator.clone();
-            scheduler.request_outside_renderpass();
-            let device = self.base.device.clone();
+            let descriptor_allocator = self
+                .base
+                .descriptor_allocator
+                .as_ref()
+                .expect("QueriesPrefixScanPass requires descriptor bindings")
+                .reference();
+            scheduler.request_outside_render_pass_operation_context();
+            let conditional_rendering_supported =
+                self.base.device.get().is_ext_conditional_rendering();
+            let device = self.base.device.get().get_logical().clone();
             let descriptor_template = self.base.descriptor_template;
             let pipeline = self.base.pipeline;
             let layout = self.base.layout;
-            let conditional_rendering_supported = self.conditional_rendering_supported;
             scheduler.record(move |cmdbuf| unsafe {
                 let descriptor_set = descriptor_allocator
-                    .commit(known_gpu_tick, pending_tick)
+                    .commit()
                     .expect("query prefix-scan descriptor allocation failed");
                 let read_barrier = vk::MemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -880,15 +1028,23 @@ impl QueriesPrefixScanPass {
 /// GPU-accelerated ASTC texture decoding via compute shader.
 pub struct AstcDecoderPass {
     base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    #[allow(dead_code)]
+    staging_buffer_pool: NonNull<StagingBufferPool>,
     compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
+    #[allow(dead_code)]
+    memory_allocator: NonNull<MemoryAllocator>,
 }
 
 impl AstcDecoderPass {
     /// Port of `ASTCDecoderPass::ASTCDecoderPass`.
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
+        scheduler: &mut Scheduler,
         descriptor_pool: &mut DescriptorPool,
+        staging_buffer_pool: &mut StagingBufferPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        memory_allocator: &mut MemoryAllocator,
     ) -> Result<Self, vk::Result> {
         let bindings: [vk::DescriptorSetLayoutBinding; ASTC_NUM_BINDINGS] = [
             vk::DescriptorSetLayoutBinding {
@@ -937,6 +1093,7 @@ impl AstcDecoderPass {
         }];
         let base = ComputePass::new(
             device,
+            scheduler,
             descriptor_pool,
             &bindings,
             &templates,
@@ -947,15 +1104,16 @@ impl AstcDecoderPass {
         )?;
         Ok(AstcDecoderPass {
             base,
+            scheduler: NonNull::from(scheduler),
+            staging_buffer_pool: NonNull::from(staging_buffer_pool),
             compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+            memory_allocator: NonNull::from(memory_allocator),
         })
     }
 
     /// Port of `ASTCDecoderPass::Assemble`.
     pub fn assemble(
         &mut self,
-        device: &ash::Device,
-        scheduler: &mut Scheduler,
         image: vk::Image,
         aspect_mask: vk::ImageAspectFlags,
         is_initialized: bool,
@@ -966,14 +1124,15 @@ impl AstcDecoderPass {
         swizzles: &[SwizzleParameters],
         storage_views: &[vk::ImageView],
     ) -> bool {
-        let device_handle = device.clone();
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let device_handle = self.base.device.get().get_logical().clone();
         let block_dims = [
             crate::surface::default_block_width(info.format),
             crate::surface::default_block_height(info.format),
         ];
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         let device = device_handle.clone();
         scheduler.record(move |cmdbuf| unsafe {
             let image_barrier = vk::ImageMemoryBarrier::builder()
@@ -1003,7 +1162,9 @@ impl AstcDecoderPass {
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 if is_initialized {
-                    vk::PipelineStageFlags::ALL_COMMANDS
+                    vk::PipelineStageFlags::ALL_GRAPHICS
+                        | vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::TRANSFER
                 } else {
                     vk::PipelineStageFlags::TOP_OF_PIPE
                 },
@@ -1017,75 +1178,25 @@ impl AstcDecoderPass {
         });
 
         for swizzle in swizzles {
-            let Some(&storage_view) = storage_views.get(swizzle.level as usize) else {
-                log::warn!(
-                    "ASTCDecoderPass::assemble: missing storage view for level {}",
-                    swizzle.level
-                );
-                return false;
-            };
-            if storage_view == vk::ImageView::null() {
-                return false;
-            }
+            let storage_view = storage_views[swizzle.level as usize];
+            assert_ne!(storage_view, vk::ImageView::null());
             let input_offset = staging_offset + swizzle.buffer_offset as vk::DeviceSize;
-            let range_size =
-                guest_size_bytes.saturating_sub(swizzle.buffer_offset) as vk::DeviceSize;
+            let range_size = (guest_size_bytes - swizzle.buffer_offset) as vk::DeviceSize;
             let num_dispatches_x = swizzle.num_tiles.width.div_ceil(8);
             let num_dispatches_y = swizzle.num_tiles.height.div_ceil(8);
             let num_dispatches_z = info.resources.layers as u32;
 
             let params = make_block_linear_swizzle_2d_params(swizzle, info);
-            if params.origin != [0, 0, 0]
-                || params.destination != [0, 0, 0]
-                || params.bytes_per_block_log2 != 4
-            {
-                log::warn!(
-                    "ASTCDecoderPass::assemble: unsupported swizzle params origin={:?} destination={:?} bpp_log2={}",
-                    params.origin,
-                    params.destination,
-                    params.bytes_per_block_log2
-                );
-                return false;
-            }
-
-            let descriptor_set = {
-                match self
-                    .base
-                    .descriptor_allocator
-                    .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
-                {
-                    Ok(set) => set,
-                    Err(err) => {
-                        log::warn!(
-                            "ASTCDecoderPass::assemble: failed to allocate descriptor set: {err:?}"
-                        );
-                        return false;
-                    }
-                }
+            assert_eq!(params.origin, [0, 0, 0]);
+            assert_eq!(params.destination, [0, 0, 0]);
+            assert_eq!(params.bytes_per_block_log2, 4);
+            let descriptor_data = unsafe {
+                let queue = self.compute_pass_descriptor_queue.as_mut();
+                queue.acquire(scheduler, 2, false);
+                queue.add_buffer(staging_buffer, input_offset, range_size);
+                queue.add_image(storage_view);
+                DescriptorData(queue.update_data())
             };
-            let descriptor_buffer = vk::DescriptorBufferInfo {
-                buffer: staging_buffer,
-                offset: input_offset,
-                range: range_size.max(1),
-            };
-            let descriptor_image = vk::DescriptorImageInfo {
-                sampler: vk::Sampler::null(),
-                image_view: storage_view,
-                image_layout: vk::ImageLayout::GENERAL,
-            };
-            unsafe {
-                self.compute_pass_descriptor_queue
-                    .as_mut()
-                    .acquire(scheduler, 2, false);
-                self.compute_pass_descriptor_queue.as_mut().add_buffer(
-                    staging_buffer,
-                    input_offset,
-                    range_size.max(1),
-                );
-                self.compute_pass_descriptor_queue
-                    .as_mut()
-                    .add_image(storage_view);
-            }
             let uniforms = AstcPushConstants {
                 blocks_dims: block_dims,
                 layer_stride: params.layer_stride,
@@ -1094,23 +1205,23 @@ impl AstcDecoderPass {
                 block_height: params.block_height,
                 block_height_mask: params.block_height_mask,
             };
+            let descriptor_allocator = self
+                .base
+                .descriptor_allocator
+                .as_ref()
+                .expect("AstcDecoderPass requires descriptor bindings")
+                .reference();
+            let descriptor_template = self.base.descriptor_template;
             let device = device_handle.clone();
             scheduler.record(move |cmdbuf| unsafe {
-                let writes = [
-                    vk::WriteDescriptorSet::builder()
-                        .dst_set(descriptor_set)
-                        .dst_binding(ASTC_BINDING_INPUT_BUFFER)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(std::slice::from_ref(&descriptor_buffer))
-                        .build(),
-                    vk::WriteDescriptorSet::builder()
-                        .dst_set(descriptor_set)
-                        .dst_binding(ASTC_BINDING_OUTPUT_IMAGE)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(std::slice::from_ref(&descriptor_image))
-                        .build(),
-                ];
-                device.update_descriptor_sets(&writes, &[]);
+                let descriptor_set = descriptor_allocator
+                    .commit()
+                    .expect("ASTC decoder descriptor allocation failed");
+                device.update_descriptor_set_with_template(
+                    descriptor_set,
+                    descriptor_template,
+                    descriptor_data.as_raw_data(),
+                );
                 device.cmd_bind_descriptor_sets(
                     cmdbuf,
                     vk::PipelineBindPoint::COMPUTE,
@@ -1151,7 +1262,7 @@ impl AstcDecoderPass {
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -1178,7 +1289,7 @@ pub struct BlockLinearUnswizzle3DPass {
 
 impl BlockLinearUnswizzle3DPass {
     pub fn new(
-        device: &ash::Device,
+        device: &Device,
         scheduler: &mut Scheduler,
         descriptor_pool: &DescriptorPool,
         staging_buffer_pool: &mut StagingBufferPool,
@@ -1210,6 +1321,7 @@ impl BlockLinearUnswizzle3DPass {
         }];
         let base = ComputePass::new(
             device,
+            scheduler,
             descriptor_pool,
             &bindings,
             &templates,
@@ -1242,16 +1354,17 @@ impl BlockLinearUnswizzle3DPass {
         z_count: u32,
     ) -> bool {
         let max_batch_slices = z_count.min(info.size.depth);
-        if max_batch_slices == 0 || swizzles.len() != 1 {
+        if max_batch_slices == 0 {
             return false;
         }
+        assert_eq!(swizzles.len(), 1);
         let swizzle = &swizzles[0];
         let params = make_block_linear_swizzle_3d_params(swizzle, info);
         let blocks_x = info.size.width.div_ceil(4);
         let blocks_y = info.size.height.div_ceil(4);
 
         let scheduler = unsafe { self.scheduler.as_mut() };
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         for z_offset in (0..z_count).step_by(max_batch_slices as usize) {
             let current_chunk_slices = max_batch_slices.min(z_count - z_offset);
             let current_z_start = z_start + z_offset;
@@ -1311,9 +1424,7 @@ impl BlockLinearUnswizzle3DPass {
             _pad_end: 0,
         };
         let input_offset = swizzled_offset + swizzle.buffer_offset as vk::DeviceSize;
-        let input_size = guest_size_bytes
-            .saturating_sub(swizzle.buffer_offset as usize)
-            .max(1) as vk::DeviceSize;
+        let input_size = (guest_size_bytes - swizzle.buffer_offset as usize) as vk::DeviceSize;
         let scheduler = unsafe { self.scheduler.as_mut() };
         let descriptor_data = unsafe {
             let queue = self.compute_pass_descriptor_queue.as_mut();
@@ -1329,10 +1440,13 @@ impl BlockLinearUnswizzle3DPass {
         let barrier_size =
             u64::from(blocks_x) * u64::from(blocks_y) * bytes_per_block * u64::from(z_count);
         let is_first_chunk = z_start == 0;
-        let known_gpu_tick = scheduler.known_gpu_tick();
-        let pending_tick = scheduler.pending_tick();
-        let descriptor_allocator = self.base.descriptor_allocator.clone();
-        let device = self.base.device.clone();
+        let descriptor_allocator = self
+            .base
+            .descriptor_allocator
+            .as_ref()
+            .expect("BlockLinearUnswizzle3DPass requires descriptor bindings")
+            .reference();
+        let device = self.base.device.get().get_logical().clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
@@ -1341,7 +1455,7 @@ impl BlockLinearUnswizzle3DPass {
                 return;
             }
             let descriptor_set = descriptor_allocator
-                .commit(known_gpu_tick, pending_tick)
+                .commit()
                 .expect("BlockLinearUnswizzle3DPass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
@@ -1540,5 +1654,13 @@ mod tests {
             templates[0].stride,
             std::mem::size_of::<DescriptorUpdateEntry>()
         );
+    }
+
+    #[test]
+    fn required_subgroup_size_is_chained_only_when_supported_and_requested() {
+        assert!(!use_setup_size(false, None));
+        assert!(!use_setup_size(true, None));
+        assert!(!use_setup_size(false, Some(32)));
+        assert!(use_setup_size(true, Some(32)));
     }
 }

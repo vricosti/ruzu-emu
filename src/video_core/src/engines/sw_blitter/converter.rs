@@ -1084,6 +1084,18 @@ mod tests {
     }
 
     #[test]
+    fn r16_float_unpack_preserves_fractional_mantissa() {
+        let mut factory = ConverterFactory::new();
+        let converter = factory.get_format_converter(0xF2); // R16_FLOAT
+        let input = 0x3E00u16.to_le_bytes(); // 1.5 in IEEE 754 binary16
+        let mut ir = [0.0f32; 4];
+
+        converter.convert_to(&input, &mut ir);
+
+        assert_eq!(ir[0], 1.5);
+    }
+
+    #[test]
     fn test_r32g32_uint_convert() {
         let mut factory = ConverterFactory::new();
         // R32G32_UINT = 0xCD

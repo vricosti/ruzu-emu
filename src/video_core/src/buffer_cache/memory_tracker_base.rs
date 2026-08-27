@@ -7,12 +7,12 @@
 //! per-region `WordManager` instances. Each higher page covers 4 MiB
 //! and is lazily allocated from a pooled free-list.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::types::VAddr;
 
-use super::word_manager::{DeviceTracker, Type, WordManager, BYTES_PER_WORD};
+use super::word_manager::{BYTES_PER_WORD, DeviceTracker, Type, WordManager};
 
 // ---------------------------------------------------------------------------
 // Constants — match upstream exactly
@@ -39,17 +39,19 @@ const MANAGER_POOL_SIZE: usize = 32;
 /// Number of words each manager needs on the stack.
 const WORDS_STACK_NEEDED: usize = (HIGHER_PAGE_SIZE as usize) / (BYTES_PER_WORD as usize);
 
+/// Matching upstream `using Manager = WordManager<...>` alias.
+type Manager<DT> = WordManager<DT, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
+
 /// Diagnostic: how many out-of-range tracker queries have been logged so far.
 /// Upstream indexes a `std::array<Manager*, NUM_HIGH_PAGES>` with the raw page
 /// index (silent UB if the device address exceeds the 16 GiB device address
-/// space). ruzu's bounds-checked `Vec` would panic instead, so we detect and
-/// log the offending (address, size) once to surface the real bug — a device
+/// space). ruzu's bounds-checked fixed array would panic instead, so we detect
+/// and log the offending (address, size) to surface the real bug — a device
 /// address above `SMMU_VA_LIMIT` (2^34) must never reach the buffer cache.
 static OOR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Returns true if `page_index` is within the tracked address space. When it is
-/// not, logs the offending query (rate-limited) so the bad address source can be
-/// traced. Out-of-range pages are skipped rather than crashing the GPU thread.
+/// Log an out-of-range page query (rate-limited) so the bad address source can
+/// be traced. Out-of-range pages are skipped rather than crashing the GPU thread.
 #[cold]
 #[inline(never)]
 fn report_out_of_range(cpu_address: VAddr, size: u64, page_index: usize) {
@@ -86,12 +88,12 @@ fn report_out_of_range(cpu_address: VAddr, size: u64, page_index: usize) {
 /// Corresponds to the C++ `MemoryTrackerBase<DeviceTracker>` template.
 pub struct MemoryTrackerBase<DT: DeviceTracker> {
     /// Pool storage for word managers.
-    manager_pool: Vec<Vec<WordManager<DT, WORDS_STACK_NEEDED>>>,
+    manager_pool: Vec<Box<[Manager<DT>; MANAGER_POOL_SIZE]>>,
     /// Free-list indices: `(pool_index, slot_index)`.
-    free_managers: Vec<(usize, usize)>,
+    free_managers: VecDeque<(usize, usize)>,
     /// Top-tier mapping from higher-page index to pool location.
     /// `None` means no manager allocated yet.
-    top_tier: Vec<Option<(usize, usize)>>,
+    top_tier: Box<[Option<(usize, usize)>; NUM_HIGH_PAGES]>,
     /// Set of higher-page indices that have pending cached writes.
     cached_pages: HashSet<u32>,
     /// Pointer to the device tracker (rasterizer).
@@ -106,8 +108,11 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     pub fn new(device_tracker: &DT) -> Self {
         Self {
             manager_pool: Vec::new(),
-            free_managers: Vec::new(),
-            top_tier: vec![None; NUM_HIGH_PAGES],
+            free_managers: VecDeque::new(),
+            top_tier: vec![None; NUM_HIGH_PAGES]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("memory tracker top tier has its fixed size")),
             cached_pages: HashSet::new(),
             device_tracker: device_tracker as *const DT,
         }
@@ -159,7 +164,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     /// Mark region as CPU-modified, notifying the device tracker about this change.
     pub fn mark_region_as_cpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            mgr.change_region_state(Type::Cpu, true, mgr.get_cpu_addr() + offset, size);
+            mgr.change_region_state(
+                Type::Cpu,
+                true,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+            );
             IterateResult::Void
         });
     }
@@ -167,7 +177,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     /// Unmark region as CPU-modified, notifying the device tracker.
     pub fn unmark_region_as_cpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            mgr.change_region_state(Type::Cpu, false, mgr.get_cpu_addr() + offset, size);
+            mgr.change_region_state(
+                Type::Cpu,
+                false,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+            );
             IterateResult::Void
         });
     }
@@ -175,7 +190,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     /// Mark region as modified from the host GPU.
     pub fn mark_region_as_gpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            mgr.change_region_state(Type::Gpu, true, mgr.get_cpu_addr() + offset, size);
+            mgr.change_region_state(
+                Type::Gpu,
+                true,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+            );
             IterateResult::Void
         });
     }
@@ -183,7 +203,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     /// Mark region as preflushable.
     pub fn mark_region_as_preflushable(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            mgr.change_region_state(Type::Preflushable, true, mgr.get_cpu_addr() + offset, size);
+            mgr.change_region_state(
+                Type::Preflushable,
+                true,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+            );
             IterateResult::Void
         });
     }
@@ -191,7 +216,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     /// Unmark region as GPU-modified.
     pub fn unmark_region_as_gpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            mgr.change_region_state(Type::Gpu, false, mgr.get_cpu_addr() + offset, size);
+            mgr.change_region_state(
+                Type::Gpu,
+                false,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+            );
             IterateResult::Void
         });
     }
@@ -199,7 +229,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     /// Unmark region as preflushable.
     pub fn unmark_region_as_preflushable(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            mgr.change_region_state(Type::Preflushable, false, mgr.get_cpu_addr() + offset, size);
+            mgr.change_region_state(
+                Type::Preflushable,
+                false,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+            );
             IterateResult::Void
         });
     }
@@ -209,7 +244,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         // We need to collect page indices first because iterate_pages borrows self mutably
         let mut page_indices = Vec::new();
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
-            let cpu_address = mgr.get_cpu_addr() + offset;
+            let cpu_address = mgr.get_cpu_addr().wrapping_add(offset);
             mgr.change_region_state(Type::CachedCpu, true, cpu_address, size);
             page_indices.push((cpu_address >> HIGHER_PAGE_BITS) as u32);
             IterateResult::Void
@@ -247,7 +282,13 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         F: FnMut(VAddr, u64),
     {
         self.iterate_pages::<true, _>(query_cpu_range, query_size, |mgr, offset, size| {
-            mgr.for_each_modified_range(Type::Cpu, true, mgr.get_cpu_addr() + offset, size, func);
+            mgr.for_each_modified_range(
+                Type::Cpu,
+                true,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+                func,
+            );
             IterateResult::Void
         });
     }
@@ -263,7 +304,13 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         F: FnMut(VAddr, u64),
     {
         self.iterate_pages::<false, _>(query_cpu_range, query_size, |mgr, offset, size| {
-            mgr.for_each_modified_range(Type::Gpu, clear, mgr.get_cpu_addr() + offset, size, func);
+            mgr.for_each_modified_range(
+                Type::Gpu,
+                clear,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+                func,
+            );
             IterateResult::Void
         });
     }
@@ -278,7 +325,13 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         F: FnMut(VAddr, u64),
     {
         self.iterate_pages::<false, _>(query_cpu_range, query_size, |mgr, offset, size| {
-            mgr.for_each_modified_range(Type::Gpu, true, mgr.get_cpu_addr() + offset, size, func);
+            mgr.for_each_modified_range(
+                Type::Gpu,
+                true,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+                func,
+            );
             IterateResult::Void
         });
     }
@@ -289,9 +342,9 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Get a mutable reference to the manager at a given pool location.
     fn get_manager_mut(
-        pool: &mut Vec<Vec<WordManager<DT, WORDS_STACK_NEEDED>>>,
+        pool: &mut [Box<[Manager<DT>; MANAGER_POOL_SIZE]>],
         loc: (usize, usize),
-    ) -> &mut WordManager<DT, WORDS_STACK_NEEDED> {
+    ) -> &mut Manager<DT> {
         &mut pool[loc.0][loc.1]
     }
 
@@ -304,7 +357,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         mut func: F,
     ) -> bool
     where
-        F: FnMut(&mut WordManager<DT, WORDS_STACK_NEEDED>, u64, u64) -> IterateResult,
+        F: FnMut(&mut Manager<DT>, u64, u64) -> IterateResult,
     {
         let mut remaining_size = size as usize;
         let mut page_index = (cpu_address >> HIGHER_PAGE_BITS) as usize;
@@ -349,7 +402,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         mut func: F,
     ) -> (u64, u64)
     where
-        F: FnMut(&WordManager<DT, WORDS_STACK_NEEDED>, u64, u64) -> (u64, u64),
+        F: FnMut(&Manager<DT>, u64, u64) -> (u64, u64),
     {
         let mut remaining_size = size as usize;
         let mut page_index = (cpu_address >> HIGHER_PAGE_BITS) as usize;
@@ -366,12 +419,12 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
             }
 
             let mut execute =
-                |mgr: &WordManager<DT, WORDS_STACK_NEEDED>, begin: &mut u64, end: &mut u64| {
+                |mgr: &Manager<DT>, begin: &mut u64, end: &mut u64| {
                     let (new_begin, new_end) = func(mgr, page_offset, copy_amount as u64);
                     if new_begin != 0 || new_end != 0 {
                         let base_address = (page_index as u64) << HIGHER_PAGE_BITS;
-                        *begin = (*begin).min(new_begin + base_address);
-                        *end = (*end).max(new_end + base_address);
+                        *begin = (*begin).min(new_begin.wrapping_add(base_address));
+                        *end = (*end).max(new_end.wrapping_add(base_address));
                     }
                 };
 
@@ -390,11 +443,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
             remaining_size -= copy_amount;
         }
 
-        if begin < end {
-            (begin, end)
-        } else {
-            (0, 0)
-        }
+        if begin < end { (begin, end) } else { (0, 0) }
     }
 
     /// Allocate a manager for the given higher-page index.
@@ -406,7 +455,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Get a manager from the free-list or allocate a new pool batch.
     fn get_new_manager(&mut self, base_cpu_address: VAddr) -> (usize, usize) {
-        if let Some(loc) = self.free_managers.pop() {
+        if let Some(loc) = self.free_managers.pop_front() {
             let mgr = &mut self.manager_pool[loc.0][loc.1];
             mgr.set_cpu_address(base_cpu_address);
             return loc;
@@ -417,19 +466,26 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         let tracker = unsafe { &*self.device_tracker };
         let mut batch = Vec::with_capacity(MANAGER_POOL_SIZE);
         for _ in 0..MANAGER_POOL_SIZE {
-            batch.push(WordManager::new(0, tracker, HIGHER_PAGE_SIZE));
+            batch.push(Manager::new(0, tracker));
         }
+        let batch = batch
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("manager pool batch has its fixed size"));
         self.manager_pool.push(batch);
 
-        // Push all but the first to the free-list
-        for i in (1..MANAGER_POOL_SIZE).rev() {
-            self.free_managers.push((pool_index, i));
+        // Eden appends every manager in slot order and then consumes the FIFO front.
+        for i in 0..MANAGER_POOL_SIZE {
+            self.free_managers.push_back((pool_index, i));
         }
 
-        // Use the first one
-        let mgr = &mut self.manager_pool[pool_index][0];
+        let loc = self
+            .free_managers
+            .pop_front()
+            .expect("new manager pool must populate the free list");
+        let mgr = &mut self.manager_pool[loc.0][loc.1];
         mgr.set_cpu_address(base_cpu_address);
-        (pool_index, 0)
+        loc
     }
 }
 
@@ -461,6 +517,10 @@ mod tests {
         // Initially, CPU-modified should be true for any region
         // (because cpu words are initialized to all-ones)
         assert!(mem_tracker.is_region_cpu_modified(0x1000, 0x1000));
+        assert_eq!(mem_tracker.top_tier.len(), NUM_HIGH_PAGES);
+        assert_eq!(mem_tracker.manager_pool.len(), 1);
+        assert_eq!(mem_tracker.manager_pool[0].len(), MANAGER_POOL_SIZE);
+        assert_eq!(mem_tracker.free_managers.front(), Some(&(0, 1)));
 
         // GPU-modified should be false initially
         assert!(!mem_tracker.is_region_gpu_modified(0x1000, 0x1000));

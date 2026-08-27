@@ -522,9 +522,9 @@ where
                     kept.push(query);
                 }
             }
-            if !kept.is_empty() {
-                self.cached_queries.insert(page, kept);
-            }
+            // `std::erase_if(contents, ...)` leaves Eden's map entry in place
+            // when every cached query on the page was removed.
+            self.cached_queries.insert(page, kept);
         }
     }
 
@@ -535,10 +535,11 @@ where
     {
         let mutex = Arc::clone(&self.mutex);
         let _lock = mutex.lock();
-        let Some(flush_list) = self.committed_flushes.pop_front() else {
+        let Some(flush_list) = self.committed_flushes.front().cloned() else {
             return;
         };
         let Some(flush_list) = flush_list else {
+            self.committed_flushes.pop_front();
             return;
         };
         for async_job_id in flush_list {
@@ -557,6 +558,7 @@ where
                 );
             }
         }
+        self.committed_flushes.pop_front();
     }
 
     /// Port of `QueryCacheLegacy::Register`.
@@ -747,6 +749,7 @@ mod tests {
         size: u64,
         async_job_id: AsyncJobId,
         observed_commands: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+        observed_committed_front: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     impl LegacyCachedQuery<TestCounter> for TestCachedQuery {
@@ -756,6 +759,7 @@ mod tests {
                 size: 8,
                 async_job_id: NULL_ASYNC_JOB_ID,
                 observed_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                observed_committed_front: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -791,7 +795,7 @@ mod tests {
 
         fn flush<F>(
             &mut self,
-            _cache: &mut QueryCacheLegacy<Self, TestCounter>,
+            cache: &mut QueryCacheLegacy<Self, TestCounter>,
             _async: bool,
             any_command_queued: bool,
             _make_counter: &mut F,
@@ -803,6 +807,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(any_command_queued);
+            self.observed_committed_front
+                .lock()
+                .unwrap()
+                .push(cache.committed_flushes.front().is_some());
             0
         }
     }
@@ -904,6 +912,7 @@ mod tests {
     #[test]
     fn async_flush_uses_current_rasterizer_command_state() {
         let observed_commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_committed_front = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let cpu_addr = 0x5510_6000;
         let page = cpu_addr >> 12;
         let mut cache = QueryCacheLegacy::<TestCachedQuery, TestCounter>::new();
@@ -920,6 +929,7 @@ mod tests {
                 size: 8,
                 async_job_id,
                 observed_commands: std::sync::Arc::clone(&observed_commands),
+                observed_committed_front: std::sync::Arc::clone(&observed_committed_front),
             }],
         );
         cache.committed_flushes.push_back(Some(vec![async_job_id]));
@@ -928,5 +938,7 @@ mod tests {
         cache.pop_async_flushes(true, &mut unused_counter);
 
         assert_eq!(*observed_commands.lock().unwrap(), vec![true]);
+        assert_eq!(*observed_committed_front.lock().unwrap(), vec![true]);
+        assert!(cache.committed_flushes.is_empty());
     }
 }

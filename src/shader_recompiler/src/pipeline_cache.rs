@@ -77,7 +77,7 @@ pub struct PipelineCache {
 
 fn translate_cfg_to_program(
     code: &[u64],
-    base_offset: u32,
+    code_base_offset: u32,
     stage: ShaderStage,
     cfg_blocks: &[control_flow::CfgBlock],
     sph: Option<&ProgramHeader>,
@@ -103,7 +103,7 @@ fn translate_cfg_to_program(
         &structured.actions,
         cfg_blocks,
         code,
-        base_offset,
+        code_base_offset,
         sph,
         env,
     );
@@ -187,7 +187,7 @@ fn materialize_structured_actions(
     actions: &[StructuredAction],
     cfg_blocks: &[control_flow::CfgBlock],
     code: &[u64],
-    base_offset: u32,
+    code_base_offset: u32,
     sph: Option<&ProgramHeader>,
     env: Option<&dyn Environment>,
 ) {
@@ -206,7 +206,7 @@ fn materialize_structured_actions(
                     if i >= code.len() {
                         break;
                     }
-                    if is_sched_control_word(i, base_offset) {
+                    if is_sched_control_word(i, code_base_offset) {
                         continue;
                     }
                     tv.translate_instruction(code[i]);
@@ -415,8 +415,8 @@ fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
     })
 }
 
-fn is_sched_control_word(word_index: usize, base_offset: u32) -> bool {
-    base_offset.wrapping_add((word_index as u32).wrapping_mul(8)) % 32 == 0
+fn is_sched_control_word(word_index: usize, code_base_offset: u32) -> bool {
+    (code_base_offset as usize + word_index * std::mem::size_of::<u64>()) % 32 == 0
 }
 
 impl PipelineCache {
@@ -572,33 +572,6 @@ pub fn translate_program_from_env_with_host_info(
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
-    if std::env::var_os("RUZU_TRACE_SHADER_CFG").is_some() {
-        let mut translated_words = 0usize;
-        let mut invalid_words = 0usize;
-        let mut first_invalid = Vec::new();
-        for block in &cfg_blocks {
-            for word_index in block.begin as usize..block.end as usize {
-                if word_index >= code.len() || is_sched_control_word(word_index, base_offset) {
-                    continue;
-                }
-                translated_words += 1;
-                if super::frontend::maxwell_opcodes::decode_opcode(code[word_index]).is_none() {
-                    invalid_words += 1;
-                    if first_invalid.len() < 8 {
-                        first_invalid.push((word_index, code[word_index]));
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "[SHADER_CFG] stage={:?} base=0x{base_offset:X} code_words={} blocks={} translated={} invalid={} first_invalid={first_invalid:?}",
-            env.shader_stage(),
-            code.len(),
-            cfg_blocks.len(),
-            translated_words,
-            invalid_words,
-        );
-    }
     let sph = env.sph().clone();
     let mut program = translate_cfg_to_program(
         code,
@@ -1463,14 +1436,19 @@ mod tests {
     }
 
     #[test]
-    fn sched_control_skip_uses_the_absolute_location() {
-        assert!(!is_sched_control_word(0, 0x50));
-        assert!(!is_sched_control_word(1, 0x50));
-        assert!(is_sched_control_word(2, 0x50));
-        assert!(!is_sched_control_word(3, 0x50));
-        assert!(!is_sched_control_word(4, 0x50));
-        assert!(!is_sched_control_word(5, 0x50));
-        assert!(is_sched_control_word(6, 0x50));
+    fn sched_control_skip_uses_the_absolute_maxwell_grid() {
+        assert!(is_sched_control_word(0, 0));
+        assert!(!is_sched_control_word(1, 0));
+        assert!(!is_sched_control_word(2, 0));
+        assert!(!is_sched_control_word(3, 0));
+        assert!(is_sched_control_word(4, 0));
+
+        // A code slice beginning at absolute offset 0x10 reaches the next
+        // scheduling word at its relative word index 2, not at index 0.
+        assert!(!is_sched_control_word(0, 0x10));
+        assert!(!is_sched_control_word(1, 0x10));
+        assert!(is_sched_control_word(2, 0x10));
+        assert!(is_sched_control_word(6, 0x10));
     }
 
     const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;
@@ -1600,11 +1578,7 @@ mod tests {
         program.blocks.push(Block::new());
         // STL.B32 R2, [RZ + 0x20]. The immediate is within the compute
         // environment allocation, but outside the zero-valued graphics SPH.
-        let stl = 0xEF50_0000_0000_0000u64
-            | (4u64 << 48)
-            | (0x20u64 << 20)
-            | (255u64 << 8)
-            | 2;
+        let stl = 0xEF50_0000_0000_0000u64 | (4u64 << 48) | (0x20u64 << 20) | (255u64 << 8) | 2;
         {
             let mut visitor = TranslatorVisitor::new_with_env(&mut program, 0, &env);
             crate::frontend::translate::load_store_local_shared::stl(&mut visitor, stl);
@@ -1659,7 +1633,7 @@ fn runtime_hash_includes_dual_source_blend_and_xfb_stream() {
         ..Default::default()
     };
     let mut stream_zero = base.clone();
-    stream_zero.xfb_varyings = vec![varying];
+    stream_zero.xfb_varyings[0] = varying;
     stream_zero.xfb_count = 1;
     let mut stream_one = stream_zero.clone();
     stream_one.xfb_varyings[0].stream = 1;

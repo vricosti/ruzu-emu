@@ -6,7 +6,6 @@
 //! AMD FidelityFX Super Resolution (FSR) upscaling pass for OpenGL.
 
 use super::util::{create_bilinear_sampler, replace_include};
-use crate::framebuffer_config::RectF;
 use crate::fsr::{fsr_easu_con_offset, fsr_rcas_con};
 use crate::host_shaders::fragment_shaders::{
     OPENGL_FIDELITYFX_FSR_EASU_FRAG, OPENGL_FIDELITYFX_FSR_FRAG, OPENGL_FIDELITYFX_FSR_RCAS_FRAG,
@@ -18,6 +17,7 @@ use crate::renderer_opengl::gl_resource_manager::{
 };
 use crate::renderer_opengl::gl_shader_manager::ProgramManager;
 use crate::renderer_opengl::gl_shader_util::create_program_from_source;
+use common::math_util::Rectangle;
 
 type FsrConstants = [u32; 4 * 4];
 
@@ -123,7 +123,7 @@ impl FSR {
         input_texture: u32,
         input_image_width: u32,
         input_image_height: u32,
-        crop_rect: RectF,
+        crop_rect: Rectangle<f32>,
     ) -> u32 {
         let input_width = input_image_width as f32;
         let input_height = input_image_height as f32;

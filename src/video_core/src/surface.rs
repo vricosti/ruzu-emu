@@ -6,10 +6,10 @@
 //! Pixel format utilities, surface target helpers, block dimension tables,
 //! and format classification functions.
 //!
-//! The canonical `PixelFormat` enum lives in
-//! `crate::texture_cache::format_lookup_table` (matching upstream's placement
-//! in `surface.h`). This module re-exports it and provides the associated
-//! lookup tables and utility functions.
+//! As in upstream `surface.h`, this module owns the canonical `PixelFormat`
+//! enum together with its indexed property tables and utility functions.
+
+use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 
 // Upstream defines this enum in `video_core/surface.h`; keep it here so the
 // ordering that every `PixelFormat`-indexed table depends on lives with those
@@ -140,7 +140,7 @@ pub enum PixelFormat {
     MaxDepthStencilFormat,
 
     #[default]
-    Invalid,
+    Invalid = 255,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ pub enum PixelFormat {
 ///
 /// Port of `VideoCore::Surface::SurfaceType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum SurfaceType {
     ColorTexture = 0,
     Depth = 1,
@@ -168,7 +168,7 @@ pub enum SurfaceType {
 ///
 /// Port of `VideoCore::Surface::SurfaceTarget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum SurfaceTarget {
     Texture1D,
     TextureBuffer,
@@ -214,8 +214,14 @@ pub const MAX_PIXEL_FORMAT: usize = MAX_DEPTH_STENCIL_FORMAT as usize;
 // Render-target format conversion
 // ---------------------------------------------------------------------------
 
-fn stop_unimplemented_surface_format(kind: &str, format: u32, fallback: PixelFormat) -> ! {
-    panic!("Surface::{kind} unimplemented format=0x{format:X} fallback={fallback:?}");
+fn unimplemented_surface_format(kind: &str, format: u32, fallback: PixelFormat) -> PixelFormat {
+    // Eden's `UNIMPLEMENTED_MSG` is an always-on, fail-soft assertion. It logs
+    // and returns the switch's fallback unless the user enables debug asserts.
+    log::error!("Surface::{kind} unimplemented format=0x{format:X}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("Surface::{kind} unimplemented format=0x{format:X}");
+    }
+    fallback
 }
 
 /// Port of `PixelFormatFromRenderTargetFormat` from `surface.cpp`.
@@ -267,7 +273,7 @@ pub fn pixel_format_from_render_target_format(format: u32) -> PixelFormat {
         0xF4 => PixelFormat::R8Snorm,
         0xF5 => PixelFormat::R8Sint,
         0xF6 => PixelFormat::R8Uint,
-        _ => stop_unimplemented_surface_format(
+        _ => unimplemented_surface_format(
             "PixelFormatFromRenderTargetFormat",
             format,
             PixelFormat::A8B8G8R8Unorm,
@@ -285,7 +291,7 @@ pub fn pixel_format_from_depth_format(format: u32) -> PixelFormat {
         0x17 => PixelFormat::S8Uint,
         0x19 => PixelFormat::D32FloatS8Uint,
         0x15 => PixelFormat::X8D24Unorm,
-        _ => stop_unimplemented_surface_format(
+        _ => unimplemented_surface_format(
             "PixelFormatFromDepthFormat",
             format,
             PixelFormat::S8UintD24Unorm,
@@ -294,14 +300,14 @@ pub fn pixel_format_from_depth_format(format: u32) -> PixelFormat {
 }
 
 /// Port of `PixelFormatFromGPUPixelFormat` from `surface.cpp`.
-pub fn pixel_format_from_gpu_pixel_format(format: u32) -> PixelFormat {
+pub fn pixel_format_from_gpu_pixel_format(format: AndroidPixelFormat) -> PixelFormat {
     match format {
-        1 | 2 => PixelFormat::A8B8G8R8Unorm,
-        4 => PixelFormat::R5G6B5Unorm,
-        5 => PixelFormat::B8G8R8A8Unorm,
-        _ => stop_unimplemented_surface_format(
+        AndroidPixelFormat::Rgba8888 | AndroidPixelFormat::Rgbx8888 => PixelFormat::A8B8G8R8Unorm,
+        AndroidPixelFormat::Rgb565 => PixelFormat::R5G6B5Unorm,
+        AndroidPixelFormat::Bgra8888 => PixelFormat::B8G8R8A8Unorm,
+        _ => unimplemented_surface_format(
             "PixelFormatFromGPUPixelFormat",
-            format,
+            format as u32,
             PixelFormat::A8B8G8R8Unorm,
         ),
     }
@@ -711,6 +717,24 @@ pub fn bytes_per_block(format: PixelFormat) -> u32 {
 // SurfaceTarget helpers
 // ---------------------------------------------------------------------------
 
+/// Port of `SurfaceTargetFromTextureType` from `surface.cpp`.
+pub fn surface_target_from_texture_type(
+    texture_type: crate::textures::texture::TextureType,
+) -> SurfaceTarget {
+    use crate::textures::texture::TextureType;
+
+    match texture_type {
+        TextureType::Texture1D => SurfaceTarget::Texture1D,
+        TextureType::Texture1DBuffer => SurfaceTarget::TextureBuffer,
+        TextureType::Texture2D | TextureType::Texture2DNoMipmap => SurfaceTarget::Texture2D,
+        TextureType::Texture3D => SurfaceTarget::Texture3D,
+        TextureType::TextureCubemap => SurfaceTarget::TextureCubemap,
+        TextureType::TextureCubeArray => SurfaceTarget::TextureCubeArray,
+        TextureType::Texture1DArray => SurfaceTarget::Texture1DArray,
+        TextureType::Texture2DArray => SurfaceTarget::Texture2DArray,
+    }
+}
+
 /// Returns whether a surface target is layered (array or cubemap).
 ///
 /// Port of `SurfaceTargetIsLayered` from `surface.cpp`.
@@ -757,12 +781,57 @@ pub fn get_format_type(pixel_format: PixelFormat) -> SurfaceType {
     if idx < MAX_DEPTH_STENCIL_FORMAT {
         return SurfaceType::DepthStencil;
     }
+
+    // Upstream ASSERT is fail-soft unless debug asserts are enabled.
+    log::error!("surface.cpp: assert false for pixel_format={pixel_format:?}");
+    if *common::settings::values().use_debug_asserts.get_value() {
+        panic!("assertion failed: unsupported pixel format {pixel_format:?}");
+    }
     SurfaceType::Invalid
 }
 
 // ---------------------------------------------------------------------------
 // Format classification functions
 // ---------------------------------------------------------------------------
+
+/// Returns whether the format has an alpha component.
+///
+/// Port of `HasAlpha` from `surface.cpp`.
+pub fn has_alpha(pixel_format: PixelFormat) -> bool {
+    matches!(
+        pixel_format,
+        PixelFormat::A8B8G8R8Unorm
+            | PixelFormat::A8B8G8R8Snorm
+            | PixelFormat::A8B8G8R8Sint
+            | PixelFormat::A8B8G8R8Uint
+            | PixelFormat::A1R5G5B5Unorm
+            | PixelFormat::A2B10G10R10Unorm
+            | PixelFormat::A2B10G10R10Uint
+            | PixelFormat::A2R10G10B10Unorm
+            | PixelFormat::A1B5G5R5Unorm
+            | PixelFormat::A5B5G5R1Unorm
+            | PixelFormat::R16G16B16A16Float
+            | PixelFormat::R16G16B16A16Unorm
+            | PixelFormat::R16G16B16A16Snorm
+            | PixelFormat::R16G16B16A16Sint
+            | PixelFormat::R16G16B16A16Uint
+            | PixelFormat::R32G32B32A32Uint
+            | PixelFormat::Bc1RgbaUnorm
+            | PixelFormat::B8G8R8A8Unorm
+            | PixelFormat::R32G32B32A32Float
+            | PixelFormat::R32G32B32A32Sint
+            | PixelFormat::A8B8G8R8Srgb
+            | PixelFormat::B8G8R8A8Srgb
+            | PixelFormat::Bc1RgbaSrgb
+            | PixelFormat::A4B4G4R4Unorm
+            | PixelFormat::Bc2Srgb
+            | PixelFormat::Bc2Unorm
+            | PixelFormat::Bc3Srgb
+            | PixelFormat::Bc3Unorm
+            | PixelFormat::Bc7Srgb
+            | PixelFormat::Bc7Unorm
+    )
+}
 
 /// Returns true if the format is an ASTC compressed format.
 ///
@@ -959,51 +1028,47 @@ pub fn get_astc_block_size(format: PixelFormat) -> (u32, u32) {
 /// Returns the size of an ASTC texture after transcoding.
 ///
 /// Port of `TranscodedAstcSize` from `surface.cpp`.
-/// Note: the `astc_recompression` setting is not available here;
-/// this returns the uncompressed size (RGBA8 equivalent).
 pub fn transcoded_astc_size(base_size: u64, format: PixelFormat) -> u64 {
     const RGBA8_PIXEL_SIZE: u64 = 4;
     let base_block_size = (default_block_width(format) as u64)
         * (default_block_height(format) as u64)
         * RGBA8_PIXEL_SIZE;
-    let bpb = bytes_per_block(format) as u64;
-    if bpb == 0 {
-        return 0;
+    let uncompressed_size =
+        base_size.wrapping_mul(base_block_size) / bytes_per_block(format) as u64;
+
+    match *common::settings::values().astc_recompression.get_value() {
+        common::settings_enums::AstcRecompression::Bc1 => uncompressed_size / 8,
+        common::settings_enums::AstcRecompression::Bc3 => uncompressed_size / 4,
+        common::settings_enums::AstcRecompression::Uncompressed => uncompressed_size,
     }
-    (base_size * base_block_size) / bpb
-}
-
-// ---------------------------------------------------------------------------
-// IsViewCompatible (referenced by image_view_base)
-// ---------------------------------------------------------------------------
-
-/// Check if a view format is compatible with an image format.
-///
-/// Port of `VideoCore::Surface::IsViewCompatible`.
-pub fn is_view_compatible(
-    image_format: PixelFormat,
-    view_format: PixelFormat,
-    broken_views: bool,
-    native_bgr: bool,
-) -> bool {
-    crate::compatible_formats::is_view_compatible(
-        image_format,
-        view_format,
-        broken_views,
-        native_bgr,
-    )
-}
-
-/// Check if two image formats are compatible for copy operations.
-///
-/// Port of `VideoCore::Surface::IsCopyCompatible`.
-pub fn is_copy_compatible(format_a: PixelFormat, format_b: PixelFormat, native_bgr: bool) -> bool {
-    crate::compatible_formats::is_copy_compatible(format_a, format_b, native_bgr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::settings_enums::AstcRecompression;
+    use std::sync::Mutex;
+
+    static ASTC_RECOMPRESSION_LOCK: Mutex<()> = Mutex::new(());
+
+    struct AstcRecompressionRestore(AstcRecompression);
+
+    impl Drop for AstcRecompressionRestore {
+        fn drop(&mut self) {
+            common::settings::values_mut()
+                .astc_recompression
+                .set_value(self.0);
+        }
+    }
+
+    #[test]
+    fn enum_values_and_layout_match_upstream_surface_h() {
+        assert_eq!(PixelFormat::MaxDepthStencilFormat as u32, 112);
+        assert_eq!(PixelFormat::Invalid as u32, 255);
+        assert_eq!(std::mem::size_of::<PixelFormat>(), 4);
+        assert_eq!(std::mem::size_of::<SurfaceType>(), 4);
+        assert_eq!(std::mem::size_of::<SurfaceTarget>(), 4);
+    }
 
     #[test]
     fn table_sizes() {
@@ -1053,6 +1118,62 @@ mod tests {
             get_format_type(PixelFormat::D24UnormS8Uint),
             SurfaceType::DepthStencil
         );
+        assert_eq!(get_format_type(PixelFormat::Invalid), SurfaceType::Invalid);
+    }
+
+    #[test]
+    fn texture_type_to_surface_target_matches_upstream() {
+        use crate::textures::texture::TextureType;
+
+        let cases = [
+            (TextureType::Texture1D, SurfaceTarget::Texture1D),
+            (TextureType::Texture1DBuffer, SurfaceTarget::TextureBuffer),
+            (TextureType::Texture2D, SurfaceTarget::Texture2D),
+            (TextureType::Texture2DNoMipmap, SurfaceTarget::Texture2D),
+            (TextureType::Texture3D, SurfaceTarget::Texture3D),
+            (TextureType::TextureCubemap, SurfaceTarget::TextureCubemap),
+            (
+                TextureType::TextureCubeArray,
+                SurfaceTarget::TextureCubeArray,
+            ),
+            (TextureType::Texture1DArray, SurfaceTarget::Texture1DArray),
+            (TextureType::Texture2DArray, SurfaceTarget::Texture2DArray),
+        ];
+
+        for (texture_type, expected) in cases {
+            assert_eq!(surface_target_from_texture_type(texture_type), expected);
+        }
+    }
+
+    #[test]
+    fn alpha_classification_matches_upstream() {
+        for format in [
+            PixelFormat::A8B8G8R8Unorm,
+            PixelFormat::A2B10G10R10Uint,
+            PixelFormat::R16G16B16A16Float,
+            PixelFormat::R32G32B32A32Uint,
+            PixelFormat::Bc1RgbaUnorm,
+            PixelFormat::Bc2Unorm,
+            PixelFormat::Bc3Srgb,
+            PixelFormat::Bc7Unorm,
+            PixelFormat::B8G8R8A8Srgb,
+            PixelFormat::A4B4G4R4Unorm,
+        ] {
+            assert!(has_alpha(format), "{format:?}");
+        }
+
+        for format in [
+            PixelFormat::R8Unorm,
+            PixelFormat::R5G6B5Unorm,
+            PixelFormat::Bc4Unorm,
+            PixelFormat::Bc5Snorm,
+            PixelFormat::Astc2d4x4Unorm,
+            PixelFormat::Etc2RgbaUnorm,
+            PixelFormat::D32Float,
+            PixelFormat::Invalid,
+        ] {
+            assert!(!has_alpha(format), "{format:?}");
+        }
     }
 
     #[test]
@@ -1116,46 +1237,6 @@ mod tests {
     }
 
     #[test]
-    fn view_compatible_same_format() {
-        assert!(is_view_compatible(
-            PixelFormat::A8B8G8R8Unorm,
-            PixelFormat::A8B8G8R8Unorm,
-            false,
-            true,
-        ));
-    }
-
-    #[test]
-    fn view_compatible_respects_native_bgr_table() {
-        assert!(!is_view_compatible(
-            PixelFormat::B8G8R8A8Unorm,
-            PixelFormat::A8B8G8R8Unorm,
-            false,
-            false,
-        ));
-        assert!(is_view_compatible(
-            PixelFormat::B8G8R8A8Unorm,
-            PixelFormat::A8B8G8R8Unorm,
-            false,
-            true,
-        ));
-    }
-
-    #[test]
-    fn copy_compatible_uses_compatible_formats_table() {
-        assert!(is_copy_compatible(
-            PixelFormat::Bc2Unorm,
-            PixelFormat::Bc3Unorm,
-            false,
-        ));
-        assert!(is_copy_compatible(
-            PixelFormat::B8G8R8A8Unorm,
-            PixelFormat::A8B8G8R8Unorm,
-            false,
-        ));
-    }
-
-    #[test]
     fn astc_block_size() {
         assert_eq!(get_astc_block_size(PixelFormat::Astc2d4x4Unorm), (4, 4));
         assert_eq!(get_astc_block_size(PixelFormat::Astc2d8x8Unorm), (8, 8));
@@ -1163,12 +1244,28 @@ mod tests {
     }
 
     #[test]
-    fn transcoded_astc_size_basic() {
+    fn transcoded_astc_size_follows_recompression_setting() {
+        let _lock = ASTC_RECOMPRESSION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = *common::settings::values().astc_recompression.get_value();
+        let _restore = AstcRecompressionRestore(previous);
+
         // A 128-bit block covering 4x4 pixels -> 4*4*4 = 64 bytes uncompressed
         // base_size = 16 bytes (one ASTC block), format 4x4 (block=16 bytes)
-        let size = transcoded_astc_size(16, PixelFormat::Astc2d4x4Unorm);
-        // 16 * (4*4*4) / 16 = 64
-        assert_eq!(size, 64);
+        for (recompression, expected) in [
+            (AstcRecompression::Uncompressed, 64),
+            (AstcRecompression::Bc1, 8),
+            (AstcRecompression::Bc3, 16),
+        ] {
+            common::settings::values_mut()
+                .astc_recompression
+                .set_value(recompression);
+            assert_eq!(
+                transcoded_astc_size(16, PixelFormat::Astc2d4x4Unorm),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1263,36 +1360,36 @@ mod tests {
     #[test]
     fn gpu_pixel_format_mapping_matches_upstream_surface_cpp() {
         let cases = [
-            (1, PixelFormat::A8B8G8R8Unorm),
-            (2, PixelFormat::A8B8G8R8Unorm),
-            (4, PixelFormat::R5G6B5Unorm),
-            (5, PixelFormat::B8G8R8A8Unorm),
+            (AndroidPixelFormat::Rgba8888, PixelFormat::A8B8G8R8Unorm),
+            (AndroidPixelFormat::Rgbx8888, PixelFormat::A8B8G8R8Unorm),
+            (AndroidPixelFormat::Rgb565, PixelFormat::R5G6B5Unorm),
+            (AndroidPixelFormat::Bgra8888, PixelFormat::B8G8R8A8Unorm),
         ];
 
         for (format, expected) in cases {
             assert_eq!(
                 pixel_format_from_gpu_pixel_format(format),
                 expected,
-                "GPU pixel format {format}"
+                "GPU pixel format {}",
+                format as u32
             );
         }
     }
 
     #[test]
-    fn unimplemented_surface_format_conversions_stop_like_upstream_unimplemented_msg() {
-        let render_target = std::panic::catch_unwind(|| {
-            pixel_format_from_render_target_format(u32::MAX);
-        });
-        let depth = std::panic::catch_unwind(|| {
-            pixel_format_from_depth_format(u32::MAX);
-        });
-        let gpu = std::panic::catch_unwind(|| {
-            pixel_format_from_gpu_pixel_format(u32::MAX);
-        });
-
-        assert!(render_target.is_err());
-        assert!(depth.is_err());
-        assert!(gpu.is_err());
+    fn unimplemented_surface_format_conversions_are_fail_soft_like_upstream() {
+        assert_eq!(
+            pixel_format_from_render_target_format(u32::MAX),
+            PixelFormat::A8B8G8R8Unorm
+        );
+        assert_eq!(
+            pixel_format_from_depth_format(u32::MAX),
+            PixelFormat::S8UintD24Unorm
+        );
+        assert_eq!(
+            pixel_format_from_gpu_pixel_format(AndroidPixelFormat::NoFormat),
+            PixelFormat::A8B8G8R8Unorm
+        );
     }
     // Ported alongside the ETC2/EAC block. Values come from upstream's
     // `PIXEL_FORMAT_ELEM(name, block_width, block_height, bits_per_block)`

@@ -161,12 +161,15 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
-        self.swizzle_data_buffer.resize(guest_size_bytes, 0);
+        self.swizzle_data_buffer
+            .resize_destructive(guest_size_bytes);
         gpu_memory
             .lock()
             .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
+
         let copies = if flags.contains(ImageFlagBits::CONVERTED) {
-            self.unswizzle_data_buffer.resize(unswizzled_size_bytes, 0);
+            self.unswizzle_data_buffer
+                .resize_destructive(unswizzled_size_bytes);
             let mut copies = unswizzle_image(
                 &(),
                 gpu_addr,
@@ -218,21 +221,25 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::QueueAsyncDecode requires bound channel GPU memory");
-        self.swizzle_data_buffer.resize(guest_size_bytes, 0);
+        self.swizzle_data_buffer
+            .resize_destructive(guest_size_bytes);
         gpu_memory
             .lock()
             .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
         let mut local_unswizzle_data_buffer = vec![0; unswizzled_size_bytes];
-        let mut copies = unswizzle_image(
+        let mut copies: SmallVec<[BufferImageCopy; 16]> = unswizzle_image(
             &(),
             gpu_addr,
             &info,
             &self.swizzle_data_buffer,
             &mut local_unswizzle_data_buffer,
-        );
+        )
+        .into_iter()
+        .collect();
         let out_size = map_size_bytes(&self.slot_images[image_id]) as usize;
-        self.texture_decode_worker.queue_work(move || {
-            let mut decoded_data = vec![0; out_size];
+        self.texture_decode_worker.queue_stateless_work(move || {
+            let mut decoded_data = common::scratch_buffer::ScratchBuffer::<u8>::new();
+            decoded_data.resize_destructive(out_size);
             convert_image(
                 &local_unswizzle_data_buffer,
                 &info,
@@ -430,7 +437,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             } else {
                 &mut channel_state.graphics_image_table
             };
-            if index > table.limit() {
+            if index > table.current_limit {
                 log::debug!("Invalid image view index={}", index);
                 return NULL_IMAGE_VIEW_ID;
             }
@@ -513,10 +520,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     fn insert_typed_image_view(
         &mut self,
+        info: ImageViewInfo,
         base: ImageViewBase,
         image_id: Option<ImageId>,
     ) -> ImageViewId {
-        let view_id = self.slot_image_views.insert(ImageViewSlot::pending(base));
+        let view_id = self
+            .slot_image_views
+            .insert(ImageViewSlot::pending(info, base));
         let base = std::ptr::NonNull::from(self.slot_image_views[view_id].base.as_mut());
         let image = image_id.and_then(|id| {
             self.slot_images[id]
@@ -530,7 +540,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             // constructed and registered.
             unsafe { &*image }
         });
-        let backend = P::create_image_view(runtime, view_id, base, image);
+        let backend = P::create_image_view(runtime, view_id, &info, base, image);
         self.slot_image_views[view_id].backend = Some(backend);
         view_id
     }
@@ -657,24 +667,21 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     }
 
     pub fn set_channel_gpu_memory(&mut self, gpu_memory: Arc<ParkingMutex<MemoryManager>>) {
-        self.update_channel_gpu_memory(Some(gpu_memory));
+        self.channel_gpu_memory = Some(gpu_memory);
         self.rebase_virtual_invalid_images();
     }
 
     pub fn clear_channel_gpu_memory(&mut self) {
-        self.update_channel_gpu_memory(None);
+        self.channel_gpu_memory = None;
     }
 
     fn translated_cpu_addr(&self, gpu_addr: GPUVAddr, size: u64) -> Option<u64> {
-        self.channel_gpu_memory
-            .as_ref()
-            .and_then(|gpu_memory| {
-                let gpu_memory = gpu_memory.lock();
-                gpu_memory
-                    .gpu_to_cpu_address(gpu_addr)
-                    .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, size))
-            })
-            .or_else(|| self.virtual_invalid_ranges.get(&(gpu_addr, size)).copied())
+        self.channel_gpu_memory.as_ref().and_then(|gpu_memory| {
+            let gpu_memory = gpu_memory.lock();
+            gpu_memory
+                .gpu_to_cpu_address(gpu_addr)
+                .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, size))
+        })
     }
 
     pub(crate) fn resolve_or_allocate_cpu_addr(&mut self, gpu_addr: GPUVAddr, size: u64) -> u64 {
@@ -686,13 +693,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         }) {
             return cpu_addr;
         }
-        if let Some(&cpu_addr) = self.virtual_invalid_ranges.get(&(gpu_addr, size)) {
-            return cpu_addr;
-        }
         let fake_addr = !(1u64 << 40) + self.virtual_invalid_space;
         self.virtual_invalid_space += common::alignment::align_up(size, 32);
-        self.virtual_invalid_ranges
-            .insert((gpu_addr, size), fake_addr);
         fake_addr
     }
 
@@ -969,27 +971,23 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         copies: &[BufferImageCopy],
         staging: &[u8],
     ) -> bool {
-        if let Some(gpu_memory) = self.channel_gpu_memory_handle {
-            // SAFETY: `set_channel_gpu_memory` retains the owning Arc and the
-            // renderer/channel graph serializes this callback. This path is
-            // specifically entered from a channel MemoryManager read, so its
-            // mutex can already be held; upstream uses the same stored raw
-            // pointer without attempting a recursive lock.
-            let gpu_memory = unsafe { gpu_memory.as_ref() };
-            super::util::swizzle_image(
-                &|gpu_addr, output| {
-                    let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
-                },
-                &|gpu_addr, data| {
-                    let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
-                },
-                image.gpu_addr,
-                &image.info,
-                copies,
-                staging,
-                &mut self.swizzle_data_buffer,
-            );
-            return true;
+        if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+            if let Some(gpu_memory) = gpu_memory.try_lock() {
+                super::util::swizzle_image(
+                    &|gpu_addr, output| {
+                        let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
+                    },
+                    &|gpu_addr, data| {
+                        let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
+                    },
+                    image.gpu_addr,
+                    &image.info,
+                    copies,
+                    staging,
+                    &mut self.swizzle_data_buffer,
+                );
+                return true;
+            }
         }
 
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
@@ -1033,19 +1031,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             cpu_addr,
             size,
             |image_id, image, slot_map_views| {
-                if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
-                    && image.flags.contains(ImageFlagBits::GPU_MODIFIED)
-                    && !image.flags.contains(ImageFlagBits::CPU_MODIFIED)
-                {
-                    eprintln!(
-                        "[TEXTURE_CPU_WRITE_OVERLAP] write=0x{cpu_addr:X}+0x{size:X} image={:?} cpu=0x{:X}+0x{:X} gpu=0x{:X} flags={:?}",
-                        image_id,
-                        image.cpu_addr,
-                        image.guest_size_bytes,
-                        image.gpu_addr,
-                        image.flags
-                    );
-                }
                 if image.flags.contains(ImageFlagBits::CPU_MODIFIED) {
                     return false;
                 }
@@ -1126,7 +1111,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 let current = area.get_or_insert(RasterizerDownloadArea {
                     start_address: cpu_addr,
                     end_address: cpu_addr.wrapping_add(size as u64),
-                    preemptive: true,
+                    preemtive: true,
                 });
                 current.start_address = current.start_address.min(image.cpu_addr);
                 current.end_address = current.end_address.max(image.cpu_addr_end);
@@ -1135,7 +1120,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                         .flags
                         .insert(ImageViewFlagBits::PREEMTIVE_DOWNLOAD);
                 }
-                current.preemptive &= image.info.forced_flushed;
+                current.preemtive &= image.info.forced_flushed;
                 image.info.forced_flushed = true;
                 false
             },
@@ -1191,9 +1176,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             }
         }
 
-        let view_format = match config.pixel_format.0 {
-            4 => PixelFormat::R5G6B5Unorm,
-            5 => PixelFormat::B8G8R8A8Unorm,
+        let view_format = match config.pixel_format {
+            ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat::Rgb565 => {
+                PixelFormat::R5G6B5Unorm
+            }
+            ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat::Bgra8888 => {
+                PixelFormat::B8G8R8A8Unorm
+            }
             _ => PixelFormat::A8B8G8R8Unorm,
         };
         let mut info = ImageViewInfo::for_render_target(
@@ -1214,7 +1203,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         } else {
             let image = &self.slot_images[image_id];
             let view = ImageViewBase::new(&info, &image.info, image_id, image.gpu_addr);
-            let view_id = self.insert_typed_image_view(view, Some(image_id));
+            let view_id = self.insert_typed_image_view(info, view, Some(image_id));
             self.slot_images[image_id].insert_view(info, view_id);
             view_id
         };
@@ -1374,7 +1363,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
-            return self.insert_typed_image_view(view, None);
+            return self.insert_typed_image_view(view_info, view, None);
         }
         let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
@@ -1416,7 +1405,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
-            return self.insert_typed_image_view(view, None);
+            return self.insert_typed_image_view(view_info, view, None);
         }
         let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
@@ -1466,7 +1455,26 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
     ) -> ImageId {
-        if let Some(id) = self.find_image(info, gpu_addr) {
+        self.find_or_insert_image_with_caps(
+            info,
+            gpu_addr,
+            RelaxedOptions::empty(),
+            self.has_broken_texture_view_formats,
+            self.has_native_bgr,
+        )
+    }
+
+    fn find_or_insert_image_with_caps(
+        &mut self,
+        info: &super::image_info::ImageInfo,
+        gpu_addr: GPUVAddr,
+        options: RelaxedOptions,
+        broken_views: bool,
+        native_bgr: bool,
+    ) -> ImageId {
+        if let Some(id) =
+            self.find_image_with_caps(info, gpu_addr, options, broken_views, native_bgr)
+        {
             return id;
         }
         self.insert_image(info, gpu_addr)
@@ -1496,7 +1504,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// flags supplied by the caller. Upstream `TextureCache<P>::FindImage`
     /// derives these from `runtime.HasBrokenTextureViewFormats()` and
     /// `runtime.HasNativeBgr()` before calling `IsSubresource`.
-    #[cfg(test)]
     pub(crate) fn find_image_with_caps(
         &mut self,
         info: &super::image_info::ImageInfo,
@@ -1553,7 +1560,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     && existing.image_type == info.image_type
                     && existing.pitch() == info.pitch()
                     && super::util::is_pitch_linear_same_size(existing, info, strict_size)
-                    && surface::is_view_compatible(
+                    && crate::compatible_formats::is_view_compatible(
                         existing.format,
                         info.format,
                         broken_views,
@@ -1590,7 +1597,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// info, ...)` upload glue. Resolves the CPU/device address in the same
     /// order as upstream: direct GPU translation, range translation, then a
     /// virtual-invalid fake CPU range.
-    #[cfg(test)]
     pub(crate) fn insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,
@@ -1793,7 +1799,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             } else {
                 &mut channel_state.graphics_sampler_table
             };
-            if index > table.limit() {
+            if index > table.current_limit {
                 log::debug!("Invalid sampler index={}", index);
                 return NULL_SAMPLER_ID;
             }
@@ -2366,6 +2372,17 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         ) {
             return image_id;
         }
+        self.insert_image_from_info_with_options(info, gpu_addr, cpu_addr, options)
+    }
+
+    /// CPU-address-aware counterpart of upstream `TextureCache<P>::InsertImage`.
+    fn insert_image_from_info_with_options(
+        &mut self,
+        info: &ImageInfo,
+        gpu_addr: GPUVAddr,
+        cpu_addr: u64,
+        _options: RelaxedOptions,
+    ) -> ImageId {
         let image_id = self.join_images(info, gpu_addr, cpu_addr);
         // Upstream `InsertImage` registers the new ImageId in image_allocs_table
         // immediately after the synchronous `JoinImages` lifecycle. Delaying
@@ -2453,7 +2470,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         let image_info = self.slot_images[image_id].info.clone();
         let view = ImageViewBase::new(&info, &image_info, image_id, gpu_addr);
-        let view_id = self.insert_typed_image_view(view, Some(image_id));
+        let view_id = self.insert_typed_image_view(info, view, Some(image_id));
         self.slot_images[image_id].insert_view(info, view_id);
         view_id
     }
@@ -2468,16 +2485,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         mut cpu_addr: u64,
     ) -> ImageId {
         let mut new_info = info.clone();
-        let trace_join = std::env::var_os("RUZU_TRACE_TEXTURE_JOIN").is_some()
-            && info.size.width == 512
-            && info.size.height == 512
-            && info.format == crate::texture_cache::format_lookup_table::PixelFormat::D16Unorm;
-        if trace_join {
-            eprintln!(
-                "[TEXTURE_JOIN_BEGIN] gpu=0x{gpu_addr:X} cpu=0x{cpu_addr:X} resources={:?} stride=0x{:X}",
-                info.resources, info.layer_stride
-            );
-        }
         let size_bytes = super::util::calculate_guest_size_in_bytes(&new_info) as usize;
         let broken_views = self.has_broken_texture_view_formats;
         let native_bgr = self.has_native_bgr;
@@ -2534,18 +2541,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     broken_views,
                     native_bgr,
                 ) {
-                    if trace_join {
-                        eprintln!(
-                            "[TEXTURE_JOIN_RESOLVE] input_gpu=0x{gpu_addr:X} input_cpu=0x{cpu_addr:X} overlap_id={} overlap_gpu=0x{:X} overlap_cpu=0x{:X} overlap_resources={:?} result_gpu=0x{:X} result_cpu=0x{:X} result_resources={:?}",
-                            overlap_id.index,
-                            overlap.gpu_addr,
-                            overlap.cpu_addr,
-                            overlap.info.resources,
-                            solution.gpu_addr,
-                            solution.cpu_addr,
-                            solution.resources
-                        );
-                    }
                     gpu_addr = solution.gpu_addr;
                     cpu_addr = solution.cpu_addr;
                     new_info.resources = solution.resources;
@@ -2642,17 +2637,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         let new_image_id =
             self.insert_typed_image(ImageBase::new(new_info.clone(), gpu_addr, cpu_addr));
-        if trace_join {
-            let image = &self.slot_images[new_image_id];
-            eprintln!(
-                "[TEXTURE_JOIN_RESULT] id={} gpu=0x{:X} cpu=0x{:X} end=0x{:X} resources={:?}",
-                new_image_id.index,
-                image.gpu_addr,
-                image.cpu_addr,
-                image.cpu_addr_end,
-                image.info.resources
-            );
-        }
         if new_info.is_sparse {
             let gpu_memory = self
                 .channel_gpu_memory
@@ -2721,7 +2705,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 else {
                     continue;
                 };
-                P::copy_image(self, new_image_id, alias.id, &alias.copies);
+                self.copy_image(new_image_id, alias.id, &alias.copies);
                 self.slot_images[new_image_id].modification_tick =
                     self.slot_images[copy_object.id].modification_tick;
                 continue;
@@ -2889,7 +2873,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         if is_sparse {
             let segments = self.sparse_segments_for_image(image_id, "TextureCache::register_image");
-            let mut sparse_maps = Vec::new();
+            let mut sparse_maps = SmallVec::<[ImageMapId; 16]>::new();
             for (segment_gpu_addr, cpu_addr, segment_size) in segments {
                 let map_id = self.slot_map_views.insert(ImageMapView::new(
                     segment_gpu_addr,
@@ -3045,18 +3029,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         let registered = image.flags.contains(ImageFlagBits::REGISTERED);
         let cpu_addr = image.cpu_addr;
         let guest_size_bytes = image.guest_size_bytes;
-        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some() && guest_size_bytes >= 0x10_0000 {
-            let first = self.device_memory.smmu_cpu_backing_for_address(cpu_addr);
-            let last = self.device_memory.smmu_cpu_backing_for_address(
-                cpu_addr.saturating_add(u64::from(guest_size_bytes.saturating_sub(1))),
-            );
-            eprintln!(
-                "[TEXTURE_TRACK_LARGE] image={:?} cpu=0x{cpu_addr:X}+0x{guest_size_bytes:X} gpu=0x{:X} flags={:?} first={first:?} last={last:?}",
-                image_id,
-                image.gpu_addr,
-                image.flags
-            );
-        }
         if !is_sparse {
             // Upstream guard: skip the "kernel" sentinel range
             // (`cpu_addr >= ~(1ULL << 40)`).
@@ -3107,7 +3079,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Field-split body of upstream `TextureCache<P>::UntrackImage`.
     fn untrack_image_parts(
         device_memory: &crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
-        sparse_views: &HashMap<ImageId, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+        sparse_views: &HashMap<ImageId, SmallVec<[ImageMapId; 16]>, BuildUnorderedDenseHasher>,
         slot_map_views: &common::slot_vector::SlotVector<ImageMapView>,
         image_id: ImageId,
         image: &mut ImageBase,
@@ -3325,15 +3297,359 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     // ── Blit ───────────────────────────────────────────────────────────
 
-    /// Port of `TextureCache<P>::BlitImage`.
+    /// Port of upstream `TextureCache<P>::GetBlitImages`.
     ///
-    /// Resolves source/destination image pairs, handles rescaling, and
-    /// delegates to the backend blit/resolve operations.  Returns false until
-    /// Fermi2D engine types and backend runtime are available.
-    pub fn blit_image(&mut self, _dst: &(), _src: &(), _copy: &()) -> bool {
-        panic!(
-            "TextureCacheBase::blit_image cannot perform upstream Fermi2D image preparation or backend blit without a backend runtime; use the backend texture-cache wrapper"
+    /// Image lookup, insertion, format deduction and retry ordering remain
+    /// owned here, matching `texture_cache.h`. The bound channel memory
+    /// manager supplies translation and `InsertImage` allocates upstream's
+    /// virtual-invalid CPU range when translation fails.
+    pub fn get_blit_images(
+        &mut self,
+        dst: &crate::engines::fermi_2d::Surface,
+        src: &crate::engines::fermi_2d::Surface,
+        copy: &crate::engines::fermi_2d::Config,
+    ) -> Option<BlitImages> {
+        const FIND_OPTIONS: RelaxedOptions = RelaxedOptions::SAMPLES;
+
+        let dst_addr = dst.address();
+        let src_addr = src.address();
+        let mut dst_info = ImageInfo::from_fermi2d_surface(dst);
+        let mut src_info = ImageInfo::from_fermi2d_surface(src);
+        let can_be_depth_blit = dst_info.format == src_info.format
+            && copy.filter == crate::engines::fermi_2d::Filter::Point;
+        let try_options = if can_be_depth_blit {
+            FIND_OPTIONS | RelaxedOptions::FORMAT
+        } else {
+            FIND_OPTIONS
+        };
+
+        let mut src_id;
+        let mut dst_id;
+        loop {
+            self.has_deleted_images = false;
+            src_id = self.find_image_with_caps(
+                &src_info,
+                src_addr,
+                try_options,
+                self.has_broken_texture_view_formats,
+                self.has_native_bgr,
+            );
+            dst_id = self.find_image_with_caps(
+                &dst_info,
+                dst_addr,
+                try_options,
+                self.has_broken_texture_view_formats,
+                self.has_native_bgr,
+            );
+            if !copy.must_accelerate {
+                if src_id.is_none() && dst_id.is_none() {
+                    return None;
+                }
+                let src_gpu_modified = src_id.is_some_and(|id| {
+                    self.slot_images[id]
+                        .flags
+                        .contains(ImageFlagBits::GPU_MODIFIED)
+                });
+                let dst_gpu_modified = dst_id.is_some_and(|id| {
+                    self.slot_images[id]
+                        .flags
+                        .contains(ImageFlagBits::GPU_MODIFIED)
+                });
+                if !src_gpu_modified && !dst_gpu_modified {
+                    return None;
+                }
+            }
+
+            let src_image = src_id.map(|id| &*self.slot_images[id]);
+            if src_image.is_some_and(|image| image.info.num_samples > 1) {
+                let find_options = FIND_OPTIONS | RelaxedOptions::FORCE_BROKEN_VIEWS;
+                src_id = Some(self.find_or_insert_image_with_caps(
+                    &src_info,
+                    src_addr,
+                    find_options,
+                    self.has_broken_texture_view_formats,
+                    self.has_native_bgr,
+                ));
+                dst_id = Some(self.find_or_insert_image_with_caps(
+                    &dst_info,
+                    dst_addr,
+                    find_options,
+                    self.has_broken_texture_view_formats,
+                    self.has_native_bgr,
+                ));
+                if self.has_deleted_images {
+                    continue;
+                }
+                break;
+            }
+
+            if can_be_depth_blit {
+                let src_image = src_id.map(|id| &*self.slot_images[id]);
+                let dst_image = dst_id.map(|id| &*self.slot_images[id]);
+                super::util::deduce_blit_images(&mut dst_info, &mut src_info, dst_image, src_image);
+                if surface::get_format_type(dst_info.format)
+                    != surface::get_format_type(src_info.format)
+                {
+                    continue;
+                }
+            }
+
+            if src_id.is_none() {
+                src_id = Some(self.insert_image(&src_info, src_addr));
+            }
+            if dst_id.is_none() {
+                dst_id = Some(self.insert_image(&dst_info, dst_addr));
+            }
+            if !self.has_deleted_images {
+                break;
+            }
+        }
+
+        let mut src_id = src_id?;
+        let mut dst_id = dst_id?;
+        let src_image = &self.slot_images[src_id];
+        let dst_image = &self.slot_images[dst_id];
+        if surface::get_format_type(dst_info.format)
+            != surface::get_format_type(dst_image.info.format)
+            || surface::get_format_type(src_info.format)
+                != surface::get_format_type(src_image.info.format)
+            || !crate::compatible_formats::is_view_compatible(
+                dst_info.format,
+                dst_image.info.format,
+                false,
+                self.has_native_bgr,
+            )
+            || !crate::compatible_formats::is_view_compatible(
+                src_info.format,
+                src_image.info.format,
+                false,
+                self.has_native_bgr,
+            )
+        {
+            loop {
+                self.has_deleted_images = false;
+                src_id = self.find_or_insert_image_with_caps(
+                    &src_info,
+                    src_addr,
+                    RelaxedOptions::empty(),
+                    self.has_broken_texture_view_formats,
+                    self.has_native_bgr,
+                );
+                dst_id = self.find_or_insert_image_with_caps(
+                    &dst_info,
+                    dst_addr,
+                    RelaxedOptions::empty(),
+                    self.has_broken_texture_view_formats,
+                    self.has_native_bgr,
+                );
+                if !self.has_deleted_images {
+                    break;
+                }
+            }
+        }
+
+        Some(BlitImages {
+            dst_id,
+            src_id,
+            dst_format: dst_info.format,
+            src_format: src_info.format,
+        })
+    }
+
+    /// Port of upstream `TextureCache<P>::BlitImage`.
+    pub fn blit_image(
+        &mut self,
+        dst: &crate::engines::fermi_2d::Surface,
+        src: &crate::engines::fermi_2d::Surface,
+        copy: &crate::engines::fermi_2d::Config,
+    ) -> bool {
+        let Some(images) = self.get_blit_images(dst, src, copy) else {
+            return false;
+        };
+        let dst_id = images.dst_id;
+        let src_id = images.src_id;
+
+        self.prepare_image(src_id, false, false);
+        self.prepare_image(dst_id, true, false);
+
+        let mut is_src_rescaled = self.slot_images[src_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED);
+        let mut is_dst_rescaled = self.slot_images[dst_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED);
+        let is_resolve = self.slot_images[src_id].info.num_samples != 1
+            && self.slot_images[dst_id].info.num_samples == 1;
+        if is_src_rescaled != is_dst_rescaled {
+            if self.image_can_rescale(src_id) {
+                self.scale_up(src_id);
+                is_src_rescaled = self.slot_images[src_id]
+                    .flags
+                    .contains(ImageFlagBits::RESCALED);
+                if is_resolve {
+                    self.slot_images[dst_id].info.rescaleable = true;
+                    let aliases = self.slot_images[dst_id].aliased_images.clone();
+                    for alias in aliases {
+                        self.slot_images[alias.id].info.rescaleable = true;
+                    }
+                }
+            }
+            if self.image_can_rescale(dst_id) {
+                self.scale_up(dst_id);
+                is_dst_rescaled = self.slot_images[dst_id]
+                    .flags
+                    .contains(ImageFlagBits::RESCALED);
+            }
+        }
+        if is_resolve && is_src_rescaled != is_dst_rescaled {
+            self.scale_down(src_id);
+            self.scale_down(dst_id);
+            is_src_rescaled = self.slot_images[src_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED);
+            is_dst_rescaled = self.slot_images[dst_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED);
+        }
+
+        let resolution = common::settings::values().resolution_info.clone();
+        let scale_region = |region: &mut Region2D| {
+            region.start.x = resolution.scale_up_i32(region.start.x);
+            region.start.y = resolution.scale_up_i32(region.start.y);
+            region.end.x = resolution.scale_up_i32(region.end.x);
+            region.end.y = resolution.scale_up_i32(region.end.y);
+        };
+
+        let src_base = self.slot_images[src_id]
+            .try_find_base(src.address())
+            .expect("TextureCache::BlitImage source must belong to its image");
+        let src_view_info = ImageViewInfo::for_render_target(
+            ImageViewType::E2D,
+            images.src_format,
+            SubresourceRange {
+                base: src_base,
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            },
         );
+        let Ok((src_framebuffer_id, src_view_id)) =
+            self.render_target_from_image(src_id, src_view_info, src.address())
+        else {
+            return false;
+        };
+        let (src_samples_x, src_samples_y) =
+            super::samples_helper::samples_log2(self.slot_images[src_id].info.num_samples as i32);
+        let mut src_region = Region2D {
+            start: Offset2D {
+                x: copy.src_x0 >> src_samples_x,
+                y: copy.src_y0 >> src_samples_y,
+            },
+            end: Offset2D {
+                x: copy.src_x1 >> src_samples_x,
+                y: copy.src_y1 >> src_samples_y,
+            },
+        };
+        if is_src_rescaled {
+            scale_region(&mut src_region);
+        }
+
+        let dst_base = self.slot_images[dst_id]
+            .try_find_base(dst.address())
+            .expect("TextureCache::BlitImage destination must belong to its image");
+        let dst_view_info = ImageViewInfo::for_render_target(
+            ImageViewType::E2D,
+            images.dst_format,
+            SubresourceRange {
+                base: dst_base,
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            },
+        );
+        let Ok((dst_framebuffer_id, dst_view_id)) =
+            self.render_target_from_image(dst_id, dst_view_info, dst.address())
+        else {
+            return false;
+        };
+        let (dst_samples_x, dst_samples_y) =
+            super::samples_helper::samples_log2(self.slot_images[dst_id].info.num_samples as i32);
+        let mut dst_region = Region2D {
+            start: Offset2D {
+                x: copy.dst_x0 >> dst_samples_x,
+                y: copy.dst_y0 >> dst_samples_y,
+            },
+            end: Offset2D {
+                x: copy.dst_x1 >> dst_samples_x,
+                y: copy.dst_y1 >> dst_samples_y,
+            },
+        };
+        if is_dst_rescaled {
+            scale_region(&mut dst_region);
+        }
+
+        P::blit_image(
+            self,
+            dst_framebuffer_id,
+            src_framebuffer_id,
+            dst_view_id,
+            src_view_id,
+            dst_region,
+            src_region,
+            copy.filter,
+            copy.operation,
+        );
+        true
+    }
+
+    /// Port of upstream `TextureCache<P>::RenderTargetFromImage`.
+    fn render_target_from_image(
+        &mut self,
+        image_id: ImageId,
+        view_info: ImageViewInfo,
+        gpu_addr: GPUVAddr,
+    ) -> Result<(FramebufferId, ImageViewId), P::FramebufferError> {
+        let view_id = self.find_or_emplace_image_view(image_id, view_info, gpu_addr);
+        let image = &self.slot_images[image_id];
+        let is_rescaled = image.flags.contains(ImageFlagBits::RESCALED);
+        let is_color =
+            surface::get_format_type(image.info.format) == surface::SurfaceType::ColorTexture;
+        let color_view_id = if is_color {
+            view_id
+        } else {
+            ImageViewId::default()
+        };
+        let depth_view_id = if is_color {
+            ImageViewId::default()
+        } else {
+            view_id
+        };
+        let mut extent = super::util::mip_size(image.info.size, view_info.range.base.level as u32);
+        if is_rescaled {
+            let resolution = common::settings::values().resolution_info.clone();
+            extent.width = resolution.scale_up_u32(extent.width);
+            if image.info.image_type == ImageType::E2D {
+                extent.height = resolution.scale_up_u32(extent.height);
+            }
+        }
+        let (samples_x, samples_y) =
+            super::samples_helper::samples_log2(image.info.num_samples as i32);
+        let mut color_buffer_ids = [ImageViewId::default(); NUM_RT];
+        color_buffer_ids[0] = color_view_id;
+        let key = RenderTargets {
+            color_buffer_ids,
+            depth_buffer_id: depth_view_id,
+            size: Extent2D {
+                width: extent.width >> samples_x,
+                height: extent.height >> samples_y,
+            },
+            is_rescaled,
+            ..RenderTargets::default()
+        };
+        let framebuffer_id = self.get_framebuffer_id(&key)?;
+        Ok((framebuffer_id, view_id))
     }
 
     // ── Maxwell DMA image/buffer copies ────────────────────────────────
@@ -3389,7 +3705,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                         && existing.image_type == info.image_type
                         && existing.pitch() == info.pitch()
                         && super::util::is_pitch_linear_same_size(existing, info, strict_size)
-                        && surface::is_view_compatible(existing.format, info.format, false, true)
+                        && crate::compatible_formats::is_view_compatible(
+                            existing.format,
+                            info.format,
+                            false,
+                            true,
+                        )
                 } else {
                     super::util::is_sub_copy(info, existing_image, gpu_addr)
                 };
@@ -3528,7 +3849,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     self.scale_down(alias_id);
                 }
             }
-            P::copy_image(self, image_id, alias_id, &copies);
+            self.copy_image(image_id, alias_id, &copies);
         }
     }
 
@@ -3555,6 +3876,149 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         }
         let lru_index = self.slot_images[image_id].lru_index;
         self.lru_cache.touch(lru_index, self.frame_tick);
+    }
+
+    /// Port of upstream `TextureCache<P>::CopyImage`.
+    fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+        let mut copies = copies.to_vec();
+        let is_rescaled = self.slot_images[src_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED);
+        if is_rescaled {
+            if !self.slot_images[dst_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED)
+            {
+                log::error!(
+                    "TextureCache::CopyImage source is rescaled but destination is not: src={} dst={}",
+                    src_id.index,
+                    dst_id.index,
+                );
+            }
+            let both_2d = self.slot_images[src_id].info.image_type == ImageType::E2D
+                && self.slot_images[dst_id].info.image_type == ImageType::E2D;
+            let resolution = common::settings::values().resolution_info.clone();
+            for copy in &mut copies {
+                copy.src_offset.x = resolution.scale_up_i32(copy.src_offset.x);
+                copy.dst_offset.x = resolution.scale_up_i32(copy.dst_offset.x);
+                copy.extent.width = resolution.scale_up_u32(copy.extent.width);
+                if both_2d {
+                    copy.src_offset.y = resolution.scale_up_i32(copy.src_offset.y);
+                    copy.dst_offset.y = resolution.scale_up_i32(copy.dst_offset.y);
+                    copy.extent.height = resolution.scale_up_u32(copy.extent.height);
+                }
+            }
+        }
+
+        let dst_format_type = surface::get_format_type(self.slot_images[dst_id].info.format);
+        let src_format_type = surface::get_format_type(self.slot_images[src_id].info.format);
+        if src_format_type == dst_format_type {
+            if P::HAS_EMULATED_COPIES && !P::can_image_be_copied(self, dst_id, src_id) {
+                P::emulate_copy_image(self, dst_id, src_id, &copies);
+                return;
+            }
+            P::copy_image(self, dst_id, src_id, &copies);
+            return;
+        }
+
+        let dst_info = self.slot_images[dst_id].info.clone();
+        let src_info = self.slot_images[src_id].info.clone();
+        if dst_info.image_type != ImageType::E2D {
+            log::error!(
+                "TextureCache::CopyImage destination reinterpret type is not 2D: {:?}",
+                dst_info.image_type,
+            );
+        }
+        if src_info.image_type != ImageType::E2D {
+            log::error!(
+                "TextureCache::CopyImage source reinterpret type is not 2D: {:?}",
+                src_info.image_type,
+            );
+        }
+        if P::should_reinterpret(self, dst_id, src_id) {
+            P::reinterpret_image(self, dst_id, src_id, &copies);
+            return;
+        }
+
+        let dst_gpu_addr = self.slot_images[dst_id].gpu_addr;
+        let src_gpu_addr = self.slot_images[src_id].gpu_addr;
+        for copy in &copies {
+            if copy.dst_subresource.num_layers != 1 {
+                log::error!("TextureCache::CopyImage destination layer count is not one");
+            }
+            if copy.src_subresource.num_layers != 1 {
+                log::error!("TextureCache::CopyImage source layer count is not one");
+            }
+            if copy.src_offset != Offset3D::default() {
+                log::error!("TextureCache::CopyImage source offset is not zero");
+            }
+            if copy.dst_offset != Offset3D::default() {
+                log::error!("TextureCache::CopyImage destination offset is not zero");
+            }
+
+            let dst_range = SubresourceRange {
+                base: SubresourceBase {
+                    level: copy.dst_subresource.base_level,
+                    layer: copy.dst_subresource.base_layer,
+                },
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            };
+            let src_range = SubresourceRange {
+                base: SubresourceBase {
+                    level: copy.src_subresource.base_level,
+                    layer: copy.src_subresource.base_layer,
+                },
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            };
+            let mut dst_format = dst_info.format;
+            if src_format_type == surface::SurfaceType::DepthStencil
+                && dst_format_type == surface::SurfaceType::ColorTexture
+                && surface::bytes_per_block(dst_format) == 4
+            {
+                dst_format = PixelFormat::A8B8G8R8Unorm;
+            }
+            let dst_view_info =
+                ImageViewInfo::for_render_target(ImageViewType::E2D, dst_format, dst_range);
+            let src_view_info =
+                ImageViewInfo::for_render_target(ImageViewType::E2D, src_info.format, src_range);
+            let Ok((dst_framebuffer_id, dst_view_id)) =
+                self.render_target_from_image(dst_id, dst_view_info, dst_gpu_addr)
+            else {
+                return;
+            };
+            let src_view_id = self.find_or_emplace_image_view(src_id, src_view_info, src_gpu_addr);
+            let dst_view = &self.slot_image_views[dst_view_id];
+            let src_view = &self.slot_image_views[src_view_id];
+            let expected_size = Extent3D {
+                width: dst_view.size.width.min(src_view.size.width),
+                height: dst_view.size.height.min(src_view.size.height),
+                depth: dst_view.size.depth.min(src_view.size.depth),
+            };
+            let scaled_extent = if is_rescaled {
+                let resolution = common::settings::values().resolution_info.clone();
+                Extent3D {
+                    width: resolution.scale_up_u32(expected_size.width),
+                    height: resolution.scale_up_u32(expected_size.height),
+                    depth: expected_size.depth,
+                }
+            } else {
+                expected_size
+            };
+            if copy.extent != scaled_extent {
+                log::error!(
+                    "TextureCache::CopyImage extent differs from the conversion views: copy={:?} expected={:?}",
+                    copy.extent,
+                    scaled_extent,
+                );
+            }
+            P::convert_image(self, dst_framebuffer_id, dst_view_id, src_view_id);
+        }
     }
 
     // ── Modification marks ─────────────────────────────────────────────
@@ -3658,11 +4122,10 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
-    use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
+    use crate::framebuffer_config::FramebufferConfig;
     use crate::texture_cache::render_targets::RenderTargets;
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry, TscEntry};
-
-    static RESOLUTION_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 
     fn collect_images_in_region_for_test(
         cache: &mut TextureCacheBase,
@@ -3747,6 +4210,113 @@ mod tests {
         cache
     }
 
+    #[test]
+    fn get_blit_images_matches_upstream_lookup_insertion_and_formats() {
+        use crate::engines::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
+        use crate::gpu::RenderTargetFormat;
+
+        let surface = |gpu_addr: u64| Surface {
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::Pitch as u32,
+            block_dimensions: 0,
+            depth: 1,
+            layer: 0,
+            pitch: 16,
+            width: 4,
+            height: 2,
+            addr_upper: (gpu_addr >> 32) as u32,
+            addr_lower: gpu_addr as u32,
+        };
+        let src = surface(0x1_0000);
+        let dst = surface(0x2_0000);
+        let mut copy = Config {
+            operation: Operation::SrcCopy,
+            filter: Filter::Point,
+            must_accelerate: false,
+            dst_x0: 0,
+            dst_y0: 0,
+            dst_x1: 4,
+            dst_y1: 2,
+            src_x0: 0,
+            src_y0: 0,
+            src_x1: 4,
+            src_y1: 2,
+        };
+        let mut cache = test_cache();
+        let gpu_memory = cache
+            .channel_gpu_memory
+            .as_ref()
+            .cloned()
+            .expect("test cache binds channel GPU memory");
+        gpu_memory
+            .lock()
+            .map(0x1_0000, 0x10_0000, 0x1_0000, 0, true);
+        gpu_memory
+            .lock()
+            .map(0x2_0000, 0x20_0000, 0x1_0000, 0, true);
+        cache.set_channel_gpu_memory(gpu_memory);
+        assert!(cache.get_blit_images(&dst, &src, &copy).is_none());
+
+        copy.must_accelerate = true;
+        let images = cache
+            .get_blit_images(&dst, &src, &copy)
+            .expect("accelerated blit inserts both upstream image owners");
+        assert!(images.src_id.is_valid());
+        assert!(images.dst_id.is_valid());
+        assert_ne!(images.src_id, images.dst_id);
+        assert_eq!(images.src_format, PixelFormat::A8B8G8R8Unorm);
+        assert_eq!(images.dst_format, PixelFormat::A8B8G8R8Unorm);
+        assert_eq!(cache.slot_images[images.src_id].gpu_addr, 0x1_0000);
+        assert_eq!(cache.slot_images[images.dst_id].gpu_addr, 0x2_0000);
+    }
+
+    #[test]
+    fn get_blit_images_uses_distinct_virtual_invalid_addresses_for_unmapped_images() {
+        use crate::engines::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
+        use crate::gpu::RenderTargetFormat;
+
+        let surface = |gpu_addr: u64| Surface {
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::Pitch as u32,
+            block_dimensions: 0,
+            depth: 1,
+            layer: 0,
+            pitch: 16,
+            width: 4,
+            height: 2,
+            addr_upper: (gpu_addr >> 32) as u32,
+            addr_lower: gpu_addr as u32,
+        };
+        let src = surface(0x3000);
+        let dst = surface(0x4000);
+        let copy = Config {
+            operation: Operation::SrcCopy,
+            filter: Filter::Point,
+            must_accelerate: true,
+            dst_x0: 0,
+            dst_y0: 0,
+            dst_x1: 4,
+            dst_y1: 2,
+            src_x0: 0,
+            src_y0: 0,
+            src_x1: 4,
+            src_y1: 2,
+        };
+
+        let mut cache = test_cache();
+        let images = cache
+            .get_blit_images(&dst, &src, &copy)
+            .expect("upstream inserts accelerated blit images without a GPU mapping");
+
+        let src_image = &cache.slot_images[images.src_id];
+        let dst_image = &cache.slot_images[images.dst_id];
+        assert_eq!(src_image.gpu_addr, 0x3000);
+        assert_eq!(dst_image.gpu_addr, 0x4000);
+        assert!(src_image.cpu_addr >= !(1u64 << 40));
+        assert!(dst_image.cpu_addr >= !(1u64 << 40));
+        assert_ne!(src_image.cpu_addr, dst_image.cpu_addr);
+    }
+
     struct TestImageViewBackend {
         base: TextureCacheBase<TestImageViewParams>,
     }
@@ -3769,6 +4339,9 @@ mod tests {
         static JOIN_COPY_DISPATCH: std::cell::Cell<(u32, u32)> = const {
             std::cell::Cell::new((0, 0))
         };
+        static JOIN_COPY_COPIES: std::cell::RefCell<Vec<ImageCopy>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
         static FRAMEBUFFER_CONSTRUCTIONS: std::cell::Cell<u32> = const {
             std::cell::Cell::new(0)
         };
@@ -3780,6 +4353,18 @@ mod tests {
         };
         static UPLOAD_BARRIER_CALLS: std::cell::Cell<u32> = const {
             std::cell::Cell::new(0)
+        };
+        static BLIT_DISPATCH: std::cell::RefCell<Option<(
+            FramebufferId,
+            FramebufferId,
+            ImageViewId,
+            ImageViewId,
+            Region2D,
+            Region2D,
+            crate::engines::fermi_2d::Filter,
+            crate::engines::fermi_2d::Operation,
+        )>> = const {
+            std::cell::RefCell::new(None)
         };
     }
 
@@ -3807,6 +4392,7 @@ mod tests {
         fn create_image_view(
             _: Option<&mut ()>,
             _: ImageViewId,
+            _: &ImageViewInfo,
             _: std::ptr::NonNull<ImageViewBase>,
             _: Option<&()>,
         ) {
@@ -3927,11 +4513,17 @@ mod tests {
             UPLOAD_BARRIER_CALLS.with(|calls| calls.set(calls.get().wrapping_add(1)));
         }
 
-        fn copy_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: ImageId, _: &[ImageCopy]) {
+        fn copy_image(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: ImageId,
+            copies: &[ImageCopy],
+        ) {
             JOIN_COPY_DISPATCH.with(|dispatch| {
                 let (copy, msaa) = dispatch.get();
                 dispatch.set((copy + 1, msaa));
             });
+            JOIN_COPY_COPIES.with(|observed| observed.borrow_mut().extend_from_slice(copies));
         }
 
         fn copy_image_msaa(
@@ -3943,6 +4535,31 @@ mod tests {
             JOIN_COPY_DISPATCH.with(|dispatch| {
                 let (copy, msaa) = dispatch.get();
                 dispatch.set((copy, msaa + 1));
+            });
+        }
+
+        fn blit_image(
+            _: &mut TextureCacheBase<Self>,
+            dst_framebuffer_id: FramebufferId,
+            src_framebuffer_id: FramebufferId,
+            dst_view_id: ImageViewId,
+            src_view_id: ImageViewId,
+            dst_region: Region2D,
+            src_region: Region2D,
+            filter: crate::engines::fermi_2d::Filter,
+            operation: crate::engines::fermi_2d::Operation,
+        ) {
+            BLIT_DISPATCH.with(|dispatch| {
+                *dispatch.borrow_mut() = Some((
+                    dst_framebuffer_id,
+                    src_framebuffer_id,
+                    dst_view_id,
+                    src_view_id,
+                    dst_region,
+                    src_region,
+                    filter,
+                    operation,
+                ));
             });
         }
     }
@@ -3988,6 +4605,7 @@ mod tests {
         };
         let view_id = cache.slot_image_views.insert(ImageViewSlot {
             backend: Some(()),
+            info: view_info,
             base: Box::new(ImageViewBase::new(
                 &view_info,
                 &image_info,
@@ -4077,6 +4695,7 @@ mod tests {
         };
         let view_id = cache.slot_image_views.insert(ImageViewSlot {
             backend: Some(()),
+            info: view_info,
             base: Box::new(ImageViewBase::new(
                 &view_info,
                 &image_info,
@@ -4163,10 +4782,20 @@ mod tests {
         }
     }
 
+    fn map_dma_operand(cache: &TextureCacheBase, gpu_addr: u64, cpu_addr: u64) {
+        cache
+            .channel_gpu_memory
+            .as_ref()
+            .expect("test cache binds channel GPU memory")
+            .lock()
+            .map(gpu_addr, cpu_addr, 0x1_0000, 0, true);
+    }
+
     #[test]
     fn dma_image_id_requires_gpu_modified_image() {
         let mut cache = test_cache();
         let operand = dma_operand(0x5000_0000, 64, 64, 4);
+        map_dma_operand(&cache, operand.address, 0x1000_0000);
         let info = ImageInfo::from_dma_operand(&operand);
         let image_id = cache.insert_image(&info, operand.address);
 
@@ -4181,6 +4810,7 @@ mod tests {
     fn dma_image_id_download_first_marks_dma_downloaded_and_returns_null() {
         let mut cache = test_cache();
         let operand = dma_operand(0x5100_0000, 64, 64, 4);
+        map_dma_operand(&cache, operand.address, 0x1100_0000);
         let info = ImageInfo::from_dma_operand(&operand);
         let image_id = cache.insert_image(&info, operand.address);
         cache.mark_modification_by_id(image_id);
@@ -4197,6 +4827,7 @@ mod tests {
         let mut operand = dma_operand(0x5200_0000, 32, 32, 4);
         operand.params.block_size.raw = 1 << 8;
         operand.params.depth = 4;
+        map_dma_operand(&cache, operand.address, 0x1200_0000);
         let info = ImageInfo::from_dma_operand(&operand);
         let image_id = cache.insert_image(&info, operand.address);
         cache.mark_modification_by_id(image_id);
@@ -4574,8 +5205,8 @@ mod tests {
             },
         );
 
-        assert_eq!(cache.channel_state.compute_image_table.limit(), 4);
-        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 2);
+        assert_eq!(cache.channel_state.compute_image_table.current_limit, 4);
+        assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 2);
         assert!(cache.channel_state.image_view_ids.is_empty());
         assert!(cache.channel_state.sampler_ids.is_empty());
     }
@@ -4594,8 +5225,8 @@ mod tests {
             },
         );
 
-        assert_eq!(cache.channel_state.compute_image_table.limit(), 6);
-        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 6);
+        assert_eq!(cache.channel_state.compute_image_table.current_limit, 6);
+        assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 6);
         assert!(cache.channel_state.image_view_ids.is_empty());
         assert!(cache.channel_state.sampler_ids.is_empty());
     }
@@ -4622,12 +5253,12 @@ mod tests {
             .channel_caches
             .channel_state_by_bind_id(10)
             .expect("bound texture-cache channel exists");
-        assert_eq!(bound.graphics_image_table.limit(), 808);
-        assert_eq!(bound.graphics_sampler_table.limit(), 64);
+        assert_eq!(bound.graphics_image_table.current_limit, 808);
+        assert_eq!(bound.graphics_sampler_table.current_limit, 64);
         assert!(bound.image_view_ids.is_empty());
         assert!(bound.sampler_ids.is_empty());
-        assert_eq!(cache.channel_state.graphics_image_table.limit(), 0);
-        assert_eq!(cache.channel_state.graphics_sampler_table.limit(), 0);
+        assert_eq!(cache.channel_state.graphics_image_table.current_limit, 0);
+        assert_eq!(cache.channel_state.graphics_sampler_table.current_limit, 0);
     }
 
     #[test]
@@ -4652,12 +5283,12 @@ mod tests {
             .channel_caches
             .channel_state_by_bind_id(10)
             .expect("bound texture-cache channel exists");
-        assert_eq!(bound.compute_image_table.limit(), 12);
-        assert_eq!(bound.compute_sampler_table.limit(), 12);
+        assert_eq!(bound.compute_image_table.current_limit, 12);
+        assert_eq!(bound.compute_sampler_table.current_limit, 12);
         assert!(bound.image_view_ids.is_empty());
         assert!(bound.sampler_ids.is_empty());
-        assert_eq!(cache.channel_state.compute_image_table.limit(), 0);
-        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 0);
+        assert_eq!(cache.channel_state.compute_image_table.current_limit, 0);
+        assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 0);
     }
 
     #[test]
@@ -4849,7 +5480,9 @@ mod tests {
     fn update_render_targets_from_snapshot_scales_render_target_size_when_rescaling() {
         use common::settings;
 
-        let _settings_guard = RESOLUTION_SETTINGS_LOCK.lock().unwrap();
+        let _settings_guard = crate::test_support::RESOLUTION_SETTINGS_MUTEX
+            .lock()
+            .unwrap();
         let previous_resolution = settings::values().resolution_info.clone();
         {
             let mut values = settings::values_mut();
@@ -4870,7 +5503,9 @@ mod tests {
     fn update_render_targets_size_uses_wrapping_scale_multiply_like_upstream() {
         use common::settings;
 
-        let _settings_guard = RESOLUTION_SETTINGS_LOCK.lock().unwrap();
+        let _settings_guard = crate::test_support::RESOLUTION_SETTINGS_MUTEX
+            .lock()
+            .unwrap();
         let previous_resolution = settings::values().resolution_info.clone();
         {
             let mut values = settings::values_mut();
@@ -5189,7 +5824,7 @@ mod tests {
             width: 64,
             height: 32,
             stride: 64,
-            pixel_format: AndroidPixelFormat(5),
+            pixel_format: AndroidPixelFormat::Bgra8888,
             ..Default::default()
         };
         let view = cache
@@ -5240,7 +5875,7 @@ mod tests {
             width: 64,
             height: 32,
             stride: 64,
-            pixel_format: AndroidPixelFormat(0),
+            pixel_format: AndroidPixelFormat::NoFormat,
             ..Default::default()
         };
         let view = cache
@@ -5316,7 +5951,7 @@ mod tests {
             .expect("GPU-modified image should return a flush area");
         assert_eq!(area.start_address, cache.slot_images[image_id].cpu_addr);
         assert_eq!(area.end_address, cache.slot_images[image_id].cpu_addr_end);
-        assert!(!area.preemptive);
+        assert!(!area.preemtive);
         assert!(cache.slot_images[image_id].info.forced_flushed);
         assert!(cache.slot_image_views[view_id]
             .flags
@@ -5325,7 +5960,7 @@ mod tests {
         let second = cache
             .get_flush_area(0x535B_5010, 0x10)
             .expect("forced-flushed image should still return a flush area");
-        assert!(second.preemptive);
+        assert!(second.preemtive);
 
         cache.slot_images[image_id]
             .flags
@@ -5604,7 +6239,7 @@ mod tests {
             ..existing_info
         };
 
-        assert!(surface::is_view_compatible(
+        assert!(crate::compatible_formats::is_view_compatible(
             existing_info.format,
             view_compatible_info.format,
             false,
@@ -5644,7 +6279,7 @@ mod tests {
     }
 
     #[test]
-    fn find_or_insert_reuses_stable_virtual_invalid_range_for_unmapped_gpu_address() {
+    fn find_or_insert_allocates_a_new_virtual_invalid_range_after_each_lookup_miss() {
         let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
@@ -5660,9 +6295,14 @@ mod tests {
         let second_id = cache.find_or_insert_image(&info, 0x4000);
         let other_id = cache.find_or_insert_image(&info, 0x8000);
 
-        assert_eq!(first_id, second_id);
+        assert_ne!(first_id, second_id);
         assert_ne!(first_id, other_id);
-        assert_eq!(cache.slot_images.size(), 3);
+        assert_ne!(second_id, other_id);
+        assert_eq!(cache.slot_images.size(), 4);
+        assert_ne!(
+            cache.slot_images[first_id].cpu_addr,
+            cache.slot_images[second_id].cpu_addr
+        );
     }
 
     #[test]
@@ -5683,7 +6323,6 @@ mod tests {
 
         let slot_count = cache.slot_images.size();
         let virtual_invalid_space = cache.virtual_invalid_space;
-        let virtual_invalid_ranges = cache.virtual_invalid_ranges.len();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             cache.insert_image(&info, 0x8000);
@@ -5692,7 +6331,6 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(cache.slot_images.size(), slot_count);
         assert_eq!(cache.virtual_invalid_space, virtual_invalid_space);
-        assert_eq!(cache.virtual_invalid_ranges.len(), virtual_invalid_ranges);
     }
 
     #[test]
@@ -5921,10 +6559,10 @@ mod tests {
     }
 
     #[test]
-    fn write_downloaded_image_uses_gpu_virtual_mapping_when_owner_is_already_borrowed() {
+    fn write_downloaded_image_uses_guest_writer_when_channel_memory_is_locked() {
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
 
         let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
@@ -5934,13 +6572,15 @@ mod tests {
             16,
             12,
         )));
-        {
-            let mut memory = gpu_memory.lock();
-            memory.map(0x4000, 0x8000, 0x1000, 0, false);
-        }
         cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
-        cache.set_guest_memory_writer(Arc::new(|_, _| {
-            panic!("download writeback must retain the GPU virtual mapping")
+
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_for_callback = Arc::clone(&writes);
+        cache.set_guest_memory_writer(Arc::new(move |addr, data| {
+            writes_for_callback
+                .lock()
+                .unwrap()
+                .push((addr, data.to_vec()));
         }));
 
         let _held_channel_lock = gpu_memory.lock();
@@ -5973,6 +6613,9 @@ mod tests {
         };
 
         assert!(cache.write_downloaded_image(&image, &[copy], &[1, 2, 3, 4]));
+        let writes = writes.lock().unwrap();
+        assert!(!writes.is_empty());
+        assert_eq!(writes[0].0, 0x8000);
     }
 
     #[test]
@@ -6758,10 +7401,172 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot perform upstream Fermi2D image preparation")]
-    fn common_blit_image_rejects_backendless_path() {
-        let mut cache = test_cache();
-        let _ = cache.blit_image(&(), &(), &());
+    fn copy_image_owns_upstream_same_type_and_rescaling_policy() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let _settings_guard = crate::test_support::RESOLUTION_SETTINGS_MUTEX
+            .lock()
+            .unwrap();
+        let previous_resolution = common::settings::values().resolution_info.clone();
+        struct ResolutionRestore(common::settings::ResolutionScalingInfo);
+        impl Drop for ResolutionRestore {
+            fn drop(&mut self) {
+                common::settings::values_mut().resolution_info = self.0.clone();
+            }
+        }
+        let _restore = ResolutionRestore(previous_resolution);
+        {
+            let mut values = common::settings::values_mut();
+            values.resolution_info.up_scale = 3;
+            values.resolution_info.down_shift = 1;
+            values.resolution_info.active = true;
+        }
+
+        JOIN_COPY_DISPATCH.with(|dispatch| dispatch.set((0, 0)));
+        JOIN_COPY_COPIES.with(|copies| copies.borrow_mut().clear());
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let image_info = |format| ImageInfo {
+            format,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 64,
+                height: 32,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let dst_id = cache.insert_typed_image(ImageBase::new(
+            image_info(PixelFormat::A8B8G8R8Unorm),
+            0x1000,
+            0x2000,
+        ));
+        let src_id = cache.insert_typed_image(ImageBase::new(
+            image_info(PixelFormat::R8Unorm),
+            0x3000,
+            0x4000,
+        ));
+        cache.slot_images[dst_id]
+            .flags
+            .insert(ImageFlagBits::RESCALED);
+        cache.slot_images[src_id]
+            .flags
+            .insert(ImageFlagBits::RESCALED);
+        let copy = ImageCopy {
+            src_offset: Offset3D { x: 2, y: 4, z: 1 },
+            dst_offset: Offset3D { x: 6, y: 8, z: 1 },
+            extent: Extent3D {
+                width: 10,
+                height: 12,
+                depth: 2,
+            },
+            ..ImageCopy::default()
+        };
+
+        cache.copy_image(dst_id, src_id, &[copy]);
+
+        assert_eq!(
+            surface::get_format_type(cache.slot_images[dst_id].info.format),
+            surface::get_format_type(cache.slot_images[src_id].info.format)
+        );
+        assert_ne!(
+            surface::bytes_per_block(cache.slot_images[dst_id].info.format),
+            surface::bytes_per_block(cache.slot_images[src_id].info.format)
+        );
+        JOIN_COPY_DISPATCH.with(|dispatch| assert_eq!(dispatch.get(), (1, 0)));
+        JOIN_COPY_COPIES.with(|copies| {
+            let copies = copies.borrow();
+            assert_eq!(copies.len(), 1);
+            let observed = copies[0];
+            assert_eq!(observed.src_offset, Offset3D { x: 3, y: 6, z: 1 });
+            assert_eq!(observed.dst_offset, Offset3D { x: 9, y: 12, z: 1 });
+            assert_eq!(
+                observed.extent,
+                Extent3D {
+                    width: 15,
+                    height: 18,
+                    depth: 2,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn common_blit_image_owns_upstream_view_framebuffer_and_region_flow() {
+        use crate::engines::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
+        use crate::gpu::RenderTargetFormat;
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+
+        BLIT_DISPATCH.with(|dispatch| *dispatch.borrow_mut() = None);
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(MemoryManager::new(17))));
+        let surface = |gpu_addr: u64| Surface {
+            format: RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::Pitch as u32,
+            block_dimensions: 0,
+            depth: 1,
+            layer: 0,
+            pitch: 32,
+            width: 8,
+            height: 8,
+            addr_upper: (gpu_addr >> 32) as u32,
+            addr_lower: gpu_addr as u32,
+        };
+        let src = surface(0x5000);
+        let dst = surface(0x6000);
+        let copy = Config {
+            operation: Operation::SrcCopy,
+            filter: Filter::Point,
+            must_accelerate: true,
+            dst_x0: 1,
+            dst_y0: 2,
+            dst_x1: 7,
+            dst_y1: 6,
+            src_x0: 2,
+            src_y0: 3,
+            src_x1: 8,
+            src_y1: 7,
+        };
+
+        assert!(cache.blit_image(&dst, &src, &copy));
+        BLIT_DISPATCH.with(|dispatch| {
+            let (
+                dst_framebuffer_id,
+                src_framebuffer_id,
+                dst_view_id,
+                src_view_id,
+                dst_region,
+                src_region,
+                filter,
+                operation,
+            ) = dispatch
+                .borrow()
+                .expect("common BlitImage must dispatch exactly once to its backend policy");
+            assert!(dst_framebuffer_id.is_valid());
+            assert!(src_framebuffer_id.is_valid());
+            assert!(dst_view_id.is_valid());
+            assert!(src_view_id.is_valid());
+            assert_eq!(
+                dst_region,
+                Region2D {
+                    start: Offset2D { x: 1, y: 2 },
+                    end: Offset2D { x: 7, y: 6 },
+                }
+            );
+            assert_eq!(
+                src_region,
+                Region2D {
+                    start: Offset2D { x: 2, y: 3 },
+                    end: Offset2D { x: 8, y: 7 },
+                }
+            );
+            assert_eq!(filter, Filter::Point);
+            assert_eq!(operation, Operation::SrcCopy);
+        });
     }
 
     #[test]
@@ -7525,7 +8330,9 @@ mod tests {
         let mut view =
             ImageViewBase::null(crate::texture_cache::image_view_base::NullImageViewParams);
         view.image_id = image_id;
-        cache.slot_image_views.insert(view.into())
+        cache
+            .slot_image_views
+            .insert(ImageViewSlot::pending(ImageViewInfo::default(), view))
     }
 
     #[test]

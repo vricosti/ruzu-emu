@@ -82,7 +82,7 @@ impl GpuMemoryManagerHandle {
 }
 
 impl GuestMemoryInterface for GpuMemoryManagerHandle {
-    const HAS_FLUSH_INVALIDATION: bool = true;
+    const HAS_FLUSH_INVALIDATION: bool = MemoryManager::HAS_FLUSH_INVALIDATION;
 
     fn get_span(&self, addr: u64, size: usize) -> Option<*mut u8> {
         let ptr = self.memory_manager.lock().get_span(addr, size);

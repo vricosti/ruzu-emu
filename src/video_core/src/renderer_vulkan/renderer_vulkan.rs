@@ -16,7 +16,7 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::present::{PRESENT_FILTERS_FOR_APPLET_CAPTURE, PRESENT_FILTERS_FOR_DISPLAY};
 use crate::rasterizer_interface::RasterizerInterface;
-use crate::renderer_base::{RendererBase, RendererBaseData};
+use crate::renderer_base::{update_current_framebuffer_layout, RendererBase, RendererBaseData};
 use crate::textures::decoders;
 use crate::vulkan_common::vulkan_debug_callback::{
     create_debug_utils_callback, DebugUtilsMessenger,
@@ -24,12 +24,14 @@ use crate::vulkan_common::vulkan_debug_callback::{
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_instance;
 use crate::vulkan_common::vulkan_library;
-use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
+};
 use crate::vulkan_common::vulkan_surface;
 use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
 
-use super::blit_screen::{BlitFrame, BlitScreen};
+use super::blit_screen::BlitScreen;
 use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
@@ -209,6 +211,7 @@ impl OwnedSurface {
         self.handle
     }
 
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(super) fn replace(&mut self, handle: vk::SurfaceKHR) {
         if self.handle != vk::SurfaceKHR::null() {
             unsafe {
@@ -245,7 +248,6 @@ impl RendererVulkan {
     pub fn new(
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
         window_info: &ruzu_core::frontend::emu_window::WindowSystemInfo,
-        drawable_size: (u32, u32),
         window_shown: Arc<AtomicBool>,
         framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
         frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
@@ -253,6 +255,11 @@ impl RendererVulkan {
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
     ) -> Result<Self, VulkanError> {
+        // Eden constructs RendererBase first, which refreshes the frontend
+        // framebuffer layout before any Vulkan owner is initialized.
+        update_current_framebuffer_layout(&framebuffer_layout);
+        let initial_layout = framebuffer_layout.read().unwrap().clone();
+
         let entry = vulkan_library::open_library()?;
         let window_type = map_window_type(window_info.type_)?;
         let instance = vulkan_instance::create_instance(
@@ -285,13 +292,6 @@ impl RendererVulkan {
         )));
 
         let device = Box::new(create_device(&instance, surface.lock().unwrap().handle())?);
-        let physical_device = device.get_physical();
-        let memory_properties = unsafe {
-            instance
-                .instance
-                .get_physical_device_memory_properties(physical_device)
-        };
-
         // `RasterizerVulkan` and its `PipelineCache` retain the upstream
         // `const Device&`. Box the owner before constructing either borrower
         // so its address remains stable when `RendererVulkan` is returned.
@@ -332,10 +332,9 @@ impl RendererVulkan {
             surface_handle,
             &device,
             submit_mutex.clone(),
-            drawable_size.0.max(1),
-            drawable_size.1.max(1),
+            initial_layout.width,
+            initial_layout.height,
         )?;
-        let frame_image_format = swapchain.get_image_format();
         let swapchain_image_count = swapchain.get_image_count();
         let swapchain = std::sync::Arc::new(std::sync::Mutex::new(swapchain));
         // Upstream gates the present thread on `Settings::values.async_presentation`.
@@ -346,8 +345,7 @@ impl RendererVulkan {
             surface_info,
             Arc::clone(&surface),
             device.as_ref(),
-            memory_properties,
-            frame_image_format,
+            memory_allocator.as_mut(),
             device.get_graphics_family(),
             swapchain_image_count,
             use_present_thread,
@@ -355,14 +353,9 @@ impl RendererVulkan {
             std::sync::Arc::clone(&swapchain),
             device.get_graphics_queue(),
         );
-        let blit_swapchain =
-            BlitScreen::new(device.get_logical().clone(), &PRESENT_FILTERS_FOR_DISPLAY);
-        let blit_capture =
-            BlitScreen::new(device.get_logical().clone(), &PRESENT_FILTERS_FOR_DISPLAY);
-        let blit_applet = BlitScreen::new(
-            device.get_logical().clone(),
-            &PRESENT_FILTERS_FOR_APPLET_CAPTURE,
-        );
+        let blit_swapchain = BlitScreen::new(&PRESENT_FILTERS_FOR_DISPLAY);
+        let blit_capture = BlitScreen::new(&PRESENT_FILTERS_FOR_DISPLAY);
+        let blit_applet = BlitScreen::new(&PRESENT_FILTERS_FOR_APPLET_CAPTURE);
         let rasterizer = super::RasterizerVulkan::new(
             shader_notify,
             device.as_ref(),
@@ -370,8 +363,6 @@ impl RendererVulkan {
             device.get_physical(),
             device.get_driver_id(),
             device.cant_blit_msaa(),
-            crate::capture::LINEAR_WIDTH,
-            crate::capture::LINEAR_HEIGHT,
             device.is_depth_bounds_supported(),
             device.is_ext_depth_range_unrestricted_supported(),
             device.is_nv_viewport_swizzle_supported(),
@@ -380,13 +371,6 @@ impl RendererVulkan {
             device.is_ext_extended_dynamic_state_supported(),
             device.is_ext_transform_feedback_supported(),
             device.is_host_query_reset_supported(),
-            device.is_subgroup_feature_supported(
-                vk::SubgroupFeatureFlags::BASIC
-                    | vk::SubgroupFeatureFlags::ARITHMETIC
-                    | vk::SubgroupFeatureFlags::SHUFFLE
-                    | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE,
-            ),
-            device.is_ext_conditional_rendering(),
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_ext_extended_dynamic_state2_extras_supported(),
             device.is_ext_extended_dynamic_state3_blending_supported(),
@@ -407,10 +391,8 @@ impl RendererVulkan {
             device.is_ext_vertex_input_dynamic_state_supported(),
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
-            device.must_emulate_scaled_formats(),
             device.must_emulate_bgr565(),
             device.is_ext_4444_formats_supported(),
-            device.is_ext_shader_stencil_export_supported(),
             device.is_khr_image_format_list_supported(),
             device.is_optimal_astc_supported(),
             device.is_ext_custom_border_color_supported(),
@@ -437,8 +419,7 @@ impl RendererVulkan {
             .get_value()
             && device.should_boost_clocks()
         {
-            let turbo_mode =
-                TurboMode::new(&instance.entry, &instance.instance, device.get_physical())?;
+            let turbo_mode = TurboMode::new(&instance)?;
             scheduler.register_on_submit(Some(turbo_mode.submit_callback()));
             Some(turbo_mode)
         } else {
@@ -494,10 +475,13 @@ impl RendererVulkan {
         if !should_present_window(&self.window_shown) {
             return;
         }
-        let layout = self.current_framebuffer_layout_for_present();
         self.render_screenshot(framebuffers);
 
         let frame_index = self.present_manager.get_render_frame_index();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
+
+        let layout = self.current_framebuffer_layout_for_present();
         // Upstream reads these swapchain getters without a lock
         // (renderer_vulkan.cpp:163). Locking `swapchain_mutex` here stalled
         // the GPU thread behind the present thread, which holds that mutex
@@ -506,7 +490,6 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
-        self.scheduler.request_outside_renderpass();
         self.blit_swapchain.draw_to_present_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -534,15 +517,15 @@ impl RendererVulkan {
     /// Downloads the applet capture image from GPU to CPU and returns the
     /// pixel data as a byte vector.
     pub fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
-        let mut out = vec![0; crate::capture::tiled_size() as usize];
+        let mut out = vec![0; crate::capture::TILED_SIZE as usize];
 
         if self.applet_frame.image == vk::Image::null() {
             return out;
         }
 
-        let dst_buffer =
-            self.create_download_buffer(crate::capture::tiled_size() as vk::DeviceSize);
-        self.scheduler.request_outside_renderpass();
+        let dst_buffer = self.create_download_buffer(crate::capture::TILED_SIZE as vk::DeviceSize);
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();
         let image = self.applet_frame.image;
         let buffer = dst_buffer.buffer();
@@ -608,29 +591,25 @@ impl RendererVulkan {
         layout: &FramebufferLayout,
         format: vk::Format,
         buffer_size: vk::DeviceSize,
-    ) -> MappedBuffer {
+    ) -> AllocatedBuffer {
         let mut frame = Frame::default();
-        frame.width = layout.width;
-        frame.height = layout.height;
-        frame.image = create_wrapped_image(
-            self.device.get_logical(),
-            &self.memory_allocator,
+        let image = create_wrapped_image(
+            self.memory_allocator.as_ref(),
             vk::Extent2D {
                 width: layout.width,
                 height: layout.height,
             },
             format,
         );
-        frame.image_view =
-            create_wrapped_image_view(self.device.get_logical(), frame.image, format);
+        frame.set_image_allocation(image);
+        frame.image_view = create_wrapped_image_view(&self.device, frame.image, format);
         frame.framebuffer = self.blit_capture.create_framebuffer(
             self.device.as_ref(),
             &mut self.scheduler,
             &self.present_manager,
+            layout,
             frame.image_view,
             format,
-            layout.width,
-            layout.height,
         );
 
         let dst_buffer = self.create_download_buffer(buffer_size);
@@ -641,14 +620,15 @@ impl RendererVulkan {
             &self.present_manager,
             &self.memory_allocator,
             &self.device_memory,
-            BlitFrame::from(&frame),
+            &mut frame,
             framebuffers,
             layout,
             1,
             format,
         );
 
-        self.scheduler.request_outside_renderpass();
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         let device = self.device.get_logical().clone();
         let image = frame.image;
         let buffer = dst_buffer.buffer();
@@ -668,11 +648,13 @@ impl RendererVulkan {
                 self.device
                     .get_logical()
                     .destroy_framebuffer(frame.framebuffer, None);
+                frame.framebuffer = vk::Framebuffer::null();
             }
             if frame.image_view != vk::ImageView::null() {
                 self.device
                     .get_logical()
                     .destroy_image_view(frame.image_view, None);
+                frame.image_view = vk::ImageView::null();
             }
         }
         dst_buffer
@@ -687,18 +669,12 @@ impl RendererVulkan {
             return;
         }
 
-        let screenshot_layout = self
+        let layout = self
             .base_data
             .settings
             .screenshot_framebuffer_layout
             .clone();
-        let layout = FramebufferLayout {
-            width: screenshot_layout.width,
-            height: screenshot_layout.height,
-            screen: Rectangle::new(0, 0, screenshot_layout.width, screenshot_layout.height),
-            is_srgb: false,
-        };
-        let buffer_size = layout.width as vk::DeviceSize * layout.height as vk::DeviceSize * 4;
+        let buffer_size = screenshot_buffer_size(&layout);
         let dst_buffer = self.render_to_buffer(
             framebuffers,
             &layout,
@@ -726,33 +702,28 @@ impl RendererVulkan {
     /// Renders framebuffers to the applet capture frame at 1280x720
     /// using the applet-specific blit screen and filter configuration.
     fn render_applet_capture_layer(&mut self, framebuffers: &[FramebufferConfig]) {
+        let layout = capture_framebuffer_layout();
         if self.applet_frame.image == vk::Image::null() {
-            self.applet_frame.width = crate::capture::LINEAR_WIDTH;
-            self.applet_frame.height = crate::capture::LINEAR_HEIGHT;
-            self.applet_frame.image = create_wrapped_image(
-                self.device.get_logical(),
-                &self.memory_allocator,
+            let image = create_wrapped_image(
+                self.memory_allocator.as_ref(),
                 CAPTURE_IMAGE_SIZE,
                 CAPTURE_FORMAT,
             );
-            self.applet_frame.image_view = create_wrapped_image_view(
-                self.device.get_logical(),
-                self.applet_frame.image,
-                CAPTURE_FORMAT,
-            );
+            self.applet_frame.set_image_allocation(image);
+            self.applet_frame.image_view =
+                create_wrapped_image_view(&self.device, self.applet_frame.image, CAPTURE_FORMAT);
             self.applet_frame.framebuffer = self.blit_applet.create_framebuffer(
                 self.device.as_ref(),
                 &mut self.scheduler,
                 &self.present_manager,
+                &layout,
                 self.applet_frame.image_view,
                 CAPTURE_FORMAT,
-                crate::capture::LINEAR_WIDTH,
-                crate::capture::LINEAR_HEIGHT,
             );
         }
 
-        let layout = capture_framebuffer_layout();
-        let frame = BlitFrame::from(&self.applet_frame);
+        self.scheduler
+            .request_outside_render_pass_operation_context();
         self.blit_applet.draw_to_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -760,7 +731,7 @@ impl RendererVulkan {
             &self.present_manager,
             &self.memory_allocator,
             &self.device_memory,
-            frame,
+            &mut self.applet_frame,
             framebuffers,
             &layout,
             1,
@@ -768,14 +739,14 @@ impl RendererVulkan {
         );
     }
 
-    fn create_download_buffer(&self, size: vk::DeviceSize) -> MappedBuffer {
+    fn create_download_buffer(&self, size: vk::DeviceSize) -> AllocatedBuffer {
         let ci = vk::BufferCreateInfo::builder()
             .size(size.max(1))
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         self.memory_allocator
-            .create_mapped_buffer(&ci, MemoryUsage::Download)
+            .create_buffer(&ci, MemoryUsage::Download)
             .expect("Failed to create Vulkan download buffer")
     }
 
@@ -862,7 +833,7 @@ impl RendererBase for RendererVulkan {
     }
 
     fn refresh_base_settings(&mut self) {
-        crate::renderer_base::update_current_framebuffer_layout(&self.framebuffer_layout);
+        update_current_framebuffer_layout(&self.framebuffer_layout);
     }
 
     fn is_screenshot_pending(&self) -> bool {
@@ -944,6 +915,10 @@ fn capture_framebuffer_layout() -> FramebufferLayout {
         ),
         is_srgb: false,
     }
+}
+
+fn screenshot_buffer_size(layout: &FramebufferLayout) -> vk::DeviceSize {
+    layout.width.wrapping_mul(layout.height).wrapping_mul(4) as vk::DeviceSize
 }
 
 fn should_present_window(window_shown: &AtomicBool) -> bool {
@@ -1031,6 +1006,20 @@ mod tests {
         assert_eq!(CAPTURE_IMAGE_SIZE.height, crate::capture::LINEAR_HEIGHT);
         assert_eq!(CAPTURE_IMAGE_EXTENT.depth, crate::capture::LINEAR_DEPTH);
         assert_eq!(CAPTURE_FORMAT, vk::Format::A8B8G8R8_UNORM_PACK32);
+    }
+
+    #[test]
+    fn screenshot_buffer_size_preserves_upstream_u32_wraparound() {
+        let layout = FramebufferLayout {
+            width: u32::MAX,
+            height: 2,
+            ..FramebufferLayout::default()
+        };
+
+        assert_eq!(
+            screenshot_buffer_size(&layout),
+            u32::MAX.wrapping_mul(2).wrapping_mul(4) as u64
+        );
     }
 
     #[test]

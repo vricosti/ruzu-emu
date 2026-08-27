@@ -1,6 +1,4 @@
-//! Port of zuyu/src/common/alignment.h
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-05
+//! Port of `common/alignment.h`.
 
 /// Align a value up to the given alignment (works for both signed and unsigned).
 /// The C++ version casts to unsigned internally; here we provide separate fns.
@@ -10,7 +8,7 @@ pub const fn align_up(value: u64, size: u64) -> u64 {
     if remainder == 0 {
         value
     } else {
-        value - remainder + size
+        value.wrapping_sub(remainder).wrapping_add(size)
     }
 }
 
@@ -24,7 +22,7 @@ pub const fn align_up_signed(value: i64, size: u64) -> i64 {
 /// Align up using a log2 alignment value.
 #[inline]
 pub const fn align_up_log2(value: u64, align_log2: u32) -> u64 {
-    (value + ((1u64 << align_log2) - 1)) >> align_log2 << align_log2
+    value.wrapping_add((1u64 << align_log2) - 1) >> align_log2 << align_log2
 }
 
 /// Align a value down to the given alignment.
@@ -40,12 +38,6 @@ pub const fn align_down_signed(value: i64, size: u64) -> i64 {
     align_down(u, size) as i64
 }
 
-/// Check if a value is 4KB-aligned.
-#[inline]
-pub const fn is_4kb_aligned(value: u64) -> bool {
-    (value & 0xFFF) == 0
-}
-
 /// Check if a value is word-aligned (4-byte aligned).
 #[inline]
 pub const fn is_word_aligned(value: u64) -> bool {
@@ -56,14 +48,14 @@ pub const fn is_word_aligned(value: u64) -> bool {
 /// Alignment must be a power of two.
 #[inline]
 pub const fn is_aligned(value: u64, alignment: u64) -> bool {
-    let mask = alignment - 1;
+    let mask = alignment.wrapping_sub(1);
     (value & mask) == 0
 }
 
 /// Integer division rounding up. Equivalent to `DivideUp` in C++.
 #[inline]
 pub const fn divide_up(x: u64, y: u64) -> u64 {
-    (x + (y - 1)) / y
+    x.wrapping_add(y.wrapping_sub(1)) / y
 }
 
 /// Return the least significant set bit of x.
@@ -112,13 +104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_4kb_aligned() {
-        assert!(is_4kb_aligned(0));
-        assert!(is_4kb_aligned(4096));
-        assert!(!is_4kb_aligned(1));
-    }
-
-    #[test]
     fn test_is_word_aligned() {
         assert!(is_word_aligned(0));
         assert!(is_word_aligned(4));
@@ -155,6 +140,14 @@ mod tests {
         assert_eq!(align_up_log2(0, 12), 0);
         assert_eq!(align_up_log2(1, 12), 4096);
         assert_eq!(align_up_log2(4096, 12), 4096);
+    }
+
+    #[test]
+    fn unsigned_alignment_arithmetic_wraps_like_cpp() {
+        assert_eq!(align_up(u64::MAX, 2), 0);
+        assert_eq!(align_up_log2(u64::MAX, 1), 0);
+        assert_eq!(divide_up(u64::MAX, 2), 0);
+        assert!(is_aligned(0, 0));
     }
 
     #[test]

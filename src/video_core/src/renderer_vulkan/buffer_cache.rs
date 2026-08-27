@@ -3,8 +3,8 @@
 
 //! GPU buffer cache for vertex, index, uniform, and storage data.
 //!
-//! Ref: zuyu `vk_buffer_cache.h` — caches VkBuffer objects by GPU VA range
-//! to avoid redundant uploads of unchanged data.
+//! Ref: Eden `video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}` — caches
+//! VkBuffer objects by GPU VA range to avoid redundant uploads of unchanged data.
 
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -304,22 +304,34 @@ fn quad_count_for_topology(topology: PrimitiveTopology, num_indices: u32) -> u32
     }
 }
 
-fn append_quad_index(bytes: &mut Vec<u8>, index_type: vk::IndexType, index: u32) {
-    match index_type {
-        vk::IndexType::UINT8_EXT => bytes.push(index as u8),
-        vk::IndexType::UINT16 => bytes.extend_from_slice(&(index as u16).to_le_bytes()),
-        vk::IndexType::UINT32 => bytes.extend_from_slice(&index.to_le_bytes()),
+fn write_quad_index(
+    bytes: &mut [u8],
+    byte_offset: &mut usize,
+    index_type: vk::IndexType,
+    index: u32,
+) {
+    let encoded = match index_type {
+        vk::IndexType::UINT8_EXT => [index as u8, 0, 0, 0],
+        vk::IndexType::UINT16 => {
+            let value = (index as u16).to_ne_bytes();
+            [value[0], value[1], 0, 0]
+        }
+        vk::IndexType::UINT32 => index.to_ne_bytes(),
         _ => unreachable!("invalid Vulkan index type"),
-    }
+    };
+    let size = bytes_per_index(index_type);
+    bytes[*byte_offset..*byte_offset + size].copy_from_slice(&encoded[..size]);
+    *byte_offset += size;
 }
 
-fn make_quad_lut(
+fn fill_quad_lut(
+    bytes: &mut [u8],
     topology: PrimitiveTopology,
     num_indices: u32,
     index_type: vk::IndexType,
-) -> Vec<u8> {
+) {
     let num_quads = quad_count_for_topology(topology, num_indices);
-    let mut bytes = Vec::with_capacity(num_quads as usize * 6 * 4 * bytes_per_index(index_type));
+    let mut byte_offset = 0;
     for first in 0u32..4 {
         for quad in 0..num_quads {
             let offsets = match topology {
@@ -330,10 +342,24 @@ fn make_quad_lut(
                 _ => unreachable!("invalid quad topology"),
             };
             for index in offsets {
-                append_quad_index(&mut bytes, index_type, index);
+                write_quad_index(bytes, &mut byte_offset, index_type, index);
             }
         }
     }
+}
+
+#[cfg(test)]
+fn make_quad_lut(
+    topology: PrimitiveTopology,
+    num_indices: u32,
+    index_type: vk::IndexType,
+) -> Vec<u8> {
+    let size = quad_count_for_topology(topology, num_indices) as usize
+        * 6
+        * 4
+        * bytes_per_index(index_type);
+    let mut bytes = vec![0; size];
+    fill_quad_lut(&mut bytes, topology, num_indices, index_type);
     bytes
 }
 
@@ -437,7 +463,7 @@ impl BufferCacheRuntime {
     ) -> Result<Self, vk::Result> {
         let device = vulkan_device.get_logical();
         let quad_index_pass = QuadIndexedPass::new(
-            device,
+            vulkan_device,
             scheduler,
             descriptor_pool,
             staging_pool,
@@ -445,7 +471,7 @@ impl BufferCacheRuntime {
         )?;
         let uint8_pass = if vulkan_device.supports_uint8_indices() {
             Some(Uint8Pass::new(
-                device,
+                vulkan_device,
                 scheduler,
                 descriptor_pool,
                 staging_pool,
@@ -494,6 +520,87 @@ impl BufferCacheRuntime {
             limit_dynamic_storage_buffers,
             max_dynamic_storage_buffers,
         })
+    }
+
+    /// Port of `BufferCacheRuntime::BindVertexBuffer`.
+    pub fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        mut buffer: vk::Buffer,
+        mut offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        if index >= self.max_vertex_input_bindings {
+            return;
+        }
+        let device = self.device_owner;
+        if self.extended_dynamic_state_supported {
+            self.scheduler().record(move |cmdbuf| unsafe {
+                let device = device.get().get_logical();
+                let vk_offset = if buffer != vk::Buffer::null() {
+                    u64::from(offset)
+                } else {
+                    0
+                };
+                let vk_size = if buffer != vk::Buffer::null() {
+                    u64::from(size)
+                } else {
+                    vk::WHOLE_SIZE
+                };
+                let vk_stride = u64::from(stride);
+                device.cmd_bind_vertex_buffers2(
+                    cmdbuf,
+                    index,
+                    std::slice::from_ref(&buffer),
+                    std::slice::from_ref(&vk_offset),
+                    Some(std::slice::from_ref(&vk_size)),
+                    Some(std::slice::from_ref(&vk_stride)),
+                );
+            });
+            return;
+        }
+
+        if !self.has_null_descriptor && buffer == vk::Buffer::null() {
+            self.reserve_null_buffer();
+            buffer = self.null_buffer_handle();
+            offset = 0;
+        }
+        self.scheduler().record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
+            device.cmd_bind_vertex_buffers(cmdbuf, index, &[buffer], &[u64::from(offset)]);
+        });
+    }
+
+    /// Port of `BufferCacheRuntime::BindTransformFeedbackBuffer`.
+    pub fn bind_transform_feedback_buffer(
+        &mut self,
+        index: u32,
+        mut buffer: vk::Buffer,
+        mut offset: u32,
+        mut size: u32,
+    ) {
+        let Some(transform_feedback) = self.transform_feedback.clone() else {
+            return;
+        };
+        if buffer == vk::Buffer::null() {
+            self.reserve_null_buffer();
+            buffer = self.null_buffer_handle();
+            offset = 0;
+            size = 0;
+        }
+        self.scheduler().record(move |command_buffer| unsafe {
+            let vk_offset = u64::from(offset);
+            let vk_size = u64::from(size);
+            (transform_feedback.cmd_bind_transform_feedback_buffers_ext)(
+                command_buffer,
+                index,
+                1,
+                &buffer,
+                &vk_offset,
+                &vk_size,
+            );
+        });
     }
 
     fn scheduler(&mut self) -> &mut Scheduler {
@@ -550,70 +657,107 @@ impl BufferCacheRuntime {
         }
 
         self.scheduler().finish();
-        match topology {
-            PrimitiveTopology::Quads => self.quad_array_index_buffer.buffer = None,
-            PrimitiveTopology::QuadStrip => self.quad_strip_index_buffer.buffer = None,
-            _ => unreachable!("invalid quad topology"),
-        }
-
         let index_type = index_type_from_num_elements(num_indices, self.index_type_uint8_supported);
-        let data = make_quad_lut(topology, num_indices, index_type);
-        let size = data.len() as vk::DeviceSize;
+        {
+            let state = match topology {
+                PrimitiveTopology::Quads => &mut self.quad_array_index_buffer,
+                PrimitiveTopology::QuadStrip => &mut self.quad_strip_index_buffer,
+                _ => unreachable!("invalid quad topology"),
+            };
+            state.num_indices = num_indices;
+            state.index_type = index_type;
+        }
+        let size = u64::from(quad_count_for_topology(topology, num_indices))
+            * 6
+            * 4
+            * bytes_per_index(index_type) as u64;
         let allocation = self
             .create_gpu_buffer(
                 size,
                 vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             )
             .expect("quad index buffer allocation failed");
-        let staging = self
-            .staging_pool()
-            .request_upload_buffer(size)
-            .expect("quad index upload staging allocation failed");
-        unsafe {
-            std::slice::from_raw_parts_mut(staging.mapped, data.len()).copy_from_slice(&data);
-        }
-
-        let device = self.device_owner;
-        let src_buffer = staging.buffer;
-        let src_offset = staging.offset;
-        let dst_buffer = allocation.handle();
-        self.scheduler().request_outside_renderpass();
-        self.scheduler().record(move |cmdbuf| unsafe {
-            let device = device.get().get_logical();
-            let copy = vk::BufferCopy {
-                src_offset,
-                dst_offset: 0,
-                size,
+        {
+            let state = match topology {
+                PrimitiveTopology::Quads => &mut self.quad_array_index_buffer,
+                PrimitiveTopology::QuadStrip => &mut self.quad_strip_index_buffer,
+                _ => unreachable!("invalid quad topology"),
             };
-            let barrier = vk::BufferMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::INDEX_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(dst_buffer)
-                .offset(0)
-                .size(size)
-                .build();
-            device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &[copy]);
-            device.cmd_pipeline_barrier(
-                cmdbuf,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::VERTEX_INPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                std::slice::from_ref(&barrier),
-                &[],
-            );
-        });
-
-        let state = match topology {
-            PrimitiveTopology::Quads => &mut self.quad_array_index_buffer,
-            PrimitiveTopology::QuadStrip => &mut self.quad_strip_index_buffer,
+            state.buffer = Some(allocation);
+        }
+        let buffer = match topology {
+            PrimitiveTopology::Quads => self.quad_array_index_buffer.buffer.as_ref(),
+            PrimitiveTopology::QuadStrip => self.quad_strip_index_buffer.buffer.as_ref(),
             _ => unreachable!("invalid quad topology"),
-        };
-        state.buffer = Some(allocation);
-        state.index_type = index_type;
-        state.num_indices = num_indices;
+        }
+        .expect("quad index buffer was just allocated")
+        .handle();
+        if self.vulkan_device().has_debugging_tool_attached() {
+            self.vulkan_device().set_buffer_name(buffer, "Quad LUT");
+        }
+        let host_visible = match topology {
+            PrimitiveTopology::Quads => self.quad_array_index_buffer.buffer.as_ref(),
+            PrimitiveTopology::QuadStrip => self.quad_strip_index_buffer.buffer.as_ref(),
+            _ => unreachable!("invalid quad topology"),
+        }
+        .expect("quad index buffer was just allocated")
+        .is_host_visible();
+        if host_visible {
+            let allocation = match topology {
+                PrimitiveTopology::Quads => self.quad_array_index_buffer.buffer.as_mut(),
+                PrimitiveTopology::QuadStrip => self.quad_strip_index_buffer.buffer.as_mut(),
+                _ => unreachable!("invalid quad topology"),
+            }
+            .expect("quad index buffer was just allocated");
+            fill_quad_lut(allocation.mapped_slice_mut(), topology, num_indices, index_type);
+            allocation.flush();
+        } else {
+            let staging = self
+                .staging_pool()
+                .request_upload_buffer(size)
+                .expect("quad index upload staging allocation failed");
+            unsafe {
+                fill_quad_lut(
+                    std::slice::from_raw_parts_mut(staging.mapped, size as usize),
+                    topology,
+                    num_indices,
+                    index_type,
+                );
+            }
+
+            let device = self.device_owner;
+            let src_buffer = staging.buffer;
+            let src_offset = staging.offset;
+            let dst_buffer = buffer;
+            self.scheduler().request_outside_render_pass_operation_context();
+            self.scheduler().record(move |cmdbuf| unsafe {
+                let device = device.get().get_logical();
+                let copy = vk::BufferCopy {
+                    src_offset,
+                    dst_offset: 0,
+                    size,
+                };
+                let barrier = vk::BufferMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::INDEX_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(dst_buffer)
+                    .offset(0)
+                    .size(size)
+                    .build();
+                device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &[copy]);
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::VERTEX_INPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&barrier),
+                    &[],
+                );
+            });
+        }
     }
 
     /// Port of upstream `BufferCacheRuntime::ReserveNullBuffer`.
@@ -641,7 +785,7 @@ impl BufferCacheRuntime {
         let buffer = allocation.handle();
 
         let device = self.device_owner;
-        self.scheduler().request_outside_renderpass();
+        self.scheduler().request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| unsafe {
             let device = device.get().get_logical();
             device.cmd_fill_buffer(cmdbuf, buffer, 0, vk::WHOLE_SIZE, 0);
@@ -671,7 +815,7 @@ impl BufferCacheRuntime {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         self.memory_allocator()
-            .create_owned_buffer(&buffer_info, MemoryUsage::DeviceLocal)
+            .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)
     }
 
     fn make_buffer_copies(copies: &[BufferCopy]) -> SmallVec<[vk::BufferCopy; 8]> {
@@ -728,13 +872,13 @@ impl BufferCacheRuntime {
             can_reorder_upload && src_buffer == self.staging_pool().stream_buffer_handle();
         if can_use_upload_cmdbuf {
             self.scheduler()
-                .record_with_upload(move |_cmdbuf, upload_cmdbuf| unsafe {
+                .record_with_upload_buffer(move |_cmdbuf, upload_cmdbuf| unsafe {
                     let device = device.get().get_logical();
                     device.cmd_copy_buffer(upload_cmdbuf, src_buffer, dst_buffer, &vk_copies);
                 });
             return;
         }
-        self.scheduler().request_outside_renderpass();
+        self.scheduler().request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let read_barrier = vk::MemoryBarrier::builder()
@@ -864,7 +1008,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn pre_copy_barrier(&mut self) {
         let device = self.device_owner;
-        self.scheduler().request_outside_renderpass();
+        self.scheduler().request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let read_barrier = vk::MemoryBarrier::builder()
@@ -887,7 +1031,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn post_copy_barrier(&mut self) {
         let device = self.device_owner;
-        self.scheduler().request_outside_renderpass();
+        self.scheduler().request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let write_barrier = vk::MemoryBarrier::builder()
@@ -958,7 +1102,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             return;
         }
         let device = self.device_owner;
-        self.scheduler().request_outside_renderpass();
+        self.scheduler().request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let read_barrier = vk::MemoryBarrier::builder()
@@ -1056,6 +1200,13 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             return;
         }
 
+        if !matches!(
+            topology,
+            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
+        ) {
+            return;
+        }
+
         self.update_quad_index_buffer(topology, first.wrapping_add(count));
         let state = match topology {
             PrimitiveTopology::Quads => &self.quad_array_index_buffer,
@@ -1077,6 +1228,17 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             let device = device.get().get_logical();
             device.cmd_bind_index_buffer(cmdbuf, buffer, offset, index_type);
         });
+    }
+
+    fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut Buffer,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        BufferCacheRuntime::bind_vertex_buffer(self, index, buffer.handle(), offset, size, stride);
     }
 
     fn bind_vertex_buffers(
@@ -1212,13 +1374,28 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         let Some(transform_feedback) = self.transform_feedback.clone() else {
             return;
         };
-        let buffer_handles: Vec<vk::Buffer> = bindings
+        if bindings
             .buffer_ids
             .iter()
-            .map(|&buffer_id| buffers[buffer_id].handle())
-            .collect();
-        let offsets: Vec<vk::DeviceSize> = bindings.offsets.iter().copied().collect();
-        let sizes: Vec<vk::DeviceSize> = bindings.sizes.iter().copied().collect();
+            .any(|&buffer_id| buffers[buffer_id].handle() == vk::Buffer::null())
+        {
+            self.reserve_null_buffer();
+        }
+        let null_buffer = self.null_buffer_handle();
+        let mut buffer_handles = Vec::with_capacity(bindings.buffer_ids.len());
+        let mut offsets: Vec<vk::DeviceSize> = bindings.offsets.iter().copied().collect();
+        let mut sizes: Vec<vk::DeviceSize> = bindings.sizes.iter().copied().collect();
+        for (index, &buffer_id) in bindings.buffer_ids.iter().enumerate() {
+            let (buffer, offset, size) = prepare_transform_feedback_binding(
+                buffers[buffer_id].handle(),
+                offsets[index],
+                sizes[index],
+                null_buffer,
+            );
+            buffer_handles.push(buffer);
+            offsets[index] = offset;
+            sizes[index] = size;
+        }
         self.scheduler().record(move |command_buffer| unsafe {
             (transform_feedback.cmd_bind_transform_feedback_buffers_ext)(
                 command_buffer,
@@ -1320,6 +1497,21 @@ fn prepare_vertex_binding(
     (null_buffer, 0, vk::WHOLE_SIZE)
 }
 
+/// Port of the null-handle branch in upstream
+/// `BufferCacheRuntime::BindTransformFeedbackBuffers`.
+fn prepare_transform_feedback_binding(
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    null_buffer: vk::Buffer,
+) -> (vk::Buffer, vk::DeviceSize, vk::DeviceSize) {
+    if buffer == vk::Buffer::null() {
+        (null_buffer, 0, 0)
+    } else {
+        (buffer, offset, size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,6 +1524,21 @@ mod tests {
         fn require_signature(_: fn(&BufferCacheRuntime) -> DeviceReference) {}
 
         require_signature(device_reference);
+    }
+
+    #[test]
+    fn runtime_exposes_upstream_single_buffer_binding_methods() {
+        fn require_vertex_signature(
+            _: fn(&mut BufferCacheRuntime, u32, vk::Buffer, u32, u32, u32),
+        ) {
+        }
+        fn require_transform_feedback_signature(
+            _: fn(&mut BufferCacheRuntime, u32, vk::Buffer, u32, u32),
+        ) {
+        }
+
+        require_vertex_signature(BufferCacheRuntime::bind_vertex_buffer);
+        require_transform_feedback_signature(BufferCacheRuntime::bind_transform_feedback_buffer);
     }
 
     #[test]
@@ -1377,6 +1584,24 @@ mod tests {
         assert_eq!(
             prepare_vertex_binding(vk::Buffer::null(), 91, 73, false, fallback),
             (fallback, 0, vk::WHOLE_SIZE)
+        );
+    }
+
+    #[test]
+    fn null_transform_feedback_binding_uses_zero_sized_fallback() {
+        let fallback = vk::Buffer::from_raw(0x1234);
+        assert_eq!(
+            prepare_transform_feedback_binding(vk::Buffer::null(), 91, 73, fallback),
+            (fallback, 0, 0)
+        );
+    }
+
+    #[test]
+    fn transform_feedback_binding_preserves_non_null_range() {
+        let buffer = vk::Buffer::from_raw(0x5678);
+        assert_eq!(
+            prepare_transform_feedback_binding(buffer, 91, 73, vk::Buffer::null()),
+            (buffer, 91, 73)
         );
     }
 

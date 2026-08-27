@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::scheduler::SchedulerWaitHandle;
+use super::scheduler::{Scheduler, SchedulerWaitHandle};
 
 // ---------------------------------------------------------------------------
 // InnerFence
@@ -36,23 +36,25 @@ impl InnerFence {
     /// Port of `InnerFence::Queue`.
     ///
     /// Records the current scheduler tick and triggers a flush.
-    /// When no scheduler is wired, behaves as if immediately signaled.
-    pub fn queue(&mut self, current_tick: u64) {
+    pub fn queue(&mut self, scheduler: &mut Scheduler) {
         if self.is_stubbed {
             return;
         }
-        self.wait_tick = current_tick;
+        self.wait_tick = scheduler.current_tick();
+        scheduler.flush();
     }
 
     /// Port of `InnerFence::IsSignaled`.
     ///
     /// Returns true if the GPU has completed the tick this fence is waiting on.
-    pub fn is_signaled(&self, known_gpu_tick: u64) -> bool {
+    pub fn is_signaled(&self) -> bool {
         if self.is_stubbed {
             return true;
         }
-        // In upstream: scheduler.IsFree(wait_tick)
-        known_gpu_tick >= self.wait_tick
+        self.scheduler
+            .as_ref()
+            .expect("non-stubbed Vulkan fence must retain its scheduler")
+            .is_free(self.wait_tick)
     }
 
     /// Port of `InnerFence::Wait`.
@@ -66,16 +68,6 @@ impl InnerFence {
             .as_ref()
             .expect("non-stubbed Vulkan fence must retain its scheduler")
             .wait(self.wait_tick);
-    }
-
-    /// Returns the tick this fence is waiting for.
-    pub fn wait_tick(&self) -> u64 {
-        self.wait_tick
-    }
-
-    /// Returns whether this fence is a stub (always signaled).
-    pub fn is_stubbed(&self) -> bool {
-        self.is_stubbed
     }
 }
 
@@ -119,15 +111,15 @@ impl FenceManager {
     }
 
     /// Port of `FenceManager::QueueFence`.
-    pub fn queue_fence(&mut self, fence: &Fence, current_tick: u64) {
+    pub fn queue_fence(&mut self, fence: &Fence, scheduler: &mut Scheduler) {
         let mut inner = fence.lock().unwrap();
-        inner.queue(current_tick);
+        inner.queue(scheduler);
     }
 
     /// Port of `FenceManager::IsFenceSignaled`.
-    pub fn is_fence_signaled(&self, fence: &Fence, known_gpu_tick: u64) -> bool {
+    pub fn is_fence_signaled(&self, fence: &Fence) -> bool {
         let inner = fence.lock().unwrap();
-        inner.is_signaled(known_gpu_tick)
+        inner.is_signaled()
     }
 
     /// Port of `FenceManager::WaitFence`.
@@ -149,21 +141,25 @@ mod tests {
                 scheduler: None,
             }
         }
+
+        fn is_signaled_at(&self, known_gpu_tick: u64) -> bool {
+            self.is_stubbed || known_gpu_tick >= self.wait_tick
+        }
     }
 
     #[test]
     fn stubbed_fence_is_always_signaled() {
         let fence = InnerFence::new_for_test(true);
-        assert!(fence.is_signaled(0));
+        assert!(fence.is_signaled());
         fence.wait();
     }
 
     #[test]
     fn fence_tracks_queued_tick() {
         let mut fence = InnerFence::new_for_test(false);
-        fence.queue(10);
-        assert!(!fence.is_signaled(5));
-        assert!(fence.is_signaled(10));
-        assert!(fence.is_signaled(15));
+        fence.wait_tick = 10;
+        assert!(!fence.is_signaled_at(5));
+        assert!(fence.is_signaled_at(10));
+        assert!(fence.is_signaled_at(15));
     }
 }

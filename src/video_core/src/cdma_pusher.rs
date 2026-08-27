@@ -43,46 +43,38 @@ impl ChSubmissionMode {
 }
 
 /// Channel class IDs for Host1x devices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ChClassId {
-    NoClass = 0x0,
-    Control = 0x1,
-    VideoEncodeMpeg = 0x20,
-    VideoEncodeNvEnc = 0x21,
-    VideoStreamingVi = 0x30,
-    VideoStreamingIsp = 0x32,
-    VideoStreamingIspB = 0x34,
-    VideoStreamingViI2c = 0x36,
-    GraphicsVic = 0x5d,
-    Graphics3D = 0x60,
-    GraphicsGpu = 0x61,
-    Tsec = 0xe0,
-    TsecB = 0xe1,
-    NvJpg = 0xc0,
-    NvDec = 0xf0,
-}
+///
+/// This is a transparent newtype instead of a Rust enum because C++ enum
+/// casts preserve unknown raw class IDs. Mapping them to `NoClass` would alter
+/// the command stream's state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ChClassId(u32);
 
+#[allow(non_upper_case_globals)]
 impl ChClassId {
-    pub fn from_u32(val: u32) -> Self {
-        match val {
-            0x0 => Self::NoClass,
-            0x1 => Self::Control,
-            0x20 => Self::VideoEncodeMpeg,
-            0x21 => Self::VideoEncodeNvEnc,
-            0x30 => Self::VideoStreamingVi,
-            0x32 => Self::VideoStreamingIsp,
-            0x34 => Self::VideoStreamingIspB,
-            0x36 => Self::VideoStreamingViI2c,
-            0x5d => Self::GraphicsVic,
-            0x60 => Self::Graphics3D,
-            0x61 => Self::GraphicsGpu,
-            0xe0 => Self::Tsec,
-            0xe1 => Self::TsecB,
-            0xc0 => Self::NvJpg,
-            0xf0 => Self::NvDec,
-            _ => Self::NoClass,
-        }
+    pub const NoClass: Self = Self(0x0);
+    pub const Control: Self = Self(0x1);
+    pub const VideoEncodeMpeg: Self = Self(0x20);
+    pub const VideoEncodeNvEnc: Self = Self(0x21);
+    pub const VideoStreamingVi: Self = Self(0x30);
+    pub const VideoStreamingIsp: Self = Self(0x32);
+    pub const VideoStreamingIspB: Self = Self(0x34);
+    pub const VideoStreamingViI2c: Self = Self(0x36);
+    pub const GraphicsVic: Self = Self(0x5d);
+    pub const Graphics3D: Self = Self(0x60);
+    pub const GraphicsGpu: Self = Self(0x61);
+    pub const Tsec: Self = Self(0xe0);
+    pub const TsecB: Self = Self(0xe1);
+    pub const NvJpg: Self = Self(0xc0);
+    pub const NvDec: Self = Self(0xf0);
+
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
     }
 }
 
@@ -164,9 +156,9 @@ pub trait ProcessMethodHook: Send {
 
 /// No-op processor for devices that haven't been ported yet.
 ///
-/// Used by `Host1x::start_device` when wiring NvDec / Vic with placeholder
-/// behavior — `IncSyncpt` and the `Control` host-processor path still run,
-/// matching the parts of upstream that don't depend on subclass logic.
+/// Used by `Host1x::start_device` for the currently unported NvJpg subclass;
+/// NvDec and Vic install their concrete processors. `IncSyncpt` and the
+/// `Control` host-processor path still run independently of this hook.
 pub struct NullProcessor;
 
 impl ProcessMethodHook for NullProcessor {
@@ -268,7 +260,7 @@ impl CDmaPusherInner {
             ChSubmissionMode::SetClass => {
                 state.mask = header_value & 0x3F;
                 state.method_offset = header_method_offset;
-                let class = ChClassId::from_u32((header_value >> 6) & 0x3FF);
+                let class = ChClassId::from_raw((header_value >> 6) & 0x3FF);
                 *self.current_class.lock().unwrap() = class;
             }
             ChSubmissionMode::Incrementing | ChSubmissionMode::NonIncrementing => {
@@ -298,20 +290,27 @@ impl CDmaPusherInner {
         match class {
             ChClassId::Control => {
                 log::trace!(
-                    "CDmaPusher: Class {:?} method 0x{:X} arg 0x{:X}",
-                    class,
+                    "CDmaPusher: Class {} method 0x{:X} arg 0x{:X}",
+                    class.raw(),
                     method,
                     arg
                 );
-                if let Some(m) = ControlMethod::from_u32(method) {
-                    self.host_processor.lock().unwrap().process_method(m, arg);
-                }
+                self.host_processor
+                    .lock()
+                    .unwrap()
+                    .process_method(ControlMethod::from_raw(method), arg);
             }
             _ => {
                 {
                     let mut regs = self.thi_regs.lock().unwrap();
                     if (method as usize) < THI_NUM_REGS {
                         regs.reg_array[method as usize] = arg;
+                    } else {
+                        log::error!(
+                            "CDmaPusher: THI method 0x{:X} is outside the 0x{:X}-register file",
+                            method,
+                            THI_NUM_REGS
+                        );
                     }
                 }
                 match method {
@@ -320,8 +319,8 @@ impl CDmaPusherInner {
                         let syncpoint_id = arg & 0xFF;
                         let _cond = (arg >> 8) & 0xFF;
                         log::trace!(
-                            "CDmaPusher: Class {:?} IncSyncpt syncpt {} cond {}",
-                            class,
+                            "CDmaPusher: Class {} IncSyncpt syncpt {} cond {}",
+                            class.raw(),
                             syncpoint_id,
                             _cond
                         );
@@ -332,8 +331,8 @@ impl CDmaPusherInner {
                         // ThiMethod::SetMethod1 — dispatch to subclass via method_0.
                         let method_0 = self.thi_regs.lock().unwrap().method_0();
                         log::trace!(
-                            "CDmaPusher: Class {:?} method 0x{:X} arg 0x{:X}",
-                            class,
+                            "CDmaPusher: Class {} method 0x{:X} arg 0x{:X}",
+                            class.raw(),
                             method_0,
                             arg
                         );
@@ -384,7 +383,7 @@ impl CDmaPusher {
             syncpoint_manager,
             host_processor: Mutex::new(host_processor),
             process_method: Mutex::new(process_method),
-            current_class: Mutex::new(ChClassId::from_u32(id as u32)),
+            current_class: Mutex::new(ChClassId::from_raw(id as u32)),
             thi_regs: Mutex::new(ThiRegisters::default()),
             state: Mutex::new(ParserState::default()),
             command_queue: Mutex::new(CommandQueue::default()),
@@ -436,9 +435,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_types_preserve_upstream_raw_layout_and_values() {
+        assert_eq!(std::mem::size_of::<ChCommandHeader>(), 4);
+        assert_eq!(std::mem::size_of::<ChClassId>(), 4);
+        assert_eq!(ChSubmissionMode::SetClass as u32, 0);
+        assert_eq!(ChSubmissionMode::Incrementing as u32, 1);
+        assert_eq!(ChSubmissionMode::NonIncrementing as u32, 2);
+        assert_eq!(ChSubmissionMode::Mask as u32, 3);
+        assert_eq!(ChSubmissionMode::Immediate as u32, 4);
+        assert_eq!(ChSubmissionMode::Restart as u32, 5);
+        assert_eq!(ChSubmissionMode::Gather as u32, 6);
+        assert_eq!(ChClassId::Control.raw(), 0x1);
+        assert_eq!(ChClassId::GraphicsVic.raw(), 0x5d);
+        assert_eq!(ChClassId::NvDec.raw(), 0xf0);
+        assert_eq!(ChClassId::from_raw(0x155).raw(), 0x155);
+        assert_eq!(ThiMethod::IncSyncpt as u32, 0);
+        assert_eq!(ThiMethod::SetMethod0 as u32, 16);
+        assert_eq!(ThiMethod::SetMethod1 as u32, 17);
+        assert_eq!(std::mem::size_of::<ThiRegisters>(), 0x20 * 4);
+
+        let header = ChCommandHeader { raw: 0x4abc_1234 };
+        assert_eq!(header.value(), 0x1234);
+        assert_eq!(header.method_offset(), 0xabc);
+        assert_eq!(header.submission_mode(), Some(ChSubmissionMode::Immediate));
+    }
+
+    #[test]
+    fn set_class_preserves_unknown_raw_class_id() {
+        let sm = Arc::new(SyncpointManager::new());
+        let pusher = CDmaPusher::new(sm, ChClassId::NvDec.raw() as i32);
+        let mut state = ParserState::default();
+        pusher
+            .inner
+            .step_one(&mut state, ChCommandHeader { raw: (0x155 << 6) });
+        assert_eq!(pusher.inner.current_class.lock().unwrap().raw(), 0x155);
+    }
+
+    #[test]
     fn inc_syncpt_advances_host1x_syncpoint() {
         let sm = Arc::new(SyncpointManager::new());
-        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec as i32);
+        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec.raw() as i32);
 
         let initial = sm.get_host_syncpoint_value(3);
         pusher.execute_command(0, 3); // IncSyncpt syncpt_id=3
@@ -449,18 +485,18 @@ mod tests {
     #[test]
     fn control_class_load_then_wait_does_not_block_when_satisfied() {
         let sm = Arc::new(SyncpointManager::new());
-        let pusher = CDmaPusher::new(sm.clone(), ChClassId::Control as i32);
+        let pusher = CDmaPusher::new(sm.clone(), ChClassId::Control.raw() as i32);
 
         // Pre-increment host syncpoint so WaitSyncpt32 returns immediately.
         sm.increment_host(0);
-        pusher.execute_command(ControlMethod::LoadSyncptPayload32 as u32, 1);
-        pusher.execute_command(ControlMethod::WaitSyncpt32 as u32, 0);
+        pusher.execute_command(ControlMethod::LoadSyncptPayload32.raw(), 1);
+        pusher.execute_command(ControlMethod::WaitSyncpt32.raw(), 0);
     }
 
     #[test]
     fn push_entries_is_drained_by_worker_thread() {
         let sm = Arc::new(SyncpointManager::new());
-        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec as i32);
+        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec.raw() as i32);
 
         pusher.push_entries(vec![ChCommandHeader {
             raw: ((ChSubmissionMode::Immediate as u32) << 28)
@@ -480,7 +516,7 @@ mod tests {
     #[test]
     fn parser_state_persists_across_queued_command_lists() {
         let sm = Arc::new(SyncpointManager::new());
-        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec as i32);
+        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec.raw() as i32);
 
         pusher.push_entries(vec![ChCommandHeader {
             raw: ((ChSubmissionMode::NonIncrementing as u32) << 28)

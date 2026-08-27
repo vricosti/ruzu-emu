@@ -54,7 +54,9 @@ impl ShaderNotify {
 
         if now_complete == now_building {
             let now = Instant::now();
-            if report.completed && now_complete == report.num_when_completed {
+            if report.completed
+                && self.num_complete.load(Ordering::SeqCst) == report.num_when_completed
+            {
                 if let Some(complete_time) = report.complete_time {
                     if now.duration_since(complete_time) > TIME_TO_STOP_REPORTING {
                         report.report_base = now_complete;
@@ -63,7 +65,7 @@ impl ShaderNotify {
                 }
             } else {
                 report.completed = true;
-                report.num_when_completed = now_complete;
+                report.num_when_completed = self.num_complete.load(Ordering::SeqCst);
                 report.complete_time = Some(now);
             }
         }
@@ -73,12 +75,12 @@ impl ShaderNotify {
 
     /// Mark a shader as completed.
     pub fn mark_shader_complete(&self) {
-        self.num_complete.fetch_add(1, Ordering::Relaxed);
+        self.num_complete.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Mark a shader as building.
     pub fn mark_shader_building(&self) {
-        self.num_building.fetch_add(1, Ordering::Relaxed);
+        self.num_building.fetch_add(1, Ordering::SeqCst);
     }
 }
 

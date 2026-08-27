@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of `zuyu/src/video_core/vulkan_common/vulkan_wrapper.h` and
-//! `zuyu/src/video_core/vulkan_common/vulkan_wrapper.cpp`.
+//! Port of Eden's `video_core/vulkan_common/vulkan_wrapper.h` and
+//! `video_core/vulkan_common/vulkan_wrapper.cpp`.
 //!
 //! Provides RAII wrappers and dispatch tables for Vulkan objects.
 //! In the C++ codebase this is a large custom Vulkan abstraction layer with
@@ -15,6 +15,8 @@
 use ash::vk;
 use ash::vk::Handle;
 use std::ffi::{CStr, CString};
+
+use super::vk_enum_string_helper::string_vk_result;
 
 // ---------------------------------------------------------------------------
 // Exception / error type — port of `vk::Exception`
@@ -36,7 +38,7 @@ impl VulkanError {
 
 impl std::fmt::Display for VulkanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Vulkan error: {:?}", self.result)
+        f.write_str(&string_vk_result(self.result))
     }
 }
 
@@ -51,6 +53,48 @@ pub fn check(result: vk::Result) -> Result<(), VulkanError> {
     }
 }
 
+fn set_object_name_with(
+    set_name: Option<vk::PFN_vkSetDebugUtilsObjectNameEXT>,
+    device: vk::Device,
+    object_type: vk::ObjectType,
+    object_handle: u64,
+    name: &CStr,
+) -> Result<(), VulkanError> {
+    let Some(set_name) = set_name else {
+        return Ok(());
+    };
+    let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
+        .object_type(object_type)
+        .object_handle(object_handle)
+        .object_name(name);
+    check(unsafe { set_name(device, &*name_info) })
+}
+
+/// Rust counterpart of upstream's file-local `SetObjectName` helper.
+pub(crate) fn set_object_name(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    object_type: vk::ObjectType,
+    object_handle: u64,
+    name: &str,
+) -> Result<(), VulkanError> {
+    let Ok(name) = CString::new(name) else {
+        return Ok(());
+    };
+    let function_name =
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"vkSetDebugUtilsObjectNameEXT\0") };
+    let set_name =
+        unsafe { instance.get_device_proc_addr(device.handle(), function_name.as_ptr()) }.map(
+            |function| unsafe {
+                std::mem::transmute::<
+                    unsafe extern "system" fn(),
+                    vk::PFN_vkSetDebugUtilsObjectNameEXT,
+                >(function)
+            },
+        );
+    set_object_name_with(set_name, device.handle(), object_type, object_handle, &name)
+}
+
 /// Port of `vk::Framebuffer::SetObjectNameEXT`.
 pub fn set_framebuffer_name(
     instance: &ash::Instance,
@@ -58,21 +102,13 @@ pub fn set_framebuffer_name(
     framebuffer: vk::Framebuffer,
     name: &str,
 ) -> Result<(), VulkanError> {
-    let Ok(name) = CString::new(name) else {
-        return Ok(());
-    };
-    let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
-        instance
-            .get_device_proc_addr(device.handle(), function_name.as_ptr())
-            .map_or(std::ptr::null(), |function| {
-                function as *const std::ffi::c_void
-            })
-    });
-    let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
-        .object_type(vk::ObjectType::FRAMEBUFFER)
-        .object_handle(framebuffer.as_raw())
-        .object_name(&name);
-    check(unsafe { (functions.set_debug_utils_object_name_ext)(device.handle(), &*name_info) })
+    set_object_name(
+        instance,
+        device,
+        vk::ObjectType::FRAMEBUFFER,
+        framebuffer.as_raw(),
+        name,
+    )
 }
 
 /// Port of `vk::Filter` — returns `Err` only on error results (negative).
@@ -182,24 +218,10 @@ fn enumerate_physical_device_tool_properties(
     };
 
     let mut count = 0;
-    let result = unsafe { get_properties(physical_device, &mut count, std::ptr::null_mut()) };
-    if result != vk::Result::SUCCESS || count == 0 {
-        return Vec::new();
-    }
-
-    loop {
-        let mut properties = vec![vk::PhysicalDeviceToolProperties::default(); count as usize];
-        let result =
-            unsafe { get_properties(physical_device, &mut count, properties.as_mut_ptr()) };
-        match result {
-            vk::Result::SUCCESS => {
-                properties.truncate(count as usize);
-                return properties;
-            }
-            vk::Result::INCOMPLETE => continue,
-            _ => return Vec::new(),
-        }
-    }
+    let _ = unsafe { get_properties(physical_device, &mut count, std::ptr::null_mut()) };
+    let mut properties = vec![vk::PhysicalDeviceToolProperties::default(); count as usize];
+    let _ = unsafe { get_properties(physical_device, &mut count, properties.as_mut_ptr()) };
+    properties
 }
 
 /// Port of `PhysicalDevice::GetPhysicalDeviceToolProperties`.
@@ -229,6 +251,16 @@ pub fn get_physical_device_tool_properties(
 // Instance wrapper — thin wrapper around ash::Instance
 // ---------------------------------------------------------------------------
 
+fn make_application_info(application_name: &CStr) -> vk::ApplicationInfo {
+    vk::ApplicationInfo::builder()
+        .application_name(application_name)
+        .application_version(vk::make_api_version(0, 1, 3, 0))
+        .engine_name(application_name)
+        .engine_version(vk::make_api_version(0, 1, 3, 0))
+        .api_version(vk::API_VERSION_1_3)
+        .build()
+}
+
 /// RAII wrapper around an `ash::Instance`.
 ///
 /// Port of `vk::Instance` from `vulkan_wrapper.h`.
@@ -244,13 +276,19 @@ impl Instance {
     /// Port of `vk::Instance::Create`.
     pub fn create(
         entry: ash::Entry,
-        app_info: &vk::ApplicationInfo,
+        version: u32,
         layers: &[*const std::os::raw::c_char],
         extensions: &[*const std::os::raw::c_char],
-        flags: vk::InstanceCreateFlags,
     ) -> Result<Self, VulkanError> {
+        let _ = version;
+        let application_name = CString::new("ruzu Emulator").unwrap();
+        let application_info = make_application_info(&application_name);
+        #[cfg(target_os = "macos")]
+        let flags = vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        #[cfg(not(target_os = "macos"))]
+        let flags = vk::InstanceCreateFlags::empty();
         let create_info = vk::InstanceCreateInfo::builder()
-            .application_info(app_info)
+            .application_info(&application_info)
             .enabled_layer_names(layers)
             .enabled_extension_names(extensions)
             .flags(flags)
@@ -261,6 +299,12 @@ impl Instance {
                 .create_instance(&create_info, None)
                 .map_err(|e| VulkanError::new(e))?
         };
+        let destroy_name = unsafe { CStr::from_bytes_with_nul_unchecked(b"vkDestroyInstance\0") };
+        if unsafe { entry.get_instance_proc_addr(instance.handle(), destroy_name.as_ptr()) }
+            .is_none()
+        {
+            return Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED));
+        }
 
         Ok(Self { entry, instance })
     }
@@ -354,8 +398,8 @@ pub fn available_version(entry: &ash::Entry) -> u32 {
         Ok(None) => vk::API_VERSION_1_0,
         Err(e) => {
             log::error!(
-                "vkEnumerateInstanceVersion failed: {:?}, assuming Vulkan 1.1",
-                e
+                "vkEnumerateInstanceVersion returned {}, assuming Vulkan 1.1",
+                string_vk_result(e)
             );
             vk::API_VERSION_1_1
         }
@@ -382,6 +426,44 @@ pub fn enumerate_instance_layer_properties(entry: &ash::Entry) -> Option<Vec<vk:
     entry.enumerate_instance_layer_properties().ok()
 }
 
+/// Port of `vk::GetDriverName`.
+pub fn get_driver_name(driver: &vk::PhysicalDeviceDriverProperties) -> String {
+    const MESA_HONEYKRISP: vk::DriverId = vk::DriverId::from_raw(26);
+    const MESA_KOSMICKRISP: vk::DriverId = vk::DriverId::from_raw(28);
+    let known_name = match driver.driver_id {
+        vk::DriverId::AMD_PROPRIETARY => Some("AMD"),
+        vk::DriverId::AMD_OPEN_SOURCE => Some("AMDVLK"),
+        vk::DriverId::MESA_RADV => Some("RADV"),
+        vk::DriverId::NVIDIA_PROPRIETARY => Some("Nvidia"),
+        vk::DriverId::INTEL_PROPRIETARY_WINDOWS => Some("Intel"),
+        vk::DriverId::INTEL_OPEN_SOURCE_MESA => Some("ANV"),
+        vk::DriverId::IMAGINATION_PROPRIETARY => Some("PowerVR"),
+        vk::DriverId::QUALCOMM_PROPRIETARY => Some("Qualcomm"),
+        vk::DriverId::ARM_PROPRIETARY => Some("Mali"),
+        vk::DriverId::GOOGLE_SWIFTSHADER => Some("SwiftShader"),
+        vk::DriverId::BROADCOM_PROPRIETARY => Some("Broadcom"),
+        vk::DriverId::MESA_LLVMPIPE => Some("llvmpipe"),
+        vk::DriverId::MOLTENVK => Some("MoltenVK"),
+        vk::DriverId::VERISILICON_PROPRIETARY => Some("Vivante"),
+        vk::DriverId::MESA_TURNIP => Some("Turnip"),
+        vk::DriverId::MESA_V3DV => Some("V3DV"),
+        vk::DriverId::MESA_PANVK => Some("PanVK"),
+        vk::DriverId::SAMSUNG_PROPRIETARY => Some("Xclipse"),
+        vk::DriverId::MESA_VENUS => Some("Venus"),
+        vk::DriverId::MESA_DOZEN => Some("Dozen"),
+        vk::DriverId::MESA_NVK => Some("NVK"),
+        vk::DriverId::IMAGINATION_OPEN_SOURCE_MESA => Some("PVR"),
+        MESA_HONEYKRISP => Some("HoneyKrisp"),
+        MESA_KOSMICKRISP => Some("KosmicKrisp"),
+        _ => None,
+    };
+    known_name.map(str::to_owned).unwrap_or_else(|| {
+        unsafe { CStr::from_ptr(driver.driver_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports for convenience — these map to C++ `vk::` namespace types
 // ---------------------------------------------------------------------------
@@ -400,6 +482,9 @@ pub type Span<'a, T> = &'a [T];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "system" fn one_tool(
         _physical_device: vk::PhysicalDevice,
@@ -423,11 +508,24 @@ mod tests {
         vk::Result::SUCCESS
     }
 
+    unsafe extern "system" fn incomplete_tools(
+        _physical_device: vk::PhysicalDevice,
+        count: *mut u32,
+        properties: *mut vk::PhysicalDeviceToolProperties,
+    ) -> vk::Result {
+        TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
+        if properties.is_null() {
+            unsafe { *count = 2 };
+            return vk::Result::ERROR_UNKNOWN;
+        }
+        unsafe { *count = 1 };
+        vk::Result::INCOMPLETE
+    }
+
     #[test]
     fn test_vulkan_error_display() {
         let err = VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED);
-        let msg = format!("{}", err);
-        assert!(msg.contains("ERROR_INITIALIZATION_FAILED"));
+        assert_eq!(err.to_string(), "VK_ERROR_INITIALIZATION_FAILED");
     }
 
     #[test]
@@ -489,5 +587,60 @@ mod tests {
             unsafe { CStr::from_ptr(tools[0].name.as_ptr()) }.to_bytes(),
             b"tool"
         );
+    }
+
+    #[test]
+    fn tooling_info_preserves_upstream_two_call_contract() {
+        TOOL_CALLS.store(0, Ordering::Relaxed);
+        let tools = enumerate_physical_device_tool_properties(
+            Some(incomplete_tools),
+            vk::PhysicalDevice::null(),
+        );
+        assert_eq!(TOOL_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn missing_debug_name_symbol_is_an_upstream_noop() {
+        let name = CString::new("framebuffer").unwrap();
+        assert!(set_object_name_with(
+            None,
+            vk::Device::null(),
+            vk::ObjectType::FRAMEBUFFER,
+            1,
+            &name,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn driver_names_match_upstream_and_fall_back_to_the_reported_name() {
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        driver.driver_id = vk::DriverId::NVIDIA_PROPRIETARY;
+        assert_eq!(get_driver_name(&driver), "Nvidia");
+        driver.driver_id = vk::DriverId::MESA_LLVMPIPE;
+        assert_eq!(get_driver_name(&driver), "llvmpipe");
+        driver.driver_id = vk::DriverId::from_raw(26);
+        assert_eq!(get_driver_name(&driver), "HoneyKrisp");
+        driver.driver_id = vk::DriverId::from_raw(28);
+        assert_eq!(get_driver_name(&driver), "KosmicKrisp");
+
+        driver.driver_id = vk::DriverId::from_raw(-1);
+        driver.driver_name[..9].copy_from_slice(&[
+            b'f' as _, b'a' as _, b'l' as _, b'l' as _, b'b' as _, b'a' as _, b'c' as _, b'k' as _,
+            0,
+        ]);
+        assert_eq!(get_driver_name(&driver), "fallback");
+    }
+
+    #[test]
+    fn instance_application_versions_match_upstream() {
+        let name = CString::new("ruzu Emulator").unwrap();
+        let info = make_application_info(&name);
+        assert_eq!(info.application_version, vk::make_api_version(0, 1, 3, 0));
+        assert_eq!(info.engine_version, vk::make_api_version(0, 1, 3, 0));
+        assert_eq!(info.api_version, vk::API_VERSION_1_3);
+        assert_eq!(unsafe { CStr::from_ptr(info.p_application_name) }, &*name);
+        assert_eq!(unsafe { CStr::from_ptr(info.p_engine_name) }, &*name);
     }
 }

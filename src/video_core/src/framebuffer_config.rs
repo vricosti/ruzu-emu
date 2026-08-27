@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of video_core/framebuffer_config.h and video_core/framebuffer_config.cpp
-//!
-//! Framebuffer configuration for the display compositor.
+//! Port of `video_core/framebuffer_config.h` and `framebuffer_config.cpp`.
 
-/// Device address type.
+use common::math_util::Rectangle;
+use ruzu_core::hle::service::nvnflinger::buffer_transform_flags::BufferTransformFlags;
+use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat;
+
+/// Represents a pointer in the device-specific virtual address space.
 pub type DAddr = u64;
 
-/// Blend mode for framebuffer compositing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
     #[default]
@@ -17,56 +18,7 @@ pub enum BlendMode {
     Coverage,
 }
 
-/// Buffer transform flags (matching android BufferTransformFlags).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BufferTransformFlags(pub u32);
-
-impl BufferTransformFlags {
-    pub const FLIP_H: Self = Self(0x01);
-    pub const FLIP_V: Self = Self(0x02);
-
-    pub fn contains(&self, flag: Self) -> bool {
-        self.0 & flag.0 != 0
-    }
-
-    pub fn remove(&mut self, flag: Self) {
-        self.0 &= !flag.0;
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0 == 0
-    }
-}
-
-/// Android pixel format (stub; full definition in nvnflinger).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct AndroidPixelFormat(pub u32);
-
-/// A rectangle with integer coordinates.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RectI {
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-}
-
-impl RectI {
-    pub fn is_empty(&self) -> bool {
-        self.left == 0 && self.top == 0 && self.right == 0 && self.bottom == 0
-    }
-}
-
-/// A rectangle with float coordinates.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RectF {
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
-}
-
-/// Framebuffer configuration descriptor.
+/// Port of `Tegra::FramebufferConfig`.
 #[derive(Debug, Clone, Default)]
 pub struct FramebufferConfig {
     pub address: DAddr,
@@ -74,20 +26,18 @@ pub struct FramebufferConfig {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
-    pub pixel_format: AndroidPixelFormat,
+    pub pixel_format: PixelFormat,
     pub transform_flags: BufferTransformFlags,
-    pub crop_rect: RectI,
+    pub crop_rect: Rectangle<i32>,
     pub blending: BlendMode,
 }
 
-/// Normalize the crop rectangle to [0..1] UV coordinates.
-///
-/// Applies horizontal/vertical flip based on transform flags.
+/// Port of `Tegra::NormalizeCrop`.
 pub fn normalize_crop(
     framebuffer: &FramebufferConfig,
     texture_width: u32,
     texture_height: u32,
-) -> RectF {
+) -> Rectangle<f32> {
     let (mut left, mut top, mut right, mut bottom);
 
     if !framebuffer.crop_rect.is_empty() {
@@ -102,31 +52,75 @@ pub fn normalize_crop(
         bottom = framebuffer.height as f32;
     }
 
-    let mut transform_flags = framebuffer.transform_flags;
+    let mut framebuffer_transform_flags = framebuffer.transform_flags;
 
-    if transform_flags.contains(BufferTransformFlags::FLIP_H) {
+    if framebuffer_transform_flags.contains(BufferTransformFlags::FLIP_H) {
         std::mem::swap(&mut left, &mut right);
     }
-    if transform_flags.contains(BufferTransformFlags::FLIP_V) {
+    if framebuffer_transform_flags.contains(BufferTransformFlags::FLIP_V) {
         std::mem::swap(&mut top, &mut bottom);
     }
 
-    transform_flags.remove(BufferTransformFlags::FLIP_H);
-    transform_flags.remove(BufferTransformFlags::FLIP_V);
-    if !transform_flags.is_empty() {
+    framebuffer_transform_flags.remove(BufferTransformFlags::FLIP_H);
+    framebuffer_transform_flags.remove(BufferTransformFlags::FLIP_V);
+    if !framebuffer_transform_flags.is_empty() {
         log::warn!(
             "Unsupported framebuffer_transform_flags={}",
-            transform_flags.0
+            framebuffer_transform_flags.bits()
         );
     }
 
-    let tw = texture_width as f32;
-    let th = texture_height as f32;
+    left /= texture_width as f32;
+    top /= texture_height as f32;
+    right /= texture_width as f32;
+    bottom /= texture_height as f32;
 
-    RectF {
-        left: left / tw,
-        top: top / th,
-        right: right / tw,
-        bottom: bottom / th,
+    Rectangle {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_width_crop_uses_framebuffer_dimensions() {
+        let framebuffer = FramebufferConfig {
+            width: 640,
+            height: 360,
+            crop_rect: Rectangle::new(12, 24, 12, 96),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_crop(&framebuffer, 640, 360),
+            Rectangle::new(0.0, 0.0, 1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn crop_and_flip_order_matches_upstream() {
+        let framebuffer = FramebufferConfig {
+            crop_rect: Rectangle::new(16, 8, 80, 40),
+            transform_flags: BufferTransformFlags::FLIP_H | BufferTransformFlags::FLIP_V,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_crop(&framebuffer, 128, 64),
+            Rectangle::new(0.625, 0.625, 0.125, 0.125)
+        );
+    }
+
+    #[test]
+    fn framebuffer_uses_canonical_android_types() {
+        let framebuffer = FramebufferConfig::default();
+        let _: PixelFormat = framebuffer.pixel_format;
+        let _: BufferTransformFlags = framebuffer.transform_flags;
+        let _: Rectangle<i32> = framebuffer.crop_rect;
     }
 }

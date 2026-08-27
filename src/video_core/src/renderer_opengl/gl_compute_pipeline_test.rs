@@ -28,6 +28,24 @@ fn compute_texture_bindings_keep_upstream_static_vector_capacities() {
 }
 
 #[test]
+#[should_panic(expected = "image-view bindings exceed Eden's static_vector capacity")]
+fn compute_texture_bindings_do_not_spill_views_past_upstream_capacity() {
+    let mut bindings = ComputeTextureBindings::default();
+    for _ in 0..=(MAX_TEXTURES + MAX_IMAGES) {
+        bindings.push_view(ImageViewInOut::default());
+    }
+}
+
+#[test]
+#[should_panic(expected = "sampler bindings exceed Eden's static_vector capacity")]
+fn compute_texture_bindings_do_not_spill_samplers_past_upstream_capacity() {
+    let mut bindings = ComputeTextureBindings::default();
+    for index in 0..=MAX_TEXTURES {
+        bindings.push_sampler(SamplerId { index });
+    }
+}
+
+#[test]
 fn compute_pipeline_key_hash() {
     let key = ComputePipelineKey {
         unique_hash: 0x1234,

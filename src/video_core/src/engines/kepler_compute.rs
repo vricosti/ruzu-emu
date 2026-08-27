@@ -13,10 +13,8 @@ use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
-use super::{ClassId, Engine, PendingWrite};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
-#[cfg(test)]
 use crate::textures::texture::{TicEntry, TscEntry};
 
 // ── Register offset constants (method addresses) ────────────────────────────
@@ -490,10 +488,11 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTICEntry`.
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn get_tic_entry(&self, tic_index: u32) -> TicEntry {
-        let tic_address_gpu =
-            self.tic_address() + tic_index as u64 * std::mem::size_of::<TicEntry>() as u64;
+        let tic_address_gpu = self
+            .tic_address()
+            .wrapping_add((tic_index as u64).wrapping_mul(std::mem::size_of::<TicEntry>() as u64));
         let mut bytes = [0u8; std::mem::size_of::<TicEntry>()];
         self.memory_manager
             .lock()
@@ -502,10 +501,11 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTSCEntry`.
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn get_tsc_entry(&self, tsc_index: u32) -> TscEntry {
-        let tsc_address_gpu =
-            self.tsc_address() + tsc_index as u64 * std::mem::size_of::<TscEntry>() as u64;
+        let tsc_address_gpu = self
+            .tsc_address()
+            .wrapping_add((tsc_index as u64).wrapping_mul(std::mem::size_of::<TscEntry>() as u64));
         let mut bytes = [0u8; std::mem::size_of::<TscEntry>()];
         self.memory_manager
             .lock()
@@ -550,6 +550,10 @@ impl EngineInterface for KeplerCompute {
         }
     }
 
+    fn has_pending_methods(&self) -> bool {
+        !self.interface_state.method_sink.is_empty()
+    }
+
     fn execution_mask(&self) -> &[bool] {
         &self.interface_state.execution_mask
     }
@@ -571,20 +575,13 @@ impl EngineInterface for KeplerCompute {
     }
 }
 
-impl Engine for KeplerCompute {
-    fn class_id(&self) -> ClassId {
-        ClassId::Compute
-    }
-
+#[cfg(test)]
+impl KeplerCompute {
     fn write_reg(&mut self, method: u32, value: u32) {
         if method != LAUNCH {
             log::trace!("KeplerCompute: reg[0x{:X}] = 0x{:X}", method, value);
         }
         self.call_method(method, value, true);
-    }
-
-    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        vec![]
     }
 }
 
@@ -636,6 +633,7 @@ mod tests {
         dirty_size: u64,
         dispatches: Cell<u32>,
         last_dispatch: RefCell<Option<DispatchCall>>,
+        inline_uploads: RefCell<Vec<(u64, usize, Vec<u8>)>>,
     }
 
     impl TestRasterizer {
@@ -646,6 +644,7 @@ mod tests {
                 dirty_size,
                 dispatches: Cell::new(0),
                 last_dispatch: RefCell::new(None),
+                inline_uploads: RefCell::new(Vec::new()),
             }
         }
     }
@@ -726,7 +725,7 @@ mod tests {
             RasterizerDownloadArea {
                 start_address: 0,
                 end_address: 0,
-                preemptive: false,
+                preemtive: false,
             }
         }
 
@@ -777,19 +776,11 @@ mod tests {
             false
         }
 
-        fn accelerate_inline_to_memory(
-            &mut self,
-            _address: u64,
-            _copy_size: usize,
-            _memory: &[u8],
-        ) {
+        fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
+            self.inline_uploads
+                .borrow_mut()
+                .push((address, copy_size, memory.to_vec()));
         }
-    }
-
-    #[test]
-    fn test_class_id() {
-        let engine = new_test_engine();
-        assert_eq!(engine.class_id(), ClassId::Compute);
     }
 
     #[test]
@@ -1082,6 +1073,8 @@ mod tests {
 
         let mut engine = KeplerCompute::new(Arc::clone(&memory_manager));
         let rasterizer = TestRasterizer::new(0x8000_0000, 4);
+        memory_manager.lock().bind_rasterizer(&rasterizer);
+        engine.bind_rasterizer(&rasterizer);
         engine.set_current_dma_segment(0x10000);
 
         engine.regs[LAUNCH_DESC_LOC as usize] = (launch_desc >> 8) as u32;
@@ -1097,12 +1090,14 @@ mod tests {
         engine.call_method(EXEC_UPLOAD, 1, true);
         engine.call_method(DATA_UPLOAD, 0x0000_0042, true);
         assert_eq!(
-            &backing[0x1000 + 0x0C * 4..0x1000 + 0x0C * 4 + 4],
-            &[0x42, 0, 0, 0]
+            rasterizer.inline_uploads.borrow().as_slice(),
+            &[(
+                launch_desc + 0x0C * 4,
+                4,
+                0x0000_0042u32.to_ne_bytes().to_vec(),
+            )]
         );
         engine.call_method(EXEC_UPLOAD, 1, true);
-        memory_manager.lock().bind_rasterizer(&rasterizer);
-        engine.bind_rasterizer(&rasterizer);
 
         engine.call_method(LAUNCH, 1, true);
 
@@ -1146,19 +1141,6 @@ mod tests {
         assert!(engine.rasterizer.is_none());
         engine.bind_rasterizer(&rasterizer);
         assert!(engine.rasterizer.is_some());
-    }
-
-    #[test]
-    fn test_no_pending_no_dispatch() {
-        let mut engine = new_test_engine();
-
-        // Call execute_pending without writing LAUNCH.
-        let writes = engine.execute_pending(&|_addr, _buf| {
-            panic!("should not read GPU memory");
-        });
-        assert!(writes.is_empty());
-
-        assert_eq!(engine.launch_description, LaunchParams::default());
     }
 
     #[test]

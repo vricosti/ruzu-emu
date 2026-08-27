@@ -98,8 +98,8 @@ pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
 
-use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
 use crate::environment::Environment;
+use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
 use crate::ir::emitter::Emitter;
 use crate::ir::program::Program;
 use crate::ir::types::ShaderStage;
@@ -154,11 +154,7 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// Construct the runtime visitor with the same environment ownership as
     /// upstream `TranslatorVisitor(Environment&, IR::Block&)`.
-    pub fn new_with_env(
-        program: &'a mut Program,
-        block: u32,
-        env: &'a dyn Environment,
-    ) -> Self {
+    pub fn new_with_env(program: &'a mut Program, block: u32, env: &'a dyn Environment) -> Self {
         let stage = env.shader_stage();
         Self {
             ir: Emitter::new(program, block),
@@ -1088,6 +1084,17 @@ mod tests {
     }
 
     #[test]
+    fn invalid_encoding_falls_back_to_nop_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0);
+
+        assert!(tv.ir.program.blocks[0].is_empty());
+    }
+
+    #[test]
     fn regression_i2i_cc_feeds_csetp_through_ssa() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
@@ -1293,4 +1300,5 @@ mod tests {
 
         assert!(tv.ir.program.blocks[0].is_empty());
     }
+
 }

@@ -629,7 +629,6 @@ impl GpuMemoryManager {
     /// Returns true if a closure signaled early exit.
     ///
     /// Upstream: `MemoryOperation<true>(...)`.
-    #[allow(dead_code)]
     fn memory_operation_big<FM, FR, FU>(
         &self,
         gpu_src_addr: u64,
@@ -670,7 +669,6 @@ impl GpuMemoryManager {
     /// Walk small pages, calling the appropriate closure for each page's entry type.
     ///
     /// Upstream: `MemoryOperation<false>(...)`.
-    #[allow(dead_code)]
     fn memory_operation_small<FM, FR, FU>(
         &self,
         gpu_src_addr: u64,
@@ -706,6 +704,44 @@ impl GpuMemoryManager {
             current_address += copy_amount as u64;
         }
         false
+    }
+
+    /// Apply a callback to the mapped device-memory chunks produced by
+    /// Eden's nested `MemoryOperation` walk, without coalescing adjacent
+    /// pages. Returning true stops the walk like Eden's bool callbacks.
+    fn for_each_mapped_device_segment(
+        &self,
+        gpu_addr: u64,
+        size: u64,
+        callback: impl FnMut(u64, u64) -> bool,
+    ) -> bool {
+        let callback = std::cell::RefCell::new(callback);
+
+        self.memory_operation_big(
+            gpu_addr,
+            size,
+            |page_index, offset, copy_amount| {
+                let dev_addr =
+                    ((self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS) + offset as u64;
+                callback.borrow_mut()(dev_addr, copy_amount as u64)
+            },
+            |_, _, _| false,
+            |page_index, offset, copy_amount| {
+                let base = ((page_index as u64) << self.big_page_bits) + offset as u64;
+                self.memory_operation_small(
+                    base,
+                    copy_amount as u64,
+                    |small_page_index, small_offset, small_copy_amount| {
+                        let dev_addr = ((self.page_table[small_page_index] as u64)
+                            << CPU_PAGE_BITS)
+                            + small_offset as u64;
+                        callback.borrow_mut()(dev_addr, small_copy_amount as u64)
+                    },
+                    |_, _, _| false,
+                    |_, _, _| false,
+                )
+            },
+        )
     }
 
     // ── Read/Write block operations ─────────────────────────────────────
@@ -1324,7 +1360,7 @@ impl GpuMemoryManager {
         if self.get_entry_big(gpu_addr) == EntryType::Mapped {
             let page_index = (gpu_addr >> self.big_page_bits) as usize;
             if self.is_big_page_continuous(page_index) {
-                let page = (gpu_addr & self.big_page_mask) + size;
+                let page = ((page_index as u64) & self.big_page_mask) + size;
                 return page <= self.big_page_size;
             }
             let page = (gpu_addr & DEVICE_PAGE_MASK) + size;
@@ -1776,12 +1812,17 @@ impl GpuMemoryManager {
     }
 
     pub fn flush_region_with_cache_type(&mut self, gpu_addr: u64, size: u64, which: CacheType) {
-        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
-        let _ = self.with_rasterizer_mut(|rasterizer| {
-            for (addr, map_size) in ranges {
-                rasterizer.flush_region(addr, map_size, which);
-            }
-        });
+        let Some(handle) = self.rasterizer else {
+            return;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                self.for_each_mapped_device_segment(gpu_addr, size, |addr, map_size| {
+                    rasterizer.flush_region(addr, map_size, which);
+                    false
+                });
+            });
+        }
     }
 
     /// Upstream: `MemoryManager::InvalidateRegion(gpu_addr, size)`.
@@ -1795,27 +1836,29 @@ impl GpuMemoryManager {
         size: u64,
         which: CacheType,
     ) {
-        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
-        let _ = self.with_rasterizer_mut(|rasterizer| {
-            for (addr, map_size) in ranges {
-                rasterizer.invalidate_region(addr, map_size, which);
-            }
-        });
+        let Some(handle) = self.rasterizer else {
+            return;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                self.for_each_mapped_device_segment(gpu_addr, size, |addr, map_size| {
+                    rasterizer.invalidate_region(addr, map_size, which);
+                    false
+                });
+            });
+        }
     }
 
     /// Upstream: `MemoryManager::FlushCaching()`.
     pub fn flush_caching(&mut self) {
-        if !self.accumulator.any_accumulated() {
-            return;
-        }
-
-        let mut gpu_ranges = Vec::new();
-        self.accumulator
-            .callback(|addr, size| gpu_ranges.push((addr, size)));
-
         let mut device_ranges = Vec::new();
-        for (addr, size) in gpu_ranges {
+        let mut accumulator = std::mem::take(&mut self.accumulator);
+        let invalidated = accumulator.invalidate_all(|addr, size| {
             device_ranges.extend(self.get_submapped_device_ranges(addr, size as u64));
+        });
+        self.accumulator = accumulator;
+        if !invalidated {
+            return;
         }
 
         let _ = self.with_rasterizer_mut(|rasterizer| {
@@ -1825,8 +1868,6 @@ impl GpuMemoryManager {
                 .collect();
             rasterizer.inner_invalidation(&sequences);
         });
-
-        self.accumulator.clear();
     }
 
     /// Check if a GPU address is within the valid address range.
@@ -1847,13 +1888,16 @@ impl GpuMemoryManager {
         size: u64,
         which: CacheType,
     ) -> bool {
-        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
-        self.with_rasterizer_mut(|rasterizer| {
-            ranges
-                .into_iter()
-                .any(|(addr, map_size)| rasterizer.must_flush_region(addr, map_size, which))
-        })
-        .unwrap_or(false)
+        let Some(handle) = self.rasterizer else {
+            return false;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                self.for_each_mapped_device_segment(gpu_addr, size, |addr, map_size| {
+                    rasterizer.must_flush_region(addr, map_size, which)
+                })
+            })
+        }
     }
 
     /// Read a value of type `T` from GPU virtual address space.
@@ -1933,7 +1977,6 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 /// Wraps `GpuMemoryManager` with the outer API expected by channel_state, gpu.rs,
 /// nvdrv, etc.
 pub struct MemoryManager {
-    id: usize,
     inner: GpuMemoryManager,
     /// Upstream stores `MaxwellDeviceMemoryManager& memory` directly.
     /// Rust keeps the Host1x owner as an `Arc` while the broader owner graph is
@@ -1942,6 +1985,9 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
+    /// Upstream `MemoryManager::HAS_FLUSH_INVALIDATION`.
+    pub const HAS_FLUSH_INVALIDATION: bool = true;
+
     /// Reduced test constructor. Upstream runtime constructors always receive
     /// `Core::System&` and resolve `MaxwellDeviceMemoryManager&` from it or
     /// receive the device-memory owner explicitly.
@@ -1977,22 +2023,26 @@ impl MemoryManager {
         page_bits: u64,
     ) -> Self {
         let inner_device_memory = Arc::clone(&device_memory);
+        let mut inner = GpuMemoryManager::with_params_and_device_memory(
+            inner_device_memory,
+            address_space_bits,
+            split_address,
+            big_page_bits,
+            page_bits,
+        );
+        // The Rust GPU owner allocates the address-space identifier before it
+        // constructs this object. Keep the identifier on the actual upstream
+        // MemoryManager counterpart so GetID and ModifyGPUMemory cannot diverge.
+        inner.unique_identifier = id;
         Self {
-            id,
-            inner: GpuMemoryManager::with_params_and_device_memory(
-                inner_device_memory,
-                address_space_bits,
-                split_address,
-                big_page_bits,
-                page_bits,
-            ),
+            inner,
             device_memory,
         }
     }
 
     /// Upstream: `MemoryManager::GetID()`.
     pub fn get_id(&self) -> usize {
-        self.id
+        self.inner.get_id()
     }
 
     pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {
@@ -2361,6 +2411,7 @@ mod tests {
         invalidate_cache_types: Arc<Mutex<Vec<CacheType>>>,
         inner_invalidation_calls: Arc<Mutex<Vec<Vec<(u64, usize)>>>>,
         dirty_regions: Arc<Mutex<Vec<(u64, u64)>>>,
+        must_flush_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         must_flush_cache_types: Arc<Mutex<Vec<CacheType>>>,
     }
 
@@ -2376,6 +2427,7 @@ mod tests {
                 invalidate_cache_types: Arc::new(Mutex::new(Vec::new())),
                 inner_invalidation_calls: Arc::new(Mutex::new(Vec::new())),
                 dirty_regions: Arc::new(Mutex::new(Vec::new())),
+                must_flush_calls: Arc::new(Mutex::new(Vec::new())),
                 must_flush_cache_types: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -2436,6 +2488,7 @@ mod tests {
             self.flush_cache_types.lock().unwrap().push(which);
         }
         fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool {
+            self.must_flush_calls.lock().unwrap().push((addr, size));
             self.must_flush_cache_types.lock().unwrap().push(which);
             self.dirty_regions.lock().unwrap().contains(&(addr, size))
         }
@@ -2443,7 +2496,7 @@ mod tests {
             RasterizerDownloadArea {
                 start_address: addr,
                 end_address: addr + size,
-                preemptive: false,
+                preemtive: false,
             }
         }
         fn invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
@@ -2676,7 +2729,13 @@ mod tests {
         mm.unmap(0x10000, 0x1000);
 
         assert!(mm.has_bound_rasterizer());
-        assert_eq!(modify_calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            *modify_calls.lock().unwrap(),
+            vec![
+                (mm.get_id(), 0x10000, 0x1000),
+                (mm.get_id(), 0x10000, 0x1000)
+            ]
+        );
         assert_eq!(*unmap_calls.lock().unwrap(), vec![(0x9000_0000, 0x1000)]);
     }
 
@@ -2687,20 +2746,46 @@ mod tests {
         let flush_calls = Arc::clone(&rasterizer.flush_calls);
         let invalidate_calls = Arc::clone(&rasterizer.invalidate_calls);
         let dirty_regions = Arc::clone(&rasterizer.dirty_regions);
+        let must_flush_calls = Arc::clone(&rasterizer.must_flush_calls);
 
         mm.bind_rasterizer(&rasterizer);
         mm.map(0x20000, 0x9100_0000, 0x2000, 0, false);
-        dirty_regions.lock().unwrap().push((0x9100_0000, 0x2000));
+        dirty_regions.lock().unwrap().push((0x9100_1000, 0x1000));
 
         assert!(mm.inner.is_memory_dirty(0x20000, 0x2000));
         mm.flush_region(0x20000, 0x2000);
         mm.invalidate_region(0x20000, 0x2000);
 
-        assert_eq!(*flush_calls.lock().unwrap(), vec![(0x9100_0000, 0x2000)]);
+        assert_eq!(
+            *must_flush_calls.lock().unwrap(),
+            vec![(0x9100_0000, 0x1000), (0x9100_1000, 0x1000)]
+        );
+        assert_eq!(
+            *flush_calls.lock().unwrap(),
+            vec![(0x9100_0000, 0x1000), (0x9100_1000, 0x1000)]
+        );
         assert_eq!(
             *invalidate_calls.lock().unwrap(),
-            vec![(0x9100_0000, 0x2000)]
+            vec![(0x9100_0000, 0x1000), (0x9100_1000, 0x1000)]
         );
+    }
+
+    #[test]
+    fn granular_big_page_range_uses_upstream_page_index_mask() {
+        let mut mm = GpuMemoryManager::new();
+        let gpu_addr = 0x10_0000;
+        mm.big_page_table_op(
+            EntryType::Mapped,
+            gpu_addr,
+            0x9000_0000,
+            mm.big_page_size,
+            PteKind::INVALID,
+        );
+        let page_index = mm.page_entry_index_big(gpu_addr);
+        mm.set_big_page_continuous(page_index, true);
+
+        assert!(mm.is_granular_range(gpu_addr, mm.big_page_size - page_index as u64));
+        assert!(!mm.is_granular_range(gpu_addr, mm.big_page_size));
     }
 
     #[test]

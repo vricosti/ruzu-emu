@@ -27,216 +27,18 @@ pub const BYTES_PER_WORD: u64 = PAGES_PER_WORD * BYTES_PER_PAGE;
 // ---------------------------------------------------------------------------
 
 /// Which tracking channel a query / mutation targets.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
-    Cpu,
-    Gpu,
-    CachedCpu,
-    Untracked,
-    Preflushable,
+    Cpu = 0,
+    Gpu = 1,
+    CachedCpu = 2,
+    Untracked = 3,
+    Preflushable = 4,
+    Max = 5,
 }
 
-// ---------------------------------------------------------------------------
-// WordsArray<N> — small-vector-optimized bitmask storage
-// ---------------------------------------------------------------------------
-
-/// Vector tracking modified pages, tightly packed with small vector optimization.
-///
-/// When the buffer is small enough (`num_words <= STACK_WORDS`), the bits live
-/// on the stack. Otherwise they are heap-allocated.
-pub struct WordsArray<const STACK_WORDS: usize> {
-    /// Small-buffer stack storage.
-    pub stack: [u64; STACK_WORDS],
-    /// Heap pointer used when the buffer does not fit on the stack.
-    /// When using stack storage this is left dangling / uninitialized.
-    pub heap: *mut u64,
-}
-
-// Manual impls because raw pointer prevents auto-derive.
-unsafe impl<const N: usize> Send for WordsArray<N> {}
-unsafe impl<const N: usize> Sync for WordsArray<N> {}
-
-impl<const N: usize> Default for WordsArray<N> {
-    fn default() -> Self {
-        Self {
-            stack: [0u64; N],
-            heap: std::ptr::null_mut(),
-        }
-    }
-}
-
-impl<const N: usize> WordsArray<N> {
-    /// Returns a pointer to the words state.
-    #[inline]
-    pub fn pointer(&self, is_short: bool) -> *const u64 {
-        if is_short {
-            self.stack.as_ptr()
-        } else {
-            self.heap as *const u64
-        }
-    }
-
-    /// Returns a mutable pointer to the words state.
-    #[inline]
-    pub fn pointer_mut(&mut self, is_short: bool) -> *mut u64 {
-        if is_short {
-            self.stack.as_mut_ptr()
-        } else {
-            self.heap
-        }
-    }
-
-    /// Returns a slice view into the active storage.
-    #[inline]
-    pub fn as_slice(&self, is_short: bool, num_words: usize) -> &[u64] {
-        unsafe { std::slice::from_raw_parts(self.pointer(is_short), num_words) }
-    }
-
-    /// Returns a mutable slice view into the active storage.
-    #[inline]
-    pub fn as_mut_slice(&mut self, is_short: bool, num_words: usize) -> &mut [u64] {
-        unsafe { std::slice::from_raw_parts_mut(self.pointer_mut(is_short), num_words) }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Words<N> — the five tracking channels for one region
-// ---------------------------------------------------------------------------
-
-/// Tracks five channels of page-level dirty bits for a memory region.
-///
-/// Corresponds to the C++ `Words<stack_words>` template.
-pub struct Words<const STACK_WORDS: usize> {
-    pub size_bytes: u64,
-    pub num_words: usize,
-    pub cpu: WordsArray<STACK_WORDS>,
-    pub gpu: WordsArray<STACK_WORDS>,
-    pub cached_cpu: WordsArray<STACK_WORDS>,
-    pub untracked: WordsArray<STACK_WORDS>,
-    pub preflushable: WordsArray<STACK_WORDS>,
-}
-
-impl<const STACK_WORDS: usize> Default for Words<STACK_WORDS> {
-    fn default() -> Self {
-        Self {
-            size_bytes: 0,
-            num_words: 0,
-            cpu: WordsArray::default(),
-            gpu: WordsArray::default(),
-            cached_cpu: WordsArray::default(),
-            untracked: WordsArray::default(),
-            preflushable: WordsArray::default(),
-        }
-    }
-}
-
-impl<const STACK_WORDS: usize> Words<STACK_WORDS> {
-    /// Create a new `Words` tracking `size_bytes` of memory.
-    pub fn new(size_bytes: u64) -> Self {
-        let num_words = common::div_ceil::div_ceil(size_bytes, BYTES_PER_WORD) as usize;
-        let mut words = Self {
-            size_bytes,
-            num_words,
-            cpu: WordsArray::default(),
-            gpu: WordsArray::default(),
-            cached_cpu: WordsArray::default(),
-            untracked: WordsArray::default(),
-            preflushable: WordsArray::default(),
-        };
-
-        if words.is_short() {
-            words.cpu.stack.fill(!0u64);
-            words.gpu.stack.fill(0);
-            words.cached_cpu.stack.fill(0);
-            words.untracked.stack.fill(!0u64);
-            words.preflushable.stack.fill(0);
-        } else {
-            // Share allocation between all five channels
-            let layout = std::alloc::Layout::array::<u64>(num_words * 5).unwrap();
-            let alloc = unsafe { std::alloc::alloc_zeroed(layout) as *mut u64 };
-            assert!(!alloc.is_null(), "allocation failed");
-
-            words.cpu.heap = alloc;
-            words.gpu.heap = unsafe { alloc.add(num_words) };
-            words.cached_cpu.heap = unsafe { alloc.add(num_words * 2) };
-            words.untracked.heap = unsafe { alloc.add(num_words * 3) };
-            words.preflushable.heap = unsafe { alloc.add(num_words * 4) };
-
-            // cpu: all 1s, gpu: 0, cached_cpu: 0, untracked: all 1s, preflushable: 0
-            unsafe {
-                std::ptr::write_bytes(words.cpu.heap, 0xFF, num_words);
-                // gpu, cached_cpu already zeroed
-                std::ptr::write_bytes(words.untracked.heap, 0xFF, num_words);
-                // preflushable already zeroed
-            }
-        }
-
-        // Clean up trailing bits in the last word
-        let last_word_size = size_bytes % BYTES_PER_WORD;
-        let last_local_page = common::div_ceil::div_ceil(last_word_size, BYTES_PER_PAGE);
-        let shift = (PAGES_PER_WORD - last_local_page) % PAGES_PER_WORD;
-        let last_word = (!0u64 << shift) >> shift;
-
-        let is_short = words.is_short();
-        let nw = words.num_words;
-        if nw > 0 {
-            words.cpu.as_mut_slice(is_short, nw)[nw - 1] = last_word;
-            words.untracked.as_mut_slice(is_short, nw)[nw - 1] = last_word;
-        }
-
-        words
-    }
-
-    /// Returns true when the buffer fits in the small vector optimization.
-    #[inline]
-    pub fn is_short(&self) -> bool {
-        self.num_words <= STACK_WORDS
-    }
-
-    /// Returns the number of words.
-    #[inline]
-    pub fn num_words(&self) -> usize {
-        self.num_words
-    }
-
-    /// Get a slice for the given tracking type.
-    pub fn span(&self, ty: Type) -> &[u64] {
-        let is_short = self.is_short();
-        let n = self.num_words;
-        match ty {
-            Type::Cpu => self.cpu.as_slice(is_short, n),
-            Type::Gpu => self.gpu.as_slice(is_short, n),
-            Type::CachedCpu => self.cached_cpu.as_slice(is_short, n),
-            Type::Untracked => self.untracked.as_slice(is_short, n),
-            Type::Preflushable => self.preflushable.as_slice(is_short, n),
-        }
-    }
-
-    /// Get a mutable slice for the given tracking type.
-    pub fn span_mut(&mut self, ty: Type) -> &mut [u64] {
-        let is_short = self.is_short();
-        let n = self.num_words;
-        match ty {
-            Type::Cpu => self.cpu.as_mut_slice(is_short, n),
-            Type::Gpu => self.gpu.as_mut_slice(is_short, n),
-            Type::CachedCpu => self.cached_cpu.as_mut_slice(is_short, n),
-            Type::Untracked => self.untracked.as_mut_slice(is_short, n),
-            Type::Preflushable => self.preflushable.as_mut_slice(is_short, n),
-        }
-    }
-}
-
-impl<const STACK_WORDS: usize> Drop for Words<STACK_WORDS> {
-    fn drop(&mut self) {
-        if !self.is_short() && !self.cpu.heap.is_null() {
-            // CPU heap is the base for the single shared allocation
-            let layout = std::alloc::Layout::array::<u64>(self.num_words * 5).unwrap();
-            unsafe {
-                std::alloc::dealloc(self.cpu.heap as *mut u8, layout);
-            }
-        }
-    }
-}
+const TYPE_COUNT: usize = Type::Max as usize;
 
 // ---------------------------------------------------------------------------
 // DeviceTracker trait — abstraction for the rasterizer notification callback
@@ -253,38 +55,83 @@ pub trait DeviceTracker {
 }
 
 // ---------------------------------------------------------------------------
-// WordManager<DT, STACK_WORDS>
+// WordManager<DT, STACK_WORDS, SIZE_BYTES>
 // ---------------------------------------------------------------------------
 
 /// Per-region word-level dirty tracker.
 ///
-/// Corresponds to the C++ `WordManager<DeviceTracker, stack_words>` template.
-pub struct WordManager<DT: DeviceTracker, const STACK_WORDS: usize = 1> {
-    cpu_addr: VAddr,
+/// Corresponds to the C++
+/// `WordManager<DeviceTracker, stack_words, size_bytes>` template.
+#[repr(C)]
+pub struct WordManager<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64> {
+    // Stable Rust cannot use `Type::Max * num_words` as a generic array
+    // expression, so preserve the same fixed inline storage as one array per
+    // tracking type. The type-major, word-minor ordering is unchanged.
+    heap: [[u64; STACK_WORDS]; TYPE_COUNT],
     tracker: *const DT,
-    words: Words<STACK_WORDS>,
+    cpu_addr: VAddr,
 }
 
-unsafe impl<DT: DeviceTracker, const N: usize> Send for WordManager<DT, N> {}
-unsafe impl<DT: DeviceTracker, const N: usize> Sync for WordManager<DT, N> {}
+unsafe impl<DT: DeviceTracker, const N: usize, const S: u64> Send for WordManager<DT, N, S> {}
+unsafe impl<DT: DeviceTracker, const N: usize, const S: u64> Sync for WordManager<DT, N, S> {}
 
-impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
-    /// Create a new word manager for a region starting at `cpu_addr` of `size_bytes`.
-    pub fn new(cpu_addr: VAddr, tracker: &DT, size_bytes: u64) -> Self {
+impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
+    WordManager<DT, STACK_WORDS, SIZE_BYTES>
+{
+    /// Matching upstream `static constexpr size_t num_words`.
+    pub const NUM_WORDS: usize = SIZE_BYTES.div_ceil(BYTES_PER_WORD) as usize;
+
+    /// Create a new word manager for a region starting at `cpu_addr`.
+    pub fn new(cpu_addr: VAddr, tracker: &DT) -> Self {
+        Self::assert_template_parameters();
+
+        let mut heap = [[0; STACK_WORDS]; TYPE_COUNT];
+        heap[Type::Cpu as usize].fill(!0);
+        heap[Type::Untracked as usize].fill(!0);
+
+        // Clean up trailing bits exactly like the upstream constructor.
+        let last_word_size = SIZE_BYTES % BYTES_PER_WORD;
+        let last_local_page = last_word_size.div_ceil(BYTES_PER_PAGE);
+        let shift = (PAGES_PER_WORD - last_local_page) % PAGES_PER_WORD;
+        let last_word = (!0u64 << shift) >> shift;
+        heap[Type::Cpu as usize][STACK_WORDS - 1] = last_word;
+        heap[Type::Untracked as usize][STACK_WORDS - 1] = last_word;
+
         Self {
-            cpu_addr,
+            heap,
             tracker: tracker as *const DT,
-            words: Words::new(size_bytes),
+            cpu_addr,
         }
     }
 
     /// Create a default (empty) word manager.
     pub fn empty() -> Self {
+        Self::assert_template_parameters();
         Self {
-            cpu_addr: 0,
+            heap: [[0; STACK_WORDS]; TYPE_COUNT],
             tracker: std::ptr::null(),
-            words: Words::default(),
+            cpu_addr: 0,
         }
+    }
+
+    #[inline]
+    fn span(&self, ty: Type) -> &[u64] {
+        &self.heap[ty as usize]
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Mirrors upstream's mutable Span overload; raw pointers avoid borrow aliasing below.
+    fn span_mut(&mut self, ty: Type) -> &mut [u64] {
+        &mut self.heap[ty as usize]
+    }
+
+    #[inline]
+    fn assert_template_parameters() {
+        assert_eq!(
+            STACK_WORDS,
+            Self::NUM_WORDS,
+            "stack_words must equal DivCeil(size_bytes, BYTES_PER_WORD)"
+        );
     }
 
     pub fn set_cpu_address(&mut self, new_cpu_addr: VAddr) {
@@ -323,12 +170,13 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
     {
         let start = (offset as i64).max(0) as usize;
         let end = (offset.wrapping_add(size) as i64).max(0) as usize;
-        if start >= self.size_bytes() as usize || end <= start {
+        if start >= SIZE_BYTES as usize || end <= start {
             return;
         }
         let (mut start_word, start_page) = Self::get_word_page(start as u64);
-        let (mut end_word, mut end_page) = Self::get_word_page((end as u64) + BYTES_PER_PAGE - 1);
-        let num_words = self.num_words();
+        let (mut end_word, mut end_page) =
+            Self::get_word_page((end as u64).wrapping_add(BYTES_PER_PAGE).wrapping_sub(1));
+        let num_words = Self::NUM_WORDS;
         start_word = start_word.min(num_words);
         end_word = end_word.min(num_words);
         let diff = end_word - start_word;
@@ -376,13 +224,11 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
     ///
     /// `enable` = true sets the bits, false clears them.
     pub fn change_region_state(&mut self, ty: Type, enable: bool, dirty_addr: u64, size: u64) {
-        // We need to work with raw pointers to allow simultaneous mutable access
-        // to different word arrays, matching the C++ approach.
-        let is_short = self.words.is_short();
-
-        let state_ptr = self.words.span_mut(ty).as_mut_ptr();
-        let untracked_ptr = self.words.untracked.pointer_mut(is_short);
-        let cached_ptr = self.words.cached_cpu.pointer_mut(is_short);
+        // Use raw pointers to split simultaneous mutable access to distinct
+        // tracking channels, matching the independent upstream spans.
+        let state_ptr = self.heap[ty as usize].as_mut_ptr();
+        let untracked_ptr = self.heap[Type::Untracked as usize].as_mut_ptr();
+        let cached_ptr = self.heap[Type::CachedCpu as usize].as_mut_ptr();
 
         let cpu_addr = self.cpu_addr;
         let tracker = self.tracker;
@@ -443,10 +289,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
     ) where
         F: FnMut(VAddr, u64),
     {
-        let is_short = self.words.is_short();
-        let state_ptr = self.words.span_mut(ty).as_mut_ptr();
-        let untracked_ptr = self.words.untracked.pointer_mut(is_short);
-        let cached_ptr = self.words.cached_cpu.pointer_mut(is_short);
+        let state_ptr = self.heap[ty as usize].as_mut_ptr();
+        let untracked_ptr = self.heap[Type::Untracked as usize].as_mut_ptr();
+        let cached_ptr = self.heap[Type::CachedCpu as usize].as_mut_ptr();
 
         let offset = query_cpu_range.wrapping_sub(self.cpu_addr);
         let cpu_addr = self.cpu_addr;
@@ -501,8 +346,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
                     }
                     // Release the pending range
                     func(
-                        cpu_addr + (pending_offset as u64) * BYTES_PER_PAGE,
-                        (pending_pointer - pending_offset) as u64 * BYTES_PER_PAGE,
+                        cpu_addr.wrapping_add((pending_offset as u64).wrapping_mul(BYTES_PER_PAGE)),
+                        ((pending_pointer - pending_offset) as u64).wrapping_mul(BYTES_PER_PAGE),
                     );
                     pending_offset = base_offset + pages_offset;
                     pending_pointer = base_offset + pages_offset + pages_size;
@@ -512,8 +357,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         });
         if pending {
             func(
-                cpu_addr + (pending_offset as u64) * BYTES_PER_PAGE,
-                (pending_pointer - pending_offset) as u64 * BYTES_PER_PAGE,
+                cpu_addr.wrapping_add((pending_offset as u64).wrapping_mul(BYTES_PER_PAGE)),
+                ((pending_pointer - pending_offset) as u64).wrapping_mul(BYTES_PER_PAGE),
             );
         }
         Self::apply_collected_ranges(tracker, &mut ranges, 1);
@@ -521,8 +366,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
 
     /// Returns true when a region has been modified for the given type.
     pub fn is_region_modified(&self, ty: Type, offset: u64, size: u64) -> bool {
-        let state_words = self.words.span(ty);
-        let untracked_words = self.words.span(Type::Untracked);
+        let state_words = self.span(ty);
+        let untracked_words = self.span(Type::Untracked);
         let mut result = false;
 
         self.iterate_words(offset, size, |index, mut mask| {
@@ -541,8 +386,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
 
     /// Returns the inclusive modified region as a `(begin, end)` pair in bytes.
     pub fn modified_region(&self, ty: Type, offset: u64, size: u64) -> (u64, u64) {
-        let state_words = self.words.span(ty);
-        let untracked_words = self.words.span(Type::Untracked);
+        let state_words = self.span(ty);
+        let untracked_words = self.span(Type::Untracked);
         let mut begin: u64 = u64::MAX;
         let mut end: u64 = 0;
 
@@ -556,44 +401,28 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
             }
             let local_page_begin = word.trailing_zeros() as u64;
             let local_page_end = PAGES_PER_WORD - word.leading_zeros() as u64;
-            let page_index = index as u64 * PAGES_PER_WORD;
-            begin = begin.min(page_index + local_page_begin);
-            end = page_index + local_page_end;
+            let page_index = (index as u64).wrapping_mul(PAGES_PER_WORD);
+            begin = begin.min(page_index.wrapping_add(local_page_begin));
+            end = page_index.wrapping_add(local_page_end);
             None
         });
 
         if begin < end {
-            (begin * BYTES_PER_PAGE, end * BYTES_PER_PAGE)
+            (
+                begin.wrapping_mul(BYTES_PER_PAGE),
+                end.wrapping_mul(BYTES_PER_PAGE),
+            )
         } else {
             (0, 0)
         }
     }
 
-    /// Returns the number of words of the manager.
-    #[inline]
-    pub fn num_words(&self) -> usize {
-        self.words.num_words()
-    }
-
-    /// Returns the size in bytes of the manager.
-    #[inline]
-    pub fn size_bytes(&self) -> u64 {
-        self.words.size_bytes
-    }
-
-    /// Returns true when the buffer fits in the small vector optimization.
-    #[inline]
-    pub fn is_short(&self) -> bool {
-        self.words.is_short()
-    }
-
     /// Flush cached CPU writes: move cached bits into the CPU channel.
     pub fn flush_cached_writes(&mut self) {
-        let num_words = self.num_words();
-        let is_short = self.words.is_short();
-        let cached_ptr = self.words.cached_cpu.pointer_mut(is_short);
-        let untracked_ptr = self.words.untracked.pointer_mut(is_short);
-        let cpu_ptr = self.words.cpu.pointer_mut(is_short);
+        let num_words = Self::NUM_WORDS;
+        let cached_ptr = self.heap[Type::CachedCpu as usize].as_mut_ptr();
+        let untracked_ptr = self.heap[Type::Untracked as usize].as_mut_ptr();
+        let cpu_ptr = self.heap[Type::Cpu as usize].as_mut_ptr();
         let tracker = self.tracker;
         let cpu_addr = self.cpu_addr;
         let mut ranges = Vec::new();
@@ -635,11 +464,11 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         } else {
             !current_bits & new_bits
         };
-        let addr = cpu_addr + word_index as u64 * BYTES_PER_WORD;
+        let addr = cpu_addr.wrapping_add((word_index as u64).wrapping_mul(BYTES_PER_WORD));
         Self::iterate_pages(changed_bits, |page_offset, page_size| {
             ranges.push((
-                addr + page_offset as u64 * BYTES_PER_PAGE,
-                page_size * BYTES_PER_PAGE as usize,
+                addr.wrapping_add((page_offset as u64).wrapping_mul(BYTES_PER_PAGE)),
+                page_size.wrapping_mul(BYTES_PER_PAGE as usize),
             ));
         });
     }
@@ -654,8 +483,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         let mut coalesced = Vec::with_capacity(ranges.len());
         let (mut current_addr, mut current_size) = ranges[0];
         for &(next_addr, next_size) in &ranges[1..] {
-            if current_addr + current_size as u64 == next_addr {
-                current_size += next_size;
+            if current_addr.wrapping_add(current_size as u64) == next_addr {
+                current_size = current_size.wrapping_add(next_size);
             } else {
                 coalesced.push((current_addr, current_size));
                 current_addr = next_addr;
@@ -664,11 +493,12 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         }
         coalesced.push((current_addr, current_size));
 
-        if !tracker.is_null() {
-            unsafe {
-                (*tracker).update_pages_cached_batch(&coalesced, delta);
-            }
-        }
+        let tracker = unsafe {
+            tracker
+                .as_ref()
+                .expect("a WordManager that applies ranges must have a device tracker")
+        };
+        tracker.update_pages_cached_batch(&coalesced, delta);
         ranges.clear();
     }
 }
@@ -678,29 +508,27 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    type DummyManager = WordManager<DummyTracker, 1, { BYTES_PER_WORD }>;
+    type RecordingManager = WordManager<RecordingTracker, 2, { BYTES_PER_WORD * 2 }>;
+    type TailManager = WordManager<RecordingTracker, 1, { 3 * BYTES_PER_PAGE }>;
+
     #[test]
     fn test_extract_bits() {
         // Full word
-        assert_eq!(
-            WordManager::<DummyTracker, 1>::extract_bits(!0u64, 0, 64),
-            !0u64
-        );
+        assert_eq!(DummyManager::extract_bits(!0u64, 0, 64), !0u64);
         // First bit only
-        assert_eq!(WordManager::<DummyTracker, 1>::extract_bits(!0u64, 0, 1), 1);
+        assert_eq!(DummyManager::extract_bits(!0u64, 0, 1), 1);
         // Bits 2..5
-        assert_eq!(
-            WordManager::<DummyTracker, 1>::extract_bits(!0u64, 2, 5),
-            0b11100
-        );
+        assert_eq!(DummyManager::extract_bits(!0u64, 2, 5), 0b11100);
     }
 
     #[test]
     fn test_get_word_page() {
-        let (w, p) = WordManager::<DummyTracker, 1>::get_word_page(0);
+        let (w, p) = DummyManager::get_word_page(0);
         assert_eq!(w, 0);
         assert_eq!(p, 0);
 
-        let (w, p) = WordManager::<DummyTracker, 1>::get_word_page(BYTES_PER_WORD);
+        let (w, p) = DummyManager::get_word_page(BYTES_PER_WORD);
         assert_eq!(w, 1);
         assert_eq!(p, 0);
     }
@@ -708,7 +536,7 @@ mod tests {
     #[test]
     fn test_iterate_pages() {
         let mut ranges = Vec::new();
-        WordManager::<DummyTracker, 1>::iterate_pages(0b1110_0011, |off, sz| {
+        DummyManager::iterate_pages(0b1110_0011, |off, sz| {
             ranges.push((off, sz));
         });
         assert_eq!(ranges, vec![(0, 2), (5, 3)]);
@@ -718,8 +546,7 @@ mod tests {
     fn change_region_state_batches_across_word_boundaries() {
         let tracker = RecordingTracker::default();
         let base = 0x4000_0000;
-        let mut manager =
-            WordManager::<RecordingTracker, 2>::new(base, &tracker, BYTES_PER_WORD * 2);
+        let mut manager = RecordingManager::new(base, &tracker);
         let addr = base + 63 * BYTES_PER_PAGE;
         let size = 3 * BYTES_PER_PAGE;
 
@@ -739,13 +566,12 @@ mod tests {
     fn flush_cached_writes_coalesces_word_ranges() {
         let tracker = RecordingTracker::default();
         let base = 0x5000_0000;
-        let mut manager =
-            WordManager::<RecordingTracker, 2>::new(base, &tracker, BYTES_PER_WORD * 2);
+        let mut manager = RecordingManager::new(base, &tracker);
 
-        manager.words.span_mut(Type::CachedCpu)[0] = 1 << 63;
-        manager.words.span_mut(Type::CachedCpu)[1] = 0b11;
-        manager.words.span_mut(Type::Untracked)[0] &= !(1 << 63);
-        manager.words.span_mut(Type::Untracked)[1] &= !0b11;
+        manager.span_mut(Type::CachedCpu)[0] = 1 << 63;
+        manager.span_mut(Type::CachedCpu)[1] = 0b11;
+        manager.span_mut(Type::Untracked)[0] &= !(1 << 63);
+        manager.span_mut(Type::Untracked)[1] &= !0b11;
 
         manager.flush_cached_writes();
 
@@ -754,6 +580,45 @@ mod tests {
             *tracker.calls.lock().unwrap(),
             vec![(vec![(addr, (3 * BYTES_PER_PAGE) as usize)], -1)]
         );
+    }
+
+    #[test]
+    fn type_order_and_inline_storage_match_upstream() {
+        assert_eq!(
+            [
+                Type::Cpu as usize,
+                Type::Gpu as usize,
+                Type::CachedCpu as usize,
+                Type::Untracked as usize,
+                Type::Preflushable as usize,
+                Type::Max as usize,
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(std::mem::size_of::<Type>(), std::mem::size_of::<i32>());
+
+        let tracker = RecordingTracker::default();
+        let manager = RecordingManager::new(0, &tracker);
+        assert_eq!(manager.heap.len(), Type::Max as usize);
+        assert!(manager.heap.iter().all(|words| words.len() == 2));
+        assert_eq!(RecordingManager::NUM_WORDS, 2);
+        assert_eq!(
+            std::mem::size_of::<RecordingManager>(),
+            Type::Max as usize * 2 * std::mem::size_of::<u64>()
+                + std::mem::size_of::<*const RecordingTracker>()
+                + std::mem::size_of::<VAddr>()
+        );
+    }
+
+    #[test]
+    fn constructor_cleans_trailing_pages_like_upstream() {
+        let tracker = RecordingTracker::default();
+        let manager = TailManager::new(0, &tracker);
+        assert_eq!(manager.span(Type::Cpu), &[0b111]);
+        assert_eq!(manager.span(Type::Untracked), &[0b111]);
+        assert_eq!(manager.span(Type::Gpu), &[0]);
+        assert_eq!(manager.span(Type::CachedCpu), &[0]);
+        assert_eq!(manager.span(Type::Preflushable), &[0]);
     }
 
     #[derive(Default)]

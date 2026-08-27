@@ -93,7 +93,7 @@ impl MasterSemaphore {
         has_timeline: bool,
         synchronization2_core: bool,
         synchronization2_khr: Option<ash::extensions::khr::Synchronization2>,
-    ) -> Self {
+    ) -> Result<Self, vk::Result> {
         let semaphore = if has_timeline {
             let mut type_ci = vk::SemaphoreTypeCreateInfo {
                 s_type: vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO,
@@ -106,11 +106,7 @@ impl MasterSemaphore {
                 p_next: &mut type_ci as *mut _ as *mut std::ffi::c_void,
                 flags: vk::SemaphoreCreateFlags::empty(),
             };
-            unsafe {
-                device
-                    .create_semaphore(&ci, None)
-                    .expect("Failed to create timeline semaphore")
-            }
+            unsafe { device.create_semaphore(&ci, None)? }
         } else {
             vk::Semaphore::null()
         };
@@ -119,10 +115,16 @@ impl MasterSemaphore {
             let mut fences = VecDeque::with_capacity(FENCE_RESERVE_SIZE);
             let fence_ci = vk::FenceCreateInfo::builder().build();
             for _ in 0..FENCE_RESERVE_SIZE {
-                let fence = unsafe {
-                    device
-                        .create_fence(&fence_ci, None)
-                        .expect("Failed to create fence")
+                let fence = match unsafe { device.create_fence(&fence_ci, None) } {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        for fence in fences {
+                            unsafe {
+                                device.destroy_fence(fence, None);
+                            }
+                        }
+                        return Err(error);
+                    }
                 };
                 fences.push_back(fence);
             }
@@ -144,43 +146,69 @@ impl MasterSemaphore {
                 stop_requested: Arc::clone(&stop_requested),
             })
         });
-        let wait_thread = fence_wait_state.as_ref().map(|state| {
-            let state = Arc::clone(state);
-            std::thread::Builder::new()
+        let wait_thread = if let Some(state) = fence_wait_state.as_ref() {
+            let thread_state = Arc::clone(state);
+            match std::thread::Builder::new()
                 .name("VulkanFenceWait".into())
-                .spawn(move || Self::wait_thread(state))
-                .expect("Failed to spawn Vulkan fence wait thread")
-        });
+                .spawn(move || Self::wait_thread(thread_state))
+            {
+                Ok(thread) => Some(thread),
+                Err(error) => {
+                    log::error!("Failed to spawn Vulkan fence wait thread: {error}");
+                    let free_queue = state.free_queue.lock().unwrap();
+                    for fence in free_queue.iter() {
+                        unsafe {
+                            device.destroy_fence(*fence, None);
+                        }
+                    }
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+            }
+        } else {
+            None
+        };
         let debug_thread = if has_timeline && *common::settings::values().renderer_debug.get_value()
         {
             let debug_device = device.clone();
             let debug_stop = Arc::clone(&stop_requested);
-            Some(
-                std::thread::Builder::new()
-                    .name("VulkanTimelineDebugWait".into())
-                    .spawn(move || {
-                        let mut counter = 0;
-                        while !debug_stop.load(Ordering::Acquire) {
-                            let semaphores = [semaphore];
-                            let values = [counter];
-                            let wait_info = vk::SemaphoreWaitInfo::builder()
-                                .semaphores(&semaphores)
-                                .values(&values)
-                                .build();
-                            if unsafe { debug_device.wait_semaphores(&wait_info, 10_000_000) }
-                                .is_ok()
-                            {
-                                counter += 1;
+            match std::thread::Builder::new()
+                .name("VulkanTimelineDebugWait".into())
+                .spawn(move || {
+                    let mut counter = 0;
+                    while !debug_stop.load(Ordering::Acquire) {
+                        let semaphores = [semaphore];
+                        let values = [counter];
+                        let wait_info = vk::SemaphoreWaitInfo::builder()
+                            .semaphores(&semaphores)
+                            .values(&values)
+                            .build();
+                        match unsafe { debug_device.wait_semaphores(&wait_info, 10_000_000) } {
+                            Ok(()) => counter += 1,
+                            Err(vk::Result::TIMEOUT) => {}
+                            Err(error) => {
+                                log::error!(
+                                    "Vulkan timeline debug wait failed at value {counter}: {error:?}"
+                                );
+                                std::process::abort();
                             }
                         }
-                    })
-                    .expect("Failed to spawn Vulkan timeline debug wait thread"),
-            )
+                    }
+                })
+            {
+                Ok(thread) => Some(thread),
+                Err(error) => {
+                    log::error!("Failed to spawn Vulkan timeline debug wait thread: {error}");
+                    unsafe {
+                        device.destroy_semaphore(semaphore, None);
+                    }
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+            }
         } else {
             None
         };
 
-        MasterSemaphore {
+        Ok(MasterSemaphore {
             device,
             semaphore,
             has_timeline,
@@ -193,7 +221,7 @@ impl MasterSemaphore {
             debug_thread,
             wait_thread,
             graphics_queue,
-        }
+        })
     }
 
     /// Returns the current logical tick.
@@ -347,34 +375,37 @@ impl MasterSemaphore {
                     .command_buffer(cmdbuf)
                     .build(),
             ];
-            let mut signal_infos = vec![vk::SemaphoreSubmitInfo::builder()
-                .semaphore(self.semaphore)
-                .value(host_tick)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .build()];
+            let mut signal_infos = [
+                vk::SemaphoreSubmitInfo::builder()
+                    .semaphore(self.semaphore)
+                    .value(host_tick)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .build(),
+                vk::SemaphoreSubmitInfo::default(),
+            ];
+            let mut num_signal_semaphores = 1;
             if signal_semaphore != vk::Semaphore::null() {
-                signal_infos.push(
-                    vk::SemaphoreSubmitInfo::builder()
-                        .semaphore(signal_semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .build(),
-                );
+                signal_infos[1] = vk::SemaphoreSubmitInfo::builder()
+                    .semaphore(signal_semaphore)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .build();
+                num_signal_semaphores = 2;
             }
-            let wait_infos = (wait_semaphore != vk::Semaphore::null())
-                .then(|| {
-                    vk::SemaphoreSubmitInfo::builder()
-                        .semaphore(wait_semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::from_raw(
-                            WAIT_STAGE_MASK.as_raw() as u64
-                        ))
-                        .build()
-                })
-                .into_iter()
-                .collect::<Vec<_>>();
+            let wait_info = vk::SemaphoreSubmitInfo::builder()
+                .semaphore(wait_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::from_raw(
+                    WAIT_STAGE_MASK.as_raw() as u64
+                ))
+                .build();
+            let wait_infos = if wait_semaphore != vk::Semaphore::null() {
+                std::slice::from_ref(&wait_info)
+            } else {
+                &[]
+            };
             let submit_info = vk::SubmitInfo2::builder()
-                .wait_semaphore_infos(&wait_infos)
+                .wait_semaphore_infos(wait_infos)
                 .command_buffer_infos(&command_buffer_infos)
-                .signal_semaphore_infos(&signal_infos)
+                .signal_semaphore_infos(&signal_infos[..num_signal_semaphores])
                 .build();
             return unsafe {
                 if self.synchronization2_core {
@@ -470,30 +501,30 @@ impl MasterSemaphore {
                     .command_buffer(cmdbuf)
                     .build(),
             ];
-            let signal_infos = (signal_semaphore != vk::Semaphore::null())
-                .then(|| {
-                    vk::SemaphoreSubmitInfo::builder()
-                        .semaphore(signal_semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .build()
-                })
-                .into_iter()
-                .collect::<Vec<_>>();
-            let wait_infos = (wait_semaphore != vk::Semaphore::null())
-                .then(|| {
-                    vk::SemaphoreSubmitInfo::builder()
-                        .semaphore(wait_semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::from_raw(
-                            WAIT_STAGE_MASK.as_raw() as u64
-                        ))
-                        .build()
-                })
-                .into_iter()
-                .collect::<Vec<_>>();
+            let signal_info = vk::SemaphoreSubmitInfo::builder()
+                .semaphore(signal_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .build();
+            let signal_infos = if signal_semaphore != vk::Semaphore::null() {
+                std::slice::from_ref(&signal_info)
+            } else {
+                &[]
+            };
+            let wait_info = vk::SemaphoreSubmitInfo::builder()
+                .semaphore(wait_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::from_raw(
+                    WAIT_STAGE_MASK.as_raw() as u64
+                ))
+                .build();
+            let wait_infos = if wait_semaphore != vk::Semaphore::null() {
+                std::slice::from_ref(&wait_info)
+            } else {
+                &[]
+            };
             let submit_info = vk::SubmitInfo2::builder()
-                .wait_semaphore_infos(&wait_infos)
+                .wait_semaphore_infos(wait_infos)
                 .command_buffer_infos(&command_buffer_infos)
-                .signal_semaphore_infos(&signal_infos)
+                .signal_semaphore_infos(signal_infos)
                 .build();
             let fence = self.get_free_fence();
             let result = unsafe {
@@ -520,6 +551,10 @@ impl MasterSemaphore {
                     .unwrap()
                     .push_back((host_tick, fence));
                 state.wait_cv.notify_one();
+            } else {
+                unsafe {
+                    self.device.destroy_fence(fence, None);
+                }
             }
             return result;
         }
@@ -577,6 +612,10 @@ impl MasterSemaphore {
             let mut wait_queue = state.wait_queue.lock().unwrap();
             wait_queue.push_back((host_tick, fence));
             state.wait_cv.notify_one();
+        } else {
+            unsafe {
+                self.device.destroy_fence(fence, None);
+            }
         }
 
         result
@@ -595,7 +634,10 @@ impl MasterSemaphore {
             return unsafe {
                 self.device
                     .create_fence(&fence_ci, None)
-                    .expect("Failed to create fence")
+                    .unwrap_or_else(|error| {
+                        log::error!("Failed to grow Vulkan fence pool: {error:?}");
+                        std::process::abort();
+                    })
             };
         }
 
@@ -618,10 +660,14 @@ impl MasterSemaphore {
                     .expect("notified fence wait queue must not be empty")
             };
 
-            unsafe { state.device.wait_for_fences(&[fence], true, u64::MAX) }
-                .expect("MasterSemaphore fence wait failed");
-            unsafe { state.device.reset_fences(&[fence]) }
-                .expect("MasterSemaphore fence reset failed");
+            if let Err(error) = unsafe { state.device.wait_for_fences(&[fence], true, u64::MAX) } {
+                log::error!("MasterSemaphore fence wait failed: {error:?}");
+                std::process::abort();
+            }
+            if let Err(error) = unsafe { state.device.reset_fences(&[fence]) } {
+                log::error!("MasterSemaphore fence reset failed: {error:?}");
+                std::process::abort();
+            }
             {
                 let mut free_queue = state.free_queue.lock().unwrap();
                 free_queue.push_front(fence);

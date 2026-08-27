@@ -13,13 +13,14 @@ use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::draw_manager::{
     DrawMode, DrawState, IndexBuffer, Maxwell3DDrawRegisters, VertexBuffer,
 };
+use crate::engines::maxwell_3d::StreamOutLayout;
 #[cfg(test)]
 use crate::engines::maxwell_3d::VertexAttribType;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, FrontFace, PolygonMode,
     PrimitiveTopology, StencilOp,
 };
-use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
+use crate::transform_feedback::{TransformFeedbackLayout, TransformFeedbackState};
 
 // ---------------------------------------------------------------------------
 // Constants — port of anonymous namespace in fixed_pipeline_state.cpp
@@ -1747,12 +1748,12 @@ fn read_u64(file: &mut std::fs::File) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::const_buffer_info::ConstBufferInfo;
     use crate::engines::maxwell_3d::{
-        AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ConstBufferBinding,
-        DepthMode, DepthStencilInfo, DrawCall, IndexFormat, LogicOpInfo, RasterizerInfo,
-        RenderTargetInfo, RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo,
-        StencilFaceInfo, VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo,
-        ZetaInfo,
+        AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, DepthMode,
+        DepthStencilInfo, DrawCall, IndexFormat, LogicOpInfo, RasterizerInfo, RenderTargetInfo,
+        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo,
+        VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo, ZetaInfo,
     };
     use std::collections::hash_map::DefaultHasher;
 
@@ -1942,7 +1943,7 @@ mod tests {
             line_anti_alias_enable: false,
             line_stipple: Default::default(),
             program_base_address: 0,
-            cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
+            cb_bindings: [[ConstBufferInfo::default(); 18]; 5],
             vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); NUM_RENDER_TARGETS],

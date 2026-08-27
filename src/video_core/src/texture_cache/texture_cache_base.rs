@@ -20,11 +20,22 @@ use std::sync::{Arc, Mutex};
 
 use common::hash::{BuildIdentityHasher, BuildUnorderedDenseHasher};
 use common::lru_cache::LeastRecentlyUsedCache;
+use common::scratch_buffer::ScratchBuffer;
+use common::thread::ThreadPlacement;
+use common::thread_worker::ThreadWorker;
 use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
 use smallvec::SmallVec;
 
 use common::slot_vector::SlotVector;
 
+use super::descriptor_table::DescriptorTable;
+use super::image_base::{
+    GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
+};
+use super::image_view_base::{ImageViewBase, NullImageViewParams};
+use super::image_view_info::ImageViewInfo;
+use super::render_targets::RenderTargets;
+use super::types::*;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{
     ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches, FromChannelState,
@@ -35,15 +46,6 @@ use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::memory_manager::{MemoryManager, MemoryManagerHandle};
 use crate::renderer_base::GuestMemoryWriter;
-use crate::textures::workers::ThreadWorker;
-
-use super::descriptor_table::DescriptorTable;
-use super::image_base::{
-    GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
-};
-use super::image_view_base::{ImageViewBase, NullImageViewParams};
-use super::render_targets::RenderTargets;
-use super::types::*;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -89,8 +91,8 @@ pub struct AsyncDecodeContext {
 }
 
 pub struct AsyncDecodeOutput {
-    pub decoded_data: Vec<u8>,
-    pub copies: Vec<BufferImageCopy>,
+    pub decoded_data: ScratchBuffer<u8>,
+    pub copies: SmallVec<[BufferImageCopy; 16]>,
 }
 
 /// State for an in-flight GPU block-linear 3D unswizzle.
@@ -128,8 +130,8 @@ impl AsyncDecodeContext {
         Self {
             image_id,
             output: Mutex::new(AsyncDecodeOutput {
-                decoded_data: Vec::new(),
-                copies: Vec::new(),
+                decoded_data: ScratchBuffer::new(),
+                copies: SmallVec::new(),
             }),
             complete: std::sync::atomic::AtomicBool::new(false),
         }
@@ -259,7 +261,7 @@ impl ChannelCacheAccessor for TextureCacheChannelInfo {
         self.channel_info.kepler_compute
     }
 
-    fn gpu_memory_ref(&self) -> usize {
+    fn gpu_memory_id(&self) -> usize {
         self.channel_info.gpu_memory_index
     }
 
@@ -347,6 +349,7 @@ pub trait TextureCacheParams {
     fn create_image_view(
         runtime: Option<&mut Self::Runtime>,
         view_id: ImageViewId,
+        info: &ImageViewInfo,
         base: std::ptr::NonNull<ImageViewBase>,
         image: Option<&Self::Image>,
     ) -> Self::ImageView;
@@ -444,7 +447,21 @@ pub trait TextureCacheParams {
     where
         Self: Sized;
 
-    /// Backend operation used by upstream `CopyImage`.
+    /// Backend `Runtime::CanImageBeCopied` primitive used by the common
+    /// `TextureCache<P>::CopyImage` policy.
+    fn can_image_be_copied(
+        _cache: &TextureCacheBase<Self>,
+        _dst_id: ImageId,
+        _src_id: ImageId,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
+    /// Backend `Runtime::CopyImage` primitive used by the common
+    /// `TextureCache<P>::CopyImage` policy.
     fn copy_image(
         cache: &mut TextureCacheBase<Self>,
         dst_id: ImageId,
@@ -452,6 +469,54 @@ pub trait TextureCacheParams {
         copies: &[ImageCopy],
     ) where
         Self: Sized;
+
+    /// Backend `Runtime::EmulateCopyImage` primitive used when
+    /// `HAS_EMULATED_COPIES` is set and a direct copy is unsuitable.
+    fn emulate_copy_image(
+        cache: &mut TextureCacheBase<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) where
+        Self: Sized,
+    {
+        Self::copy_image(cache, dst_id, src_id, copies);
+    }
+
+    /// Backend `Runtime::ShouldReinterpret` primitive.
+    fn should_reinterpret(
+        _cache: &TextureCacheBase<Self>,
+        _dst_id: ImageId,
+        _src_id: ImageId,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    /// Backend `Runtime::ReinterpretImage` primitive.
+    fn reinterpret_image(
+        _cache: &mut TextureCacheBase<Self>,
+        _dst_id: ImageId,
+        _src_id: ImageId,
+        _copies: &[ImageCopy],
+    ) where
+        Self: Sized,
+    {
+    }
+
+    /// Backend `Runtime::ConvertImage` primitive. The common cache owns
+    /// image-view/framebuffer selection exactly as upstream does.
+    fn convert_image(
+        _cache: &mut TextureCacheBase<Self>,
+        _dst_framebuffer_id: FramebufferId,
+        _dst_view_id: ImageViewId,
+        _src_view_id: ImageViewId,
+    ) where
+        Self: Sized,
+    {
+    }
 
     /// Backend operation used by the multisample branch of upstream
     /// `TextureCache<P>::JoinImages`.
@@ -462,6 +527,24 @@ pub trait TextureCacheParams {
         copies: &[ImageCopy],
     ) where
         Self: Sized;
+
+    /// Backend runtime operation selected by upstream
+    /// `TextureCache<P>::BlitImage` after the common cache has resolved the
+    /// images, views, framebuffers, scaling state and regions.
+    fn blit_image(
+        _cache: &mut TextureCacheBase<Self>,
+        _dst_framebuffer_id: FramebufferId,
+        _src_framebuffer_id: FramebufferId,
+        _dst_view_id: ImageViewId,
+        _src_view_id: ImageViewId,
+        _dst_region: Region2D,
+        _src_region: Region2D,
+        _filter: crate::engines::fermi_2d::Filter,
+        _operation: crate::engines::fermi_2d::Operation,
+    ) where
+        Self: Sized,
+    {
+    }
 }
 
 /// Rust representation of an upstream backend class inheriting `ImageBase`.
@@ -513,15 +596,19 @@ impl<B> From<ImageBase> for ImageSlot<B> {
 pub struct ImageViewSlot<B = ()> {
     /// Drop the derived/backend portion before its base subobject.
     pub backend: Option<B>,
+    /// Constructor input retained for backend rematerialisation. Upstream
+    /// consumes this directly while constructing its derived `ImageView`.
+    pub info: ImageViewInfo,
     /// Stable allocation corresponding to upstream's inherited
     /// `ImageViewBase` subobject. See `ImageSlot::base`.
     pub base: Box<ImageViewBase>,
 }
 
 impl<B> ImageViewSlot<B> {
-    pub fn pending(base: ImageViewBase) -> Self {
+    pub fn pending(info: ImageViewInfo, base: ImageViewBase) -> Self {
         Self {
             backend: None,
+            info,
             base: Box::new(base),
         }
     }
@@ -538,12 +625,6 @@ impl<B> Deref for ImageViewSlot<B> {
 impl<B> DerefMut for ImageViewSlot<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.base.as_mut()
-    }
-}
-
-impl<B> From<ImageViewBase> for ImageViewSlot<B> {
-    fn from(value: ImageViewBase) -> Self {
-        Self::pending(value)
     }
 }
 
@@ -609,7 +690,7 @@ impl TextureCacheParams for CommonTextureCacheParams {
     type Sampler = ();
     type Framebuffer = ();
     type FramebufferError = std::convert::Infallible;
-    type AsyncBuffer = ();
+    type AsyncBuffer = Vec<u8>;
     type BufferType = ();
 
     const ENABLE_VALIDATION: bool = true;
@@ -625,6 +706,7 @@ impl TextureCacheParams for CommonTextureCacheParams {
     fn create_image_view(
         _: Option<&mut ()>,
         _: ImageViewId,
+        _: &ImageViewInfo,
         _: std::ptr::NonNull<ImageViewBase>,
         _: Option<&()>,
     ) {
@@ -651,13 +733,15 @@ impl TextureCacheParams for CommonTextureCacheParams {
         false
     }
 
-    fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, _: usize, _: bool) {}
-
-    fn staging_mapped_span(_: &mut ()) -> &mut [u8] {
-        &mut []
+    fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, size: usize, _: bool) -> Vec<u8> {
+        vec![0; size]
     }
 
-    fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut ()) {}
+    fn staging_mapped_span(buffer: &mut Vec<u8>) -> &mut [u8] {
+        buffer
+    }
+
+    fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut Vec<u8>) {}
 
     fn can_upload_msaa(_: &TextureCacheBase<Self>) -> bool {
         true
@@ -665,12 +749,18 @@ impl TextureCacheParams for CommonTextureCacheParams {
 
     fn transition_image_layout(_: &mut TextureCacheBase<Self>, _: ImageId) {}
 
-    fn upload_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: &(), _: &[BufferImageCopy]) {}
+    fn upload_image(
+        _: &mut TextureCacheBase<Self>,
+        _: ImageId,
+        _: &Vec<u8>,
+        _: &[BufferImageCopy],
+    ) {
+    }
 
     fn accelerate_image_upload(
         _: &mut TextureCacheBase<Self>,
         _: ImageId,
-        _: &(),
+        _: &Vec<u8>,
         _: &[SwizzleParameters],
         _: u32,
         _: u32,
@@ -733,7 +823,7 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub framebuffers: HashMap<RenderTargets, FramebufferId, BuildUnorderedDenseHasher>,
     // Page tables
     pub page_table: HashMap<u64, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
-    pub sparse_views: HashMap<ImageId, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+    pub sparse_views: HashMap<ImageId, SmallVec<[ImageMapId; 16]>, BuildUnorderedDenseHasher>,
 
     // Memory tracking
     pub has_deleted_images: bool,
@@ -774,25 +864,24 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub current_unswizzle_frame: u8,
 
     // Join caching
-    pub join_overlap_ids: Vec<ImageId>,
+    pub join_overlap_ids: SmallVec<[ImageId; 4]>,
     pub join_overlaps_found: HashSet<ImageId, BuildUnorderedDenseHasher>,
-    pub join_left_aliased_ids: Vec<ImageId>,
-    pub join_right_aliased_ids: Vec<ImageId>,
+    pub join_left_aliased_ids: SmallVec<[ImageId; 4]>,
+    pub join_right_aliased_ids: SmallVec<[ImageId; 4]>,
     pub join_ignore_textures: HashSet<ImageId, BuildUnorderedDenseHasher>,
-    pub join_bad_overlap_ids: Vec<ImageId>,
-    pub join_copies_to_do: Vec<JoinCopy>,
+    pub join_bad_overlap_ids: SmallVec<[ImageId; 4]>,
+    pub join_copies_to_do: SmallVec<[JoinCopy; 4]>,
     pub join_alias_indices: HashMap<ImageId, usize, BuildUnorderedDenseHasher>,
 
     // Image alloc table
     pub image_allocs_table: HashMap<GPUVAddr, ImageAllocId, BuildUnorderedDenseHasher>,
-    /// Upstream `virtual_invalid_space`, used to allocate stable fake CPU
-    /// ranges for images whose GPU address cannot be translated.
+    /// Upstream `virtual_invalid_space`, used to allocate fake CPU ranges for
+    /// images whose GPU address cannot be translated.
     pub virtual_invalid_space: u64,
-    pub virtual_invalid_ranges: HashMap<(GPUVAddr, u64), u64>,
 
     // Scratch buffers
-    pub swizzle_data_buffer: Vec<u8>,
-    pub unswizzle_data_buffer: Vec<u8>,
+    pub swizzle_data_buffer: ScratchBuffer<u8>,
+    pub unswizzle_data_buffer: ScratchBuffer<u8>,
 
     // Rust adaptation of upstream `Runtime::DownloadStagingBuffer` +
     // backend `Image::DownloadMemory` and `Tegra::MemoryManager`.
@@ -873,16 +962,10 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         {
             let channel_caches = &mut self.channel_caches;
             let gpu_page_table_storage = &mut self.gpu_page_table_storage;
-            channel_caches.create_channel_with_on_gpu_as_register(
-                channel,
-                |_memory_id, storage_id| {
-                    let sparse_index = storage_id * 2 + 1;
-                    if gpu_page_table_storage.len() <= sparse_index {
-                        gpu_page_table_storage
-                            .resize_with(sparse_index + 1, TextureCacheGPUMap::default);
-                    }
-                },
-            );
+            channel_caches.create_channel_with_on_gpu_as_register(channel, |_memory_id| {
+                gpu_page_table_storage.push(TextureCacheGPUMap::default());
+                gpu_page_table_storage.push(TextureCacheGPUMap::default());
+            });
         }
         let Some(memory_manager) = channel.memory_manager.as_ref() else {
             return;
@@ -1086,25 +1169,28 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             sampler_heap_budget: None,
             last_sampler_gc_frame: u64::MAX,
             async_decodes: Vec::new(),
-            texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
+            texture_decode_worker: ThreadWorker::new_stateless_with_placement(
+                1,
+                "TextureDecoder".to_owned(),
+                ThreadPlacement::Efficiency,
+            ),
             gpu_unswizzle_maxsize,
             swizzle_chunk_size,
             swizzle_slices_per_batch,
             unswizzle_queue: VecDeque::new(),
             current_unswizzle_frame: 0,
-            join_overlap_ids: Vec::new(),
+            join_overlap_ids: SmallVec::new(),
             join_overlaps_found: HashSet::default(),
-            join_left_aliased_ids: Vec::new(),
-            join_right_aliased_ids: Vec::new(),
+            join_left_aliased_ids: SmallVec::new(),
+            join_right_aliased_ids: SmallVec::new(),
             join_ignore_textures: HashSet::default(),
-            join_bad_overlap_ids: Vec::new(),
-            join_copies_to_do: Vec::new(),
+            join_bad_overlap_ids: SmallVec::new(),
+            join_copies_to_do: SmallVec::new(),
             join_alias_indices: HashMap::default(),
             image_allocs_table: HashMap::default(),
             virtual_invalid_space: 0,
-            virtual_invalid_ranges: HashMap::new(),
-            swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
-            unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
+            swizzle_data_buffer: ScratchBuffer::with_capacity(8 * 1024 * 1024),
+            unswizzle_data_buffer: ScratchBuffer::with_capacity(1024 * 1024),
             image_downloader: None,
             guest_memory_writer: None,
             channel_gpu_memory: None,
@@ -1128,9 +1214,10 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .slot_images
             .insert(ImageBase::null(NullImageParams).into());
         debug_assert_eq!(null_image_id, crate::texture_cache::types::NULL_IMAGE_ID);
-        let null_view_id = cache
-            .slot_image_views
-            .insert(ImageViewBase::null(NullImageViewParams).into());
+        let null_view_id = cache.slot_image_views.insert(ImageViewSlot::pending(
+            ImageViewInfo::default(),
+            ImageViewBase::null(NullImageViewParams),
+        ));
         debug_assert_eq!(
             null_view_id,
             crate::texture_cache::types::NULL_IMAGE_VIEW_ID
@@ -1357,7 +1444,7 @@ impl TextureCacheBase<CommonTextureCacheParams> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommonTextureCacheParams, ImageSlot, TextureCacheBase, TextureCacheGPUMap,
+        CommonTextureCacheParams, ImageSlot, ImageViewSlot, TextureCacheBase, TextureCacheGPUMap,
         TextureCacheParams, TICKS_TO_DESTROY,
     };
     use crate::framebuffer_config::FramebufferConfig;
@@ -1412,6 +1499,7 @@ mod tests {
         fn create_image_view(
             _: Option<&mut ()>,
             _: crate::texture_cache::types::ImageViewId,
+            _: &ImageViewInfo,
             _: std::ptr::NonNull<ImageViewBase>,
             _: Option<&DropProbe>,
         ) {
@@ -1557,6 +1645,20 @@ mod tests {
         drop(cache);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
+
+    #[test]
+    fn common_backend_staging_buffer_exposes_the_requested_mapped_span() {
+        let mut cache = TextureCacheBase::<CommonTextureCacheParams>::new(std::sync::Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let mut staging = CommonTextureCacheParams::upload_staging_buffer(&mut cache, 37, false);
+
+        assert_eq!(
+            CommonTextureCacheParams::staging_mapped_span(&mut staging).len(),
+            37
+        );
+    }
+
     use std::hash::{BuildHasher, Hash, Hasher};
     use std::sync::Arc;
 
@@ -1646,6 +1748,25 @@ mod tests {
     }
 
     #[test]
+    fn cache_scratch_and_inline_containers_match_upstream_owners() {
+        fn assert_common_worker(_: &common::thread_worker::ThreadWorker) {}
+
+        let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        assert_eq!(cache.swizzle_data_buffer.size(), 8 * 1024 * 1024);
+        assert_eq!(cache.unswizzle_data_buffer.size(), 1024 * 1024);
+        assert!(cache.join_overlap_ids.capacity() >= 4);
+        assert!(cache.join_left_aliased_ids.capacity() >= 4);
+        assert!(cache.join_right_aliased_ids.capacity() >= 4);
+        assert!(cache.join_bad_overlap_ids.capacity() >= 4);
+        assert!(cache.join_copies_to_do.capacity() >= 4);
+        assert_common_worker(&cache.texture_decode_worker);
+
+        let decode = super::AsyncDecodeContext::new(ImageId::default());
+        let output = decode.output.lock().unwrap();
+        assert!(output.copies.capacity() >= 16);
+    }
+
+    #[test]
     fn framebuffer_lookup_uses_most_recent_image_for_shared_cpu_address() {
         fn insert_presentable_image(
             cache: &mut TextureCacheBase,
@@ -1674,7 +1795,9 @@ mod tests {
                 SubresourceRange::default(),
             );
             let view = ImageViewBase::new(&view_info, &info, image_id, gpu_addr);
-            let view_id = cache.slot_image_views.insert(view.into());
+            let view_id = cache
+                .slot_image_views
+                .insert(ImageViewSlot::pending(view_info, view));
             cache.slot_images[image_id].insert_view(view_info, view_id);
             cache.register_image(image_id);
             image_id

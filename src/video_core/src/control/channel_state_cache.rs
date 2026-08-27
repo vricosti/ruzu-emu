@@ -90,7 +90,7 @@ impl ChannelInfo {
 struct AddressSpaceRef {
     ref_count: usize,
     storage_id: usize,
-    gpu_memory_id: usize,
+    gpu_memory: Arc<Mutex<MemoryManager>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ pub struct ChannelSetupCaches<P> {
     /// Cached KeplerCompute owner for the currently bound channel.
     pub kepler_compute: Option<usize>,
     /// Cached GPU memory owner for the currently bound channel.
-    pub gpu_memory: Option<usize>,
+    pub gpu_memory: Option<Arc<Mutex<MemoryManager>>>,
     /// Program ID of the currently bound channel.
     pub program_id: u64,
 
@@ -168,7 +168,7 @@ impl<P> ChannelSetupCaches<P> {
     where
         P: FromChannelState,
     {
-        self.create_channel_with_on_gpu_as_register(channel, |_, _| {});
+        self.create_channel_with_on_gpu_as_register(channel, |_| {});
     }
 
     /// Create channel state and run the derived-cache address-space hook when
@@ -179,7 +179,7 @@ impl<P> ChannelSetupCaches<P> {
     pub fn create_channel_with_on_gpu_as_register(
         &mut self,
         channel: &ChannelState,
-        mut on_gpu_as_register: impl FnMut(usize, usize),
+        mut on_gpu_as_register: impl FnMut(usize),
     ) where
         P: FromChannelState,
     {
@@ -208,8 +208,7 @@ impl<P> ChannelSetupCaches<P> {
 
         // Address-space bookkeeping.
         if let Some(ref mm) = channel.memory_manager {
-            let mm_locked = mm.lock();
-            let mm_id = mm_locked.get_id();
+            let mm_id = mm.lock().get_id();
             if let Some(entry) = self.address_spaces.get_mut(&mm_id) {
                 entry.ref_count += 1;
                 return;
@@ -220,10 +219,10 @@ impl<P> ChannelSetupCaches<P> {
                 AddressSpaceRef {
                     ref_count: 1,
                     storage_id,
-                    gpu_memory_id: mm_id,
+                    gpu_memory: Arc::clone(mm),
                 },
             );
-            on_gpu_as_register(mm_id, storage_id);
+            on_gpu_as_register(mm_id);
         }
     }
 
@@ -246,9 +245,9 @@ impl<P> ChannelSetupCaches<P> {
         let state = &*self.channel_storage[storage_id];
         self.maxwell3d = Some(state.maxwell3d_ref());
         self.kepler_compute = Some(state.kepler_compute_ref());
-        self.gpu_memory = Some(state.gpu_memory_ref());
+        self.gpu_memory = state.gpu_memory_arc();
         self.program_id = state.program_id_val();
-        self.current_address_space = state.gpu_memory_ref();
+        self.current_address_space = state.gpu_memory_id();
     }
 
     /// Erase channel's state.
@@ -285,11 +284,17 @@ impl<P> ChannelSetupCaches<P> {
         }
     }
 
-    /// Look up a `MemoryManager` GPU-memory ID by address-space map id.
+    /// Look up the `MemoryManager` belonging to an address-space map id.
     ///
     /// Corresponds to `ChannelSetupCaches<P>::GetFromID`.
-    pub fn get_from_id(&self, id: usize) -> Option<usize> {
-        self.address_spaces.get(&id).map(|r| r.gpu_memory_id)
+    pub fn get_from_id(&self, id: usize) -> Arc<Mutex<MemoryManager>> {
+        Arc::clone(
+            &self
+                .address_spaces
+                .get(&id)
+                .expect("get_from_id: unknown address space")
+                .gpu_memory,
+        )
     }
 
     /// Look up the storage id for an address-space map id.
@@ -361,7 +366,7 @@ pub trait FromChannelState {
 pub trait ChannelCacheAccessor {
     fn maxwell3d_ref(&self) -> usize;
     fn kepler_compute_ref(&self) -> usize;
-    fn gpu_memory_ref(&self) -> usize;
+    fn gpu_memory_id(&self) -> usize;
     fn gpu_memory_arc(&self) -> Option<Arc<Mutex<MemoryManager>>>;
     fn program_id_val(&self) -> u64;
 }
@@ -385,7 +390,7 @@ impl ChannelCacheAccessor for ChannelInfo {
         self.kepler_compute
     }
 
-    fn gpu_memory_ref(&self) -> usize {
+    fn gpu_memory_id(&self) -> usize {
         self.gpu_memory_index
     }
 
@@ -434,6 +439,32 @@ mod tests {
         caches.erase_channel(7);
         assert!(!caches.channel_map.contains_key(&7));
         assert!(caches.active_channel_ids.is_empty());
+    }
+
+    #[test]
+    fn free_channel_slots_are_reused_in_fifo_order() {
+        let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
+        for bind_id in 1..=3 {
+            let mut channel = ChannelState::new(bind_id);
+            channel.program_id = bind_id as u64;
+            caches.create_channel(&channel);
+        }
+
+        caches.erase_channel(1);
+        caches.erase_channel(2);
+
+        let mut fourth = ChannelState::new(4);
+        fourth.program_id = 40;
+        caches.create_channel(&fourth);
+        let mut fifth = ChannelState::new(5);
+        fifth.program_id = 50;
+        caches.create_channel(&fifth);
+
+        assert_eq!(caches.channel_map[&4], 0);
+        assert_eq!(caches.channel_map[&5], 1);
+        assert_eq!(caches.channel_storage.len(), 3);
+        assert_eq!(caches.channel_storage[0].program_id, 40);
+        assert_eq!(caches.channel_storage[1].program_id, 50);
     }
 
     #[test]
@@ -503,17 +534,19 @@ mod tests {
 
         let mut registrations = Vec::new();
         let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
-        caches.create_channel_with_on_gpu_as_register(&first, |memory_id, storage_id| {
-            registrations.push((memory_id, storage_id));
+        caches.create_channel_with_on_gpu_as_register(&first, |memory_id| {
+            registrations.push(memory_id);
         });
-        caches.create_channel_with_on_gpu_as_register(&second, |memory_id, storage_id| {
-            registrations.push((memory_id, storage_id));
+        caches.create_channel_with_on_gpu_as_register(&second, |memory_id| {
+            registrations.push(memory_id);
         });
-        caches.create_channel_with_on_gpu_as_register(&third, |memory_id, storage_id| {
-            registrations.push((memory_id, storage_id));
+        caches.create_channel_with_on_gpu_as_register(&third, |memory_id| {
+            registrations.push(memory_id);
         });
 
-        assert_eq!(registrations, vec![(42, 0), (77, 1)]);
+        assert_eq!(registrations, vec![42, 77]);
+        assert!(Arc::ptr_eq(&caches.get_from_id(42), &shared));
+        assert!(Arc::ptr_eq(&caches.get_from_id(77), &separate));
     }
 
     #[test]

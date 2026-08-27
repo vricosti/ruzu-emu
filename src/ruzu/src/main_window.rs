@@ -3190,7 +3190,6 @@ impl GMainWindow {
 
         let emu = GtkEmuWindow::from_metal_layer(layer);
         let window_info = emu.window_info().clone();
-        let drawable_size = emu.drawable_size();
         let shown_state = emu.shown_state();
         let framebuffer_layout = emu.framebuffer_layout();
 
@@ -3278,7 +3277,6 @@ impl GMainWindow {
         *self.current_game_path.borrow_mut() = Some(filepath.clone());
         let session = crate::boot::boot_game(
             window_info,
-            drawable_size,
             shown_state,
             framebuffer_layout,
             None,
@@ -3387,7 +3385,6 @@ impl GMainWindow {
         };
         let emu = GtkEmuWindow::from_window_info(window_info, embedded.drawable_size);
         let window_info = emu.window_info().clone();
-        let drawable_size = emu.drawable_size();
         let shown_state = emu.shown_state();
         let framebuffer_layout = emu.framebuffer_layout();
 
@@ -3470,7 +3467,6 @@ impl GMainWindow {
         *self.current_game_path.borrow_mut() = Some(filepath.clone());
         let session = crate::boot::boot_game(
             window_info,
-            drawable_size,
             shown_state,
             framebuffer_layout,
             embedded
@@ -3574,7 +3570,6 @@ impl GMainWindow {
         };
         let emu = GtkEmuWindow::from_window_info(window_info, embedded.drawable_size);
         let window_info = emu.window_info().clone();
-        let drawable_size = emu.drawable_size();
         let shown_state = emu.shown_state();
         let framebuffer_layout = emu.framebuffer_layout();
 
@@ -3653,7 +3648,6 @@ impl GMainWindow {
         *self.current_game_path.borrow_mut() = Some(filepath.clone());
         let session = crate::boot::boot_game(
             window_info,
-            drawable_size,
             shown_state,
             framebuffer_layout,
             None,

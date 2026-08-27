@@ -14,7 +14,7 @@ use crate::ir::program::{CbufDescriptor, Program, TexDescriptor};
 use crate::ir::types::{FmzMode, FpControl, TextureInstInfo, Type};
 use crate::ir::value::{Attribute, Value};
 use crate::program_header::{PixelImap, ProgramHeader};
-use crate::shader_info::{Info, TextureType};
+use crate::shader_info::{ImageFormat, Info, TextureType};
 
 const NVN_DESCRIPTOR_SIZE: u32 = 0x10;
 const NUM_NVN_BUFFERS: u32 = 16;
@@ -676,6 +676,26 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                         .get_associated_pseudo(Opcode::GetSparseFromOp)
                         .is_some();
                 }
+                Opcode::ImageRead => {
+                    let flags = TextureInstInfo::from_u32(inst.flags);
+                    let ty = TextureType::from_u8(flags.texture_type);
+                    program.info.uses_typeless_image_reads |=
+                        ImageFormat::from_u8(flags.image_format) == ImageFormat::Typeless;
+                    program.info.uses_image_1d |=
+                        ty == TextureType::Color1D || ty == TextureType::ColorArray1D;
+                    program.info.uses_sparse_residency |= inst
+                        .get_associated_pseudo(Opcode::GetSparseFromOp)
+                        .is_some();
+                }
+                Opcode::ImageWrite => {
+                    let flags = TextureInstInfo::from_u32(inst.flags);
+                    let ty = TextureType::from_u8(flags.texture_type);
+                    program.info.uses_typeless_image_writes |=
+                        ImageFormat::from_u8(flags.image_format) == ImageFormat::Typeless;
+                    program.info.uses_image_buffers |= ty == TextureType::Buffer;
+                    program.info.uses_image_1d |=
+                        ty == TextureType::Color1D || ty == TextureType::ColorArray1D;
+                }
 
                 // Local memory
                 Opcode::LoadLocal | Opcode::WriteLocal => {
@@ -960,7 +980,7 @@ mod tests {
     use crate::ir::types::{FmzMode, FpControl, ShaderStage, TextureInstInfo};
     use crate::ir::value::{Attribute, Value};
     use crate::program_header::ProgramHeader;
-    use crate::shader_info::TextureType;
+    use crate::shader_info::{ImageFormat, TextureType};
 
     #[test]
     fn collect_info_marks_scalar_width_usages_like_upstream() {
@@ -1174,6 +1194,37 @@ mod tests {
         assert!(program.info.uses_shadow_lod);
         assert_eq!(program.info.texture_descriptors.len(), 1);
         assert_eq!(program.info.texture_descriptors[0].cbuf_index, 3);
+    }
+
+    #[test]
+    fn collect_info_records_typeless_image_access_capabilities() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let read = TextureInstInfo {
+            texture_type: TextureType::Color1D as u8,
+            image_format: ImageFormat::Typeless as u8,
+            ..Default::default()
+        };
+        let write = TextureInstInfo {
+            texture_type: TextureType::Buffer as u8,
+            image_format: ImageFormat::Typeless as u8,
+            ..Default::default()
+        };
+        program
+            .block_mut(0)
+            .append_inst(Inst::with_flags(Opcode::ImageRead, vec![], read.to_u32()));
+        program.block_mut(0).append_inst(Inst::with_flags(
+            Opcode::ImageWrite,
+            vec![],
+            write.to_u32(),
+        ));
+
+        collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_typeless_image_reads);
+        assert!(program.info.uses_typeless_image_writes);
+        assert!(program.info.uses_image_1d);
+        assert!(program.info.uses_image_buffers);
     }
 
     #[test]

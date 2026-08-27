@@ -12,11 +12,12 @@ pub type GPUVAddr = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum EngineTypes {
-    KeplerCompute = 0,
-    Maxwell3D = 1,
-    Fermi2D = 2,
-    MaxwellDMA = 3,
-    KeplerMemory = 4,
+    Nv01Timer = 0,
+    KeplerCompute = 1,
+    Maxwell3D = 2,
+    Fermi2D = 3,
+    MaxwellDMA = 4,
+    KeplerMemory = 5,
 }
 
 /// Trait corresponding to the C++ `EngineInterface` base class.
@@ -39,13 +40,16 @@ pub trait EngineInterface: Send {
     /// Consume the method sink, flushing deferred writes. Default implementation
     /// calls `call_method` for each entry then clears the sink.
     fn consume_sink(&mut self) {
-        // Default: process deferred writes.
-        // Concrete types override `consume_sink_impl` for custom behavior.
-        self.consume_sink_impl();
+        if self.has_pending_methods() {
+            self.consume_sink_impl();
+        }
     }
 
     /// Internal sink consumption — override in concrete engines.
     fn consume_sink_impl(&mut self);
+
+    /// Whether the upstream-owned method sink contains deferred writes.
+    fn has_pending_methods(&self) -> bool;
 
     /// Access the execution mask. The DmaPusher uses this to decide whether
     /// a method should be executed immediately or deferred to the sink.
@@ -144,5 +148,88 @@ impl EngineInterfaceState {
 impl Default for EngineInterfaceState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EngineInterface, EngineInterfaceState, EngineTypes};
+
+    struct TestEngine {
+        state: EngineInterfaceState,
+        consume_calls: usize,
+    }
+
+    impl TestEngine {
+        fn new() -> Self {
+            Self {
+                state: EngineInterfaceState::new(),
+                consume_calls: 0,
+            }
+        }
+    }
+
+    impl EngineInterface for TestEngine {
+        fn call_method(&mut self, _method: u32, _method_argument: u32, _is_last_call: bool) {}
+
+        fn call_multi_method(
+            &mut self,
+            _method: u32,
+            _base_start: &[u32],
+            _amount: u32,
+            _methods_pending: u32,
+        ) {
+        }
+
+        fn consume_sink_impl(&mut self) {
+            self.consume_calls += 1;
+            self.state.method_sink.clear();
+        }
+
+        fn has_pending_methods(&self) -> bool {
+            !self.state.method_sink.is_empty()
+        }
+
+        fn execution_mask(&self) -> &[bool] {
+            &self.state.execution_mask
+        }
+
+        fn push_method_sink(&mut self, method: u32, value: u32) {
+            self.state.method_sink.push((method, value));
+        }
+
+        fn set_current_dma_segment(&mut self, segment: u64) {
+            self.state.current_dma_segment = segment;
+        }
+
+        fn current_dirty(&self) -> bool {
+            self.state.current_dirty
+        }
+
+        fn set_current_dirty(&mut self, dirty: bool) {
+            self.state.current_dirty = dirty;
+        }
+    }
+
+    #[test]
+    fn engine_type_discriminants_match_eden() {
+        assert_eq!(EngineTypes::Nv01Timer as u32, 0);
+        assert_eq!(EngineTypes::KeplerCompute as u32, 1);
+        assert_eq!(EngineTypes::Maxwell3D as u32, 2);
+        assert_eq!(EngineTypes::Fermi2D as u32, 3);
+        assert_eq!(EngineTypes::MaxwellDMA as u32, 4);
+        assert_eq!(EngineTypes::KeplerMemory as u32, 5);
+    }
+
+    #[test]
+    fn consume_sink_only_calls_the_override_for_pending_methods() {
+        let mut engine = TestEngine::new();
+
+        engine.consume_sink();
+        assert_eq!(engine.consume_calls, 0);
+
+        engine.push_method_sink(0x40, 1);
+        engine.consume_sink();
+        assert_eq!(engine.consume_calls, 1);
     }
 }

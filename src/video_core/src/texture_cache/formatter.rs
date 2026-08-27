@@ -53,6 +53,7 @@ impl fmt::Display for PixelFormat {
             PixelFormat::Bc7Unorm => "BC7_UNORM",
             PixelFormat::Bc6hUfloat => "BC6H_UFLOAT",
             PixelFormat::Bc6hSfloat => "BC6H_SFLOAT",
+            PixelFormat::Astc2d4x4Unorm => "ASTC_2D_4X4_UNORM",
             PixelFormat::B8G8R8A8Unorm => "B8G8R8A8_UNORM",
             PixelFormat::R32G32B32A32Float => "R32G32B32A32_FLOAT",
             PixelFormat::R32G32B32A32Sint => "R32G32B32A32_SINT",
@@ -79,6 +80,50 @@ impl fmt::Display for PixelFormat {
             PixelFormat::R16G16B16X16Float => "R16G16B16X16_FLOAT",
             PixelFormat::R32Uint => "R32_UINT",
             PixelFormat::R32Sint => "R32_SINT",
+            PixelFormat::Astc2d8x8Unorm => "ASTC_2D_8X8_UNORM",
+            PixelFormat::Astc2d8x5Unorm => "ASTC_2D_8X5_UNORM",
+            PixelFormat::Astc2d5x4Unorm => "ASTC_2D_5X4_UNORM",
+            PixelFormat::B8G8R8A8Srgb => "B8G8R8A8_SRGB",
+            PixelFormat::Bc1RgbaSrgb => "BC1_RGBA_SRGB",
+            PixelFormat::Bc2Srgb => "BC2_SRGB",
+            PixelFormat::Bc3Srgb => "BC3_SRGB",
+            PixelFormat::Bc7Srgb => "BC7_SRGB",
+            PixelFormat::A4B4G4R4Unorm => "A4B4G4R4_UNORM",
+            PixelFormat::G4R4Unorm => "G4R4_UNORM",
+            PixelFormat::Astc2d4x4Srgb => "ASTC_2D_4X4_SRGB",
+            PixelFormat::Astc2d8x8Srgb => "ASTC_2D_8X8_SRGB",
+            PixelFormat::Astc2d8x5Srgb => "ASTC_2D_8X5_SRGB",
+            PixelFormat::Astc2d5x4Srgb => "ASTC_2D_5X4_SRGB",
+            PixelFormat::Astc2d5x5Unorm => "ASTC_2D_5X5_UNORM",
+            PixelFormat::Astc2d5x5Srgb => "ASTC_2D_5X5_SRGB",
+            PixelFormat::Astc2d10x8Unorm => "ASTC_2D_10X8_UNORM",
+            PixelFormat::Astc2d10x8Srgb => "ASTC_2D_10X8_SRGB",
+            PixelFormat::Astc2d6x6Unorm => "ASTC_2D_6X6_UNORM",
+            PixelFormat::Astc2d6x6Srgb => "ASTC_2D_6X6_SRGB",
+            PixelFormat::Astc2d10x6Unorm => "ASTC_2D_10X6_UNORM",
+            PixelFormat::Astc2d10x6Srgb => "ASTC_2D_10X6_SRGB",
+            PixelFormat::Astc2d10x5Unorm => "ASTC_2D_10X5_UNORM",
+            PixelFormat::Astc2d10x5Srgb => "ASTC_2D_10X5_SRGB",
+            PixelFormat::Astc2d10x10Unorm => "ASTC_2D_10X10_UNORM",
+            PixelFormat::Astc2d10x10Srgb => "ASTC_2D_10X10_SRGB",
+            PixelFormat::Astc2d12x10Unorm => "ASTC_2D_12X10_UNORM",
+            PixelFormat::Astc2d12x10Srgb => "ASTC_2D_12X10_SRGB",
+            PixelFormat::Astc2d12x12Unorm => "ASTC_2D_12X12_UNORM",
+            PixelFormat::Astc2d12x12Srgb => "ASTC_2D_12X12_SRGB",
+            PixelFormat::Astc2d8x6Unorm => "ASTC_2D_8X6_UNORM",
+            PixelFormat::Astc2d8x6Srgb => "ASTC_2D_8X6_SRGB",
+            PixelFormat::Astc2d6x5Unorm => "ASTC_2D_6X5_UNORM",
+            PixelFormat::Astc2d6x5Srgb => "ASTC_2D_6X5_SRGB",
+            PixelFormat::Etc2RgbUnorm => "ETC2_RGB_UNORM",
+            PixelFormat::Etc2RgbaUnorm => "ETC2_RGBA_UNORM",
+            PixelFormat::Etc2RgbPtaUnorm => "ETC2_RGB_PTA_UNORM",
+            PixelFormat::Etc2RgbSrgb => "ETC2_RGB_SRGB",
+            PixelFormat::Etc2RgbaSrgb => "ETC2_RGBA_SRGB",
+            PixelFormat::Etc2RgbPtaSrgb => "ETC2_RGB_PTA_SRGB",
+            PixelFormat::EacR11Unorm => "EAC_R11_UNORM",
+            PixelFormat::EacR11Snorm => "EAC_R11_SNORM",
+            PixelFormat::EacR11G11Unorm => "EAC_R11G11_UNORM",
+            PixelFormat::EacR11G11Snorm => "EAC_R11G11_SNORM",
             PixelFormat::D32Float => "D32_FLOAT",
             PixelFormat::D16Unorm => "D16_UNORM",
             PixelFormat::X8D24Unorm => "X8_D24_UNORM",
@@ -87,7 +132,7 @@ impl fmt::Display for PixelFormat {
             PixelFormat::S8UintD24Unorm => "S8_UINT_D24_UNORM",
             PixelFormat::D32FloatS8Uint => "D32_FLOAT_S8_UINT",
             PixelFormat::E5B9G9R9Float => "E5B9G9R9_FLOAT",
-            _ => "Invalid",
+            PixelFormat::MaxDepthStencilFormat | PixelFormat::Invalid => "Invalid",
         })
     }
 }
@@ -169,34 +214,34 @@ pub fn image_view_name(view: &ImageViewBase, addr: GPUVAddr) -> String {
         String::new()
     };
     match view.view_type {
-        ImageViewType::E1D => format!("ImageView 1D 0x{:X} {}{}", addr, w, level_str),
+        ImageViewType::E1D => format!("ImageView 1D 0x{:x} {}{}", addr, w, level_str),
         ImageViewType::E2D => {
-            format!("ImageView 2D 0x{:X} {}x{}{}", addr, w, h, level_str)
+            format!("ImageView 2D 0x{:x} {}x{}{}", addr, w, h, level_str)
         }
         ImageViewType::Cube => {
-            format!("ImageView Cube 0x{:X} {}x{}{}", addr, w, h, level_str)
+            format!("ImageView Cube 0x{:x} {}x{}{}", addr, w, h, level_str)
         }
         ImageViewType::E3D => {
-            format!("ImageView 3D 0x{:X} {}x{}x{}{}", addr, w, h, d, level_str)
+            format!("ImageView 3D 0x{:x} {}x{}x{}{}", addr, w, h, d, level_str)
         }
         ImageViewType::E1DArray => {
             format!(
-                "ImageView 1DArray 0x{:X} {}{}|{}",
+                "ImageView 1DArray 0x{:x} {}{}|{}",
                 addr, w, level_str, layers
             )
         }
         ImageViewType::E2DArray => format!(
-            "ImageView 2DArray 0x{:X} {}x{}{}|{}",
+            "ImageView 2DArray 0x{:x} {}x{}{}|{}",
             addr, w, h, level_str, layers
         ),
         ImageViewType::CubeArray => format!(
-            "ImageView CubeArray 0x{:X} {}x{}{}|{}",
+            "ImageView CubeArray 0x{:x} {}x{}{}|{}",
             addr, w, h, level_str, layers
         ),
         ImageViewType::Rect => {
-            format!("ImageView Rect 0x{:X} {}x{}{}", addr, w, h, level_str)
+            format!("ImageView Rect 0x{:x} {}x{}{}", addr, w, h, level_str)
         }
-        ImageViewType::Buffer => format!("BufferView 0x{:X} {}", addr, w),
+        ImageViewType::Buffer => format!("BufferView 0x{:x} {}", addr, w),
     }
 }
 
@@ -224,5 +269,42 @@ pub fn render_targets_name(rt: &RenderTargets) -> String {
         )
     } else {
         format!("Framebuffer {} {}x{}", prefix, size.width, size.height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::texture_cache::image_view_base::{ImageViewFlagBits, NullImageViewParams};
+
+    #[test]
+    fn pixel_format_names_cover_compressed_and_srgb_formats() {
+        assert_eq!(PixelFormat::Astc2d4x4Unorm.to_string(), "ASTC_2D_4X4_UNORM");
+        assert_eq!(PixelFormat::Bc1RgbaSrgb.to_string(), "BC1_RGBA_SRGB");
+        assert_eq!(PixelFormat::Etc2RgbPtaSrgb.to_string(), "ETC2_RGB_PTA_SRGB");
+        assert_eq!(PixelFormat::EacR11G11Snorm.to_string(), "EAC_R11G11_SNORM");
+        assert_eq!(PixelFormat::MaxDepthStencilFormat.to_string(), "Invalid");
+        assert_eq!(PixelFormat::Invalid.to_string(), "Invalid");
+    }
+
+    #[test]
+    fn image_view_name_uses_lowercase_hexadecimal_addresses() {
+        let mut view = ImageViewBase::null(NullImageViewParams);
+        view.view_type = ImageViewType::E2DArray;
+        view.range.extent = SubresourceExtent {
+            levels: 3,
+            layers: 4,
+        };
+        view.size = Extent3D {
+            width: 128,
+            height: 64,
+            depth: 1,
+        };
+        view.flags = ImageViewFlagBits::empty();
+
+        assert_eq!(
+            image_view_name(&view, 0xABCD_EF12),
+            "ImageView 2DArray 0xabcdef12 128x64:3|4"
+        );
     }
 }

@@ -17,6 +17,7 @@ use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurfac
 use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_dma::AccelerateDMAInterface;
 use crate::query_cache::types::QueryPropertiesFlags;
+pub use crate::rasterizer_download_area::RasterizerDownloadArea;
 
 /// Shader loading callback stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,14 +123,6 @@ impl RasterizerHandle {
         let rasterizer = unsafe { self.as_mut() };
         f(rasterizer)
     }
-}
-
-/// Download area for flushing GPU caches to CPU memory.
-#[derive(Debug, Clone)]
-pub struct RasterizerDownloadArea {
-    pub start_address: u64,
-    pub end_address: u64,
-    pub preemptive: bool,
 }
 
 /// Abstract rasterizer interface — corresponds to zuyu's `VideoCore::RasterizerInterface`.

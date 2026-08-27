@@ -4,6 +4,7 @@
 //! Port of `renderer_vulkan/present/sgsr.h` and `sgsr.cpp`.
 
 use ash::vk;
+use std::ptr::NonNull;
 
 use crate::host_shaders::spirv_shaders::{
     SGSR1_SHADER_MOBILE_EDGE_DIRECTION_FRAG_SPV, SGSR1_SHADER_MOBILE_FRAG_SPV,
@@ -11,22 +12,25 @@ use crate::host_shaders::spirv_shaders::{
 };
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
-use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
+use crate::vulkan_common::vulkan_device::Device;
+use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator};
 
 use super::util;
 
-const SGSR_STAGE_COUNT: usize = 1;
+pub const SGSR_STAGE_COUNT: usize = 1;
 type PushConstants = [u32; 4 + 2 + 1];
 
 struct Images {
     descriptor_sets: Vec<vk::DescriptorSet>,
-    image: vk::Image,
+    image: AllocatedImage,
     image_view: vk::ImageView,
     framebuffer: vk::Framebuffer,
 }
 
 pub struct Sgsr {
     device: ash::Device,
+    #[allow(dead_code)]
+    memory_allocator: NonNull<MemoryAllocator>,
     image_count: usize,
     extent: vk::Extent2D,
     descriptor_pool: vk::DescriptorPool,
@@ -39,27 +43,29 @@ pub struct Sgsr {
     sampler: vk::Sampler,
     dynamic_images: Vec<Images>,
     images_ready: bool,
+    #[allow(dead_code)]
+    edge_dir: bool,
 }
 
 impl Sgsr {
     /// Port of `SGSR::SGSR`.
     pub fn new(
-        device: ash::Device,
+        device: &Device,
         allocator: &MemoryAllocator,
         image_count: usize,
         extent: vk::Extent2D,
         edge_dir: bool,
     ) -> Self {
+        let logical = device.get_logical();
         let mut dynamic_images = Vec::with_capacity(image_count);
         for _ in 0..image_count {
-            let image = util::create_wrapped_image(
-                &device,
-                allocator,
-                extent,
+            let image =
+                util::create_wrapped_image(allocator, extent, vk::Format::R16G16B16A16_SFLOAT);
+            let image_view = util::create_wrapped_image_view(
+                device,
+                image.handle(),
                 vk::Format::R16G16B16A16_SFLOAT,
             );
-            let image_view =
-                util::create_wrapped_image_view(&device, image, vk::Format::R16G16B16A16_SFLOAT);
             dynamic_images.push(Images {
                 descriptor_sets: Vec::new(),
                 image,
@@ -69,17 +75,17 @@ impl Sgsr {
         }
 
         let renderpass = util::create_wrapped_render_pass(
-            &device,
+            device,
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageLayout::GENERAL,
         );
         for images in &mut dynamic_images {
             images.framebuffer =
-                util::create_wrapped_framebuffer(&device, renderpass, images.image_view, extent);
+                util::create_wrapped_framebuffer(device, renderpass, images.image_view, extent);
         }
 
-        let sampler = util::create_bilinear_sampler(&device);
-        let vert_shader = build_shader(&device, SGSR1_SHADER_VERT_SPV)
+        let sampler = util::create_bilinear_sampler(device);
+        let vert_shader = build_shader(logical, SGSR1_SHADER_VERT_SPV)
             .expect("Failed to build sgsr1_shader.vert");
         let (stage_code, stage_name) = if edge_dir {
             (
@@ -89,22 +95,23 @@ impl Sgsr {
         } else {
             (SGSR1_SHADER_MOBILE_FRAG_SPV, "sgsr1_shader_mobile.frag")
         };
-        let stage_shader = build_shader(&device, stage_code)
+        let stage_shader = build_shader(logical, stage_code)
             .unwrap_or_else(|_| panic!("Failed to build {stage_name}"));
 
         let descriptor_pool = util::create_wrapped_descriptor_pool(
-            &device,
-            image_count as u32,
-            image_count as u32,
+            device,
+            image_count,
+            image_count,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
         );
         let descriptor_set_layout = util::create_wrapped_descriptor_set_layout(
-            &device,
+            device,
             &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
         for images in &mut dynamic_images {
             images.descriptor_sets = util::create_wrapped_descriptor_sets(
-                &device,
+                logical,
                 descriptor_pool,
                 &[descriptor_set_layout; SGSR_STAGE_COUNT],
             );
@@ -121,12 +128,12 @@ impl Sgsr {
             .push_constant_ranges(std::slice::from_ref(&push_constant_range))
             .build();
         let pipeline_layout = unsafe {
-            device
+            logical
                 .create_pipeline_layout(&pipeline_layout_info, None)
                 .expect("Failed to create SGSR pipeline layout")
         };
         let stage_pipeline = util::create_wrapped_pipeline(
-            &device,
+            device,
             renderpass,
             pipeline_layout,
             vert_shader,
@@ -134,7 +141,8 @@ impl Sgsr {
         );
 
         Self {
-            device,
+            device: logical.clone(),
+            memory_allocator: NonNull::from(allocator),
             image_count,
             extent,
             descriptor_pool,
@@ -147,11 +155,17 @@ impl Sgsr {
             sampler,
             dynamic_images,
             images_ready: false,
+            edge_dir,
         }
     }
 
     /// Port of `SGSR::UpdateDescriptorSets`.
-    fn update_descriptor_sets(&self, image_view: vk::ImageView, image_index: usize) {
+    fn update_descriptor_sets(
+        &self,
+        device: &Device,
+        image_view: vk::ImageView,
+        image_index: usize,
+    ) {
         let images = &self.dynamic_images[image_index];
         let image_info = vk::DescriptorImageInfo {
             sampler: self.sampler,
@@ -165,21 +179,21 @@ impl Sgsr {
             .image_info(std::slice::from_ref(&image_info))
             .build();
         unsafe {
-            self.device.update_descriptor_sets(&[update], &[]);
+            device.get_logical().update_descriptor_sets(&[update], &[]);
         }
     }
 
     /// Port of `SGSR::UploadImages`.
-    fn upload_images(&mut self, scheduler: &mut Scheduler) {
+    fn upload_images(&mut self, device: &Device, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
         let images: Vec<vk::Image> = self
             .dynamic_images
             .iter()
-            .map(|image| image.image)
+            .map(|image| image.image.handle())
             .collect();
-        let device = self.device.clone();
+        let device = device.get_logical().clone();
         scheduler.record(move |cmdbuf| {
             for image in images {
                 util::clear_color_image(&device, cmdbuf, image);
@@ -192,6 +206,7 @@ impl Sgsr {
     /// Port of `SGSR::Draw`.
     pub fn draw(
         &mut self,
+        device: &Device,
         scheduler: &mut Scheduler,
         image_index: usize,
         source_image: vk::Image,
@@ -201,7 +216,7 @@ impl Sgsr {
     ) -> vk::ImageView {
         debug_assert!(image_index < self.image_count);
         let images = &self.dynamic_images[image_index];
-        let output_image = images.image;
+        let output_image = images.image.handle();
         let output_view = images.image_view;
         let descriptor_set = images.descriptor_sets[0];
         let framebuffer = images.framebuffer;
@@ -222,15 +237,15 @@ impl Sgsr {
             sharpening.to_bits(),
         ];
 
-        self.upload_images(scheduler);
-        self.update_descriptor_sets(source_image_view, image_index);
+        self.upload_images(device, scheduler);
+        self.update_descriptor_sets(device, source_image_view, image_index);
 
-        let device = self.device.clone();
+        let device = device.get_logical().clone();
         let renderpass = self.renderpass;
         let pipeline_layout = self.pipeline_layout;
         let stage_pipeline = self.stage_pipeline;
         let extent = self.extent;
-        scheduler.request_outside_renderpass();
+        scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             util::transition_image_layout(
                 &device,
@@ -293,9 +308,24 @@ impl Drop for Sgsr {
                     self.device.destroy_image_view(images.image_view, None);
                     images.image_view = vk::ImageView::null();
                 }
+                drop(std::mem::replace(&mut images.image, AllocatedImage::null()));
+                images.descriptor_sets.clear();
+            }
+            self.dynamic_images.clear();
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+            }
+            if self.renderpass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.renderpass, None);
             }
             if self.stage_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.stage_pipeline, None);
+            }
+            if self.stage_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.stage_shader, None);
+            }
+            if self.vert_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.vert_shader, None);
             }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device
@@ -308,18 +338,6 @@ impl Drop for Sgsr {
             if self.descriptor_pool != vk::DescriptorPool::null() {
                 self.device
                     .destroy_descriptor_pool(self.descriptor_pool, None);
-            }
-            if self.stage_shader != vk::ShaderModule::null() {
-                self.device.destroy_shader_module(self.stage_shader, None);
-            }
-            if self.vert_shader != vk::ShaderModule::null() {
-                self.device.destroy_shader_module(self.vert_shader, None);
-            }
-            if self.sampler != vk::Sampler::null() {
-                self.device.destroy_sampler(self.sampler, None);
-            }
-            if self.renderpass != vk::RenderPass::null() {
-                self.device.destroy_render_pass(self.renderpass, None);
             }
         }
     }

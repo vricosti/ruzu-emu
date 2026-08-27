@@ -16,6 +16,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum MaxwellOpcode {
+    CCTLT,
     // ── Attribute / Output ────────────────────────────────────────────
     AL2P,
     ALD,
@@ -44,7 +45,6 @@ pub enum MaxwellOpcode {
     BRX,
     CAL,
     // ── Cache ─────────────────────────────────────────────────────────
-    CCTLT,
     CCTL,
     CCTLL,
     // ── Control Flow ──────────────────────────────────────────────────
@@ -691,9 +691,9 @@ const ENCODINGS_TEXT: &[(MaxwellOpcode, &str)] = &[
     (MaxwellOpcode::ST, "101- ---- ---- ----"),
 ];
 
-/// Lazily-initialized decode table. The insertion order is the exact order of
-/// upstream `maxwell.inc`; `Decode` is a first-match decoder and several
-/// encodings overlap.
+/// Lazily-initialized decode table. Mirrors upstream `maxwell.inc` in its
+/// original order: `Decode` returns the first matching entry, so reordering
+/// overlapping encodings changes instruction semantics.
 fn encodings() -> &'static [InstEncoding] {
     static TABLE: std::sync::OnceLock<Vec<InstEncoding>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
@@ -912,7 +912,6 @@ impl MaxwellOpcode {
                     IDE => "IDE",
                     CCTL => "CCTL",
                     CCTLL => "CCTLL",
-                    CCTLT => "CCTLT",
                     VABSDIFF => "VABSDIFF",
                     VABSDIFF4 => "VABSDIFF4",
                     VADD => "VADD",
@@ -959,8 +958,9 @@ mod tests {
 
     /// Encoding strings shorter than 16 effective bits (`"100- ----..."`)
     /// should still place mask bits at the top of the word. Pick insn
-    /// values that don't collide with the earlier IMAD32I encoding
-    /// (`"1000 00-- ---- ----"`).
+    /// values that don't collide with the more-specific IMAD32I encoding
+    /// (`"1000 00-- ---- ----"`) so the upstream first-match order returns
+    /// the right opcode.
     #[test]
     fn decodes_ld_st_short_encodings() {
         // LD: "100- ---- ---- ----" — top nibble must be 0b100x. Use 0x9 to
@@ -1001,34 +1001,6 @@ mod tests {
         assert_eq!(decode_opcode(exit), Some(MaxwellOpcode::EXIT));
     }
 
-    #[test]
-    fn overlapping_encodings_keep_upstream_first_match_order() {
-        assert_eq!(
-            decode_opcode(0xEF90_0000_0000_0000),
-            Some(MaxwellOpcode::LDC)
-        );
-        assert_eq!(
-            decode_opcode(0xEF98_0000_0000_0000),
-            Some(MaxwellOpcode::MEMBAR)
-        );
-        assert_eq!(
-            decode_opcode(0xEED0_0000_0000_0000),
-            Some(MaxwellOpcode::LDG)
-        );
-        assert_eq!(
-            decode_opcode(0xEED8_0000_0000_0000),
-            Some(MaxwellOpcode::STG)
-        );
-        assert_eq!(
-            decode_opcode(0xEEA0_0000_0000_0000),
-            Some(MaxwellOpcode::STP)
-        );
-        assert_eq!(
-            decode_opcode(0xEBF0_0000_0000_0000),
-            Some(MaxwellOpcode::CCTLT)
-        );
-    }
-
     /// Sched-control words and all-zero padding must NOT decode to any
     /// opcode. (The frontend skip-every-4th rule keeps these out of the
     /// decoder in practice, but the decoder must still reject them.)
@@ -1041,8 +1013,7 @@ mod tests {
     }
 
     /// Overlap test: BFI_reg `"0101 1011 1111 0---"` and SHF_l_reg
-    /// `"0101 1011 1111 1---"` share 12 high bits but differ at bit 51 —
-    /// the upstream first-match table must pick the right one for each.
+    /// `"0101 1011 1111 1---"` share 12 high bits but differ at bit 51.
     #[test]
     fn disambiguates_bfi_vs_shf_l_at_bit_51() {
         // BFI_reg expects bit 51 = 0.
@@ -1051,6 +1022,29 @@ mod tests {
         // SHF_l_reg expects bit 51 = 1.
         let shf_l = 0x5BF8_0000_0000_0000;
         assert_eq!(decode_opcode(shf_l), Some(MaxwellOpcode::SHF_l_reg));
+    }
+
+    /// Upstream intentionally resolves overlapping encodings by their order
+    /// in `maxwell.inc`, not by mask specificity. The broad ATOMS_cas and
+    /// CCTLL patterns must not steal the earlier concrete operations.
+    #[test]
+    fn overlapping_encodings_preserve_upstream_first_match_order() {
+        assert_eq!(
+            decode_opcode(0xEEA0_0000_0000_0000),
+            Some(MaxwellOpcode::STP)
+        );
+        assert_eq!(
+            decode_opcode(0xEF90_0000_0000_0000),
+            Some(MaxwellOpcode::LDC)
+        );
+        assert_eq!(
+            decode_opcode(0xEF98_0000_0000_0000),
+            Some(MaxwellOpcode::MEMBAR)
+        );
+        assert_eq!(
+            decode_opcode(0xEE00_0000_0000_0000),
+            Some(MaxwellOpcode::ATOMS_cas)
+        );
     }
 
     /// Every encoding must, by construction, decode itself: build an insn

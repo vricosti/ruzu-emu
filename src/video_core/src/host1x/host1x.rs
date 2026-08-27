@@ -6,7 +6,7 @@
 //! Main Host1x class: owns the syncpoint manager, device memory manager,
 //! GMMU, allocator, frame queue, and active CDMA devices.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use log::error;
@@ -33,18 +33,22 @@ pub struct FrameQueue {
 }
 
 struct FrameQueueInner {
-    /// Presentation-order frames: fd -> deque of (offset, frame).
-    presentation_order: HashMap<i32, Vec<(u64, Arc<Frame>)>>,
-    /// Decode-order frames: fd -> map of offset -> frame.
-    decode_order: HashMap<i32, HashMap<u64, Arc<Frame>>>,
+    frame_devices: HashMap<i32, FrameDevice>,
+}
+
+struct FrameDevice {
+    presentation_order: VecDeque<(u64, Arc<Frame>)>,
+    decode_order: HashMap<u64, Arc<Frame>>,
 }
 
 impl FrameQueue {
+    const MAX_PRESENT_QUEUE: usize = 100;
+    const MAX_DECODE_MAP: usize = 200;
+
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FrameQueueInner {
-                presentation_order: HashMap::new(),
-                decode_order: HashMap::new(),
+                frame_devices: HashMap::new(),
             }),
         }
     }
@@ -52,15 +56,19 @@ impl FrameQueue {
     /// Register a new NVDEC file descriptor.
     pub fn open(&self, fd: i32) {
         let mut inner = self.inner.lock().unwrap();
-        inner.presentation_order.entry(fd).or_default();
-        inner.decode_order.entry(fd).or_default();
+        inner.frame_devices.insert(
+            fd,
+            FrameDevice {
+                presentation_order: VecDeque::new(),
+                decode_order: HashMap::new(),
+            },
+        );
     }
 
     /// Unregister an NVDEC file descriptor.
     pub fn close(&self, fd: i32) {
         let mut inner = self.inner.lock().unwrap();
-        inner.presentation_order.remove(&fd);
-        inner.decode_order.remove(&fd);
+        inner.frame_devices.remove(&fd);
     }
 
     /// Search all FDs for a frame matching the given offset.
@@ -70,16 +78,13 @@ impl FrameQueue {
     pub fn vic_find_nvdec_fd_from_offset(&self, search_offset: u64) -> i32 {
         let inner = self.inner.lock().unwrap();
 
-        for (fd, frames) in &inner.presentation_order {
-            for (offset, _) in frames {
+        for (fd, device) in &inner.frame_devices {
+            for (offset, _) in &device.presentation_order {
                 if *offset == search_offset {
                     return *fd;
                 }
             }
-        }
-
-        for (fd, frames) in &inner.decode_order {
-            for (offset, _) in frames {
+            for (offset, _) in &device.decode_order {
                 if *offset == search_offset {
                     return *fd;
                 }
@@ -92,16 +97,27 @@ impl FrameQueue {
     /// Push a frame in presentation order.
     pub fn push_present_order(&self, fd: i32, offset: u64, frame: Arc<Frame>) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(queue) = inner.presentation_order.get_mut(&fd) {
-            queue.push((offset, frame));
+        if let Some(device) = inner.frame_devices.get_mut(&fd) {
+            if device.presentation_order.len() >= Self::MAX_PRESENT_QUEUE {
+                device.presentation_order.pop_front();
+            }
+            device.presentation_order.push_back((offset, frame));
         }
     }
 
     /// Push a frame in decode order (keyed by offset, replaces existing).
     pub fn push_decode_order(&self, fd: i32, offset: u64, frame: Arc<Frame>) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(map) = inner.decode_order.get_mut(&fd) {
-            map.insert(offset, frame);
+        if let Some(device) = inner.frame_devices.get_mut(&fd) {
+            device.decode_order.insert(offset, frame);
+            let excess = device
+                .decode_order
+                .len()
+                .saturating_sub(Self::MAX_DECODE_MAP);
+            let stale_offsets: Vec<_> = device.decode_order.keys().copied().take(excess).collect();
+            for stale_offset in stale_offsets {
+                device.decode_order.remove(&stale_offset);
+            }
         }
     }
 
@@ -114,18 +130,11 @@ impl FrameQueue {
 
         let mut inner = self.inner.lock().unwrap();
 
-        // Try presentation order first.
-        if let Some(queue) = inner.presentation_order.get_mut(&fd) {
-            if !queue.is_empty() {
-                // Pop the front element (presentation order).
-                let (_offset, frame) = queue.remove(0);
+        if let Some(device) = inner.frame_devices.get_mut(&fd) {
+            if let Some((_offset, frame)) = device.presentation_order.pop_front() {
                 return Some(frame);
             }
-        }
-
-        // Fall back to decode order.
-        if let Some(map) = inner.decode_order.get_mut(&fd) {
-            if let Some(frame) = map.remove(&offset) {
+            if let Some(frame) = device.decode_order.remove(&offset) {
                 return Some(frame);
             }
         }
@@ -183,8 +192,8 @@ impl ChannelType {
 /// Main Host1x subsystem.
 ///
 /// Port of `Tegra::Host1x::Host1x`. The `devices` map mirrors upstream's
-/// `std::unordered_map<s32, std::unique_ptr<CDmaPusher>>` — channel ioctls
-/// look up the per-fd `CDmaPusher` and forward command lists to it.
+/// fixed variant array. Rust stores only active entries in a map and lets each
+/// `CDmaPusher` own the corresponding `Nvdec` or `Vic` processor.
 pub struct Host1x {
     /// Upstream stores `Core::System& system`.
     system: SystemRef,
@@ -323,10 +332,6 @@ impl Host1x {
                     Arc::clone(&self.gmmu_manager),
                 )),
             ),
-            ChannelType::NvJpg => (
-                ChClassId::NvJpg,
-                Box::new(crate::cdma_pusher::NullProcessor),
-            ),
             _ => {
                 error!(
                     "Unimplemented host1x device {:?} ({})",
@@ -337,11 +342,10 @@ impl Host1x {
         };
         let pusher = Arc::new(CDmaPusher::new_with_processor(
             self.syncpoint_manager.clone(),
-            class_id as i32,
+            class_id.raw() as i32,
             processor,
         ));
         self.devices.lock().unwrap().insert(fd, pusher);
-        log::info!("Started {:?} device fd={}", channel_type, fd);
     }
 
     /// Stop a device on the given file descriptor.
@@ -354,16 +358,12 @@ impl Host1x {
     /// Push command entries to a device.
     ///
     /// Port of `Host1x::PushEntries`. Looks up the per-fd `CDmaPusher` and
-    /// forwards the command headers; mirrors upstream's `devices.find(fd)
-    /// ->second->PushEntries(...)`.
+    /// forwards the command headers to its `Nvdec` or `Vic` processor.
     pub fn push_entries(&self, fd: i32, entries: Vec<u32>) {
         use crate::cdma_pusher::ChCommandHeader;
         let pusher = match self.devices.lock().unwrap().get(&fd) {
             Some(p) => p.clone(),
-            None => {
-                log::warn!("Host1x::push_entries: no device for fd={}", fd);
-                return;
-            }
+            None => return,
         };
         let headers: Vec<ChCommandHeader> = entries
             .into_iter()
@@ -546,7 +546,7 @@ mod tests {
 
     fn frame_queue_contains(host1x: &Host1x, fd: i32) -> bool {
         let inner = host1x.frame_queue.inner.lock().unwrap();
-        inner.presentation_order.contains_key(&fd) && inner.decode_order.contains_key(&fd)
+        inner.frame_devices.contains_key(&fd)
     }
 
     #[test]
@@ -556,13 +556,36 @@ mod tests {
         host1x.start_device(7, ChannelType::NvDec, 0);
         assert!(frame_queue_contains(&host1x, 7));
         host1x.stop_device(7, ChannelType::NvDec);
-        assert!(frame_queue_contains(&host1x, 7));
+        assert!(!frame_queue_contains(&host1x, 7));
 
         host1x.frame_queue.open(9);
         host1x.start_device(9, ChannelType::Vic, 0);
         assert!(frame_queue_contains(&host1x, 9));
         host1x.stop_device(9, ChannelType::Vic);
         assert!(!frame_queue_contains(&host1x, 9));
+    }
+
+    #[test]
+    fn frame_queue_limits_match_upstream() {
+        let queue = super::FrameQueue::new();
+        queue.open(3);
+        let frame = Arc::new(crate::host1x::ffmpeg::ffmpeg::Frame::new());
+
+        for offset in 0..=super::FrameQueue::MAX_PRESENT_QUEUE as u64 {
+            queue.push_present_order(3, offset, Arc::clone(&frame));
+        }
+        for offset in 0..=super::FrameQueue::MAX_DECODE_MAP as u64 {
+            queue.push_decode_order(3, offset, Arc::clone(&frame));
+        }
+
+        let inner = queue.inner.lock().unwrap();
+        let device = inner.frame_devices.get(&3).unwrap();
+        assert_eq!(
+            device.presentation_order.len(),
+            super::FrameQueue::MAX_PRESENT_QUEUE
+        );
+        assert_eq!(device.presentation_order.front().unwrap().0, 1);
+        assert_eq!(device.decode_order.len(), super::FrameQueue::MAX_DECODE_MAP);
     }
 
     #[test]

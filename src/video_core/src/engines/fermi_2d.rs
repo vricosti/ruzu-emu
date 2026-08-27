@@ -1,14 +1,10 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Fermi 2D engine stub (NV class 902D).
-//!
-//! Handles 2D blitting operations (surface copies, fills). Detects blit
-//! trigger writes and logs parameters; actual pixel copy is not yet implemented.
+//! Port of the Fermi 2D engine (NV class 902D).
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::sw_blitter::blitter::SoftwareBlitEngine;
-use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
@@ -98,18 +94,37 @@ pub enum Filter {
     Bilinear = 1,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum Operation {
-    SrcCopyAnd = 0,
-    RopAnd = 1,
-    Blend = 2,
-    #[default]
-    SrcCopy = 3,
-    Rop = 4,
-    SrcCopyPremult = 5,
-    BlendPremult = 6,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Operation(u32);
+
+#[allow(non_upper_case_globals)]
+impl Operation {
+    pub const SrcCopyAnd: Self = Self(0);
+    pub const RopAnd: Self = Self(1);
+    pub const Blend: Self = Self(2);
+    pub const SrcCopy: Self = Self(3);
+    pub const Rop: Self = Self(4);
+    pub const SrcCopyPremult: Self = Self(5);
+    pub const BlendPremult: Self = Self(6);
+
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
+
+impl Default for Operation {
+    fn default() -> Self {
+        Self::SrcCopyAnd
+    }
+}
+
+unsafe impl Zeroable for Operation {}
+unsafe impl Pod for Operation {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -210,8 +225,8 @@ pub enum MonochromePatternFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Surface {
-    pub format: RenderTargetFormat,
-    pub linear: MemoryLayout,
+    pub format: u32,
+    pub linear: u32,
     pub block_dimensions: u32,
     pub depth: u32,
     pub layer: u32,
@@ -225,8 +240,8 @@ pub struct Surface {
 impl Default for Surface {
     fn default() -> Self {
         Self {
-            format: RenderTargetFormat::None,
-            linear: MemoryLayout::BlockLinear,
+            format: RenderTargetFormat::None as u32,
+            linear: MemoryLayout::BlockLinear as u32,
             block_dimensions: 0,
             depth: 0,
             layer: 0,
@@ -257,43 +272,12 @@ impl Surface {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(C)]
-struct SurfaceRaw {
-    format: RenderTargetFormatRaw,
-    linear: MemoryLayoutRaw,
-    block_dimensions: BlockDimensionsRaw,
-    depth: u32,
-    layer: u32,
-    pitch: u32,
-    width: u32,
-    height: u32,
-    addr_upper: u32,
-    addr_lower: u32,
-}
-
-unsafe impl Zeroable for SurfaceRaw {}
-unsafe impl Pod for SurfaceRaw {}
-
-impl From<SurfaceRaw> for Surface {
-    fn from(raw: SurfaceRaw) -> Self {
-        Self {
-            format: raw.format.get(),
-            linear: raw.linear.get(),
-            block_dimensions: raw.block_dimensions.raw,
-            depth: raw.depth,
-            layer: raw.layer,
-            pitch: raw.pitch,
-            width: raw.width,
-            height: raw.height,
-            addr_upper: raw.addr_upper,
-            addr_lower: raw.addr_lower,
-        }
-    }
-}
+unsafe impl Zeroable for Surface {}
+unsafe impl Pod for Surface {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
+#[cfg(test)]
 struct BlockDimensionsRaw {
     raw: u32,
 }
@@ -310,26 +294,6 @@ impl BlockDimensionsRaw {
 
     fn block_depth(self) -> u32 {
         (self.raw >> 8) & 0xF
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-struct RenderTargetFormatRaw(u32);
-
-impl RenderTargetFormatRaw {
-    fn get(self) -> RenderTargetFormat {
-        Fermi2D::decode_render_target_format(self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-struct MemoryLayoutRaw(u32);
-
-impl MemoryLayoutRaw {
-    fn get(self) -> MemoryLayout {
-        Fermi2D::decode_memory_layout(self.0)
     }
 }
 
@@ -520,25 +484,6 @@ struct Beta1Raw(u32);
 impl Beta1Raw {
     fn get(self) -> u32 {
         self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-struct OperationRaw(u32);
-
-impl OperationRaw {
-    fn get(self) -> Operation {
-        match self.0 {
-            0 => Operation::SrcCopyAnd,
-            1 => Operation::RopAnd,
-            2 => Operation::Blend,
-            3 => Operation::SrcCopy,
-            4 => Operation::Rop,
-            5 => Operation::SrcCopyPremult,
-            6 => Operation::BlendPremult,
-            _ => Operation::SrcCopy,
-        }
     }
 }
 
@@ -1042,10 +987,10 @@ impl Default for RegsPrefixRaw {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 struct ActiveRegsRaw {
-    dst: SurfaceRaw,
+    dst: Surface,
     pixels_from_cpu_index_wrap: CpuIndexWrapRaw,
     kind2d_check_enable: Kind2dCheckEnableRaw,
-    src: SurfaceRaw,
+    src: Surface,
     pixels_from_memory_sector_promotion: SectorPromotionRaw,
     pad_0x25c: u32,
     num_tpcs: NumTpcsRaw,
@@ -1064,7 +1009,7 @@ struct ActiveRegsRaw {
     rop: RopRaw,
     beta1: Beta1Raw,
     beta4: Beta4Raw,
-    operation: OperationRaw,
+    operation: Operation,
     pattern_offset: PatternOffsetRaw,
     pattern_select: PatternSelectRaw,
     pad_0x2b8_to_0x2e8: [u32; 0xC],
@@ -1085,10 +1030,10 @@ unsafe impl Pod for ActiveRegsRaw {}
 impl Default for ActiveRegsRaw {
     fn default() -> Self {
         Self {
-            dst: SurfaceRaw::default(),
+            dst: Surface::default(),
             pixels_from_cpu_index_wrap: CpuIndexWrapRaw::default(),
             kind2d_check_enable: Kind2dCheckEnableRaw::default(),
-            src: SurfaceRaw::default(),
+            src: Surface::default(),
             pixels_from_memory_sector_promotion: SectorPromotionRaw::default(),
             pad_0x25c: 0,
             num_tpcs: NumTpcsRaw::default(),
@@ -1107,7 +1052,7 @@ impl Default for ActiveRegsRaw {
             rop: RopRaw::default(),
             beta1: Beta1Raw::default(),
             beta4: Beta4Raw::default(),
-            operation: OperationRaw::default(),
+            operation: Operation::default(),
             pattern_offset: PatternOffsetRaw::default(),
             pattern_select: PatternSelectRaw::default(),
             pad_0x2b8_to_0x2e8: [0; 0xC],
@@ -1201,42 +1146,6 @@ impl Default for RegsUnionRaw {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-struct RegsRuntimeTailRaw {
-    words: [u32; ENGINE_REG_COUNT - NUM_REGS_WORDS],
-}
-
-unsafe impl Zeroable for RegsRuntimeTailRaw {}
-unsafe impl Pod for RegsRuntimeTailRaw {}
-
-impl Default for RegsRuntimeTailRaw {
-    fn default() -> Self {
-        Self {
-            words: [0; ENGINE_REG_COUNT - NUM_REGS_WORDS],
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct RegsStorageRaw {
-    regs: RegsUnionRaw,
-    runtime_tail: RegsRuntimeTailRaw,
-}
-
-unsafe impl Zeroable for RegsStorageRaw {}
-unsafe impl Pod for RegsStorageRaw {}
-
-impl Default for RegsStorageRaw {
-    fn default() -> Self {
-        Self {
-            regs: RegsUnionRaw::default(),
-            runtime_tail: RegsRuntimeTailRaw::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct Config {
@@ -1254,11 +1163,9 @@ pub struct Config {
 }
 
 pub struct Fermi2D {
-    regs: RegsStorageRaw,
+    regs: RegsUnionRaw,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
-    /// Set when a blit trigger is detected; consumed by tests / future logic.
-    pub pending_blit: bool,
     rasterizer: Option<RasterizerHandle>,
     sw_blitter: SoftwareBlitEngine,
     #[cfg(test)]
@@ -1268,14 +1175,13 @@ pub struct Fermi2D {
 impl Fermi2D {
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         let mut this = Self {
-            regs: RegsStorageRaw::default(),
+            regs: RegsUnionRaw::default(),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
                 state.execution_mask[BLIT_TRIGGER as usize] = true;
                 state
             },
             memory_manager: Arc::clone(&memory_manager),
-            pending_blit: false,
             rasterizer: None,
             sw_blitter: SoftwareBlitEngine::new(memory_manager),
             #[cfg(test)]
@@ -1302,7 +1208,7 @@ impl Fermi2D {
         self.upstream_reg_array_mut()[idx] = argument;
 
         if method == BLIT_TRIGGER {
-            self.handle_blit();
+            self.blit();
         }
     }
 
@@ -1314,9 +1220,14 @@ impl Fermi2D {
         amount: u32,
         methods_pending: u32,
     ) {
-        for (i, &arg) in args.iter().take(amount as usize).enumerate() {
-            let is_last_call = methods_pending.wrapping_sub(i as u32) <= 1;
-            self.call_method(method, arg, is_last_call);
+        assert!(
+            args.len() >= amount as usize,
+            "Fermi2D::call_multi_method needs {amount} arguments, got {}",
+            args.len()
+        );
+        for i in 0..amount {
+            let is_last_call = methods_pending.wrapping_sub(i) <= 1;
+            self.call_method(method, args[i as usize], is_last_call);
         }
     }
 
@@ -1371,24 +1282,22 @@ impl Fermi2D {
 
     fn words(&self) -> &[u32] {
         let ptr = std::ptr::from_ref(&self.regs).cast::<u32>();
-        // RegsStorageRaw is repr(C), starts with the register union, and its
-        // tested size is exactly ENGINE_REG_COUNT words.
-        unsafe { std::slice::from_raw_parts(ptr, ENGINE_REG_COUNT) }
+        // `RegsUnionRaw` is the exact Rust counterpart of Eden's `Regs` union.
+        unsafe { std::slice::from_raw_parts(ptr, NUM_REGS_WORDS) }
     }
 
     fn words_mut(&mut self) -> &mut [u32] {
         let ptr = std::ptr::from_mut(&mut self.regs).cast::<u32>();
-        // See words(): the runtime tail immediately follows the upstream
-        // register union in the same contiguous repr(C) storage.
-        unsafe { std::slice::from_raw_parts_mut(ptr, ENGINE_REG_COUNT) }
+        // See `words`: the union contains exactly `Regs::NUM_REGS` words.
+        unsafe { std::slice::from_raw_parts_mut(ptr, NUM_REGS_WORDS) }
     }
 
     fn upstream_reg_array_mut(&mut self) -> &mut [u32; NUM_REGS_WORDS] {
-        unsafe { &mut self.regs.regs.reg_array }
+        unsafe { &mut self.regs.reg_array }
     }
 
     fn regs_head(&self) -> &RegsRaw {
-        unsafe { &self.regs.regs.structured }
+        unsafe { &self.regs.structured }
     }
 
     fn clip_enable(&self) -> u32 {
@@ -1396,75 +1305,7 @@ impl Fermi2D {
     }
 
     fn operation(&self) -> Operation {
-        self.regs_head().active.operation.get()
-    }
-
-    fn decode_memory_layout(raw: u32) -> MemoryLayout {
-        match raw {
-            1 => MemoryLayout::Pitch,
-            _ => MemoryLayout::BlockLinear,
-        }
-    }
-
-    fn decode_render_target_format(raw: u32) -> RenderTargetFormat {
-        match raw {
-            0x0 => RenderTargetFormat::None,
-            0xC0 => RenderTargetFormat::R32G32B32A32Float,
-            0xC1 => RenderTargetFormat::R32G32B32A32Sint,
-            0xC2 => RenderTargetFormat::R32G32B32A32Uint,
-            0xC3 => RenderTargetFormat::R32G32B32X32Float,
-            0xC4 => RenderTargetFormat::R32G32B32X32Sint,
-            0xC5 => RenderTargetFormat::R32G32B32X32Uint,
-            0xC6 => RenderTargetFormat::R16G16B16A16Unorm,
-            0xC7 => RenderTargetFormat::R16G16B16A16Snorm,
-            0xC8 => RenderTargetFormat::R16G16B16A16Sint,
-            0xC9 => RenderTargetFormat::R16G16B16A16Uint,
-            0xCA => RenderTargetFormat::R16G16B16A16Float,
-            0xCB => RenderTargetFormat::R32G32Float,
-            0xCC => RenderTargetFormat::R32G32Sint,
-            0xCD => RenderTargetFormat::R32G32Uint,
-            0xCE => RenderTargetFormat::R16G16B16X16Float,
-            0xCF => RenderTargetFormat::A8R8G8B8Unorm,
-            0xD0 => RenderTargetFormat::A8R8G8B8Srgb,
-            0xD1 => RenderTargetFormat::A2B10G10R10Unorm,
-            0xD2 => RenderTargetFormat::A2B10G10R10Uint,
-            0xD5 => RenderTargetFormat::A8B8G8R8Unorm,
-            0xD6 => RenderTargetFormat::A8B8G8R8Srgb,
-            0xD7 => RenderTargetFormat::A8B8G8R8Snorm,
-            0xD8 => RenderTargetFormat::A8B8G8R8Sint,
-            0xD9 => RenderTargetFormat::A8B8G8R8Uint,
-            0xDA => RenderTargetFormat::R16G16Unorm,
-            0xDB => RenderTargetFormat::R16G16Snorm,
-            0xDC => RenderTargetFormat::R16G16Sint,
-            0xDD => RenderTargetFormat::R16G16Uint,
-            0xDE => RenderTargetFormat::R16G16Float,
-            0xDF => RenderTargetFormat::A2R10G10B10Unorm,
-            0xE0 => RenderTargetFormat::B10G11R11Float,
-            0xE3 => RenderTargetFormat::R32Sint,
-            0xE4 => RenderTargetFormat::R32Uint,
-            0xE5 => RenderTargetFormat::R32Float,
-            0xE6 => RenderTargetFormat::X8R8G8B8Unorm,
-            0xE7 => RenderTargetFormat::X8R8G8B8Srgb,
-            0xE8 => RenderTargetFormat::R5G6B5Unorm,
-            0xE9 => RenderTargetFormat::A1R5G5B5Unorm,
-            0xEA => RenderTargetFormat::R8G8Unorm,
-            0xEB => RenderTargetFormat::R8G8Snorm,
-            0xEC => RenderTargetFormat::R8G8Sint,
-            0xED => RenderTargetFormat::R8G8Uint,
-            0xEE => RenderTargetFormat::R16Unorm,
-            0xEF => RenderTargetFormat::R16Snorm,
-            0xF0 => RenderTargetFormat::R16Sint,
-            0xF1 => RenderTargetFormat::R16Uint,
-            0xF2 => RenderTargetFormat::R16Float,
-            0xF3 => RenderTargetFormat::R8Unorm,
-            0xF4 => RenderTargetFormat::R8Snorm,
-            0xF5 => RenderTargetFormat::R8Sint,
-            0xF6 => RenderTargetFormat::R8Uint,
-            0xF8 => RenderTargetFormat::X1R5G5B5Unorm,
-            0xF9 => RenderTargetFormat::X8B8G8R8Unorm,
-            0xFA => RenderTargetFormat::X8B8G8R8Srgb,
-            _ => RenderTargetFormat::None,
-        }
+        self.regs_head().active.operation
     }
 
     fn active_regs(&self) -> ActiveRegsRaw {
@@ -1477,11 +1318,11 @@ impl Fermi2D {
     }
 
     fn src_surface(&self) -> Surface {
-        self.active_regs().src.into()
+        self.active_regs().src
     }
 
     fn dst_surface(&self) -> Surface {
-        self.active_regs().dst.into()
+        self.active_regs().dst
     }
 
     fn pixels_from_memory(&self) -> PixelsFromMemory {
@@ -1502,22 +1343,14 @@ impl Fermi2D {
         let mut src_y = args.src_y0();
 
         if args.origin() == Origin::Corner {
-            src_x -= (du_dx >> 33) << 32;
-            src_y -= (dv_dy >> 33) << 32;
+            src_x = src_x.wrapping_sub((du_dx >> 33).wrapping_shl(32));
+            src_y = src_y.wrapping_sub((dv_dy >> 33).wrapping_shl(32));
         }
 
-        let bytes_per_pixel = if src.format == RenderTargetFormat::None {
-            0
-        } else {
-            surface::bytes_per_block(surface::pixel_format_from_render_target_format(
-                src.format as u32,
-            ))
-        };
-        let delegate_to_gpu = src.width > 512
-            && src.height > 512
-            && bytes_per_pixel <= 8
-            && bytes_per_pixel != 0
-            && src.format != dst.format;
+        let bytes_per_pixel =
+            surface::bytes_per_block(surface::pixel_format_from_render_target_format(src.format));
+        let delegate_to_gpu =
+            src.width > 512 && src.height > 512 && bytes_per_pixel <= 8 && src.format != dst.format;
 
         let mut config = Config {
             operation: self.operation(),
@@ -1527,25 +1360,25 @@ impl Fermi2D {
                 || delegate_to_gpu,
             dst_x0,
             dst_y0,
-            dst_x1: dst_x0 + dst_width,
-            dst_y1: dst_y0 + dst_height,
+            dst_x1: dst_x0.wrapping_add(dst_width),
+            dst_y1: dst_y0.wrapping_add(dst_height),
             src_x0: (src_x >> 32) as i32,
             src_y0: (src_y >> 32) as i32,
-            src_x1: ((src_x + du_dx * dst_width as i64) >> 32) as i32,
-            src_y1: ((src_y + dv_dy * dst_height as i64) >> 32) as i32,
+            src_x1: (src_x.wrapping_add(du_dx.wrapping_mul(dst_width as i64)) >> 32) as i32,
+            src_y1: (src_y.wrapping_add(dv_dy.wrapping_mul(dst_height as i64)) >> 32) as i32,
         };
 
-        let need_align_to_pitch = src.linear == MemoryLayout::Pitch
+        let need_align_to_pitch = src.linear == MemoryLayout::Pitch as u32
             && src.width as i32 == config.src_x1
-            && bytes_per_pixel != 0
             && config.src_x1 > (src.pitch / bytes_per_pixel) as i32
             && config.src_x0 > 0;
         if need_align_to_pitch {
-            let address = src.address() + config.src_x0 as u64 * bytes_per_pixel as u64;
+            let offset = (config.src_x0 as u32).wrapping_mul(bytes_per_pixel) as u64;
+            let address = src.address().wrapping_add(offset);
             src.addr_upper = (address >> 32) as u32;
             src.addr_lower = address as u32;
-            src.width -= config.src_x0 as u32;
-            config.src_x1 -= config.src_x0;
+            src.width = src.width.wrapping_sub(config.src_x0 as u32);
+            config.src_x1 = config.src_x1.wrapping_sub(config.src_x0);
             config.src_x0 = 0;
         }
 
@@ -1554,7 +1387,17 @@ impl Fermi2D {
 
     // ── Blit handling ──────────────────────────────────────────────────
 
-    fn handle_blit(&mut self) {
+    fn report_unimplemented_blit(condition: bool, message: &str) {
+        if !condition {
+            return;
+        }
+        log::error!("Fermi2D: {message}");
+        if *common::settings::values().use_debug_asserts.get_value() {
+            panic!("Fermi2D: {message}");
+        }
+    }
+
+    fn blit(&mut self) {
         log::debug!(
             "Fermi2D: BLIT dst=0x{:X} ({}x{} pitch={} fmt={}) src=0x{:X} ({}x{} pitch={} fmt={})",
             self.dst_addr(),
@@ -1568,34 +1411,27 @@ impl Fermi2D {
             self.src_pitch(),
             self.src_format(),
         );
-        if self.operation() != Operation::SrcCopy {
-            log::warn!("Fermi2D: operation {:?} is not SrcCopy", self.operation());
-        }
-        if self.src_surface().layer != 0 {
-            log::warn!("Fermi2D: source layer is not zero");
-        }
-        if self.dst_surface().layer != 0 {
-            log::warn!("Fermi2D: destination layer is not zero");
-        }
-        if self.src_surface().depth != 1 {
-            log::warn!("Fermi2D: source depth is not one");
-        }
-        if self.clip_enable() != 0 {
-            log::warn!("Fermi2D: clipped blit enabled");
-        }
-        self.execute_blit();
-    }
+        Self::report_unimplemented_blit(
+            self.operation() != Operation::SrcCopy,
+            "Operation is not copy",
+        );
+        Self::report_unimplemented_blit(self.src_surface().layer != 0, "Source layer is not zero");
+        Self::report_unimplemented_blit(
+            self.dst_surface().layer != 0,
+            "Destination layer is not zero",
+        );
+        Self::report_unimplemented_blit(self.src_surface().depth != 1, "Source depth is not one");
+        Self::report_unimplemented_blit(self.clip_enable() != 0, "Clipped blit enabled");
 
-    fn execute_blit(&mut self) {
-        self.pending_blit = false;
         let (src_surface, dst_surface, blit_config) = self.prepare_blit();
         self.memory_manager.lock().flush_caching();
 
-        if let Some(rasterizer_handle) = self.rasterizer {
-            let rasterizer = unsafe { rasterizer_handle.as_mut() };
-            if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
-                return;
-            }
+        let rasterizer_handle = self
+            .rasterizer
+            .expect("Fermi2D rasterizer must be bound before Blit");
+        let rasterizer = unsafe { rasterizer_handle.as_mut() };
+        if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
+            return;
         }
 
         self.sw_blitter
@@ -1630,6 +1466,10 @@ impl EngineInterface for Fermi2D {
         }
     }
 
+    fn has_pending_methods(&self) -> bool {
+        !self.interface_state.method_sink.is_empty()
+    }
+
     fn execution_mask(&self) -> &[bool] {
         &self.interface_state.execution_mask
     }
@@ -1658,22 +1498,11 @@ impl Default for Fermi2D {
     }
 }
 
-impl Engine for Fermi2D {
-    fn class_id(&self) -> ClassId {
-        ClassId::Twod
-    }
-
+#[cfg(test)]
+impl Fermi2D {
     fn write_reg(&mut self, method: u32, value: u32) {
         log::trace!("Fermi2D: reg[0x{:X}] = 0x{:X}", method, value);
         <Self as EngineInterface>::call_method(self, method, value, true);
-    }
-
-    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        if !self.pending_blit {
-            return vec![];
-        }
-        self.execute_blit();
-        vec![]
     }
 }
 
@@ -1763,7 +1592,7 @@ mod tests {
         eng.write_reg(SRC_ADDR_LOW, 0x3456_7890);
 
         let src = eng.src_surface();
-        assert_eq!(src.linear, MemoryLayout::Pitch);
+        assert_eq!(src.linear, MemoryLayout::Pitch as u32);
         assert_eq!(src.block_width(), 1);
         assert_eq!(src.block_height(), 2);
         assert_eq!(src.block_depth(), 3);
@@ -1787,7 +1616,9 @@ mod tests {
 
     #[test]
     fn test_config_size_matches_upstream() {
+        assert_eq!(std::mem::size_of::<Operation>(), 4);
         assert_eq!(std::mem::size_of::<Config>(), 0x2c);
+        assert_eq!(Operation::default().raw(), 0);
     }
 
     #[test]
@@ -1801,18 +1632,9 @@ mod tests {
     }
 
     #[test]
-    fn test_regs_storage_size_matches_engine_reg_count() {
+    fn test_regs_union_size_matches_upstream_num_regs() {
         assert_eq!(std::mem::size_of::<RegsRawTail0x8e0To0x960>(), 0x80);
-        assert_eq!(
-            std::mem::size_of::<RegsRuntimeTailRaw>(),
-            (ENGINE_REG_COUNT - NUM_REGS_WORDS) * 4
-        );
-        assert_eq!(std::mem::size_of::<RegsStorageRaw>(), ENGINE_REG_COUNT * 4);
-        assert_eq!(std::mem::offset_of!(RegsStorageRaw, regs), 0x0);
-        assert_eq!(
-            std::mem::offset_of!(RegsStorageRaw, runtime_tail),
-            NUM_REGS_WORDS * 4
-        );
+        assert_eq!(std::mem::size_of::<RegsUnionRaw>(), NUM_REGS_WORDS * 4);
     }
 
     #[test]
@@ -1865,11 +1687,6 @@ mod tests {
     fn test_typed_raw_wrappers_decode_upstream_enum_values() {
         assert_eq!(NotifyTypeRaw(1).get(), NotifyType::WriteThenAwaken);
         assert!(BoolBitRaw(1).get());
-        assert_eq!(
-            RenderTargetFormatRaw(RenderTargetFormat::A8B8G8R8Unorm as u32).get(),
-            RenderTargetFormat::A8B8G8R8Unorm
-        );
-        assert_eq!(MemoryLayoutRaw(1).get(), MemoryLayout::Pitch);
         let block = BlockDimensionsRaw { raw: 0x321 };
         assert_eq!(block.block_width(), 0x1);
         assert_eq!(block.block_height(), 0x2);
@@ -1880,7 +1697,7 @@ mod tests {
         assert!(SafeOverlapRaw(1).get());
         assert_eq!(RopRaw(0x123).get(), 0x23);
         assert_eq!(Beta1Raw(0x34).get(), 0x34);
-        assert_eq!(OperationRaw(4).get(), Operation::Rop);
+        assert_eq!(Operation::from_raw(4), Operation::Rop);
         assert_eq!(CpuIndexWrapRaw(1).get(), CpuIndexWrap::NoWrap);
         assert_eq!(SectorPromotionRaw(3).get(), SectorPromotion::PromoteTo4);
         assert_eq!(NumTpcsRaw(1).get(), NumTpcs::One);
@@ -2048,14 +1865,13 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_words_cover_union_head_and_rust_tail_contiguously() {
+    fn test_register_words_cover_the_complete_upstream_union() {
         let mut eng = Fermi2D::default();
         eng.write_reg((NUM_REGS_WORDS - 1) as u32, 0xCAFE_BABE);
-        eng.words_mut()[NUM_REGS_WORDS] = 0xDEAD_BEEF;
 
         let words = eng.words();
+        assert_eq!(words.len(), NUM_REGS_WORDS);
         assert_eq!(words[NUM_REGS_WORDS - 1], 0xCAFE_BABE);
-        assert_eq!(words[NUM_REGS_WORDS], 0xDEAD_BEEF);
     }
 
     #[test]
@@ -2175,7 +1991,9 @@ mod tests {
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_LOW, 0x1111_2222);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_HIGH, 0x3333_4444);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_LOW, 0x5555_6666);
-        eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_HIGH, 0x7777_8888);
+        // This register triggers `Blit`; seed the union directly because this
+        // test only verifies the register decoding contract.
+        eng.words_mut()[PIXELS_FROM_MEMORY_SRC_Y0_HIGH as usize] = 0x7777_8888;
 
         let args = eng.pixels_from_memory();
         assert_eq!(args.block_shape(), 7 & 0x7);
@@ -2208,8 +2026,8 @@ mod tests {
         eng.write_reg(SRC_ADDR_LOW, 0x5566_7788);
 
         let src = eng.src_surface();
-        assert_eq!(src.format, RenderTargetFormat::A8B8G8R8Unorm);
-        assert_eq!(src.linear, MemoryLayout::Pitch);
+        assert_eq!(src.format, RenderTargetFormat::A8B8G8R8Unorm as u32);
+        assert_eq!(src.linear, MemoryLayout::Pitch as u32);
         assert_eq!(src.block_dimensions, 0x321);
         assert_eq!(src.block_width(), 1);
         assert_eq!(src.block_height(), 2);
@@ -2224,9 +2042,31 @@ mod tests {
     }
 
     #[test]
+    fn test_surface_registers_preserve_unknown_raw_values() {
+        let mut eng = Fermi2D::default();
+        eng.write_reg(SRC_FORMAT, 0xDEAD_BEEF);
+        eng.write_reg(SRC_LINEAR, 0xCAFE_BABE);
+
+        let src = eng.src_surface();
+        assert_eq!(src.format, 0xDEAD_BEEF);
+        assert_eq!(src.linear, 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn test_operation_register_preserves_unknown_raw_value() {
+        let mut eng = Fermi2D::default();
+        eng.write_reg(OPERATION, 0xDEAD_BEEF);
+        eng.write_reg(SRC_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
+        eng.write_reg(DST_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
+
+        let (_, _, config) = eng.prepare_blit();
+        assert_eq!(config.operation.raw(), 0xDEAD_BEEF);
+    }
+
+    #[test]
     fn test_prepare_blit_decodes_pixels_from_memory_like_upstream() {
         let mut eng = Fermi2D::default();
-        eng.write_reg(OPERATION, Operation::SrcCopy as u32);
+        eng.write_reg(OPERATION, Operation::SrcCopy.raw());
         eng.write_reg(SRC_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
         eng.write_reg(DST_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
         eng.write_reg(SRC_LINEAR, MemoryLayout::Pitch as u32);
@@ -2271,7 +2111,7 @@ mod tests {
     #[test]
     fn test_prepare_blit_corner_origin_adjusts_source_coordinates() {
         let mut eng = Fermi2D::default();
-        eng.write_reg(OPERATION, Operation::SrcCopy as u32);
+        eng.write_reg(OPERATION, Operation::SrcCopy.raw());
         eng.write_reg(SRC_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
         eng.write_reg(DST_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
         eng.write_reg(PIXELS_FROM_MEMORY_SAMPLE_MODE, 1);
@@ -2296,7 +2136,7 @@ mod tests {
     #[test]
     fn test_prepare_blit_aligns_pitch_linear_source_like_upstream() {
         let mut eng = Fermi2D::default();
-        eng.write_reg(OPERATION, Operation::SrcCopy as u32);
+        eng.write_reg(OPERATION, Operation::SrcCopy.raw());
         eng.write_reg(SRC_FORMAT, RenderTargetFormat::A8B8G8R8Unorm as u32);
         eng.write_reg(DST_FORMAT, RenderTargetFormat::R8Unorm as u32);
         eng.write_reg(SRC_LINEAR, MemoryLayout::Pitch as u32);
@@ -2323,7 +2163,10 @@ mod tests {
     #[test]
     fn test_blit_trigger_executes_immediately() {
         let mut eng = Fermi2D::default();
-        assert!(!eng.pending_blit);
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        eng.bind_rasterizer(&rasterizer);
 
         eng.write_reg(DST_ADDR_HIGH, 0);
         eng.write_reg(DST_ADDR_LOW, 0x1000);
@@ -2341,16 +2184,26 @@ mod tests {
 
         // Trigger blit
         eng.write_reg(BLIT_TRIGGER, 1);
-        assert!(!eng.pending_blit);
+        assert_eq!(eng.words()[BLIT_TRIGGER as usize], 1);
     }
 
     #[test]
     fn test_call_method_blit_trigger_executes_immediately() {
         let mut eng = Fermi2D::default();
-        assert!(!eng.pending_blit);
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        eng.bind_rasterizer(&rasterizer);
 
         eng.call_method(BLIT_TRIGGER, 1, true);
-        assert!(!eng.pending_blit);
+        assert_eq!(eng.words()[BLIT_TRIGGER as usize], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Fermi2D rasterizer must be bound before Blit")]
+    fn test_blit_requires_the_upstream_rasterizer_binding() {
+        let mut eng = Fermi2D::default();
+        eng.call_method(BLIT_TRIGGER, 0, true);
     }
 
     #[test]
@@ -2372,10 +2225,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "needs 3 arguments")]
+    fn test_call_multi_method_rejects_short_argument_slice() {
+        let mut eng = Fermi2D::default();
+        eng.call_multi_method(0x100, &[1, 2], 3, 3);
+    }
+
+    #[test]
     fn test_no_trigger_without_blit_method() {
         let mut eng = Fermi2D::default();
         eng.write_reg(0x100, 42); // Random register
-        assert!(!eng.pending_blit);
+        assert_eq!(eng.words()[0x100], 42);
     }
 
     #[test]
@@ -2390,7 +2250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_pending_uses_rasterizer_surface_copy_hook() {
+    fn test_blit_trigger_uses_rasterizer_surface_copy_hook() {
         let syncpoints =
             std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
         let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
@@ -2414,12 +2274,16 @@ mod tests {
         eng.write_reg(DST_PITCH, 16);
 
         eng.write_reg(BLIT_TRIGGER, 1);
-        assert!(!eng.pending_blit);
     }
 
     #[test]
     fn test_blit_copies_pixels() {
         let mut eng = Fermi2D::default();
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let mut rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        rasterizer.set_surface_copy_succeeds(false);
+        eng.bind_rasterizer(&rasterizer);
 
         // Set up matching src/dst: 4x2, pitch=16 (4 pixels * 4 bytes).
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -2463,13 +2327,17 @@ mod tests {
 
         eng.write_reg(BLIT_TRIGGER, 0);
 
-        assert!(!eng.pending_blit);
         assert_eq!(&backing[0x4000..0x4000 + src_data.len()], &src_data);
     }
 
     #[test]
     fn test_blit_different_pitches() {
         let mut eng = Fermi2D::default();
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let mut rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        rasterizer.set_surface_copy_succeeds(false);
+        eng.bind_rasterizer(&rasterizer);
 
         // Source: pitch=8, 2 rows.
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -2516,7 +2384,6 @@ mod tests {
         }
 
         eng.write_reg(BLIT_TRIGGER, 0);
-        assert!(!eng.pending_blit);
 
         // copy_width = min(8, 16) = 8; each row copies 8 bytes into a 16-byte stride.
         let dst = &backing[0x4000..0x4000 + 32];

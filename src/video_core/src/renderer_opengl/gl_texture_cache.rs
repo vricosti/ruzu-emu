@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use common::settings;
+use shader_recompiler::shader_info::NUM_TEXTURE_TYPES;
 use smallvec::SmallVec;
 
 use super::gl_resource_manager::{
@@ -37,15 +38,12 @@ use crate::texture_cache::texture_cache_base::{
 };
 #[cfg(test)]
 use crate::texture_cache::types::SubresourceExtent;
-use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
+use crate::texture_cache::types::{BufferImageCopy, ImageCopy, NUM_RT};
 use crate::texture_cache::types::{
-    Extent2D, Extent3D, FramebufferId, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D,
-    Region2D, RelaxedOptions, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID,
+    Extent2D, Extent3D, FramebufferId, ImageId, ImageType, ImageViewId, ImageViewType, Region2D,
+    SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID,
 };
 use crate::texture_cache::util::{full_download_copies, map_size_bytes};
-
-/// Number of render targets.
-pub const NUM_RT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FramebufferAttachmentMode {
@@ -83,25 +81,6 @@ unsafe fn attach_framebuffer_texture(
             gl::NamedFramebufferTextureLayer(framebuffer, attachment, texture, 0, layer);
         }
     }
-}
-
-fn scale_up_image_copies(copies: &[ImageCopy], both_2d: bool) -> Vec<ImageCopy> {
-    let resolution = settings::values().resolution_info.clone();
-    copies
-        .iter()
-        .copied()
-        .map(|mut copy| {
-            copy.src_offset.x = resolution.scale_up_i32(copy.src_offset.x);
-            copy.dst_offset.x = resolution.scale_up_i32(copy.dst_offset.x);
-            copy.extent.width = resolution.scale_up_u32(copy.extent.width);
-            if both_2d {
-                copy.src_offset.y = resolution.scale_up_i32(copy.src_offset.y);
-                copy.dst_offset.y = resolution.scale_up_i32(copy.dst_offset.y);
-                copy.extent.height = resolution.scale_up_u32(copy.extent.height);
-            }
-            copy
-        })
-        .collect()
 }
 
 fn is_pixel_format_bgr(format: PixelFormat) -> bool {
@@ -176,9 +155,56 @@ fn is_converted_image(has_native_astc: bool, format: PixelFormat, image_type: Im
     matches!(format, PixelFormat::Bc4Unorm | PixelFormat::Bc5Unorm) && image_type == ImageType::E3D
 }
 
+// Preserved beside Eden's `CanBeAccelerated`. The formats remain unreachable while Eden's
+// unconditional `return false` disables non-ASTC accelerated uploads.
+#[allow(dead_code)]
+const ACCELERATED_FORMATS: [u32; 39] = [
+    gl::RGBA32F,
+    gl::RGBA16F,
+    gl::RG32F,
+    gl::RG16F,
+    gl::R11F_G11F_B10F,
+    gl::R32F,
+    gl::R16F,
+    gl::RGBA32UI,
+    gl::RGBA16UI,
+    gl::RGB10_A2UI,
+    gl::RGBA8UI,
+    gl::RG32UI,
+    gl::RG16UI,
+    gl::RG8UI,
+    gl::R32UI,
+    gl::R16UI,
+    gl::R8UI,
+    gl::RGBA32I,
+    gl::RGBA16I,
+    gl::RGBA8I,
+    gl::RG32I,
+    gl::RG16I,
+    gl::RG8I,
+    gl::R32I,
+    gl::R16I,
+    gl::R8I,
+    gl::RGBA16,
+    gl::RGB10_A2,
+    gl::RGBA8,
+    gl::RG16,
+    gl::RG8,
+    gl::R16,
+    gl::R8,
+    gl::RGBA16_SNORM,
+    gl::RGBA8_SNORM,
+    gl::RG16_SNORM,
+    gl::RG8_SNORM,
+    gl::R16_SNORM,
+    gl::R8_SNORM,
+];
+
 /// Port of upstream `CanBeAccelerated(const TextureCacheRuntime&, const ImageInfo&)`.
-fn can_be_accelerated(has_native_astc: bool, info: &ImageInfo) -> bool {
-    if crate::surface::is_pixel_format_astc(info.format) && info.size.depth == 1 && !has_native_astc
+fn can_be_accelerated(runtime: &TextureCacheRuntime, info: &ImageInfo) -> bool {
+    if crate::surface::is_pixel_format_astc(info.format)
+        && info.size.depth == 1
+        && !runtime.has_native_astc()
     {
         return *common::settings::values().accelerate_astc.get_value()
             == common::settings_enums::AstcDecodeMode::Gpu
@@ -189,9 +215,9 @@ fn can_be_accelerated(has_native_astc: bool, info: &ImageInfo) -> bool {
 }
 
 /// Port of upstream `CanBeDecodedAsync(const TextureCacheRuntime&, const ImageInfo&)`.
-fn can_be_decoded_async(has_native_astc: bool, info: &ImageInfo) -> bool {
+fn can_be_decoded_async(runtime: &TextureCacheRuntime, info: &ImageInfo) -> bool {
     crate::surface::is_pixel_format_astc(info.format)
-        && !has_native_astc
+        && !runtime.has_native_astc()
         && *common::settings::values().accelerate_astc.get_value()
             == common::settings_enums::AstcDecodeMode::CpuAsynchronous
 }
@@ -233,9 +259,6 @@ fn select_astc_format(_format: PixelFormat, is_srgb: bool) -> u32 {
         }
     }
 }
-
-/// Number of texture types (1D, 2D, 2DRect, 3D, Cube, 1DArray, 2DArray, Buffer, CubeArray).
-const NUM_TEXTURE_TYPES: usize = 9;
 
 /// Format properties for a given GL internal format.
 ///
@@ -388,8 +411,7 @@ pub struct TextureCacheRuntime {
     state_tracker: NonNull<StateTracker>,
     staging_buffer_pool: SharedStagingBufferPool,
     format_properties: [HashMap<u32, FormatProperties>; 3],
-    null_image_views: [u32; NUM_TEXTURE_TYPES],
-    resolution: common::settings::ResolutionScalingInfo,
+    null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     #[cfg(test)]
     is_test_stub: bool,
 }
@@ -493,7 +515,7 @@ impl TextureCacheRuntime {
             }
         }
 
-        let mut null_image_views = [0u32; NUM_TEXTURE_TYPES];
+        let mut null_image_views = [0u32; NUM_TEXTURE_TYPES as usize];
         let mut set_view = |texture_type: TextureType, handle: u32| {
             if device.has_debugging_tool_attached() {
                 let name = format!("NullImage {texture_type:?}");
@@ -523,7 +545,9 @@ impl TextureCacheRuntime {
 
         const HALF_GIB: u64 = 512 * 1024 * 1024;
         let device_access_memory = if device.can_report_memory_usage() {
-            device.get_current_dedicated_video_memory() + HALF_GIB
+            device
+                .get_current_dedicated_video_memory()
+                .wrapping_add(HALF_GIB)
         } else {
             2 * 1024 * 1024 * 1024
         };
@@ -551,7 +575,6 @@ impl TextureCacheRuntime {
             staging_buffer_pool,
             format_properties,
             null_image_views,
-            resolution,
             #[cfg(test)]
             is_test_stub: false,
         }
@@ -587,8 +610,7 @@ impl TextureCacheRuntime {
             state_tracker: NonNull::from(state_tracker),
             staging_buffer_pool,
             format_properties: std::array::from_fn(|_| HashMap::new()),
-            null_image_views: [0; NUM_TEXTURE_TYPES],
-            resolution: common::settings::ResolutionScalingInfo::default(),
+            null_image_views: [0; NUM_TEXTURE_TYPES as usize],
             is_test_stub: true,
         }
     }
@@ -1104,6 +1126,13 @@ fn image_view_target(view_type: TextureType, num_samples: i32) -> u32 {
 fn swizzle(source: SwizzleSource) -> i32 {
     match source {
         SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::Invalid => {
+            log::error!("Invalid swizzle source={source:?}");
+            if *settings::values().use_debug_asserts.get_value() {
+                panic!("Invalid swizzle source={source:?}");
+            }
+            gl::NONE as i32
+        }
         SwizzleSource::R => gl::RED as i32,
         SwizzleSource::G => gl::GREEN as i32,
         SwizzleSource::B => gl::BLUE as i32,
@@ -1122,6 +1151,13 @@ fn convert_green_red(value: SwizzleSource) -> SwizzleSource {
 fn convert_a5b5g5r1_unorm(source: SwizzleSource) -> i32 {
     match source {
         SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::Invalid => {
+            log::error!("Invalid swizzle source={source:?}");
+            if *settings::values().use_debug_asserts.get_value() {
+                panic!("Invalid swizzle source={source:?}");
+            }
+            gl::NONE as i32
+        }
         SwizzleSource::R => gl::ALPHA as i32,
         SwizzleSource::G => gl::BLUE as i32,
         SwizzleSource::B => gl::GREEN as i32,
@@ -1191,6 +1227,7 @@ fn decode_swizzle(raw: [u8; 4]) -> Option<[SwizzleSource; 4]> {
     fn decode(value: u8) -> Option<SwizzleSource> {
         match value {
             0 => Some(SwizzleSource::Zero),
+            1 => Some(SwizzleSource::Invalid),
             2 => Some(SwizzleSource::R),
             3 => Some(SwizzleSource::G),
             4 => Some(SwizzleSource::B),
@@ -1798,12 +1835,7 @@ impl Image {
     /// Port of `Image::ScaleUp`.
     /// Scales the image up by the resolution scaling factor.
     pub fn scale_up(&mut self, base: &mut ImageBase, ignore: bool) -> bool {
-        let resolution_active = self.runtime.is_some_and(|runtime| {
-            // SAFETY: production images retain the runtime that constructed
-            // them, matching Eden's TextureCacheRuntime pointer lifetime.
-            unsafe { runtime.as_ref() }.resolution.active
-        });
-        if !resolution_active {
+        if self.runtime.is_none() || !settings::values().resolution_info.active {
             return false;
         }
         if base.flags.contains(ImageFlagBits::RESCALED) {
@@ -1830,11 +1862,7 @@ impl Image {
     /// Port of `Image::ScaleDown`.
     /// Scales the image down from the resolution scaling factor.
     pub fn scale_down(&mut self, base: &mut ImageBase, ignore: bool) -> bool {
-        let resolution_active = self.runtime.is_some_and(|runtime| {
-            // SAFETY: see `scale_up`.
-            unsafe { runtime.as_ref() }.resolution.active
-        });
-        if !resolution_active {
+        if self.runtime.is_none() || !settings::values().resolution_info.active {
             return false;
         }
         if !base.flags.contains(ImageFlagBits::RESCALED) {
@@ -1868,7 +1896,10 @@ impl Image {
             .expect("production OpenGL Image requires TextureCacheRuntime");
         // SAFETY: the runtime is boxed by the texture cache and outlives all
         // image slots, matching Eden's retained runtime pointer.
-        let resolution = unsafe { runtime_ptr.as_ref() }.resolution.clone();
+        // Eden retains a reference to the live global resolution state. Rust
+        // reads the locked global here instead of retaining an unsynchronised
+        // pointer into `Settings::Values`.
+        let resolution = settings::values().resolution_info.clone();
         let scaled_width = resolution.scale_up_u32(base.info.size.width);
         let scaled_height = if is_2d {
             resolution.scale_up_u32(base.info.size.height)
@@ -1965,8 +1996,8 @@ impl Image {
 /// formats than unsigned, even at the same bit width).
 #[derive(Default)]
 struct StorageViews {
-    signeds: [u32; NUM_TEXTURE_TYPES],
-    unsigneds: [u32; NUM_TEXTURE_TYPES],
+    signeds: [u32; NUM_TEXTURE_TYPES as usize],
+    unsigneds: [u32; NUM_TEXTURE_TYPES as usize],
 }
 
 /// An OpenGL image view.
@@ -1976,7 +2007,7 @@ pub struct ImageView {
     /// Stable address of the `ImageViewBase` subobject owned by the typed
     /// slot, matching upstream's inheritance rather than duplicating it.
     base: NonNull<ImageViewBase>,
-    pub views: [u32; NUM_TEXTURE_TYPES],
+    pub views: [u32; NUM_TEXTURE_TYPES as usize],
     pub default_handle: u32,
     pub internal_format: u32,
     pub buffer_size: u32,
@@ -1998,12 +2029,12 @@ pub struct ImageView {
 impl ImageView {
     #[cfg(test)]
     pub fn new(base: &mut ImageViewBase) -> Self {
-        Self::with_null_views(NonNull::from(base), [0; NUM_TEXTURE_TYPES])
+        Self::with_null_views(NonNull::from(base), [0; NUM_TEXTURE_TYPES as usize])
     }
 
     fn with_null_views(
         base: NonNull<ImageViewBase>,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     ) -> Self {
         Self {
             base,
@@ -2026,7 +2057,7 @@ impl ImageView {
     /// Port of `ImageView(TextureCacheRuntime&, NullImageViewParams)`.
     fn from_null_base(
         base: NonNull<ImageViewBase>,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     ) -> Self {
         Self::with_null_views(base, null_image_views)
     }
@@ -2083,7 +2114,7 @@ impl ImageView {
     pub fn new_color_2d(
         base: NonNull<ImageViewBase>,
         image: &Image,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
         set_object_label: bool,
     ) -> Self {
         // SAFETY: `base` points into the boxed base of the owning slot.
@@ -2122,7 +2153,8 @@ impl ImageView {
     /// and `ImageViewBase::new_buffer` already copied those two fields.
     pub fn from_buffer_base(
         base: NonNull<ImageViewBase>,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        _view_info: &ImageViewInfo,
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
     ) -> Self {
         // SAFETY: `base` points into the boxed base of the owning slot.
         let base_ref = unsafe { base.as_ref() };
@@ -2179,8 +2211,9 @@ impl ImageView {
     /// from the same boxed `ImageBase` subobject as the generic cache.
     pub fn from_image_view_info(
         base: NonNull<ImageViewBase>,
+        info: &ImageViewInfo,
         image: &Image,
-        null_image_views: [u32; NUM_TEXTURE_TYPES],
+        null_image_views: [u32; NUM_TEXTURE_TYPES as usize],
         set_object_label: bool,
     ) -> Self {
         use crate::texture_cache::types::ImageViewType;
@@ -2205,12 +2238,14 @@ impl ImageView {
         view.full_range = base_ref.range;
         view.flat_range = base_ref.range;
         view.set_object_label = set_object_label;
-        view.is_render_target = base_ref.is_render_target();
+        view.is_render_target = info.is_render_target();
         if !view.is_render_target {
-            view.swizzle = decode_swizzle(base_ref.swizzle).unwrap_or_else(|| {
-                log::error!("OpenGL::ImageView received an invalid component swizzle");
-                [SwizzleSource::Zero; 4]
-            });
+            view.swizzle =
+                decode_swizzle([info.x_source, info.y_source, info.z_source, info.w_source])
+                    .unwrap_or_else(|| {
+                        log::error!("OpenGL::ImageView received an invalid component swizzle");
+                        [SwizzleSource::Zero; 4]
+                    });
         }
 
         // First switch: per-type SetupView calls.
@@ -2346,23 +2381,25 @@ impl ImageView {
         }
         let is_signed = matches!(image_format, ImageFormat::R8Sint | ImageFormat::R16Sint);
         let idx = texture_type as usize;
-        // Probe the cache first (immutable read), then create + insert
-        // if missing. The make_view borrow + storage_views borrow can't
-        // overlap, so split into two stages.
-        let cached = self.storage_views.as_ref().map(|sv| {
+        // Eden materializes `StorageViews` before selecting and probing the
+        // requested slot. End the borrow before `make_view`, then publish the
+        // new handle into the already-created cache.
+        let cached = {
+            let storage = self.storage_views.get_or_insert_with(StorageViews::default);
             if is_signed {
-                sv.signeds[idx]
+                storage.signeds[idx]
             } else {
-                sv.unsigneds[idx]
+                storage.unsigneds[idx]
             }
-        });
-        if let Some(h) = cached {
-            if h != 0 {
-                return h;
-            }
+        };
+        if cached != 0 {
+            return cached;
         }
         let new_view = self.make_view(texture_type, shader_format(image_format));
-        let storage = self.storage_views.get_or_insert_with(StorageViews::default);
+        let storage = self
+            .storage_views
+            .as_mut()
+            .expect("StorageViews was materialized before MakeView");
         if is_signed {
             storage.signeds[idx] = new_view;
         } else {
@@ -2697,10 +2734,7 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
     ) -> Image {
         let runtime = runtime.expect("OpenGL TextureCache runtime must be bound");
         // SAFETY: the generic cache exclusively owns the just-inserted slot.
-        TextureCache::apply_backend_image_flags(
-            unsafe { base.as_mut() },
-            runtime.has_native_astc(),
-        );
+        TextureCache::apply_backend_image_flags(unsafe { base.as_mut() }, runtime);
         Image::from_base(base, runtime)
     }
 
@@ -2711,16 +2745,18 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
     fn create_image_view(
         runtime: Option<&mut TextureCacheRuntime>,
         _view_id: ImageViewId,
+        info: &ImageViewInfo,
         base: NonNull<ImageViewBase>,
         image: Option<&Image>,
     ) -> ImageView {
         let runtime = runtime.expect("OpenGL TextureCache runtime must be bound");
         // SAFETY: the base belongs to the slot receiving this payload.
         if unsafe { base.as_ref() }.is_buffer() {
-            ImageView::from_buffer_base(base, runtime.null_image_views)
+            ImageView::from_buffer_base(base, info, runtime.null_image_views)
         } else {
             ImageView::from_image_view_info(
                 base,
+                info,
                 image.expect("non-buffer OpenGL image view requires its parent image"),
                 runtime.null_image_views,
                 runtime.has_debugging_tool_attached(),
@@ -2860,6 +2896,19 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         cache.runtime().insert_upload_memory_barrier();
     }
 
+    fn can_image_be_copied(
+        cache: &CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+    ) -> bool {
+        cache.runtime.is_some()
+            && cache.slot_images[dst_id]
+                .backend
+                .as_ref()
+                .zip(cache.slot_images[src_id].backend.as_ref())
+                .is_some_and(|(dst, src)| cache.runtime().can_image_be_copied(dst, src))
+    }
+
     fn copy_image(
         cache: &mut CommonTextureCache<Self>,
         dst_id: ImageId,
@@ -2872,6 +2921,75 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         texture_cache_from_base(cache).copy_image(dst_id, src_id, copies);
     }
 
+    fn emulate_copy_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) {
+        if cache.runtime.is_none() {
+            return;
+        }
+        texture_cache_from_base(cache).emulate_copy_image(dst_id, src_id, copies);
+    }
+
+    fn should_reinterpret(
+        cache: &CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+    ) -> bool {
+        cache.slot_images[dst_id]
+            .backend
+            .as_ref()
+            .zip(cache.slot_images[src_id].backend.as_ref())
+            .is_some_and(|(dst, src)| cache.runtime().should_reinterpret(dst, src))
+    }
+
+    fn reinterpret_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) {
+        if cache.runtime.is_none() {
+            return;
+        }
+        texture_cache_from_base(cache).reinterpret_image(dst_id, src_id, copies);
+    }
+
+    fn convert_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_framebuffer_id: FramebufferId,
+        dst_view_id: ImageViewId,
+        src_view_id: ImageViewId,
+    ) {
+        if cache.runtime.is_none() {
+            return;
+        }
+        let runtime = cache.runtime_mut() as *mut TextureCacheRuntime;
+        let dst_framebuffer =
+            &mut cache.slot_framebuffers[dst_framebuffer_id] as *mut TextureCacheFramebuffer;
+        let dst_view = cache.slot_image_views[dst_view_id]
+            .backend
+            .as_mut()
+            .expect("OpenGL destination conversion view must be materialized")
+            as *mut ImageView;
+        let src_view = cache.slot_image_views[src_view_id]
+            .backend
+            .as_mut()
+            .expect("OpenGL source conversion view must be materialized")
+            as *mut ImageView;
+        // SAFETY: the runtime, framebuffer, and two distinct view slots are
+        // disjoint owners in the texture cache.
+        unsafe {
+            (&mut *runtime).convert_image(
+                Some(&mut *dst_framebuffer),
+                &mut *dst_view,
+                &mut *src_view,
+            );
+        }
+    }
+
     fn copy_image_msaa(
         cache: &mut CommonTextureCache<Self>,
         dst_id: ImageId,
@@ -2882,6 +3000,37 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
             return;
         }
         texture_cache_from_base(cache).copy_image_msaa(dst_id, src_id, copies);
+    }
+
+    fn blit_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_framebuffer_id: FramebufferId,
+        src_framebuffer_id: FramebufferId,
+        _dst_view_id: ImageViewId,
+        _src_view_id: ImageViewId,
+        dst_region: Region2D,
+        src_region: Region2D,
+        filter: crate::engines::fermi_2d::Filter,
+        operation: crate::engines::fermi_2d::Operation,
+    ) {
+        let (dst_handle, dst_buffer_bits) = {
+            let framebuffer = &cache.slot_framebuffers[dst_framebuffer_id];
+            (framebuffer.handle(), framebuffer.buffer_bits())
+        };
+        let (src_handle, src_buffer_bits) = {
+            let framebuffer = &cache.slot_framebuffers[src_framebuffer_id];
+            (framebuffer.handle(), framebuffer.buffer_bits())
+        };
+        cache.runtime_mut().blit_framebuffer(
+            dst_handle,
+            src_handle,
+            dst_buffer_bits,
+            src_buffer_bits,
+            dst_region,
+            src_region,
+            filter,
+            operation,
+        );
     }
 }
 
@@ -3227,15 +3376,19 @@ impl TextureCache {
         self.base.slot_image_views[view_id].backend.take()
     }
 
-    fn apply_backend_image_flags(image: &mut ImageBase, has_native_astc: bool) {
+    fn apply_backend_image_flags(image: &mut ImageBase, runtime: &TextureCacheRuntime) {
         // Upstream sets ASYNCHRONOUS_DECODE / ACCELERATED_UPLOAD in
         // OpenGL::Image::Image with this priority.
-        if can_be_decoded_async(has_native_astc, &image.info) {
+        if can_be_decoded_async(runtime, &image.info) {
             image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
-        } else if can_be_accelerated(has_native_astc, &image.info) {
+        } else if can_be_accelerated(runtime, &image.info) {
             image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
         }
-        if is_converted_image(has_native_astc, image.info.format, image.info.image_type) {
+        if is_converted_image(
+            runtime.has_native_astc(),
+            image.info.format,
+            image.info.image_type,
+        ) {
             image
                 .flags
                 .insert(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD);
@@ -3243,118 +3396,27 @@ impl TextureCache {
     }
 
     #[cfg(test)]
-    fn apply_backend_image_flags_for_test(image: &mut ImageBase, has_native_astc: bool) {
-        Self::apply_backend_image_flags(image, has_native_astc);
+    fn apply_backend_image_flags_for_test(image: &mut ImageBase, runtime: &TextureCacheRuntime) {
+        Self::apply_backend_image_flags(image, runtime);
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
         self.base.set_guest_memory_writer(writer);
     }
 
-    fn base_image_exists(&self, image_id: ImageId) -> bool {
-        Self::base_image_exists_in(&self.base, image_id)
-    }
-
-    fn base_image_exists_in(
-        base: &CommonTextureCache<TextureCacheParams>,
-        image_id: ImageId,
-    ) -> bool {
-        base.slot_images.contains(image_id)
-    }
-
-    fn find_or_insert_image_from_info_with_options_and_finish(
-        &mut self,
-        info: &ImageInfo,
-        gpu_addr: u64,
-        cpu_addr: u64,
-        options: RelaxedOptions,
-        _read_gpu: &mut dyn FnMut(u64, &mut [u8]) -> bool,
-    ) -> ImageId {
-        self.base
-            .find_or_insert_image_from_info_with_options(info, gpu_addr, cpu_addr, options)
-    }
-
     fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
-        if !dst_id.is_valid() || !src_id.is_valid() || copies.is_empty() {
-            return;
-        }
-
-        let dst_info = self.base.slot_images[dst_id].info.clone();
-        let src_info = self.base.slot_images[src_id].info.clone();
-        let src_flags = self.base.slot_images[src_id].flags;
-        let src_rescaled = src_flags.contains(ImageFlagBits::RESCALED);
-        let scaled_copies = if src_rescaled {
-            if !self.base.slot_images[dst_id]
-                .flags
-                .contains(ImageFlagBits::RESCALED)
-            {
-                // Eden's ASSERT is fail-soft: it reports the invariant but
-                // continues through the rescaled-copy path.
-                log::error!(
-                    "TextureCache::CopyImage source is rescaled but destination is not: src={} dst={}",
-                    src_id.index,
-                    dst_id.index,
-                );
-            }
-            let both_2d =
-                src_info.image_type == ImageType::E2D && dst_info.image_type == ImageType::E2D;
-            Some(scale_up_image_copies(copies, both_2d))
-        } else {
-            None
-        };
-        let copies = scaled_copies.as_deref().unwrap_or(copies);
-
-        let dst_format_type = crate::surface::get_format_type(dst_info.format);
-        let src_format_type = crate::surface::get_format_type(src_info.format);
-
         if !self.backend_image_is_ready(dst_id) || !self.backend_image_is_ready(src_id) {
             return;
         }
-
-        if self.backend_image(dst_id).map(Image::handle).unwrap_or(0) == 0
-            || self.backend_image(src_id).map(Image::handle).unwrap_or(0) == 0
-        {
-            return;
-        }
-
-        let can_copy = self
+        let runtime = self.base.runtime() as *const TextureCacheRuntime;
+        let dst = self
             .backend_image(dst_id)
-            .zip(self.backend_image(src_id))
-            .is_some_and(|(dst, src)| self.base.runtime().can_image_be_copied(dst, src));
-        if src_format_type == dst_format_type && can_copy {
-            let runtime = self.base.runtime() as *const TextureCacheRuntime;
-            let dst = self
-                .backend_image(dst_id)
-                .expect("backend image was checked above");
-            let src = self
-                .backend_image(src_id)
-                .expect("backend image was checked above");
-            // SAFETY: runtime and image slots are disjoint cache owners.
-            unsafe { &*runtime }.copy_image(dst, src, copies);
-            return;
-        }
-
-        if src_format_type == dst_format_type {
-            self.emulate_copy_image(dst_id, src_id, copies);
-            return;
-        }
-
-        if dst_info.image_type != ImageType::E2D || src_info.image_type != ImageType::E2D {
-            // These are upstream UNIMPLEMENTED_IF checks. Eden reports them
-            // and then continues into ShouldReinterpret.
-            log::error!(
-                "TextureCache::copy_image: reinterpret path only implemented for 2D images dst={:?} src={:?}",
-                dst_info.image_type,
-                src_info.image_type
-            );
-        }
-        let should_reinterpret = self
-            .backend_image(dst_id)
-            .zip(self.backend_image(src_id))
-            .is_some_and(|(dst, src)| self.base.runtime().should_reinterpret(dst, src));
-        if should_reinterpret {
-            self.reinterpret_image(dst_id, src_id, copies);
-        }
+            .expect("backend image was checked above");
+        let src = self
+            .backend_image(src_id)
+            .expect("backend image was checked above");
+        // SAFETY: runtime and image slots are disjoint cache owners.
+        unsafe { &*runtime }.copy_image(dst, src, copies);
     }
 
     fn copy_image_msaa(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
@@ -3848,395 +3910,14 @@ impl TextureCache {
         };
         (framebuffer.handle(), size.width, size.height)
     }
-    /// OpenGL-backed port of `TextureCache<P>::BlitImage` for the currently
-    /// implemented framebuffer-blit path (`TextureCacheParams::FRAMEBUFFER_BLITS`).
+    /// OpenGL wrapper for the common upstream-owned `TextureCache<P>::BlitImage`.
     pub fn blit_image(
         &mut self,
         dst: &crate::engines::fermi_2d::Surface,
         src: &crate::engines::fermi_2d::Surface,
         copy: &crate::engines::fermi_2d::Config,
-        mut gpu_to_cpu: impl FnMut(u64) -> Option<u64>,
-        mut read_gpu: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> bool {
-        let dst_addr = dst.address();
-        let src_addr = src.address();
-        let mut dst_info = ImageInfo::from_fermi2d_surface(dst);
-        let mut src_info = ImageInfo::from_fermi2d_surface(src);
-        let can_be_depth_blit = dst_info.format == src_info.format
-            && copy.filter == crate::engines::fermi_2d::Filter::Point;
-        let try_options = if can_be_depth_blit {
-            RelaxedOptions::SAMPLES | RelaxedOptions::FORMAT
-        } else {
-            RelaxedOptions::SAMPLES
-        };
-
-        let Some(src_cpu_addr) = gpu_to_cpu(src_addr) else {
-            return false;
-        };
-        let Some(dst_cpu_addr) = gpu_to_cpu(dst_addr) else {
-            return false;
-        };
-
-        let mut src_id;
-        let mut dst_id;
-        loop {
-            self.base.has_deleted_images = false;
-            src_id = self.base.find_image_in_cpu_region_with_caps(
-                &src_info,
-                src_addr,
-                src_cpu_addr,
-                try_options,
-                self.base.has_broken_texture_view_formats,
-                self.base.has_native_bgr,
-            );
-            dst_id = self.base.find_image_in_cpu_region_with_caps(
-                &dst_info,
-                dst_addr,
-                dst_cpu_addr,
-                try_options,
-                self.base.has_broken_texture_view_formats,
-                self.base.has_native_bgr,
-            );
-            if !copy.must_accelerate {
-                let src_gpu_modified = src_id
-                    .map(|id| {
-                        self.base.slot_images[id]
-                            .flags
-                            .contains(ImageFlagBits::GPU_MODIFIED)
-                    })
-                    .unwrap_or(false);
-                let dst_gpu_modified = dst_id
-                    .map(|id| {
-                        self.base.slot_images[id]
-                            .flags
-                            .contains(ImageFlagBits::GPU_MODIFIED)
-                    })
-                    .unwrap_or(false);
-                if src_id.is_none() && dst_id.is_none() {
-                    return false;
-                }
-                if !src_gpu_modified && !dst_gpu_modified {
-                    return false;
-                }
-            }
-
-            let src_image = src_id.map(|id| &self.base.slot_images[id]);
-            if src_image.is_some_and(|image| image.info.num_samples > 1) {
-                let msaa_options = RelaxedOptions::SAMPLES | RelaxedOptions::FORCE_BROKEN_VIEWS;
-                src_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &src_info,
-                    src_addr,
-                    src_cpu_addr,
-                    msaa_options,
-                    &mut read_gpu,
-                ));
-                dst_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &dst_info,
-                    dst_addr,
-                    dst_cpu_addr,
-                    msaa_options,
-                    &mut read_gpu,
-                ));
-                if self.base.has_deleted_images {
-                    continue;
-                }
-                break;
-            }
-
-            if can_be_depth_blit {
-                let src_image = src_id.map(|id| &*self.base.slot_images[id]);
-                let dst_image = dst_id.map(|id| &*self.base.slot_images[id]);
-                crate::texture_cache::util::deduce_blit_images(
-                    &mut dst_info,
-                    &mut src_info,
-                    dst_image,
-                    src_image,
-                );
-                if crate::surface::get_format_type(dst_info.format)
-                    != crate::surface::get_format_type(src_info.format)
-                {
-                    continue;
-                }
-            }
-
-            if src_id.is_none() {
-                src_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &src_info,
-                    src_addr,
-                    src_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                ));
-            }
-            if dst_id.is_none() {
-                dst_id = Some(self.find_or_insert_image_from_info_with_options_and_finish(
-                    &dst_info,
-                    dst_addr,
-                    dst_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                ));
-            }
-            if !self.base.has_deleted_images {
-                break;
-            }
-        }
-
-        let mut src_id = src_id.unwrap_or(NULL_IMAGE_ID);
-        let mut dst_id = dst_id.unwrap_or(NULL_IMAGE_ID);
-        if !src_id.is_valid() || !dst_id.is_valid() {
-            return false;
-        }
-
-        if !self.base_image_exists(src_id) || !self.base_image_exists(dst_id) {
-            return false;
-        }
-
-        let native_bgr = self.base.has_native_bgr;
-        if crate::surface::get_format_type(dst_info.format)
-            != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
-            || crate::surface::get_format_type(src_info.format)
-                != crate::surface::get_format_type(self.base.slot_images[src_id].info.format)
-            || !crate::surface::is_view_compatible(
-                dst_info.format,
-                self.base.slot_images[dst_id].info.format,
-                false,
-                native_bgr,
-            )
-            || !crate::surface::is_view_compatible(
-                src_info.format,
-                self.base.slot_images[src_id].info.format,
-                false,
-                native_bgr,
-            )
-        {
-            loop {
-                self.base.has_deleted_images = false;
-                src_id = self.find_or_insert_image_from_info_with_options_and_finish(
-                    &src_info,
-                    src_addr,
-                    src_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                );
-                dst_id = self.find_or_insert_image_from_info_with_options_and_finish(
-                    &dst_info,
-                    dst_addr,
-                    dst_cpu_addr,
-                    RelaxedOptions::empty(),
-                    &mut read_gpu,
-                );
-                if !self.base.has_deleted_images {
-                    break;
-                }
-            }
-            if !self.base_image_exists(src_id) || !self.base_image_exists(dst_id) {
-                return false;
-            }
-        }
-
-        self.base.prepare_image(src_id, false, false);
-        self.base.prepare_image(dst_id, true, false);
-
-        if !self.backend_image_is_ready(dst_id) || !self.backend_image_is_ready(src_id) {
-            return false;
-        }
-
-        let mut is_src_rescaled = self.base.slot_images[src_id]
-            .flags
-            .contains(ImageFlagBits::RESCALED);
-        let mut is_dst_rescaled = self.base.slot_images[dst_id]
-            .flags
-            .contains(ImageFlagBits::RESCALED);
-        let is_resolve = self.base.slot_images[src_id].info.num_samples != 1
-            && self.base.slot_images[dst_id].info.num_samples == 1;
-        if is_src_rescaled != is_dst_rescaled {
-            if self.base.image_can_rescale(src_id) {
-                self.base.scale_up(src_id);
-                is_src_rescaled = self.base.slot_images[src_id]
-                    .flags
-                    .contains(ImageFlagBits::RESCALED);
-                if is_resolve {
-                    self.base.slot_images[dst_id].info.rescaleable = true;
-                    let aliases = self.base.slot_images[dst_id].aliased_images.clone();
-                    for alias in aliases {
-                        self.base.slot_images[alias.id].info.rescaleable = true;
-                    }
-                }
-            }
-            if self.base.image_can_rescale(dst_id) {
-                self.base.scale_up(dst_id);
-                is_dst_rescaled = self.base.slot_images[dst_id]
-                    .flags
-                    .contains(ImageFlagBits::RESCALED);
-            }
-        }
-        if is_resolve && is_src_rescaled != is_dst_rescaled {
-            self.base.scale_down(src_id);
-            self.base.scale_down(dst_id);
-            is_src_rescaled = self.base.slot_images[src_id]
-                .flags
-                .contains(ImageFlagBits::RESCALED);
-            is_dst_rescaled = self.base.slot_images[dst_id]
-                .flags
-                .contains(ImageFlagBits::RESCALED);
-        }
-        let resolution = settings::values().resolution_info.clone();
-        let scale_region = |region: &mut Region2D| {
-            region.start.x = resolution.scale_up_i32(region.start.x);
-            region.start.y = resolution.scale_up_i32(region.start.y);
-            region.end.x = resolution.scale_up_i32(region.end.x);
-            region.end.y = resolution.scale_up_i32(region.end.y);
-        };
-
-        let Some(src_base) = self.base.slot_images[src_id].try_find_base(src_addr) else {
-            return false;
-        };
-        let Some(dst_base) = self.base.slot_images[dst_id].try_find_base(dst_addr) else {
-            return false;
-        };
-        let src_range = SubresourceRange {
-            base: src_base,
-            ..Default::default()
-        };
-        let dst_range = SubresourceRange {
-            base: dst_base,
-            ..Default::default()
-        };
-        let src_view_id = self.ensure_color_view_for_range(src_id, src_info.format, src_range);
-        let dst_view_id = self.ensure_color_view_for_range(dst_id, dst_info.format, dst_range);
-        let Some((src_fbo, _, _)) = self.framebuffer_for_image_view(src_view_id) else {
-            return false;
-        };
-        let Some((dst_fbo, _, _)) = self.framebuffer_for_image_view(dst_view_id) else {
-            return false;
-        };
-
-        let (src_samples_x, src_samples_y) = crate::texture_cache::samples_helper::samples_log2(
-            self.base.slot_images[src_id].info.num_samples as i32,
-        );
-        let (dst_samples_x, dst_samples_y) = crate::texture_cache::samples_helper::samples_log2(
-            self.base.slot_images[dst_id].info.num_samples as i32,
-        );
-
-        let mut src_region = Region2D {
-            start: Offset2D {
-                x: copy.src_x0 >> src_samples_x,
-                y: copy.src_y0 >> src_samples_y,
-            },
-            end: Offset2D {
-                x: copy.src_x1 >> src_samples_x,
-                y: copy.src_y1 >> src_samples_y,
-            },
-        };
-        if is_src_rescaled {
-            scale_region(&mut src_region);
-        }
-        let mut dst_region = Region2D {
-            start: Offset2D {
-                x: copy.dst_x0 >> dst_samples_x,
-                y: copy.dst_y0 >> dst_samples_y,
-            },
-            end: Offset2D {
-                x: copy.dst_x1 >> dst_samples_x,
-                y: copy.dst_y1 >> dst_samples_y,
-            },
-        };
-        if is_dst_rescaled {
-            scale_region(&mut dst_region);
-        }
-        self.base.runtime_mut().blit_framebuffer(
-            dst_fbo,
-            src_fbo,
-            gl::COLOR_BUFFER_BIT,
-            gl::COLOR_BUFFER_BIT,
-            dst_region,
-            src_region,
-            copy.filter,
-            copy.operation,
-        );
-        self.base.mark_modification_by_id(dst_id);
-
-        true
-    }
-
-    fn ensure_color_view_for_range(
-        &mut self,
-        image_id: ImageId,
-        view_format: crate::surface::PixelFormat,
-        range: SubresourceRange,
-    ) -> ImageViewId {
-        let view_info = ImageViewInfo::for_render_target(ImageViewType::E2D, view_format, range);
-        let existing = self.base.slot_images[image_id].find_view(&view_info);
-        if existing.is_valid() {
-            return existing;
-        }
-        let gpu_addr = self.base.slot_images[image_id].gpu_addr;
-        self.base
-            .find_or_emplace_image_view(image_id, view_info, gpu_addr)
-    }
-
-    fn framebuffer_for_image_view(&mut self, view_id: ImageViewId) -> Option<(u32, u32, u32)> {
-        let view_base = self
-            .base
-            .slot_image_views
-            .get(view_id)
-            .base
-            .as_ref()
-            .clone();
-        let image_id = view_base.image_id;
-        if !image_id.is_valid() {
-            return None;
-        }
-        self.ready_backend_image_mut(image_id)?;
-        let view_mismatch = {
-            let backend_image = self
-                .backend_image(image_id)
-                .expect("image inserted above must be present");
-            self.base.slot_image_views[view_id]
-                .backend
-                .as_ref()
-                .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
-        };
-        if view_mismatch {
-            self.take_backend_image_view(view_id);
-            self.remove_framebuffers_for_view(view_id);
-        }
-        if self.base.slot_image_views[view_id].backend.is_none() {
-            let base = NonNull::from(self.base.slot_image_views[view_id].base.as_mut());
-            let backend_image = self.base.slot_images[image_id]
-                .backend
-                .as_ref()
-                .expect("image inserted above must be present");
-            let view = ImageView::new_color_2d(
-                base,
-                backend_image,
-                self.base.runtime().null_image_views,
-                self.base.runtime().has_debugging_tool_attached(),
-            );
-            self.base.slot_image_views[view_id].backend = Some(view);
-        }
-        let backend_view = self.base.slot_image_views[view_id]
-            .backend
-            .as_ref()
-            .expect("image view was materialized above");
-        let attachment_texture = framebuffer_attachment_texture(&view_base, backend_view);
-        if attachment_texture == 0 {
-            return None;
-        }
-        let key = self.render_targets_key_for_image_view(view_id, &view_base);
-        let framebuffer_id = if let Some(&framebuffer_id) = self.base.framebuffers.get(&key) {
-            framebuffer_id
-        } else {
-            let framebuffer =
-                self.create_color_framebuffer_for_view(key, &view_base, attachment_texture);
-            let framebuffer_id = self.base.slot_framebuffers.insert(framebuffer);
-            self.base.framebuffers.insert(key, framebuffer_id);
-            framebuffer_id
-        };
-        let framebuffer = &self.base.slot_framebuffers[framebuffer_id];
-        let handle = framebuffer.handle();
-        (handle != 0).then_some((handle, key.size.width, key.size.height))
+        self.base.blit_image(dst, src, copy)
     }
 
     fn render_targets_key_for_image_view(
@@ -4337,6 +4018,7 @@ impl TextureCache {
             self.remove_framebuffers_for_view(view_id);
         }
         if self.base.slot_image_views[view_id].backend.is_none() {
+            let info = self.base.slot_image_views[view_id].info;
             let base = NonNull::from(self.base.slot_image_views[view_id].base.as_mut());
             let backend_image = self.base.slot_images[image_id]
                 .backend
@@ -4344,6 +4026,7 @@ impl TextureCache {
                 .expect("image inserted above must be present");
             let backend_view = ImageView::from_image_view_info(
                 base,
+                &info,
                 backend_image,
                 self.base.runtime().null_image_views,
                 self.base.runtime().has_debugging_tool_attached(),

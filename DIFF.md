@@ -17561,3 +17561,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: compile-time assertions and `raw_nvdec_layout_matches_codec_types_header` verify every
   upstream size assertion and all upstream offset assertions for H264, VP9, and VP8 payloads.
+
+## 2026-08-27 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust splits the mutable `SamplesStreamer`/`TFBCounterStreamer` and `QueryRuntimeBackend` borrows
+  before calling `QueryCacheRuntime::sync_host_values`. Eden reaches the same runtime-owned method
+  through the streamer's stable reference to `QueryCacheRuntime`.
+
+### Unintentional differences (to fix)
+
+- Resolved: `sync_samples_writes` and `sync_tfb_writes` no longer use `Option::take` to move their
+  mutex-owning streamers out of and back into `QueryCacheRuntime`. Eden's streamers remain at stable
+  addresses inside the heap-owned `QueryCacheRuntimeImpl`; retaining the Rust streamers in place
+  prevents the fence-release thread from waiting on the abandoned address of a moved mutex.
+
+### Missing items
+
+- Live query-pool validation remains necessary for recorded Vulkan commands; the startup
+  regression was additionally exercised through five consecutive release launches.
+
+### Binary layout verification
+
+- N/A: this correction changes host-side ownership and borrowing only; no guest payload or disk
+  cache layout changes.

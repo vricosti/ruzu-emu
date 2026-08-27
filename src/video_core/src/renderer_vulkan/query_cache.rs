@@ -797,9 +797,9 @@ impl SamplesStreamer {
         self.pending_sync.clear();
     }
 
-    fn sync_writes(&mut self, runtime: &mut QueryCacheRuntime) {
+    fn sync_writes(&mut self, backend: &mut QueryRuntimeBackend) {
         for (values, source_buffer) in self.sync_values_stash.drain(..) {
-            runtime.sync_host_values(&values, source_buffer);
+            QueryCacheRuntime::sync_host_values(backend, &values, source_buffer);
         }
     }
 
@@ -1682,7 +1682,7 @@ impl TfbCounterStreamer {
         !self.pending_sync.is_empty()
     }
 
-    fn sync_writes(&mut self, scheduler: &mut Scheduler, runtime: &mut QueryCacheRuntime) {
+    fn sync_writes(&mut self, scheduler: &mut Scheduler, backend: &mut QueryRuntimeBackend) {
         self.close_counter(scheduler);
         let mut values_by_bank: BTreeMap<u64, (vk::Buffer, Vec<HostSyncValues>)> = BTreeMap::new();
         for (report, address) in self.pending_sync.drain(..) {
@@ -1698,7 +1698,7 @@ impl TfbCounterStreamer {
                 });
         }
         for (_, (source_buffer, values)) in values_by_bank {
-            runtime.sync_host_values(&values, source_buffer);
+            QueryCacheRuntime::sync_host_values(backend, &values, source_buffer);
         }
     }
 
@@ -2063,61 +2063,6 @@ fn sync_guest_values(backend: &mut QueryRuntimeBackend, values: &[SyncValuesStru
     });
 }
 
-/// Port of `QueryCacheRuntime::SyncValues<HostSyncValues>` where the source
-/// values already live in a Vulkan buffer produced by the query resolve.
-fn sync_host_values(
-    backend: &mut QueryRuntimeBackend,
-    values: &[HostSyncValues],
-    source_buffer: vk::Buffer,
-) {
-    if values.is_empty() {
-        return;
-    }
-    let (redirect_cache, little_cache, _) =
-        build_sync_value_regions_from(values.iter().map(|value| (value.address, value.size)));
-
-    let buffer_cache = unsafe { backend.buffer_cache.as_mut() };
-    let mutex = Arc::clone(&buffer_cache.mutex);
-    let _lock = mutex.lock();
-    let mut destination_buffers = Vec::with_capacity(little_cache.len());
-    for &(begin, end) in &little_cache {
-        let Ok(size) = u32::try_from(end - begin) else {
-            return;
-        };
-        let (buffer_id, offset) = buffer_cache.obtain_cpu_buffer(
-            begin,
-            size,
-            ObtainBufferSynchronize::FullSynchronize,
-            ObtainBufferOperation::DoNothing,
-        );
-        let raw_buffer = buffer_cache.resolve_backend_buffer_raw(buffer_id);
-        if raw_buffer == 0 {
-            return;
-        }
-        destination_buffers.push((vk::Buffer::from_raw(raw_buffer), u64::from(offset)));
-    }
-    drop(_lock);
-
-    let mut copies = vec![Vec::<vk::BufferCopy>::new(); little_cache.len()];
-    for (index, value) in values.iter().enumerate() {
-        let destination = redirect_cache[index];
-        copies[destination].push(vk::BufferCopy {
-            src_offset: value.offset,
-            dst_offset: destination_buffers[destination].1 + value.address
-                - little_cache[destination].0,
-            size: value.size,
-        });
-    }
-    let device = backend.device.clone();
-    let scheduler = unsafe { backend.scheduler.as_mut() };
-    scheduler.request_outside_render_pass_operation_context();
-    scheduler.record(move |cmdbuf| unsafe {
-        for (index, &(destination, _)) in destination_buffers.iter().enumerate() {
-            device.cmd_copy_buffer(cmdbuf, source_buffer, destination, &copies[index]);
-        }
-    });
-}
-
 pub struct QueryCacheRuntime {
     guest_streamer: Option<Box<GuestStreamer<QueryRuntimeSyncHandle>>>,
     samples_streamer: Option<SamplesStreamer>,
@@ -2135,6 +2080,65 @@ pub struct QueryCacheRuntime {
 }
 
 impl QueryCacheRuntime {
+    /// Port of `QueryCacheRuntime::SyncValues<HostSyncValues>` where the source
+    /// values already live in a Vulkan buffer produced by the query resolve.
+    ///
+    /// `backend` is passed separately so Rust can mutably borrow the runtime's
+    /// streamer and backend fields without moving either streamer. Eden keeps
+    /// both inside its heap-stable `QueryCacheRuntimeImpl`.
+    fn sync_host_values(
+        backend: &mut QueryRuntimeBackend,
+        values: &[HostSyncValues],
+        source_buffer: vk::Buffer,
+    ) {
+        if values.is_empty() {
+            return;
+        }
+        let (redirect_cache, little_cache, _) =
+            build_sync_value_regions_from(values.iter().map(|value| (value.address, value.size)));
+
+        let buffer_cache = unsafe { backend.buffer_cache.as_mut() };
+        let mutex = Arc::clone(&buffer_cache.mutex);
+        let _lock = mutex.lock();
+        let mut destination_buffers = Vec::with_capacity(little_cache.len());
+        for &(begin, end) in &little_cache {
+            let Ok(size) = u32::try_from(end - begin) else {
+                return;
+            };
+            let (buffer_id, offset) = buffer_cache.obtain_cpu_buffer(
+                begin,
+                size,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DoNothing,
+            );
+            let raw_buffer = buffer_cache.resolve_backend_buffer_raw(buffer_id);
+            if raw_buffer == 0 {
+                return;
+            }
+            destination_buffers.push((vk::Buffer::from_raw(raw_buffer), u64::from(offset)));
+        }
+        drop(_lock);
+
+        let mut copies = vec![Vec::<vk::BufferCopy>::new(); little_cache.len()];
+        for (index, value) in values.iter().enumerate() {
+            let destination = redirect_cache[index];
+            copies[destination].push(vk::BufferCopy {
+                src_offset: value.offset,
+                dst_offset: destination_buffers[destination].1 + value.address
+                    - little_cache[destination].0,
+                size: value.size,
+            });
+        }
+        let device = backend.device.clone();
+        let scheduler = unsafe { backend.scheduler.as_mut() };
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.record(move |cmdbuf| unsafe {
+            for (index, &(destination, _)) in destination_buffers.iter().enumerate() {
+                device.cmd_copy_buffer(cmdbuf, source_buffer, destination, &copies[index]);
+            }
+        });
+    }
+
     /// Port of `QueryCacheRuntime::QueryCacheRuntime`.
     ///
     /// In the full implementation, this creates the PIMPL with:
@@ -2260,26 +2264,24 @@ impl QueryCacheRuntime {
         Arc::clone(&self.state)
     }
 
-    fn sync_host_values(&mut self, values: &[HostSyncValues], source_buffer: vk::Buffer) {
-        if let Some(backend) = self.backend.as_deref_mut() {
-            sync_host_values(backend, values, source_buffer);
-        }
-    }
-
     fn sync_samples_writes(&mut self) {
-        let Some(mut streamer) = self.samples_streamer.take() else {
+        let Some(streamer) = self.samples_streamer.as_mut() else {
             return;
         };
-        streamer.sync_writes(self);
-        self.samples_streamer = Some(streamer);
+        let Some(backend) = self.backend.as_deref_mut() else {
+            return;
+        };
+        streamer.sync_writes(backend);
     }
 
     fn sync_tfb_writes(&mut self, scheduler: &mut Scheduler) {
-        let Some(mut streamer) = self.tfb_streamer.take() else {
+        let Some(streamer) = self.tfb_streamer.as_mut() else {
             return;
         };
-        streamer.sync_writes(scheduler, self);
-        self.tfb_streamer = Some(streamer);
+        let Some(backend) = self.backend.as_deref_mut() else {
+            return;
+        };
+        streamer.sync_writes(scheduler, backend);
     }
 
     /// Port of `QueryCacheRuntime::Barriers`.
@@ -3693,5 +3695,19 @@ mod tests {
         );
 
         assert_eq!(&backing[0..4], &[0; 4]);
+    }
+
+    #[test]
+    fn sync_writes_keeps_mutex_owning_streamers_in_place() {
+        // The fence-release thread can lock each streamer's flush queue while
+        // the GPU thread performs SyncWrites. Moving either streamer here
+        // moves a live parking_lot mutex and can strand the fence thread on
+        // the old address. Eden's QueryCacheRuntimeImpl keeps both members at
+        // stable addresses for the same lifetime.
+        let source = include_str!("query_cache.rs");
+        let samples_take = ["self.samples_streamer", ".take()"].concat();
+        let tfb_take = ["self.tfb_streamer", ".take()"].concat();
+        assert!(!source.contains(&samples_take));
+        assert!(!source.contains(&tfb_take));
     }
 }

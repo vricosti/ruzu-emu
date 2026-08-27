@@ -98,6 +98,7 @@ pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
 
+use crate::environment::Environment;
 use crate::frontend::maxwell_opcodes::{self, MaxwellOpcode, SrcType};
 use crate::ir::emitter::Emitter;
 use crate::ir::program::Program;
@@ -131,6 +132,9 @@ pub struct TranslatorVisitor<'a> {
     pub ir: Emitter<'a>,
     pub stage: ShaderStage,
     pub sph: Option<ProgramHeader>,
+    /// Upstream `TranslatorVisitor::env` owner. Runtime translation always
+    /// supplies this; reduced instruction tests may omit it.
+    pub env: Option<&'a dyn Environment>,
 }
 
 impl<'a> TranslatorVisitor<'a> {
@@ -144,6 +148,19 @@ impl<'a> TranslatorVisitor<'a> {
             ir: Emitter::new(program, block),
             stage,
             sph,
+            env: None,
+        }
+    }
+
+    /// Construct the runtime visitor with the same environment ownership as
+    /// upstream `TranslatorVisitor(Environment&, IR::Block&)`.
+    pub fn new_with_env(program: &'a mut Program, block: u32, env: &'a dyn Environment) -> Self {
+        let stage = env.shader_stage();
+        Self {
+            ir: Emitter::new(program, block),
+            stage,
+            sph: Some(env.sph().clone()),
+            env: Some(env),
         }
     }
 

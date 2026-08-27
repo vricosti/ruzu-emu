@@ -73,9 +73,9 @@ fn short_offset(tv: &mut TranslatorVisitor<'_>, offset: Value) -> Value {
 }
 
 fn local_memory_size(tv: &TranslatorVisitor<'_>) -> u32 {
-    tv.sph
-        .as_ref()
-        .map(|sph| sph.local_memory_size() as u32)
+    tv.env
+        .map(crate::environment::Environment::local_memory_size)
+        .or_else(|| tv.sph.as_ref().map(|sph| sph.local_memory_size() as u32))
         .unwrap_or(tv.ir.program.local_memory_size)
 }
 

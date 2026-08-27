@@ -17586,3 +17586,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this correction changes host-side ownership and borrowing only; no guest payload or disk
   cache layout changes.
+
+## 2026-08-27 — `src/shader_recompiler/src/frontend/translate/{mod.rs,load_store_local_shared.rs}` and `src/shader_recompiler/src/pipeline_cache.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/{impl/impl.h,impl/load_store_local_shared.cpp,translate.cpp}`
+
+### Intentional differences
+
+- Reduced Rust instruction tests and compatibility callers may construct a `TranslatorVisitor`
+  without an `Environment`; those paths retain the explicit SPH/program fallback. Every runtime
+  environment translation supplies the upstream-owned environment reference.
+
+### Unintentional differences (to fix)
+
+- Resolved: the runtime visitor had lost Eden's `Environment& env` member, so local-memory bounds
+  used a cloned graphics program header. Compute allocations live in
+  `Environment::local_memory_size`; a zero-valued header therefore discarded valid immediate
+  `STL` writes and left their consumer buffers uninitialized.
+
+### Missing items
+
+- None in the verified runtime environment ownership, `LDL` bounds lookup, or immediate `STL`
+  bounds decision.
+
+### Binary layout verification
+
+- N/A: this correction retains shader IR writes and changes no serialized or raw-memory payload.

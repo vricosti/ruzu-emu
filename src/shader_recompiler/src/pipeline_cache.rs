@@ -81,6 +81,7 @@ fn translate_cfg_to_program(
     stage: ShaderStage,
     cfg_blocks: &[control_flow::CfgBlock],
     sph: Option<&ProgramHeader>,
+    env: Option<&dyn Environment>,
 ) -> Program {
     let mut structured = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
         linear_structured_syntax(cfg_blocks)
@@ -104,6 +105,7 @@ fn translate_cfg_to_program(
         code,
         code_base_offset,
         sph,
+        env,
     );
     rebuild_syntax_successors(&mut program);
 
@@ -187,6 +189,7 @@ fn materialize_structured_actions(
     code: &[u64],
     code_base_offset: u32,
     sph: Option<&ProgramHeader>,
+    env: Option<&dyn Environment>,
 ) {
     for action in actions {
         match action {
@@ -194,7 +197,11 @@ fn materialize_structured_actions(
                 let Some(cfg_block) = cfg_blocks.get(*cfg_block) else {
                     continue;
                 };
-                let mut tv = TranslatorVisitor::new_with_sph(program, *block, sph.cloned());
+                let mut tv = if let Some(env) = env {
+                    TranslatorVisitor::new_with_env(program, *block, env)
+                } else {
+                    TranslatorVisitor::new_with_sph(program, *block, sph.cloned())
+                };
                 for i in cfg_block.begin as usize..cfg_block.end as usize {
                     if i >= code.len() {
                         break;
@@ -497,7 +504,7 @@ pub fn compile_shader(
 
     // Step 2/3: Convert flat CFG to structured control flow and translate
     // Maxwell instructions into matching IR blocks.
-    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None, None);
     log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
@@ -566,8 +573,14 @@ pub fn translate_program_from_env_with_host_info(
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
     let sph = env.sph().clone();
-    let mut program =
-        translate_cfg_to_program(code, base_offset, env.shader_stage(), &cfg_blocks, Some(&sph));
+    let mut program = translate_cfg_to_program(
+        code,
+        base_offset,
+        env.shader_stage(),
+        &cfg_blocks,
+        Some(&sph),
+        Some(&*env),
+    );
     apply_environment_program_metadata(&mut program, env, &normalized_host_info);
     optimize_program_with_env(env, &mut program, &normalized_host_info, Some(&sph));
     collect_interpolation_info(&sph, &mut program);
@@ -607,7 +620,7 @@ pub fn compile_shader_glsl(
     );
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None, None);
 
     optimize_program_without_env(
         &mut program,
@@ -882,7 +895,7 @@ fn emit_glsl_program_at_offset(
         base_offset
     );
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, base_offset, stage, &cfg_blocks, sph);
+    let mut program = translate_cfg_to_program(code, base_offset, stage, &cfg_blocks, sph, None);
 
     optimize_program_without_env(&mut program, host_info, sph, texture_bound_buffer);
 
@@ -1040,7 +1053,7 @@ fn translate_and_optimize_with_host_info(
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, 0, stage, &cfg_blocks, None, None);
     optimize_program_without_env(&mut program, &normalized_host_info, None, None);
     program
 }
@@ -1262,6 +1275,7 @@ mod tests {
             ShaderStage::VertexB,
             cfg_blocks.as_slice(),
             None,
+            None,
         );
 
         // Upstream TranslatePass keeps consecutive Code statements in the
@@ -1291,7 +1305,8 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], 0, ShaderStage::VertexB, &cfg_blocks, None);
+        let program =
+            translate_cfg_to_program(&[0], 0, ShaderStage::VertexB, &cfg_blocks, None, None);
         let entry_block = match program.syntax_list.first() {
             Some(SyntaxNode::Block(block)) => *block,
             _ => panic!("translation must start with an entry block"),
@@ -1324,7 +1339,8 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], 0, ShaderStage::Fragment, &cfg_blocks, None);
+        let program =
+            translate_cfg_to_program(&[0], 0, ShaderStage::Fragment, &cfg_blocks, None, None);
 
         assert!(program.blocks.iter().any(|block| {
             block
@@ -1383,6 +1399,7 @@ mod tests {
             0,
             ShaderStage::VertexB,
             cfg_blocks.as_slice(),
+            None,
             None,
         );
 
@@ -1549,6 +1566,27 @@ mod tests {
         assert_eq!(program.shared_memory_size, 0x180);
         assert_eq!(program.workgroup_size, [8, 4, 2]);
         assert!(!program.blocks.is_empty());
+    }
+
+    #[test]
+    fn runtime_translator_uses_compute_environment_local_memory_for_stl_bounds() {
+        let env = DummyEnvironment::compute();
+        assert_eq!(env.sph.local_memory_size(), 0);
+        assert_eq!(env.local_memory_size(), 0x240);
+
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        // STL.B32 R2, [RZ + 0x20]. The immediate is within the compute
+        // environment allocation, but outside the zero-valued graphics SPH.
+        let stl = 0xEF50_0000_0000_0000u64 | (4u64 << 48) | (0x20u64 << 20) | (255u64 << 8) | 2;
+        {
+            let mut visitor = TranslatorVisitor::new_with_env(&mut program, 0, &env);
+            crate::frontend::translate::load_store_local_shared::stl(&mut visitor, stl);
+        }
+
+        assert!(program.blocks[0]
+            .iter()
+            .any(|inst| inst.opcode == Opcode::WriteLocal));
     }
 
     #[test]

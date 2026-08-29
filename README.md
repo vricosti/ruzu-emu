@@ -204,11 +204,17 @@ MoltenVK under `Contents/Frameworks`, matching the upstream macOS bundle
 layout. Set `MOLTENVK_LIBRARY=/path/to/libMoltenVK.dylib` to package a specific
 MoltenVK build instead of the Homebrew installation.
 
-> **Windows:** `build.bat` is **IN PROGRESS** and the automated Windows build is
-> not yet considered complete.
-
-The intended Windows workflow starts by running `build.bat` from an x64 Native
-Tools command prompt. Packaging additionally requires
+On Windows, run `build.bat` from an ordinary Command Prompt. It detects or
+installs Visual Studio Build Tools, Rust and vcpkg, then configures the current
+prompt and creates a standalone Release build in
+`build\x86_64-pc-windows-msvc\release`. Pass `-Debug` to use the `debug`
+subdirectory instead. Cargo keeps its intermediate artifacts under `target`;
+only `ruzu.exe` and the matching vcpkg runtime DLLs are staged in `build`, so
+the executable can be launched outside the build prompt. An existing standalone
+vcpkg is selected from `VCPKG_ROOT`, `PATH`, or common locations. To select one
+explicitly, use
+`build.bat -VcpkgRoot D:\path\to\vcpkg`; add `-Yes` for unattended dependency
+installation. Packaging additionally requires
 [NSIS 3](https://nsis.sourceforge.io/Download); the portable runtime directory
 and installer are then generated with:
 

@@ -146,8 +146,7 @@ fn corrected_migration_path(
     legacy_user_dir: &std::path::Path,
     ruzu_destination: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    migrated_path
-        .starts_with(legacy_user_dir)
+    crate::user_data_migration::path_is_within(migrated_path, legacy_user_dir)
         .then(|| ruzu_destination.to_path_buf())
 }
 
@@ -189,6 +188,56 @@ fn restart_path_after_shutdown(
     (!shutdown_failed && !close_after_stop)
         .then_some(pending_restart_path)
         .flatten()
+}
+
+/// Native child-window geometry in physical pixels. Unlike the previous size
+/// tuple this also tracks the render area's origin and DPI, both of which may
+/// change when a Windows toplevel is minimized, restored, or moved between
+/// monitors without changing the GTK stack's logical size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderGeometry {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    scale: i32,
+}
+
+fn render_geometry(x: f32, y: f32, width: f32, height: f32, scale: i32) -> Option<RenderGeometry> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let scale = scale.max(1);
+    Some(RenderGeometry {
+        x: (x * scale as f32).round() as i32,
+        y: (y * scale as f32).round() as i32,
+        width: (width * scale as f32).round().max(1.0) as i32,
+        height: (height * scale as f32).round().max(1.0) as i32,
+        scale,
+    })
+}
+
+#[cfg(test)]
+mod render_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn native_geometry_detects_origin_size_and_dpi_changes() {
+        let initial = render_geometry(0.0, 24.0, 1280.0, 672.0, 1).unwrap();
+        assert_ne!(
+            initial,
+            render_geometry(0.0, 30.0, 1280.0, 672.0, 1).unwrap()
+        );
+        assert_ne!(
+            initial,
+            render_geometry(0.0, 24.0, 1279.0, 672.0, 1).unwrap()
+        );
+        assert_ne!(
+            initial,
+            render_geometry(0.0, 24.0, 1280.0, 672.0, 2).unwrap()
+        );
+        assert_eq!(render_geometry(0.0, 0.0, 0.0, 672.0, 1), None);
+    }
 }
 
 /// The main launcher window.
@@ -240,8 +289,9 @@ pub struct GMainWindow {
     /// Native render-window handles for the running game, so it can be resized
     /// when the GTK window resizes.
     render: RefCell<Option<RenderHandles>>,
-    /// Last observed central-stack size, to detect resizes.
-    render_size: Cell<(i32, i32)>,
+    /// Last native render rectangle, including origin and DPI, so the child
+    /// surface cannot drift over the menu/status bars after a restore.
+    render_geometry: Cell<Option<RenderGeometry>>,
     /// The open configuration dialog, kept alive while it is on screen
     /// (upstream holds `ConfigureDialog` on the stack across `exec()`).
     configure_dialog: RefCell<Option<Rc<crate::configuration::ConfigureDialog>>>,
@@ -962,7 +1012,8 @@ impl GMainWindow {
         #[cfg(not(target_os = "macos"))]
         let menu_bar = {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
-            menubar.set_halign(gtk::Align::Start);
+            menubar.set_halign(gtk::Align::Fill);
+            menubar.set_hexpand(true);
             menubar.connect_map(|menubar| {
                 force_menu_mnemonic_underlines(menubar.upcast_ref());
             });
@@ -1074,7 +1125,7 @@ impl GMainWindow {
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
             is_amiibo_file_select_active: Cell::new(false),
             render: RefCell::new(None),
-            render_size: Cell::new((0, 0)),
+            render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
             play_time_manager,
@@ -1180,6 +1231,13 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             this,
             move |_| {
+                // A native child can retain stale placement across Win32/X11
+                // minimize/restore even when its logical size is unchanged.
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                {
+                    this.render_geometry.set(None);
+                    this.maybe_resize_render();
+                }
                 let render = this.render.borrow();
                 if let Some(handles) = render.as_ref() {
                     handles.emu_window.set_shown(true);
@@ -2137,33 +2195,47 @@ impl GMainWindow {
             completion.emulator.name
         );
 
+        use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
+
         if completion.selection.configuration {
-            use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
-
-            // Capture Ruzu's active destinations before loading the imported
-            // config, which may temporarily replace them with Yuzu paths.
-            let ruzu_destinations = [
-                (RuzuPath::NANDDir, get_ruzu_path(RuzuPath::NANDDir)),
-                (RuzuPath::SDMCDir, get_ruzu_path(RuzuPath::SDMCDir)),
-                (RuzuPath::DumpDir, get_ruzu_path(RuzuPath::DumpDir)),
-                (RuzuPath::LoadDir, get_ruzu_path(RuzuPath::LoadDir)),
-            ];
-
             crate::configuration::qt_config::load_global_values();
-            for (path, ruzu_destination) in ruzu_destinations {
-                let migrated_path = get_ruzu_path(path);
-                if let Some(corrected) = corrected_migration_path(
-                    &migrated_path,
-                    completion.emulator.get_user_dir(),
-                    &ruzu_destination,
-                ) {
-                    set_ruzu_path(path, &corrected);
-                }
+        }
+
+        // Imported configuration may contain absolute paths into any legacy
+        // user tree. The migration dialog already resolved safe Ruzu targets;
+        // apply those targets after loading the imported file, or repair an
+        // earlier partial import even when configuration was not selected now.
+        let ruzu_destinations = [
+            (RuzuPath::NANDDir, &completion.destinations.nand),
+            (RuzuPath::SDMCDir, &completion.destinations.sdmc),
+            (RuzuPath::DumpDir, &completion.destinations.dump),
+            (RuzuPath::LoadDir, &completion.destinations.load),
+            (RuzuPath::SaveDir, &completion.destinations.save),
+            (RuzuPath::TASDir, &completion.destinations.tas),
+        ];
+        let mut corrected_storage_path = false;
+        for (path, ruzu_destination) in ruzu_destinations {
+            let migrated_path = get_ruzu_path(path);
+            let corrected =
+                completion
+                    .destinations
+                    .legacy_user_dirs
+                    .iter()
+                    .find_map(|legacy_user_dir| {
+                        corrected_migration_path(&migrated_path, legacy_user_dir, ruzu_destination)
+                    });
+            if let Some(corrected) = corrected {
+                set_ruzu_path(path, &corrected);
+                corrected_storage_path = true;
             }
+        }
+        if corrected_storage_path {
             if let Err(error) = crate::configuration::qt_config::save_global_values() {
                 log::warn!("Could not persist corrected post-migration paths: {error}");
             }
+        }
 
+        if completion.selection.configuration {
             crate::configuration::qt_config::load_control_values();
             crate::configuration::qt_config::load_ui_language();
             let interface_language =
@@ -3212,8 +3284,7 @@ impl GMainWindow {
             child_window: layer.child_window as usize,
             metal_layer: layer.metal_layer as usize,
         });
-        self.render_size
-            .set((self.stack.width(), self.stack.height()));
+        self.render_geometry.set(None);
 
         self.show_loading_screen();
 
@@ -3408,8 +3479,7 @@ impl GMainWindow {
             child_window: embedded.window as usize,
             colormap: embedded.colormap,
         });
-        self.render_size
-            .set((self.stack.width(), self.stack.height()));
+        self.render_geometry.set(None);
 
         self.show_loading_screen();
 
@@ -3593,8 +3663,7 @@ impl GMainWindow {
             emu_window: emu,
             child_window: embedded.window as usize,
         });
-        self.render_size
-            .set((self.stack.width(), self.stack.height()));
+        self.render_geometry.set(None);
         self.show_loading_screen();
 
         let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
@@ -3704,19 +3773,25 @@ impl GMainWindow {
     /// staying fixed at the boot size).
     #[cfg(target_os = "macos")]
     fn maybe_resize_render(&self) {
-        let (w, h) = (self.stack.width(), self.stack.height());
-        if w <= 0 || h <= 0 || self.render_size.get() == (w, h) {
+        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+            return;
+        };
+        let scale = self
+            .window
+            .surface()
+            .map_or(1, |surface| surface.scale_factor());
+        let Some(geometry) =
+            render_geometry(rect.x(), rect.y(), rect.width(), rect.height(), scale)
+        else {
+            return;
+        };
+        if self.render_geometry.get() == Some(geometry) {
             return;
         }
         let mut render = self.render.borrow_mut();
         let Some(handles) = render.as_mut() else {
-            self.render_size.set((w, h));
             return;
         };
-        let Some(rect) = self.stack.compute_bounds(&self.window) else {
-            return;
-        };
-        self.render_size.set((w, h));
         let gr = (
             rect.x() as f64,
             rect.y() as f64,
@@ -3733,6 +3808,7 @@ impl GMainWindow {
             handles.metal_layer as *mut _,
             gr,
         ) {
+            self.render_geometry.set(Some(geometry));
             handles.emu_window.update_framebuffer_layout(dw, dh);
         }
     }
@@ -3741,19 +3817,25 @@ impl GMainWindow {
     /// window to the stack's new bounds and rebuild the frame layout.
     #[cfg(target_os = "linux")]
     fn maybe_resize_render(&self) {
-        let (w, h) = (self.stack.width(), self.stack.height());
-        if w <= 0 || h <= 0 || self.render_size.get() == (w, h) {
+        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+            return;
+        };
+        let scale = self
+            .window
+            .surface()
+            .map_or(1, |surface| surface.scale_factor());
+        let Some(geometry) =
+            render_geometry(rect.x(), rect.y(), rect.width(), rect.height(), scale)
+        else {
+            return;
+        };
+        if self.render_geometry.get() == Some(geometry) {
             return;
         }
         let mut render = self.render.borrow_mut();
         let Some(handles) = render.as_mut() else {
-            self.render_size.set((w, h));
             return;
         };
-        let Some(rect) = self.stack.compute_bounds(&self.window) else {
-            return;
-        };
-        self.render_size.set((w, h));
         let gr = (
             rect.x() as f64,
             rect.y() as f64,
@@ -3766,6 +3848,7 @@ impl GMainWindow {
             handles.child_window as u64,
             gr,
         ) {
+            self.render_geometry.set(Some(geometry));
             handles.emu_window.update_framebuffer_layout(dw, dh);
         }
     }
@@ -3774,19 +3857,25 @@ impl GMainWindow {
     /// and publish the new framebuffer layout after the native resize.
     #[cfg(target_os = "windows")]
     fn maybe_resize_render(&self) {
-        let (width, height) = (self.stack.width(), self.stack.height());
-        if width <= 0 || height <= 0 || self.render_size.get() == (width, height) {
+        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+            return;
+        };
+        let scale = self
+            .window
+            .surface()
+            .map_or(1, |surface| surface.scale_factor());
+        let Some(geometry) =
+            render_geometry(rect.x(), rect.y(), rect.width(), rect.height(), scale)
+        else {
+            return;
+        };
+        if self.render_geometry.get() == Some(geometry) {
             return;
         }
         let mut render = self.render.borrow_mut();
         let Some(handles) = render.as_mut() else {
-            self.render_size.set((width, height));
             return;
         };
-        let Some(rect) = self.stack.compute_bounds(&self.window) else {
-            return;
-        };
-        self.render_size.set((width, height));
         let gtk_rect = (
             rect.x() as f64,
             rect.y() as f64,
@@ -3800,6 +3889,7 @@ impl GMainWindow {
                 gtk_rect,
             )
         {
+            self.render_geometry.set(Some(geometry));
             handles
                 .emu_window
                 .update_framebuffer_layout(drawable_width, drawable_height);

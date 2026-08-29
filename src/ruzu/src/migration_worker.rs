@@ -969,8 +969,18 @@ fn directory_link_target(path: &Path) -> io::Result<Option<PathBuf>> {
 }
 
 #[cfg(windows)]
+fn junction_exists(path: &Path) -> io::Result<bool> {
+    const ERROR_NOT_A_REPARSE_POINT: i32 = 4390;
+
+    match junction::exists(path) {
+        Err(error) if error.raw_os_error() == Some(ERROR_NOT_A_REPARSE_POINT) => Ok(false),
+        result => result,
+    }
+}
+
+#[cfg(windows)]
 fn directory_link_target(path: &Path) -> io::Result<Option<PathBuf>> {
-    if junction::exists(path)? {
+    if junction_exists(path)? {
         return junction::get_target(path).map(Some);
     }
     let metadata = match fs::symlink_metadata(path) {
@@ -1001,7 +1011,7 @@ fn create_symlink(source: &Path, target: &Path, destination: &Path) -> io::Resul
 
 fn remove_entry(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
-    if junction::exists(path)? {
+    if junction_exists(path)? {
         return junction::delete(path);
     }
 
@@ -1089,6 +1099,16 @@ mod tests {
         };
         assert!(selection.any());
         assert!(!selection.tree_data_selected());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn regular_directory_is_not_reported_as_a_directory_link() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("regular-directory");
+        fs::create_dir(&directory).unwrap();
+
+        assert_eq!(directory_link_target(&directory).unwrap(), None);
     }
 
     #[test]

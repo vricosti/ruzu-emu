@@ -55,13 +55,21 @@ pub fn show_error<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail
     show_message_with_type(parent, message, detail, MessageType::Error, false);
 }
 
-/// Show an error whose title and detail were already translated.
-pub fn show_pretranslated_error<P: IsA<gtk::Window>>(
+/// Show a translated error and run `callback` once the user dismisses it.
+pub fn show_pretranslated_error_then<P: IsA<gtk::Window>>(
     parent: Option<&P>,
     message: &str,
     detail: &str,
+    callback: impl FnOnce() + 'static,
 ) {
-    show_pretranslated_message_with_type(parent, message, detail, MessageType::Error, false);
+    show_pretranslated_message_with_type_then(
+        parent,
+        message,
+        detail,
+        MessageType::Error,
+        false,
+        callback,
+    );
 }
 
 fn show_message_with_type<P: IsA<gtk::Window>>(

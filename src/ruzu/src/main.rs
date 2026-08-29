@@ -71,6 +71,31 @@ fn main_window() -> Option<Rc<GMainWindow>> {
     MAIN_WINDOW.with(|slot| slot.borrow().as_ref().cloned())
 }
 
+/// Let Win32 own the non-client frame unless the caller explicitly asks GTK
+/// to draw client-side decorations.
+///
+/// GTK4 forces CSD on its Windows backend by default. Its transparent resize
+/// and shadow margins can be presented as opaque black pixels by the Windows
+/// rendering path, producing a rectangular black frame around every toplevel
+/// and dialog. Eden uses ordinary native Windows frames through Qt's
+/// `windowsvista` style, so disabling GTK's default CSD is the matching
+/// platform adaptation.
+#[cfg(target_os = "windows")]
+fn windows_gtk_csd_default(current: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    current.is_none().then_some("0")
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_native_decorations() -> bool {
+    let current = std::env::var_os("GTK_CSD");
+    let Some(value) = windows_gtk_csd_default(current.as_deref()) else {
+        return false;
+    };
+
+    std::env::set_var("GTK_CSD", value);
+    true
+}
+
 /// Apply the selected interface locale to the live launcher, matching
 /// upstream's `GMainWindow::OnLanguageChanged` retranslation step.
 pub(crate) fn retranslate_application() {
@@ -107,6 +132,11 @@ fn configure_linux_gdk_backend() -> bool {
 }
 
 fn main() -> glib::ExitCode {
+    // This must happen before constructing any GTK object: GtkWindow reads
+    // GTK_CSD while deciding how each native toplevel is decorated.
+    #[cfg(target_os = "windows")]
+    let enabled_native_windows_decorations = configure_windows_native_decorations();
+
     #[cfg(target_os = "linux")]
     let _xlib_threading = crate::render_window_x11::initialize_xlib_threads();
 
@@ -114,6 +144,11 @@ fn main() -> glib::ExitCode {
     let forced_x11 = configure_linux_gdk_backend();
 
     env_logger::init();
+
+    #[cfg(target_os = "windows")]
+    if enabled_native_windows_decorations {
+        log::info!("Using native Win32 window decorations (GTK_CSD=0)");
+    }
 
     #[cfg(target_os = "linux")]
     if forced_x11 {
@@ -222,5 +257,23 @@ mod tests {
     fn linux_launcher_keeps_the_default_backend_without_the_preference() {
         assert_eq!(linux_gdk_backend_override(None, false), None);
         assert_eq!(linux_gdk_backend_override(Some("wayland"), false), None);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn native_decorations_are_the_windows_default() {
+        assert_eq!(windows_gtk_csd_default(None), Some("0"));
+        assert_eq!(
+            windows_gtk_csd_default(Some(std::ffi::OsStr::new("1"))),
+            None
+        );
+        assert_eq!(
+            windows_gtk_csd_default(Some(std::ffi::OsStr::new("0"))),
+            None
+        );
     }
 }

@@ -30,6 +30,7 @@ pub struct MigrationCompletion {
     pub emulator: Emulator,
     pub selection: MigrationSelection,
     pub report: MigrationReport,
+    pub(crate) destinations: Destinations,
 }
 
 type CompletionCallback = Box<dyn FnOnce(Option<MigrationCompletion>)>;
@@ -89,7 +90,8 @@ fn show_dialog<P: IsA<gtk::Window>>(
         return false;
     }
 
-    let destinations = destinations();
+    let destinations =
+        destinations().outside_legacy_sources(&emulators, &get_ruzu_path(RuzuPath::RuzuDir));
     let dialog = gtk::Dialog::builder()
         .title(&crate::i18n::tr("User Data Migration"))
         .transient_for(parent)
@@ -237,9 +239,7 @@ fn show_dialog<P: IsA<gtk::Window>>(
                     mark_migration_prompt_seen();
                 }
                 dialog.close();
-                if let Some(callback) = callback.borrow_mut().take() {
-                    callback(None);
-                }
+                complete_without_migration(&callback);
                 return;
             };
 
@@ -248,9 +248,7 @@ fn show_dialog<P: IsA<gtk::Window>>(
                     mark_migration_prompt_seen();
                 }
                 dialog.close();
-                if let Some(callback) = callback.borrow_mut().take() {
-                    callback(None);
-                }
+                complete_without_migration(&callback);
                 return;
             }
 
@@ -282,10 +280,14 @@ fn show_dialog<P: IsA<gtk::Window>>(
                         "Ruzu could not inspect the existing migration destination:\n%1",
                         &[error.to_string()],
                     );
-                    crate::gtk_compat::show_pretranslated_error(
-                        Some(dialog),
+                    let message_parent = dialog.transient_for();
+                    dialog.hide();
+                    let callback = Rc::clone(&callback);
+                    crate::gtk_compat::show_pretranslated_error_then(
+                        message_parent.as_ref(),
                         &crate::i18n::tr("Migration Failed"),
                         &detail,
+                        move || complete_without_migration(&callback),
                     );
                     return;
                 }
@@ -298,6 +300,7 @@ fn show_dialog<P: IsA<gtk::Window>>(
             });
             let worker_plan = plan.clone();
             let worker_emulator = emulator.clone();
+            let worker_destinations = destinations.clone();
             show_migration_confirmation(
                 dialog,
                 &emulator,
@@ -317,6 +320,7 @@ fn show_dialog<P: IsA<gtk::Window>>(
                             worker_plan,
                             worker_emulator,
                             selection,
+                            worker_destinations,
                             Rc::clone(&callback),
                         );
                     }
@@ -360,6 +364,7 @@ fn start_worker(
     plan: MigrationPlan,
     emulator: Emulator,
     selection: MigrationSelection,
+    destinations: Destinations,
     callback: Rc<RefCell<Option<CompletionCallback>>>,
 ) {
     let strategy = plan.strategy;
@@ -412,7 +417,6 @@ fn start_worker(
         let _ = sender.send(result);
     });
 
-    let migration_dialog = migration_dialog.clone();
     let message_parent = parent;
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let result = match receiver.try_recv() {
@@ -438,26 +442,31 @@ fn start_worker(
                         emulator: emulator.clone(),
                         selection: selection.clone(),
                         report,
+                        destinations: destinations.clone(),
                     }));
                 }
             }
             Err(error) => {
                 log::error!("Migration from {} failed: {error}", emulator.name);
                 let detail = migration_error_text(strategy, &selection, &error.to_string());
-                crate::gtk_compat::show_pretranslated_error(
+                let callback = Rc::clone(&callback);
+                crate::gtk_compat::show_pretranslated_error_then(
                     message_parent.as_ref(),
                     &crate::i18n::tr("Migration Failed"),
                     &detail,
+                    move || complete_without_migration(&callback),
                 );
-                // The migration dialog was hidden while the worker ran. Show
-                // it again so the user can retry or choose no migration.
-                // Closing it here can emit a Cancel response and incorrectly
-                // persist the one-time prompt marker after a failed copy.
-                migration_dialog.present();
             }
         }
         glib::ControlFlow::Break
     });
+}
+
+fn complete_without_migration(callback: &Rc<RefCell<Option<CompletionCallback>>>) {
+    let callback = callback.borrow_mut().take();
+    if let Some(callback) = callback {
+        callback(None);
+    }
 }
 
 fn migration_success_text(
@@ -524,12 +533,52 @@ fn migration_error_text(
 }
 
 #[derive(Debug, Clone)]
-struct Destinations {
+pub(crate) struct Destinations {
     config: PathBuf,
-    nand: PathBuf,
-    sdmc: PathBuf,
-    load: PathBuf,
+    pub(crate) nand: PathBuf,
+    pub(crate) sdmc: PathBuf,
+    pub(crate) load: PathBuf,
     keys: PathBuf,
+    pub(crate) dump: PathBuf,
+    pub(crate) save: PathBuf,
+    pub(crate) tas: PathBuf,
+    pub(crate) legacy_user_dirs: Vec<PathBuf>,
+}
+
+impl Destinations {
+    /// A copied legacy configuration can contain absolute paths back into that
+    /// emulator's user directory. Never use such a path as a migration target:
+    /// doing so would make source and destination identical, or could overwrite
+    /// a different legacy installation. Paths outside every discovered legacy
+    /// tree remain valid custom Ruzu destinations.
+    fn outside_legacy_sources(self, emulators: &[Emulator], ruzu_dir: &Path) -> Self {
+        let legacy_user_dirs = emulators
+            .iter()
+            .map(|emulator| emulator.get_user_dir().to_path_buf())
+            .collect::<Vec<_>>();
+        let safe = |configured: PathBuf, fallback: PathBuf| {
+            if legacy_user_dirs
+                .iter()
+                .any(|legacy_user_dir| path_is_within(&configured, legacy_user_dir))
+            {
+                fallback
+            } else {
+                configured
+            }
+        };
+
+        Self {
+            config: self.config,
+            nand: safe(self.nand, ruzu_dir.join("nand")),
+            sdmc: safe(self.sdmc, ruzu_dir.join("sdmc")),
+            load: safe(self.load, ruzu_dir.join("load")),
+            keys: self.keys,
+            dump: safe(self.dump, ruzu_dir.join("dump")),
+            save: safe(self.save, ruzu_dir.join("nand")),
+            tas: safe(self.tas, ruzu_dir.join("tas")),
+            legacy_user_dirs,
+        }
+    }
 }
 
 fn destinations() -> Destinations {
@@ -539,7 +588,38 @@ fn destinations() -> Destinations {
         sdmc: get_ruzu_path(RuzuPath::SDMCDir),
         load: get_ruzu_path(RuzuPath::LoadDir),
         keys: get_ruzu_path(RuzuPath::KeysDir),
+        dump: get_ruzu_path(RuzuPath::DumpDir),
+        save: get_ruzu_path(RuzuPath::SaveDir),
+        tas: get_ruzu_path(RuzuPath::TASDir),
+        legacy_user_dirs: Vec::new(),
     }
+}
+
+pub(crate) fn path_is_within(path: &Path, directory: &Path) -> bool {
+    let (path, directory) = match (
+        std::fs::canonicalize(path),
+        std::fs::canonicalize(directory),
+    ) {
+        (Ok(path), Ok(directory)) => (path, directory),
+        _ => (path.to_path_buf(), directory.to_path_buf()),
+    };
+    let mut path_components = path.components();
+
+    directory.components().all(|expected| {
+        path_components.next().is_some_and(|actual| {
+            #[cfg(windows)]
+            {
+                actual
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                actual == expected
+            }
+        })
+    })
 }
 
 fn migration_plan(
@@ -712,17 +792,23 @@ fn conversion_warning_text(
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} {}", UNITS[0]);
+    const MEBIBYTE: u64 = 1024 * 1024;
+    const GIBIBYTE: u64 = 1024 * MEBIBYTE;
+    const MAX_MEBIBYTES: u64 = 999;
+
+    if bytes > MAX_MEBIBYTES * MEBIBYTE {
+        format!(
+            "{:.1} {}",
+            bytes as f64 / GIBIBYTE as f64,
+            crate::i18n::tr("GB")
+        )
+    } else {
+        format!(
+            "{:.1} {}",
+            bytes as f64 / MEBIBYTE as f64,
+            crate::i18n::tr("MB")
+        )
     }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn migration_prompt_seen() -> bool {
@@ -849,6 +935,10 @@ mod tests {
             sdmc: root.path().join("ruzu/sdmc"),
             load: root.path().join("ruzu/load"),
             keys: root.path().join("ruzu/keys"),
+            dump: root.path().join("ruzu/dump"),
+            save: root.path().join("ruzu/nand"),
+            tas: root.path().join("ruzu/tas"),
+            legacy_user_dirs: Vec::new(),
         };
         let plan = migration_plan(
             &emulator,
@@ -872,6 +962,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_storage_destinations_fall_back_to_the_ruzu_user_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let ruzu = root.path().join("ruzu");
+        let yuzu = root.path().join("yuzu");
+        let sudachi = root.path().join("sudachi");
+        std::fs::create_dir_all(yuzu.join("nand")).unwrap();
+        std::fs::create_dir_all(&sudachi).unwrap();
+
+        let emulators = [
+            Emulator {
+                name: "Yuzu",
+                directory_name: "yuzu",
+                user_dir: yuzu.clone(),
+                config_dir: yuzu.join("config"),
+                cache_dir: yuzu.join("cache"),
+            },
+            Emulator {
+                name: "Sudachi",
+                directory_name: "sudachi",
+                user_dir: sudachi.clone(),
+                config_dir: sudachi.join("config"),
+                cache_dir: sudachi.join("cache"),
+            },
+        ];
+        let destinations = Destinations {
+            config: ruzu.join("config"),
+            nand: yuzu.join("nand"),
+            sdmc: sudachi.join("sdmc"),
+            load: root.path().join("custom-load"),
+            keys: ruzu.join("keys"),
+            dump: yuzu.join("dump"),
+            save: yuzu.join("nand"),
+            tas: yuzu.join("tas"),
+            legacy_user_dirs: Vec::new(),
+        }
+        .outside_legacy_sources(&emulators, &ruzu);
+
+        assert_eq!(destinations.nand, ruzu.join("nand"));
+        assert_eq!(destinations.sdmc, ruzu.join("sdmc"));
+        assert_eq!(destinations.load, root.path().join("custom-load"));
+        assert_eq!(destinations.dump, ruzu.join("dump"));
+        assert_eq!(destinations.save, ruzu.join("nand"));
+        assert_eq!(destinations.tas, ruzu.join("tas"));
+    }
+
+    #[test]
+    fn estimated_size_switches_to_gigabytes_above_999_megabytes() {
+        const MEBIBYTE: u64 = 1024 * 1024;
+
+        crate::i18n::set_language("fr");
+        assert_eq!(format_bytes(999 * MEBIBYTE), "999.0 Mo");
+        assert_eq!(format_bytes(999 * MEBIBYTE + 1), "1.0 Go");
+        assert_eq!(format_bytes(1536 * MEBIBYTE), "1.5 Go");
+        crate::i18n::set_language("en");
+    }
+
+    #[test]
     fn migration_prompt_seen_is_an_explicit_dedicated_marker() {
         let root = tempfile::tempdir().unwrap();
         assert!(!migration_prompt_seen_in(root.path()));
@@ -882,6 +1029,21 @@ mod tests {
             std::fs::read(root.path().join(MIGRATION_PROMPT_MARKER)).unwrap(),
             b"true\n"
         );
+    }
+
+    #[test]
+    fn failed_migration_completion_dismisses_the_flow_once() {
+        let completions = Rc::new(RefCell::new(Vec::new()));
+        let callback: Rc<RefCell<Option<CompletionCallback>>> =
+            Rc::new(RefCell::new(Some(Box::new({
+                let completions = Rc::clone(&completions);
+                move |completion| completions.borrow_mut().push(completion.is_some())
+            }))));
+
+        complete_without_migration(&callback);
+        complete_without_migration(&callback);
+
+        assert_eq!(&*completions.borrow(), &[false]);
     }
 
     #[test]

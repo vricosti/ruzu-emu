@@ -6,13 +6,19 @@ Installs and verifies the native Windows dependencies required to build Ruzu.
 
 .DESCRIPTION
 The script uses the native x64 MSVC toolchain. Rust is installed exclusively
-through rustup. GTK4, FFmpeg, OpenSSL, Vulkan, glslang, and pkgconf are built
-and managed by vcpkg. Cargo builds SDL3 statically from source.
+through rustup. GTK4, FFmpeg, Opus, OpenSSL, Vulkan, glslang, and pkgconf are
+built and managed by vcpkg. Cargo builds SDL3 statically from source.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$Yes
+    [switch]$Yes,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$VcpkgRoot,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$EnvironmentFile
 )
 
 Set-StrictMode -Version Latest
@@ -22,16 +28,35 @@ $ProgressPreference = "SilentlyContinue"
 $RustMinimum = [version]"1.85.0"
 $RustToolchain = "stable-x86_64-pc-windows-msvc"
 $VcpkgTriplet = "x64-windows-ruzu"
+# -Debug is the standard switch supplied by CmdletBinding.
+$BuildProfile = if ($PSBoundParameters.ContainsKey("Debug")) {
+    "debug"
+}
+else {
+    "release"
+}
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDirectory
-$EnvironmentBatch = Join-Path $env:TEMP "ruzu-windows-env.bat"
+$EnvironmentBatch = if ($PSBoundParameters.ContainsKey("EnvironmentFile")) {
+    [IO.Path]::GetFullPath($EnvironmentFile)
+}
+else {
+    Join-Path $env:TEMP "ruzu-windows-env.bat"
+}
 $VcpkgOverlayTriplets = Join-Path $ScriptDirectory "vcpkg-triplets"
 $CmakeWrapper = Join-Path $ScriptDirectory "cmake-clean-env.cmd"
-$RequestedVcpkgRoot = $env:VCPKG_ROOT
+$VcpkgRootWasExplicit = $PSBoundParameters.ContainsKey("VcpkgRoot")
+$RequestedVcpkgRoot = if ($VcpkgRootWasExplicit) {
+    $VcpkgRoot
+}
+else {
+    $env:VCPKG_ROOT
+}
 
 $VcpkgPackages = @(
     "gtk:$VcpkgTriplet"
     "ffmpeg[avcodec]:$VcpkgTriplet"
+    "opus:$VcpkgTriplet"
     "openssl:$VcpkgTriplet"
     "vulkan:$VcpkgTriplet"
     "glslang[tools]:$VcpkgTriplet"
@@ -75,14 +100,14 @@ function Set-CurrentPath {
 function Refresh-CommandPath {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    Set-CurrentPath -Value "$machinePath;$userPath"
+    Add-CurrentPath -Entries @(($machinePath, $userPath) -split ";" | Where-Object { $_ })
 }
 
 function Add-CurrentPath {
     param([Parameter(Mandatory)][string[]]$Entries)
 
     foreach ($entry in $Entries) {
-        if ($entry -and (Test-Path $entry)) {
+        if ($entry -and (Test-Path -LiteralPath $entry)) {
             $currentPath = [Environment]::GetEnvironmentVariable("Path", "Process")
             $parts = $currentPath -split ";" | Where-Object { $_ }
             if ($parts -notcontains $entry) {
@@ -98,7 +123,7 @@ function Add-UserPath {
     $current = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @($current -split ";" | Where-Object { $_ })
     foreach ($entry in $Entries) {
-        if ($entry -and (Test-Path $entry) -and $parts -notcontains $entry) {
+        if ($entry -and (Test-Path -LiteralPath $entry) -and $parts -notcontains $entry) {
             $parts += $entry
         }
     }
@@ -110,7 +135,9 @@ function Get-VSWherePath {
         (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe")
         (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
     )
-    return $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    return $candidates |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
 }
 
 function Get-VSInstallation {
@@ -394,11 +421,67 @@ function Get-MissingVcpkgPackages {
         throw "Unable to query installed vcpkg packages."
     }
 
-    $requiredNames = @("gtk", "ffmpeg", "openssl", "vulkan", "glslang", "pkgconf")
-    return @($requiredNames | Where-Object {
-        $pattern = "^$([regex]::Escape($_)):$([regex]::Escape($VcpkgTriplet))\s"
+    $requiredPackages = @(
+        "gtk:$VcpkgTriplet"
+        "ffmpeg:$VcpkgTriplet"
+        "ffmpeg[avcodec]:$VcpkgTriplet"
+        "opus:$VcpkgTriplet"
+        "openssl:$VcpkgTriplet"
+        "vulkan:$VcpkgTriplet"
+        "glslang:$VcpkgTriplet"
+        "glslang[tools]:$VcpkgTriplet"
+        "pkgconf:$VcpkgTriplet"
+    )
+    return @($requiredPackages | Where-Object {
+        $pattern = "^$([regex]::Escape($_))\s"
         -not ($installed -match $pattern)
     })
+}
+
+function Get-NormalizedVcpkgRoot {
+    param([AllowNull()][AllowEmptyString()][string]$Candidate)
+
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        return $null
+    }
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Candidate.Trim().Trim('"'))
+    if ([IO.Path]::GetFileName($expanded) -ieq "vcpkg.exe") {
+        $expanded = Split-Path -Parent $expanded
+    }
+
+    try {
+        return [IO.Path]::GetFullPath($expanded).TrimEnd("\", "/")
+    }
+    catch {
+        Write-Warning "Ignoring an invalid vcpkg path: $Candidate"
+        return $null
+    }
+}
+
+function Test-StandaloneVcpkgRoot {
+    param(
+        [Parameter(Mandatory)][string]$Candidate,
+        [switch]$RequireExecutable
+    )
+
+    if (-not (Test-Path -LiteralPath $Candidate -PathType Container)) {
+        return $false
+    }
+    if (Test-Path -LiteralPath (Join-Path $Candidate "vcpkg-bundle.json")) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath (
+        Join-Path $Candidate "scripts\buildsystems\vcpkg.cmake"
+    ))) {
+        return $false
+    }
+    if ($RequireExecutable -and -not (Test-Path -LiteralPath (
+        Join-Path $Candidate "vcpkg.exe"
+    ) -PathType Leaf)) {
+        return $false
+    }
+    return $true
 }
 
 function Find-VcpkgRoot {
@@ -407,22 +490,37 @@ function Find-VcpkgRoot {
         $candidates += $RequestedVcpkgRoot
     }
 
-    # Prefer Ruzu's standalone installation over vcpkg instances injected into
-    # PATH by Visual Studio's developer environment.
-    $candidates += Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
+    foreach ($scope in @("User", "Machine")) {
+        $candidates += [Environment]::GetEnvironmentVariable("VCPKG_ROOT", $scope)
+    }
 
     $command = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
     if ($command) {
         $candidates += Split-Path -Parent $command.Source
     }
 
-    foreach ($candidate in $candidates | Select-Object -Unique) {
-        $executable = Join-Path $candidate "vcpkg.exe"
-        $toolchain = Join-Path $candidate "scripts\buildsystems\vcpkg.cmake"
-        $visualStudioBundle = Join-Path $candidate "vcpkg-bundle.json"
-        if ((Test-Path $executable) -and
-            (Test-Path $toolchain) -and
-            -not (Test-Path $visualStudioBundle)) {
+    $ancestor = $ProjectRoot
+    while ($ancestor) {
+        $candidates += Join-Path $ancestor "vcpkg"
+        $parent = Split-Path -Parent $ancestor
+        if (-not $parent -or $parent -eq $ancestor) {
+            break
+        }
+        $ancestor = $parent
+    }
+
+    $candidates += @(
+        (Join-Path $env:USERPROFILE "vcpkg")
+        (Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg")
+        (Join-Path $env:SystemDrive "vcpkg")
+    )
+
+    $normalizedCandidates = @($candidates |
+        ForEach-Object { Get-NormalizedVcpkgRoot $_ } |
+        Where-Object { $_ } |
+        Select-Object -Unique)
+    foreach ($candidate in $normalizedCandidates) {
+        if (Test-StandaloneVcpkgRoot -Candidate $candidate -RequireExecutable) {
             return $candidate
         }
     }
@@ -430,14 +528,70 @@ function Find-VcpkgRoot {
     return $null
 }
 
+function Install-OrBootstrapVcpkg {
+    param([Parameter(Mandatory)][string]$Root)
+
+    $executable = Join-Path $Root "vcpkg.exe"
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        $parent = Split-Path -Parent $Root
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        & git.exe clone --depth 1 https://github.com/microsoft/vcpkg.git $Root | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to clone vcpkg into $Root."
+        }
+    }
+    elseif (-not (Test-StandaloneVcpkgRoot -Candidate $Root)) {
+        $contents = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop)
+        if ($contents.Count -eq 0) {
+            & git.exe clone --depth 1 https://github.com/microsoft/vcpkg.git $Root | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw "Unable to clone vcpkg into the empty directory $Root."
+            }
+        }
+        else {
+            throw (
+                "The selected VCPKG_ROOT is not a standalone vcpkg checkout: $Root. " +
+                "Choose another directory with -VcpkgRoot or correct VCPKG_ROOT."
+            )
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+        $bootstrap = Join-Path $Root "bootstrap-vcpkg.bat"
+        if (-not (Test-Path -LiteralPath $bootstrap -PathType Leaf)) {
+            throw "The vcpkg bootstrap script was not found in $Root."
+        }
+        & $bootstrap -disableMetrics | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to bootstrap vcpkg in $Root."
+        }
+    }
+
+    if (-not (Test-StandaloneVcpkgRoot -Candidate $Root -RequireExecutable)) {
+        throw "vcpkg is incomplete after installation in $Root."
+    }
+}
+
 function Ensure-VcpkgDependencies {
-    $vcpkgRoot = Find-VcpkgRoot
+    $vcpkgRoot = if ($VcpkgRootWasExplicit) {
+        Get-NormalizedVcpkgRoot $RequestedVcpkgRoot
+    }
+    else {
+        Find-VcpkgRoot
+    }
     if (-not $vcpkgRoot) {
-        $vcpkgRoot = Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
+        $vcpkgRoot = Get-NormalizedVcpkgRoot $RequestedVcpkgRoot
+    }
+    if (-not $vcpkgRoot) {
+        $vcpkgRoot = Get-NormalizedVcpkgRoot (
+            Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
+        )
     }
     $vcpkgExecutable = Join-Path $vcpkgRoot "vcpkg.exe"
 
-    $missingVcpkg = -not (Test-Path $vcpkgExecutable)
+    $missingVcpkg = -not (
+        Test-StandaloneVcpkgRoot -Candidate $vcpkgRoot -RequireExecutable
+    )
     $missingPackages = @()
     if (-not $missingVcpkg) {
         $env:VCPKG_ROOT = $vcpkgRoot
@@ -450,7 +604,7 @@ function Ensure-VcpkgDependencies {
             Write-Host "[MISSING] vcpkg is not installed in $vcpkgRoot."
         }
         foreach ($package in $missingPackages) {
-            Write-Host "  [MISSING] $package`:$VcpkgTriplet"
+            Write-Host "  [MISSING] $package"
         }
 
         if (-not (Confirm-Install "Install the missing native libraries with vcpkg?")) {
@@ -458,17 +612,7 @@ function Ensure-VcpkgDependencies {
         }
 
         if ($missingVcpkg) {
-            $parent = Split-Path -Parent $vcpkgRoot
-            New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            & git.exe clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
-            if ($LASTEXITCODE -ne 0) {
-                throw "Unable to clone vcpkg."
-            }
-
-            & (Join-Path $vcpkgRoot "bootstrap-vcpkg.bat") -disableMetrics
-            if ($LASTEXITCODE -ne 0) {
-                throw "Unable to bootstrap vcpkg."
-            }
+            Install-OrBootstrapVcpkg -Root $vcpkgRoot
         }
 
         $vcpkgExecutable = Join-Path $vcpkgRoot "vcpkg.exe"
@@ -480,7 +624,7 @@ function Ensure-VcpkgDependencies {
             "--overlay-triplets=$VcpkgOverlayTriplets"
             "--disable-metrics"
         )
-        & $vcpkgExecutable @installArguments
+        & $vcpkgExecutable @installArguments | Out-Host
         if ($LASTEXITCODE -ne 0) {
             throw "vcpkg dependency installation failed."
         }
@@ -500,7 +644,7 @@ function Configure-NativeEnvironment {
 
     $installed = Join-Path $VcpkgRoot "installed\$VcpkgTriplet"
     $pkgConfig = Get-ChildItem `
-        -Path (Join-Path $installed "tools\pkgconf") `
+        -LiteralPath (Join-Path $installed "tools\pkgconf") `
         -Filter "pkgconf.exe" `
         -File `
         -Recurse |
@@ -515,6 +659,7 @@ function Configure-NativeEnvironment {
     ) -join ";"
     $pathEntries = @(
         (Join-Path $env:USERPROFILE ".cargo\bin")
+        $VcpkgRoot
         (Join-Path $installed "bin")
         $pkgConfig.DirectoryName
         (Join-Path $installed "tools\glslang")
@@ -523,7 +668,7 @@ function Configure-NativeEnvironment {
     $cmakeExecutable = (Get-Command cmake.exe -ErrorAction Stop).Source
     $gsettingsSchemaDirectory = Join-Path $installed "share\glib-2.0\schemas"
     $glibCompileSchemas = Join-Path $installed "tools\glib\glib-compile-schemas.exe"
-    if (-not (Test-Path $glibCompileSchemas)) {
+    if (-not (Test-Path -LiteralPath $glibCompileSchemas)) {
         throw "The GLib schema compiler installed by vcpkg was not found."
     }
     & $glibCompileSchemas $gsettingsSchemaDirectory
@@ -537,6 +682,7 @@ function Configure-NativeEnvironment {
     $env:VCPKG_DEFAULT_TRIPLET = $VcpkgTriplet
     $env:VCPKGRS_TRIPLET = $VcpkgTriplet
     $env:VCPKGRS_DYNAMIC = "1"
+    $env:VCPKG_OVERLAY_TRIPLETS = $VcpkgOverlayTriplets
     $env:PKG_CONFIG = $pkgConfig.FullName
     $env:PKG_CONFIG_PATH = $pkgConfigPath
     $env:OPENSSL_DIR = $installed
@@ -548,6 +694,11 @@ function Configure-NativeEnvironment {
     [Environment]::SetEnvironmentVariable("VCPKG_DEFAULT_TRIPLET", $VcpkgTriplet, "User")
     [Environment]::SetEnvironmentVariable("VCPKGRS_TRIPLET", $VcpkgTriplet, "User")
     [Environment]::SetEnvironmentVariable("VCPKGRS_DYNAMIC", "1", "User")
+    [Environment]::SetEnvironmentVariable(
+        "VCPKG_OVERLAY_TRIPLETS",
+        $VcpkgOverlayTriplets,
+        "User"
+    )
     [Environment]::SetEnvironmentVariable("PKG_CONFIG", $pkgConfig.FullName, "User")
     [Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", $pkgConfigPath, "User")
     [Environment]::SetEnvironmentVariable("OPENSSL_DIR", $installed, "User")
@@ -562,19 +713,22 @@ function Configure-NativeEnvironment {
     $batchLines = @(
         "@echo off"
         "call `"$vsDevCmd`" -no_logo -arch=x64 -host_arch=x64"
+        "if errorlevel 1 exit /b %errorlevel%"
         "set `"CMAKE=$CmakeWrapper`""
         "set `"RUZU_CMAKE_EXE=$cmakeExecutable`""
         "set `"VCPKG_ROOT=$VcpkgRoot`""
         "set `"VCPKG_DEFAULT_TRIPLET=$VcpkgTriplet`""
         "set `"VCPKGRS_TRIPLET=$VcpkgTriplet`""
         "set `"VCPKGRS_DYNAMIC=1`""
+        "set `"VCPKG_OVERLAY_TRIPLETS=$VcpkgOverlayTriplets`""
         "set `"PKG_CONFIG=$($pkgConfig.FullName)`""
         "set `"PKG_CONFIG_PATH=$pkgConfigPath`""
         "set `"OPENSSL_DIR=$installed`""
         "set `"GSETTINGS_SCHEMA_DIR=$gsettingsSchemaDirectory`""
+        "set `"RUZU_BUILD_PROFILE=$BuildProfile`""
         "set `"PATH=$($pathEntries -join ';');%PATH%`""
     )
-    Set-Content -Path $EnvironmentBatch -Value $batchLines -Encoding ASCII
+    Set-Content -LiteralPath $EnvironmentBatch -Value $batchLines -Encoding ASCII
 }
 
 function Verify-NativeDependencies {
@@ -582,6 +736,7 @@ function Verify-NativeDependencies {
         [pscustomobject]@{ Package = "gtk4"; Minimum = "4.6" }
         [pscustomobject]@{ Package = "libavcodec"; Minimum = $null }
         [pscustomobject]@{ Package = "libavutil"; Minimum = $null }
+        [pscustomobject]@{ Package = "opus"; Minimum = $null }
         [pscustomobject]@{ Package = "openssl"; Minimum = $null }
         [pscustomobject]@{ Package = "vulkan"; Minimum = $null }
     )
@@ -636,7 +791,4 @@ Write-Host "Cargo : $(& cargo.exe --version)"
 Write-Host "vcpkg : $vcpkgRoot"
 Write-Host "All required dependencies are available."
 Write-Host ""
-Write-Host "Build Ruzu from this Command Prompt with:"
-Write-Host ""
-Write-Host "  cargo build --locked --bin ruzu"
-Write-Host "  target\debug\ruzu.exe"
+Write-Host "Build profile: $BuildProfile"

@@ -92,6 +92,10 @@ pub struct ConfigureDialog {
     window: Window,
     notebook: gtk::Notebook,
     sections: Rc<Vec<Section>>,
+    /// Input owners retained so closing the asynchronous GTK dialog can end
+    /// configuration synchronously, before its page widgets are destroyed.
+    input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     /// Index of the section currently shown in the notebook, so a re-selection
     /// of the same row doesn't rebuild the tabs (which would reset the tab
     /// position, unlike upstream's `QSignalBlocker`-guarded rebuild).
@@ -181,7 +185,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "Controls",
-                pages: configure_input::pages(input_subsystem, hid_core),
+                pages: configure_input::pages(Rc::clone(&input_subsystem), Arc::clone(&hid_core)),
                 apply: configure_input::apply_configuration,
             },
         ];
@@ -246,6 +250,8 @@ impl ConfigureDialog {
             window,
             notebook,
             sections: Rc::new(sections),
+            input_subsystem,
+            hid_core,
             shown: RefCell::new(None),
             on_applied: RefCell::new(None),
         });
@@ -346,9 +352,67 @@ impl ConfigureDialog {
     /// Notify the owner once the GTK window closes so its `Rc` can be dropped,
     /// matching upstream's stack-owned dialog lifetime.
     pub fn connect_closed(&self, callback: impl Fn() + 'static) {
+        let input_subsystem = Rc::clone(&self.input_subsystem);
+        let hid_core = Arc::clone(&self.hid_core);
         self.window.connect_close_request(move |_| {
+            finish_input_configuration(&input_subsystem, &hid_core);
             callback();
             glib::Propagation::Proceed
         });
+    }
+}
+
+/// Finish the input lifetime owned by `ConfigureInput` before GTK releases its
+/// pages. Qt destroys every `ConfigureInputPlayer` synchronously when
+/// `ConfigureDialog::exec()` returns; the GTK close signal is asynchronous, so
+/// relying only on `PlayerPage::drop` can leave both the physical engines and
+/// guest-facing controllers in configuration mode while the game resumes.
+fn finish_input_configuration(
+    input_subsystem: &Rc<RefCell<input_common::InputSubsystem>>,
+    hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+) {
+    input_subsystem.borrow_mut().stop_mapping();
+
+    let controllers = {
+        let hid_core = hid_core.lock();
+        let mut controllers = (0..8)
+            .map(|index| hid_core.get_emulated_controller_by_index(index))
+            .collect::<Vec<_>>();
+        controllers
+            .push(hid_core.get_emulated_controller(hid_core::hid_types::NpadIdType::Handheld));
+        controllers
+    };
+    for controller in controllers {
+        controller.lock().disable_configuration();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_dialog_disables_exactly_the_configure_input_controllers() {
+        let input_subsystem = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+        let hid_core = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let (player_one, handheld, other) = {
+            let hid = hid_core.lock();
+            (
+                hid.get_emulated_controller(hid_core::hid_types::NpadIdType::Player1),
+                hid.get_emulated_controller(hid_core::hid_types::NpadIdType::Handheld),
+                hid.get_emulated_controller(hid_core::hid_types::NpadIdType::Other),
+            )
+        };
+        player_one.lock().enable_configuration();
+        handheld.lock().enable_configuration();
+        // `Other` has no ConfigureInputPlayer page and must not have temporary
+        // state committed by this dialog's cleanup.
+        other.lock().enable_configuration();
+
+        finish_input_configuration(&input_subsystem, &hid_core);
+
+        assert!(!player_one.lock().is_configuring_mode());
+        assert!(!handheld.lock().is_configuring_mode());
+        assert!(other.lock().is_configuring_mode());
     }
 }

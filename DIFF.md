@@ -17851,3 +17851,95 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the change affects host scheduler ownership and control flow only.
+
+## 2026-08-29 — `src/ruzu/src/configuration/configure_dialog.rs` vs Eden `src/yuzu/configuration/configure_dialog.{h,cpp}` and `configure_input_player.{h,cpp}`
+
+### Intentional differences
+
+- GTK closes the modeless configuration window asynchronously, so the dialog owner explicitly
+  stops input mapping and disables the eight player controllers plus the handheld controller
+  before page destruction. Eden obtains the same final state synchronously from the
+  `ConfigureInputPlayer` destructors when its stack-owned modal dialog returns.
+
+### Unintentional differences (to fix)
+
+- None after closing Configure now ends the temporary input-configuration lifetime before gameplay
+  resumes.
+
+### Missing items
+
+- None in this close/lifetime slice.
+
+### Binary layout verification
+
+- N/A: this changes frontend and input lifecycle state only.
+
+## 2026-08-29 — `src/ruzu/src/{main_window.rs,main.rs,i18n.rs}` vs Eden `src/yuzu/{bootmanager.{h,cpp},main.cpp,main_window.cpp}`
+
+### Intentional differences
+
+- GTK native render children require explicit tracking of their logical origin, size, and surface
+  scale. Eden's Qt layout owns the child render widget and invokes `OnFramebufferSizeChanged` from
+  `GRenderWindow::resizeEvent` and screen changes.
+- Eden selects Qt's `windowsvista` style before constructing `QApplication`. Ruzu supplies the
+  GTK-specific `GTK_CSD=0` default before GTK initialization so Win32 owns every decorated
+  toplevel frame; an explicit caller-provided value is preserved.
+- Qt resolves the system locale internally. Ruzu queries the Windows user locale when POSIX locale
+  variables are absent, then resolves it through the available frontend catalogs.
+
+### Unintentional differences (to fix)
+
+- None after restore/DPI changes invalidate native render geometry, the menubar fills its allocated
+  row, Windows dialogs use native frames, and `<System>` follows the OS locale with English fallback.
+
+### Missing items
+
+- None in these render-window geometry, decoration, and locale slices.
+
+### Binary layout verification
+
+- N/A: these changes affect frontend geometry and process startup configuration only.
+
+## 2026-08-29 — `src/ruzu/src/{user_data_migration.rs,migration_worker.rs,gtk_compat.rs}` vs no Eden frontend counterpart
+
+### Intentional differences
+
+- User-data migration is a Ruzu GTK onboarding feature and has no Eden Qt counterpart. It keeps
+  legacy sources read-only, validates Windows junctions without treating ordinary directories as
+  reparse points, repairs imported absolute storage paths, dismisses failed flows exactly once,
+  and formats estimates as localized MB or GB at the requested threshold.
+
+### Unintentional differences (to fix)
+
+- None in the verified migration failure, destination-safety, junction, and size-formatting paths.
+
+### Missing items
+
+- None in this migration correction slice.
+
+### Binary layout verification
+
+- N/A: migration plans and GTK callbacks are host-side state and are not raw-copied or serialized.
+
+## 2026-08-29 — `build.bat`, `scripts/build.ps1`, and `README.md` vs no Eden source-file counterpart
+
+### Intentional differences
+
+- Ruzu's Windows bootstrap/build/package workflow is repository tooling rather than a ported C++
+  module. It discovers an existing standalone vcpkg through explicit, environment, PATH, ancestor,
+  and conventional locations; otherwise it installs under `%LOCALAPPDATA%\Ruzu\vcpkg`. Release is
+  the default, Debug is explicit, and the executable plus runtime DLLs are staged under
+  `build\x86_64-pc-windows-msvc\<profile>`.
+
+### Unintentional differences (to fix)
+
+- None after the verified Windows Release build used `D:\Dev\vcpkg` and produced the standalone
+  runtime directory.
+
+### Missing items
+
+- None in the requested Windows build workflow.
+
+### Binary layout verification
+
+- N/A: build orchestration does not define a guest or serialized binary payload.

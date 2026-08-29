@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 /target-clean-head/
+/build/
 
 screenshots/
 bugs/

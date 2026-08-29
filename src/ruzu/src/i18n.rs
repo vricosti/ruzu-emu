@@ -184,11 +184,38 @@ fn effective_language() -> String {
         return resolve_catalog_locale(&configured);
     }
 
-    ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
+    let environment_locale = ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
-        .map(|value| resolve_catalog_locale(&value))
+        .map(|value| resolve_catalog_locale(&value));
+    environment_locale
+        .or_else(|| operating_system_locale().map(|locale| resolve_catalog_locale(&locale)))
         .unwrap_or_else(|| "en".to_string())
+}
+
+/// Return the desktop locale when the user selected `<System>`. Qt performs
+/// this lookup internally; Ruzu's catalog is independent of Qt/gettext, so it
+/// must explicitly query Windows when the POSIX locale variables are absent.
+#[cfg(target_os = "windows")]
+fn operating_system_locale() -> Option<String> {
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+
+    // Win32's `LOCALE_NAME_MAX_LENGTH` is 85 UTF-16 code units including the
+    // terminator, but windows-sys 0.59 does not export the SDK macro.
+    const LOCALE_NAME_CAPACITY: usize = 85;
+    let mut locale = [0u16; LOCALE_NAME_CAPACITY];
+    let length = unsafe { GetUserDefaultLocaleName(locale.as_mut_ptr(), locale.len() as i32) };
+    (length > 1)
+        .then(|| String::from_utf16(&locale[..length as usize - 1]).ok())
+        .flatten()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn operating_system_locale() -> Option<String> {
+    glib::language_names()
+        .into_iter()
+        .map(|locale| locale.to_string())
+        .find(|locale| !locale.is_empty() && locale != "C")
 }
 
 fn resolve_catalog_locale(locale: &str) -> String {
@@ -496,6 +523,17 @@ mod tests {
             Some(value) => std::env::set_var("LANGUAGE", value),
             None => std::env::remove_var("LANGUAGE"),
         }
+    }
+
+    #[test]
+    fn os_locale_resolves_to_a_supported_catalog_or_english() {
+        if let Some(locale) = operating_system_locale() {
+            let resolved = resolve_catalog_locale(&locale);
+            assert!(AVAILABLE_LANGUAGES
+                .iter()
+                .any(|(candidate, _)| *candidate == resolved));
+        }
+        assert_eq!(resolve_catalog_locale("xx-Unsupported"), "en");
     }
 
     #[test]

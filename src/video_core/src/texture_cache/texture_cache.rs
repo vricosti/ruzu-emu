@@ -667,12 +667,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     }
 
     pub fn set_channel_gpu_memory(&mut self, gpu_memory: Arc<ParkingMutex<MemoryManager>>) {
-        self.channel_gpu_memory = Some(gpu_memory);
+        self.update_channel_gpu_memory(Some(gpu_memory));
         self.rebase_virtual_invalid_images();
     }
 
     pub fn clear_channel_gpu_memory(&mut self) {
-        self.channel_gpu_memory = None;
+        self.update_channel_gpu_memory(None);
     }
 
     fn translated_cpu_addr(&self, gpu_addr: GPUVAddr, size: u64) -> Option<u64> {
@@ -990,6 +990,28 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             }
         }
 
+        // `ReadBlock` may enter the rasterizer while the owning channel mutex
+        // is already held. Upstream uses its non-owning `gpu_memory` pointer in
+        // that callback, so use the matching handle instead of falling back to
+        // a CPU-linear write which loses the GPU page-table translation.
+        if let Some(gpu_memory) = self.channel_gpu_memory_handle {
+            let gpu_memory = unsafe { gpu_memory.as_ref() };
+            super::util::swizzle_image(
+                &|gpu_addr, output| {
+                    let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
+                },
+                &|gpu_addr, data| {
+                    let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
+                },
+                image.gpu_addr,
+                &image.info,
+                copies,
+                staging,
+                &mut self.swizzle_data_buffer,
+            );
+            return true;
+        }
+
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
             return false;
         };
@@ -1054,9 +1076,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         let Some(downloader) = self.image_downloader.as_ref().cloned() else {
             return;
         };
-        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
-            return;
-        };
 
         let mut images = SmallVec::<[ImageId; 16]>::new();
         self.for_each_image_in_region(cpu_addr, size, |image_id, image| {
@@ -1079,18 +1098,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 continue;
             }
             let copies = super::util::full_download_copies(&image.info);
-            let device_memory = std::sync::Arc::clone(&self.device_memory);
-            super::util::swizzle_image(
-                &move |device_addr, output| {
-                    let _ = device_memory.smmu_read_block_unsafe(device_addr, output);
-                },
-                writer.as_ref(),
-                image.cpu_addr,
-                &image.info,
-                &copies,
-                &staging,
-                &mut self.swizzle_data_buffer,
-            );
+            // Upstream writes the downloaded image through `gpu_memory` at
+            // `image.gpu_addr`.  This is essential when a contiguous GPU
+            // image is assembled from non-contiguous device-memory ranges.
+            // Treating `image.cpu_addr` as a linear backing range can write
+            // into unrelated allocations between those ranges.
+            let _ = self.write_downloaded_image(&image, &copies, &staging);
         }
     }
 
@@ -6045,9 +6058,20 @@ mod tests {
 
     #[test]
     fn download_memory_selects_only_upstream_safe_images_and_clears_gpu_modified() {
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
         use std::sync::{Arc, Mutex};
 
         let mut cache = test_cache();
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+            7,
+            22,
+            1 << 22,
+            16,
+            12,
+        )));
+        gpu_memory.lock().map(0, 0, 0x1_0000, 0, false);
+        cache.set_channel_gpu_memory(gpu_memory);
         let info = test_color_info(1, 1);
         let safe_id = cache
             .slot_images
@@ -6074,7 +6098,9 @@ mod tests {
             staging.fill(0);
             true
         }));
-        cache.set_guest_memory_writer(Arc::new(|_, _| {}));
+        cache.set_guest_memory_writer(Arc::new(|_, _| {
+            panic!("texture downloads must write through channel GPU memory")
+        }));
 
         cache.download_memory(0x8000, 0x2000);
 
@@ -6559,19 +6585,34 @@ mod tests {
     }
 
     #[test]
-    fn write_downloaded_image_uses_guest_writer_when_channel_memory_is_locked() {
+    fn write_downloaded_image_uses_gpu_mapping_when_channel_memory_is_locked() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::{Arc, Mutex};
 
         let mut cache = test_cache();
-        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x5000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut memory_manager = MemoryManager::new_with_geometry_and_device_memory(
             7,
+            device_memory,
             22,
             1 << 22,
             16,
             12,
-        )));
+        );
+        memory_manager.map(0x4000, 0x9000_0000, 0x1000, 0, false);
+        let gpu_memory = Arc::new(ParkingMutex::new(memory_manager));
         cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
 
         let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
@@ -6614,8 +6655,11 @@ mod tests {
 
         assert!(cache.write_downloaded_image(&image, &[copy], &[1, 2, 3, 4]));
         let writes = writes.lock().unwrap();
-        assert!(!writes.is_empty());
-        assert_eq!(writes[0].0, 0x8000);
+        assert!(
+            writes.is_empty(),
+            "a held channel lock must not lose GPU-address translation"
+        );
+        assert_eq!(&backing[..4], &[1, 2, 3, 4]);
     }
 
     #[test]

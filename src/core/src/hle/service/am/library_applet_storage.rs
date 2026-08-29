@@ -131,10 +131,6 @@ impl LibraryAppletStorage for TransferMemoryLibraryAppletStorage {
     fn get_size(&self) -> i64 {
         self.size
     }
-
-    fn get_handle_object_id(&self) -> Option<u64> {
-        Some(self.object_id)
-    }
 }
 
 /// Port of upstream `HandleLibraryAppletStorage`.
@@ -175,7 +171,7 @@ impl LibraryAppletStorage for HandleLibraryAppletStorage {
     }
 
     fn get_handle_object_id(&self) -> Option<u64> {
-        self.inner.get_handle_object_id()
+        Some(self.inner.object_id)
     }
 }
 
@@ -207,4 +203,36 @@ pub fn create_handle_storage(
         object_id,
         size,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SystemRef;
+    use crate::device_memory::DeviceMemory;
+
+    #[test]
+    fn only_handle_storage_exposes_the_transfer_memory_handle() {
+        let device_memory = Box::new(DeviceMemory::with_size(0x1000));
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref() as *const _,
+                &device_memory.buffer as *const _,
+            )
+        }));
+        let transfer_memory = Arc::new(Mutex::new(KTransferMemory::new()));
+
+        let transfer = TransferMemoryLibraryAppletStorage::new(
+            Arc::clone(&memory),
+            Arc::clone(&transfer_memory),
+            42,
+            true,
+            0x1000,
+        );
+        assert_eq!(transfer.get_handle_object_id(), None);
+
+        let handle = HandleLibraryAppletStorage::new(memory, transfer_memory, 42, 0x1000);
+        assert_eq!(handle.get_handle_object_id(), Some(42));
+    }
 }

@@ -921,6 +921,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Inline appear parameters, guest text/cursor updates, `ChangedString`, `MovedCursor`, key-disable
   flags, optional number-pad symbols, Shift/Caps Lock transitions and wrapped grid navigation now
   follow Eden's corresponding paths.
+- Fixed: the persistent GTK frontend is now exited on the same emulation-starting and
+  emulation-stopping boundaries as Eden's `MainWindow::SoftwareKeyboardExit` connections. A
+  stopped session can no longer leave the frontend initialized and suppress the next session's
+  inline keyboard initialization.
 
 ### Missing items
 
@@ -17781,3 +17785,69 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: this correction retains shader IR writes and changes no serialized or raw-memory payload.
+
+## 2026-08-29 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h`
+
+### Intentional differences
+
+- A non-owning `MemoryManagerHandle` represents Eden's directly stored `Tegra::MemoryManager*`
+  when a Rust memory-read callback re-enters the rasterizer while the channel mutex is held.
+
+### Unintentional differences (to fix)
+
+- Resolved: texture downloads previously wrote through `image.cpu_addr` as one linear device-memory
+  range whenever the channel mutex was held. Eden always calls `SwizzleImage(*gpu_memory,
+  image.gpu_addr, ...)`, preserving every GPU page-table segment. Ruzu now does the same in both
+  unlocked and re-entrant callback paths.
+
+### Missing items
+
+- None in the verified `DownloadMemory` writeback path.
+
+### Binary layout verification
+
+- N/A: the correction changes address translation and lifecycle access only.
+
+## 2026-08-29 — `src/core/src/hle/service/am/library_applet_storage.rs` vs Eden `src/core/hle/service/am/library_applet_storage.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps the transfer-memory object ID in the composed base storage so
+  `HandleLibraryAppletStorage` can return it without duplicating the backing storage state.
+
+### Unintentional differences (to fix)
+
+- Resolved: ordinary `TransferMemoryLibraryAppletStorage` exposed its transfer-memory handle,
+  causing `IStorage::Open` to reject it. It now matches Eden's null `GetHandle()` result; only
+  `HandleLibraryAppletStorage` exposes the handle.
+
+### Missing items
+
+- None in the verified storage-type/handle distinction.
+
+### Binary layout verification
+
+- N/A: these are host-side polymorphic storage objects, not raw guest payloads.
+
+## 2026-08-29 — `src/core/src/hle/kernel/k_scheduler.rs` vs Eden `src/core/hle/kernel/k_scheduler.{h,cpp}`
+
+### Intentional differences
+
+- Before bootstrap has installed a scheduler-owned current thread, Rust may fall back to its
+  host-thread TLS pointer. Once installed, `self.current_thread` is the counterpart of Eden's
+  per-core `GetCurrentThreadPointer(kernel)` and remains authoritative across fiber yields.
+
+### Unintentional differences (to fix)
+
+- Resolved: `ScheduleImpl` preferred the fiber-shared TLS pointer even when the scheduler already
+  owned a current thread. During cross-core migration this could unload a stale thread and spin
+  forever trying to reacquire the actual current thread's context guard. Current-thread selection
+  now follows Eden's per-core scheduler pointer before the bootstrap fallback.
+
+### Missing items
+
+- None in the verified `ScheduleImpl` current-thread selection and same-thread fast path.
+
+### Binary layout verification
+
+- N/A: the change affects host scheduler ownership and control flow only.

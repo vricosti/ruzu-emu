@@ -1456,4 +1456,35 @@ mod tests {
         assert!(state.parameters.enable_return_button);
         assert!(state.parameters.disable_cancel_button);
     }
+
+    #[test]
+    fn exit_allows_the_persistent_frontend_to_initialize_for_the_next_session() {
+        let (keyboard, receiver) = GtkSoftwareKeyboard::new();
+        keyboard.initialize_keyboard(
+            true,
+            KeyboardInitializeParameters {
+                header_text: "first".to_owned(),
+                ..Default::default()
+            },
+            Box::new(|_, _, _| {}),
+            Box::new(|_, _, _| {}),
+        );
+
+        keyboard.exit_keyboard();
+        assert!(matches!(receiver.recv().unwrap(), SoftwareKeyboardRequest::Close));
+
+        keyboard.initialize_keyboard(
+            true,
+            KeyboardInitializeParameters {
+                header_text: "second".to_owned(),
+                ..Default::default()
+            },
+            Box::new(|_, _, _| {}),
+            Box::new(|_, _, _| {}),
+        );
+
+        let state = keyboard.state();
+        assert!(state.initialized);
+        assert_eq!(state.parameters.header_text, "second");
+    }
 }

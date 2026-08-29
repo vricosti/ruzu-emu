@@ -391,19 +391,22 @@ mod tests {
     }
 
     #[test]
-    fn schedule_impl_fiber_fast_path_repairs_stale_current_thread_id() {
+    fn schedule_impl_fiber_uses_scheduler_current_when_fiber_tls_is_stale() {
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = current_thread.lock().unwrap();
-            guard.thread_id = 75;
+            guard.thread_id = 140;
             guard.set_current_core(0);
-            guard.set_active_core(0);
+            // The priority queue may already have selected this thread for a
+            // different core while it is still resident on this scheduler.
+            guard.set_active_core(2);
         }
+        assert!(KScheduler::try_lock_thread_context(&current_thread, 0));
 
         let stale_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = stale_thread.lock().unwrap();
-            guard.thread_id = 104;
+            guard.thread_id = 9;
             guard.set_current_core(0);
             guard.set_active_core(0);
         }
@@ -413,25 +416,29 @@ mod tests {
 
         let mut scheduler = KScheduler::new(0);
         scheduler.global_scheduler_context = Some(gsc);
-        scheduler.current_thread = Some(Arc::downgrade(&stale_thread));
-        scheduler.current_thread_id = Some(104);
-        scheduler.state.highest_priority_thread_id = Some(75);
+        scheduler.current_thread = Some(Arc::downgrade(&current_thread));
+        scheduler.current_thread_id = Some(140);
+        scheduler.state.highest_priority_thread_id = Some(140);
         scheduler
             .state
             .needs_scheduling
             .store(true, Ordering::Relaxed);
 
-        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&stale_thread));
         scheduler.schedule_impl_fiber();
         crate::hle::kernel::kernel::set_current_emu_thread(None);
 
-        assert_eq!(scheduler.current_thread_id, Some(75));
+        assert_eq!(scheduler.current_thread_id, Some(140));
         let resolved = scheduler
             .current_thread
             .as_ref()
             .and_then(Weak::upgrade)
             .unwrap();
         assert!(Arc::ptr_eq(&resolved, &current_thread));
+        assert!(scheduler.switch_cur_thread.is_none());
+        assert!(scheduler.switch_highest_priority_thread.is_none());
+        assert!(!scheduler.switch_from_schedule);
+        assert!(KScheduler::unlock_thread_context(&current_thread, 0));
     }
 
     #[test]
@@ -2827,12 +2834,16 @@ impl KScheduler {
         self.state.needs_scheduling.store(false, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::SeqCst);
 
-        // Upstream `ScheduleImpl()` reads `GetCurrentThreadPointer(kernel)`,
-        // i.e. the thread attached to the currently executing host fiber. Do
-        // not use `self.current_thread` here: if scheduler bookkeeping drifts,
-        // the `highest == current` fast path would return without yielding to
-        // the runnable fiber that should actually run.
-        let cur_thread = self.current_thread_for_scheduler_core();
+        // Upstream `GetCurrentThreadPointer(kernel)` is the per-core current
+        // pointer updated by `SwitchThread`, represented here by
+        // `self.current_thread`. Rust fibers share OS-thread TLS, so the TLS
+        // value can still name a previously resumed fiber and must only be a
+        // bootstrap fallback when this scheduler has no current thread yet.
+        let cur_thread = self
+            .current_thread
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .or_else(|| self.current_thread_for_scheduler_core());
         let highest = self.state.highest_priority_thread_id;
         let cur_thread_id = cur_thread
             .as_ref()

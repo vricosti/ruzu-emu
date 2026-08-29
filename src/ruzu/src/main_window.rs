@@ -3102,7 +3102,17 @@ impl GMainWindow {
         Some(Arc::clone(&self.software_keyboard)
             as Arc<
                 dyn ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet,
-            >)
+        >)
+    }
+
+    /// Eden connects both `EmulationStarting` and `EmulationStopping` to
+    /// `MainWindow::SoftwareKeyboardExit`.  The GTK frontend is persistent,
+    /// so explicitly release any dialog and its initialized state at the same
+    /// lifecycle boundaries before the frontend is reused by another session.
+    fn reset_software_keyboard(&self) {
+        ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet::exit_keyboard(
+            self.software_keyboard.as_ref(),
+        );
     }
 
     fn controller_applet_for_boot(
@@ -3149,6 +3159,8 @@ impl GMainWindow {
             });
             return;
         }
+
+        self.reset_software_keyboard();
 
         // Stop any existing session first (upstream stops before re-booting).
         self.play_time_manager.stop();
@@ -3335,6 +3347,8 @@ impl GMainWindow {
             });
             return;
         }
+
+        self.reset_software_keyboard();
 
         // Stop any existing session first (upstream stops before re-booting).
         self.play_time_manager.stop();
@@ -3525,6 +3539,8 @@ impl GMainWindow {
             });
             return;
         }
+
+        self.reset_software_keyboard();
 
         // Upstream releases the previous render target before initializing the
         // next one. Stop the session first so Vulkan no longer owns its HWND.
@@ -3992,6 +4008,8 @@ impl GMainWindow {
         if !requested {
             return false;
         }
+
+        self.reset_software_keyboard();
 
         if let Some(app) = self.window.application() {
             if self.window.is_fullscreen() {

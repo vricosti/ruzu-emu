@@ -560,7 +560,7 @@ impl VfsDirectory for RealVfsDirectory {
     fn get_file_relative(&self, relative_path: &str) -> Option<VirtualFile> {
         let full_path = path_util::sanitize_path(
             &format!("{}/{}", self.path, relative_path),
-            path_util::DirectorySeparator::ForwardSlash,
+            path_util::DirectorySeparator::PlatformDefault,
         );
         let p = Path::new(&full_path);
         let root =
@@ -574,7 +574,7 @@ impl VfsDirectory for RealVfsDirectory {
     fn get_directory_relative(&self, relative_path: &str) -> Option<VirtualDir> {
         let full_path = path_util::sanitize_path(
             &format!("{}/{}", self.path, relative_path),
-            path_util::DirectorySeparator::ForwardSlash,
+            path_util::DirectorySeparator::PlatformDefault,
         );
         let p = Path::new(&full_path);
         let root =
@@ -596,7 +596,7 @@ impl VfsDirectory for RealVfsDirectory {
     fn create_file_relative(&self, relative_path: &str) -> Option<VirtualFile> {
         let full_path = path_util::sanitize_path(
             &format!("{}/{}", self.path, relative_path),
-            path_util::DirectorySeparator::ForwardSlash,
+            path_util::DirectorySeparator::PlatformDefault,
         );
         let root =
             path_util::sanitize_path(&self.path, path_util::DirectorySeparator::PlatformDefault);
@@ -610,7 +610,7 @@ impl VfsDirectory for RealVfsDirectory {
     fn create_directory_relative(&self, relative_path: &str) -> Option<VirtualDir> {
         let full_path = path_util::sanitize_path(
             &format!("{}/{}", self.path, relative_path),
-            path_util::DirectorySeparator::ForwardSlash,
+            path_util::DirectorySeparator::PlatformDefault,
         );
         self.base.arc_create_directory(&full_path, self.perms)
     }
@@ -618,7 +618,7 @@ impl VfsDirectory for RealVfsDirectory {
     fn delete_subdirectory_recursive(&self, name: &str) -> bool {
         let full_path = path_util::sanitize_path(
             &format!("{}/{}", self.path, name),
-            path_util::DirectorySeparator::ForwardSlash,
+            path_util::DirectorySeparator::PlatformDefault,
         );
         self.base.delete_directory(&full_path)
     }
@@ -661,7 +661,7 @@ impl VfsDirectory for RealVfsDirectory {
     fn get_file_time_stamp(&self, path: &str) -> FileTimeStampRaw {
         let full_path = path_util::sanitize_path(
             &format!("{}/{}", self.path, path),
-            path_util::DirectorySeparator::ForwardSlash,
+            path_util::DirectorySeparator::PlatformDefault,
         );
 
         #[cfg(unix)]
@@ -866,6 +866,8 @@ mod tests {
         let directory = test_directory();
         let root = directory.join("root");
         std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("inside.bin");
+        std::fs::write(&inside, b"inside").unwrap();
         let outside = directory.join("outside.bin");
         std::fs::write(&outside, b"outside").unwrap();
 
@@ -875,8 +877,10 @@ mod tests {
             root.to_string_lossy().into_owned(),
             OpenMode::READ,
         );
+        assert!(root_directory.get_file_relative("inside.bin").is_some());
         assert!(root_directory.get_file_relative("../outside.bin").is_none());
 
+        std::fs::remove_file(inside).unwrap();
         std::fs::remove_file(outside).unwrap();
         std::fs::remove_dir(root).unwrap();
         std::fs::remove_dir(directory).unwrap();

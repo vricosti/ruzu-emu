@@ -7,14 +7,14 @@
 use std::collections::HashSet;
 
 use rxbyak::{dword_ptr, qword_ptr};
-use rxbyak::{JmpType, RegExp, EAX, EBP, EBX, ECX, R12, R15, RAX, RBP, RBX, RCX};
+use rxbyak::{JmpType, RegExp, EAX, EBP, EBX, ECX, R12, R15, RAX, RBP, RBX, RCX, RSP};
 
 use crate::backend::block_range_information::BlockRangeInformation;
 use crate::backend::x64::a32_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
 use crate::backend::x64::a32_jitstate::A32JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn, STACK_LAYOUT_RSP_OFFSET,
 };
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
@@ -28,6 +28,7 @@ use crate::backend::x64::patch_info::{
     PatchTable, PatchType, A32_PATCH_JG_SIZE, A32_PATCH_JMP_SIZE, A32_PATCH_JZ_SIZE,
 };
 use crate::backend::x64::reg_alloc::RegAlloc;
+use crate::backend::x64::stack_layout::StackLayout;
 use crate::frontend::a32::translate::translate_callbacks::TranslateCallbacks;
 use crate::frontend::a32::translate::{translate as a32_translate, TranslationOptions};
 use crate::interface::optimization_flags::OptimizationFlag;
@@ -47,6 +48,39 @@ pub struct FastDispatchEntry {
 // Upstream: `backend/x64/a32_emit_x64.h`
 const FAST_DISPATCH_TABLE_SIZE: usize = 0x10000;
 const FAST_DISPATCH_TABLE_MASK: u32 = 0xFFFF0;
+
+/// Emit the A32 per-block base-pointer setup from upstream
+/// `A32EmitX64::Emit`: save the ABI RBP and point RBP just below its stack
+/// slot for the duration of the block.
+pub(crate) fn emit_block_prologue(ra: &mut RegAlloc) {
+    let abi_base_pointer_offset =
+        STACK_LAYOUT_RSP_OFFSET + core::mem::offset_of!(StackLayout, abi_base_pointer);
+    ra.asm
+        .mov(
+            qword_ptr(RegExp::from(RSP) + abi_base_pointer_offset as i32),
+            RBP,
+        )
+        .unwrap();
+    ra.asm
+        .lea(
+            RBP,
+            qword_ptr(RegExp::from(RSP) + abi_base_pointer_offset as i32 - 8),
+        )
+        .unwrap();
+}
+
+/// Restore the ABI RBP immediately before emitting the A32 terminal, matching
+/// upstream `A32EmitX64::Emit` ordering.
+pub(crate) fn emit_block_epilogue(ra: &mut RegAlloc) {
+    let abi_base_pointer_offset =
+        STACK_LAYOUT_RSP_OFFSET + core::mem::offset_of!(StackLayout, abi_base_pointer);
+    ra.asm
+        .mov(
+            RBP,
+            qword_ptr(RegExp::from(RSP) + abi_base_pointer_offset as i32),
+        )
+        .unwrap();
+}
 
 fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool) -> u32 {
     #[cfg(target_arch = "x86_64")]

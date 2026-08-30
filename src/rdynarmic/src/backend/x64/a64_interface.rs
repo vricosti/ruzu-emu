@@ -1234,7 +1234,7 @@ extern "C" fn memory_read_128_trampoline(inner_ptr: u64, vaddr: u64) -> Pair128 
 }
 
 #[cfg(target_os = "windows")]
-extern "C" fn memory_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: *mut Pair128) {
+extern "C" fn memory_read_128_trampoline(inner_ptr: u64, ret_ptr: *mut Pair128, vaddr: u64) {
     unsafe { ret_ptr.write(memory_read_128_impl(inner_ptr, vaddr)) };
 }
 

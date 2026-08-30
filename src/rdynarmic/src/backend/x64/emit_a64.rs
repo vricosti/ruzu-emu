@@ -12,6 +12,7 @@ use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::inst::Inst;
 use crate::ir::opcode::Opcode;
+use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 
 /// Walks Identity chain backwards from `value` and returns the producing
@@ -453,81 +454,57 @@ pub fn emit_a64_set_check_bit(
 // NZCV pseudo-ops (GetCarryFromOp, GetOverflowFromOp, GetNZCVFromOp)
 // ---------------------------------------------------------------------------
 
-/// GetCarryFromOp: result = CF after the producing instruction.
-///
-/// This is a pseudo-op. When the producing instruction (shift, add, sub, etc.)
-/// has already captured the carry via GetAssociatedPseudoOperation and emitted
-/// SETC inline, this handler is a no-op. Otherwise, it falls back to reading
-/// the current CF from RFLAGS (which may be stale if other instructions were
-/// emitted between the producer and this handler).
+/// GetCarryFromOp is emitted by its associated producing instruction.
 pub fn emit_get_carry_from_op(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
-    _inst: &Inst,
+    inst: &Inst,
 ) {
-    // If the producing instruction already defined this value inline, skip.
-    if ra.is_value_defined(inst_ref) {
-        ra.register_pseudo_operation(inst_ref, &_inst.args, _inst.num_args());
-        return;
-    }
-    // Fallback: read CF from current RFLAGS (correct only if no intervening instructions).
-    let result = ra.scratch_gpr();
-    let r8 = result.cvt8().unwrap();
-    ra.asm.setc(r8).unwrap();
-    let r32 = result.cvt32().unwrap();
-    ra.asm.movzx(r32, r8).unwrap();
-    ra.define_value(inst_ref, result);
+    ra.register_pseudo_operation(inst_ref, &inst.args, inst.num_args());
 }
 
-/// GetOverflowFromOp: result = OF after the producing instruction.
+/// GetOverflowFromOp is emitted by its associated producing instruction.
 pub fn emit_get_overflow_from_op(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
-    _inst: &Inst,
+    inst: &Inst,
 ) {
-    if ra.is_value_defined(inst_ref) {
-        ra.register_pseudo_operation(inst_ref, &_inst.args, _inst.num_args());
-        return;
-    }
-    let result = ra.scratch_gpr();
-    let r8 = result.cvt8().unwrap();
-    ra.asm.seto(r8).unwrap();
-    let r32 = result.cvt32().unwrap();
-    ra.asm.movzx(r32, r8).unwrap();
-    ra.define_value(inst_ref, result);
+    ra.register_pseudo_operation(inst_ref, &inst.args, inst.num_args());
 }
 
-/// GetNZCVFromOp: result = packed NZCV in x86-64 RFLAGS format.
-///
-/// Uses `lahf` to get SF/ZF/CF into AH, and `seto` to get OF.
-/// Produces: AH[7]=SF(N), AH[6]=ZF(Z), AH[0]=CF(C), result_low=OF(V)
-/// Then packs into the x64 NZCV format: bits 15,14,8,0.
-pub fn emit_get_nzcv_from_op(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    _inst: &Inst,
-) {
+/// GetNZCVFromOp: use the producer-defined value when available; otherwise
+/// derive N/Z from the input value and clear C/V, exactly as Eden does.
+pub fn emit_get_nzcv_from_op(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     if ra.is_value_defined(inst_ref) {
-        ra.register_pseudo_operation(inst_ref, &_inst.args, _inst.num_args());
+        ra.register_pseudo_operation(inst_ref, &inst.args, inst.num_args());
         return;
     }
-    // We need RAX for lahf (writes AH)
+
+    let value_type = match inst.args[0] {
+        Value::Inst(value_ref) => ctx
+            .block
+            .expect("GetNZCVFromOp requires its owning IR block")
+            .inst_real_return_type(value_ref),
+        value => value.get_type(),
+    };
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let rax = ra.scratch_gpr_at(HOST_RAX);
-    let al = rax.cvt8().unwrap();
-    // seto al — stores OF in AL
-    ra.asm.seto(al).unwrap();
-    // lahf — stores SF:ZF:0:AF:0:PF:1:CF into AH
+    let value = ra.use_gpr(&mut args[0]);
+    let value = match value_type {
+        Type::U8 => value.cvt8().unwrap(),
+        Type::U16 => value.cvt16().unwrap(),
+        Type::U32 => value.cvt32().unwrap(),
+        Type::U64 => value,
+        ty => unreachable!("GetNZCVFromOp unsupported input type {ty:?}"),
+    };
+
+    ra.asm.test(value, value).unwrap();
     ra.asm.lahf().unwrap();
-    // Now AX = AH:AL = (flags_byte : overflow_byte)
-    // We want bits: 15=SF(N), 14=ZF(Z), 8=CF(C), 0=OF(V)
-    // AH has SF at bit 7 (= bit 15 of AX), ZF at bit 6 (= bit 14 of AX),
-    // CF at bit 0 (= bit 8 of AX), AL has OF at bit 0.
-    // So EAX already has the format we want! Just mask it.
-    let eax = rax.cvt32().unwrap();
-    ra.asm.and_(eax, nzcv_util::X64_MASK as i32).unwrap();
+    ra.asm
+        .xor_(rax.cvt8().unwrap(), rax.cvt8().unwrap())
+        .unwrap();
     ra.define_value(inst_ref, rax);
 }
 

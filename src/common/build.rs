@@ -31,9 +31,10 @@ fn version_after(text: &str, marker: &str) -> Option<String> {
         .map(|version| version.trim_end_matches(',').to_owned())
 }
 
-fn numeric_version_in(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .find(|word| {
+fn msvc_version_in(text: &str) -> Option<String> {
+    let versions = text
+        .split_whitespace()
+        .filter(|word| {
             let word = word.trim_matches(|character: char| {
                 !character.is_ascii_alphanumeric() && character != '.'
             });
@@ -46,6 +47,17 @@ fn numeric_version_in(text: &str) -> Option<String> {
             word.trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
                 .to_owned()
         })
+        .collect::<Vec<_>>();
+    let primary = versions.first()?;
+    versions
+        .iter()
+        .find(|version| {
+            version.len() > primary.len()
+                && version.starts_with(primary)
+                && version.as_bytes().get(primary.len()) == Some(&b'.')
+        })
+        .cloned()
+        .or_else(|| Some(primary.clone()))
 }
 
 fn compiler_id(repository: &Path) -> String {
@@ -62,7 +74,23 @@ fn compiler_id(repository: &Path) -> String {
     } else {
         &["--version"]
     };
-    let Some(output) = command_text(&compiler, args, repository) else {
+    // `cl.exe /Bv` prints the complete compiler version, then exits with
+    // D8003 because no source file was supplied. The output is nevertheless
+    // authoritative; requiring a successful status here discarded it and
+    // made every MSVC build report "Unknown compiler".
+    let Some(output) = Command::new(&compiler)
+        .args(args)
+        .current_dir(repository)
+        .output()
+        .ok()
+        .filter(|output| output.status.success() || target_env == "msvc")
+        .map(|output| {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            text.trim().to_owned()
+        })
+        .filter(|output| !output.is_empty())
+    else {
         return "Unknown compiler".to_owned();
     };
 
@@ -73,7 +101,7 @@ fn compiler_id(repository: &Path) -> String {
         return format!("Clang {version}");
     }
     if target_env == "msvc" || output.contains("Microsoft (R) C/C++") {
-        return numeric_version_in(&output)
+        return msvc_version_in(&output)
             .map(|version| format!("MSVC {version}"))
             .unwrap_or_else(|| "MSVC".to_owned());
     }

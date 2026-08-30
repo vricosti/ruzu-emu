@@ -399,9 +399,12 @@ impl<'a> PatchManager<'a> {
 
             if selected_update.is_none()
                 && versions.is_empty()
-                && !provider.supports_origin_tracking()
                 && !is_legacy_update_disabled(&disabled)
             {
+                // Eden falls back to ContentProvider::GetEntryRaw here even
+                // when the provider is a ContentProviderUnion. This also
+                // covers unversioned frontend-manual content discovered in a
+                // game container.
                 selected_update = provider
                     .get_entry_raw(update_tid, ContentRecordType::Program)
                     .map(|file| (file, provider.get_entry_version(update_tid).unwrap_or(0)));
@@ -1229,9 +1232,12 @@ impl<'a> PatchManager<'a> {
             }
             if selected_update.is_none()
                 && versions.is_empty()
-                && !provider.supports_origin_tracking()
                 && !is_legacy_update_disabled(&disabled)
             {
+                // Match Eden's union-wide GetEntryRaw fallback. In
+                // particular, an update Control NCA can come from the
+                // frontend-manual provider even when no versioned entry was
+                // registered for this record type.
                 selected_update = provider
                     .get_entry_raw(update_tid, record_type)
                     .map(|file| (file, provider.get_entry_version(update_tid).unwrap_or(0)));
@@ -1326,6 +1332,10 @@ mod tests {
         ) -> Vec<ContentProviderEntry> {
             Vec::new()
         }
+
+        fn supports_origin_tracking(&self) -> bool {
+            true
+        }
     }
 
     #[test]
@@ -1405,6 +1415,29 @@ mod tests {
         assert_eq!(
             *provider.control_requests.lock().unwrap(),
             vec![application_id, get_update_title_id(application_id)]
+        );
+    }
+
+    #[test]
+    fn romfs_uses_raw_fallback_with_an_origin_tracking_provider() {
+        let application_id = 0x05AA_0000_0000_1000;
+        let controller = crate::hle::service::filesystem::filesystem::FileSystemController::new();
+        let provider = RecordingContentProvider {
+            control_requests: Mutex::new(Vec::new()),
+        };
+        let patch_manager = PatchManager::new(application_id, &controller, &provider);
+        let base_romfs: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            "base.romfs".to_owned(),
+            None,
+        ));
+
+        let _ =
+            patch_manager.patch_romfs(None, base_romfs, ContentRecordType::Control, None, false);
+
+        assert_eq!(
+            *provider.control_requests.lock().unwrap(),
+            vec![get_update_title_id(application_id)]
         );
     }
 }

@@ -129,6 +129,25 @@ pub enum LoadingEvent {
     StopComplete,
 }
 
+/// Return the user-facing version of the enabled update selected by the patch
+/// manager. Eden normally obtains the same string from the patched Control
+/// NACP. Some external/manual containers expose a usable Program update while
+/// their Control RomFS cannot be layered over the base NCA; the patch list
+/// still owns the exact NACP display string discovered while indexing the
+/// container.
+fn enabled_update_display_version(
+    patches: &[ruzu_core::file_sys::patch_manager::Patch],
+) -> Option<&str> {
+    use ruzu_core::file_sys::patch_manager::PatchType;
+
+    patches
+        .iter()
+        .find(|patch| {
+            patch.enabled && patch.patch_type == PatchType::Update && !patch.version.is_empty()
+        })
+        .map(|patch| patch.version.as_str())
+}
+
 fn running_title(system: &ruzu_core::core::System, filepath: &str) -> RunningTitle {
     use ruzu_core::file_sys::patch_manager::PatchManager;
     use ruzu_core::loader::loader::ResultStatus;
@@ -154,6 +173,10 @@ fn running_title(system: &ruzu_core::core::System, filepath: &str) -> RunningTit
         if let Some(metadata) = patch_manager.get_control_metadata().0 {
             title_version = metadata.get_version_string();
             title_name = metadata.get_application_name();
+        }
+        let patches = patch_manager.get_patches(None);
+        if let Some(update_version) = enabled_update_display_version(&patches) {
+            title_version = update_version.to_owned();
         }
     }
 
@@ -1193,6 +1216,33 @@ fn renderer_backend_unavailable_detail(
 mod tests {
     use super::*;
     use ruzu_core::core::SystemResultStatus;
+    use ruzu_core::file_sys::patch_manager::{Patch, PatchSource, PatchType};
+
+    fn update_patch(enabled: bool, version: &str) -> Patch {
+        Patch {
+            enabled,
+            name: "Update".to_owned(),
+            version: version.to_owned(),
+            patch_type: PatchType::Update,
+            program_id: 0x0100_DCA0_064A_6000,
+            title_id: 0x0100_DCA0_064A_6800,
+            source: PatchSource::External,
+            location: String::new(),
+            numeric_version: 0x0005_0000,
+        }
+    }
+
+    #[test]
+    fn running_title_prefers_the_enabled_update_display_version() {
+        let patches = vec![update_patch(false, "1.5.0"), update_patch(true, "1.4.0")];
+        assert_eq!(enabled_update_display_version(&patches), Some("1.4.0"));
+    }
+
+    #[test]
+    fn running_title_ignores_disabled_or_empty_update_versions() {
+        let patches = vec![update_patch(false, "1.4.0"), update_patch(true, "")];
+        assert_eq!(enabled_update_display_version(&patches), None);
+    }
 
     #[test]
     fn default_boot_parameters_launch_an_application() {

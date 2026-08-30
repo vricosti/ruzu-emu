@@ -17943,3 +17943,206 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: build orchestration does not define a guest or serialized binary payload.
+
+## 2026-08-29 — `src/common/{build.rs,src/scm_rev.rs}` vs Eden `CMakeModules/GenerateSCMRev.cmake` and `src/common/scm_rev.{h,cpp.in}`
+
+### Intentional differences
+
+- Eden obtains `CMAKE_CXX_COMPILER_ID` and `CMAKE_CXX_COMPILER_VERSION` from CMake. Ruzu's Cargo
+  build script queries the selected native compiler directly and exports the equivalent
+  `COMPILER_ID` compile-time value.
+
+### Unintentional differences (to fix)
+
+- None after MSVC `/Bv` output is retained despite `cl.exe` returning D8003 when invoked without a
+  source file. Windows builds now expose CMake's complete `MSVC 19.44.35222.0` identity instead of
+  `Unknown compiler`.
+
+### Missing items
+
+- None in the compiler identity slice.
+
+### Binary layout verification
+
+- N/A: the compiler identity is build metadata embedded as a Rust string constant.
+
+## 2026-08-30 — `src/core/src/file_sys/vfs/vfs_real.rs` vs Eden `src/core/file_sys/vfs/vfs_real.{h,cpp}`
+
+### Intentional differences
+
+- Rust passes an explicit `DirectorySeparator::PlatformDefault` to `sanitize_path`; Eden's
+  `FS::SanitizePath` uses the platform default implicitly. Both now normalize the directory root
+  and its relative child with the same separator before applying `IsWithinRoot`.
+
+### Unintentional differences (to fix)
+
+- None after relative file and directory paths use the platform separator consistently. The prior
+  Windows-only mismatch compared a backslash-normalized root with a slash-normalized child, so
+  every valid relative lookup failed and `RegisteredCache` indexed zero firmware entries.
+
+### Missing items
+
+- None in the relative path lookup and containment slice.
+
+### Binary layout verification
+
+- N/A: this change affects host VFS path resolution only. The regression test verifies that an
+  in-root child opens while a `..` escape remains rejected. Runtime verification now also confirms
+  that MK8D opens the real `0100000000000802` NCA/RomFS twice, completes its animated attract race,
+  and renders `Create a Mii` plus six default Mii faces instead of an empty selection grid.
+
+## 2026-08-30 — `src/rdynarmic/src/backend/x64/emit_a64.rs` and `src/rdynarmic/src/jit.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/emit_x64.{h,cpp}`
+
+### Intentional differences
+
+- Eden obtains an IR argument's resolved type directly from `IR::Value::GetType()`. Rust
+  `Value::Inst` stores only an arena reference, so the fallback resolves the same type through the
+  owning block's `inst_real_return_type` before selecting the 8/16/32/64-bit x64 register view.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed pseudo-operation slice. `GetCarryFromOp` and `GetOverflowFromOp` now only
+  register their producer-owned pseudo-operations. `GetNZCVFromOp` now consumes its input and emits
+  Eden's exact fallback order (`test`, `lahf`, clear `AL`) when the producer did not define NZCV
+  inline; the former path read stale host flags and left the input live at block end.
+
+### Missing items
+
+- None in the three reviewed pseudo-operation handlers.
+
+### Binary layout verification
+
+- N/A: this changes generated instruction selection and register lifetime only. The focused A64
+  `ANDS W0, W0, W1` regression verifies the result and architectural N/Z/C/V value; the existing
+  mixed `TST`/shift/conditional-select regression also passes.
+
+## 2026-08-30 — `src/rdynarmic/src/backend/x64/{a64_interface.rs,a64_emit_x64_memory.rs,callback.rs}` vs Eden `src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp` and `a64_emit_x64.h`
+
+### Intentional differences
+
+- Eden devirtualizes the C++ member callback and receives MSVC's hidden aggregate-return pointer
+  after the callback object. Rust uses an explicit `Pair128*` trampoline argument, while the
+  generated accessor preserves the same register contract: context in `RCX`, return pointer in
+  `RDX`, and guest address moved to `R8`.
+
+### Unintentional differences (to fix)
+
+- None after the Windows trampoline accepts its explicit parameters in generated-register order.
+  It previously interpreted `RDX` as the guest address and `R8` as the return pointer, causing two
+  unmapped reads followed by an access violation when LM3 executed `LDR Q`.
+
+### Missing items
+
+- None in the reviewed Windows 128-bit read-return adapter.
+
+### Binary layout verification
+
+- PASS: `Pair128` remains `repr(C)`, size 16 and alignment 8. The executing Windows
+  `test_a64_ldr_q_uses_host_128_bit_return_abi` regression returns both expected 64-bit lanes.
+
+## 2026-08-30 — `externals/rxbyak/src/{code_array.rs,platform/{mod.rs,windows.rs,unix.rs}}` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
+
+### Intentional differences
+
+- Eden implements its custom virtual-memory allocator and `EnsureMemoryCommitted` directly in
+  `BlockOfCode`. Ruzu's assembler owns the backing allocation, so the same lifecycle is implemented
+  in the vendored Rxbyak `CodeBuffer`; `BlockOfCode` still receives one fixed, non-moving address
+  range and all generated-code ownership remains unchanged.
+- Unix keeps one lazy `mmap` for the complete range and treats explicit commitment as a no-op,
+  matching the effective upstream behavior outside Windows.
+
+### Unintentional differences (to fix)
+
+- None after Windows reserves the full cache with `MEM_RESERVE`, commits the initial 16 MiB prelude,
+  and commits additional 16 MiB chunks using the buffer's current protection. The previous
+  `MEM_RESERVE | MEM_COMMIT` charged all 512 MiB for every core immediately and left cores 2 and 3
+  without a JIT on the tested system.
+
+### Missing items
+
+- None in the reviewed Windows reserve/commit/free/protection lifecycle.
+
+### Binary layout verification
+
+- N/A: this changes host virtual-memory state, not guest or serialized layout. The Windows
+  `VirtualQuery` regression proves that a 512 MiB buffer starts with 16 MiB committed, retains the
+  following range as reserved, and commits the next chunk on the first crossing write. The full
+  Rxbyak test suite passes.
+
+## 2026-08-30 — `src/rdynarmic/src/backend/x64/{hostloc.rs,reg_alloc.rs,a64_emit_x64.rs,emit_data_processing.rs}` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{hostloc.h,reg_alloc.h,reg_alloc.cpp,a64_emit_x64.cpp}`
+
+### Intentional differences
+
+- Eden represents candidate registers with `std::bitset<32>`; Rust uses `&[HostLoc]`/`Vec<HostLoc>`
+  and explicitly visits the corresponding numeric host-location indices. Candidate membership,
+  conditional A64 removal of `R13`/`R14`, and selection priority remain identical.
+- Eden stores `lru_counter` in a two-bit C++ bit-field. Rust stores it as `u8` and masks each
+  increment to two bits, preserving the effective wrap while avoiding implementation-defined Rust
+  layout.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed candidate-selection slice. `any_gpr` again owns Eden's complete candidate
+  set (including `RBP`, `R13`, and `R14`), while `RegAlloc::select_a_register` owns the exclusions,
+  numeric-order empty preference, non-REX-before-REX resolution, and quasi-LRU counter update.
+
+### Missing items
+
+- None in the reviewed register candidate and selection behavior.
+
+### Binary layout verification
+
+- N/A: `HostLocInfo` is private host bookkeeping and is never copied as a binary payload. Focused
+  tests cover reserved candidates, numeric ordering, quasi-LRU updates, A64 memory-base candidate
+  removal, and unsigned division under full selectable-GPR pressure. The full `rdynarmic` suite
+  passes: 1129 passed, 4 ignored, with all auxiliary test targets passing.
+
+## 2026-08-30 — `src/core/src/file_sys/patch_manager.rs` vs Eden `src/core/file_sys/patch_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust exposes content-provider origin tracking through the `ContentProvider` trait instead of
+  Eden's concrete `ContentProviderUnion` casts. The versioned and per-origin probes therefore use
+  trait methods, while the final unversioned fallback retains Eden's union-wide `GetEntryRaw`
+  behavior.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ExeFS/RomFS update-selection fallback. Ruzu previously suppressed
+  `GetEntryRaw` whenever `supports_origin_tracking()` was true; Eden performs that fallback for its
+  `ContentProviderUnion`, including frontend-manual content. Both Rust paths now do the same when
+  no versioned update was selected and the legacy update keys are enabled.
+
+### Missing items
+
+- None in the reviewed unversioned update fallback slice.
+
+### Binary layout verification
+
+- N/A: selection changes only which existing `VirtualFile` is queried. The focused
+  `romfs_uses_raw_fallback_with_an_origin_tracking_provider` regression passes, and the LM3 runtime
+  check still applies the same `v0.5.0` ExeFS and RomFS update.
+
+## 2026-08-30 — `src/ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp` (`BootGame` title metadata)
+
+### Intentional differences
+
+- Eden normally obtains the visible version from the Control NACP returned by
+  `PatchManager::GetControlMetadata`. Ruzu keeps that primary path, then uses the first enabled
+  update patch's non-empty NACP display string when an external/manual Program update is usable but
+  its Control RomFS was not patchable. This GTK-frontend fallback consumes the same live
+  `PatchManager` state as the game list and still honors disabled updates.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed running-title slice. LM3 now reports `1.4.0` instead of the base NACP's
+  `1.0.0`, matching Eden, while the technical CNMT revision remains `v0.5.0` in patch logs.
+
+### Missing items
+
+- None in the reviewed title-name/version selection slice.
+
+### Binary layout verification
+
+- N/A: frontend strings only. The two focused `running_title_*` regressions pass, and a real
+  Windows Release launch logged and displayed `Luigi's Mansion 3 (64-bit) | 1.4.0`.

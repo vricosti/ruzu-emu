@@ -136,17 +136,17 @@ pub const HOST_R14: HostLoc = HostLoc::Gpr(14);
 pub const HOST_R15: HostLoc = HostLoc::Gpr(15);
 
 /// Available GPRs for register allocation.
-/// Excludes RSP (stack pointer) and R15 (reserved for JitState pointer).
+/// Matches upstream `any_gpr`: RBP/R13/R14 remain represented here and are
+/// rejected by `RegAlloc::select_a_register`, their upstream behavior owner.
 pub const ANY_GPR: &[HostLoc] = &[
     HOST_RAX, HOST_RBX, HOST_RCX, HOST_RDX, HOST_RSI, HOST_RDI, HOST_RBP, HOST_R8, HOST_R9,
     HOST_R10, HOST_R11, HOST_R12, HOST_R13, HOST_R14,
 ];
 
 /// Available XMM registers for register allocation.
-/// Excludes XMM0 (reserved as scratch/implicit operand).
+/// Excludes XMM0 (reserved as scratch/implicit operand) and XMM1/XMM2
+/// (reserved by 128-bit memory accessors), matching upstream `any_xmm`.
 pub const ANY_XMM: &[HostLoc] = &[
-    HostLoc::Xmm(1),
-    HostLoc::Xmm(2),
     HostLoc::Xmm(3),
     HostLoc::Xmm(4),
     HostLoc::Xmm(5),
@@ -183,16 +183,21 @@ mod tests {
     }
 
     #[test]
-    fn test_any_gpr_excludes_rsp_r15() {
+    fn test_any_gpr_matches_upstream_candidate_set() {
         assert!(!ANY_GPR.contains(&HOST_RSP));
+        assert!(ANY_GPR.contains(&HOST_RBP));
+        assert!(ANY_GPR.contains(&HOST_R13));
+        assert!(ANY_GPR.contains(&HOST_R14));
         assert!(!ANY_GPR.contains(&HOST_R15));
         assert_eq!(ANY_GPR.len(), 14);
     }
 
     #[test]
-    fn test_any_xmm_excludes_xmm0() {
+    fn test_any_xmm_excludes_reserved_registers() {
         assert!(!ANY_XMM.contains(&HostLoc::Xmm(0)));
-        assert_eq!(ANY_XMM.len(), 15);
+        assert!(!ANY_XMM.contains(&HostLoc::Xmm(1)));
+        assert!(!ANY_XMM.contains(&HostLoc::Xmm(2)));
+        assert_eq!(ANY_XMM.len(), 13);
     }
 
     #[test]

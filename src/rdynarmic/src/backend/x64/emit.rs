@@ -2,6 +2,7 @@ use crate::backend::x64::a32_emit_a32 as a32;
 use crate::backend::x64::a32_emit_x64_memory as a32_memory;
 use crate::backend::x64::a64_emit_x64_memory;
 use crate::backend::x64::a64_jitstate::A64JitState;
+use crate::backend::x64::abi;
 use crate::backend::x64::emit_a64;
 use crate::backend::x64::emit_aes;
 use crate::backend::x64::emit_context::{BlockDescriptor, EmitContext};
@@ -148,6 +149,12 @@ pub fn emit_push_rsb(
 /// Returns a `BlockDescriptor` with the entrypoint offset and size.
 pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockDescriptor {
     let start = ra.asm.size();
+
+    if ctx.arch.is_a32() {
+        crate::backend::x64::a32_emit_x64::emit_block_prologue(ra);
+    } else {
+        crate::backend::x64::a64_emit_x64::emit_block_prologue(ra);
+    }
 
     // RUZU_BLOCK_PROLOGUE_COUNT_PC — inline per-core block-entry counter.
     // Emitted INSIDE emit_block (after `start` captures the entrypoint
@@ -1856,6 +1863,13 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
         ra.end_of_alloc_scope();
     }
 
+    // Upstream `A32EmitX64::Emit` and `A64EmitX64::Emit` require the
+    // register allocator to have consumed every IR value before emitting the
+    // cycle update and terminal. Keeping this check here also prevents a
+    // directly linked successor from inheriting silently inconsistent host
+    // register state.
+    ra.assert_no_more_uses();
+
     // Subtract block cycle count from cycles_remaining (matching dynarmic's EmitAddCycles).
     // This decrements the tick budget so the dispatcher loop eventually returns to the host.
     if ctx.config.enable_cycle_counting && block.cycle_count > 0 {
@@ -1869,6 +1883,14 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 block.cycle_count as i32,
             )
             .unwrap();
+    }
+
+    // Restore RBP before the terminal exactly where the architecture-specific
+    // upstream emitters do so.
+    if ctx.arch.is_a32() {
+        crate::backend::x64::a32_emit_x64::emit_block_epilogue(ra);
+    } else {
+        crate::backend::x64::a64_emit_x64::emit_block_epilogue(ra);
     }
 
     // Emit the block terminal (control flow exit)
@@ -2060,12 +2082,15 @@ fn emit_preserved_a32_pc_trace_hook(ra: &mut RegAlloc, tag: u64) {
     ra.asm.sub(RSP, 8i32).unwrap();
 
     const XMM_SAVE_BYTES: i32 = 16 * 16;
-    ra.asm.sub(RSP, XMM_SAVE_BYTES).unwrap();
+    let callback_frame_size = XMM_SAVE_BYTES + abi::ABI_SHADOW_SPACE as i32;
+    ra.asm.sub(RSP, callback_frame_size).unwrap();
     let rsp = RegExp::from(RSP);
     for i in 0..16 {
         ra.asm
             .movups(
-                xmmword_ptr(rsp.clone() + (i * 16) as i32),
+                xmmword_ptr(
+                    rsp.clone() + abi::ABI_SHADOW_SPACE as i32 + (i * 16) as i32,
+                ),
                 Reg::xmm(i as u8),
             )
             .unwrap();
@@ -2073,9 +2098,13 @@ fn emit_preserved_a32_pc_trace_hook(ra: &mut RegAlloc, tag: u64) {
 
     // A32 JIT runs with R15 = A32JitState pointer (GPRs at offset 0) and
     // R13 = fastmem arena base. Pass both so the hook can read guest memory.
-    ra.asm.mov(RDI, R15).unwrap();
-    ra.asm.mov(RSI, rxbyak::R13).unwrap();
-    ra.asm.mov(RDX, tag as i64).unwrap();
+    ra.asm.mov(abi::ABI_PARAMS[0].to_reg64(), R15).unwrap();
+    ra.asm
+        .mov(abi::ABI_PARAMS[1].to_reg64(), rxbyak::R13)
+        .unwrap();
+    ra.asm
+        .mov(abi::ABI_PARAMS[2].to_reg64(), tag as i64)
+        .unwrap();
     ra.asm
         .mov(RAX, crate::jit::a32_pc_trace_hook as usize as i64)
         .unwrap();
@@ -2086,11 +2115,13 @@ fn emit_preserved_a32_pc_trace_hook(ra: &mut RegAlloc, tag: u64) {
         ra.asm
             .movups(
                 Reg::xmm(i as u8),
-                xmmword_ptr(rsp.clone() + (i * 16) as i32),
+                xmmword_ptr(
+                    rsp.clone() + abi::ABI_SHADOW_SPACE as i32 + (i * 16) as i32,
+                ),
             )
             .unwrap();
     }
-    ra.asm.add(RSP, XMM_SAVE_BYTES).unwrap();
+    ra.asm.add(RSP, callback_frame_size).unwrap();
     ra.asm.add(RSP, 8i32).unwrap();
 
     for &reg in caller_save_gprs.iter().rev() {

@@ -71,6 +71,8 @@ struct HostLocInfo {
     values: Vec<InstRef>,
     /// Maximum bit width of values stored here.
     max_bit_width: usize,
+    /// Quasi-LRU counter used when every selectable register is occupied.
+    lru_counter: u8,
 }
 
 impl HostLocInfo {
@@ -84,6 +86,7 @@ impl HostLocInfo {
             total_uses: 0,
             values: Vec::new(),
             max_bit_width: 0,
+            lru_counter: 0,
         }
     }
 
@@ -885,21 +888,50 @@ impl<'a> RegAlloc<'a> {
     // -------------------------------------------------------------------
 
     /// Select the best available register from the desired locations.
-    /// Prefers unlocked, empty registers.
-    fn select_a_register(&self, desired_locations: &[HostLoc]) -> HostLoc {
-        // First pass: find unlocked, empty registers
-        for &loc in desired_locations {
-            if !self.loc_info(loc).is_locked() && self.loc_info(loc).is_empty() {
-                return loc;
+    /// Matches upstream's numeric-order, empty-first, quasi-LRU selection.
+    fn select_a_register(&mut self, desired_locations: &[HostLoc]) -> HostLoc {
+        let mut min_lru_counter = usize::MAX;
+        let mut candidate = None;
+        let mut rex_candidate = None;
+        let mut empty_candidate = None;
+
+        for index in 0..NON_SPILL_COUNT {
+            let loc = index_to_hostloc(index);
+            if !desired_locations.contains(&loc) {
+                continue;
+            }
+
+            let loc_info = self.loc_info(loc);
+            if loc_info.is_locked()
+                || loc == HOST_RBP
+                || matches!(loc, HostLoc::Gpr(register) if (13..=15).contains(&register))
+            {
+                continue;
+            }
+
+            if loc_info.is_empty() {
+                empty_candidate = Some(loc);
+                break;
+            }
+
+            if (loc_info.lru_counter as usize) < min_lru_counter {
+                min_lru_counter = loc_info.lru_counter as usize;
+                if matches!(loc, HostLoc::Gpr(register) if (8..=15).contains(&register)) {
+                    rex_candidate = Some(loc);
+                } else {
+                    candidate = Some(loc);
+                }
             }
         }
-        // Second pass: find any unlocked register
-        for &loc in desired_locations {
-            if !self.loc_info(loc).is_locked() {
-                return loc;
-            }
-        }
-        panic!("All candidate registers have already been allocated");
+
+        let selected = empty_candidate
+            .or(candidate)
+            .or(rex_candidate)
+            .unwrap_or_else(|| panic!("All candidate registers have already been allocated"));
+        // Eden stores this in a two-bit field, so increment with the same wrap.
+        let next_lru_counter = self.loc_info(selected).lru_counter.wrapping_add(1) & 0b11;
+        self.loc_info_mut(selected).lru_counter = next_lru_counter;
+        selected
     }
 
     // -------------------------------------------------------------------
@@ -1324,6 +1356,35 @@ mod tests {
         let selected = ra.select_a_register(ANY_GPR);
         assert_ne!(selected, first_gpr, "Should prefer empty register");
         assert!(ra.loc_info(selected).is_empty());
+    }
+
+    #[test]
+    fn test_select_register_skips_upstream_reserved_candidates() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let mut ra = RegAlloc::new_default(&mut asm, vec![]);
+        let desired = [HOST_RBP, HOST_R13, HOST_R14, HOST_R15, HOST_RAX];
+
+        assert_eq!(ra.select_a_register(&desired), HOST_RAX);
+    }
+
+    #[test]
+    fn test_select_register_uses_numeric_order_and_quasi_lru() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let mut ra = RegAlloc::new_default(&mut asm, vec![]);
+        let desired = [HOST_RBX, HOST_RAX, HOST_RCX];
+
+        // Upstream receives a bitset and therefore visits RAX before RCX/RBX,
+        // regardless of the order used to construct the desired set.
+        assert_eq!(ra.select_a_register(&desired), HOST_RAX);
+
+        for (loc, lru_counter) in [(HOST_RAX, 2), (HOST_RCX, 1), (HOST_RBX, 3)] {
+            let info = ra.loc_info_mut(loc);
+            info.add_value(InstRef(loc.gpr_index() as u32), 64, 1);
+            info.lru_counter = lru_counter;
+        }
+
+        assert_eq!(ra.select_a_register(&desired), HOST_RCX);
+        assert_eq!(ra.loc_info(HOST_RCX).lru_counter, 2);
     }
 
     #[test]

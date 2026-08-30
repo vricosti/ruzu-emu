@@ -2180,7 +2180,7 @@ mod tests {
     use super::*;
     use crate::backend::x64::callback::Callback;
     use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig, EmitContext};
-    use crate::backend::x64::hostloc::ANY_GPR;
+    use crate::backend::x64::hostloc::{ANY_GPR, HOST_R13, HOST_R14, HOST_R15, HOST_RBP};
     use crate::backend::x64::reg_alloc::RegAlloc;
     use crate::ir::inst::Inst;
     use crate::ir::location::LocationDescriptor;
@@ -2448,12 +2448,17 @@ mod tests {
     #[test]
     fn test_emit_unsigned_div32_under_full_gpr_pressure() {
         let mut asm = CodeAssembler::new(4096).unwrap();
-        let inst_info = make_inst_info(ANY_GPR.len() + 2);
+        let selectable_gprs = ANY_GPR
+            .iter()
+            .copied()
+            .filter(|loc| !matches!(*loc, HOST_RBP | HOST_R13 | HOST_R14 | HOST_R15))
+            .collect::<Vec<_>>();
+        let inst_info = make_inst_info(selectable_gprs.len() + 2);
         let mut ra = RegAlloc::new_default(&mut asm, inst_info);
         let config = dummy_emit_config();
         let ctx = EmitContext::new(LocationDescriptor::new(0), &config);
 
-        for (i, &loc) in ANY_GPR.iter().enumerate() {
+        for (i, &loc) in selectable_gprs.iter().enumerate() {
             let reg = ra.scratch_gpr_at(loc);
             ra.define_value(InstRef(i as u32), reg);
             ra.end_of_alloc_scope();
@@ -2464,7 +2469,7 @@ mod tests {
             &[Value::Inst(InstRef(0)), Value::Inst(InstRef(1))],
         );
         let start = ra.asm.size();
-        emit_unsigned_div32(&ctx, &mut ra, InstRef(ANY_GPR.len() as u32), &inst);
+        emit_unsigned_div32(&ctx, &mut ra, InstRef(selectable_gprs.len() as u32), &inst);
         ra.end_of_alloc_scope();
 
         assert!(

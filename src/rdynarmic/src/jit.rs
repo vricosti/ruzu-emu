@@ -3554,6 +3554,22 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn test_a64_ands_consumes_result_for_nzcv_fallback() {
+        let code: &[u32] = &[
+            0x6A01_0000, // ands w0, w0, w1
+            0xD400_0001, // svc  #0
+        ];
+        let jit = run_a64_alu(code, |j| {
+            j.set_register(0, 0xF000_0000);
+            j.set_register(1, 0xF000_0000);
+        });
+
+        assert_eq!(jit.get_register(0), 0xF000_0000);
+        assert_eq!(jit.get_pstate() & 0xF000_0000, 0x8000_0000);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn test_a64_movn_w_zero_extends_into_x_register() {
         // MOVN W11, #0; SVC #0. A 32-bit GPR write clears the upper half of X11.
         let code: &[u32] = &[0x1280_000B, 0xD400_0001];

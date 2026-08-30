@@ -448,7 +448,6 @@ fn emit_preserved_a32_fastmem_write_trace_hook(
     for &reg in caller_save_gprs {
         ra.asm.push(reg).unwrap();
     }
-    ra.asm.sub(RSP, 8i32).unwrap();
 
     const XMM_SAVE_BYTES: i32 = 16 * 16;
     ra.asm.sub(RSP, XMM_SAVE_BYTES).unwrap();
@@ -462,19 +461,52 @@ fn emit_preserved_a32_fastmem_write_trace_hook(
             .unwrap();
     }
 
-    const SAVED_VALUE_OFFSET: i32 = XMM_SAVE_BYTES + 8 + 9 * 8;
+    // Keep the host stack aligned and, on Win64, provide the mandatory
+    // 32-byte shadow space plus the stack slot for the fifth argument.
+    #[cfg(target_os = "windows")]
+    const CALL_FRAME_BYTES: i32 = 40;
+    #[cfg(not(target_os = "windows"))]
+    const CALL_FRAME_BYTES: i32 = 8;
+    ra.asm.sub(RSP, CALL_FRAME_BYTES).unwrap();
+
+    const SAVED_VALUE_OFFSET: i32 = CALL_FRAME_BYTES + XMM_SAVE_BYTES + 9 * 8;
     const SAVED_VADDR_OFFSET: i32 = SAVED_VALUE_OFFSET + 8;
-    ra.asm
-        .mov(RDX, qword_ptr(RegExp::from(RSP) + SAVED_VADDR_OFFSET))
-        .unwrap();
-    ra.asm
-        .mov(R8, qword_ptr(RegExp::from(RSP) + SAVED_VALUE_OFFSET))
-        .unwrap();
-    ra.asm.mov(RDI, R15).unwrap();
-    ra.asm
-        .mov(RSI, ctx.arch.extract_pc(ctx.location) as i64)
-        .unwrap();
-    ra.asm.mov(RCX, bitsize as i64).unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Win64: RCX, RDX, R8, R9, then [rsp+32] for the fifth argument.
+        ra.asm.mov(RCX, R15).unwrap();
+        ra.asm
+            .mov(RDX, ctx.arch.extract_pc(ctx.location) as i64)
+            .unwrap();
+        ra.asm
+            .mov(R8, qword_ptr(RegExp::from(RSP) + SAVED_VADDR_OFFSET))
+            .unwrap();
+        ra.asm.mov(R9, bitsize as i64).unwrap();
+        ra.asm
+            .mov(RAX, qword_ptr(RegExp::from(RSP) + SAVED_VALUE_OFFSET))
+            .unwrap();
+        ra.asm
+            .mov(qword_ptr(RegExp::from(RSP) + 32), RAX)
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // System V: RDI, RSI, RDX, RCX, R8.
+        ra.asm.mov(RDI, R15).unwrap();
+        ra.asm
+            .mov(RSI, ctx.arch.extract_pc(ctx.location) as i64)
+            .unwrap();
+        ra.asm
+            .mov(RDX, qword_ptr(RegExp::from(RSP) + SAVED_VADDR_OFFSET))
+            .unwrap();
+        ra.asm.mov(RCX, bitsize as i64).unwrap();
+        ra.asm
+            .mov(R8, qword_ptr(RegExp::from(RSP) + SAVED_VALUE_OFFSET))
+            .unwrap();
+    }
+
     ra.asm
         .mov(
             RAX,
@@ -482,6 +514,7 @@ fn emit_preserved_a32_fastmem_write_trace_hook(
         )
         .unwrap();
     ra.asm.call_reg(RAX).unwrap();
+    ra.asm.add(RSP, CALL_FRAME_BYTES).unwrap();
 
     let rsp = RegExp::from(RSP);
     for i in 0..16 {
@@ -493,7 +526,6 @@ fn emit_preserved_a32_fastmem_write_trace_hook(
             .unwrap();
     }
     ra.asm.add(RSP, XMM_SAVE_BYTES).unwrap();
-    ra.asm.add(RSP, 8i32).unwrap();
 
     for &reg in caller_save_gprs.iter().rev() {
         ra.asm.pop(reg).unwrap();

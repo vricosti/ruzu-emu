@@ -22,5 +22,11 @@ mod tests {
         assert!(BUILD_VERSION.starts_with(&SCM_REV[..SCM_REV.len().min(10)]));
         assert!(BUILD_VERSION.ends_with(SCM_BRANCH));
         assert!(!COMPILER_ID.is_empty());
+        assert_ne!(COMPILER_ID, "Unknown compiler");
+        #[cfg(target_env = "msvc")]
+        {
+            let version = COMPILER_ID.strip_prefix("MSVC ").unwrap();
+            assert_eq!(version.split('.').count(), 4);
+        }
     }
 }

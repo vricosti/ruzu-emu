@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -110,7 +110,7 @@ pub struct SinkStream {
     last_frame: [i16; MAX_CHANNELS],
     min_played_sample_count: u64,
     max_played_sample_count: u64,
-    last_sample_count_update_time: Instant,
+    last_sample_count_update_time: Duration,
     system_volume: f32,
     device_volume: f32,
     discard_buffers: bool,
@@ -137,7 +137,7 @@ impl SinkStream {
             last_frame: [0; MAX_CHANNELS],
             min_played_sample_count: 0,
             max_played_sample_count: 0,
-            last_sample_count_update_time: Instant::now(),
+            last_sample_count_update_time: Duration::ZERO,
             system_volume: 1.0,
             device_volume: 1.0,
             discard_buffers: false,
@@ -238,6 +238,10 @@ impl SinkStream {
             return;
         }
 
+        if self.stream_type == StreamType::In {
+            return;
+        }
+
         if std::env::var_os("RUZU_TRACE_AUDIO_APPEND_CLIP").is_some() && samples.len() >= 100 {
             let mut min_sample = i16::MAX;
             let mut max_sample = i16::MIN;
@@ -278,12 +282,6 @@ impl SinkStream {
             buffer.frames_played = 0;
             buffer
         };
-
-        if self.stream_type == StreamType::In {
-            self.queue.push_back(queued_buffer);
-            self.release.queued_buffers.fetch_add(1, Ordering::Release);
-            return;
-        }
 
         let settings = common::settings::values();
         let mut yuzu_volume = common::settings::volume(&settings);
@@ -374,12 +372,13 @@ impl SinkStream {
     }
 
     pub fn get_expected_played_sample_count(&self) -> u64 {
-        let elapsed = self.last_sample_count_update_time.elapsed();
+        let current_time = self.system.get().core_timing().get_global_time_ns();
+        let elapsed = current_time.saturating_sub(self.last_sample_count_update_time);
         let expected_delta = (TARGET_SAMPLE_RATE as u128 * elapsed.as_nanos()) / 1_000_000_000u128;
         self.min_played_sample_count
             .saturating_add(expected_delta as u64)
             .min(self.max_played_sample_count)
-            .saturating_add(TARGET_SAMPLE_COUNT as u64 * 3)
+            .saturating_add(TARGET_SAMPLE_COUNT as u64 * 5)
     }
 
     pub fn wait_free_space(&self) {
@@ -411,15 +410,8 @@ impl SinkStream {
                     for sample in input_buffer.iter().skip(frames_written * frame_size) {
                         self.samples.push_back(*sample);
                     }
-                    let last_frame_start = (num_frames.saturating_sub(1)) * frame_size;
-                    let available = input_buffer.len().saturating_sub(last_frame_start);
-                    let copy_len = available.min(MAX_CHANNELS);
-                    if copy_len > 0 {
-                        self.last_frame[..copy_len].copy_from_slice(
-                            &input_buffer[last_frame_start..last_frame_start + copy_len],
-                        );
-                    }
-                    return;
+                    frames_written = num_frames;
+                    continue;
                 };
                 self.playing_buffer = buffer;
                 self.release.queued_buffers.fetch_sub(1, Ordering::Release);
@@ -448,6 +440,12 @@ impl SinkStream {
             self.last_frame[..copy_len]
                 .copy_from_slice(&input_buffer[last_frame_start..last_frame_start + copy_len]);
         }
+
+        self.last_sample_count_update_time = self.system.get().core_timing().get_global_time_ns();
+        self.min_played_sample_count = self.max_played_sample_count;
+        self.max_played_sample_count = self
+            .max_played_sample_count
+            .saturating_add(frames_written as u64);
     }
 
     pub fn process_audio_out_and_render(&mut self, output_buffer: &mut [i16], num_frames: usize) {
@@ -509,7 +507,7 @@ impl SinkStream {
                 .copy_from_slice(&output_buffer[last_frame_start..last_frame_start + copy_len]);
         }
 
-        self.last_sample_count_update_time = Instant::now();
+        self.last_sample_count_update_time = self.system.get().core_timing().get_global_time_ns();
         self.min_played_sample_count = self.max_played_sample_count;
         self.max_played_sample_count = self
             .max_played_sample_count
@@ -553,12 +551,14 @@ mod tests {
         stream.process_audio_out_and_render(&mut output, 2);
 
         assert_eq!(output, [1, 2, 3, 4]);
-        assert!(stream.get_expected_played_sample_count() >= 2);
-        assert!(stream.get_expected_played_sample_count() < 2 + TARGET_SAMPLE_COUNT as u64 * 4);
+        assert_eq!(
+            stream.get_expected_played_sample_count(),
+            TARGET_SAMPLE_COUNT as u64 * 5
+        );
     }
 
     #[test]
-    fn process_audio_in_consumes_queued_input_buffer_frames() {
+    fn process_audio_in_captures_frames_without_queued_buffers() {
         let system = make_system();
         let mut stream = SinkStream::new(system, StreamType::In);
         stream.device_channels = 2;
@@ -571,6 +571,8 @@ mod tests {
             },
             &[],
         );
+
+        assert_eq!(stream.get_queue_size(), 0);
 
         stream.process_audio_in(&[10, 11, 12, 13], 2);
 

@@ -542,9 +542,7 @@ impl StagingBufferPool {
         // SAFETY: the allocator is boxed by RendererVulkan and outlives the
         // rasterizer and its staging pool, matching upstream's reference member.
         let memory_allocator = unsafe { self.memory_allocator.as_ref() };
-        let allocation = memory_allocator
-            .create_buffer(&buf_info, usage)
-            .ok()?;
+        let allocation = memory_allocator.create_buffer(&buf_info, usage).ok()?;
         let buffer = allocation.handle();
         let mapped = allocation.mapped_ptr();
         assert!(usage == MemoryUsage::DeviceLocal || !mapped.is_null());

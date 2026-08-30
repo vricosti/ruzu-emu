@@ -305,12 +305,7 @@ impl SyncpointManager {
         }
     }
 
-    fn wait(
-        &self,
-        syncpoint: &AtomicU32,
-        cv: &Condvar,
-        expected_value: u32,
-    ) {
+    fn wait(&self, syncpoint: &AtomicU32, cv: &Condvar, expected_value: u32) {
         if syncpoint.load(Ordering::Acquire) >= expected_value {
             return;
         }

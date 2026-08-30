@@ -1471,7 +1471,10 @@ mod tests {
         );
 
         keyboard.exit_keyboard();
-        assert!(matches!(receiver.recv().unwrap(), SoftwareKeyboardRequest::Close));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            SoftwareKeyboardRequest::Close
+        ));
 
         keyboard.initialize_keyboard(
             true,

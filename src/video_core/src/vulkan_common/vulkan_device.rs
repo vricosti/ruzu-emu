@@ -36,6 +36,17 @@ const ONE_GIB: u64 = 1024 * 1024 * 1024;
 const KHR_MAINTENANCE_5_EXTENSION_NAME: &str = "VK_KHR_maintenance5";
 const KHR_MAINTENANCE_6_EXTENSION_NAME: &str = "VK_KHR_maintenance6";
 
+/// `vk-mem` 0.3 embeds a VMA revision whose allocator creation contract ends
+/// at Vulkan 1.3. Ruzu also creates its Vulkan instance for 1.3, so a newer
+/// physical-device version must not be forwarded to that allocator.
+const fn vma_api_version(device_api_version: u32) -> u32 {
+    if device_api_version > vk::API_VERSION_1_3 {
+        vk::API_VERSION_1_3
+    } else {
+        device_api_version
+    }
+}
+
 /// Stable non-owning Rust counterpart of upstream's pervasive `const Device&`
 /// members. Renderer owners are boxed before these references are created and
 /// are destroyed after every dependent cache/pipeline worker has joined.
@@ -1844,7 +1855,7 @@ impl Device {
             } else {
                 256 * 1024 * 1024
             })
-            .vulkan_api_version(device_properties.api_version);
+            .vulkan_api_version(vma_api_version(device_properties.api_version));
         let allocator = Arc::new(Mutex::new(
             vk_mem::Allocator::new(allocator_info).map_err(VulkanError::new)?,
         ));
@@ -3995,6 +4006,16 @@ fn configure_robustness2_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vk_mem_0_3_never_receives_a_version_newer_than_vulkan_1_3() {
+        assert_eq!(vma_api_version(vk::API_VERSION_1_1), vk::API_VERSION_1_1);
+        assert_eq!(vma_api_version(vk::API_VERSION_1_3), vk::API_VERSION_1_3);
+        assert_eq!(
+            vma_api_version(vk::make_api_version(0, 1, 4, 0)),
+            vk::API_VERSION_1_3
+        );
+    }
 
     #[test]
     fn maintenance5_and6_raw_payloads_match_vulkan_abi() {

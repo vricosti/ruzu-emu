@@ -16,7 +16,7 @@ use crate::ir;
 use crate::ir::program::ShaderInfo;
 use crate::ir::types::{ShaderStage, Type};
 use crate::profile::Profile;
-use crate::runtime_info::{AttributeType, InputTopology, RuntimeInfo};
+use crate::runtime_info::{AttributeType, RuntimeInfo};
 use crate::shader_info::{
     ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
     TextureBufferDescriptor, TextureDescriptor, TextureType,
@@ -2718,16 +2718,6 @@ impl SpirvEmitContext {
         id
     }
 
-    fn input_vertices(&self) -> u32 {
-        match self.runtime_info.input_topology {
-            InputTopology::Points => 1,
-            InputTopology::Lines => 2,
-            InputTopology::LinesAdjacency => 4,
-            InputTopology::Triangles => 3,
-            InputTopology::TrianglesAdjacency => 6,
-        }
-    }
-
     fn define_input(
         &mut self,
         mut value_type: spirv::Word,
@@ -2737,7 +2727,7 @@ impl SpirvEmitContext {
         if per_invocation {
             let count = match self.stage {
                 ShaderStage::TessellationControl | ShaderStage::TessellationEval => Some(32),
-                ShaderStage::Geometry => Some(self.input_vertices()),
+                ShaderStage::Geometry => Some(self.runtime_info.input_topology.vertices()),
                 _ => None,
             };
             if let Some(count) = count {

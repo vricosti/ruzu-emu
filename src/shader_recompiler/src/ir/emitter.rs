@@ -1639,6 +1639,13 @@ impl<'a> Emitter<'a> {
         ))
     }
 
+    /// Zero-extend a 32-bit unsigned integer to 64 bits.
+    ///
+    /// Counterpart of upstream `IREmitter::UConvert(64, U32)`.
+    pub fn uconvert_u64_from_u32(&mut self, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::ConvertU64U32, vec![value]))
+    }
+
     /// Polymorphic float conversion. Port of upstream
     /// `IREmitter::FPConvert(size_t result_bitsize, const F16F32F64& value, FpControl control)`.
     ///

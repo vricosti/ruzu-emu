@@ -216,19 +216,16 @@ mod tests {
         #[cfg(not(target_os = "android"))]
         assert_eq!(
             super::IGNORED_MESSAGE_IDS,
-            &[
-                0x682a878a, 0x99fb7dfd, 0xe8616bf2, 0x1608dec0, 0x55362756,
-            ]
+            &[0x682a878a, 0x99fb7dfd, 0xe8616bf2, 0x1608dec0, 0x55362756,]
         );
 
         #[cfg(target_os = "android")]
         assert_eq!(
             super::IGNORED_MESSAGE_IDS,
             &[
-                0xbf9cf353, 0x1093bebb, 0x9215850f, 0x86bf18dc, 0x0792ad08, 0x93e1ba4e,
-                0xac9c13c5, 0xc9a2001b, 0x8b7159a7, 0xb13c8036, 0xdff2e5c1, 0x0cc85f41,
-                0x1257b492, 0x398e0dab, 0x970c11a5, 0x6b453f78, 0xf66469d0, 0x1d43405e,
-                0x638462e8, 0xe0a2da61,
+                0xbf9cf353, 0x1093bebb, 0x9215850f, 0x86bf18dc, 0x0792ad08, 0x93e1ba4e, 0xac9c13c5,
+                0xc9a2001b, 0x8b7159a7, 0xb13c8036, 0xdff2e5c1, 0x0cc85f41, 0x1257b492, 0x398e0dab,
+                0x970c11a5, 0x6b453f78, 0xf66469d0, 0x1d43405e, 0x638462e8, 0xe0a2da61,
             ]
         );
     }

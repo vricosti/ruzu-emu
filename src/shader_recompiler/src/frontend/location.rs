@@ -31,7 +31,9 @@ impl Location {
             "initial_offset={} is not a multiple of 8",
             initial_offset
         );
-        let mut loc = Self { offset: initial_offset };
+        let mut loc = Self {
+            offset: initial_offset,
+        };
         loc.align();
         loc
     }
@@ -100,9 +102,7 @@ impl Location {
 
 impl Default for Location {
     fn default() -> Self {
-        Self {
-            offset: 0xcccccccc,
-        }
+        Self { offset: 0xcccccccc }
     }
 }
 

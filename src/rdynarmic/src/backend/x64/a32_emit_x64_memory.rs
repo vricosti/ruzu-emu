@@ -486,9 +486,7 @@ fn emit_preserved_a32_fastmem_write_trace_hook(
         ra.asm
             .mov(RAX, qword_ptr(RegExp::from(RSP) + SAVED_VALUE_OFFSET))
             .unwrap();
-        ra.asm
-            .mov(qword_ptr(RegExp::from(RSP) + 32), RAX)
-            .unwrap();
+        ra.asm.mov(qword_ptr(RegExp::from(RSP) + 32), RAX).unwrap();
     }
 
     #[cfg(not(target_os = "windows"))]

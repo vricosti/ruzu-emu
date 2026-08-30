@@ -977,6 +977,15 @@ pub fn emit_invocation_info(ctx: &mut SpirvEmitContext) -> Word {
                 .shift_left_logical(ctx.u32_type, None, loaded, shift)
                 .unwrap()
         }
+        ShaderStage::Geometry => {
+            let vertices = ctx
+                .builder
+                .constant_bit32(ctx.u32_type, ctx.runtime_info.input_topology.vertices());
+            let shift = ctx.builder.constant_bit32(ctx.u32_type, 16);
+            ctx.builder
+                .shift_left_logical(ctx.u32_type, None, vertices, shift)
+                .unwrap()
+        }
         _ => {
             log::warn!("(STUBBED) EmitInvocationInfo called for non-tessellation stage");
             ctx.builder.constant_bit32(ctx.u32_type, 0x00ff0000u32)

@@ -2088,9 +2088,7 @@ fn emit_preserved_a32_pc_trace_hook(ra: &mut RegAlloc, tag: u64) {
     for i in 0..16 {
         ra.asm
             .movups(
-                xmmword_ptr(
-                    rsp.clone() + abi::ABI_SHADOW_SPACE as i32 + (i * 16) as i32,
-                ),
+                xmmword_ptr(rsp.clone() + abi::ABI_SHADOW_SPACE as i32 + (i * 16) as i32),
                 Reg::xmm(i as u8),
             )
             .unwrap();
@@ -2115,9 +2113,7 @@ fn emit_preserved_a32_pc_trace_hook(ra: &mut RegAlloc, tag: u64) {
         ra.asm
             .movups(
                 Reg::xmm(i as u8),
-                xmmword_ptr(
-                    rsp.clone() + abi::ABI_SHADOW_SPACE as i32 + (i * 16) as i32,
-                ),
+                xmmword_ptr(rsp.clone() + abi::ABI_SHADOW_SPACE as i32 + (i * 16) as i32),
             )
             .unwrap();
     }

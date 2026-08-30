@@ -447,7 +447,9 @@ fn safe_adpcm_coeff_pair(
     read_index: usize,
     position_in_frame: u32,
 ) -> (i32, i32, bool) {
-    let coeff_index = ((header >> 4) & 0xF) as usize;
+    // The ADPCM predictor occupies only bits 4..=6. Bit 7 is ignored by
+    // the upstream decoder rather than extending the coefficient index.
+    let coeff_index = ((header >> 4) & 0x7) as usize;
     if let Some(pair) = adpcm_coeff_pair(coefficients, coeff_index) {
         return (pair.0, pair.1, true);
     }
@@ -828,27 +830,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_adpcm_invalid_header_advances_with_silence() {
-        let wavebuffer = [0xF0u8, 0, 0, 0, 0, 0, 0, 0];
-        let mut context = AdpcmContext::default();
-        let mut output = [123i16; ADPCM_SAMPLES_PER_FRAME as usize];
-        let mut req = DecodeArg {
-            buffer: wavebuffer.as_ptr() as CpuAddr,
-            buffer_size: wavebuffer.len() as u64,
-            start_offset: 0,
-            end_offset: ADPCM_SAMPLES_PER_FRAME,
-            channel_count: 1,
-            target_channel: 0,
-            offset: 0,
-            samples_to_read: ADPCM_SAMPLES_PER_FRAME,
-            coefficients: [0; 16],
-            adpcm_context: Some(&mut context),
-        };
+    fn adpcm_predictor_ignores_header_bit_seven_like_upstream() {
+        let coefficients = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 1234, -5678,
+        ];
 
-        let decoded = decode_adpcm(&MemoryHandle::default(), &mut output, &mut req);
+        let (coeff0, coeff1, valid) =
+            safe_adpcm_coeff_pair(&coefficients, 0xF0, 0, 0, 0, 0, 0);
 
-        assert_eq!(decoded, ADPCM_SAMPLES_PER_FRAME);
-        assert_eq!(output, [0; ADPCM_SAMPLES_PER_FRAME as usize]);
-        assert_eq!(context.header, 0xF0);
+        assert!(valid);
+        assert_eq!((coeff0, coeff1), (1234, -5678));
     }
 }

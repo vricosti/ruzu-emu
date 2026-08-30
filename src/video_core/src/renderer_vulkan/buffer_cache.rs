@@ -709,7 +709,12 @@ impl BufferCacheRuntime {
                 _ => unreachable!("invalid quad topology"),
             }
             .expect("quad index buffer was just allocated");
-            fill_quad_lut(allocation.mapped_slice_mut(), topology, num_indices, index_type);
+            fill_quad_lut(
+                allocation.mapped_slice_mut(),
+                topology,
+                num_indices,
+                index_type,
+            );
             allocation.flush();
         } else {
             let staging = self
@@ -729,7 +734,8 @@ impl BufferCacheRuntime {
             let src_buffer = staging.buffer;
             let src_offset = staging.offset;
             let dst_buffer = buffer;
-            self.scheduler().request_outside_render_pass_operation_context();
+            self.scheduler()
+                .request_outside_render_pass_operation_context();
             self.scheduler().record(move |cmdbuf| unsafe {
                 let device = device.get().get_logical();
                 let copy = vk::BufferCopy {
@@ -785,7 +791,8 @@ impl BufferCacheRuntime {
         let buffer = allocation.handle();
 
         let device = self.device_owner;
-        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler()
+            .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| unsafe {
             let device = device.get().get_logical();
             device.cmd_fill_buffer(cmdbuf, buffer, 0, vk::WHOLE_SIZE, 0);
@@ -878,7 +885,8 @@ impl BufferCacheRuntime {
                 });
             return;
         }
-        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler()
+            .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let read_barrier = vk::MemoryBarrier::builder()
@@ -1008,7 +1016,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn pre_copy_barrier(&mut self) {
         let device = self.device_owner;
-        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler()
+            .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let read_barrier = vk::MemoryBarrier::builder()
@@ -1031,7 +1040,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn post_copy_barrier(&mut self) {
         let device = self.device_owner;
-        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler()
+            .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let write_barrier = vk::MemoryBarrier::builder()
@@ -1102,7 +1112,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             return;
         }
         let device = self.device_owner;
-        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler()
+            .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
             let read_barrier = vk::MemoryBarrier::builder()

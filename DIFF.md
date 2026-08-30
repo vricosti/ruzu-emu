@@ -18146,3 +18146,207 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: frontend strings only. The two focused `running_title_*` regressions pass, and a real
   Windows Release launch logged and displayed `Luigi's Mansion 3 (64-bit) | 1.4.0`.
+
+## 2026-08-30 — `src/audio_core/src/sink/sink_stream.rs` vs Eden `src/audio_core/sink/sink_stream.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the sample and buffer FIFOs in `VecDeque` and shares the release state through
+  atomics plus a condition variable; these replace Eden's `RingBuffer`, `SPSCQueue`, mutex, and
+  condition variable without moving the owned stream behavior out of `sink_stream.rs`.
+- Rust accepts immutable guest sample slices and enqueues converted samples separately, whereas
+  Eden performs the downmix in its mutable scratch span before pushing the shortened span.
+- `discard_buffers`, stop-aware waits, and the backend start/stop closure are Rust integration
+  state used by the existing ADSP and Cubeb ownership model; they do not change the reviewed
+  AudioOut sample-count calculation.
+- Rust guards zero-frame and out-of-range channel copies that Eden assumes are prevented by its
+  callers.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed sink timing and AudioIn accounting slice. Ruzu now timestamps callbacks
+  with `CoreTiming::GetGlobalTimeNs`, uses Eden's 25 ms (`TargetSampleCount * 5`) reporting margin,
+  updates AudioIn sample counts, and leaves AudioIn append buffers unqueued like Eden. It
+  previously used the host wall clock, a 15 ms margin, and skipped the no-queue AudioIn count
+  update.
+
+### Missing items
+
+- None in the reviewed sink timing, six-to-two downmix, and AudioIn accounting paths.
+
+### Binary layout verification
+
+- N/A: `SinkBuffer` and the FIFO state are host-only and are not copied into guest or serialized
+  memory. The focused sink-stream tests pass, including exact 25 ms reporting and the six-channel
+  center-channel downmix; the complete `audio_core` library suite passes serially (202 tests).
+
+## 2026-08-30 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
+
+### Intentional differences
+
+- Eden passes the physical device's `ApiVersion()` directly to VMA 3.3.0, which accepts Vulkan
+  1.4. Ruzu currently uses `ash` 0.37 with `vk-mem` 0.3, whose bundled VMA contract asserts that
+  allocator creation receives at most Vulkan 1.3. Ruzu therefore clamps only the VMA allocator's
+  advertised API version to 1.3; the physical-device version retained and reported by `Device`
+  remains unchanged. This also matches Ruzu's Vulkan 1.3 instance creation.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed allocator-creation slice. Moving to Eden's direct `ApiVersion()` behavior
+  requires the separate, workspace-wide `ash` 0.38 and `vk-mem` 0.5 API migration.
+
+### Missing items
+
+- None in the reviewed allocator-creation slice.
+
+### Binary layout verification
+
+- N/A: the helper selects a Vulkan API version integer passed to VMA and does not alter guest or
+  serialized layout. The focused regression covers Vulkan 1.1, 1.3, and 1.4 inputs. A real AMD
+  Vulkan 1.4.315 device now creates the allocator and runs Luigi's Mansion 3 in Release without
+  the former VMA assertion. The complete `video_core` library suite passes serially (1507 passed,
+  1 ignored).
+
+## 2026-08-30 — `src/shader_recompiler/src/frontend/translate/internal_stage_buffer_entry_read.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/internal_stage_buffer_entry_read.cpp`
+
+### Intentional differences
+
+- Rust decodes the instruction fields into local enums instead of using Eden's overlapping C++
+  `BitField` union. Field positions, enum values, and the fact that `imm` includes bit 31 are
+  preserved.
+- Eden's Patch and Prim branches reinterpret the typed `IR::U32` index as `Patch`/`Attribute` and
+  rely on those modes carrying immediate indices. Rust checks that invariant before constructing
+  the corresponding strongly typed IR value; the valid instruction behavior is unchanged.
+
+### Unintentional differences (to fix)
+
+- None. Ruzu previously rejected skew, global, non-default mode, and shifted ISBERD forms, then
+  emitted a fallback register copy. It now owns Eden's complete scale-index, lane-skew, global
+  U8/U16/U32/F32 load, Patch/Prim/Attr, default-skew, and fallback-copy ordering.
+
+### Missing items
+
+- None in `TranslatorVisitor::ISBERD`.
+
+### Binary layout verification
+
+- N/A: instruction fields are decoded from a `u64` and emitted as typed IR; no host struct is
+  copied as a guest payload. Four focused regressions cover the fallback, global U16 skew,
+  indexed Attr/B32, and default-skew paths. The complete `shader_recompiler` suite passes (468
+  tests).
+
+## 2026-08-30 — `src/shader_recompiler/src/ir/emitter.rs` (`uconvert_u64_from_u32`) vs Eden `src/shader_recompiler/frontend/ir/ir_emitter.{h,cpp}` (`UConvert`)
+
+### Intentional differences
+
+- Eden exposes one runtime-polymorphic `UConvert(result_bitsize, value)` method. Rust exposes the
+  exact U32-to-U64 specialization required by ISBERD, following the existing typed emitter API;
+  both emit `Opcode::ConvertU64U32`.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed U32-to-U64 conversion branch.
+
+### Missing items
+
+- The other Eden `UConvert` width combinations remain outside this focused prerequisite slice.
+
+### Binary layout verification
+
+- N/A: this emits an IR opcode and does not serialize a host structure. The ISBERD global-load
+  regression verifies that `ConvertU64U32` is emitted before `LoadGlobalU16`; the complete
+  `shader_recompiler` suite passes (468 tests).
+
+## 2026-08-30 — `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/shader_recompiler/runtime_info.h` (`InputTopologyVertices`)
+
+### Intentional differences
+
+- Rust owns `vertices` as a `const` method on `InputTopology` instead of wrapping the enum in
+  Eden's stateless `InputTopologyVertices` helper struct. The helper remains in the corresponding
+  `runtime_info.rs` owner and returns the same value for every topology.
+
+### Unintentional differences (to fix)
+
+- None. The former SPIR-V context-local topology switch has been moved to its upstream owner and
+  all five point/line/adjacency/triangle mappings match Eden.
+
+### Missing items
+
+- None in `InputTopologyVertices::vertices`.
+
+### Binary layout verification
+
+- N/A: the helper maps an enum to a compile-time vertex count and is not serialized. A focused
+  regression covers all five topology values.
+
+## 2026-08-30 — `src/shader_recompiler/src/backend/spirv/emit_spirv_context_get_set.rs` vs Eden `src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp` (`EmitInvocationInfo`)
+
+### Intentional differences
+
+- Rspirv builder calls replace Eden's typed `EmitContext::OpShiftLeftLogical`/`Const` wrappers;
+  both construct the same unsigned 32-bit left shift by 16.
+
+### Unintentional differences (to fix)
+
+- None. Ruzu previously sent geometry shaders through the default stub and returned
+  `0x00ff0000`. It now returns `InputTopologyVertices::vertices(input_topology) << 16`, while the
+  tessellation and unsupported-stage branches retain Eden's existing behavior.
+
+### Missing items
+
+- None in `EmitInvocationInfo`.
+
+### Binary layout verification
+
+- N/A: this emits SPIR-V SSA instructions and defines no raw-memory payload. The topology helper
+  regression covers every geometry input value; the complete shader-recompiler suite passes (468
+  tests).
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` image-allocation diagnostics vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.cpp` (`MakeImage`/`Image::Image`)
+
+### Intentional differences
+
+- Ruzu logs the complete `ImageInfo`, Vulkan create-info, and current memory-budget usage when a
+  VMA image allocation fails. With `RUZU_TRACE_VULKAN_IMAGE_ALLOC` set, it also logs allocations
+  made after heap usage reaches 4 GiB. These diagnostics do not alter image creation or ownership.
+
+### Unintentional differences (to fix)
+
+- None introduced by the diagnostic path; the same VMA allocation is attempted once and its
+  original `VkResult` is returned unchanged.
+
+### Missing items
+
+- The underlying LM3 memory-pressure cause remains under investigation; this entry covers only
+  the non-invasive allocation diagnostics.
+
+### Binary layout verification
+
+- N/A: existing Rust and Ash debug formatting observes host-side values and does not change any
+  Vulkan or guest payload.
+
+## 2026-08-30 — `src/audio_core/src/renderer/command/data_source/decode.rs` vs Eden `src/audio_core/renderer/command/data_source/decode.{h,cpp}` (`DecodeAdpcm`)
+
+### Intentional differences
+
+- Rust retains bounds-checked coefficient lookup and opt-in diagnostics around Eden's direct
+  array indexing. With the upstream three-bit predictor mask, every possible header maps to one
+  of the eight valid coefficient pairs, so valid decoding behavior is identical.
+
+### Unintentional differences (to fix)
+
+- None. Ruzu previously used all four high header bits (`& 0xF`) as the ADPCM predictor index;
+  Eden uses only bits 4 through 6 (`& 0x7`). Headers with bit 7 set were therefore decoded with
+  zeroed coefficients in Ruzu. Both initial-context and per-frame header paths now use Eden's
+  three-bit predictor index.
+
+### Missing items
+
+- None in the reviewed ADPCM predictor-index extraction.
+
+### Binary layout verification
+
+- N/A: the change only selects an existing coefficient pair and does not alter a serialized
+  structure. A focused regression verifies that header `0xF0` selects coefficients 14 and 15,
+  matching Eden's `(header >> 4) & 0x7` behavior. The complete `audio_core` suite passes (202
+  tests).

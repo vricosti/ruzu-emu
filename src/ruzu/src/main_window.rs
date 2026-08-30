@@ -3174,7 +3174,7 @@ impl GMainWindow {
         Some(Arc::clone(&self.software_keyboard)
             as Arc<
                 dyn ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet,
-        >)
+            >)
     }
 
     /// Eden connects both `EmulationStarting` and `EmulationStopping` to

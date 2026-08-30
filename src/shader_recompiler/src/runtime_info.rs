@@ -44,6 +44,19 @@ impl Default for InputTopology {
     }
 }
 
+impl InputTopology {
+    /// Port of upstream `InputTopologyVertices::vertices`.
+    pub const fn vertices(self) -> u32 {
+        match self {
+            InputTopology::Lines => 2,
+            InputTopology::LinesAdjacency => 4,
+            InputTopology::Triangles => 3,
+            InputTopology::TrianglesAdjacency => 6,
+            InputTopology::Points => 1,
+        }
+    }
+}
+
 /// Depth comparison function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompareFunction {
@@ -175,6 +188,15 @@ impl Default for RuntimeInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_topology_vertices_matches_upstream() {
+        assert_eq!(InputTopology::Points.vertices(), 1);
+        assert_eq!(InputTopology::Lines.vertices(), 2);
+        assert_eq!(InputTopology::LinesAdjacency.vertices(), 4);
+        assert_eq!(InputTopology::Triangles.vertices(), 3);
+        assert_eq!(InputTopology::TrianglesAdjacency.vertices(), 6);
+    }
 
     #[test]
     fn transform_feedback_storage_matches_eden_fixed_extent() {

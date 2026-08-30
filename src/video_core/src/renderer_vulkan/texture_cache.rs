@@ -3347,9 +3347,31 @@ impl TextureCacheRuntime {
             &view_formats,
             self.image_format_list_supported,
         );
+        let memory_usage = self
+            .can_report_memory_usage()
+            .then(|| self.get_device_memory_usage());
+        if std::env::var_os("RUZU_TRACE_VULKAN_IMAGE_ALLOC").is_some()
+            && memory_usage.is_some_and(|usage| usage >= 4 * 1024 * 1024 * 1024)
+        {
+            log::warn!(
+                "Vulkan image allocation while memory pressure is high: usage={} info={:?} create_info={:?}",
+                memory_usage.unwrap_or_default(),
+                info,
+                image_info,
+            );
+        }
         self.memory_allocator()
             .create_image(&image_info)
-            .map_err(|err| err.result)
+            .map_err(|err| {
+                log::error!(
+                    "Vulkan image allocation failed: result={:?} usage={:?} info={:?} create_info={:?}",
+                    err.result,
+                    memory_usage,
+                    info,
+                    image_info,
+                );
+                err.result
+            })
     }
 
     fn create_msaa_upload_image(&mut self, info: &ImageInfo) -> Result<AllocatedImage, vk::Result> {

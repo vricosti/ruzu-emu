@@ -3640,12 +3640,7 @@ impl RasterizerInterface for RasterizerVulkan {
         {
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            lock_two_reentrant_mutexes!(
-                buffer_mutex,
-                texture_mutex,
-                _buffer_guard,
-                _texture_guard
-            );
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
             self.texture_cache.create_channel(channel);
             self.common_buffer_cache.create_channel(channel);
         }
@@ -3660,12 +3655,7 @@ impl RasterizerInterface for RasterizerVulkan {
         {
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            lock_two_reentrant_mutexes!(
-                buffer_mutex,
-                texture_mutex,
-                _buffer_guard,
-                _texture_guard
-            );
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
             self.texture_cache.bind_to_channel(channel.bind_id);
             self.common_buffer_cache.bind_to_channel(channel.bind_id);
         }
@@ -3690,12 +3680,7 @@ impl RasterizerInterface for RasterizerVulkan {
         {
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            lock_two_reentrant_mutexes!(
-                buffer_mutex,
-                texture_mutex,
-                _buffer_guard,
-                _texture_guard
-            );
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
             self.texture_cache.erase_channel(channel_id);
             self.common_buffer_cache.erase_channel(channel_id);
         }

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::types::VAddr;
 
-use super::word_manager::{BYTES_PER_WORD, DeviceTracker, Type, WordManager};
+use super::word_manager::{DeviceTracker, Type, WordManager, BYTES_PER_WORD};
 
 // ---------------------------------------------------------------------------
 // Constants — match upstream exactly
@@ -418,15 +418,14 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
                 break;
             }
 
-            let mut execute =
-                |mgr: &Manager<DT>, begin: &mut u64, end: &mut u64| {
-                    let (new_begin, new_end) = func(mgr, page_offset, copy_amount as u64);
-                    if new_begin != 0 || new_end != 0 {
-                        let base_address = (page_index as u64) << HIGHER_PAGE_BITS;
-                        *begin = (*begin).min(new_begin.wrapping_add(base_address));
-                        *end = (*end).max(new_end.wrapping_add(base_address));
-                    }
-                };
+            let mut execute = |mgr: &Manager<DT>, begin: &mut u64, end: &mut u64| {
+                let (new_begin, new_end) = func(mgr, page_offset, copy_amount as u64);
+                if new_begin != 0 || new_end != 0 {
+                    let base_address = (page_index as u64) << HIGHER_PAGE_BITS;
+                    *begin = (*begin).min(new_begin.wrapping_add(base_address));
+                    *end = (*end).max(new_end.wrapping_add(base_address));
+                }
+            };
 
             if let Some(loc) = self.top_tier[page_index] {
                 let mgr = Self::get_manager_mut(&mut self.manager_pool, loc);
@@ -443,7 +442,11 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
             remaining_size -= copy_amount;
         }
 
-        if begin < end { (begin, end) } else { (0, 0) }
+        if begin < end {
+            (begin, end)
+        } else {
+            (0, 0)
+        }
     }
 
     /// Allocate a manager for the given higher-page index.

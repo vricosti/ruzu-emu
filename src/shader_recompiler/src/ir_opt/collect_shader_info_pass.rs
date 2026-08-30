@@ -1210,9 +1210,11 @@ mod tests {
             image_format: ImageFormat::Typeless as u8,
             ..Default::default()
         };
-        program
-            .block_mut(0)
-            .append_inst(Inst::with_flags(Opcode::ImageRead, vec![], read.to_u32()));
+        program.block_mut(0).append_inst(Inst::with_flags(
+            Opcode::ImageRead,
+            vec![],
+            read.to_u32(),
+        ));
         program.block_mut(0).append_inst(Inst::with_flags(
             Opcode::ImageWrite,
             vec![],

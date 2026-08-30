@@ -1300,5 +1300,4 @@ mod tests {
 
         assert!(tv.ir.program.blocks[0].is_empty());
     }
-
 }

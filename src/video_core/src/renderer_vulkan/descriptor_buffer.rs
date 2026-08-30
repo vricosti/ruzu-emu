@@ -112,8 +112,7 @@ impl DescriptorBufferRing {
         ring.chunk_addresses.reserve(total_chunks);
         ring.chunk_hosts.reserve(total_chunks);
         for _ in 0..total_chunks {
-            let buffer =
-                memory_allocator.create_buffer(&buffer_info, MemoryUsage::Upload)?;
+            let buffer = memory_allocator.create_buffer(&buffer_info, MemoryUsage::Upload)?;
             if !buffer.is_host_visible() {
                 log::debug!("Descriptor buffer is not host visible, disabling");
                 ring.chunks.clear();

@@ -53,6 +53,7 @@ use crate::framebuffer_config::FramebufferConfig;
 use crate::gpu_logging::{get_instance, is_active};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
+use crate::memory_manager::MemoryManagerHandle;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::texture_cache::types::NULL_IMAGE_ID;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
@@ -112,12 +113,21 @@ macro_rules! lock_two_reentrant_mutexes {
     };
 }
 
-struct GpuTickGuard(Option<crate::renderer_base::GpuTickCallback>);
+struct GpuTickGuard(Option<NonNull<dyn Fn() + Send + Sync>>);
+
+impl GpuTickGuard {
+    fn new(callback: Option<&crate::renderer_base::GpuTickCallback>) -> Self {
+        Self(callback.map(|callback| NonNull::from(callback.as_ref())))
+    }
+}
 
 impl Drop for GpuTickGuard {
     fn drop(&mut self) {
-        if let Some(callback) = self.0.as_ref() {
-            callback();
+        if let Some(callback) = self.0 {
+            // SAFETY: the rasterizer owns the callback Arc for the complete
+            // draw call. The guard is dropped before that field can be
+            // replaced, matching Eden's scope-exit reference to `gpu`.
+            unsafe { callback.as_ref()() };
         }
     }
 }
@@ -472,36 +482,44 @@ impl From<vk::Result> for RendererError {
 }
 
 struct GpuMemoryAccessAdapter {
-    mm: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    mm: MemoryManagerHandle,
 }
 
 impl GpuMemoryAccess for GpuMemoryAccessAdapter {
     fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
-        self.mm.lock().gpu_to_cpu_address(gpu_addr)
+        // SAFETY: the rasterizer retains the channel's owning Arc while this
+        // adapter is installed, and BufferCache access is externally
+        // serialized by its recursive mutex, matching upstream's stored raw
+        // `Tegra::MemoryManager*`.
+        unsafe { self.mm.as_ref().gpu_to_cpu_address(gpu_addr) }
     }
 
     fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
         let mut buf = [0u8; 8];
-        self.mm.lock().read_block(gpu_addr, &mut buf);
+        unsafe {
+            self.mm.as_ref().read_block(gpu_addr, &mut buf);
+        }
         Some(u64::from_le_bytes(buf))
     }
 
     fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
         let mut buf = [0u8; 4];
-        self.mm.lock().read_block(gpu_addr, &mut buf);
+        unsafe {
+            self.mm.as_ref().read_block(gpu_addr, &mut buf);
+        }
         Some(u32::from_le_bytes(buf))
     }
 
     fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {
-        self.mm.lock().is_within_gpu_address_range(gpu_addr)
+        unsafe { self.mm.as_ref().is_within_gpu_address_range(gpu_addr) }
     }
 
     fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
-        self.mm.lock().max_continuous_range(gpu_addr, size)
+        unsafe { self.mm.as_ref().max_continuous_range(gpu_addr, size) }
     }
 
     fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
-        self.mm.lock().get_memory_layout_size(gpu_addr)
+        unsafe { self.mm.as_ref().get_memory_layout_size(gpu_addr) }
     }
 }
 
@@ -630,6 +648,10 @@ pub struct RasterizerVulkan {
     // Channel-bound GPU memory manager, matching upstream rasterizer access to
     // the active channel's Tegra::MemoryManager.
     channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
+    // Non-owning counterpart of upstream's channel-bound
+    // `Tegra::MemoryManager*`. `channel_memory_manager` remains the lifetime
+    // owner; graphics pipeline descriptor reads use this pointer directly.
+    channel_memory_manager_handle: Option<MemoryManagerHandle>,
     /// Rust owner bridge for upstream `Tegra::GPU& gpu` / `gpu.TickWork()`.
     gpu_tick_callback: Option<crate::renderer_base::GpuTickCallback>,
     /// Rust owner bridge for upstream `Tegra::GPU& gpu` /
@@ -1107,6 +1129,7 @@ impl RasterizerVulkan {
             transform_feedback_supported,
             transform_feedback_draw_supported: vulkan_device.is_transform_feedback_draw_supported(),
             channel_memory_manager: None,
+            channel_memory_manager_handle: None,
             gpu_tick_callback: None,
             invalidate_gpu_cache_callback: None,
         })
@@ -1148,10 +1171,11 @@ impl RasterizerVulkan {
         zpass_pixel_count_enabled: bool,
         indirect_params: Option<crate::engines::draw_manager::IndirectParams>,
         dirty_flags: &mut [bool; 256],
+        dirty_flags_are_live: bool,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
+        let _gpu_tick_guard = GpuTickGuard::new(self.gpu_tick_callback.as_ref());
         // 1. Periodic flush
         self.flush_work();
         if let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() {
@@ -1183,10 +1207,12 @@ impl RasterizerVulkan {
                 return;
             }
         };
-        // `FixedPipelineState::Refresh` consumes live Maxwell dirty flags
-        // before Configure. Mirror those changes into the draw-scoped array
-        // without aliasing the array with the live register view.
-        *dirty_flags = *draw.dirty_flags();
+        // `FixedPipelineState::Refresh` consumes Maxwell dirty flags before
+        // Configure. Production draws already use that live array directly;
+        // snapshot-only callers refresh their owned fallback here.
+        if !dirty_flags_are_live {
+            *dirty_flags = *draw.dirty_flags();
+        }
         // Serialize every common-buffer-cache access on this draw
         // (uniform/storage descriptor binding AND the geometry binding below)
         // against concurrent CPU-write invalidation. A guest write on another
@@ -1206,7 +1232,7 @@ impl RasterizerVulkan {
             _bc_draw_buffer_guard,
             _bc_draw_texture_guard
         );
-        if let Some(gpu_memory) = self.channel_memory_manager.as_ref().cloned() {
+        if let Some(gpu_memory) = self.channel_memory_manager_handle {
             gp.set_engine(
                 draw,
                 dirty_flags,
@@ -1231,18 +1257,16 @@ impl RasterizerVulkan {
             return;
         }
         if self.scheduler.current_tick() != command_buffer_tick_before_configure {
-            // Eden's StateTracker points directly at the live Maxwell flags,
-            // so Scheduler::InvalidateState immediately reaches the flags
-            // consumed by UpdateDynamicStates. Ruzu uses a draw-scoped mirror
-            // during Configure to avoid aliased mutable register access. Keep
-            // that mirror in step when Configure allocates/recycles resources
-            // and flushes onto a fresh command buffer. Configure binds the
-            // geometry before allocating descriptor-buffer space, so such a
-            // flush also leaves those bindings in the submitted command
-            // buffer. Rebind them on the fresh command buffer before emitting
-            // the draw.
-            self.state_tracker
-                .apply_command_buffer_invalidation(dirty_flags);
+            // `StateTracker::InvalidateState` already writes the live Maxwell
+            // flags, exactly as in Eden. Snapshot-only callers still need the
+            // same invalidation copied into their fallback array.
+            if !dirty_flags_are_live {
+                self.state_tracker
+                    .apply_command_buffer_invalidation(dirty_flags);
+            }
+            // Configure binds geometry before descriptor allocation. If the
+            // latter rolls the command buffer, repeat those bindings on its
+            // successor before recording the draw.
             self.common_buffer_cache
                 .bind_host_geometry_buffers(draw.is_indexed());
         }
@@ -2617,32 +2641,52 @@ impl RasterizerInterface for RasterizerVulkan {
             "RasterizerVulkan::draw indexed={} instances={}",
             draw_indexed, instance_count
         );
-        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(memory_manager) = self.channel_memory_manager_handle else {
             warn!("RasterizerVulkan::draw skipped: no bound channel memory manager");
             return;
         };
         let zpass_pixel_count_enabled = draw_view.zpass_pixel_count_enabled();
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
-            memory_manager.lock().read_block(gpu_va, output);
+            // SAFETY: the rasterizer retains the owning channel Arc and the
+            // draw executes synchronously on the GPU thread.
+            unsafe {
+                memory_manager.as_ref().read_block(gpu_va, output);
+            }
         };
-        let memory_manager_unsafe = Arc::clone(&memory_manager);
         let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            memory_manager_unsafe
-                .lock()
-                .read_block_unsafe(gpu_va, output)
+            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
         };
-        let original_dirty_flags = *draw_view.dirty_flags();
-        let mut dirty_flags = original_dirty_flags;
-        self.prepare_draw(
-            &mut draw_view,
-            instance_count,
-            zpass_pixel_count_enabled,
-            None,
-            &mut dirty_flags,
-            &read_gpu,
-            &read_gpu_unsafe,
-        );
-        propagate_consumed_dirty_flags(&mut draw_view, &original_dirty_flags, &dirty_flags);
+        if let Some(mut dirty_flags) = draw_view.dirty_flags_ptr() {
+            // SAFETY: production draws execute synchronously on the GPU thread.
+            // The pointer targets the bound channel's stable Maxwell dirty
+            // array, which is also the sole owner selected by StateTracker.
+            unsafe {
+                self.prepare_draw(
+                    &mut draw_view,
+                    instance_count,
+                    zpass_pixel_count_enabled,
+                    None,
+                    dirty_flags.as_mut(),
+                    true,
+                    &read_gpu,
+                    &read_gpu_unsafe,
+                );
+            }
+        } else {
+            let original_dirty_flags = *draw_view.dirty_flags();
+            let mut dirty_flags = original_dirty_flags;
+            self.prepare_draw(
+                &mut draw_view,
+                instance_count,
+                zpass_pixel_count_enabled,
+                None,
+                &mut dirty_flags,
+                false,
+                &read_gpu,
+                &read_gpu_unsafe,
+            );
+            propagate_consumed_dirty_flags(&mut draw_view, &original_dirty_flags, &dirty_flags);
+        }
     }
 
     fn draw_indirect(
@@ -2650,7 +2694,7 @@ impl RasterizerInterface for RasterizerVulkan {
         mut indirect_view: crate::engines::draw_manager::Maxwell3DIndirectView<'_>,
     ) {
         let params = *indirect_view.params();
-        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(memory_manager) = self.channel_memory_manager_handle else {
             warn!("RasterizerVulkan::draw_indirect skipped: no bound channel memory manager");
             return;
         };
@@ -2658,13 +2702,12 @@ impl RasterizerInterface for RasterizerVulkan {
         self.draw_sequence = self.draw_sequence.wrapping_add(1);
         let zpass_pixel_count_enabled = indirect_view.draw_view_mut().zpass_pixel_count_enabled();
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
-            memory_manager.lock().read_block(gpu_va, output);
+            unsafe {
+                memory_manager.as_ref().read_block(gpu_va, output);
+            }
         };
-        let memory_manager_unsafe = Arc::clone(&memory_manager);
         let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            memory_manager_unsafe
-                .lock()
-                .read_block_unsafe(gpu_va, output)
+            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
         };
         let cache_params = crate::buffer_cache::buffer_cache_base::DrawIndirectParams {
             indirect_start_address: params.indirect_start_address,
@@ -2676,23 +2719,40 @@ impl RasterizerInterface for RasterizerVulkan {
         };
         self.common_buffer_cache
             .set_draw_indirect(Some(cache_params));
-        let original_dirty_flags = *indirect_view.draw_view_mut().dirty_flags();
-        let mut dirty_flags = original_dirty_flags;
         let instance_count = indirect_view.draw_view_mut().draw_state().instance_count;
-        self.prepare_draw(
-            indirect_view.draw_view_mut(),
-            instance_count,
-            zpass_pixel_count_enabled,
-            Some(params),
-            &mut dirty_flags,
-            &read_gpu,
-            &read_gpu_unsafe,
-        );
-        propagate_consumed_dirty_flags(
-            indirect_view.draw_view_mut(),
-            &original_dirty_flags,
-            &dirty_flags,
-        );
+        if let Some(mut dirty_flags) = indirect_view.dirty_flags_ptr() {
+            // SAFETY: same live-channel invariant as the direct draw path.
+            unsafe {
+                self.prepare_draw(
+                    indirect_view.draw_view_mut(),
+                    instance_count,
+                    zpass_pixel_count_enabled,
+                    Some(params),
+                    dirty_flags.as_mut(),
+                    true,
+                    &read_gpu,
+                    &read_gpu_unsafe,
+                );
+            }
+        } else {
+            let original_dirty_flags = *indirect_view.draw_view_mut().dirty_flags();
+            let mut dirty_flags = original_dirty_flags;
+            self.prepare_draw(
+                indirect_view.draw_view_mut(),
+                instance_count,
+                zpass_pixel_count_enabled,
+                Some(params),
+                &mut dirty_flags,
+                false,
+                &read_gpu,
+                &read_gpu_unsafe,
+            );
+            propagate_consumed_dirty_flags(
+                indirect_view.draw_view_mut(),
+                &original_dirty_flags,
+                &dirty_flags,
+            );
+        }
         self.common_buffer_cache.set_draw_indirect(None);
     }
 
@@ -2700,21 +2760,19 @@ impl RasterizerInterface for RasterizerVulkan {
         &mut self,
         mut draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
     ) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
+        let _gpu_tick_guard = GpuTickGuard::new(self.gpu_tick_callback.as_ref());
         self.flush_work();
 
         let draw_texture_state = draw_texture_view.draw_texture_state();
         let render_targets = draw_texture_view.render_targets();
         let descriptor_sync_regs = draw_texture_view.descriptor_sync_regs();
-        let original_dirty_flags = *draw_texture_view.dirty_flags();
-        let mut dirty_flags = original_dirty_flags;
 
-        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(memory_manager) = self.channel_memory_manager_handle else {
             log::warn!("RasterizerVulkan::draw_texture skipped: no bound channel memory manager");
             return;
         };
         let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            memory_manager.lock().read_block_unsafe(gpu_va, output)
+            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
         };
 
         // Upstream keeps TextureCache::mutex locked from descriptor
@@ -2724,22 +2782,45 @@ impl RasterizerInterface for RasterizerVulkan {
         self.texture_cache
             .base
             .synchronize_graphics_descriptors(descriptor_sync_regs);
-        if !self.texture_cache.update_render_targets(
-            &render_targets,
-            &mut dirty_flags,
-            &read_gpu_unsafe,
-            false,
-            None,
-        ) {
-            log::warn!("RasterizerVulkan::draw_texture skipped: render-target update failed");
-            return;
+        if let Some(mut dirty_flags) = draw_texture_view.dirty_flags_ptr() {
+            // SAFETY: the draw-texture callback is serialized on the GPU
+            // thread. This points at the same live channel flags used by
+            // StateTracker and mirrors Eden's persistent Maxwell3D owner.
+            unsafe {
+                if !self.texture_cache.update_render_targets(
+                    &render_targets,
+                    dirty_flags.as_mut(),
+                    &read_gpu_unsafe,
+                    false,
+                    None,
+                ) {
+                    log::warn!(
+                        "RasterizerVulkan::draw_texture skipped: render-target update failed"
+                    );
+                    return;
+                }
+                self.update_dynamic_states(draw_texture_view.draw_view_mut(), dirty_flags.as_mut());
+            }
+        } else {
+            let original_dirty_flags = *draw_texture_view.dirty_flags();
+            let mut dirty_flags = original_dirty_flags;
+            if !self.texture_cache.update_render_targets(
+                &render_targets,
+                &mut dirty_flags,
+                &read_gpu_unsafe,
+                false,
+                None,
+            ) {
+                log::warn!("RasterizerVulkan::draw_texture skipped: render-target update failed");
+                return;
+            }
+            self.update_dynamic_states(draw_texture_view.draw_view_mut(), &mut dirty_flags);
+            propagate_consumed_dirty_flags(
+                draw_texture_view.draw_view_mut(),
+                &original_dirty_flags,
+                &dirty_flags,
+            );
         }
-        self.update_dynamic_states(draw_texture_view.draw_view_mut(), &mut dirty_flags);
-        propagate_consumed_dirty_flags(
-            draw_texture_view.draw_view_mut(),
-            &original_dirty_flags,
-            &dirty_flags,
-        );
         self.query_cache.notify_segment(true);
         self.query_cache.counter_enable(
             &mut self.scheduler,
@@ -2859,38 +2940,52 @@ impl RasterizerInterface for RasterizerVulkan {
         }
 
         let render_targets = clear_view.render_targets();
-        let mut dirty_flags = *clear_view.dirty_flags();
-        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(memory_manager) = self.channel_memory_manager_handle else {
             warn!("RasterizerVulkan::clear skipped: no bound channel memory manager");
             return;
         };
         let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            memory_manager.lock().read_block_unsafe(gpu_va, output)
+            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
         };
         let clear_scissor = clear_view.use_scissor().then(|| {
             let scissor = clear_view.scissor(0);
             (scissor.min_x, scissor.min_y, scissor.max_x, scissor.max_y)
         });
-        let original_flags = dirty_flags;
         // Upstream holds texture_cache.mutex from UpdateRenderTargets through
         // the clear command. CPU invalidation may otherwise erase a slot while
         // alias synchronization is iterating slot_images.
         let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;
         let _texture_cache_guard = unsafe { (*texture_cache_mutex).lock() };
-        if !self.texture_cache.update_render_targets(
-            &render_targets,
-            &mut dirty_flags,
-            &read_gpu_unsafe,
-            true,
-            clear_scissor,
-        ) {
-            return;
-        }
-        // Same live-flag propagation as the draw path: the snapshot copy must
-        // not swallow the flags consumed by UpdateRenderTargets.
-        for (index, dirty) in dirty_flags.iter().enumerate() {
-            if !dirty && original_flags[index] {
-                clear_view.clear_dirty_flag(index as u8);
+        if let Some(mut dirty_flags) = clear_view.dirty_flags_ptr() {
+            // SAFETY: clear executes synchronously on the GPU thread and the
+            // pointer targets the bound channel's stable dirty flag array.
+            if !unsafe {
+                self.texture_cache.update_render_targets(
+                    &render_targets,
+                    dirty_flags.as_mut(),
+                    &read_gpu_unsafe,
+                    true,
+                    clear_scissor,
+                )
+            } {
+                return;
+            }
+        } else {
+            let original_flags = *clear_view.dirty_flags();
+            let mut dirty_flags = original_flags;
+            if !self.texture_cache.update_render_targets(
+                &render_targets,
+                &mut dirty_flags,
+                &read_gpu_unsafe,
+                true,
+                clear_scissor,
+            ) {
+                return;
+            }
+            for (index, dirty) in dirty_flags.iter().enumerate() {
+                if !dirty && original_flags[index] {
+                    clear_view.clear_dirty_flag(index as u8);
+                }
             }
         }
         let target = match self.texture_cache.get_framebuffer() {
@@ -3124,11 +3219,11 @@ impl RasterizerInterface for RasterizerVulkan {
         else {
             return;
         };
-        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(memory_manager) = self.channel_memory_manager_handle else {
             return;
         };
         let read_gpu = |address: u64, output: &mut [u8]| {
-            memory_manager.lock().read_block_unsafe(address, output)
+            unsafe { memory_manager.as_ref().read_block_unsafe(address, output) }
         };
         let buffer_cache_mutex: *const _ = Arc::as_ptr(&self.common_buffer_cache.mutex);
         let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;
@@ -3355,22 +3450,6 @@ impl RasterizerInterface for RasterizerVulkan {
     fn flush_region(&mut self, addr: u64, size: u64, which: CacheType) {
         if addr == 0 || size == 0 {
             return;
-        }
-        if std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
-            && (size == 0x50 || size == 0x1000)
-        {
-            let buffer_modified = which.contains(CacheType::BUFFER_CACHE)
-                && self
-                    .common_buffer_cache
-                    .is_region_gpu_modified(addr, size as usize);
-            let texture_modified = which.contains(CacheType::TEXTURE_CACHE)
-                && self
-                    .texture_cache
-                    .base
-                    .is_region_gpu_modified(addr, size as usize);
-            eprintln!(
-                "[VULKAN_FLUSH_OWNERS] device=0x{addr:X} size=0x{size:X} buffer={buffer_modified} texture={texture_modified}"
-            );
         }
         if which.contains(CacheType::TEXTURE_CACHE) {
             unsafe {
@@ -3674,9 +3753,13 @@ impl RasterizerInterface for RasterizerVulkan {
             .channel_caches
             .current_channel_state()
             .and_then(ChannelCacheAccessor::gpu_memory_arc);
-        if let Some(mm) = self.channel_memory_manager.as_ref() {
+        self.channel_memory_manager_handle = self.channel_memory_manager.as_ref().map(|mm| {
+            let memory = mm.lock();
+            MemoryManagerHandle::from_ref(&memory)
+        });
+        if let Some(mm) = self.channel_memory_manager_handle {
             self.common_buffer_cache
-                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm }));
         }
     }
 
@@ -3693,7 +3776,20 @@ impl RasterizerInterface for RasterizerVulkan {
         self.shader_cache.erase_channel(channel_id);
         self.pipeline_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
-        self.channel_memory_manager = None;
+        self.channel_memory_manager = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
+        self.channel_memory_manager_handle = self.channel_memory_manager.as_ref().map(|mm| {
+            let memory = mm.lock();
+            MemoryManagerHandle::from_ref(&memory)
+        });
+        if let Some(mm) = self.channel_memory_manager_handle {
+            self.common_buffer_cache
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm }));
+        } else {
+            self.common_buffer_cache.clear_gpu_memory();
+        }
     }
 
     fn accelerate_surface_copy(
@@ -3997,6 +4093,40 @@ fn create_host_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_tick_scope_exit_borrows_callback_without_arc_clone() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let callback: crate::renderer_base::GpuTickCallback = Arc::new(move || {
+            callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let owners_before = Arc::strong_count(&callback);
+
+        {
+            let _guard = GpuTickGuard::new(Some(&callback));
+            assert_eq!(Arc::strong_count(&callback), owners_before);
+        }
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn buffer_cache_gpu_memory_adapter_uses_bound_non_owning_pointer() {
+        let memory = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new(0),
+        ));
+        let guard = memory.lock();
+        let adapter = GpuMemoryAccessAdapter {
+            mm: MemoryManagerHandle::from_ref(&guard),
+        };
+
+        // Deliberately keep the non-reentrant owner mutex held. Eden's buffer
+        // cache calls its stored `Tegra::MemoryManager*` directly; the Rust
+        // adapter must not acquire that mutex again for each address lookup.
+        assert_eq!(adapter.gpu_to_cpu_address(0x1000), None);
+        assert_eq!(adapter.read_u32(0x1000), Some(0));
+    }
 
     #[test]
     fn rasterizer_borrows_upstream_device_owner() {

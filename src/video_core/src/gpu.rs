@@ -258,24 +258,20 @@ impl Gpu {
         // host1x.GMMU().BindRasterizer(rasterizer);
         if let Some(rasterizer) = self.rasterizer_handle() {
             if let Some(host1x) = self.system_ref().get().host1x_core() {
-                if std::env::var_os("RUZU_DISABLE_HOST1X_INVALIDATE_BIND").is_none() {
-                    host1x.bind_device_memory_invalidator(Box::new(move |addr, size| unsafe {
-                        rasterizer.as_mut().invalidate_region(
-                            addr,
-                            size as u64,
-                            crate::cache_types::CacheType::ALL,
-                        );
-                    }));
-                }
-                if std::env::var_os("RUZU_DISABLE_HOST1X_FLUSH_BIND").is_none() {
-                    host1x.bind_device_memory_flusher(Box::new(move |addr, size| unsafe {
-                        rasterizer.as_mut().flush_region(
-                            addr,
-                            size as u64,
-                            crate::cache_types::CacheType::ALL,
-                        );
-                    }));
-                }
+                host1x.bind_device_memory_invalidator(Box::new(move |addr, size| unsafe {
+                    rasterizer.as_mut().invalidate_region(
+                        addr,
+                        size as u64,
+                        crate::cache_types::CacheType::ALL,
+                    );
+                }));
+                host1x.bind_device_memory_flusher(Box::new(move |addr, size| unsafe {
+                    rasterizer.as_mut().flush_region(
+                        addr,
+                        size as u64,
+                        crate::cache_types::CacheType::ALL,
+                    );
+                }));
                 if let Some(host1x) = host1x
                     .as_any()
                     .downcast_ref::<crate::host1x::host1x::Host1x>()

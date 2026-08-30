@@ -1926,6 +1926,13 @@ impl<'a> Maxwell3DClearView<'a> {
         }
     }
 
+    pub fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
+        match &mut self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.dirty_flags_ptr(),
+            Maxwell3DClearSource::Snapshot { .. } => None,
+        }
+    }
+
     pub fn clear_dirty_flag(&mut self, index: u8) {
         match &mut self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.clear_dirty_flag(index),
@@ -3075,6 +3082,32 @@ mod tests {
         assert!(
             view.dirty_flags()[crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize]
         );
+    }
+
+    #[test]
+    fn live_draw_and_clear_views_share_maxwell_dirty_flags() {
+        let draw_state = DrawState::default();
+        let flag = crate::dirty_flags::flags::COLOR_BUFFER0 as usize;
+        let mut maxwell3d = Maxwell3D::new();
+
+        {
+            let mut draw = Maxwell3DDrawView::live(&draw_state, false, &mut maxwell3d);
+            let mut flags = draw.dirty_flags_ptr().expect("live draw flags");
+            // SAFETY: the view exclusively borrows `maxwell3d` for this scope.
+            unsafe { flags.as_mut()[flag] = true };
+        }
+        assert!(maxwell3d.dirty_flags()[flag]);
+
+        {
+            let mut clear = Maxwell3DClearView::live(&mut maxwell3d);
+            let mut flags = clear.dirty_flags_ptr().expect("live clear flags");
+            // SAFETY: the view exclusively borrows `maxwell3d` for this scope.
+            unsafe { flags.as_mut()[flag] = false };
+        }
+        assert!(!maxwell3d.dirty_flags()[flag]);
+
+        let mut snapshot = Maxwell3DClearView::default();
+        assert!(snapshot.dirty_flags_ptr().is_none());
     }
 
     #[test]

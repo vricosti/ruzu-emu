@@ -207,14 +207,6 @@ impl ChannelState {
     /// same owner list as upstream.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         log::debug!("ChannelState::bind_rasterizer bind_id={}", self.bind_id);
-        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
-            let ptr = rasterizer as *const dyn RasterizerInterface;
-            log::info!(
-                "ChannelState::bind_rasterizer bind_id={} rasterizer_ptr={:p}",
-                self.bind_id,
-                ptr
-            );
-        }
         if let Some(ref mut dma) = self.dma_pusher {
             dma.bind_rasterizer(rasterizer);
         }

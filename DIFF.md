@@ -13988,9 +13988,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Rust slice checks skip a copy whose source or destination range is outside the supplied span.
-  Eden indexes the span and calls `memcpy`, which is undefined for the same invalid range; valid
-  texture spans use the same offsets and copy sizes.
+- Rust validates the linear span and the last byte actually visited in the tiled span once before
+  the full-image loop. Eden relies on its internal callers and indexes those spans unchecked; some
+  compressed-image callers intentionally omit untouched tail padding from the containing GOB.
+  After that one safe-API guard, Rust uses the same fixed-size non-overlapping copy in the per-pixel
+  loop; subrectangle copies retain their existing range guards because their linear-span layout is
+  not a full image.
 - Eden's `ASSERT_MSG` for an unsupported bytes-per-pixel value is represented by `panic!`.
 - The eight C++ `BPP_CASE` macro expansions are written as explicit Rust match arms.
 
@@ -14001,6 +14004,13 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   using the upstream-owned `common` alignment/division helpers.
 - None after preserving the wrapping behavior of every upstream `u32` offset, size, and coordinate
   calculation in debug builds.
+- Corrected: the full-image loop previously performed `checked_add`, two bounds comparisons, slice
+  construction, and conditional skipping for every pixel. Eden performs a direct fixed-size
+  `memcpy`; Ruzu now validates the spans once and gives the hot loop the same shape.
+- Corrected during full-suite validation: the first global guard required the complete theoretical
+  GOB allocation (`slice_size * depth_blocks`) even when Eden's caller supplied only the bytes
+  touched by a compressed image. The guard now derives the monotonic final visited tiled offset;
+  the BC tile-count regression again passes without restoring per-pixel checks.
 
 ### Missing items
 
@@ -14009,8 +14019,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the module copies byte spans and owns no serialized structure. Focused tests exercise every
-  BPP dispatch arm, GOB offsets, overflow behavior, and Eden's non-power-of-two subrectangle
-  overlap semantics.
+  BPP dispatch arm through full swizzle/unswizzle round trips, GOB offsets, overflow behavior, and
+  Eden's non-power-of-two subrectangle overlap semantics. Texture-cache coverage additionally
+  verifies a compressed image whose input omits untouched GOB tail padding.
 
 ## 2026-08-26 — `src/audio_core/src/renderer/memory/pool_mapper.rs` vs Eden `src/audio_core/renderer/memory/pool_mapper.cpp`
 
@@ -17814,7 +17825,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Intentional differences
 
 - A non-owning `MemoryManagerHandle` represents Eden's directly stored `Tegra::MemoryManager*`
-  when a Rust memory-read callback re-enters the rasterizer while the channel mutex is held.
+  while the owning `Arc<Mutex<MemoryManager>>` keeps the channel object alive. Descriptor reads and
+  memory-read callbacks use that stable handle under the texture-cache/channel serialization that
+  protects Eden's pointer; reduced tests without a bound channel retain the owned fallback path.
 
 ### Unintentional differences (to fix)
 
@@ -17822,14 +17835,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   range whenever the channel mutex was held. Eden always calls `SwizzleImage(*gpu_memory,
   image.gpu_addr, ...)`, preserving every GPU page-table segment. Ruzu now does the same in both
   unlocked and re-entrant callback paths.
+- Resolved: `VisitImageView` and ordinary `GetSamplerId` previously locked the Rust channel
+  `MemoryManager` once for every TIC/TSC descriptor read. Eden reads both tables through its stored
+  non-owning pointer while the texture cache is already serialized. Ruzu now uses the matching
+  stable handle, removing two atomic mutex operations per descriptor from every draw.
 
 ### Missing items
 
-- None in the verified `DownloadMemory` writeback path.
+- None in the verified `DownloadMemory`, `VisitImageView`, and `GetSamplerId` memory-access paths.
 
 ### Binary layout verification
 
-- N/A: the correction changes address translation and lifecycle access only.
+- N/A: the corrections change address translation and lifecycle access only. A focused regression
+  holds the owning channel mutex while `GetSamplerId` reads through the stable non-owning handle,
+  proving that the hot path neither recursively locks nor changes descriptor contents.
 
 ## 2026-08-29 — `src/core/src/hle/service/am/library_applet_storage.rs` vs Eden `src/core/hle/service/am/library_applet_storage.{h,cpp}`
 
@@ -18672,25 +18691,31 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - PASS for the reviewed command payload: binding address/usage and compute descriptor offset
   arguments remain identical to Eden.
 
-## 2026-08-30 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (`PrepareDraw`)
+## 2026-08-30 — `src/video_core/src/engines/draw_manager.rs`, `renderer_vulkan/state_tracker.rs`, `renderer_vulkan/vk_rasterizer.rs`, and `renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.{h,cpp}`, `renderer_vulkan/vk_state_tracker.{h,cpp}`, `renderer_vulkan/vk_rasterizer.{h,cpp}`, and `texture_cache/texture_cache.h` (live dirty flags / `PrepareDraw`)
 
 ### Intentional differences
 
-- Eden's scheduler and state tracker share the live Maxwell dirty flags. Ruzu uses a draw-scoped
-  dirty-flag mirror to avoid aliased mutable register access and detects a command-buffer rollover
-  by comparing scheduler ticks around `GraphicsPipeline::configure`.
+- Eden passes its persistent `Maxwell3D*` through the renderer. Ruzu's production draw, indirect,
+  draw-texture, and clear views expose a short-lived `NonNull<[bool; 256]>` to the stable
+  channel-owned dirty array; this is the narrow unsafe ownership adapter needed for the same
+  single live flag owner. Snapshot-only unit-test views retain an owned fallback array.
 - Eden binds host geometry inside `GraphicsPipeline::Configure`, before descriptor-buffer
   allocation. If that allocation forces `Scheduler::Finish`, Ruzu explicitly repeats
-  `BindHostGeometryBuffers` on the fresh command buffer, alongside the existing draw-scoped state
-  invalidation. This preserves the upstream binding ownership while adapting the worker-owned
+  `BindHostGeometryBuffers` on the fresh command buffer. The live StateTracker already invalidates
+  the same Maxwell flags consumed by `UpdateDynamicStates`; only snapshot fixtures explicitly copy
+  the invalidation mask. This preserves upstream state ownership while adapting the worker-owned
   command-buffer lifecycle.
 
 ### Unintentional differences (to fix)
 
-- None in the corrected rollover slice. Previously the index, vertex, transform-feedback, and
-  indirect buffer commands could remain in the submitted command buffer while the draw was
-  recorded in its successor. Vulkan validation reported missing vertex and index bindings
-  immediately before the deterministic device loss.
+- Corrected: Ruzu previously copied all 256 Maxwell dirty flags at every draw boundary and scanned
+  them again to propagate consumed flags. It also combined that mirror with a second live flag
+  owner in the Vulkan texture-cache adapter. All production paths now consume and mutate the one
+  live channel array, matching Eden and removing the per-draw copy/scan.
+- Corrected earlier in this slice: index, vertex, transform-feedback, and indirect buffer commands
+  could remain in the submitted command buffer while the draw was recorded in its successor.
+  Vulkan validation reported missing vertex and index bindings immediately before the deterministic
+  device loss.
 
 ### Missing items
 
@@ -18699,9 +18724,32 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 
-- N/A: no serialized structure changes. The focused state-tracker regression verifies that
-  command-buffer invalidation marks the aggregate and complete per-slot vertex-buffer dirty range;
-  indexed geometry binding itself remains unconditional as in Eden.
+- N/A: no serialized structure changes. Focused regressions verify that draw and clear views mutate
+  the channel-owned array, snapshot views remain isolated, the render-target adapter has one owner,
+  and command-buffer invalidation marks the complete per-slot vertex-buffer dirty range.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` and `renderer_vulkan/vk_texture_cache.{h,cpp}` (`DownloadMemory`)
+
+### Intentional differences
+
+- Rust reconstructs a temporary slice from the persistently mapped staging pointer after
+  `Scheduler::Finish`; Eden carries the equivalent `StagingBufferRef::mapped_span` directly.
+  Ownership remains with the staging pool in both implementations.
+
+### Unintentional differences (to fix)
+
+- Resolved: Ruzu previously allocated a new `Vec<u8>` and copied the complete mapped download
+  buffer before calling `SwizzleImage`. Eden passes the mapped staging span directly after
+  `runtime.Finish()`. Ruzu now preserves that order and avoids the extra allocation and full-image
+  host copy.
+
+### Missing items
+
+- None in the reviewed synchronous Vulkan download-to-swizzle handoff.
+
+### Binary layout verification
+
+- N/A: the staging bytes are consumed in place and are not a serialized host payload.
 
 ## 2026-08-30 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` (`RunGarbageCollector`)
 
@@ -18735,23 +18783,58 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the non-aggressive pass exhausts its quota and the aggressive pass must continue after crossing
   the critical threshold.
 
-## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}` (temporary memory diagnostics)
+## 2026-08-30 — video-core runtime hot paths vs the corresponding Eden paths (diagnostic cleanup)
 
 ### Intentional differences
 
-- Ruzu temporarily emits texture-cache residency plus GC/deferred-retirement timing telemetry every
-  60 frames when `RUZU_TRACE_BUFFER_CACHE` is set. This investigation-only diagnostic has no Eden
-  counterpart and remains disabled during normal execution; it will be removed after the LM3 VRAM
-  churn is fixed.
+- None in the restored runtime paths; ordinary `log::trace!` calls that already correspond to the
+  project's logging policy remain outside this investigation-only telemetry.
 
 ### Unintentional differences (to fix)
 
-- None introduced by the disabled-by-default diagnostic.
+- Corrected: investigation-only memory, descriptor, allocation, GMMU, render-target, and
+  garbage-collector probes remained in production hot paths. Even while disabled, their live
+  environment lookups accounted for about 9.6% of sampled GPU-thread CPU cycles. The probes and
+  behavior-changing diagnostic bypasses are now removed rather than merely cached.
 
 ### Missing items
 
-- Remove the temporary telemetry after the active performance investigation is complete.
+- None in the reviewed diagnostic cleanup.
 
 ### Binary layout verification
 
 - N/A: logging only; no Vulkan or guest-visible structure layout changes.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` and `vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` and `vk_rasterizer.{h,cpp}` (channel memory ownership / `PrepareDraw`)
+
+### Intentional differences
+
+- Ruzu retains an owning `Arc<Mutex<MemoryManager>>` in the rasterizer because channel ownership is
+  shared in Rust. A copyable `MemoryManagerHandle` is the non-owning counterpart of Eden's stored
+  `Tegra::MemoryManager*`; it is cleared or rebound with the current channel before its owner can be
+  released.
+- `GpuTickGuard` stores a non-owning callback pointer for the draw scope while the rasterizer keeps
+  the callback `Arc` alive. This reproduces Eden's `SCOPE_EXIT { gpu.TickWork(); }` without an
+  atomic `Arc` clone on every draw.
+
+### Unintentional differences (to fix)
+
+- Corrected: `GraphicsPipeline::Configure`, render-target readers, compute configuration, and the
+  Vulkan buffer-cache adapter previously reacquired `Arc<Mutex<MemoryManager>>` for individual
+  four/eight-byte address and descriptor reads. Eden calls its already-bound pointer directly.
+  These GPU-thread paths now share the stable channel handle and retain one lock only for mutable
+  `FlushCaching`.
+- Corrected: releasing a non-current Vulkan channel unconditionally cleared the rasterizer's active
+  owning memory reference while the buffer cache retained a separate stale owner. The current
+  channel memory pointer and buffer-cache adapter are now rebound after `EraseChannel`, matching
+  `ChannelSetupCaches::EraseChannel` ownership.
+
+### Missing items
+
+- None in the reviewed Vulkan channel-memory and draw-scope callback access paths.
+
+### Binary layout verification
+
+- N/A: these are host ownership adapters. Focused regressions keep the owning non-reentrant mutex
+  locked while graphics-pipeline and buffer-cache reads use the stable pointer, and verify that the
+  tick scope-exit does not increase the callback `Arc` strong count.

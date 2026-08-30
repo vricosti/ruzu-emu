@@ -83,6 +83,51 @@ fn swizzle_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
     let block_depth_mask = 1u32.wrapping_shl(block_depth).wrapping_sub(1);
     let x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
 
+    // Upstream indexes its two spans directly and performs a fixed-size
+    // `memcpy` in the inner loop. Validate the complete buffers once so the
+    // Rust port can preserve that loop shape without per-pixel slice checks.
+    let linear_size = (width as usize)
+        .checked_mul(BYTES_PER_PIXEL as usize)
+        .and_then(|size| size.checked_mul(height as usize))
+        .and_then(|size| size.checked_mul(depth as usize))
+        .expect("linear swizzle size overflow");
+    // The spans supplied by upstream callers may omit untouched GOB padding.
+    // Validate through the last byte actually addressed by the loop rather
+    // than requiring `slice_size * depth_blocks` bytes. The deposited X/Y
+    // coordinates and block offsets are monotonic over this zero-origin
+    // traversal, so the final texel carries the maximum tiled offset.
+    let tiled_size = if width == 0 || height == 0 || depth == 0 {
+        0
+    } else {
+        let z = depth - 1;
+        let offset_z = (z >> block_depth)
+            .wrapping_mul(slice_size)
+            .wrapping_add((z & block_depth_mask).wrapping_shl(GOB_SIZE_SHIFT + block_height));
+        let y = height - 1;
+        let block_y = y >> GOB_SIZE_Y_SHIFT;
+        let offset_y = (block_y >> block_height)
+            .wrapping_mul(block_size)
+            .wrapping_add((block_y & block_height_mask).wrapping_shl(GOB_SIZE_SHIFT));
+        let x = (width - 1).wrapping_mul(BYTES_PER_PIXEL);
+        let offset_x = (x >> GOB_SIZE_X_SHIFT).wrapping_shl(x_shift);
+        let swizzled_offset = offset_z
+            .wrapping_add(offset_y)
+            .wrapping_add(offset_x)
+            .wrapping_add(pdep::<SWIZZLE_X_BITS>(x) | pdep::<SWIZZLE_Y_BITS>(y));
+        (swizzled_offset as usize)
+            .checked_add(BYTES_PER_PIXEL as usize)
+            .expect("tiled swizzle size overflow")
+    };
+    let (output_size, input_size) = if TO_LINEAR {
+        (tiled_size, linear_size)
+    } else {
+        (linear_size, tiled_size)
+    };
+    assert!(output.len() >= output_size, "swizzle output is too small");
+    assert!(input.len() >= input_size, "swizzle input is too small");
+    let output_ptr = output.as_mut_ptr();
+    let input_ptr = input.as_ptr();
+
     for slice in 0..depth {
         let z = slice.wrapping_add(origin_z);
         let offset_z = (z >> block_depth)
@@ -113,27 +158,20 @@ fn swizzle_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
                     .wrapping_add(column.wrapping_mul(BYTES_PER_PIXEL))
                     as usize;
 
-                let bpp = BYTES_PER_PIXEL as usize;
-                if TO_LINEAR {
-                    if let (Some(dst_end), Some(src_end)) = (
-                        swizzled_offset.checked_add(bpp),
-                        unswizzled_offset.checked_add(bpp),
-                    ) {
-                        if dst_end <= output.len() && src_end <= input.len() {
-                            output[swizzled_offset..dst_end]
-                                .copy_from_slice(&input[unswizzled_offset..src_end]);
-                        }
-                    }
+                let (dst_offset, src_offset) = if TO_LINEAR {
+                    (swizzled_offset, unswizzled_offset)
                 } else {
-                    if let (Some(dst_end), Some(src_end)) = (
-                        unswizzled_offset.checked_add(bpp),
-                        swizzled_offset.checked_add(bpp),
-                    ) {
-                        if dst_end <= output.len() && src_end <= input.len() {
-                            output[unswizzled_offset..dst_end]
-                                .copy_from_slice(&input[swizzled_offset..src_end]);
-                        }
-                    }
+                    (unswizzled_offset, swizzled_offset)
+                };
+                // SAFETY: the complete linear and tiled spans were validated
+                // before the loops. Their storage is disjoint because Rust's
+                // public API receives `&mut [u8]` and `&[u8]` separately.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        input_ptr.add(src_offset),
+                        output_ptr.add(dst_offset),
+                        BYTES_PER_PIXEL as usize,
+                    );
                 }
 
                 incrpdep::<SWIZZLE_X_BITS, BYTES_PER_PIXEL>(&mut swizzled_x);

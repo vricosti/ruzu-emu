@@ -449,14 +449,11 @@ impl StateTracker {
         self.stencil_reset = true;
     }
 
-    /// Applies Eden's command-buffer invalidation mask to a draw-scoped dirty
-    /// flag mirror.
+    /// Applies Eden's command-buffer invalidation mask to a snapshot fixture.
     ///
-    /// Upstream mutates the bound Maxwell dirty flags directly. The Rust draw
-    /// path temporarily mirrors those flags to avoid aliasing the register
-    /// view while a pipeline is configured. If configuration flushes the
-    /// scheduler, the new command buffer still needs the same dynamic-state
-    /// invalidation applied to that mirror before the draw is recorded.
+    /// Production paths use `invalidate_command_buffer_state`, which mutates
+    /// the bound Maxwell flags directly. This helper only keeps reduced test
+    /// views behaviorally equivalent when they have no live channel owner.
     pub fn apply_command_buffer_invalidation(&self, flags: &mut DirtyFlags) {
         for (flag, &invalidate) in flags.iter_mut().zip(&self.invalidation_flags) {
             if invalidate {

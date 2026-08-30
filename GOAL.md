@@ -28,4 +28,3 @@ Bring Ruzu's Vulkan execution of *Luigi's Mansion 3* to the same performance and
 - Vulkan memory remains within the device budget without pathological texture eviction/recreation cycles.
 - Every retained implementation change has focused coverage where practical and a corresponding `DIFF.md` audit entry.
 - Relevant focused tests, `cargo test -p video_core`, formatting checks, and the release build pass.
-

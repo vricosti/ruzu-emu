@@ -96,6 +96,30 @@ fn configure_windows_native_decorations() -> bool {
     true
 }
 
+/// Prefer GTK's Cairo renderer on Windows unless the caller selected another
+/// GSK renderer explicitly.
+///
+/// The Win32 GL renderer creates a `GdkWin32GL` child for each popup surface.
+/// Its transparent CSS shadow margins are presented as opaque black pixels,
+/// which puts a rectangular black frame around menus, dropdowns, and popovers.
+/// Cairo composites those margins correctly. The emulated game keeps using its
+/// separate native Vulkan child window, so this only changes GTK's UI renderer.
+#[cfg(target_os = "windows")]
+fn windows_gsk_renderer_default(current: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    current.is_none().then_some("cairo")
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_gsk_renderer() -> bool {
+    let current = std::env::var_os("GSK_RENDERER");
+    let Some(value) = windows_gsk_renderer_default(current.as_deref()) else {
+        return false;
+    };
+
+    std::env::set_var("GSK_RENDERER", value);
+    true
+}
+
 /// Apply the selected interface locale to the live launcher, matching
 /// upstream's `GMainWindow::OnLanguageChanged` retranslation step.
 pub(crate) fn retranslate_application() {
@@ -137,6 +161,9 @@ fn main() -> glib::ExitCode {
     #[cfg(target_os = "windows")]
     let enabled_native_windows_decorations = configure_windows_native_decorations();
 
+    #[cfg(target_os = "windows")]
+    let enabled_windows_cairo_renderer = configure_windows_gsk_renderer();
+
     #[cfg(target_os = "linux")]
     let _xlib_threading = crate::render_window_x11::initialize_xlib_threads();
 
@@ -148,6 +175,11 @@ fn main() -> glib::ExitCode {
     #[cfg(target_os = "windows")]
     if enabled_native_windows_decorations {
         log::info!("Using native Win32 window decorations (GTK_CSD=0)");
+    }
+
+    #[cfg(target_os = "windows")]
+    if enabled_windows_cairo_renderer {
+        log::info!("Using the GTK Cairo renderer for correctly composited Win32 popups");
     }
 
     #[cfg(target_os = "linux")]
@@ -273,6 +305,19 @@ mod windows_tests {
         );
         assert_eq!(
             windows_gtk_csd_default(Some(std::ffi::OsStr::new("0"))),
+            None
+        );
+    }
+
+    #[test]
+    fn cairo_is_the_windows_gsk_renderer_default() {
+        assert_eq!(windows_gsk_renderer_default(None), Some("cairo"));
+        assert_eq!(
+            windows_gsk_renderer_default(Some(std::ffi::OsStr::new("gl"))),
+            None
+        );
+        assert_eq!(
+            windows_gsk_renderer_default(Some(std::ffi::OsStr::new("cairo"))),
             None
         );
     }

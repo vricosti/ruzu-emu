@@ -4792,8 +4792,16 @@ fn install_menu_css() {
             return;
         };
         let provider = gtk::CssProvider::new();
-        provider.load_from_data(
-            "popover.menu check {\
+        let windows_popover_css = if cfg!(target_os = "windows") {
+            "popover.background > contents {\
+                 box-shadow: none;\
+             }"
+        } else {
+            ""
+        };
+        provider.load_from_data(&format!(
+            "{windows_popover_css}\
+             popover.menu check {{\
                  min-width: 14px;\
                  min-height: 14px;\
                  border: 1px solid alpha(currentColor, 0.55);\
@@ -4802,16 +4810,16 @@ fn install_menu_css() {
                  background-image: none;\
                  box-shadow: none;\
                  transform: none;\
-             }\
-             popover.menu check:checked {\
+             }}\
+             popover.menu check:checked {{\
                  border-color: @theme_selected_bg_color;\
                  background-color: @theme_selected_bg_color;\
                  color: @theme_selected_fg_color;\
-             }\
-             popover.menu check:disabled {\
+             }}\
+             popover.menu check:disabled {{\
                  opacity: 0.5;\
-             }",
-        );
+             }}"
+        ));
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,

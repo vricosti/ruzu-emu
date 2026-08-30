@@ -7,6 +7,7 @@ pub const DECODE_MULTI_STREAM_OBJECT_MAGIC: u32 = 0xDEAD_BEEF;
 const OPUS_RESET_STATE: c_int = 4028;
 const OPUS_GET_FINAL_RANGE_REQUEST: c_int = 4031;
 const OPUS_MULTI_STREAM_DECODE_OBJECT_SIZE: u32 = 0x20;
+const OPUS_STREAM_COUNT_MAX: u32 = 255;
 
 // Linkage against libopus is declared by `src/audio_core/build.rs`, which probes
 // pkg-config so the linker also learns where the library lives.
@@ -41,14 +42,10 @@ pub struct OpusMultiStreamDecodeObject {
 }
 
 impl OpusMultiStreamDecodeObject {
-    fn is_valid_channel_count(channel_count: u32) -> bool {
-        matches!(channel_count, 1 | 2)
-    }
-
     fn is_valid_stream_counts(total_stream_count: u32, stereo_stream_count: u32) -> bool {
         total_stream_count > 0
+            && total_stream_count <= OPUS_STREAM_COUNT_MAX
             && stereo_stream_count <= total_stream_count
-            && Self::is_valid_channel_count(total_stream_count)
     }
 
     pub fn get_work_buffer_size(total_stream_count: u32, stereo_stream_count: u32) -> u32 {
@@ -216,6 +213,20 @@ impl OpusMultiStreamDecodeObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_upstream_multistream_count_range() {
+        assert!(OpusMultiStreamDecodeObject::get_work_buffer_size(6, 0) > 0);
+        assert_eq!(OpusMultiStreamDecodeObject::get_work_buffer_size(0, 0), 0);
+        assert_eq!(OpusMultiStreamDecodeObject::get_work_buffer_size(6, 7), 0);
+        assert_eq!(OpusMultiStreamDecodeObject::get_work_buffer_size(256, 0), 0);
+
+        let mut object = OpusMultiStreamDecodeObject::initialize(0x1000, 0x1000, None);
+        assert_eq!(
+            object.initialize_decoder(48_000, 6, 6, 0, &[0, 1, 2, 3, 4, 5]),
+            OPUS_OK
+        );
+    }
 
     #[test]
     fn decodes_non_silent_pcm_with_libopus() {

@@ -22,7 +22,7 @@ use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::{CullFace, VertexAttribSize, VertexAttribType};
 use crate::gpu::RenderTargetFormat;
 use crate::gpu_logging::{get_instance, is_active};
-use crate::memory_manager::MemoryManager;
+use crate::memory_manager::MemoryManagerHandle;
 use crate::shader_cache::NUM_PROGRAMS;
 use crate::shader_notify::ShaderNotifyHandle;
 use crate::surface::{
@@ -154,7 +154,7 @@ type GpuReader<'a> = dyn Fn(u64, &mut [u8]) + 'a;
 type GpuUnsafeReader<'a> = dyn Fn(u64, &mut [u8]) -> bool + 'a;
 
 enum GraphicsGpuMemory {
-    Memory(Arc<parking_lot::Mutex<MemoryManager>>),
+    Memory(MemoryManagerHandle),
     LegacyReaders {
         read: *const GpuReader<'static>,
         read_unsafe: *const GpuUnsafeReader<'static>,
@@ -166,16 +166,21 @@ unsafe impl Send for GraphicsGpuMemory {}
 impl GraphicsGpuMemory {
     fn read(&self, addr: u64, output: &mut [u8]) {
         match self {
-            Self::Memory(memory) => {
-                memory.lock().read_block(addr, output);
-            }
+            // SAFETY: the rasterizer retains the channel's owning
+            // `Arc<Mutex<MemoryManager>>` for the complete configure call and
+            // serializes this GPU-thread access, matching upstream's stored
+            // `Tegra::MemoryManager*`.
+            Self::Memory(memory) => unsafe {
+                memory.as_ref().read_block(addr, output);
+            },
             Self::LegacyReaders { read, .. } => unsafe { (&**read)(addr, output) },
         }
     }
 
     fn read_unsafe(&self, addr: u64, output: &mut [u8]) -> bool {
         match self {
-            Self::Memory(memory) => memory.lock().read_block_unsafe(addr, output),
+            // SAFETY: same channel-owner invariant as `read`.
+            Self::Memory(memory) => unsafe { memory.as_ref().read_block_unsafe(addr, output) },
             Self::LegacyReaders { read_unsafe, .. } => unsafe { (&**read_unsafe)(addr, output) },
         }
     }
@@ -772,7 +777,7 @@ impl GraphicsPipeline {
         &self,
         draw: &mut Maxwell3DDrawView<'_>,
         dirty_flags: &mut [bool; 256],
-        gpu_memory: Arc<parking_lot::Mutex<MemoryManager>>,
+        gpu_memory: MemoryManagerHandle,
         push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
         fallback_sampler: vk::Sampler,
     ) {
@@ -1288,9 +1293,11 @@ impl GraphicsPipeline {
         let update_rescaling = scheduler.update_rescaling(is_rescaling);
         let pipeline = Arc::clone(&self.pipeline);
         let bind_pipeline = scheduler.update_graphics_pipeline(Some(self));
-        let bind_descriptor_buffer = self.descriptor_set_layout != vk::DescriptorSetLayout::null()
+        if self.descriptor_set_layout != vk::DescriptorSetLayout::null()
             && self.uses_descriptor_buffer
-            && scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
+        {
+            scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
+        }
 
         if bind_pipeline
             && is_active()
@@ -1330,10 +1337,18 @@ impl GraphicsPipeline {
             .map(DescriptorAllocator::reference);
         let uses_push_descriptor = self.uses_push_descriptor;
         let uses_descriptor_buffer = self.uses_descriptor_buffer;
-        let descriptor_buffer_binding = bind_descriptor_buffer.then(|| {
-            let info = descriptor_buffer_ring.binding_info(descriptor_buffer_chunk);
-            (info.address, info.usage)
-        });
+        // Eden can cache this binding because its scheduler state and command-buffer
+        // lifetime are the same object graph. Ruzu records commands for a worker-owned
+        // command buffer; validation showed that the cached state can otherwise outlive
+        // the command buffer it describes (VUID-08065). Bind immediately before setting
+        // the offset so the recorded command stream is self-contained.
+        let descriptor_buffer_binding = (self.descriptor_set_layout
+            != vk::DescriptorSetLayout::null()
+            && uses_descriptor_buffer)
+            .then(|| {
+                let info = descriptor_buffer_ring.binding_info(descriptor_buffer_chunk);
+                (info.address, info.usage)
+            });
         let uses_render_area = self.uses_render_area;
         let rescaling_data = prepared.rescaling_data;
         let render_area_data = prepared.render_area_data;
@@ -2188,6 +2203,22 @@ mod tests {
     use crate::engines::maxwell_3d::PrimitiveTopology;
     use ash::vk::Handle;
     use std::mem::ManuallyDrop;
+
+    #[test]
+    fn graphics_gpu_memory_uses_upstream_non_owning_pointer() {
+        let memory = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new(0),
+        ));
+        let guard = memory.lock();
+        let access = GraphicsGpuMemory::Memory(MemoryManagerHandle::from_ref(&guard));
+        let mut output = [0u8; 4];
+
+        // Keep the Rust ownership mutex locked deliberately. Upstream reads
+        // through the already-bound `Tegra::MemoryManager*`; this must not try
+        // to acquire the same non-reentrant mutex for every descriptor word.
+        assert!(access.read_unsafe(0x1000, &mut output));
+        assert_eq!(output, [0; 4]);
+    }
 
     #[test]
     fn graphics_descriptor_work_lists_keep_upstream_inline_capacity() {

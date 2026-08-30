@@ -558,21 +558,6 @@ pub fn push_image_descriptors(
                     handle
                 })
                 .unwrap_or(fallback_sampler);
-            if std::env::var_os("RUZU_TRACE_TEXTURE_DESCRIPTORS").is_some()
-                && (!view_id.is_valid()
-                    || view_id == NULL_IMAGE_VIEW_ID
-                    || image_view.is_none()
-                    || vk_image_view == vk::ImageView::null()
-                    || format == crate::surface::PixelFormat::Invalid)
-            {
-                eprintln!(
-                    "[TEXTURE_DESCRIPTOR] view={view_id:?} present={} handle={:?} format={format:?} sampler={:?} type={:?}",
-                    image_view.is_some(),
-                    vk_image_view,
-                    sampler,
-                    desc.texture_type,
-                );
-            }
             descriptor_queue.add_sampled_image(vk_image_view, sampler);
             is_rescaled |= texture_cache.base.is_rescaling_image_view(view_id);
             *view_cursor += 1;

@@ -8,8 +8,9 @@
 
 use super::ns_types::*;
 use crate::core::SystemRef;
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
 
@@ -312,7 +313,7 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (2517, false, "CreateApplicationInstance"),
     (2518, false, "UpdateQualificationForDebug"),
     (2519, false, "IsQualificationTransitionSupported"),
-    (2520, false, "IsQualificationTransitionSupportedByProcessId"),
+    (2520, true, "IsQualificationTransitionSupportedByProcessId"),
     (2521, false, "GetRightsUserChangedEvent"),
     (2522, false, "IsRomRedirectionAvailable"),
     (2800, false, "GetApplicationIdOfPreomia"),
@@ -347,13 +348,34 @@ impl IApplicationManagerInterface {
     pub fn new(system: SystemRef) -> Self {
         let functions = IAPPLICATION_MANAGER_INTERFACE_COMMANDS
             .iter()
-            .map(|&(command_id, _, name)| (command_id, None, name))
+            .map(|&(command_id, _, name)| {
+                let handler = match command_id {
+                    2520 => {
+                        Some(Self::is_qualification_transition_supported_by_process_id_handler as _)
+                    }
+                    _ => None,
+                };
+                (command_id, handler, name)
+            })
             .collect::<Vec<_>>();
         Self {
             system,
             handlers: build_handler_map(&functions),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn is_qualification_transition_supported_by_process_id_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let process_id = rp.pop_u64();
+        let is_supported = is_qualification_transition_supported_by_process_id(process_id);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(is_supported);
     }
 }
 
@@ -403,6 +425,14 @@ pub fn check_application_launch_version(_application_id: u64) {
     log::warn!("(STUBBED) IApplicationManagerInterface::CheckApplicationLaunchVersion called");
 }
 
+/// Stub: upstream reports qualification transitions as supported for every process.
+pub fn is_qualification_transition_supported_by_process_id(process_id: u64) -> bool {
+    log::warn!(
+        "(STUBBED) IApplicationManagerInterface::IsQualificationTransitionSupportedByProcessId called, process_id={process_id}"
+    );
+    true
+}
+
 /// Stub: GetApplicationView fills stub data upstream.
 pub fn get_application_view(application_ids: &[u64], out_views: &mut [ApplicationView]) {
     let size = core::cmp::min(application_ids.len(), out_views.len());
@@ -417,5 +447,21 @@ pub fn get_application_view(application_ids: &[u64], out_views: &mut [Applicatio
         view.unk = 0x70000;
         view.flags = 0x401f17;
         out_views[i] = view;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualification_transition_command_matches_upstream_registration_and_result() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        assert!(service
+            .handlers()
+            .get(&2520)
+            .and_then(|info| info.handler_callback)
+            .is_some());
+        assert!(is_qualification_transition_supported_by_process_id(0x51));
     }
 }

@@ -10,6 +10,7 @@ use crate::hle::service::am::am_types::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::file_sys::fs_save_data_types::{SaveDataAttribute, SaveDataSpaceId, SaveDataType};
 use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::get_update_title_id;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -332,6 +333,31 @@ impl IApplicationFunctions {
         copy_display_version(version.as_deref())
     }
 
+    /// Port of `IApplicationFunctions::EnsureSaveData`.
+    fn ensure_save_data(&self, user_id: u128) -> Result<u64, ResultCode> {
+        let program_id = self.applet.lock().unwrap().program_id;
+        let uuid = common::uuid::UUID::from_bytes(user_id.to_le_bytes());
+        log::info!("EnsureSaveData called, uid={}", uuid.formatted_string());
+
+        let attribute = SaveDataAttribute::make_default(
+            program_id,
+            SaveDataType::Account,
+            [user_id as u64, (user_id >> 64) as u64],
+            0,
+        );
+
+        let file_system_controller = self.system.get().get_filesystem_controller();
+        let save_data = file_system_controller
+            .lock()
+            .unwrap()
+            .open_save_data_controller()
+            .create_save_data(SaveDataSpaceId::User, &attribute);
+
+        save_data
+            .map(|_| 0)
+            .ok_or_else(|| ResultCode::new(crate::file_sys::errors::RESULT_TARGET_NOT_FOUND.raw()))
+    }
+
     /// Port of IApplicationFunctions::PrepareForJit
     pub fn prepare_for_jit(&self) {
         log::debug!("PrepareForJit called");
@@ -452,12 +478,23 @@ impl IApplicationFunctions {
     }
 
     /// EnsureSaveData (cmd 20): ensures save data exists for the given user.
-    /// Upstream creates save data via filesystem controller, returns Out<u64> = 0.
-    fn ensure_save_data_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) EnsureSaveData called");
+    fn ensure_save_data_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        let user_id = rp.pop_raw::<u128>();
+
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(0); // size = 0
+        match service.ensure_save_data(user_id) {
+            Ok(size) => {
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(size);
+            }
+            Err(result) => {
+                rb.push_result(result);
+                rb.push_u64(0);
+            }
+        }
     }
 
     /// GetDesiredLanguage (cmd 21): returns the desired language code.
@@ -744,6 +781,26 @@ mod tests {
         assert_eq!(create.name, "CreateCacheStorage");
         assert!(max.handler_callback.is_some());
         assert_eq!(max.name, "GetSaveDataSizeMax");
+    }
+
+    #[test]
+    fn ensure_save_data_propagates_filesystem_creation_failure() {
+        let system = crate::core::System::new();
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        applet.lock().unwrap().program_id = 0x0100_DCA0_064A_6000;
+        let service = IApplicationFunctions::new(system_ref, applet);
+
+        // A fresh System has no VFS-backed SaveDataFactory. Eden propagates
+        // CreateSaveData's ResultTargetNotFound instead of reporting success.
+        let result = service
+            .ensure_save_data(u128::from_le_bytes(*b"Eden Default UID"))
+            .unwrap_err();
+
+        assert_eq!(
+            result.get_inner_value(),
+            crate::file_sys::errors::RESULT_TARGET_NOT_FOUND.raw()
+        );
     }
 
     #[test]

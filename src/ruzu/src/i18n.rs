@@ -212,7 +212,7 @@ fn operating_system_locale() -> Option<String> {
 
 #[cfg(not(target_os = "windows"))]
 fn operating_system_locale() -> Option<String> {
-    glib::language_names()
+    gtk::glib::language_names()
         .into_iter()
         .map(|locale| locale.to_string())
         .find(|locale| !locale.is_empty() && locale != "C")

@@ -15,9 +15,7 @@ use common::hash::BuildUnorderedDenseHasher;
 use smallvec::SmallVec;
 
 use crate::control::channel_state::ChannelState;
-use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::fermi_2d::{Filter as BlitFilter, Operation as BlitOperation};
-use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::dma;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::gpu_logging::{get_instance, is_active};
@@ -79,43 +77,26 @@ fn assert_fail_soft(condition: bool, message: &str) {
     }
 }
 
-/// Rust adapter for the draw-scoped dirty copy used by the Vulkan command
-/// path. Upstream reads and writes the one live `maxwell3d->dirty.flags`
-/// array. Keep the draw copy and that live owner synchronized so mutations
-/// made by `DeleteImage`/`InvalidateScale` are visible to the next iteration
-/// of `RescaleRenderTargets` in the same call.
+/// Adapter over the dirty flags owned by the bound Maxwell3D channel.
+///
+/// Production Vulkan draws pass the live array directly, matching upstream's
+/// single `maxwell3d->dirty.flags` owner. Snapshot-only tests can still pass
+/// their owned array through the same interface.
 struct VulkanRenderTargetDirtyFlags<'a> {
-    draw_flags: &'a mut [bool; 256],
-    maxwell3d: Option<NonNull<Maxwell3D>>,
+    flags: &'a mut [bool; 256],
 }
 
 impl RenderTargetDirtyFlagAccess for VulkanRenderTargetDirtyFlags<'_> {
     fn render_target_dirty_flag(&self, flag: u8) -> bool {
-        self.draw_flags[flag as usize]
-            || self.maxwell3d.is_some_and(|maxwell3d| {
-                // SAFETY: the Vulkan renderer serializes the draw and texture
-                // cache on the GPU thread; this is the same stable non-owning
-                // engine pointer stored by upstream `ChannelSetupCaches`.
-                unsafe { maxwell3d.as_ref().dirty_flag(flag) }
-            })
+        self.flags[flag as usize]
     }
 
     fn clear_render_target_dirty_flag(&mut self, flag: u8) {
-        self.draw_flags[flag as usize] = false;
-        if let Some(mut maxwell3d) = self.maxwell3d {
-            // SAFETY: see `render_target_dirty_flag`; mutation is serialized
-            // for the duration of the render-target update.
-            unsafe { maxwell3d.as_mut().clear_dirty_flag(flag) };
-        }
+        self.flags[flag as usize] = false;
     }
 
     fn set_render_target_dirty_flag(&mut self, flag: u8) {
-        self.draw_flags[flag as usize] = true;
-        if let Some(mut maxwell3d) = self.maxwell3d {
-            // SAFETY: see `render_target_dirty_flag`; mutation is serialized
-            // for the duration of the render-target update.
-            unsafe { maxwell3d.as_mut().set_dirty_flag(flag) };
-        }
+        self.flags[flag as usize] = true;
     }
 }
 
@@ -3354,16 +3335,6 @@ impl TextureCacheRuntime {
         let memory_usage = self
             .can_report_memory_usage()
             .then(|| self.get_device_memory_usage());
-        if std::env::var_os("RUZU_TRACE_VULKAN_IMAGE_ALLOC").is_some()
-            && memory_usage.is_some_and(|usage| usage >= 4 * 1024 * 1024 * 1024)
-        {
-            log::warn!(
-                "Vulkan image allocation while memory pressure is high: usage={} info={:?} create_info={:?}",
-                memory_usage.unwrap_or_default(),
-                info,
-                image_info,
-            );
-        }
         self.memory_allocator()
             .create_image(&image_info)
             .map_err(|err| {
@@ -4490,29 +4461,10 @@ impl TextureCache {
             return;
         }
 
-        let trace_zero_memory = std::env::var_os("RUZU_TRACE_ZERO_GPU_MEMORY").is_some()
-            && (size == 0x50 || size == 0x1000);
-
         let mut images = SmallVec::<[ImageId; 16]>::new();
         self.base
             .for_each_image_in_region(cpu_addr, size, |image_id, image| {
-                if trace_zero_memory {
-                    eprintln!(
-                        "[TEXTURE_DOWNLOAD_CANDIDATE] requested=0x{cpu_addr:X}+0x{size:X} image_id={image_id:?} gpu=0x{:X} cpu=0x{:X} end=0x{:X} flags={:?} safe={} info={:?}",
-                        image.gpu_addr,
-                        image.cpu_addr,
-                        image.cpu_addr_end,
-                        image.flags,
-                        image.is_safe_download(),
-                        image.info,
-                    );
-                }
                 if !image.is_safe_download() {
-                    return false;
-                }
-                if std::env::var_os("RUZU_SKIP_BAD_OVERLAP_DOWNLOAD").is_some()
-                    && image.flags.contains(ImageFlagBits::BAD_OVERLAP)
-                {
                     return false;
                 }
                 image.flags.remove(ImageFlagBits::GPU_MODIFIED);
@@ -4526,29 +4478,20 @@ impl TextureCache {
 
         for image_id in images {
             let Some((image_base, staging)) = self.download_image_to_host_staging(image_id) else {
-                if trace_zero_memory {
-                    eprintln!("[TEXTURE_DOWNLOAD_FAILED] image_id={image_id:?}");
-                }
                 continue;
             };
-            if trace_zero_memory {
-                eprintln!(
-                    "[TEXTURE_DOWNLOAD_STAGING] image_id={image_id:?} len=0x{:X} head={:02X?}",
-                    staging.len(),
-                    &staging[..staging.len().min(32)],
-                );
-            }
+            let staging_size = image_base.unswizzled_size_bytes as usize;
+            // SAFETY: the staging pool owns this persistently mapped buffer;
+            // `finish` completed the image-to-buffer copy before the helper
+            // returned, and no new staging allocation occurs while this slice
+            // is consumed. This is the Rust equivalent of Eden passing
+            // `map.mapped_span` directly to `SwizzleImage`.
+            let staging_bytes = unsafe {
+                std::slice::from_raw_parts(staging.mapped.cast_const(), staging_size)
+            };
             let copies = full_download_copies(&image_base.info);
-            let wrote = self
-                .base
-                .write_downloaded_image(&image_base, &copies, &staging);
-            if trace_zero_memory {
-                eprintln!(
-                    "[TEXTURE_DOWNLOAD_WRITTEN] image_id={image_id:?} wrote={wrote} gpu=0x{:X} cpu=0x{:X}",
-                    image_base.gpu_addr,
-                    image_base.cpu_addr,
-                );
-            }
+            self.base
+                .write_downloaded_image(&image_base, &copies, staging_bytes);
         }
     }
 
@@ -4867,7 +4810,7 @@ impl TextureCache {
     fn download_image_to_host_staging(
         &mut self,
         image_id: ImageId,
-    ) -> Option<(ImageBase, Vec<u8>)> {
+    ) -> Option<(ImageBase, StagingBufferRef)> {
         if !self.base_image_exists(image_id) {
             return None;
         }
@@ -4905,9 +4848,7 @@ impl TextureCache {
         }
 
         self.base.runtime_mut().finish();
-        let staging_bytes =
-            unsafe { std::slice::from_raw_parts(staging.mapped, staging_size) }.to_vec();
-        Some((image_base, staging_bytes))
+        Some((image_base, staging))
     }
 
     /// Port of the Vulkan texture-cache owner `EraseChannel` edge.
@@ -4927,13 +4868,7 @@ impl TextureCache {
         let Some(gpu_memory) = self.base.channel_gpu_memory.as_ref().cloned() else {
             return false;
         };
-        let maxwell3d = NonNull::new(
-            self.base.current_channel_state().channel_info.maxwell3d as *mut Maxwell3D,
-        );
-        let mut dirty_access = VulkanRenderTargetDirtyFlags {
-            draw_flags: dirty_flags,
-            maxwell3d,
-        };
+        let mut dirty_access = VulkanRenderTargetDirtyFlags { flags: dirty_flags };
         self.base.update_render_targets_with_snapshot(
             render_targets,
             &mut dirty_access,
@@ -5952,23 +5887,17 @@ mod tests {
     }
 
     #[test]
-    fn render_target_dirty_adapter_keeps_draw_copy_and_live_engine_in_sync() {
-        let mut maxwell3d = Maxwell3D::new();
-        let mut draw_flags = [false; 256];
-        maxwell3d.set_dirty_flag(crate::dirty_flags::flags::COLOR_BUFFER0);
-        let mut access = VulkanRenderTargetDirtyFlags {
-            draw_flags: &mut draw_flags,
-            maxwell3d: Some(NonNull::from(&mut maxwell3d)),
-        };
+    fn render_target_dirty_adapter_mutates_its_single_owner() {
+        let mut flags = [false; 256];
+        flags[crate::dirty_flags::flags::COLOR_BUFFER0 as usize] = true;
+        let mut access = VulkanRenderTargetDirtyFlags { flags: &mut flags };
 
         assert!(access.render_target_dirty_flag(crate::dirty_flags::flags::COLOR_BUFFER0));
         access.clear_render_target_dirty_flag(crate::dirty_flags::flags::COLOR_BUFFER0);
-        assert!(!access.draw_flags[crate::dirty_flags::flags::COLOR_BUFFER0 as usize]);
-        assert!(!maxwell3d.dirty_flag(crate::dirty_flags::flags::COLOR_BUFFER0));
+        assert!(!access.flags[crate::dirty_flags::flags::COLOR_BUFFER0 as usize]);
 
         access.set_render_target_dirty_flag(crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL);
-        assert!(access.draw_flags[crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL as usize]);
-        assert!(maxwell3d.dirty_flag(crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL));
+        assert!(access.flags[crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL as usize]);
     }
 
     #[test]

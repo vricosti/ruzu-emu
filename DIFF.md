@@ -13988,9 +13988,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Rust slice checks skip a copy whose source or destination range is outside the supplied span.
-  Eden indexes the span and calls `memcpy`, which is undefined for the same invalid range; valid
-  texture spans use the same offsets and copy sizes.
+- Rust validates the linear span and the last byte actually visited in the tiled span once before
+  the full-image loop. Eden relies on its internal callers and indexes those spans unchecked; some
+  compressed-image callers intentionally omit untouched tail padding from the containing GOB.
+  After that one safe-API guard, Rust uses the same fixed-size non-overlapping copy in the per-pixel
+  loop; subrectangle copies retain their existing range guards because their linear-span layout is
+  not a full image.
 - Eden's `ASSERT_MSG` for an unsupported bytes-per-pixel value is represented by `panic!`.
 - The eight C++ `BPP_CASE` macro expansions are written as explicit Rust match arms.
 
@@ -14001,6 +14004,13 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   using the upstream-owned `common` alignment/division helpers.
 - None after preserving the wrapping behavior of every upstream `u32` offset, size, and coordinate
   calculation in debug builds.
+- Corrected: the full-image loop previously performed `checked_add`, two bounds comparisons, slice
+  construction, and conditional skipping for every pixel. Eden performs a direct fixed-size
+  `memcpy`; Ruzu now validates the spans once and gives the hot loop the same shape.
+- Corrected during full-suite validation: the first global guard required the complete theoretical
+  GOB allocation (`slice_size * depth_blocks`) even when Eden's caller supplied only the bytes
+  touched by a compressed image. The guard now derives the monotonic final visited tiled offset;
+  the BC tile-count regression again passes without restoring per-pixel checks.
 
 ### Missing items
 
@@ -14009,8 +14019,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: the module copies byte spans and owns no serialized structure. Focused tests exercise every
-  BPP dispatch arm, GOB offsets, overflow behavior, and Eden's non-power-of-two subrectangle
-  overlap semantics.
+  BPP dispatch arm through full swizzle/unswizzle round trips, GOB offsets, overflow behavior, and
+  Eden's non-power-of-two subrectangle overlap semantics. Texture-cache coverage additionally
+  verifies a compressed image whose input omits untouched GOB tail padding.
 
 ## 2026-08-26 — `src/audio_core/src/renderer/memory/pool_mapper.rs` vs Eden `src/audio_core/renderer/memory/pool_mapper.cpp`
 
@@ -17814,7 +17825,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Intentional differences
 
 - A non-owning `MemoryManagerHandle` represents Eden's directly stored `Tegra::MemoryManager*`
-  when a Rust memory-read callback re-enters the rasterizer while the channel mutex is held.
+  while the owning `Arc<Mutex<MemoryManager>>` keeps the channel object alive. Descriptor reads and
+  memory-read callbacks use that stable handle under the texture-cache/channel serialization that
+  protects Eden's pointer; reduced tests without a bound channel retain the owned fallback path.
 
 ### Unintentional differences (to fix)
 
@@ -17822,14 +17835,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   range whenever the channel mutex was held. Eden always calls `SwizzleImage(*gpu_memory,
   image.gpu_addr, ...)`, preserving every GPU page-table segment. Ruzu now does the same in both
   unlocked and re-entrant callback paths.
+- Resolved: `VisitImageView` and ordinary `GetSamplerId` previously locked the Rust channel
+  `MemoryManager` once for every TIC/TSC descriptor read. Eden reads both tables through its stored
+  non-owning pointer while the texture cache is already serialized. Ruzu now uses the matching
+  stable handle, removing two atomic mutex operations per descriptor from every draw.
 
 ### Missing items
 
-- None in the verified `DownloadMemory` writeback path.
+- None in the verified `DownloadMemory`, `VisitImageView`, and `GetSamplerId` memory-access paths.
 
 ### Binary layout verification
 
-- N/A: the correction changes address translation and lifecycle access only.
+- N/A: the corrections change address translation and lifecycle access only. A focused regression
+  holds the owning channel mutex while `GetSamplerId` reads through the stable non-owning handle,
+  proving that the hot path neither recursively locks nor changes descriptor contents.
 
 ## 2026-08-29 — `src/core/src/hle/service/am/library_applet_storage.rs` vs Eden `src/core/hle/service/am/library_applet_storage.{h,cpp}`
 
@@ -18373,3 +18392,449 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   structure. A focused regression verifies that header `0xF0` selects coefficients 14 and 15,
   matching Eden's `(header >> 4) & 0x7` behavior. The complete `audio_core` suite passes (202
   tests).
+
+## 2026-08-30 — `src/audio_core/src/adsp/apps/opus/opus_multistream_decode_object.rs` vs `src/audio_core/adsp/apps/opus/opus_multistream_decode_object.{h,cpp}`
+
+### Intentional differences
+
+- Rust owns the opaque libopus decoder storage in an aligned `Vec<usize>` instead of placing the
+  C `OpusMSDecoder` immediately after the C++ wrapper in a caller-owned work buffer. The object
+  remains owned by the matching ADSP Opus module and uses the same libopus entry points.
+- Rust represents Eden's `self` pointer comparison with the emulated work-buffer identifier and
+  returns `OPUS_INVALID_STATE` before calling libopus with absent decoder storage.
+
+### Unintentional differences (to fix)
+
+- Fixed: `IsValidStreamCounts` previously restricted `total_stream_count` to `1` or `2`, reusing
+  the single-stream channel constraint. Eden accepts every positive stream count through 255.
+  Ruzu now uses the upstream-owned `OpusStreamCountMax = 255` condition and still rejects zero,
+  counts above 255, and stereo counts greater than the total count.
+
+### Missing items
+
+- None in the reviewed stream-count validation and libopus multistream initialization path.
+
+### Binary layout verification
+
+- N/A: the Rust object is host-side state and is not serialized as the C++ wrapper. A focused
+  regression verifies all validation boundaries and initializes a real six-stream libopus decoder.
+  The complete `audio_core` suite passes sequentially (203 tests).
+
+## 2026-08-30 — `src/core/src/file_sys/control_metadata.rs` vs Eden `src/core/file_sys/control_metadata.{h,cpp}` (`Language` / `LANGUAGE_NAMES`)
+
+### Intentional differences
+
+- Rust declares the array length as `Language::Count as usize` instead of C++
+  `size_t(Language::Count)`; both bind the table length to the owning NACP language enum.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed NACP language enum/table slice. Ruzu previously stopped at
+  `BrazilianPortuguese` and exposed only 16 names, so Eden's French priority list produced an
+  invalid index for `Polish=16`. Ruzu now owns Eden's `Polish=16`, `Thai=17`, `Count=18` values
+  and both corresponding names in the same order.
+
+### Missing items
+
+- The existing Rust file still lacks Eden's compressed 18+-entry `LanguageEntryData` handling and
+  several named late `RawNACP` fields. Those pre-existing, larger structural differences are
+  outside this focused table correction; uncompressed raw NACP bytes remain preserved by the
+  current fixed-size representation.
+
+### Binary layout verification
+
+- PASS for the reviewed enum/table slice: `Language` remains `repr(u8)`, the new discriminants
+  match Eden exactly, and the table has `Language::Count` entries. The focused regression passes.
+  The existing `RawNACP` size assertion remains `0x4000`; compressed language-entry parity is
+  still missing as noted above.
+
+## 2026-08-30 — `src/ruzu/src/migration_worker.rs` vs Eden `src/yuzu/migration_worker.{h,cpp}` (copy activation of firmware)
+
+### Intentional differences
+
+- Eden removes its entire destination user directory before copying. Ruzu retains its existing
+  selective, transactional migration model so configuration, keys, SDMC, NAND user data, saves,
+  and mods can be merged without deleting unrelated Ruzu-owned data.
+- Within that selective model, `nand/system/Contents` is now prepared as a separate exact-copy
+  tree. This preserves Eden's whole-installation invariant for firmware without broadening the
+  deletion boundary to the rest of Ruzu's NAND.
+
+### Unintentional differences (to fix)
+
+- None in the corrected firmware-copy slice. Ruzu previously seeded every copy payload with the
+  current destination. For firmware this retained obsolete destination-only NCAs and produced a
+  hybrid installation. The observed Ruzu store contained all 229 files from Eden firmware 16.0.3
+  plus 212 stale files, causing player-select program `0100000000001007` to resolve to unsupported
+  key generation 11 instead of Eden's loadable version.
+
+### Missing items
+
+- Ruzu intentionally does not expose Eden's destructive whole-tree `Move` strategy. Its `Copy`
+  and `Link` strategies remain the supported non-destructive subset documented in this file.
+
+### Binary layout verification
+
+- N/A: this changes transactional filesystem ownership only. The focused migration-worker suite
+  passes (18 tests), including regressions that remove stale firmware entries while retaining
+  destination-only NAND user content when NAND and firmware are selected together.
+
+## 2026-08-30 — `src/core/src/hle/service/ns/application_manager_interface.rs` vs Eden `src/core/hle/service/ns/application_manager_interface.{h,cpp}` (`IsQualificationTransitionSupportedByProcessId`)
+
+### Intentional differences
+
+- Rust uses an explicit IPC handler with `RequestParser`/`ResponseBuilder` instead of Eden's CMIF
+  `D<>` serializer. The command remains owned by the matching application-manager module and has
+  the same input, result, and output ordering.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed command. Ruzu previously listed command 2520 but registered no handler;
+  the player-select system applet therefore received an invalid IPC response. It now consumes the
+  `u64` process id, returns success, and writes `true`, exactly like Eden.
+
+### Missing items
+
+- The remainder of this pre-existing partial interface still has implemented Eden commands that
+  are only represented in Ruzu's command inventory. They require separate ownership/parity passes.
+
+### Binary layout verification
+
+- PASS for command 2520: request payload is one `u64`; response payload is `ResultSuccess` followed
+  by one CMIF `bool`. A focused regression verifies that the command is registered and returns the
+  upstream constant result.
+
+## 2026-08-30 — `src/core/src/hle/service/acc/acc.rs` vs Eden `src/core/hle/service/acc/acc.{h,cpp}` (`IManagerForSystemService` / `GetBaasAccountManagerForSystemService`)
+
+### Intentional differences
+
+- Rust stores the account UUID as `u128` and constructs its service object through an `Arc<dyn
+  SessionRequestHandler>` instead of Eden's `Common::UUID` and `PushIpcInterface` template. The
+  object remains owned by the matching ACC source module.
+- Eden passes `Core::System&` into `IManagerForSystemService`; the Rust object omits that field
+  because none of Eden's currently implemented methods use it.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed slice. Commands 102 on `acc:su` and `acc:u1` now parse the UUID and return
+  the system-service manager object. Its command table, UUID hash result, successful availability
+  and token-cache stubs, and zeroed extended licence-cache response match Eden.
+- `LoadSaveDataThumbnail` remains unimplemented intentionally because Eden also registers command
+  112 with a null handler; it was not the fatal player-select divergence.
+
+### Missing items
+
+- Other null ACC commands outside `IManagerForSystemService` remain separate pre-existing parity
+  work.
+
+### Binary layout verification
+
+- PASS for the reviewed IPC payloads: command 102 consumes the 16-byte UUID and returns one move
+  object; `GetAccountId` returns Eden's 64-bit UUID hash; the licence response preserves the
+  `u32` then `s64` order. Focused registration/hash tests pass.
+
+## 2026-08-30 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}` (`EnsureSaveData`)
+
+### Intentional differences
+
+- Eden returns `ResultTargetNotFound` from `SaveDataController::CreateSaveData`; Ruzu's existing
+  controller represents creation as `Option<VirtualDir>`, so the matching service method converts
+  `None` to the same FS result code.
+- Rust returns the `Out<u64>` value from the owned method to the CMIF handler instead of receiving
+  an `Out<u64>` wrapper. The successful value and response ordering remain identical.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed slice. Command 20 no longer reports unconditional stub success: it consumes
+  the 16-byte UUID, constructs a zero-initialized account `SaveDataAttribute` using the applet's
+  program ID, creates it in `SaveDataSpaceId::User`, propagates creation failure, then returns size
+  zero on success, matching Eden's ordering.
+
+### Missing items
+
+- None for `EnsureSaveData`. Other pre-existing missing handlers in this partial interface remain
+  separate parity slices.
+
+### Binary layout verification
+
+- PASS: `SaveDataAttribute::make_default` deterministically zeroes the system-save ID, primary
+  rank, index, and all 0x1C reserved bytes; the UUID's little-endian `AsU128` bit pattern is
+  preserved as two `u64` words. The response is `Result` followed by one `u64` size.
+
+## 2026-08-30 — `src/audio_core/src/device/audio_buffers.rs` vs Eden `src/audio_core/device/audio_buffers.h`
+
+### Intentional differences
+
+- Rust uses a `parking_lot::Mutex` and a lock-held `release_buffer_locked` helper instead of
+  Eden's recursive mutex and nested call to `ReleaseBuffer`. The ring ownership and mutation
+  ordering remain unchanged.
+
+### Unintentional differences (to fix)
+
+- None in the corrected release slice. Ruzu previously replaced a released `AudioBuffer` with
+  `AudioBuffer::default()`, erasing `start_timestamp` and `end_timestamp`. Eden clears only
+  `played_timestamp`, `samples`, `tag`, and `size`; Ruzu now does the same. This preserves the
+  last appended slot's `end_timestamp` for `GetNextTimestamp` and prevents freshly recycled
+  buffers from being classified as already played and queued without bound.
+
+### Missing items
+
+- None for the corrected `GetReleasedBuffers` lifecycle slice.
+
+### Binary layout verification
+
+- N/A: `AudioBuffer` is an in-memory host queue descriptor, not a raw serialized payload. A
+  focused regression verifies that both timestamps survive tag retrieval while exactly the four
+  fields cleared by Eden are reset.
+
+## 2026-08-30 — `src/core/src/hle/kernel/k_event.rs` vs Eden `src/core/hle/kernel/k_event.{h,cpp}` (`Signal` / `Clear`)
+
+### Intentional differences
+
+- Eden embeds `KReadableEvent` directly in `KEvent`; Ruzu resolves it from the process object map
+  as an `Arc<Mutex<KReadableEvent>>`. Ruzu must therefore acquire that Rust-owned wrapper mutex
+  before the scheduler lock and release it explicitly before scheduler-unlock may reschedule the
+  current fiber. The scheduler guard still covers the readable-event state transition and the
+  nested `KReadableEvent::Signal` / `Clear` call, preserving Eden's protected operation and
+  recursive-lock behavior without introducing an AB-BA lock cycle.
+- `signal_arc` and `clear_arc` remain Rust ownership adapters for callers that hold shared event
+  and process objects; Eden accesses the embedded readable end directly.
+
+### Unintentional differences (to fix)
+
+- None in the corrected slice. Previously all four Ruzu paths acquired the scheduler lock before
+  waiting for `Mutex<KReadableEvent>`, while direct readable-event callers held that mutex before
+  acquiring the scheduler lock. The observed runtime cycle left guest thread 84 holding the
+  global scheduler lock while guest thread 83 held the readable-event mutex.
+
+### Missing items
+
+- `KEvent` still represents upstream object ownership and post-destroy resource accounting through
+  process object IDs rather than the complete `KAutoObject` lifecycle; that pre-existing structural
+  gap is outside this deadlock correction.
+
+### Binary layout verification
+
+- N/A: this slice changes host-side lock lifetime only. The two existing focused round-trip tests
+  cover direct and shared `Signal` / `Clear` paths and pass.
+
+## 2026-08-30 — `src/core/src/hle/kernel/k_server_session.rs` vs Eden `src/core/hle/kernel/k_server_session.{h,cpp}` (`OnRequest` / `NotifyAvailable`)
+
+### Intentional differences
+
+- Ruzu's shared-owner `ServerManager` has a host `Condvar` fallback in addition to Eden's kernel
+  `MultiWait`. `KServerSession::notify_available` therefore also wakes that host-only condition;
+  it does not alter or re-signal kernel event state.
+
+### Unintentional differences (to fix)
+
+- None in the corrected slice. Ruzu previously called the manager wakeup event's full `signal()`
+  while `KServerSession::OnRequest` held the scheduler lock. Eden only calls
+  `KSynchronizationObject::NotifyAvailable` there; its manager wakeup `KEvent` is signaled by
+  `ServerManager::LinkToDeferredList`. The extra Ruzu signal inverted the scheduler lock with the
+  bridged `KReadableEvent` mutex and froze synchronous IPC during startup. The kernel session
+  waiter is now notified exactly once, while the Rust fallback receives only a host Condvar wake.
+
+### Missing items
+
+- The pre-existing `Arc<Mutex<KSessionRequest>>` and shared-owner server adapters remain structural
+  differences from Eden's intrusive request objects; they require a separate ownership pass.
+
+### Binary layout verification
+
+- N/A: this changes only host/kernel wakeup ownership. A focused regression verifies that a new
+  request wakes the manager's host fallback without signaling its bridged kernel readable event.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` (`ConfigureDraw`)
+
+### Intentional differences
+
+- Eden suppresses `BindDescriptorBuffersEXT` when its scheduler-side chunk cache is unchanged.
+  Ruzu records work for a worker-owned command buffer, and Vulkan validation proved that this
+  recording-side cache could survive the command buffer whose binding it described. Ruzu still
+  updates the scheduler cache, but records the binding immediately before every corresponding
+  `SetDescriptorBufferOffsetsEXT`, making each recorded command stream self-contained.
+
+### Unintentional differences (to fix)
+
+- None in the corrected descriptor-buffer binding slice. The former suppression produced
+  VUID-vkCmdSetDescriptorBufferOffsetsEXT-None-08065 during the Luigi's Mansion 3 workload.
+
+### Missing items
+
+- None in this reviewed `ConfigureDraw` descriptor-buffer slice. Other pre-existing graphics
+  pipeline parity work remains separate.
+
+### Binary layout verification
+
+- PASS for the reviewed command payload: the same descriptor chunk address, usage flags, buffer
+  index zero, layout, set zero, and allocation offset are recorded in Eden's order.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.{h,cpp}` (`Configure`)
+
+### Intentional differences
+
+- As in the graphics path, Ruzu records `BindDescriptorBuffersEXT` immediately before the offset
+  command instead of allowing the recording-side scheduler cache to omit it across a worker-owned
+  command-buffer lifetime. The scheduler chunk cache is still updated for state bookkeeping.
+
+### Unintentional differences (to fix)
+
+- None in the corrected descriptor-buffer binding slice.
+
+### Missing items
+
+- None in this reviewed `Configure` descriptor-buffer slice. Other pre-existing compute pipeline
+  parity work remains separate.
+
+### Binary layout verification
+
+- PASS for the reviewed command payload: binding address/usage and compute descriptor offset
+  arguments remain identical to Eden.
+
+## 2026-08-30 — `src/video_core/src/engines/draw_manager.rs`, `renderer_vulkan/state_tracker.rs`, `renderer_vulkan/vk_rasterizer.rs`, and `renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.{h,cpp}`, `renderer_vulkan/vk_state_tracker.{h,cpp}`, `renderer_vulkan/vk_rasterizer.{h,cpp}`, and `texture_cache/texture_cache.h` (live dirty flags / `PrepareDraw`)
+
+### Intentional differences
+
+- Eden passes its persistent `Maxwell3D*` through the renderer. Ruzu's production draw, indirect,
+  draw-texture, and clear views expose a short-lived `NonNull<[bool; 256]>` to the stable
+  channel-owned dirty array; this is the narrow unsafe ownership adapter needed for the same
+  single live flag owner. Snapshot-only unit-test views retain an owned fallback array.
+- Eden binds host geometry inside `GraphicsPipeline::Configure`, before descriptor-buffer
+  allocation. If that allocation forces `Scheduler::Finish`, Ruzu explicitly repeats
+  `BindHostGeometryBuffers` on the fresh command buffer. The live StateTracker already invalidates
+  the same Maxwell flags consumed by `UpdateDynamicStates`; only snapshot fixtures explicitly copy
+  the invalidation mask. This preserves upstream state ownership while adapting the worker-owned
+  command-buffer lifecycle.
+
+### Unintentional differences (to fix)
+
+- Corrected: Ruzu previously copied all 256 Maxwell dirty flags at every draw boundary and scanned
+  them again to propagate consumed flags. It also combined that mirror with a second live flag
+  owner in the Vulkan texture-cache adapter. All production paths now consume and mutate the one
+  live channel array, matching Eden and removing the per-draw copy/scan.
+- Corrected earlier in this slice: index, vertex, transform-feedback, and indirect buffer commands
+  could remain in the submitted command buffer while the draw was recorded in its successor.
+  Vulkan validation reported missing vertex and index bindings immediately before the deterministic
+  device loss.
+
+### Missing items
+
+- None in the reviewed `PrepareDraw` rollover path. Other pre-existing rasterizer parity work
+  remains separate.
+
+### Binary layout verification
+
+- N/A: no serialized structure changes. Focused regressions verify that draw and clear views mutate
+  the channel-owned array, snapshot views remain isolated, the render-target adapter has one owner,
+  and command-buffer invalidation marks the complete per-slot vertex-buffer dirty range.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` and `renderer_vulkan/vk_texture_cache.{h,cpp}` (`DownloadMemory`)
+
+### Intentional differences
+
+- Rust reconstructs a temporary slice from the persistently mapped staging pointer after
+  `Scheduler::Finish`; Eden carries the equivalent `StagingBufferRef::mapped_span` directly.
+  Ownership remains with the staging pool in both implementations.
+
+### Unintentional differences (to fix)
+
+- Resolved: Ruzu previously allocated a new `Vec<u8>` and copied the complete mapped download
+  buffer before calling `SwizzleImage`. Eden passes the mapped staging span directly after
+  `runtime.Finish()`. Ruzu now preserves that order and avoids the extra allocation and full-image
+  host copy.
+
+### Missing items
+
+- None in the reviewed synchronous Vulkan download-to-swizzle handoff.
+
+### Binary layout verification
+
+- N/A: the staging bytes are consumed in place and are not a serialized host payload.
+
+## 2026-08-30 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` (`RunGarbageCollector`)
+
+### Intentional differences
+
+- Rust collects at most the current 10/20/40-element iteration quota into a temporary vector before
+  mutating the slot storage; Eden's LRU callback performs the same ordered mutations in place. The
+  bounded candidate order, iteration quota, thresholds, and deletion decisions remain identical.
+
+### Unintentional differences (to fix)
+
+- None in the corrected aggressive-GC transition. Ruzu previously stopped the complete LRU scan
+  when one aggressive deletion brought memory below `critical_memory`. Eden only quarters the
+  remaining iteration quota, disables aggressive mode, and continues scanning. Ruzu now preserves
+  that ordering and continuation behavior.
+- Ruzu previously copied every eligible LRU identifier into a temporary vector before applying
+  Eden's 10/20/40-element quota. The collection is now bounded by the current quota, matching
+  Eden's early callback termination and avoiding work proportional to the complete cache each frame.
+- Ruzu previously allowed both the aggressive quartering and high-priority halving transitions to
+  run after one deletion. Eden uses `if`/`else if`; Ruzu now preserves that mutually exclusive
+  ordering.
+
+### Missing items
+
+- None in the reviewed aggressive-to-high-priority transition. Other pre-existing texture-cache
+  parity work remains separate.
+
+### Binary layout verification
+
+- N/A: no serialized layout changes. A focused regression covers a 21-image LRU sequence where
+  the non-aggressive pass exhausts its quota and the aggressive pass must continue after crossing
+  the critical threshold.
+
+## 2026-08-30 — video-core runtime hot paths vs the corresponding Eden paths (diagnostic cleanup)
+
+### Intentional differences
+
+- None in the restored runtime paths; ordinary `log::trace!` calls that already correspond to the
+  project's logging policy remain outside this investigation-only telemetry.
+
+### Unintentional differences (to fix)
+
+- Corrected: investigation-only memory, descriptor, allocation, GMMU, render-target, and
+  garbage-collector probes remained in production hot paths. Even while disabled, their live
+  environment lookups accounted for about 9.6% of sampled GPU-thread CPU cycles. The probes and
+  behavior-changing diagnostic bypasses are now removed rather than merely cached.
+
+### Missing items
+
+- None in the reviewed diagnostic cleanup.
+
+### Binary layout verification
+
+- N/A: logging only; no Vulkan or guest-visible structure layout changes.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` and `vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` and `vk_rasterizer.{h,cpp}` (channel memory ownership / `PrepareDraw`)
+
+### Intentional differences
+
+- Ruzu retains an owning `Arc<Mutex<MemoryManager>>` in the rasterizer because channel ownership is
+  shared in Rust. A copyable `MemoryManagerHandle` is the non-owning counterpart of Eden's stored
+  `Tegra::MemoryManager*`; it is cleared or rebound with the current channel before its owner can be
+  released.
+- `GpuTickGuard` stores a non-owning callback pointer for the draw scope while the rasterizer keeps
+  the callback `Arc` alive. This reproduces Eden's `SCOPE_EXIT { gpu.TickWork(); }` without an
+  atomic `Arc` clone on every draw.
+
+### Unintentional differences (to fix)
+
+- Corrected: `GraphicsPipeline::Configure`, render-target readers, compute configuration, and the
+  Vulkan buffer-cache adapter previously reacquired `Arc<Mutex<MemoryManager>>` for individual
+  four/eight-byte address and descriptor reads. Eden calls its already-bound pointer directly.
+  These GPU-thread paths now share the stable channel handle and retain one lock only for mutable
+  `FlushCaching`.
+- Corrected: releasing a non-current Vulkan channel unconditionally cleared the rasterizer's active
+  owning memory reference while the buffer cache retained a separate stale owner. The current
+  channel memory pointer and buffer-cache adapter are now rebound after `EraseChannel`, matching
+  `ChannelSetupCaches::EraseChannel` ownership.
+
+### Missing items
+
+- None in the reviewed Vulkan channel-memory and draw-scope callback access paths.
+
+### Binary layout verification
+
+- N/A: these are host ownership adapters. Focused regressions keep the owning non-reentrant mutex
+  locked while graphics-pipeline and buffer-cache reads use the stable pointer, and verify that the
+  tick scope-exit does not increase the callback `Arc` strong count.

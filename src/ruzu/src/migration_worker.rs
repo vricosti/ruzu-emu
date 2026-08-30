@@ -170,6 +170,10 @@ struct TreeSpec {
     destination: PathBuf,
     staging_parent: PathBuf,
     excluded: Vec<PathBuf>,
+    /// Keep destination-only entries when preparing a copy. Most user data is
+    /// merged, but firmware is one coherent content set and must replace an
+    /// older set instead of producing a mixed installation.
+    preserve_destination_entries: bool,
 }
 
 struct PreparedTree {
@@ -287,6 +291,7 @@ fn tree_specs(plan: &MigrationPlan) -> io::Result<Vec<TreeSpec>> {
             destination: plan.destination_config_dir.clone(),
             staging_parent: stable_parent(&plan.destination_config_dir),
             excluded: Vec::new(),
+            preserve_destination_entries: true,
         });
     }
     if plan.selection.keys {
@@ -295,6 +300,7 @@ fn tree_specs(plan: &MigrationPlan) -> io::Result<Vec<TreeSpec>> {
             destination: plan.destination_keys_dir.clone(),
             staging_parent: stable_parent(&plan.destination_keys_dir),
             excluded: Vec::new(),
+            preserve_destination_entries: true,
         });
     }
     if plan.selection.sdmc {
@@ -303,26 +309,31 @@ fn tree_specs(plan: &MigrationPlan) -> io::Result<Vec<TreeSpec>> {
             destination: plan.destination_sdmc_dir.clone(),
             staging_parent: stable_parent(&plan.destination_sdmc_dir),
             excluded: Vec::new(),
+            preserve_destination_entries: true,
         });
     }
 
     if plan.selection.nand {
-        let mut excluded = vec![PathBuf::from("user/save")];
-        if !plan.selection.firmware {
-            excluded.push(PathBuf::from("system/Contents"));
-        }
+        // Firmware is prepared as its own exact-replacement tree below. It
+        // cannot participate in the NAND merge: retaining destination-only
+        // NCAs combines firmware releases and can select an obsolete system
+        // applet nondeterministically.
+        let excluded = vec![PathBuf::from("user/save"), PathBuf::from("system/Contents")];
         specs.push(TreeSpec {
             source: plan.source_user_dir.join("nand"),
             destination: plan.destination_nand_dir.clone(),
             staging_parent: stable_parent(&plan.destination_nand_dir),
             excluded,
+            preserve_destination_entries: true,
         });
-    } else if plan.selection.firmware {
+    }
+    if plan.selection.firmware {
         specs.push(TreeSpec {
             source: plan.source_user_dir.join("nand/system/Contents"),
             destination: plan.destination_nand_dir.join("system/Contents"),
             staging_parent: stable_parent(&plan.destination_nand_dir),
             excluded: Vec::new(),
+            preserve_destination_entries: false,
         });
     }
 
@@ -333,6 +344,7 @@ fn tree_specs(plan: &MigrationPlan) -> io::Result<Vec<TreeSpec>> {
                 destination: plan.destination_nand_dir.join("user/save").join(relative),
                 staging_parent: stable_parent(&plan.destination_nand_dir),
                 excluded: Vec::new(),
+                preserve_destination_entries: true,
             });
         }
     }
@@ -344,6 +356,7 @@ fn tree_specs(plan: &MigrationPlan) -> io::Result<Vec<TreeSpec>> {
             destination: plan.destination_load_dir.join(directory),
             staging_parent: stable_parent(&plan.destination_load_dir),
             excluded: Vec::new(),
+            preserve_destination_entries: true,
         });
     }
 
@@ -541,11 +554,13 @@ fn prepare_copy_tree(spec: &TreeSpec, allow_mode_conversion: bool) -> io::Result
         Err(error) => return Err(error),
     };
 
-    // Start from the current Ruzu tree so activating the migration is a merge,
-    // not an implicit deletion of data the user may already have. A final
-    // symlink is an existing destination entry, but its target must never be
-    // traversed: activation replaces the Ruzu-owned link with the verified
-    // real directory and leaves the legacy target untouched.
+    // User-owned trees start from the current Ruzu tree so activation merges
+    // instead of implicitly deleting existing data. Firmware deliberately
+    // starts empty: a registered-content store must represent one release and
+    // retaining destination-only NCAs creates a broken hybrid installation.
+    // A final symlink is an existing destination entry, but its target must
+    // never be traversed: activation replaces the Ruzu-owned link with the
+    // verified real directory and leaves the legacy target untouched.
     if let Some(metadata) = destination_metadata.as_ref() {
         if directory_link_target(&spec.destination)?.is_some() {
             if !allow_mode_conversion {
@@ -566,7 +581,7 @@ fn prepare_copy_tree(spec: &TreeSpec, allow_mode_conversion: bool) -> io::Result
                     spec.destination.display()
                 ),
             ));
-        } else {
+        } else if spec.preserve_destination_entries {
             copy_tree_contents(&spec.destination, &payload, &[], false)?;
         }
     }
@@ -1144,6 +1159,91 @@ mod tests {
         assert!(!plan
             .destination_nand_dir
             .join("user/Contents/registered/update.nca")
+            .exists());
+    }
+
+    #[test]
+    fn firmware_copy_replaces_stale_destination_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan(
+            root.path(),
+            MigrationSelection {
+                firmware: true,
+                ..MigrationSelection::default()
+            },
+        );
+        let source = plan.source_user_dir.join("nand/system/Contents");
+        let destination = plan.destination_nand_dir.join("system/Contents");
+        fs::create_dir_all(source.join("registered")).unwrap();
+        fs::create_dir_all(destination.join("registered")).unwrap();
+        fs::write(source.join("registered/current.nca"), b"current").unwrap();
+        fs::write(destination.join("registered/stale.nca"), b"stale").unwrap();
+
+        process(&plan).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("registered/current.nca")).unwrap(),
+            b"current"
+        );
+        assert!(!destination.join("registered/stale.nca").exists());
+        assert_eq!(
+            fs::read(source.join("registered/current.nca")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn nand_and_firmware_merge_user_data_but_replace_firmware() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan(
+            root.path(),
+            MigrationSelection {
+                firmware: true,
+                nand: true,
+                ..MigrationSelection::default()
+            },
+        );
+        let source_nand = plan.source_user_dir.join("nand");
+        let destination_nand = &plan.destination_nand_dir;
+        fs::create_dir_all(source_nand.join("system/Contents/registered")).unwrap();
+        fs::create_dir_all(source_nand.join("user/Contents/registered")).unwrap();
+        fs::create_dir_all(destination_nand.join("system/Contents/registered")).unwrap();
+        fs::create_dir_all(destination_nand.join("user/Contents/registered")).unwrap();
+        fs::write(
+            source_nand.join("system/Contents/registered/current.nca"),
+            b"current",
+        )
+        .unwrap();
+        fs::write(
+            source_nand.join("user/Contents/registered/source-update.nca"),
+            b"source-update",
+        )
+        .unwrap();
+        fs::write(
+            destination_nand.join("system/Contents/registered/stale.nca"),
+            b"stale",
+        )
+        .unwrap();
+        fs::write(
+            destination_nand.join("user/Contents/registered/ruzu-update.nca"),
+            b"ruzu-update",
+        )
+        .unwrap();
+
+        let report = process(&plan).unwrap();
+
+        assert_eq!(report.trees, 2);
+        assert!(destination_nand
+            .join("system/Contents/registered/current.nca")
+            .exists());
+        assert!(!destination_nand
+            .join("system/Contents/registered/stale.nca")
+            .exists());
+        assert!(destination_nand
+            .join("user/Contents/registered/source-update.nca")
+            .exists());
+        assert!(destination_nand
+            .join("user/Contents/registered/ruzu-update.nca")
             .exists());
     }
 

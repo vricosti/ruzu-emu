@@ -23,10 +23,9 @@ pub struct KEvent {
 }
 
 impl KEvent {
-    /// Acquire the kernel scheduler lock. Matches upstream pattern where
-    /// `KEvent::Signal` / `Clear` open `KScopedSchedulerLock sl(kernel)`
-    /// at entry. Resolves through the kernel singleton; no GSC mutex
-    /// round-trip needed.
+    /// Acquire the kernel scheduler lock used by upstream `KEvent::Signal`
+    /// and `Clear`. Resolves through the kernel singleton; no GSC mutex
+    /// round-trip is needed.
     fn lock_scheduler() -> Option<KScopedSchedulerLock<'static>> {
         let scheduler_lock = super::kernel::scheduler_lock()?;
         Some(KScopedSchedulerLock::new(scheduler_lock))
@@ -59,8 +58,6 @@ impl KEvent {
     /// Signal the event.
     /// Matches upstream `KEvent::Signal`.
     pub fn signal(&mut self, process: &KProcess) -> u32 {
-        let _scheduler_guard = Self::lock_scheduler();
-
         if self.readable_event_destroyed {
             return RESULT_SUCCESS.get_inner_value();
         }
@@ -69,15 +66,26 @@ impl KEvent {
         else {
             return RESULT_SUCCESS.get_inner_value();
         };
-        let result = readable_event.lock().unwrap().signal();
+
+        // Eden embeds KReadableEvent directly in KEvent, so taking the
+        // scheduler lock at function entry cannot block on an intermediate
+        // object lock. Ruzu stores it behind a Mutex. Lock that Rust-owned
+        // wrapper first, otherwise this path (scheduler -> readable event)
+        // deadlocks with direct KReadableEvent::signal callers (readable event
+        // -> scheduler). The scheduler guard still covers the same upstream
+        // state checks and delegation to KReadableEvent::Signal.
+        let mut readable_event = readable_event.lock().unwrap();
+        let _scheduler_guard = Self::lock_scheduler();
+        let result = readable_event.signal();
+        // Do not let scheduler-unlock rescheduling suspend this fiber while it
+        // still owns the Rust wrapper mutex.
+        drop(readable_event);
         result
     }
 
     /// Clear the event.
     /// Matches upstream `KEvent::Clear`.
     pub fn clear(&mut self, process: &KProcess) -> u32 {
-        let _scheduler_guard = Self::lock_scheduler();
-
         if self.readable_event_destroyed {
             return RESULT_SUCCESS.get_inner_value();
         }
@@ -86,7 +94,11 @@ impl KEvent {
         else {
             return RESULT_SUCCESS.get_inner_value();
         };
-        let result = readable_event.lock().unwrap().clear();
+
+        let mut readable_event = readable_event.lock().unwrap();
+        let _scheduler_guard = Self::lock_scheduler();
+        let result = readable_event.clear();
+        drop(readable_event);
         result
     }
 
@@ -95,13 +107,9 @@ impl KEvent {
     /// Upstream stores the readable event inline and signals it directly. Rust stores
     /// the owner `KEvent` and readable event in per-process object maps, so this
     /// helper resolves the readable end from the owner process and signals it.
-    /// After the sync-object refactor the signal path only needs the scheduler
-    /// lock (acquired inside `signal`), not the `KProcess` Mutex.
+    /// The process mutex is used only to resolve the readable end and is
+    /// released before the scheduler-protected signal operation.
     pub fn signal_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<ProcessLock>) -> u32 {
-        // Upstream acquires KScopedSchedulerLock at KEvent::Signal entry,
-        // before touching the embedded KReadableEvent.
-        let _scheduler_guard = Self::lock_scheduler();
-
         let readable_event_id = {
             let event = event.lock().unwrap();
             if event.readable_event_destroyed {
@@ -119,15 +127,18 @@ impl KEvent {
             readable_event
         };
 
-        let result = readable_event.lock().unwrap().signal_from_host();
+        // See `signal`: resolve and lock the Rust-owned wrappers before the
+        // scheduler guard. Eden's embedded objects do not introduce these
+        // blocking mutex acquisitions.
+        let mut readable_event = readable_event.lock().unwrap();
+        let _scheduler_guard = Self::lock_scheduler();
+        let result = readable_event.signal_from_host();
+        drop(readable_event);
         result
     }
 
     /// Rust helper for clearing a shared `KEvent` through the current owner process.
     pub fn clear_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<ProcessLock>) -> u32 {
-        // Matches upstream KEvent::Clear lock ordering.
-        let _scheduler_guard = Self::lock_scheduler();
-
         let readable_event_id = {
             let event = event.lock().unwrap();
             if event.readable_event_destroyed {
@@ -141,7 +152,11 @@ impl KEvent {
         else {
             return RESULT_SUCCESS.get_inner_value();
         };
-        let result = readable_event.lock().unwrap().clear();
+
+        let mut readable_event = readable_event.lock().unwrap();
+        let _scheduler_guard = Self::lock_scheduler();
+        let result = readable_event.clear();
+        drop(readable_event);
         result
     }
 

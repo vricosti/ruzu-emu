@@ -427,6 +427,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     /// Port of upstream `TextureCache<P>::VisitImageView`.
     pub(crate) fn visit_image_view(&mut self, index: u32, compute: bool) -> ImageViewId {
+        let channel_gpu_memory_handle = self.channel_gpu_memory_handle;
         let (descriptor, is_new) = {
             let channel_state = self
                 .channel_caches
@@ -441,7 +442,16 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 log::debug!("Invalid image view index={}", index);
                 return NULL_IMAGE_VIEW_ID;
             }
-            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref() {
+            if let Some(gpu_memory) = channel_gpu_memory_handle {
+                // SAFETY: `update_channel_gpu_memory` derives this handle from
+                // the channel-owned `Arc<Mutex<MemoryManager>>`, which remains
+                // alive while the channel is bound. The texture cache is
+                // serialized by its owner exactly like upstream's stored
+                // `Tegra::MemoryManager*`.
+                table.read_with(index, |gpu_addr, out| unsafe {
+                    gpu_memory.as_ref().read_block_unsafe(gpu_addr, out)
+                })
+            } else if let Some(gpu_memory) = self.channel_gpu_memory.as_ref() {
                 table.read_with(index, |gpu_addr, out| {
                     gpu_memory.lock().read_block_unsafe(gpu_addr, out)
                 })
@@ -877,11 +887,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             &mut [u8],
         ) -> bool,
     ) {
-        let mut candidates = Vec::new();
+        let candidate_limit = *num_iterations;
+        let mut candidates = Vec::with_capacity(candidate_limit);
         self.lru_cache
             .for_each_item_below(tick_threshold, |image_id| {
                 candidates.push(image_id);
-                false
+                candidates.len() == candidate_limit
             });
 
         for image_id in candidates {
@@ -918,16 +929,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             let immediate_delete = self.slot_images[image_id].scale_tick > self.frame_tick + 5;
             self.delete_image(image_id, immediate_delete);
 
-            if self.total_used_memory < self.critical_memory {
-                if *aggressive_mode {
-                    *num_iterations >>= 2;
-                    *aggressive_mode = false;
-                    break;
-                }
-                if *high_priority_mode && self.total_used_memory < self.expected_memory {
-                    *num_iterations >>= 1;
-                    *high_priority_mode = false;
-                }
+            if *aggressive_mode && self.total_used_memory < self.critical_memory {
+                *num_iterations >>= 2;
+                *aggressive_mode = false;
+            } else if *high_priority_mode && self.total_used_memory < self.expected_memory {
+                *num_iterations >>= 1;
+                *high_priority_mode = false;
             }
         }
     }
@@ -1777,9 +1784,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         self.get_sampler_id_impl(index, compute, None)
     }
 
-    /// Rust ownership adapter for an upstream caller that already borrows the
-    /// channel `MemoryManager*`. This is still `GetSamplerId`; passing the
-    /// existing borrow prevents recursively locking Reden's mutex wrapper.
+    /// Mechanical ownership adapter for callers that already hold the same
+    /// channel memory borrow represented by upstream's `MemoryManager*`.
     pub(crate) fn get_sampler_id_with_memory(
         &mut self,
         index: u32,
@@ -1796,6 +1802,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         borrowed_gpu_memory: Option<&MemoryManager>,
     ) -> SamplerId {
         use crate::texture_cache::types::NULL_SAMPLER_ID;
+        let channel_gpu_memory_handle = self.channel_gpu_memory_handle;
         let (descriptor, is_new) = {
             let Self {
                 channel_gpu_memory,
@@ -1819,6 +1826,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             if let Some(gpu_memory) = borrowed_gpu_memory {
                 table.read_with(index, |gpu_addr, out| {
                     gpu_memory.read_block_unsafe(gpu_addr, out)
+                })
+            } else if let Some(gpu_memory) = channel_gpu_memory_handle {
+                // SAFETY: see `visit_image_view`; this is the same non-owning
+                // channel memory pointer used by upstream `GetSamplerId`.
+                table.read_with(index, |gpu_addr, out| unsafe {
+                    gpu_memory.as_ref().read_block_unsafe(gpu_addr, out)
                 })
             } else if let Some(gpu_memory) = channel_gpu_memory.as_ref() {
                 table.read_with(index, |gpu_addr, out| {
@@ -5152,7 +5165,7 @@ mod tests {
     }
 
     #[test]
-    fn get_sampler_id_accepts_existing_channel_memory_borrow_for_compute_tsc_reads() {
+    fn get_sampler_id_uses_upstream_non_owning_channel_memory_pointer() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
@@ -5193,10 +5206,8 @@ mod tests {
             .compute_sampler_table
             .synchronize(0x2000, 0));
 
-        let sampler_id = {
-            let gpu_memory = gpu_memory.lock();
-            cache.get_sampler_id_with_memory(0, true, &gpu_memory)
-        };
+        let _gpu_memory_guard = gpu_memory.lock();
+        let sampler_id = cache.get_sampler_id(0, true);
 
         assert!(sampler_id.is_valid());
         assert_ne!(sampler_id, NULL_SAMPLER_ID);
@@ -6458,6 +6469,33 @@ mod tests {
         assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
+    }
+
+    #[test]
+    fn aggressive_gc_keeps_scanning_after_crossing_critical_memory() {
+        let mut cache = test_cache();
+        let info = test_color_info(16, 16);
+        let mut costly_ids = Vec::new();
+        for index in 0..20u64 {
+            let image_id = cache.insert_image(&info, 0x4000 + index * 0x4000);
+            cache.slot_images[image_id]
+                .flags
+                .insert(ImageFlagBits::COSTLY_LOAD);
+            costly_ids.push(image_id);
+        }
+        let trailing_id = cache.insert_image(&info, 0x80000);
+        let image_size = cache.total_used_memory / 21;
+
+        cache.frame_tick = 100;
+        cache.expected_memory = 0;
+        cache.critical_memory = image_size + image_size / 2;
+        cache.run_garbage_collector();
+
+        for image_id in costly_ids {
+            assert!(!cache.slot_images.contains(image_id));
+        }
+        assert!(!cache.slot_images.contains(trailing_id));
+        assert_eq!(cache.total_used_memory, 0);
     }
 
     #[test]

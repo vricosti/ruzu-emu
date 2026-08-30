@@ -1288,9 +1288,11 @@ impl GraphicsPipeline {
         let update_rescaling = scheduler.update_rescaling(is_rescaling);
         let pipeline = Arc::clone(&self.pipeline);
         let bind_pipeline = scheduler.update_graphics_pipeline(Some(self));
-        let bind_descriptor_buffer = self.descriptor_set_layout != vk::DescriptorSetLayout::null()
+        if self.descriptor_set_layout != vk::DescriptorSetLayout::null()
             && self.uses_descriptor_buffer
-            && scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
+        {
+            scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
+        }
 
         if bind_pipeline
             && is_active()
@@ -1330,10 +1332,18 @@ impl GraphicsPipeline {
             .map(DescriptorAllocator::reference);
         let uses_push_descriptor = self.uses_push_descriptor;
         let uses_descriptor_buffer = self.uses_descriptor_buffer;
-        let descriptor_buffer_binding = bind_descriptor_buffer.then(|| {
-            let info = descriptor_buffer_ring.binding_info(descriptor_buffer_chunk);
-            (info.address, info.usage)
-        });
+        // Eden can cache this binding because its scheduler state and command-buffer
+        // lifetime are the same object graph. Ruzu records commands for a worker-owned
+        // command buffer; validation showed that the cached state can otherwise outlive
+        // the command buffer it describes (VUID-08065). Bind immediately before setting
+        // the offset so the recorded command stream is self-contained.
+        let descriptor_buffer_binding = (self.descriptor_set_layout
+            != vk::DescriptorSetLayout::null()
+            && uses_descriptor_buffer)
+            .then(|| {
+                let info = descriptor_buffer_ring.binding_info(descriptor_buffer_chunk);
+                (info.address, info.usage)
+            });
         let uses_render_area = self.uses_render_area;
         let rescaling_data = prepared.rescaling_data;
         let render_area_data = prepared.render_area_data;

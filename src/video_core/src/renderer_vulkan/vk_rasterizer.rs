@@ -1236,9 +1236,15 @@ impl RasterizerVulkan {
             // consumed by UpdateDynamicStates. Ruzu uses a draw-scoped mirror
             // during Configure to avoid aliased mutable register access. Keep
             // that mirror in step when Configure allocates/recycles resources
-            // and flushes onto a fresh command buffer.
+            // and flushes onto a fresh command buffer. Configure binds the
+            // geometry before allocating descriptor-buffer space, so such a
+            // flush also leaves those bindings in the submitted command
+            // buffer. Rebind them on the fresh command buffer before emitting
+            // the draw.
             self.state_tracker
                 .apply_command_buffer_invalidation(dirty_flags);
+            self.common_buffer_cache
+                .bind_host_geometry_buffers(draw.is_indexed());
         }
         let indirect_binding = indirect_params.map(|params| {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();

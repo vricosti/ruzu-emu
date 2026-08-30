@@ -12,7 +12,7 @@ use super::vfs::vfs_types::VirtualFile;
 
 /// Language name strings, indexed by Language enum.
 /// Corresponds to upstream `LANGUAGE_NAMES`.
-pub const LANGUAGE_NAMES: [&str; 16] = [
+pub const LANGUAGE_NAMES: [&str; Language::Count as usize] = [
     "AmericanEnglish",
     "BritishEnglish",
     "Japanese",
@@ -29,6 +29,8 @@ pub const LANGUAGE_NAMES: [&str; 16] = [
     "TraditionalChinese",
     "SimplifiedChinese",
     "BrazilianPortuguese",
+    "Polish",
+    "Thai",
 ];
 
 /// Mapping from system language index to NACP language code.
@@ -79,6 +81,9 @@ pub enum Language {
     TraditionalChinese = 13,
     SimplifiedChinese = 14,
     BrazilianPortuguese = 15,
+    Polish = 16,
+    Thai = 17,
+    Count = 18,
     Default = 255,
 }
 
@@ -313,4 +318,24 @@ impl Default for NACP {
 fn string_from_fixed_buffer(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_names_match_upstream_language_order() {
+        assert_eq!(LANGUAGE_NAMES.len(), Language::Count as usize);
+        assert_eq!(
+            LANGUAGE_NAMES[Language::AmericanEnglish as usize],
+            "AmericanEnglish"
+        );
+        assert_eq!(
+            LANGUAGE_NAMES[Language::BrazilianPortuguese as usize],
+            "BrazilianPortuguese"
+        );
+        assert_eq!(LANGUAGE_NAMES[Language::Polish as usize], "Polish");
+        assert_eq!(LANGUAGE_NAMES[Language::Thai as usize], "Thai");
+    }
 }

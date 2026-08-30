@@ -417,6 +417,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         if self.total_used_memory >= self.minimum_memory {
+            if std::env::var_os("RUZU_TRACE_BUFFER_CACHE").is_some()
+                && self.frame_tick.is_multiple_of(60)
+            {
+                let cached_bytes = self
+                    .slot_buffers
+                    .iter()
+                    .map(|(_, buffer)| buffer.size_bytes() as u64)
+                    .sum::<u64>();
+                log::info!(
+                    "[BUFFER_CACHE_MEMORY] frame={} device={:.2} MiB cached={:.2} MiB buffers={} minimum={:.2} MiB critical={:.2} MiB",
+                    self.frame_tick,
+                    self.total_used_memory as f64 / (1024.0 * 1024.0),
+                    cached_bytes as f64 / (1024.0 * 1024.0),
+                    self.slot_buffers.iter().count(),
+                    self.minimum_memory as f64 / (1024.0 * 1024.0),
+                    self.critical_memory as f64 / (1024.0 * 1024.0),
+                );
+            }
             self.run_garbage_collector();
         }
 

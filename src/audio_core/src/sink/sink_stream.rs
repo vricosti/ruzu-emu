@@ -289,6 +289,29 @@ impl SinkStream {
             yuzu_volume = 0.6 + 20.0 * yuzu_volume.log10();
         }
         let volume = self.system_volume * self.device_volume * yuzu_volume;
+        if std::env::var_os("RUZU_TRACE_HWOPUS_AUDIO").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+            let trace_index = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_index < 512 || trace_index.is_power_of_two() {
+                let mut peaks = vec![0u16; self.system_channels as usize];
+                for (sample_index, sample) in samples.iter().enumerate() {
+                    let channel = sample_index % self.system_channels as usize;
+                    peaks[channel] = peaks[channel].max(sample.unsigned_abs());
+                }
+                eprintln!(
+                    "[AUDIO_APPEND_CHANNELS] #{} stream={:?} name={} tag=0x{:X} frames={} sys_ch={} dev_ch={} peaks={:?}",
+                    trace_index,
+                    self.stream_type,
+                    self.name,
+                    queued_buffer.tag,
+                    queued_buffer.frames,
+                    self.system_channels,
+                    self.device_channels,
+                    peaks
+                );
+            }
+        }
         if self.system_channels == 6 && self.device_channels == 2 {
             // Match yuzu's 6ch->2ch sink downmix.
             const DOWN_MIX_COEFF: [f32; 4] = [1.0, 0.596, 0.354, 0.707];

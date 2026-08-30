@@ -894,6 +894,9 @@ mod tests {
 
         tracker.apply_command_buffer_invalidation(&mut flags);
 
+        assert!(flags[dirty::VERTEX_BUFFERS as usize]);
+        assert!(flags[dirty::VERTEX_BUFFER_0 as usize]);
+        assert!(flags[dirty::VERTEX_BUFFER_31 as usize]);
         assert!(flags[dirty::VERTEX_INPUT as usize]);
         assert!(flags[dirty::VIEWPORTS as usize]);
         assert!(flags[dirty::PRIMITIVE_RESTART_ENABLE as usize]);

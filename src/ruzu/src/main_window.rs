@@ -1334,7 +1334,7 @@ impl GMainWindow {
 
                 crate::gtk_compat::ask_question(
                     Some(&w.window),
-                    "ruzu",
+                    "Ruzu",
                     "Are you sure you want to close ruzu?",
                     "Cancel",
                     "Close ruzu",

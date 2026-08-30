@@ -102,8 +102,15 @@ impl<const N: usize> AudioBuffers<N> {
             }
 
             inner.released_count -= 1;
-            let tag = inner.buffers[index as usize].tag;
-            inner.buffers[index as usize] = AudioBuffer::default();
+            let buffer = &mut inner.buffers[index as usize];
+            let tag = buffer.tag;
+            // Match upstream AudioBuffers::GetReleasedBuffers: the playback
+            // range is retained because GetNextTimestamp reads the most
+            // recently appended slot even after its tag has been returned.
+            buffer.played_timestamp = 0;
+            buffer.samples = 0;
+            buffer.tag = 0;
+            buffer.size = 0;
             if tag == 0 {
                 break;
             }
@@ -294,5 +301,38 @@ mod tests {
         let mut tags = [0u64; 1];
         assert_eq!(buffers.get_released_buffers(&mut tags), 1);
         assert_eq!(tags[0], 0xAA);
+    }
+
+    #[test]
+    fn getting_released_tag_preserves_next_buffer_timestamp_like_upstream() {
+        let buffers = AudioBuffers::<4>::new(4);
+        buffers.append_buffer(AudioBuffer {
+            start_timestamp: 10,
+            end_timestamp: 1034,
+            played_timestamp: 77,
+            samples: 0x1000,
+            tag: 0xAA,
+            size: 4096,
+        });
+
+        {
+            let mut inner = buffers.inner.lock();
+            inner.appended_count = 0;
+            inner.released_count = 1;
+            inner.released_index = 1;
+        }
+
+        let mut tags = [0u64; 1];
+        assert_eq!(buffers.get_released_buffers(&mut tags), 1);
+        assert_eq!(tags[0], 0xAA);
+        assert_eq!(buffers.get_next_timestamp(), 1034);
+
+        let inner = buffers.inner.lock();
+        assert_eq!(inner.buffers[0].start_timestamp, 10);
+        assert_eq!(inner.buffers[0].end_timestamp, 1034);
+        assert_eq!(inner.buffers[0].played_timestamp, 0);
+        assert_eq!(inner.buffers[0].samples, 0);
+        assert_eq!(inner.buffers[0].tag, 0);
+        assert_eq!(inner.buffers[0].size, 0);
     }
 }

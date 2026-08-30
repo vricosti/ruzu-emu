@@ -2872,13 +2872,12 @@ impl KServerSession {
         if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
             common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[28, object_id]);
         }
-        // Wake the owning ServerManager through its kernel-readable event too.
-        // Normally the session object's waiter is enough. While a request is
-        // being handled, however, ServerManager temporarily unlinks that
-        // session holder before relinking it through the deferred list. A new
-        // request in that interval has no session waiter to notify; signaling
-        // only Event's host Condvar is insufficient because MultiWait blocks
-        // on kernel synchronization objects.
+        // The session synchronization object above is the kernel wakeup used
+        // by Eden's ServerManager. Ruzu also has a host Condvar fallback, so
+        // wake that side without recursively signaling the manager's kernel
+        // KEvent while the scheduler lock is held. ServerManager signals its
+        // kernel wakeup event itself when it links deferred holders, matching
+        // Eden's `LinkToDeferredList` ownership.
         if let Some(weak) = self.manager_wakeup.as_ref() {
             if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
                 common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[29, object_id]);
@@ -2888,7 +2887,7 @@ impl KServerSession {
                     common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[30, object_id]);
                     common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[31, object_id]);
                 }
-                event.signal();
+                event.signal_host_only();
                 if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
                     common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[32, object_id]);
                 }
@@ -3365,7 +3364,7 @@ mod tests {
     }
 
     #[test]
-    fn request_signals_server_manager_kernel_wakeup_event() {
+    fn request_wakes_server_manager_host_fallback_without_resignaling_kernel_event() {
         let mut process = KProcess::new();
         process.process_id = 7;
 
@@ -3393,7 +3392,7 @@ mod tests {
         server.on_request(Arc::new(Mutex::new(KSessionRequest::new())));
 
         assert!(wakeup.is_signaled());
-        assert!(readable.lock().unwrap().is_signaled());
+        assert!(!readable.lock().unwrap().is_signaled());
     }
 
     // `link_waiter_uses_parent_session_object_id` removed: the handle-indirect

@@ -831,12 +831,9 @@ mod tests {
 
     #[test]
     fn adpcm_predictor_ignores_header_bit_seven_like_upstream() {
-        let coefficients = [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 1234, -5678,
-        ];
+        let coefficients = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 1234, -5678];
 
-        let (coeff0, coeff1, valid) =
-            safe_adpcm_coeff_pair(&coefficients, 0xF0, 0, 0, 0, 0, 0);
+        let (coeff0, coeff1, valid) = safe_adpcm_coeff_pair(&coefficients, 0xF0, 0, 0, 0, 0, 0);
 
         assert!(valid);
         assert_eq!((coeff0, coeff1), (1234, -5678));

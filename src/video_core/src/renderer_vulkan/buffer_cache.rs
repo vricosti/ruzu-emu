@@ -105,7 +105,12 @@ impl Buffer {
                 size_bytes,
                 common_buffer_usage_flags(runtime.vulkan_device()),
             )
-            .expect("Vulkan buffer allocation failed");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Vulkan buffer allocation failed: cpu_addr={cpu_addr:#x}, size={size_bytes:#x} ({:.2} MiB), error={error:?}",
+                    size_bytes as f64 / (1024.0 * 1024.0),
+                )
+            });
         let buffer = allocation.handle();
         let device_address = runtime.buffer_device_address(buffer);
         if runtime.vulkan_device().has_debugging_tool_attached() {

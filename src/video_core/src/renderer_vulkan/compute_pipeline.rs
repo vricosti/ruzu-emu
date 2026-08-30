@@ -541,8 +541,9 @@ impl ComputePipeline {
             descriptor_buffer_offset = allocation.offset;
             descriptor_buffer_chunk = allocation.chunk;
         }
-        let bind_descriptor_buffer = self.uses_descriptor_buffer
-            && scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
+        if self.uses_descriptor_buffer {
+            scheduler.update_descriptor_buffer_chunk(descriptor_buffer_chunk);
+        }
         let device = self.device_owner;
         let pipeline = Arc::clone(&self.pipeline);
         let pipeline_layout = self.pipeline_layout;
@@ -554,7 +555,9 @@ impl ComputePipeline {
             .map(DescriptorAllocator::reference);
         let uses_push_descriptor = self.uses_push_descriptor;
         let uses_descriptor_buffer = self.uses_descriptor_buffer;
-        let descriptor_buffer_binding = bind_descriptor_buffer.then(|| {
+        // The worker owns the Vulkan command buffer, so do not let the recording-side
+        // chunk cache suppress the binding required by the offset command (VUID-08065).
+        let descriptor_buffer_binding = uses_descriptor_buffer.then(|| {
             let info = descriptor_buffer_ring.binding_info(descriptor_buffer_chunk);
             (info.address, info.usage)
         });

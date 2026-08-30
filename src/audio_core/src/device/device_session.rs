@@ -184,6 +184,37 @@ impl DeviceSession {
                 self.read_guest_samples(buffer.samples, sample_count)
                     .unwrap_or_else(|| vec![0i16; sample_count])
             };
+            if std::env::var("RUZU_TRACE_AUDIO_STREAM")
+                .is_ok_and(|filter| self.name.contains(&filter))
+            {
+                use std::sync::atomic::AtomicU64;
+                static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let trace_index = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace_index < 512 || trace_index.is_power_of_two() {
+                    let mut min_sample = i16::MAX;
+                    let mut max_sample = i16::MIN;
+                    let mut peak = 0u16;
+                    let mut nonzero = 0usize;
+                    for &sample in &samples {
+                        min_sample = min_sample.min(sample);
+                        max_sample = max_sample.max(sample);
+                        peak = peak.max(sample.unsigned_abs());
+                        nonzero += usize::from(sample != 0);
+                    }
+                    eprintln!(
+                        "[AUDIO_STREAM_SAMPLES] #{} name={} tag=0x{:X} frames={} samples={} min={} max={} peak={} nonzero={}",
+                        trace_index,
+                        self.name,
+                        buffer.tag,
+                        frames,
+                        samples.len(),
+                        min_sample,
+                        max_sample,
+                        peak,
+                        nonzero
+                    );
+                }
+            }
             stream.append_buffer(sink_buffer, &samples);
         }
     }

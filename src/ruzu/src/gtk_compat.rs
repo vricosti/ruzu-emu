@@ -151,11 +151,13 @@ pub fn ask_question<P: IsA<gtk::Window>>(
     accept_label: &str,
     callback: impl FnOnce(bool) + 'static,
 ) {
+    let title = message;
     let message = crate::i18n::tr(message);
     let detail = crate::i18n::tr(detail);
     let cancel_label = crate::i18n::tr(cancel_label);
     let accept_label = crate::i18n::tr(accept_label);
     let dialog = gtk::MessageDialog::builder()
+        .title(title)
         .modal(true)
         .message_type(MessageType::Question)
         .buttons(ButtonsType::None)

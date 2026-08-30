@@ -365,6 +365,18 @@ impl Interface {
         )
     }
 
+    /// Port of upstream `Module::Interface::GetBaasAccountManagerForSystemService`.
+    pub fn get_baas_account_manager_for_system_service(
+        &self,
+        uuid: u128,
+    ) -> (ResultCode, SessionRequestHandlerPtr) {
+        log::info!("Account::GetBaasAccountManagerForSystemService called, uuid=0x{uuid:032x}");
+        (
+            RESULT_SUCCESS,
+            Arc::new(IManagerForSystemService::new(uuid)),
+        )
+    }
+
     fn store_save_data_thumbnail_result(
         &self,
         uuid: u128,
@@ -454,6 +466,154 @@ fn new_ensure_token_id_cache_async_interface() -> EnsureTokenIdCacheAsyncInterfa
     let context = AsyncContextBase::new(EnsureTokenIdCacheAsyncState);
     context.mark_complete();
     context
+}
+
+/// Port of upstream `IManagerForSystemService` in `acc.cpp`.
+struct IManagerForSystemService {
+    account_id: u128,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IManagerForSystemService {
+    fn new(account_id: u128) -> Self {
+        Self {
+            account_id,
+            handlers: build_handler_map(&[
+                (
+                    0,
+                    Some(Self::check_availability_handler),
+                    "CheckAvailability",
+                ),
+                (1, Some(Self::get_account_id_handler), "GetAccountId"),
+                (2, None, "EnsureIdTokenCacheAsync"),
+                (
+                    3,
+                    Some(Self::load_id_token_cache_deprecated_handler),
+                    "LoadIdTokenCacheDeprecated",
+                ),
+                (
+                    4,
+                    Some(Self::load_id_token_cache_handler),
+                    "LoadIdTokenCache",
+                ),
+                (100, None, "SetSystemProgramIdentification"),
+                (101, None, "RefreshNotificationTokenAsync"),
+                (110, None, "GetServiceEntryRequirementCache"),
+                (111, None, "InvalidateServiceEntryRequirementCache"),
+                (112, None, "InvalidateTokenCache"),
+                (113, None, "GetServiceEntryRequirementCacheForOnlinePlay"),
+                (120, None, "GetNintendoAccountId"),
+                (
+                    121,
+                    None,
+                    "CalculateNintendoAccountAuthenticationFingerprint",
+                ),
+                (130, None, "GetNintendoAccountUserResourceCache"),
+                (131, None, "RefreshNintendoAccountUserResourceCacheAsync"),
+                (
+                    132,
+                    None,
+                    "RefreshNintendoAccountUserResourceCacheAsyncIfSecondsElapsed",
+                ),
+                (133, None, "GetNintendoAccountVerificationUrlCache"),
+                (134, None, "RefreshNintendoAccountVerificationUrlCache"),
+                (
+                    135,
+                    None,
+                    "RefreshNintendoAccountVerificationUrlCacheAsyncIfSecondsElapsed",
+                ),
+                (136, None, "GetNintendoAccountUserResourceCache"),
+                (140, None, "GetNetworkServiceLicenseCache"),
+                (141, None, "RefreshNetworkServiceLicenseCacheAsync"),
+                (
+                    142,
+                    None,
+                    "RefreshNetworkServiceLicenseCacheAsyncIfSecondsElapsed",
+                ),
+                (
+                    143,
+                    Some(Self::get_network_service_license_cache_ex_handler),
+                    "GetNetworkServiceLicenseCacheEx",
+                ),
+                (150, None, "CreateAuthorizationRequest"),
+                (160, None, "RequiresUpdateNetworkServiceAccountIdTokenCache"),
+                (161, None, "RequireReauthenticationOfNetworkServiceAccount"),
+                (170, None, "CreateDeviceHistoryRequest"),
+                (180, None, "GetRequestForNintendoAccountReauthentication"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn account_id_hash(&self) -> u64 {
+        common::uuid::UUID::from_bytes(self.account_id.to_le_bytes()).hash_value()
+    }
+
+    fn check_availability_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) IManagerForSystemService::CheckAvailability called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_account_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForSystemService) };
+        log::warn!("(STUBBED) IManagerForSystemService::GetAccountId called");
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(svc.account_id_hash());
+    }
+
+    fn load_id_token_cache_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IManagerForSystemService::LoadIdTokenCacheDeprecated called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn load_id_token_cache_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) IManagerForSystemService::LoadIdTokenCache called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_network_service_license_cache_ex_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::debug!("(STUBBED) IManagerForSystemService::GetNetworkServiceLicenseCacheEx called");
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0);
+        rb.push_i64(0);
+    }
+}
+
+impl SessionRequestHandler for IManagerForSystemService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IManagerForSystemService"
+    }
+}
+
+impl ServiceFramework for IManagerForSystemService {
+    fn get_service_name(&self) -> &str {
+        "IManagerForSystemService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 impl AsyncContextBase<EnsureTokenIdCacheAsyncState> {
@@ -1030,7 +1190,11 @@ impl AccSU {
             (99, None, "DebugActivateOpenContextRetention"),
             (100, None, "GetUserRegistrationNotifier"),
             (101, None, "GetUserStateChangeNotifier"),
-            (102, None, "GetBaasAccountManagerForSystemService"),
+            (
+                102,
+                Some(AccSU::get_baas_account_manager_for_system_service_handler),
+                "GetBaasAccountManagerForSystemService",
+            ),
             (103, None, "GetBaasUserAvailabilityChangeNotifier"),
             (104, None, "GetProfileUpdateNotifier"),
             (105, None, "CheckNetworkServiceAvailabilityAsync"),
@@ -1138,6 +1302,22 @@ impl AccSU {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(count);
+    }
+
+    fn get_baas_account_manager_for_system_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let (result, manager) = svc
+            .interface
+            .get_baas_account_manager_for_system_service(uuid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(result);
+        rb.push_ipc_interface(manager);
     }
 
     fn get_pin_code_length_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -1670,7 +1850,11 @@ impl AccU1 {
             (99, None, "DebugActivateOpenContextRetention"),
             (100, None, "GetUserRegistrationNotifier"),
             (101, None, "GetUserStateChangeNotifier"),
-            (102, None, "GetBaasAccountManagerForSystemService"),
+            (
+                102,
+                Some(AccU1::get_baas_account_manager_for_system_service_handler),
+                "GetBaasAccountManagerForSystemService",
+            ),
             (103, None, "GetBaasUserAvailabilityChangeNotifier"),
             (104, None, "GetProfileUpdateNotifier"),
             (105, None, "CheckNetworkServiceAvailabilityAsync"),
@@ -1728,6 +1912,22 @@ impl AccU1 {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(count);
+    }
+
+    fn get_baas_account_manager_for_system_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let (result, manager) = svc
+            .interface
+            .get_baas_account_manager_for_system_service(uuid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(result);
+        rb.push_ipc_interface(manager);
     }
 
     fn get_pin_code_length_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -2400,5 +2600,37 @@ mod tests {
             interface.store_save_data_thumbnail_result(1, 1, THUMBNAIL_SIZE - 1),
             RESULT_INVALID_ARRAY_LENGTH
         );
+    }
+
+    #[test]
+    fn system_service_baas_manager_matches_upstream_command_table_and_account_hash() {
+        let uuid = 0x8877_6655_4433_2211_FEDC_BA98_7654_3210u128;
+        let manager = IManagerForSystemService::new(uuid);
+
+        for command in [0, 1, 3, 4, 143] {
+            assert!(manager
+                .handlers()
+                .get(&command)
+                .and_then(|info| info.handler_callback)
+                .is_some());
+        }
+        assert_eq!(
+            manager.account_id_hash(),
+            common::uuid::UUID::from_bytes(uuid.to_le_bytes()).hash_value()
+        );
+
+        let system = crate::core::System::new();
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let module = Arc::new(Module);
+        let profile_manager = Arc::new(Mutex::new(ProfileManager::new()));
+        let acc_su = AccSU::new(module.clone(), profile_manager.clone(), system_ref);
+        let acc_u1 = AccU1::new(module, profile_manager, system_ref);
+        for service in [&acc_su as &dyn ServiceFramework, &acc_u1] {
+            assert!(service
+                .handlers()
+                .get(&102)
+                .and_then(|info| info.handler_callback)
+                .is_some());
+        }
     }
 }

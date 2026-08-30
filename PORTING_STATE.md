@@ -1353,3 +1353,76 @@
   shadowed setup removed.
 - Status: completed and re-verified; all 1,479 active `video_core` library tests pass and the
   variable/mutability warnings covered by this slice are gone.
+
+## 2026-08-30 — MK8D attract-mode investigation interrupted by guest-allocator prerequisite
+
+- Interrupted slice: reproduce and fix Mario Kart 8 Deluxe's automatic attract-mode transition,
+  which leaves only the game logo and loading spinner rendered over a black background.
+- Disproved hypothesis: the apparent `lr = r0 = 0x068A002C` context corruption is the expected
+  interior state of `nnSdk`'s AArch32 `memset`: it executes `mov lr, r0`, uses `lr` as its write
+  cursor, and returns with `pop {fp, pc}`. The saved and restored context therefore matches the
+  guest instructions and is not the prerequisite failure.
+- Disproved hypothesis: targeted CPU-map, SMMU-backing and rasterizer-cache tracing produced no
+  transition for `0x068A0000` before the first write. The page was never mapped, cached, uncached,
+  or unmapped; the GPU page-lifecycle code did not lose it.
+- Exact missing prerequisite: the guest allocator invoked from `main` offset `0x78E808` returns the
+  already-unmapped address `0x068A0000`. The allocator's prior state or the AArch32 execution that
+  calculates its result has diverged before the failing object construction. Later writes and the
+  PC-zero branch are consequences of that invalid allocation result.
+- Required next action: use a fixed diagnostic loader offset to capture the allocator object,
+  virtual target and return registers at stable guest PCs; compare the producing AArch32 function
+  and any mutated allocator metadata with the known-good Ruzu revision and Eden rdynarmic.
+- Resume condition: the allocator returns a currently mapped address at this call site, no related
+  unmapped access or null PC occurs, and MK8D renders the complete attract sequence.
+- Status: guest-allocator prerequisite investigation in progress; the attract-mode slice is paused
+  until the first divergent allocator-state or AArch32 operation is identified and fixed.
+- Prerequisite result: the allocator inputs came from MK8D parsing Ruzu's synthesized 16-byte
+  `MiiModel` fallback because `RegisteredCache` contained zero indexed entries. On Windows,
+  `RealVfsDirectory::GetFileRelative` normalized the root with backslashes and the child with
+  forward slashes, so `IsWithinRoot` rejected every valid NCA reopen after enumeration. Matching
+  Eden's single platform-default normalization restores all 229 metadata entries and the real
+  5,858,816-byte Mii model data NCA.
+- Resumed result: the focused in-root/escape regression test passes. MK8D reports both
+  `nca_present=true` and `romfs_present=true` for `0100000000000802`; a run beyond one minute has
+  no write to `0x068A0000`, no unmapped instruction, and no panic.
+- Visual verification result: the logo-and-spinner screen is the attract-demo loading transition,
+  not a terminal black render. On the cold run it was still visible at 68 seconds; the same Release
+  build subsequently rendered the full animated race at 48–60 FPS by 128 seconds while reporting
+  seven newly discovered shaders. The disk cache loaded all 649 prior pipelines and persisted the
+  new ones, so subsequent runs retain them.
+- Mii verification result: after returning to the title and injecting `L+R`, `Select a Mii` now
+  renders `Create a Mii` plus six selectable default Mii faces. The same run logged successful
+  `mii:e` startup and two successful `0100000000000802` RomFS/NCA opens.
+- Status: allocator prerequisite, visual attract mode, and populated Mii selection are completed
+  and runtime-verified. A final automated click-through was interrupted by the diagnostic process
+  closing, but the former empty-list blocker is no longer present.
+
+## 2026-08-30 — LM3 runtime verification interrupted by Windows code-cache commitment prerequisite
+
+- Interrupted slice: verify Luigi's Mansion 3 after restoring Eden's `GetNZCVFromOp` fallback
+  and the MSVC 128-bit read-return argument order.
+- Resumed evidence before interruption: the original end-of-block register-allocation panic is
+  gone; the subsequent `LDR Q` access violation was resolved to
+  `memory_read_128_trampoline` and its dedicated Windows ABI regression test passes.
+- Exact missing prerequisite: Eden's Windows `BlockOfCode` allocator reserves the full 512 MiB
+  cache per core but initially commits only the 16 MiB prelude and grows committed memory on
+  demand. Ruzu's vendored Rxbyak currently calls `VirtualAlloc(MEM_RESERVE | MEM_COMMIT)` for the
+  full cache. On a four-core boot this exhausts commit charge after two caches (`CantAlloc`),
+  leaving cores 2 and 3 without a JIT.
+- Required next action: preserve the fixed 512 MiB virtual address range while committing Windows
+  code-buffer pages progressively, including correct protection for newly committed pages; add
+  allocation/commit-boundary coverage and compare again with Eden `block_of_code.{h,cpp}`.
+- Resume condition: all four A64 JITs initialize with 512 MiB virtual caches, LM3 runs beyond the
+  prior 23-second `LDR Q` point, and no JIT allocation, panic, access violation, or unmapped-memory
+  error is logged.
+- Prerequisite result: the vendored Rxbyak buffer now reserves the complete Windows range, commits
+  an initial 16 MiB and grows commitment in 16 MiB chunks while preserving the active RW/RWX/RX
+  protection. Unix retains its existing lazy `mmap` behavior. All Rxbyak tests pass, including a
+  Windows `VirtualQuery` regression proving reserved-versus-committed transitions.
+- Resumed result: all four 512 MiB A64 JIT caches initialize. After restoring Eden's exact
+  candidate-set ownership and numeric-order quasi-LRU selection, the full `rdynarmic` suite passes
+  (1129 passed, 4 ignored). The final standalone Release build launched LM3 with exactly one
+  positional ROM argument and ran for 116 seconds with no `CantAlloc`, unavailable JIT,
+  register-allocation panic, access violation, or unmapped-memory message. The diagnostic process
+  was then closed and no Ruzu process remains.
+- Status: prerequisite completed and LM3's previously observed startup crashes runtime-verified.

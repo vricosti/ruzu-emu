@@ -145,7 +145,14 @@ impl HardwareOpus {
             );
             return RESULT_INVALID_OPUS_DSP_RETURN_CODE;
         }
-        result_code_from_libopus_error_code(backend.shared_memory.lock().dsp_return_data[0] as i32)
+        let error_code = backend.shared_memory.lock().dsp_return_data[0] as i32;
+        if std::env::var_os("RUZU_TRACE_HWOPUS_AUDIO").is_some() {
+            eprintln!(
+                "[HWOPUS_INIT] buffer=0x{:X} multi=false rate={} channels={} size=0x{:X} result={}",
+                self.buffer_id, sample_rate, channel_count, buffer_size, error_code
+            );
+        }
+        result_code_from_libopus_error_code(error_code)
     }
 
     pub fn initialize_multi_stream_decode_object(
@@ -185,7 +192,21 @@ impl HardwareOpus {
             );
             return RESULT_INVALID_OPUS_DSP_RETURN_CODE;
         }
-        result_code_from_libopus_error_code(backend.shared_memory.lock().dsp_return_data[0] as i32)
+        let error_code = backend.shared_memory.lock().dsp_return_data[0] as i32;
+        if std::env::var_os("RUZU_TRACE_HWOPUS_AUDIO").is_some() {
+            eprintln!(
+                "[HWOPUS_INIT] buffer=0x{:X} multi=true rate={} channels={} streams={}/{} mapping={:?} size=0x{:X} result={}",
+                self.buffer_id,
+                sample_rate,
+                channel_count,
+                total_stream_count,
+                stereo_stream_count,
+                mappings,
+                buffer_size,
+                error_code
+            );
+        }
+        result_code_from_libopus_error_code(error_code)
     }
 
     pub fn shutdown_decode_object(&self, buffer_size: u64) -> Result {
@@ -374,6 +395,29 @@ fn decode_interleaved_adsp(
         return RESULT_BUFFER_TOO_SMALL;
     };
     output_data[..output_size].copy_from_slice(output);
+    if std::env::var_os("RUZU_TRACE_HWOPUS_AUDIO").is_some() {
+        static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+        let trace_index = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_index < 512 || trace_index.is_power_of_two() {
+            let mut peaks = vec![0u16; channel_count as usize];
+            for (sample_index, bytes) in output.chunks_exact(2).enumerate() {
+                let channel = sample_index % channel_count as usize;
+                peaks[channel] =
+                    peaks[channel].max(i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs());
+            }
+            eprintln!(
+                "[HWOPUS_DECODE] #{} buffer=0x{:X} multi={} input={} head={:02X?} reset={} samples={} peaks={:?}",
+                trace_index,
+                buffer_id,
+                multi_stream,
+                input_data.len(),
+                &input_data[..input_data.len().min(8)],
+                reset,
+                *out_sample_count,
+                peaks
+            );
+        }
+    }
     ResultCode::SUCCESS
 }
 

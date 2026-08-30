@@ -459,10 +459,13 @@ impl NvMap {
         if inner.pins < 0 {
             log::warn!("Pin count imbalance detected!");
         } else if inner.pins == 0 {
-            drop(inner);
             // Add to the unmap queue allowing this handle's memory to be freed if needed
+            // while the handle stays locked. Upstream holds Handle::mutex while
+            // acquiring unmap_queue_lock, so PinHandle cannot observe pins == 0
+            // before the queue entry exists and leave a live handle queued for
+            // reclamation.
             let mut unmap_queue = self.unmap_queue.lock().unwrap();
-            unmap_queue.push_back(handle);
+            unmap_queue.push_back(Arc::clone(&handle));
         }
     }
 
@@ -652,5 +655,23 @@ mod tests {
         let inner = handle.lock_inner();
         assert_eq!(inner.d_address, 0);
         assert_eq!(inner.pins, 0);
+    }
+
+    #[test]
+    fn repin_removes_the_zero_pin_handle_from_the_unmap_queue() {
+        let nvmap = NvMap::new();
+        let handle = nvmap.create_handle(0x3000).unwrap();
+        {
+            let mut inner = handle.lock_inner();
+            inner.d_address = 0x20000;
+            inner.pins = 1;
+        }
+
+        nvmap.unpin_handle(handle.id);
+        assert_eq!(nvmap.unmap_queue.lock().unwrap().len(), 1);
+
+        assert_eq!(nvmap.pin_handle(handle.id, false), 0x20000);
+        assert!(nvmap.unmap_queue.lock().unwrap().is_empty());
+        assert_eq!(handle.lock_inner().pins, 1);
     }
 }

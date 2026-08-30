@@ -7,7 +7,6 @@
 
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::{Pred, Value};
 use crate::shader_info::TextureType as ShaderTextureType;
@@ -172,13 +171,6 @@ fn impl_tld(tv: &mut TranslatorVisitor, insn: u64, is_bindless: bool) {
         texture_type: texture_type as u8,
         ..Default::default()
     };
-
-    if !is_bindless {
-        tv.ir
-            .program
-            .info
-            .register_texture(cbuf_offset, texture_type, false);
-    }
 
     let sample = tv
         .ir

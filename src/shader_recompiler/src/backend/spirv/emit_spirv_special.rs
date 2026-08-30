@@ -367,7 +367,6 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         program.info.stores_frag_color[0] = true;
-        program.info.stores_frag_color[1] = true;
         Emitter::new(&mut program, 0).prologue();
         let runtime_info = crate::runtime_info::RuntimeInfo {
             dual_source_blend: true,

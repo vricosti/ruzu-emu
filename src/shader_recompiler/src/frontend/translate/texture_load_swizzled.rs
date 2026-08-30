@@ -6,7 +6,6 @@
 //! Implements TLDS (texture load swizzled, compact dual-destination encoding).
 
 use super::{field, TranslatorVisitor};
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
 use crate::shader_info::TextureType;
@@ -134,9 +133,6 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Value {
         texture_type: texture_type as u8,
         ..Default::default()
     };
-    v.ir.program
-        .info
-        .register_texture(cbuf_offset, texture_type, false);
     v.ir.image_fetch_full(handle, coords, offset, lod, multisample, info.to_u32())
 }
 

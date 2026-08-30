@@ -8,7 +8,6 @@
 
 use super::{field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::{Pred, Value};
 use crate::shader_info::TextureType as ShaderTextureType;
@@ -214,12 +213,6 @@ fn impl_tld4(
         gather_component: component as u8,
         ..Default::default()
     };
-
-    if !is_bindless {
-        v.ir.program
-            .info
-            .register_texture(cbuf_offset, texture_type, dc);
-    }
 
     let sample = if dc {
         v.ir.image_gather_dref_full(handle, coords, offset, offset2, dref, info.to_u32())

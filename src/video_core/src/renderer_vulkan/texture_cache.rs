@@ -23,6 +23,7 @@ use crate::framebuffer_config::FramebufferConfig;
 use crate::gpu_logging::{get_instance, is_active};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::{PixelFormat, SurfaceType};
+use crate::texture_cache::formatter::{image_name, image_view_name};
 use crate::texture_cache::image_base::{ImageBase, ImageFlagBits};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
@@ -204,6 +205,9 @@ impl Image {
         let aspect = image_aspect_mask(base_mut.info.format);
         let image = runtime.create_image_from_info(&base_mut.info)?;
         let image_handle = image.handle();
+        runtime
+            .vulkan_device()
+            .set_image_name(image_handle, &image_name(base_mut));
         Ok(Self {
             runtime: Some(NonNull::from(&mut *runtime)),
             base,
@@ -3526,6 +3530,7 @@ impl TextureCacheRuntime {
         let mut image_views =
             [vk::ImageView::null(); shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize];
 
+        let view_name = image_view_name(view_base, view_base.gpu_addr);
         let create = |texture_type: TextureType,
                       layer_count: Option<u32>|
          -> Result<vk::ImageView, vk::Result> {
@@ -3550,7 +3555,9 @@ impl TextureCacheRuntime {
                 view_info_builder = view_info_builder.push_next(&mut astc_decode_mode);
             }
             let view_info = view_info_builder.build();
-            unsafe { self.device.create_image_view(&view_info, None) }
+            let view = unsafe { self.device.create_image_view(&view_info, None)? };
+            self.vulkan_device().set_image_view_name(view, &view_name);
+            Ok(view)
         };
 
         let render_target = match view_base.view_type {

@@ -5,7 +5,6 @@
 
 use super::{bit, field, sfield, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::{FmzMode, FpControl, FpRounding};
 use crate::ir::value::Value;
 
@@ -49,7 +48,6 @@ fn unpack_cbuf_f64(tv: &mut TranslatorVisitor, insn: u64) -> Value {
     if offset % 2 != 0 {
         panic!("unaligned F64 constant buffer offset {}", offset * 4);
     }
-    tv.ir.program.info.register_cbuf(binding);
     let cbuf_data = tv
         .ir
         .get_cbuf_u32(Value::ImmU32(binding), Value::ImmU32(offset as u32 * 4 + 4));

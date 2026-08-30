@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::engines::draw_manager::Maxwell3DClearView;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::rasterizer_interface::RasterizerDownloadArea;
 
 #[test]
@@ -21,6 +22,7 @@ struct RasterizerCalls {
     dma_buffer_clears: Vec<(u64, u64, u32)>,
     dma_image_to_buffers: Vec<(dma::ImageCopy, dma::ImageOperand, dma::BufferOperand)>,
     dma_buffer_to_images: Vec<(dma::ImageCopy, dma::BufferOperand, dma::ImageOperand)>,
+    query_observed_memory: Vec<Vec<u8>>,
 }
 
 struct TestRasterizer {
@@ -29,6 +31,7 @@ struct TestRasterizer {
     accelerate_buffer_clear: bool,
     accelerate_image_to_buffer: bool,
     accelerate_buffer_to_image: bool,
+    query_observer: Option<(Arc<Mutex<Vec<u8>>>, std::ops::Range<usize>)>,
 }
 
 impl TestRasterizer {
@@ -39,7 +42,17 @@ impl TestRasterizer {
             accelerate_buffer_clear: false,
             accelerate_image_to_buffer: false,
             accelerate_buffer_to_image: false,
+            query_observer: None,
         }
+    }
+
+    fn observe_memory_at_query(
+        mut self,
+        memory: Arc<Mutex<Vec<u8>>>,
+        range: std::ops::Range<usize>,
+    ) -> Self {
+        self.query_observer = Some((memory, range));
+        self
     }
 }
 
@@ -110,6 +123,12 @@ impl RasterizerInterface for TestRasterizer {
         payload: u32,
         subreport: u32,
     ) {
+        if let Some((memory, range)) = &self.query_observer {
+            self.calls
+                .lock()
+                .query_observed_memory
+                .push(memory.lock()[range.clone()].to_vec());
+        }
         self.calls
             .lock()
             .queries
@@ -489,7 +508,8 @@ fn test_single_line_const_a_clear_calls_accelerated_buffer_clear_then_fallback()
     );
     let calls = calls.lock();
     assert_eq!(calls.dma_buffer_clears, vec![(0x8000, 4, 0x1122_3344)]);
-    assert_eq!(calls.invalidations, vec![(0x1_8000, 16)]);
+    assert!(calls.invalidations.is_empty());
+    assert_eq!(writes[0].mode, PendingWriteMode::Unsafe);
 }
 
 #[test]
@@ -1054,7 +1074,7 @@ fn test_single_line_remap_const_a_invalid_size_reports_and_continues_like_upstre
 }
 
 #[test]
-fn test_dma_fallback_flushes_source_and_invalidates_destination() {
+fn test_dma_fallback_flushes_source_and_defers_cached_destination_invalidation() {
     let mut eng = new_test_engine();
     let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
     let rasterizer = TestRasterizer::new(Arc::clone(&calls));
@@ -1085,9 +1105,67 @@ fn test_dma_fallback_flushes_source_and_invalidates_destination() {
     });
 
     assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].mode, PendingWriteMode::Cached);
     let calls = calls.lock();
     assert_eq!(calls.flushes, vec![(0x2_1000, 40)]);
-    assert_eq!(calls.invalidations, vec![(0x2_8000, 72)]);
+    assert!(calls.invalidations.is_empty());
+}
+
+#[test]
+fn test_runtime_dma_writes_destination_before_releasing_semaphore() {
+    let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+    let backing = Arc::new(Mutex::new(vec![0u8; 0x2000]));
+    {
+        let mut memory = backing.lock();
+        memory[..8].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        device_memory.smmu_set_physical_base_for_test(memory.as_mut_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000,
+            memory.as_mut_ptr(),
+            0x4000,
+            memory.len(),
+            1,
+            true,
+        );
+    }
+    let memory_manager = Arc::new(Mutex::new(
+        MemoryManager::new_with_geometry_and_device_memory(
+            13,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        ),
+    ));
+    {
+        let mut memory_manager = memory_manager.lock();
+        memory_manager.map(0x1000, 0x8000, 0x1000, PteKind::PITCH.raw() as u32, false);
+        memory_manager.map(0x2000, 0x9000, 0x1000, PteKind::PITCH.raw() as u32, false);
+    }
+
+    let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+    let rasterizer = TestRasterizer::new(Arc::clone(&calls))
+        .observe_memory_at_query(Arc::clone(&backing), 0x1000..0x1008);
+    let mut eng = MaxwellDMA::new(Arc::clone(&memory_manager));
+    eng.bind_rasterizer(&rasterizer);
+    memory_manager.lock().bind_rasterizer(&rasterizer);
+
+    eng.call_method(SRC_ADDR_LOW, 0x1000, true);
+    eng.call_method(DST_ADDR_LOW, 0x2000, true);
+    eng.call_method(LINE_LENGTH, 8, true);
+    eng.call_method(SEMAPHORE_ADDR_LOW, 0x3000, true);
+    eng.call_method(SEMAPHORE_PAYLOAD, 0xCAFE_BABE, true);
+    eng.call_method(
+        LAUNCH_DMA,
+        SINGLE_LINE_LAUNCH | (LAUNCH_SEMAPHORE_TYPE_RELEASE_ONE_WORD << 3),
+        true,
+    );
+
+    assert_eq!(
+        calls.lock().query_observed_memory,
+        vec![vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]]
+    );
 }
 
 #[test]

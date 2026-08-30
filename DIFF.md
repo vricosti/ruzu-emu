@@ -17786,6 +17786,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: this correction retains shader IR writes and changes no serialized or raw-memory payload.
 
+## 2026-08-27 — `src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs` vs Eden `src/shader_recompiler/backend/spirv/spirv_emit_context.cpp`
+
+### Intentional differences
+
+- Rust transports Eden's shader exceptions through typed `panic_any` payloads so the Vulkan
+  pipeline cache can reproduce `catch (const Shader::Exception&)` without treating unrelated Rust
+  panics as shader compilation failures.
+
+### Unintentional differences (to fix)
+
+- Resolved: fragment-stage stores of `PointSize`, `ClipDistance`, `Layer`, or `ViewportIndex`
+  previously used ordinary Rust assertions and could terminate the GPU thread. They now raise the
+  same typed `NotImplementedException` as Eden, allowing pipeline creation to log, cache the
+  failure, and continue.
+
+### Missing items
+
+- None in the four verified fragment-output rejection paths.
+
+### Binary layout verification
+
+- N/A: this changes host exception propagation only; no guest or serialized layout is involved.
+
 ## 2026-08-29 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h`
 
 ### Intentional differences

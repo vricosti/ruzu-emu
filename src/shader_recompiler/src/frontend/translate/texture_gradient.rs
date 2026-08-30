@@ -7,7 +7,6 @@
 //! texture-pass.
 
 use super::{field, TranslatorVisitor};
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::{Pred, Value};
 use crate::shader_info::TextureType as ShaderTextureType;
@@ -149,12 +148,6 @@ fn impl_txd(v: &mut TranslatorVisitor, insn: u64, is_bindless: bool) {
         has_lod_clamp,
         ..Default::default()
     };
-    if !is_bindless {
-        v.ir.program
-            .info
-            .register_texture(cbuf_offset, texture_type, false);
-    }
-
     let sample = v.ir.image_gradient_full(
         handle,
         coords,

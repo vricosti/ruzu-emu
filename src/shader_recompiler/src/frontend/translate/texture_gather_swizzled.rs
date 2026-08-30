@@ -7,7 +7,6 @@
 //! stores either four F32 values or two packed F16 pairs.
 
 use super::{field, TranslatorVisitor};
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
 use crate::shader_info::TextureType;
@@ -79,10 +78,6 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Value {
         is_depth: dc,
         ..Default::default()
     };
-    v.ir.program
-        .info
-        .register_texture(field(insn, 36, 13) * 4, texture_type, dc);
-
     if aoffi {
         check_alignment(reg_a, 2);
         let coords = {

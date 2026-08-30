@@ -23,6 +23,13 @@ const NUM_REGS: usize = 0x800;
 pub(crate) struct PendingWrite {
     pub gpu_va: u64,
     pub data: Vec<u8>,
+    mode: PendingWriteMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingWriteMode {
+    Unsafe,
+    Cached,
 }
 
 /// Port of upstream `Tegra::DMA` helper structs in `engines/maxwell_dma.h`.
@@ -396,23 +403,6 @@ impl MaxwellDMA {
         self.memory_manager.lock().flush_region(gpu_addr, size);
     }
 
-    /// Notify the rasterizer about a GPU-virtual destination range.
-    ///
-    /// This is the explicit Rust counterpart of the cached-write
-    /// `GpuGuestMemoryScoped` destructor used by upstream DMA fallbacks.
-    fn invalidate_gpu_region(&self, gpu_addr: u64, size: u64) {
-        if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
-            && gpu_addr < 0x4040_0000_0
-            && gpu_addr.saturating_add(size) > 0x4030_0000_0
-        {
-            let device_addr = self.memory_manager.lock().gpu_to_cpu_address(gpu_addr);
-            eprintln!(
-                "[MAXWELL_DMA_INVALIDATE_SHADER_RANGE] gpu=0x{gpu_addr:X} size=0x{size:X} device={device_addr:?}"
-            );
-        }
-        self.memory_manager.lock().invalidate_region(gpu_addr, size);
-    }
-
     fn release_semaphore(&mut self) {
         let semaphore_type = self.launch_semaphore_type();
         match semaphore_type {
@@ -557,7 +547,6 @@ impl MaxwellDMA {
         let dst_addr = self.dst_addr();
 
         self.flush_gpu_region(src_addr, src_size as u64);
-        self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         // Upstream uses GpuGuestMemoryScoped<..., *ReadCachedWrite> for the
@@ -582,6 +571,7 @@ impl MaxwellDMA {
         Some(vec![PendingWrite {
             gpu_va: dst_addr,
             data: dst,
+            mode: PendingWriteMode::Cached,
         }])
     }
 
@@ -659,7 +649,6 @@ impl MaxwellDMA {
         let dst_addr = self.dst_addr();
 
         self.flush_gpu_region(src_addr, src_size as u64);
-        self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         // Upstream uses GpuGuestMemoryScoped<..., *ReadCachedWrite> for the
@@ -684,6 +673,7 @@ impl MaxwellDMA {
         Some(vec![PendingWrite {
             gpu_va: dst_addr,
             data: dst,
+            mode: PendingWriteMode::Cached,
         }])
     }
 
@@ -749,7 +739,6 @@ impl MaxwellDMA {
         let dst_addr = self.dst_addr();
 
         self.flush_gpu_region(src_addr, src_size as u64);
-        self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         let mut intermediate = vec![0u8; mid_size];
@@ -790,6 +779,7 @@ impl MaxwellDMA {
         Some(vec![PendingWrite {
             gpu_va: dst_addr,
             data: dst,
+            mode: PendingWriteMode::Cached,
         }])
     }
 
@@ -855,33 +845,26 @@ impl MaxwellDMA {
             let _ = memory_manager.lock().read_block(addr, buf);
         };
         let writes = self.collect_launch_writes(&read_gpu);
-        if writes.is_empty() {
-            return;
-        }
-
-        let memory_manager = self.memory_manager.lock();
-        for write in writes {
-            if std::env::var_os("RUZU_TRACE_TEXTURE_ALIAS").is_some()
-                && write.gpu_va < 0x4040_0000_0
-                && write.gpu_va.saturating_add(write.data.len() as u64) > 0x4030_0000_0
-            {
-                let device_addr = memory_manager.gpu_to_cpu_address(write.gpu_va);
-                eprintln!(
-                    "[MAXWELL_DMA_WRITE_SHADER_RANGE] gpu=0x{:X} size=0x{:X} device={device_addr:?} head={:02X?}",
-                    write.gpu_va,
-                    write.data.len(),
-                    &write.data[..write.data.len().min(16)]
-                );
+        {
+            let mut memory_manager = self.memory_manager.lock();
+            for write in writes {
+                match write.mode {
+                    PendingWriteMode::Unsafe => {
+                        let _ = memory_manager.write_block_unsafe(write.gpu_va, &write.data);
+                    }
+                    PendingWriteMode::Cached => {
+                        let _ = memory_manager.write_block_cached(write.gpu_va, &write.data);
+                    }
+                }
             }
-            let _ = memory_manager.write_block_unsafe(write.gpu_va, &write.data);
         }
+        self.release_semaphore();
     }
 
     fn collect_launch_writes(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         let lines = self.line_count();
         let ll = self.line_length();
         if ll == 0 {
-            self.release_semaphore();
             return vec![];
         }
 
@@ -908,17 +891,16 @@ impl MaxwellDMA {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
                 data.truncate(ll as usize * component_size as usize);
-                self.invalidate_gpu_region(dst_addr, data.len() as u64);
                 log::debug!(
                     "MaxwellDMA: single-line remap CONST_A clear executed {} words value=0x{:X} dst=0x{:X}",
                     ll,
                     value,
                     dst_addr
                 );
-                self.release_semaphore();
                 return vec![PendingWrite {
                     gpu_va: dst_addr,
                     data,
+                    mode: PendingWriteMode::Unsafe,
                 }];
             }
 
@@ -940,17 +922,16 @@ impl MaxwellDMA {
                         read_gpu(source, &mut chunk);
                         data.extend_from_slice(&chunk);
                     }
-                    self.invalidate_gpu_region(dst_addr, ll as u64);
                     log::debug!(
                         "MaxwellDMA: single-line blocklinear->pitch copy executed {} bytes src=0x{:X} -> dst=0x{:X}",
                         ll,
                         src_addr,
                         dst_addr
                     );
-                    self.release_semaphore();
                     return vec![PendingWrite {
                         gpu_va: dst_addr,
                         data,
+                        mode: PendingWriteMode::Cached,
                     }];
                 }
 
@@ -962,8 +943,11 @@ impl MaxwellDMA {
                         let dest = convert_linear_2_blocklinear_addr(dst_addr + offset as u64);
                         let mut data = vec![0u8; 16];
                         read_gpu(source, &mut data);
-                        self.invalidate_gpu_region(dest, 16);
-                        writes.push(PendingWrite { gpu_va: dest, data });
+                        writes.push(PendingWrite {
+                            gpu_va: dest,
+                            data,
+                            mode: PendingWriteMode::Cached,
+                        });
                     }
                     log::debug!(
                         "MaxwellDMA: single-line pitch->blocklinear copy executed {} bytes src=0x{:X} -> dst=0x{:X}",
@@ -971,7 +955,6 @@ impl MaxwellDMA {
                         src_addr,
                         dst_addr
                     );
-                    self.release_semaphore();
                     return writes;
                 }
             }
@@ -984,13 +967,10 @@ impl MaxwellDMA {
                 })
                 .unwrap_or(false)
             {
-                self.release_semaphore();
                 return vec![];
             }
 
             self.flush_gpu_region(src_addr, ll as u64);
-            self.invalidate_gpu_region(dst_addr, ll as u64);
-
             let mut data = vec![0u8; ll as usize];
             read_gpu(src_addr, &mut data);
             log::debug!(
@@ -999,21 +979,19 @@ impl MaxwellDMA {
                 src_addr,
                 dst_addr
             );
-            self.release_semaphore();
             return vec![PendingWrite {
                 gpu_va: dst_addr,
                 data,
+                mode: PendingWriteMode::Cached,
             }];
         }
 
         if lines == 0 {
-            self.release_semaphore();
             return vec![];
         }
 
         if !self.launch_src_is_pitch() && !self.launch_dst_is_pitch() {
             if let Some(writes) = self.copy_blocklinear_to_blocklinear(read_gpu) {
-                self.release_semaphore();
                 return writes;
             }
             return vec![];
@@ -1021,7 +999,6 @@ impl MaxwellDMA {
 
         if !self.launch_src_is_pitch() && self.launch_dst_is_pitch() {
             if let Some(writes) = self.copy_blocklinear_to_pitch(read_gpu) {
-                self.release_semaphore();
                 return writes;
             }
             return vec![];
@@ -1029,7 +1006,6 @@ impl MaxwellDMA {
 
         if self.launch_src_is_pitch() && !self.launch_dst_is_pitch() {
             if let Some(writes) = self.copy_pitch_to_blocklinear(read_gpu) {
-                self.release_semaphore();
                 return writes;
             }
             return vec![];
@@ -1053,10 +1029,6 @@ impl MaxwellDMA {
         if src_span != 0 {
             self.flush_gpu_region(src_addr, src_span);
         }
-        if dst_span != 0 {
-            self.invalidate_gpu_region(dst_addr, dst_span);
-        }
-
         let dst_size = dst_span as usize;
         // Upstream copies only line_length bytes per row. Reading the
         // destination first preserves pitch padding between copied rows.
@@ -1083,10 +1055,10 @@ impl MaxwellDMA {
             self.dst_addr()
         );
 
-        self.release_semaphore();
         vec![PendingWrite {
             gpu_va: self.dst_addr(),
             data: dst_buf,
+            mode: PendingWriteMode::Cached,
         }]
     }
 }
@@ -1165,7 +1137,9 @@ impl MaxwellDMA {
             return vec![];
         }
         self.pending_launch = false;
-        self.collect_launch_writes(read_gpu)
+        let writes = self.collect_launch_writes(read_gpu);
+        self.release_semaphore();
+        writes
     }
 }
 

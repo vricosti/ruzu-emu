@@ -62,7 +62,6 @@ pub fn ald(tv: &mut TranslatorVisitor, insn: u64) {
                 let attr = Attribute(attr_base + element);
                 let value = tv.ir.get_attribute(attr, vertex.clone());
                 tv.set_f(dst + element, value);
-                tv.ir.program.info.loads.set(attr.0 as usize, true);
             }
         }
         return;
@@ -107,7 +106,6 @@ pub fn ast(tv: &mut TranslatorVisitor, insn: u64) {
             } else {
                 let attr = Attribute(attr_base + element);
                 tv.ir.set_attribute(attr, value, vertex.clone());
-                tv.ir.program.info.stores.set(attr.0 as usize, true);
             }
         }
         return;
@@ -170,7 +168,6 @@ pub fn ipa(tv: &mut TranslatorVisitor, insn: u64) {
     }
 
     tv.set_f(dst, result);
-    tv.ir.program.info.loads.set(attr.0 as usize, true);
 }
 
 fn num_elements(size: u32) -> u32 {
@@ -257,5 +254,29 @@ mod tests {
         let block = program.add_block();
         let mut visitor = TranslatorVisitor::new(&mut program, block);
         ipa(&mut visitor, ipa_insn(Attribute::FRONT_FACE, 0, true));
+    }
+
+    #[test]
+    fn dead_ipa_does_not_leave_stale_attribute_usage() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut sph = ProgramHeader::default();
+        sph.raw[6] = 0b10_10_10_10;
+        {
+            let mut visitor = TranslatorVisitor::new_with_sph(&mut program, block, Some(sph));
+            ipa(
+                &mut visitor,
+                ipa_insn(Attribute::generic(0, 0), 0, false),
+            );
+        }
+
+        crate::ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut program);
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+
+        assert!(!program
+            .info
+            .loads
+            .any_component(Attribute::POSITION_X.0 as usize));
+        assert!(!program.info.loads.generic_any(0));
     }
 }

@@ -7,7 +7,6 @@
 //! various addressing modes.
 
 use super::{field, sfield, TranslatorVisitor};
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::value::Value;
 
 /// LDC addressing mode.
@@ -112,8 +111,6 @@ pub fn ldc(tv: &mut TranslatorVisitor, insn: u64) {
             panic!("LDC: mode {:?} not implemented", mode);
         }
     };
-
-    tv.ir.program.info.register_cbuf(index);
 
     let result = match size {
         LdcSize::U8 => tv.ir.get_cbuf_u8(cb_index, byte_offset),

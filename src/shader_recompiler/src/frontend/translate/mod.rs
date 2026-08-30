@@ -11,7 +11,6 @@
 //! Each submodule corresponds 1:1 to an upstream `impl/*.cpp` file.
 
 // Instruction translation modules (1:1 with upstream impl/*.cpp files)
-use crate::ir::program::ShaderInfoExt;
 pub mod atomic_operations_global_memory;
 pub mod atomic_operations_shared_memory;
 pub mod attribute_memory_to_physical;
@@ -233,7 +232,6 @@ impl<'a> TranslatorVisitor<'a> {
                 let cb_offset = field(insn, 20, 14) << 2;
                 let binding = Value::ImmU32(cb_index);
                 let offset = Value::ImmU32(cb_offset);
-                self.ir.program.info.register_cbuf(cb_index);
                 self.ir.get_cbuf_u32(binding, offset)
             }
             SrcType::Immediate => {
@@ -257,7 +255,6 @@ impl<'a> TranslatorVisitor<'a> {
                 let cb_offset = field(insn, 20, 14) << 2;
                 let binding = Value::ImmU32(cb_index);
                 let offset = Value::ImmU32(cb_offset);
-                self.ir.program.info.register_cbuf(cb_index);
                 self.ir.get_cbuf_f32(binding, offset)
             }
             SrcType::Immediate => self.get_float_imm20(insn),
@@ -355,7 +352,6 @@ impl<'a> TranslatorVisitor<'a> {
         }
         let binding = Value::ImmU32(cb_index);
         let offset = Value::ImmU32(cb_offset);
-        self.ir.program.info.register_cbuf(cb_index);
         self.ir.get_cbuf_u32(binding, offset)
     }
 
@@ -371,7 +367,6 @@ impl<'a> TranslatorVisitor<'a> {
         if cb_index >= 18 {
             panic!("Out of bounds constant buffer binding {cb_index}");
         }
-        self.ir.program.info.register_cbuf(cb_index);
         let binding = Value::ImmU32(cb_index);
         let lo = self
             .ir
@@ -390,7 +385,6 @@ impl<'a> TranslatorVisitor<'a> {
         }
         let binding = Value::ImmU32(cb_index);
         let offset = Value::ImmU32(cb_offset);
-        self.ir.program.info.register_cbuf(cb_index);
         self.ir.get_cbuf_f32(binding, offset)
     }
 
@@ -403,7 +397,6 @@ impl<'a> TranslatorVisitor<'a> {
         }
         let unaligned = bit(insn, 20);
         let binding = Value::ImmU32(cb_index);
-        self.ir.program.info.register_cbuf(cb_index);
         let upper_offset = if unaligned {
             cb_offset | 4
         } else {

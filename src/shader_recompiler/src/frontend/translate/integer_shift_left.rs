@@ -5,7 +5,6 @@
 
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
-use crate::ir::program::ShaderInfoExt;
 use crate::ir::value::Value;
 
 /// Core SHL logic, matching upstream's `SHL(TranslatorVisitor& v, u64 insn, const IR::U32& unsafe_shift)`.
@@ -52,7 +51,6 @@ pub fn shl(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
             let cb_offset = field(insn, 20, 14) << 2;
             let binding = Value::ImmU32(cb_index);
             let offset = Value::ImmU32(cb_offset);
-            tv.ir.program.info.register_cbuf(cb_index);
             tv.ir.get_cbuf_u32(binding, offset)
         }
         SrcType::Immediate => {

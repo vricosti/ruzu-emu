@@ -2323,6 +2323,38 @@ impl Device {
         .expect("failed to name Vulkan buffer");
     }
 
+    /// Rust counterpart of `vk::Image::SetObjectNameEXT` used by the Vulkan
+    /// texture cache.
+    pub fn set_image_name(&self, image: vk::Image, name: &str) {
+        if !self.has_debugging_tool_attached() {
+            return;
+        }
+        set_object_name(
+            &self.instance,
+            &self.logical.device,
+            vk::ObjectType::IMAGE,
+            image.as_raw(),
+            name,
+        )
+        .expect("failed to name Vulkan image");
+    }
+
+    /// Rust counterpart of `vk::ImageView::SetObjectNameEXT` used by the
+    /// Vulkan texture cache.
+    pub fn set_image_view_name(&self, view: vk::ImageView, name: &str) {
+        if !self.has_debugging_tool_attached() {
+            return;
+        }
+        set_object_name(
+            &self.instance,
+            &self.logical.device,
+            vk::ObjectType::IMAGE_VIEW,
+            view.as_raw(),
+            name,
+        )
+        .expect("failed to name Vulkan image view");
+    }
+
     /// Returns the name of the VkDriverId reported from Vulkan.
     ///
     /// Port of `Device::GetDriverName`.

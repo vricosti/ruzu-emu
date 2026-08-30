@@ -3224,11 +3224,11 @@ impl SpirvEmitContext {
         if info.stores.get(Attribute::POINT_SIZE.0 as usize)
             || self.runtime_info.fixed_state_point_size.is_some()
         {
-            assert_ne!(
-                self.stage,
-                ShaderStage::Fragment,
-                "storing PointSize in fragment stage is unsupported upstream"
-            );
+            if self.stage == ShaderStage::Fragment {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "Storing PointSize in fragment stage",
+                ));
+            }
             self.output_point_size = self.define_output(
                 self.f32_type,
                 invocations,
@@ -3237,11 +3237,11 @@ impl SpirvEmitContext {
             );
         }
         if info.stores.clip_distances() {
-            assert_ne!(
-                self.stage,
-                ShaderStage::Fragment,
-                "storing ClipDistance in fragment stage is unsupported upstream"
-            );
+            if self.stage == ShaderStage::Fragment {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "Storing ClipDistance in fragment stage",
+                ));
+            }
             if self.profile.max_user_clip_distances > 0 {
                 let used = self.profile.max_user_clip_distances.min(8);
                 let count = self.constant_u32(used);
@@ -3261,11 +3261,11 @@ impl SpirvEmitContext {
             && (self.profile.support_viewport_index_layer_non_geometry
                 || self.stage == ShaderStage::Geometry)
         {
-            assert_ne!(
-                self.stage,
-                ShaderStage::Fragment,
-                "storing Layer in fragment stage is unsupported upstream"
-            );
+            if self.stage == ShaderStage::Fragment {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "Storing Layer in fragment stage",
+                ));
+            }
             self.layer = self.define_output(
                 self.u32_type,
                 invocations,
@@ -3277,11 +3277,11 @@ impl SpirvEmitContext {
             && (self.profile.support_viewport_index_layer_non_geometry
                 || self.stage == ShaderStage::Geometry)
         {
-            assert_ne!(
-                self.stage,
-                ShaderStage::Fragment,
-                "storing ViewportIndex in fragment stage is unsupported upstream"
-            );
+            if self.stage == ShaderStage::Fragment {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "Storing ViewportIndex in fragment stage",
+                ));
+            }
             self.viewport_index = self.define_output(
                 self.u32_type,
                 invocations,
@@ -3350,7 +3350,11 @@ impl SpirvEmitContext {
             }
             ShaderStage::Fragment => {
                 for index in 0..8 {
-                    if !info.stores_frag_color[index] && !self.profile.need_declared_frag_colors {
+                    let need_dual_source = self.runtime_info.dual_source_blend && index <= 1;
+                    if !need_dual_source
+                        && !info.stores_frag_color[index]
+                        && !self.profile.need_declared_frag_colors
+                    {
                         continue;
                     }
                     let output_type = match self.runtime_info.frag_color_types[index] {
@@ -3359,12 +3363,33 @@ impl SpirvEmitContext {
                         _ => self.f32_vec4_type,
                     };
                     let id = self.define_output(output_type, None, None, None);
-                    self.builder.decorate(
-                        id,
-                        spirv::Decoration::Location,
-                        vec![Operand::LiteralBit32(index as u32)],
-                    );
-                    self.builder.name(id, format!("frag_color{index}"));
+                    if self.runtime_info.dual_source_blend && index <= 1 {
+                        self.builder.decorate(
+                            id,
+                            spirv::Decoration::Location,
+                            vec![Operand::LiteralBit32(0)],
+                        );
+                        self.builder.decorate(
+                            id,
+                            spirv::Decoration::Index,
+                            vec![Operand::LiteralBit32(index as u32)],
+                        );
+                        self.builder.name(
+                            id,
+                            if index == 0 {
+                                "frag_color0"
+                            } else {
+                                "frag_color0_secondary"
+                            },
+                        );
+                    } else {
+                        self.builder.decorate(
+                            id,
+                            spirv::Decoration::Location,
+                            vec![Operand::LiteralBit32(index as u32)],
+                        );
+                        self.builder.name(id, format!("frag_color{index}"));
+                    }
                     self.frag_color[index] = id;
                     self.output_vars.insert(index as u32, id);
                 }
@@ -7174,6 +7199,33 @@ mod tests {
             .downcast_ref::<crate::exception::NotImplementedException>()
             .expect("typed NotImplementedException");
         assert_eq!(error.0, "SPIR-V Instruction is not implemented");
+    }
+
+    #[test]
+    fn fragment_clip_distance_store_uses_typed_shader_exception() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program
+            .info
+            .stores
+            .set(Attribute::CLIP_DISTANCE_0.0 as usize, true);
+        let mut ctx = SpirvEmitContext::new(
+            &program,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+        );
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.emit_program(&program)
+        }))
+        .expect_err("upstream rejects fragment ClipDistance stores");
+        let error = payload
+            .downcast_ref::<crate::exception::NotImplementedException>()
+            .expect("typed NotImplementedException");
+        assert_eq!(
+            error.0,
+            "Storing ClipDistance in fragment stage is not implemented"
+        );
     }
 
     #[test]

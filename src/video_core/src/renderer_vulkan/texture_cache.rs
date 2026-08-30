@@ -5194,14 +5194,13 @@ impl TextureCache {
     }
 
     pub fn tick_frame(&mut self, scheduler_tick: u64) {
+        let trace_memory = std::env::var_os("RUZU_TRACE_BUFFER_CACHE").is_some();
         if self.base.runtime().can_report_memory_usage() {
             let used_memory = self.base.runtime().get_device_memory_usage();
             self.base.update_total_used_memory_from_runtime(used_memory);
         }
         if self.base.total_used_memory > self.base.minimum_memory {
-            if std::env::var_os("RUZU_TRACE_BUFFER_CACHE").is_some()
-                && self.base.frame_tick.is_multiple_of(60)
-            {
+            if trace_memory && self.base.frame_tick.is_multiple_of(60) {
                 let mut estimated_bytes = 0u64;
                 let mut backend_images = 0usize;
                 let mut scaled_images = 0usize;
@@ -5243,6 +5242,8 @@ impl TextureCache {
                     self.base.critical_memory as f64 / (1024.0 * 1024.0),
                 );
             }
+            let gc_started = trace_memory.then(std::time::Instant::now);
+            let images_before = trace_memory.then(|| self.base.slot_images.iter().count());
             let runtime = self.base.runtime_mut() as *mut TextureCacheRuntime;
             self.base.run_garbage_collector_with_downloader(
                 |_image_id, base_image, backend, staging| {
@@ -5271,11 +5272,37 @@ impl TextureCache {
                     true
                 },
             );
+            if trace_memory && self.base.frame_tick.is_multiple_of(60) {
+                log::info!(
+                    "[TEXTURE_CACHE_GC] frame={} elapsed_ms={:.3} images_before={} images_after={} accounted_after={:.2} MiB",
+                    self.base.frame_tick,
+                    gc_started
+                        .expect("trace start must exist when tracing is enabled")
+                        .elapsed()
+                        .as_secs_f64()
+                        * 1_000.0,
+                    images_before.expect("trace image count must exist when tracing is enabled"),
+                    self.base.slot_images.iter().count(),
+                    self.base.total_used_memory as f64 / (1024.0 * 1024.0),
+                );
+            }
         }
+        let retire_started = trace_memory.then(std::time::Instant::now);
         self.base.tick_delayed_destruction_rings();
         self.base.tick_async_decode();
         self.base.tick_async_unswizzle();
         self.base.runtime_mut().tick_frame(scheduler_tick);
+        if trace_memory && self.base.frame_tick.is_multiple_of(60) {
+            log::info!(
+                "[TEXTURE_CACHE_RETIRE] frame={} elapsed_ms={:.3}",
+                self.base.frame_tick,
+                retire_started
+                    .expect("trace start must exist when tracing is enabled")
+                    .elapsed()
+                    .as_secs_f64()
+                    * 1_000.0,
+            );
+        }
         self.base.tick_frame();
         let runtime = self.base.runtime_mut() as *mut TextureCacheRuntime;
         for buffer in &mut self.base.async_buffers_death_ring {

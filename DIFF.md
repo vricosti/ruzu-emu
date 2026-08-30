@@ -18739,9 +18739,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Ruzu temporarily emits texture-cache residency telemetry every 60 frames when
-  `RUZU_TRACE_BUFFER_CACHE` is set. This investigation-only diagnostic has no Eden counterpart and
-  remains disabled during normal execution; it will be removed after the LM3 VRAM churn is fixed.
+- Ruzu temporarily emits texture-cache residency plus GC/deferred-retirement timing telemetry every
+  60 frames when `RUZU_TRACE_BUFFER_CACHE` is set. This investigation-only diagnostic has no Eden
+  counterpart and remains disabled during normal execution; it will be removed after the LM3 VRAM
+  churn is fixed.
 
 ### Unintentional differences (to fix)
 

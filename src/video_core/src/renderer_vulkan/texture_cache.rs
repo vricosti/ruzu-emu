@@ -5199,6 +5199,50 @@ impl TextureCache {
             self.base.update_total_used_memory_from_runtime(used_memory);
         }
         if self.base.total_used_memory > self.base.minimum_memory {
+            if std::env::var_os("RUZU_TRACE_BUFFER_CACHE").is_some()
+                && self.base.frame_tick.is_multiple_of(60)
+            {
+                let mut estimated_bytes = 0u64;
+                let mut backend_images = 0usize;
+                let mut scaled_images = 0usize;
+                let mut unswizzle_buffer_bytes = 0u64;
+                let mut gpu_modified_images = 0usize;
+                for (_, image) in self.base.slot_images.iter() {
+                    estimated_bytes = estimated_bytes.wrapping_add(u64::from(
+                        image.guest_size_bytes.max(image.unswizzled_size_bytes),
+                    ));
+                    if image.flags.contains(ImageFlagBits::GPU_MODIFIED) {
+                        gpu_modified_images += 1;
+                    }
+                    if let Some(backend) = image.backend.as_ref() {
+                        backend_images += 1;
+                        if backend.scaled_image.is_some() {
+                            scaled_images += 1;
+                            estimated_bytes = estimated_bytes.wrapping_add(
+                                CommonTextureCache::<TextureCacheParams>::scaled_image_memory_size(
+                                    image,
+                                ),
+                            );
+                        }
+                        unswizzle_buffer_bytes = unswizzle_buffer_bytes
+                            .wrapping_add(backend.compute_unswizzle_buffer_size);
+                    }
+                }
+                log::info!(
+                    "[TEXTURE_CACHE_MEMORY] frame={} device={:.2} MiB estimated={:.2} MiB images={} backend={} scaled={} gpu_modified={} unswizzle_buffers={:.2} MiB minimum={:.2} MiB expected={:.2} MiB critical={:.2} MiB",
+                    self.base.frame_tick,
+                    self.base.total_used_memory as f64 / (1024.0 * 1024.0),
+                    estimated_bytes as f64 / (1024.0 * 1024.0),
+                    self.base.slot_images.iter().count(),
+                    backend_images,
+                    scaled_images,
+                    gpu_modified_images,
+                    unswizzle_buffer_bytes as f64 / (1024.0 * 1024.0),
+                    self.base.minimum_memory as f64 / (1024.0 * 1024.0),
+                    self.base.expected_memory as f64 / (1024.0 * 1024.0),
+                    self.base.critical_memory as f64 / (1024.0 * 1024.0),
+                );
+            }
             let runtime = self.base.runtime_mut() as *mut TextureCacheRuntime;
             self.base.run_garbage_collector_with_downloader(
                 |_image_id, base_image, backend, staging| {

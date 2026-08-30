@@ -877,11 +877,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             &mut [u8],
         ) -> bool,
     ) {
-        let mut candidates = Vec::new();
+        let candidate_limit = *num_iterations;
+        let mut candidates = Vec::with_capacity(candidate_limit);
         self.lru_cache
             .for_each_item_below(tick_threshold, |image_id| {
                 candidates.push(image_id);
-                false
+                candidates.len() == candidate_limit
             });
 
         for image_id in candidates {
@@ -918,16 +919,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             let immediate_delete = self.slot_images[image_id].scale_tick > self.frame_tick + 5;
             self.delete_image(image_id, immediate_delete);
 
-            if self.total_used_memory < self.critical_memory {
-                if *aggressive_mode {
-                    *num_iterations >>= 2;
-                    *aggressive_mode = false;
-                    break;
-                }
-                if *high_priority_mode && self.total_used_memory < self.expected_memory {
-                    *num_iterations >>= 1;
-                    *high_priority_mode = false;
-                }
+            if *aggressive_mode && self.total_used_memory < self.critical_memory {
+                *num_iterations >>= 2;
+                *aggressive_mode = false;
+            } else if *high_priority_mode && self.total_used_memory < self.expected_memory {
+                *num_iterations >>= 1;
+                *high_priority_mode = false;
             }
         }
     }
@@ -6458,6 +6455,33 @@ mod tests {
         assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
+    }
+
+    #[test]
+    fn aggressive_gc_keeps_scanning_after_crossing_critical_memory() {
+        let mut cache = test_cache();
+        let info = test_color_info(16, 16);
+        let mut costly_ids = Vec::new();
+        for index in 0..20u64 {
+            let image_id = cache.insert_image(&info, 0x4000 + index * 0x4000);
+            cache.slot_images[image_id]
+                .flags
+                .insert(ImageFlagBits::COSTLY_LOAD);
+            costly_ids.push(image_id);
+        }
+        let trailing_id = cache.insert_image(&info, 0x80000);
+        let image_size = cache.total_used_memory / 21;
+
+        cache.frame_tick = 100;
+        cache.expected_memory = 0;
+        cache.critical_memory = image_size + image_size / 2;
+        cache.run_garbage_collector();
+
+        for image_id in costly_ids {
+            assert!(!cache.slot_images.contains(image_id));
+        }
+        assert!(!cache.slot_images.contains(trailing_id));
+        assert_eq!(cache.total_used_memory, 0);
     }
 
     #[test]

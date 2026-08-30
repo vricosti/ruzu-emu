@@ -18702,3 +18702,55 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: no serialized structure changes. The focused state-tracker regression verifies that
   command-buffer invalidation marks the aggregate and complete per-slot vertex-buffer dirty range;
   indexed geometry binding itself remains unconditional as in Eden.
+
+## 2026-08-30 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` (`RunGarbageCollector`)
+
+### Intentional differences
+
+- Rust collects at most the current 10/20/40-element iteration quota into a temporary vector before
+  mutating the slot storage; Eden's LRU callback performs the same ordered mutations in place. The
+  bounded candidate order, iteration quota, thresholds, and deletion decisions remain identical.
+
+### Unintentional differences (to fix)
+
+- None in the corrected aggressive-GC transition. Ruzu previously stopped the complete LRU scan
+  when one aggressive deletion brought memory below `critical_memory`. Eden only quarters the
+  remaining iteration quota, disables aggressive mode, and continues scanning. Ruzu now preserves
+  that ordering and continuation behavior.
+- Ruzu previously copied every eligible LRU identifier into a temporary vector before applying
+  Eden's 10/20/40-element quota. The collection is now bounded by the current quota, matching
+  Eden's early callback termination and avoiding work proportional to the complete cache each frame.
+- Ruzu previously allowed both the aggressive quartering and high-priority halving transitions to
+  run after one deletion. Eden uses `if`/`else if`; Ruzu now preserves that mutually exclusive
+  ordering.
+
+### Missing items
+
+- None in the reviewed aggressive-to-high-priority transition. Other pre-existing texture-cache
+  parity work remains separate.
+
+### Binary layout verification
+
+- N/A: no serialized layout changes. A focused regression covers a 21-image LRU sequence where
+  the non-aggressive pass exhausts its quota and the aggressive pass must continue after crossing
+  the critical threshold.
+
+## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}` (temporary memory diagnostics)
+
+### Intentional differences
+
+- Ruzu temporarily emits texture-cache residency telemetry every 60 frames when
+  `RUZU_TRACE_BUFFER_CACHE` is set. This investigation-only diagnostic has no Eden counterpart and
+  remains disabled during normal execution; it will be removed after the LM3 VRAM churn is fixed.
+
+### Unintentional differences (to fix)
+
+- None introduced by the disabled-by-default diagnostic.
+
+### Missing items
+
+- Remove the temporary telemetry after the active performance investigation is complete.
+
+### Binary layout verification
+
+- N/A: logging only; no Vulkan or guest-visible structure layout changes.

@@ -323,10 +323,7 @@ impl ImageOperands {
         let offset2 = resolve_ir_value(program, offset2);
         let mut operands = Self::default();
         if matches!(offset2, Value::Void) {
-            if !matches!(offset, Value::Void) {
-                let offset = ctx.resolve_value(&offset);
-                operands.add(spirv::ImageOperands::OFFSET, offset);
-            }
+            operands.add_offset(ctx, program, offset, true);
             return operands;
         }
 
@@ -363,17 +360,17 @@ impl ImageOperands {
             [second[0], second[1]],
             [second[2], second[3]],
         ];
+        let i32_vec2_type = ctx.builder.type_vector(ctx.i32_type, 2);
         let offsets = pairs
             .into_iter()
             .map(|pair| {
-                let x = ctx.constant_u32(pair[0]);
-                let y = ctx.constant_u32(pair[1]);
-                ctx.builder
-                    .constant_composite(ctx.u32_vec2_type, vec![x, y])
+                let x = ctx.constant_i32(pair[0] as i32);
+                let y = ctx.constant_i32(pair[1] as i32);
+                ctx.builder.constant_composite(i32_vec2_type, vec![x, y])
             })
             .collect::<Vec<_>>();
         let count = ctx.constant_u32(4);
-        let array_type = ctx.builder.type_array(ctx.u32_vec2_type, count);
+        let array_type = ctx.builder.type_array(i32_vec2_type, count);
         let offsets = ctx.builder.constant_composite(array_type, offsets);
         operands.add(spirv::ImageOperands::CONST_OFFSETS, offsets);
         operands
@@ -541,11 +538,11 @@ fn add_offset_to_coordinates(
         crate::shader_info::TextureType::ColorArray2D => {
             let x = ctx
                 .builder
-                .composite_extract(ctx.u32_type, None, coords, vec![0])
+                .composite_extract(ctx.u32_type, None, offset, vec![0])
                 .unwrap();
             let y = ctx
                 .builder
-                .composite_extract(ctx.u32_type, None, coords, vec![1])
+                .composite_extract(ctx.u32_type, None, offset, vec![1])
                 .unwrap();
             offset = ctx
                 .builder
@@ -1419,6 +1416,96 @@ mod tests {
             immediate_offset_components(&program, Value::Inst(InstRef { block: 0, inst: 2 })),
             Some(vec![1, u32::MAX])
         );
+    }
+
+    #[test]
+    fn array_2d_fetch_adds_offset_without_modifying_layer() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::ColorArray2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::ColorArray2D as u8,
+            ..TextureInstInfo::default()
+        };
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        let coords = block.append_inst(Inst::new(
+            Opcode::CompositeConstructU32x3,
+            vec![Value::ImmU32(10), Value::ImmU32(20), Value::ImmU32(3)],
+        ));
+        let offset = block.append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(1), Value::ImmU32(2)],
+        ));
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageFetch,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: offset,
+                }),
+                Value::ImmU32(0),
+                Value::Void,
+            ],
+            info.to_u32(),
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.emit_program(&program);
+
+        let offset_id = ctx.values[&(0, offset)];
+        let instructions = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .collect::<Vec<_>>();
+        let add = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == spirv::Op::IAdd)
+            .expect("array fetch offset must be added to the coordinates");
+        let Operand::IdRef(expanded_offset_id) = add.operands[1] else {
+            panic!("IAdd offset must be an id");
+        };
+        let expanded_offset = instructions
+            .iter()
+            .find(|inst| inst.result_id == Some(expanded_offset_id))
+            .expect("expanded array offset must be defined");
+        assert_eq!(expanded_offset.class.opcode, spirv::Op::CompositeConstruct);
+
+        for component in &expanded_offset.operands[..2] {
+            let Operand::IdRef(component_id) = component else {
+                panic!("expanded offset component must be an id");
+            };
+            let extract = instructions
+                .iter()
+                .find(|inst| inst.result_id == Some(*component_id))
+                .expect("expanded offset component must be extracted");
+            assert_eq!(extract.class.opcode, spirv::Op::CompositeExtract);
+            assert_eq!(extract.operands[0], Operand::IdRef(offset_id));
+        }
     }
 
     fn image_gather_context(profile: Profile, with_ptp_offsets: bool) -> SpirvEmitContext {

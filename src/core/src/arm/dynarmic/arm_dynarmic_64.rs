@@ -36,6 +36,76 @@ const _: () = assert!(
     "PageInfo size must be a power of two"
 );
 
+/// Host-backend-specific access to the active A64 JIT state.
+///
+/// Dynarmic deliberately gives its Arm64 and x64 backends different state
+/// layouts. Core diagnostics must inspect the state owned by the active host
+/// backend rather than importing the x64 layout unconditionally.
+trait A64JitStateHostAccess {
+    fn offset_of_pc() -> usize;
+    fn get_pstate(&self) -> u32;
+    fn get_fpcr(&self) -> u32;
+    fn get_fpsr(&self) -> u32;
+    fn vector_lane(&self, index: usize) -> u64;
+    fn vector_lane_or_zero(&self, index: usize) -> u64;
+}
+
+impl A64JitStateHostAccess for A64JitState {
+    fn offset_of_pc() -> usize {
+        core::mem::offset_of!(Self, pc)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_pstate(&self) -> u32 {
+        self.cpsr_nzcv
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_pstate(&self) -> u32 {
+        A64JitState::get_pstate(self)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_fpcr(&self) -> u32 {
+        self.fpcr
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_fpcr(&self) -> u32 {
+        A64JitState::get_fpcr(self)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_fpsr(&self) -> u32 {
+        self.fpsr
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_fpsr(&self) -> u32 {
+        A64JitState::get_fpsr(self)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn vector_lane(&self, index: usize) -> u64 {
+        self.vec.0[index]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn vector_lane(&self, index: usize) -> u64 {
+        self.vec[index]
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn vector_lane_or_zero(&self, index: usize) -> u64 {
+        self.vec.0.get(index).copied().unwrap_or(0)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn vector_lane_or_zero(&self, index: usize) -> u64 {
+        self.vec.get(index).copied().unwrap_or(0)
+    }
+}
+
 fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
     let mut flags = OptimizationFlag::NO_OPTIMIZATIONS;
 
@@ -418,8 +488,8 @@ fn dump_vec_at_pc(cb: &DynarmicCallbacks64) {
         return;
     }
     // V<i> = (vec[2i], vec[2i+1]) — low/high 64 bits.
-    let vlo = |i: usize| jit_state.vec[2 * i];
-    let vhi = |i: usize| jit_state.vec[2 * i + 1];
+    let vlo = |i: usize| jit_state.vector_lane(2 * i);
+    let vhi = |i: usize| jit_state.vector_lane(2 * i + 1);
     let x3 = jit_state.reg[3];
     let x5 = jit_state.reg[5];
     eprintln!(
@@ -1848,8 +1918,8 @@ x19=0x{:016X} x20=0x{:016X} x22=0x{:016X}",
                         let s = unsafe { &*jit_state_ptr };
                         // Also dump VN_lo/hi from JitState. RUZU_DUMP_V_INDEX=31 (decimal).
                         let v_idx = dump_v_index();
-                        let vlo = s.vec.get(2 * v_idx).copied().unwrap_or(0);
-                        let vhi = s.vec.get(2 * v_idx + 1).copied().unwrap_or(0);
+                        let vlo = s.vector_lane_or_zero(2 * v_idx);
+                        let vhi = s.vector_lane_or_zero(2 * v_idx + 1);
                         eprintln!(
                             "[W128_VALUE #{}] vaddr=0x{:016X} lo=0x{:016X} hi=0x{:016X} pc=0x{:016X} lr=0x{:016X} \
 x0=0x{:016X} x1=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} v{}_lo=0x{:016X} v{}_hi=0x{:016X} \
@@ -2759,8 +2829,8 @@ fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64, tpidr: u64) -
     ctx.pc = pc;
     ctx.pstate = jit_state.get_pstate();
     for i in 0..32 {
-        let lo = jit_state.vec[i * 2] as u128;
-        let hi = (jit_state.vec[i * 2 + 1] as u128) << 64;
+        let lo = jit_state.vector_lane(i * 2) as u128;
+        let hi = (jit_state.vector_lane(i * 2 + 1) as u128) << 64;
         ctx.v[i] = lo | hi;
     }
     ctx.fpcr = jit_state.get_fpcr();
@@ -2773,8 +2843,8 @@ fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64, tpidr: u64) -
 mod tests {
     use super::{
         parse_optimization_mask_env, parse_watch_ranges, thread_context_from_jit_state,
-        translate_halt_reason, upstream_optimization_config, DynarmicCallbacks64,
-        PAGE_TABLE_LOG2_STRIDE,
+        translate_halt_reason, upstream_optimization_config, A64JitState, A64JitStateHostAccess,
+        DynarmicCallbacks64, PAGE_TABLE_LOG2_STRIDE,
     };
     use crate::arm::arm_interface::{
         ArmInterfaceBase, DebugWatchpoint, DebugWatchpointType, HaltReason,
@@ -2783,11 +2853,50 @@ mod tests {
     use crate::hle::kernel::k_process::ProcessMemoryData;
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use common::settings_enums::CpuAccuracy;
-    use rdynarmic::backend::x64::a64_jitstate::A64JitState;
     use rdynarmic::interface::a64::config::UserCallbacks;
     use rdynarmic::interface::optimization_flags::OptimizationFlag;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_test_pstate(state: &mut A64JitState, value: u32) {
+        state.cpsr_nzcv = value;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_test_pstate(state: &mut A64JitState, value: u32) {
+        state.set_pstate(value);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_test_fpcr(state: &mut A64JitState, value: u32) {
+        state.fpcr = value;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_test_fpcr(state: &mut A64JitState, value: u32) {
+        state.set_fpcr(value);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_test_fpsr(state: &mut A64JitState, value: u32) {
+        state.fpsr = value;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_test_fpsr(state: &mut A64JitState, value: u32) {
+        state.set_fpsr(value);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_test_vector_lane(state: &mut A64JitState, index: usize, value: u64) {
+        state.vec.0[index] = value;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_test_vector_lane(state: &mut A64JitState, index: usize, value: u64) {
+        state.vec[index] = value;
+    }
 
     #[test]
     fn callbacks_implement_the_architecture_owned_a64_interface() {
@@ -2819,11 +2928,11 @@ mod tests {
             jit_state.reg[i] = 0x1000 + i as u64;
         }
         jit_state.sp = 0x2222;
-        jit_state.set_pstate(0xA000_0000);
-        jit_state.vec[0] = 0x0123_4567_89AB_CDEF;
-        jit_state.vec[1] = 0x0FED_CBA9_7654_3210;
-        jit_state.set_fpcr(0x0100_0000);
-        jit_state.set_fpsr(0x0800_001F);
+        set_test_pstate(&mut jit_state, 0xA000_0000);
+        set_test_vector_lane(&mut jit_state, 0, 0x0123_4567_89AB_CDEF);
+        set_test_vector_lane(&mut jit_state, 1, 0x0FED_CBA9_7654_3210);
+        set_test_fpcr(&mut jit_state, 0x0100_0000);
+        set_test_fpsr(&mut jit_state, 0x0800_001F);
         let ctx = thread_context_from_jit_state(&jit_state, 0x4444, 0x3333);
         assert_eq!(ctx.r[0], 0x1000);
         assert_eq!(ctx.r[28], 0x1000 + 28);

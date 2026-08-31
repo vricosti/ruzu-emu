@@ -106,6 +106,8 @@ pub const VRAM_USAGE_MODE: &[(VramUsageMode, &str)] = &[
 
 pub const GRAPHICS_API: &[(RendererBackend, &str)] = &[
     (RendererBackend::Vulkan, "Vulkan"),
+    #[cfg(target_os = "macos")]
+    (RendererBackend::Metal, "Metal"),
     (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
     (
         RendererBackend::OpenGlGlasm,
@@ -330,6 +332,8 @@ pub const STATUS_GPU_ACCURACY: &[(GpuAccuracy, &str)] =
 pub const STATUS_RENDERER_BACKEND: &[(RendererBackend, &str)] = &[
     (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
     (RendererBackend::Vulkan, "Vulkan"),
+    #[cfg(target_os = "macos")]
+    (RendererBackend::Metal, "Metal"),
     (RendererBackend::Null, "Null"),
     (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
     (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),

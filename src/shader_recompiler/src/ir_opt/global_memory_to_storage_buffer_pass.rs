@@ -315,8 +315,8 @@ fn track(program: &Program, value: Value, bias: Option<Bias>) -> Option<StorageB
 fn collect_storage_buffer(program: &Program, inst_ref: InstRef, info: &mut StorageInfo) {
     const NVN_BIAS: Bias = Bias {
         index: 0,
-        offset_begin: 0x110,
-        offset_end: 0x610,
+        offset_begin: 0x100,
+        offset_end: 0x700,
         alignment: 16,
     };
     let inst = program.block(inst_ref.block).inst(inst_ref.inst);
@@ -633,7 +633,7 @@ mod tests {
         program.post_order_blocks = vec![0];
         let cbuf = program.block_mut(0).append_inst(Inst::new(
             Opcode::GetCbufU32,
-            vec![Value::ImmU32(0), Value::ImmU32(0x110)],
+            vec![Value::ImmU32(0), Value::ImmU32(0x100)],
         ));
         let addr = program.block_mut(0).append_inst(Inst::new(
             Opcode::IAdd32,
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(program.info.storage_buffers_descriptors[0].cbuf_index, 0);
         assert_eq!(
             program.info.storage_buffers_descriptors[0].cbuf_offset,
-            0x110
+            0x100
         );
         assert!(program
             .block(0)

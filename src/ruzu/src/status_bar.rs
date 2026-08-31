@@ -428,12 +428,17 @@ impl StatusBar {
             RendererBackend::OpenGlGlasm => "OPENGL GLASM".to_string(),
             RendererBackend::OpenGlSpirV => "OPENGL SPIRV".to_string(),
             RendererBackend::Vulkan => "VULKAN".to_string(),
+            RendererBackend::Metal => "METAL".to_string(),
             RendererBackend::Null => "NULL".to_string(),
         };
         self.renderer.set_label(&renderer);
         // `renderer_status_button->setChecked(api == Vulkan)` — checked renders
-        // orange, unchecked blue.
-        set_checked(&self.renderer, backend == RendererBackend::Vulkan);
+        // orange, unchecked blue. Metal follows the accelerated native API
+        // presentation rather than the OpenGL presentation.
+        set_checked(
+            &self.renderer,
+            matches!(backend, RendererBackend::Vulkan | RendererBackend::Metal),
+        );
 
         // `UpdateGPUAccuracyButton`.
         let accuracy = *values.gpu_accuracy.get_value();
@@ -573,6 +578,7 @@ fn renderer_context_choices(running: bool) -> Vec<(RendererBackend, &'static str
 fn next_graphics_api(api: RendererBackend) -> RendererBackend {
     match api {
         RendererBackend::Vulkan => RendererBackend::OpenGlGlsl,
+        RendererBackend::Metal => RendererBackend::Vulkan,
         RendererBackend::OpenGlGlsl => RendererBackend::OpenGlGlsl,
         RendererBackend::OpenGlSpirV => RendererBackend::OpenGlGlasm,
         RendererBackend::OpenGlGlasm => RendererBackend::Null,
@@ -774,6 +780,10 @@ mod tests {
             RendererBackend::OpenGlGlsl
         );
         assert_eq!(
+            next_graphics_api(RendererBackend::Metal),
+            RendererBackend::Vulkan
+        );
+        assert_eq!(
             next_graphics_api(RendererBackend::OpenGlGlsl),
             RendererBackend::OpenGlGlsl
         );
@@ -792,16 +802,18 @@ mod tests {
     }
 
     #[test]
-    fn renderer_context_menu_matches_upstream_runtime_lock() {
-        assert_eq!(
-            renderer_context_choices(false),
-            vec![
-                (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
-                (RendererBackend::Vulkan, "Vulkan"),
-                (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
-                (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),
-            ]
-        );
+    fn renderer_context_menu_preserves_runtime_lock_and_adds_metal_on_macos() {
+        let mut expected = vec![
+            (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
+            (RendererBackend::Vulkan, "Vulkan"),
+        ];
+        #[cfg(target_os = "macos")]
+        expected.push((RendererBackend::Metal, "Metal"));
+        expected.extend([
+            (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
+            (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),
+        ]);
+        assert_eq!(renderer_context_choices(false), expected);
         assert!(renderer_context_choices(true).is_empty());
     }
 

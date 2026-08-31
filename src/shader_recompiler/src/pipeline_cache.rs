@@ -746,9 +746,14 @@ pub fn compile_shader_from_env_with_host_info(
     runtime_info: &RuntimeInfo,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
-    let stage = env.shader_stage();
-    let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
-    convert_legacy_to_generic(&mut program, runtime_info);
+    let program = translate_shader_from_env_with_host_info(
+        code,
+        base_offset,
+        env,
+        runtime_info,
+        host_info,
+    );
+    let stage = program.stage;
     let spirv_words = backend::emit_spirv(&program, profile, runtime_info);
     CompiledShader {
         spirv_words,
@@ -766,15 +771,37 @@ pub fn compile_shader_from_env_with_bindings_and_host_info(
     bindings: &mut backend::bindings::Bindings,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
-    let stage = env.shader_stage();
-    let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
-    convert_legacy_to_generic(&mut program, runtime_info);
+    let program = translate_shader_from_env_with_host_info(
+        code,
+        base_offset,
+        env,
+        runtime_info,
+        host_info,
+    );
+    let stage = program.stage;
     let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
     CompiledShader {
         spirv_words,
         info: program.info,
         stage,
     }
+}
+
+/// Translate and normalize one environment-backed shader into the common IR.
+///
+/// Backend owners call this function before selecting SPIR-V, GLSL, or MSL
+/// emission. Keeping `convert_legacy_to_generic` here guarantees that every
+/// backend consumes the same normalized `Program`.
+pub fn translate_shader_from_env_with_host_info(
+    code: &[u64],
+    base_offset: u32,
+    env: &mut dyn Environment,
+    runtime_info: &RuntimeInfo,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> Program {
+    let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
+    convert_legacy_to_generic(&mut program, runtime_info);
+    program
 }
 
 /// OpenGL graphics path variant that mirrors upstream's
@@ -936,6 +963,36 @@ pub fn compile_dual_vertex_shader_from_env_with_bindings_and_host_info(
     bindings: &mut backend::bindings::Bindings,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
+    let program = translate_dual_vertex_shader_from_env_with_host_info(
+        vertex_a_code,
+        vertex_a_base_offset,
+        vertex_a_env,
+        vertex_b_code,
+        vertex_b_base_offset,
+        vertex_b_env,
+        runtime_info,
+        host_info,
+    );
+    let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
+    CompiledShader {
+        spirv_words,
+        info: program.info,
+        stage: ShaderStage::VertexB,
+    }
+}
+
+/// Translate, merge, and normalize a VertexA + VertexB pair into the common
+/// IR before choosing a source backend.
+pub fn translate_dual_vertex_shader_from_env_with_host_info(
+    vertex_a_code: &[u64],
+    vertex_a_base_offset: u32,
+    vertex_a_env: &mut dyn Environment,
+    vertex_b_code: &[u64],
+    vertex_b_base_offset: u32,
+    vertex_b_env: &mut dyn Environment,
+    runtime_info: &RuntimeInfo,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> Program {
     let mut vertex_a = translate_program_from_env_with_host_info(
         vertex_a_code,
         vertex_a_base_offset,
@@ -951,12 +1008,7 @@ pub fn compile_dual_vertex_shader_from_env_with_bindings_and_host_info(
     let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b, vertex_b_env);
 
     convert_legacy_to_generic(&mut program, runtime_info);
-    let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
-    CompiledShader {
-        spirv_words,
-        info: program.info,
-        stage: ShaderStage::VertexB,
-    }
+    program
 }
 
 /// Compile a Maxwell VertexA + VertexB pair to GLSL through the

@@ -1,0 +1,1825 @@
+// SPDX-FileCopyrightText: 2026 ruzu contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Native Metal rasterizer ownership.
+//!
+//! This file is the Metal counterpart of Eden's
+//! `renderer_vulkan/vk_rasterizer.{h,cpp}`. It owns one scheduler, one staging
+//! pool, and the common buffer/texture/shader caches used by every channel.
+
+use std::ffi::c_void;
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+use objc2_metal::{
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCullMode, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLScissorRect, MTLSize, MTLViewport, MTLWinding,
+};
+use thiserror::Error;
+
+use crate::buffer_cache::buffer_cache_base::{
+    DeviceMemoryAccess, DrawIndirectParams as CacheDrawIndirectParams, GpuMemoryAccess,
+    ObtainBufferOperation, ObtainBufferSynchronize,
+};
+use crate::cache_types::CacheType;
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
+use crate::engines::draw_manager::{
+    IndirectParams, Maxwell3DClearView, Maxwell3DDrawTextureView, Maxwell3DDrawView,
+    Maxwell3DIndirectView,
+};
+use crate::engines::kepler_compute::DispatchCall;
+use crate::engines::maxwell_3d::{CullFace, FrontFace, PrimitiveTopology};
+use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
+use crate::fence_manager::FenceBase;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::syncpoint_manager::SyncpointManager;
+use crate::memory_manager::MemoryManager;
+use crate::query_cache::types::QueryPropertiesFlags;
+use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+use crate::renderer_base::{
+    GpuTickCallback, GpuTicksGetter, GuestMemoryWriter, InvalidateGpuCacheCallback,
+};
+use crate::shader_cache::ShaderCache;
+
+use super::metal_blit_helper::{
+    MetalBlitError, MetalBlitHelper, MetalBlitRegion, MetalClearColorType, MetalClearParameters,
+};
+use super::metal_buffer::MetalBufferError;
+use super::metal_buffer_cache::{BufferCacheRuntime, MetalCommonBufferCache};
+use super::metal_compute_pipeline::{
+    bind_compute_resources, configure_compute_resources, MetalComputePipelineError,
+};
+use super::metal_device::MetalDevice;
+use super::metal_fence_manager::{MetalFence, MetalFenceManager};
+use super::metal_framebuffer::{MetalFramebufferClear, MetalFramebufferError};
+use super::metal_graphics_pipeline::{
+    configure_graphics_resources, MetalGraphicsPipelineError, MetalPreparedGraphics,
+    MetalPreparedStage,
+};
+use super::metal_pipeline_cache::MetalPipelineCache;
+use super::metal_pipeline_cache::MetalPipelineError;
+use super::metal_query_cache::{MetalQueryCache, MetalQueryCacheError, MetalQueryReport};
+use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
+use super::metal_staging_buffer_pool::{MetalStagingBufferError, MetalStagingBufferPool};
+use super::metal_state_tracker::MetalStateTracker;
+use super::metal_texture_cache::MetalTextureCache;
+
+macro_rules! lock_two_reentrant_mutexes {
+    ($first:expr, $second:expr, $first_guard:ident, $second_guard:ident) => {
+        let first_address = $first as usize;
+        let second_address = $second as usize;
+        let ($first_guard, $second_guard) = if first_address <= second_address {
+            (unsafe { (*$first).lock() }, unsafe { (*$second).lock() })
+        } else {
+            let second_guard = unsafe { (*$second).lock() };
+            let first_guard = unsafe { (*$first).lock() };
+            (first_guard, second_guard)
+        };
+    };
+}
+
+#[derive(Debug, Error)]
+pub enum MetalRasterizerError {
+    #[error(transparent)]
+    Buffer(#[from] MetalBufferError),
+    #[error(transparent)]
+    Staging(#[from] MetalStagingBufferError),
+    #[error(transparent)]
+    Scheduler(#[from] MetalSchedulerError),
+    #[error(transparent)]
+    Pipeline(#[from] MetalPipelineError),
+    #[error(transparent)]
+    GraphicsPipeline(#[from] MetalGraphicsPipelineError),
+    #[error(transparent)]
+    ComputePipeline(#[from] MetalComputePipelineError),
+    #[error(transparent)]
+    QueryCache(#[from] MetalQueryCacheError),
+    #[error(transparent)]
+    Framebuffer(#[from] MetalFramebufferError),
+    #[error(transparent)]
+    Blit(#[from] MetalBlitError),
+    #[error("Metal does not support Maxwell primitive topology {0:?}")]
+    UnsupportedTopology(PrimitiveTopology),
+    #[error("Metal compute workgroup {requested:?} exceeds the native limit {maximum:?}")]
+    UnsupportedComputeWorkgroup {
+        requested: [u32; 3],
+        maximum: (usize, usize, usize),
+    },
+}
+
+#[derive(Clone, Copy)]
+struct DrawParams {
+    base_instance: u32,
+    num_instances: u32,
+    base_vertex: i32,
+    num_vertices: u32,
+    first_index: u32,
+    is_indexed: bool,
+}
+
+struct MetalIndirectBinding {
+    params: IndirectParams,
+    buffer: Arc<super::metal_buffer::MetalBuffer>,
+    offset: usize,
+    draw_count: u32,
+}
+
+fn make_draw_params(draw: &Maxwell3DDrawView<'_>, instance_count: u32) -> DrawParams {
+    let state = draw.draw_state();
+    let is_indexed = draw.is_indexed();
+    let mut params = DrawParams {
+        base_instance: state.base_instance,
+        num_instances: instance_count,
+        base_vertex: if is_indexed {
+            state.base_index as i32
+        } else {
+            state.vertex_buffer.first as i32
+        },
+        num_vertices: if is_indexed {
+            state.index_buffer.count
+        } else {
+            state.vertex_buffer.count
+        },
+        first_index: if is_indexed {
+            state.index_buffer.first
+        } else {
+            0
+        },
+        is_indexed,
+    };
+    match state.topology {
+        PrimitiveTopology::Quads => {
+            params.num_vertices = params.num_vertices / 4 * 6;
+            params.base_vertex = 0;
+            params.is_indexed = true;
+        }
+        PrimitiveTopology::QuadStrip => {
+            params.num_vertices = params.num_vertices.wrapping_sub(2) / 2 * 6;
+            params.base_vertex = 0;
+            params.is_indexed = true;
+        }
+        _ => {}
+    }
+    params
+}
+
+fn metal_primitive_type(
+    topology: PrimitiveTopology,
+) -> Result<MTLPrimitiveType, MetalRasterizerError> {
+    match topology {
+        PrimitiveTopology::Points => Ok(MTLPrimitiveType::Point),
+        PrimitiveTopology::Lines => Ok(MTLPrimitiveType::Line),
+        PrimitiveTopology::LineStrip | PrimitiveTopology::LineLoop => {
+            Ok(MTLPrimitiveType::LineStrip)
+        }
+        PrimitiveTopology::Triangles | PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip => {
+            Ok(MTLPrimitiveType::Triangle)
+        }
+        PrimitiveTopology::TriangleStrip => Ok(MTLPrimitiveType::TriangleStrip),
+        _ => Err(MetalRasterizerError::UnsupportedTopology(topology)),
+    }
+}
+
+fn bind_stage(
+    encoder: &objc2::runtime::ProtocolObject<dyn MTLRenderCommandEncoder>,
+    stage: &MetalPreparedStage,
+    vertex: bool,
+) {
+    unsafe {
+        for binding in &stage.buffers {
+            if vertex {
+                encoder.setVertexBuffer_offset_atIndex(
+                    Some(binding.buffer.handle()),
+                    binding.offset,
+                    binding.index as usize,
+                );
+            } else {
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(binding.buffer.handle()),
+                    binding.offset,
+                    binding.index as usize,
+                );
+            }
+        }
+        for binding in &stage.textures {
+            if vertex {
+                encoder
+                    .setVertexTexture_atIndex(binding.texture.as_deref(), binding.index as usize);
+            } else {
+                encoder
+                    .setFragmentTexture_atIndex(binding.texture.as_deref(), binding.index as usize);
+            }
+        }
+        for binding in &stage.samplers {
+            if vertex {
+                encoder
+                    .setVertexSamplerState_atIndex(Some(&binding.sampler), binding.index as usize);
+            } else {
+                encoder.setFragmentSamplerState_atIndex(
+                    Some(&binding.sampler),
+                    binding.index as usize,
+                );
+            }
+        }
+        if let Some((index, bytes)) = &stage.push_constants {
+            let pointer = NonNull::new(bytes.as_ptr() as *mut c_void).unwrap();
+            if vertex {
+                encoder.setVertexBytes_length_atIndex(pointer, bytes.len(), *index as usize);
+            } else {
+                encoder.setFragmentBytes_length_atIndex(pointer, bytes.len(), *index as usize);
+            }
+        }
+    }
+}
+
+struct AccelerateDMA {
+    buffer_cache: NonNull<MetalCommonBufferCache>,
+}
+
+impl AccelerateDMA {
+    fn new(buffer_cache: &mut MetalCommonBufferCache) -> Self {
+        Self {
+            buffer_cache: NonNull::from(buffer_cache),
+        }
+    }
+}
+
+impl AccelerateDMAInterface for AccelerateDMA {
+    fn buffer_copy(&mut self, src_address: u64, dest_address: u64, amount: u64) -> bool {
+        unsafe {
+            let cache = self.buffer_cache.as_mut();
+            let mutex: *const _ = &cache.mutex;
+            let _guard = (*mutex).lock();
+            cache.dma_copy(src_address, dest_address, amount)
+        }
+    }
+
+    fn buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
+        unsafe {
+            let cache = self.buffer_cache.as_mut();
+            let mutex: *const _ = &cache.mutex;
+            let _guard = (*mutex).lock();
+            cache.dma_clear(dst_address, amount, value)
+        }
+    }
+
+    fn image_to_buffer(
+        &mut self,
+        _copy_info: &dma::ImageCopy,
+        _src: &dma::ImageOperand,
+        _dst: &dma::BufferOperand,
+    ) -> bool {
+        false
+    }
+
+    fn buffer_to_image(
+        &mut self,
+        _copy_info: &dma::ImageCopy,
+        _src: &dma::BufferOperand,
+        _dst: &dma::ImageOperand,
+    ) -> bool {
+        false
+    }
+}
+
+struct GpuMemoryAccessAdapter {
+    memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
+}
+
+impl GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+        self.memory_manager.lock().gpu_to_cpu_address(gpu_addr)
+    }
+
+    fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
+        let mut bytes = [0; 8];
+        self.memory_manager.lock().read_block(gpu_addr, &mut bytes);
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
+        let mut bytes = [0; 4];
+        self.memory_manager.lock().read_block(gpu_addr, &mut bytes);
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {
+        self.memory_manager
+            .lock()
+            .is_within_gpu_address_range(gpu_addr)
+    }
+
+    fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
+        self.memory_manager
+            .lock()
+            .max_continuous_range(gpu_addr, size)
+    }
+
+    fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
+        self.memory_manager.lock().get_memory_layout_size(gpu_addr)
+    }
+}
+
+struct DeviceMemoryAccessAdapter {
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
+}
+
+impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
+        let pointer = self.device_memory.get_pointer(device_addr);
+        (!pointer.is_null()).then_some(pointer)
+    }
+
+    fn read_block_unsafe(&self, device_addr: u64, dst: &mut [u8]) {
+        self.device_memory.smmu_read_block_unsafe(device_addr, dst);
+    }
+
+    fn write_block_unsafe(&self, device_addr: u64, src: &[u8]) {
+        self.device_memory.smmu_write_block_unsafe(device_addr, src);
+    }
+}
+
+/// Backend owner corresponding to Eden's `RasterizerVulkan` construction and
+/// channel-cache lifecycle.
+pub struct MetalRasterizer {
+    device: MetalDevice,
+    scheduler: Box<MetalScheduler>,
+    staging_pool: Box<MetalStagingBufferPool>,
+    pipeline_cache: MetalPipelineCache,
+    shader_cache: ShaderCache,
+    common_buffer_cache: Box<MetalCommonBufferCache>,
+    texture_cache: Box<MetalTextureCache>,
+    query_cache: MetalQueryCache,
+    state_tracker: MetalStateTracker,
+    fence_manager: MetalFenceManager,
+    blit_image: MetalBlitHelper,
+    accelerate_dma: AccelerateDMA,
+    syncpoints: Arc<SyncpointManager>,
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
+    channel_memory_manager: Option<Arc<parking_lot::Mutex<MemoryManager>>>,
+    guest_memory_writer: Option<GuestMemoryWriter>,
+    gpu_ticks_getter: Option<GpuTicksGetter>,
+    gpu_tick_callback: Option<GpuTickCallback>,
+    invalidate_gpu_cache_callback: Option<InvalidateGpuCacheCallback>,
+}
+
+impl MetalRasterizer {
+    pub fn new(
+        device: MetalDevice,
+        syncpoints: Arc<SyncpointManager>,
+        device_memory: Arc<MaxwellDeviceMemoryManager>,
+    ) -> Result<Self, MetalRasterizerError> {
+        let mut scheduler = Box::new(MetalScheduler::new(&device));
+        let mut staging_pool = Box::new(MetalStagingBufferPool::new(&device)?);
+
+        let buffer_runtime =
+            BufferCacheRuntime::new(&device, scheduler.as_mut(), staging_pool.as_mut());
+        let mut common_buffer_cache = Box::new(MetalCommonBufferCache::new(
+            device_memory.as_ref(),
+            buffer_runtime,
+        ));
+        common_buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+            device_memory: Arc::clone(&device_memory),
+        }));
+
+        let texture_cache = Box::new(MetalTextureCache::new(
+            device.clone(),
+            Arc::clone(&device_memory),
+            scheduler.as_mut(),
+            staging_pool.as_mut(),
+        ));
+        let shader_cache = ShaderCache::new(device_memory);
+        let pipeline_cache = MetalPipelineCache::new(device.clone());
+        let query_cache = MetalQueryCache::new(&device)?;
+        let state_tracker = MetalStateTracker::new();
+        let fence_manager = MetalFenceManager::new(false);
+        let blit_image = MetalBlitHelper::new(&device)?;
+        let accelerate_dma = AccelerateDMA::new(common_buffer_cache.as_mut());
+
+        Ok(Self {
+            device,
+            scheduler,
+            staging_pool,
+            pipeline_cache,
+            shader_cache,
+            common_buffer_cache,
+            texture_cache,
+            query_cache,
+            state_tracker,
+            fence_manager,
+            blit_image,
+            accelerate_dma,
+            syncpoints,
+            channel_caches: ChannelSetupCaches::new(),
+            channel_memory_manager: None,
+            guest_memory_writer: None,
+            gpu_ticks_getter: None,
+            gpu_tick_callback: None,
+            invalidate_gpu_cache_callback: None,
+        })
+    }
+
+    pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
+        self.texture_cache
+            .base
+            .set_guest_memory_writer(Arc::clone(&writer));
+        self.guest_memory_writer = Some(writer);
+    }
+
+    pub fn set_gpu_ticks_getter(&mut self, getter: GpuTicksGetter) {
+        self.gpu_ticks_getter = Some(getter);
+    }
+
+    pub fn set_gpu_tick_callback(&mut self, callback: GpuTickCallback) {
+        self.gpu_tick_callback = Some(callback);
+    }
+
+    pub fn set_invalidate_gpu_cache_callback(&mut self, callback: InvalidateGpuCacheCallback) {
+        self.invalidate_gpu_cache_callback = Some(callback);
+    }
+
+    pub fn device(&self) -> &MetalDevice {
+        &self.device
+    }
+
+    pub fn scheduler(&mut self) -> &mut MetalScheduler {
+        self.scheduler.as_mut()
+    }
+
+    pub fn pipeline_cache(&mut self) -> &mut MetalPipelineCache {
+        &mut self.pipeline_cache
+    }
+
+    pub fn shader_cache(&mut self) -> &mut ShaderCache {
+        &mut self.shader_cache
+    }
+
+    pub fn common_buffer_cache(&mut self) -> &mut MetalCommonBufferCache {
+        self.common_buffer_cache.as_mut()
+    }
+
+    pub fn texture_cache(&mut self) -> &mut MetalTextureCache {
+        self.texture_cache.as_mut()
+    }
+
+    /// Port of Eden `RasterizerVulkan::InitializeChannel` for the caches
+    /// currently owned by the Metal backend.
+    pub fn initialize_channel(&mut self, channel: &mut ChannelState) {
+        self.channel_caches.create_channel(channel);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+        self.texture_cache.create_channel(channel);
+        self.common_buffer_cache.create_channel(channel);
+        self.shader_cache.create_channel(channel);
+        self.state_tracker.setup_tables(channel);
+    }
+
+    /// Port of Eden `RasterizerVulkan::BindChannel` for the caches currently
+    /// owned by the Metal backend.
+    pub fn bind_channel(&mut self, channel: &mut ChannelState) {
+        self.channel_caches.bind_to_channel(channel.bind_id);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+        self.texture_cache.bind_to_channel(channel.bind_id);
+        self.common_buffer_cache.bind_to_channel(channel.bind_id);
+        self.shader_cache.bind_to_channel(channel.bind_id);
+        self.state_tracker.change_channel(channel);
+        self.state_tracker.invalidate_state(channel);
+        self.channel_memory_manager = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            self.common_buffer_cache
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
+                    memory_manager: Arc::clone(memory_manager),
+                }));
+        } else {
+            self.common_buffer_cache.clear_gpu_memory();
+        }
+    }
+
+    /// Port of Eden `RasterizerVulkan::ReleaseChannel` for the caches
+    /// currently owned by the Metal backend.
+    pub fn release_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+        self.texture_cache.erase_channel(channel_id);
+        self.common_buffer_cache.erase_channel(channel_id);
+        self.shader_cache.erase_channel(channel_id);
+        self.state_tracker.release_channel(channel_id);
+        self.channel_memory_manager = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            self.common_buffer_cache
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
+                    memory_manager: Arc::clone(memory_manager),
+                }));
+        } else {
+            self.common_buffer_cache.clear_gpu_memory();
+        }
+    }
+
+    /// Port of Eden `RasterizerVulkan::Draw`/`PrepareDraw` to a native Metal
+    /// render encoder. Cache preparation remains ordered exactly like the
+    /// upstream path; only the final API bindings differ.
+    pub fn draw(
+        &mut self,
+        draw: &mut Maxwell3DDrawView<'_>,
+        instance_count: u32,
+    ) -> Result<(), MetalRasterizerError> {
+        self.draw_impl(draw, instance_count, None)
+    }
+
+    fn draw_impl(
+        &mut self,
+        draw: &mut Maxwell3DDrawView<'_>,
+        instance_count: u32,
+        indirect_params: Option<IndirectParams>,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+
+        let Some(stages) = self
+            .pipeline_cache
+            .current_graphics_shaders(draw, &mut self.shader_cache)?
+        else {
+            return Ok(());
+        };
+
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+
+        let memory_manager = self.channel_memory_manager.as_ref().cloned();
+        let mut prepared = configure_graphics_resources(
+            &self.device,
+            &stages,
+            draw,
+            self.common_buffer_cache.as_mut(),
+            self.texture_cache.as_mut(),
+            |address, output| {
+                if let Some(memory_manager) = memory_manager.as_ref() {
+                    memory_manager.lock().read_block(address, output);
+                } else {
+                    output.fill(0);
+                }
+            },
+        )?;
+
+        let indirect_binding = if let Some(params) = indirect_params {
+            let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
+            let Some(buffer) = self
+                .common_buffer_cache
+                .backend_buffer(buffer_id)
+                .map(|buffer| buffer.handle())
+            else {
+                log::warn!("Metal indirect draw skipped: missing indirect buffer");
+                return Ok(());
+            };
+            let draw_count = if params.include_count {
+                let (count_buffer_id, count_offset) =
+                    self.common_buffer_cache.get_draw_indirect_count();
+                let Some(count_buffer) = self
+                    .common_buffer_cache
+                    .backend_buffer(count_buffer_id)
+                    .map(|buffer| buffer.handle())
+                else {
+                    log::warn!("Metal indirect draw skipped: missing count buffer");
+                    return Ok(());
+                };
+                // Metal has no indirect-count render command. Synchronize the
+                // count producer, then emit the exact number of native
+                // indirect draws, preserving the guest command semantics.
+                self.scheduler.finish_all()?;
+                let mut bytes = [0; 4];
+                count_buffer.read(count_offset as usize, &mut bytes)?;
+                u32::from_ne_bytes(bytes).min(params.max_draw_counts as u32)
+            } else {
+                params.max_draw_counts as u32
+            };
+            Some(MetalIndirectBinding {
+                params,
+                buffer,
+                offset: offset as usize,
+                draw_count,
+            })
+        } else {
+            None
+        };
+
+        let render_targets = draw.render_targets();
+        let dirty_flags = *draw.dirty_flags();
+        self.texture_cache
+            .base
+            .update_render_targets_from_snapshot_with_dirty_flags(
+                &render_targets,
+                &dirty_flags,
+                |address, size| {
+                    memory_manager
+                        .as_ref()
+                        .and_then(|manager| manager.lock().gpu_to_cpu_address_range(address, size))
+                },
+            );
+
+        // Eden performs this after UpdateRenderTargets and before configuring
+        // the draw. Ending the current Metal encoder provides the required
+        // producer/consumer boundary without inventing a Vulkan-style layout.
+        let scheduler = self.scheduler.as_mut();
+        self.texture_cache
+            .base
+            .check_feedback_loop(&prepared.image_views, || scheduler.end_render_pass());
+
+        let visibility_query = self
+            .query_cache
+            .prepare_draw(self.scheduler.as_mut(), draw.zpass_pixel_count_enabled())?;
+        let visibility_result_buffer = visibility_query
+            .map(|_| self.query_cache.visibility_result_buffer_identity())
+            .unwrap_or(0);
+
+        let (render_pass, render_pass_key, render_area, pipeline_key) = {
+            let framebuffer = self.texture_cache.base.get_framebuffer()?;
+            let render_area = framebuffer.render_area();
+            let pipeline_key = self
+                .pipeline_cache
+                .make_render_pipeline_key(&stages, framebuffer)?;
+            (
+                framebuffer.render_pass_descriptor(),
+                framebuffer.render_pass_key(visibility_result_buffer),
+                render_area,
+                pipeline_key,
+            )
+        };
+        if visibility_query.is_some() {
+            self.query_cache.attach_render_pass(&render_pass);
+        }
+
+        patch_render_area(&mut prepared, &stages, render_area);
+        let pipeline_state = self
+            .pipeline_cache
+            .get_or_create_render_pipeline(pipeline_key, stages.vertex(), stages.fragment())?
+            .retained_state();
+        let depth_key = self
+            .pipeline_cache
+            .make_depth_stencil_key(&stages, &draw.depth_stencil());
+        let depth_state = self
+            .pipeline_cache
+            .retained_depth_stencil_state(depth_key)?;
+        let primitive_type = metal_primitive_type(draw.draw_state().topology)?;
+        let mut draw_params = make_draw_params(draw, instance_count);
+        if let Some(binding) = indirect_binding
+            .as_ref()
+            .filter(|binding| binding.params.is_byte_count)
+        {
+            // MTL has no draw-indirect-byte-count command. Eden's Vulkan path
+            // derives vertexCount from a transform-feedback byte counter; the
+            // synchronized fallback performs the same division explicitly.
+            self.scheduler.finish_all()?;
+            let mut bytes = [0; 4];
+            binding.buffer.read(binding.offset, &mut bytes)?;
+            draw_params.num_vertices =
+                u32::from_ne_bytes(bytes) / binding.params.stride.max(1) as u32;
+            draw_params.base_vertex = 0;
+            draw_params.is_indexed = false;
+        }
+        let rasterizer = draw.rasterizer();
+        if rasterizer.cull_enable && rasterizer.cull_face == CullFace::FrontAndBack {
+            return Ok(());
+        }
+        let blend_color = draw.blend_color();
+        let depth_stencil = draw.depth_stencil();
+        let viewport = metal_viewport(draw, render_area);
+        let scissor = metal_scissor(draw, render_area);
+        let vertex_layouts = pipeline_key.vertex_input.layouts;
+
+        self.scheduler
+            .begin_or_reuse_render_pass(&render_pass, render_pass_key)?;
+        self.scheduler.with_render_encoder(|encoder| {
+            MetalQueryCache::configure_draw(encoder, visibility_query);
+            encoder.setRenderPipelineState(&pipeline_state);
+            encoder.setDepthStencilState(Some(&depth_state));
+            encoder.setViewport(viewport);
+            encoder.setScissorRect(scissor);
+            encoder.setCullMode(if rasterizer.cull_enable {
+                match rasterizer.cull_face {
+                    CullFace::Front => MTLCullMode::Front,
+                    CullFace::Back => MTLCullMode::Back,
+                    CullFace::FrontAndBack => unreachable!("front-and-back culling returned above"),
+                }
+            } else {
+                MTLCullMode::None
+            });
+            encoder.setFrontFacingWinding(match rasterizer.front_face {
+                FrontFace::CW => MTLWinding::Clockwise,
+                FrontFace::CCW => MTLWinding::CounterClockwise,
+            });
+            encoder.setDepthBias_slopeScale_clamp(
+                rasterizer.depth_bias,
+                rasterizer.slope_scale_depth_bias,
+                rasterizer.depth_bias_clamp,
+            );
+            encoder.setBlendColorRed_green_blue_alpha(
+                blend_color.r,
+                blend_color.g,
+                blend_color.b,
+                blend_color.a,
+            );
+            if depth_stencil.stencil_two_side {
+                encoder.setStencilFrontReferenceValue_backReferenceValue(
+                    depth_stencil.front.ref_value,
+                    depth_stencil.back.ref_value,
+                );
+            } else {
+                encoder.setStencilReferenceValue(depth_stencil.front.ref_value);
+            }
+
+            bind_stage(encoder, &prepared.vertex, true);
+            bind_stage(encoder, &prepared.fragment, false);
+            unsafe {
+                for (source, layout) in vertex_layouts.iter().enumerate() {
+                    if !layout.enabled {
+                        continue;
+                    }
+                    let Some(binding) = prepared.vertex_buffers.get(source).and_then(Option::as_ref)
+                    else {
+                        continue;
+                    };
+                    encoder.setVertexBuffer_offset_atIndex(
+                        Some(binding.buffer.handle()),
+                        binding.offset,
+                        layout.buffer_index as usize,
+                    );
+                }
+
+                if let Some(binding) = indirect_binding
+                    .as_ref()
+                    .filter(|binding| !binding.params.is_byte_count)
+                {
+                    let stride = binding.params.stride as usize;
+                    if binding.params.is_indexed {
+                        let index = prepared
+                            .index_buffer
+                            .as_ref()
+                            .expect("indexed Metal indirect draw requires an index buffer binding");
+                        for draw_index in 0..binding.draw_count as usize {
+                            encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+                                primitive_type,
+                                index.index_type,
+                                index.buffer.handle(),
+                                index.offset,
+                                binding.buffer.handle(),
+                                binding.offset + draw_index * stride,
+                            );
+                        }
+                    } else {
+                        for draw_index in 0..binding.draw_count as usize {
+                            encoder.drawPrimitives_indirectBuffer_indirectBufferOffset(
+                                primitive_type,
+                                binding.buffer.handle(),
+                                binding.offset + draw_index * stride,
+                            );
+                        }
+                    }
+                } else if draw_params.is_indexed {
+                    let binding = prepared
+                        .index_buffer
+                        .as_ref()
+                        .expect("indexed Metal draw requires an index buffer binding");
+                    let index_size = match binding.index_type {
+                        objc2_metal::MTLIndexType::UInt16 => 2,
+                        objc2_metal::MTLIndexType::UInt32 => 4,
+                        _ => 4,
+                    };
+                    encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                        primitive_type,
+                        draw_params.num_vertices as usize,
+                        binding.index_type,
+                        binding.buffer.handle(),
+                        binding.offset + draw_params.first_index as usize * index_size,
+                        draw_params.num_instances as usize,
+                        draw_params.base_vertex as isize,
+                        draw_params.base_instance as usize,
+                    );
+                } else {
+                    encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                        primitive_type,
+                        draw_params.base_vertex.max(0) as usize,
+                        draw_params.num_vertices as usize,
+                        draw_params.num_instances as usize,
+                        draw_params.base_instance as usize,
+                    );
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    pub fn draw_indirect(
+        &mut self,
+        indirect_view: &mut Maxwell3DIndirectView<'_>,
+    ) -> Result<(), MetalRasterizerError> {
+        let params = *indirect_view.params();
+        self.common_buffer_cache
+            .set_draw_indirect(Some(CacheDrawIndirectParams {
+                indirect_start_address: params.indirect_start_address,
+                count_start_address: params.count_start_address,
+                buffer_size: params.buffer_size as u64,
+                max_draw_counts: params.max_draw_counts as u32,
+                stride: params.stride as u32,
+                include_count: params.include_count,
+            }));
+        let instance_count = indirect_view.draw_view_mut().draw_state().instance_count;
+        let result = self.draw_impl(indirect_view.draw_view_mut(), instance_count, Some(params));
+        self.common_buffer_cache.set_draw_indirect(None);
+        result
+    }
+
+    /// Port of Eden `RasterizerVulkan::DrawTexture` using a native Metal
+    /// textured quad rather than a Vulkan render-pass helper.
+    pub fn draw_texture(
+        &mut self,
+        mut draw_texture_view: Maxwell3DDrawTextureView<'_>,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        let state = draw_texture_view.draw_texture_state();
+        let render_targets = draw_texture_view.render_targets();
+        let original_dirty_flags = *draw_texture_view.dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
+        let memory_manager = self.channel_memory_manager.as_ref().cloned();
+
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache
+            .synchronize_graphics_descriptors(draw_texture_view.descriptor_sync_regs());
+        self.texture_cache.base.update_render_targets_with_snapshot(
+            &render_targets,
+            &mut dirty_flags,
+            |address, size| {
+                memory_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().gpu_to_cpu_address_range(address, size))
+            },
+            false,
+            None,
+        );
+        for (index, (&was_dirty, &is_dirty)) in original_dirty_flags
+            .iter()
+            .zip(dirty_flags.iter())
+            .enumerate()
+        {
+            if was_dirty && !is_dirty {
+                draw_texture_view.clear_dirty_flag(index as u8);
+            }
+        }
+
+        let sampler_id = self.texture_cache.get_sampler_id(state.src_sampler, false);
+        let Some(sampler) = self
+            .texture_cache
+            .sampler(sampler_id)
+            .map(|sampler| sampler.retained_handle())
+        else {
+            log::warn!(
+                "Metal DrawTexture skipped: invalid sampler {}",
+                state.src_sampler
+            );
+            return Ok(());
+        };
+        let Some((source, source_width, source_height, source_rescaled)) =
+            self.texture_cache.draw_texture_source(state.src_texture)
+        else {
+            log::warn!(
+                "Metal DrawTexture skipped: invalid texture {}",
+                state.src_texture
+            );
+            return Ok(());
+        };
+        let (render_pass, signature, render_area) = {
+            let framebuffer = self.texture_cache.base.get_framebuffer()?;
+            (
+                framebuffer.render_pass_descriptor(),
+                framebuffer.signature(),
+                framebuffer.render_area(),
+            )
+        };
+        let visibility_query = self.query_cache.prepare_draw(
+            self.scheduler.as_mut(),
+            draw_texture_view.zpass_pixel_count_enabled(),
+        )?;
+        if visibility_query.is_some() {
+            self.query_cache.attach_render_pass(&render_pass);
+        }
+
+        let destination_rescaled = self.texture_cache.base.is_rescaling;
+        let resolution = common::settings::values().resolution_info.clone();
+        let scale = |value: f32, rescaled: bool| {
+            let value = value as i32;
+            if rescaled {
+                resolution.scale_up_i32(value)
+            } else {
+                value
+            }
+        };
+        let dst = MetalBlitRegion {
+            start: (
+                scale(state.dst_x0, destination_rescaled),
+                scale(state.dst_y0, destination_rescaled),
+            ),
+            end: (
+                scale(state.dst_x1, destination_rescaled),
+                scale(state.dst_y1, destination_rescaled),
+            ),
+        };
+        let src = MetalBlitRegion {
+            start: (
+                scale(state.src_x0, source_rescaled),
+                scale(state.src_y0, source_rescaled),
+            ),
+            end: (
+                scale(state.src_x1, source_rescaled),
+                scale(state.src_y1, source_rescaled),
+            ),
+        };
+        let source_size = if source_rescaled {
+            (
+                resolution.scale_up_u32(source_width),
+                resolution.scale_up_u32(source_height),
+            )
+        } else {
+            (source_width, source_height)
+        };
+        self.blit_image.blit_color_with_sampler(
+            self.scheduler.as_mut(),
+            &render_pass,
+            signature,
+            render_area,
+            &source,
+            &sampler,
+            dst,
+            src,
+            source_size,
+            visibility_query,
+        )?;
+        Ok(())
+    }
+
+    /// Port of Eden `RasterizerVulkan::Clear` for full attachment clears.
+    /// Scissored and channel-masked clears are kept out of this path because
+    /// Metal load actions cannot express them; `MetalBlitHelper` owns that
+    /// shader-based prerequisite.
+    pub fn clear(
+        &mut self,
+        mut clear_view: Maxwell3DClearView<'_>,
+        layer_count: u32,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        let state = clear_view.clear_state();
+        let use_depth = state.flags & (1 << 0) != 0;
+        let use_stencil = state.flags & (1 << 1) != 0;
+        let use_r = state.flags & (1 << 2) != 0;
+        let use_g = state.flags & (1 << 3) != 0;
+        let use_b = state.flags & (1 << 4) != 0;
+        let use_a = state.flags & (1 << 5) != 0;
+        let use_color = use_r || use_g || use_b || use_a;
+        if !use_color && !use_depth && !use_stencil {
+            return Ok(());
+        }
+
+        let render_targets = clear_view.render_targets();
+        let clear_scissor = clear_view.use_scissor().then(|| {
+            let scissor = clear_view.scissor(0);
+            (scissor.min_x, scissor.min_y, scissor.max_x, scissor.max_y)
+        });
+        let original_dirty_flags = *clear_view.dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
+        let memory_manager = self.channel_memory_manager.as_ref().cloned();
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.update_render_targets_with_snapshot(
+            &render_targets,
+            &mut dirty_flags,
+            |address, size| {
+                memory_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().gpu_to_cpu_address_range(address, size))
+            },
+            true,
+            clear_scissor,
+        );
+        for (index, (&was_dirty, &is_dirty)) in original_dirty_flags
+            .iter()
+            .zip(dirty_flags.iter())
+            .enumerate()
+        {
+            if was_dirty && !is_dirty {
+                clear_view.clear_dirty_flag(index as u8);
+            }
+        }
+
+        let depth_stencil = clear_view.depth_stencil();
+        let color_attachment = ((state.flags >> 6) & 0xf) as usize;
+        let clear_layer = (state.flags >> 10) & 0xffff;
+        let color_mask = u8::from(use_r)
+            | (u8::from(use_g) << 1)
+            | (u8::from(use_b) << 2)
+            | (u8::from(use_a) << 3);
+        let stencil_mask = depth_stencil.front.write_mask;
+        let stencil_partial = use_stencil && stencil_mask != 0 && stencil_mask != 0xff;
+        let (signature, render_area, color_present, depth_present, stencil_present) = {
+            let framebuffer = self.texture_cache.base.get_framebuffer()?;
+            let signature = framebuffer.signature();
+            let color_present = use_color
+                && signature
+                    .color_formats
+                    .get(color_attachment)
+                    .is_some_and(|format| *format != objc2_metal::MTLPixelFormat::Invalid);
+            (
+                signature,
+                framebuffer.render_area(),
+                color_present,
+                use_depth && framebuffer.has_depth(),
+                use_stencil && framebuffer.has_stencil(),
+            )
+        };
+        if !color_present && !depth_present && !stencil_present {
+            return Ok(());
+        }
+        let color_format = color_present.then(|| {
+            crate::surface::pixel_format_from_render_target_format(
+                render_targets.render_targets[color_attachment].format,
+            )
+        });
+        // VkClearValue carries integer attachments as typed integer payloads.
+        // MTLClearColor is floating-point, so keep integer clears on the typed
+        // shader path even when every channel and the full extent are selected.
+        let color_is_integer = color_format.is_some_and(crate::surface::is_pixel_format_integer);
+        let full_clear = !clear_view.use_scissor()
+            && (!use_color || color_mask == 0xf)
+            && !color_is_integer
+            && !stencil_partial;
+
+        if full_clear {
+            for layer in 0..layer_count.max(1) {
+                let descriptor = {
+                    let framebuffer = self.texture_cache.base.get_framebuffer()?;
+                    framebuffer.clear_render_pass_descriptor(MetalFramebufferClear {
+                        color: color_present.then_some((color_attachment, state.color)),
+                        depth: depth_present.then_some(state.depth),
+                        stencil: stencil_present.then_some(state.stencil as u32),
+                        base_layer: clear_layer + layer,
+                        layer_count: 1,
+                    })
+                };
+                self.scheduler.begin_render_pass(&descriptor)?;
+                self.scheduler.end_render_pass();
+            }
+            return Ok(());
+        }
+
+        let resolution = common::settings::values().resolution_info.clone();
+        let (up_scale, down_shift) = if self.texture_cache.base.is_rescaling {
+            (resolution.up_scale, resolution.down_shift)
+        } else {
+            (1, 0)
+        };
+        let mut region = if clear_view.use_scissor() {
+            let scissor = clear_view.scissor(0);
+            let (min_y, max_y) = if clear_view.window_origin_lower_left() {
+                (
+                    render_targets
+                        .surface_clip
+                        .height
+                        .saturating_sub(scissor.max_y),
+                    render_targets
+                        .surface_clip
+                        .height
+                        .saturating_sub(scissor.min_y),
+                )
+            } else {
+                (scissor.min_y, scissor.max_y)
+            };
+            MetalBlitRegion {
+                start: (
+                    (scissor.min_x.wrapping_mul(up_scale) >> down_shift) as i32,
+                    (min_y.wrapping_mul(up_scale) >> down_shift) as i32,
+                ),
+                end: (
+                    (scissor.max_x.wrapping_mul(up_scale) >> down_shift) as i32,
+                    (max_y.wrapping_mul(up_scale) >> down_shift) as i32,
+                ),
+            }
+        } else {
+            MetalBlitRegion {
+                start: (0, 0),
+                end: (render_area.0 as i32, render_area.1 as i32),
+            }
+        };
+        region.start.0 = region.start.0.clamp(0, render_area.0 as i32);
+        region.start.1 = region.start.1.clamp(0, render_area.1 as i32);
+        region.end.0 = region.end.0.clamp(region.start.0, render_area.0 as i32);
+        region.end.1 = region.end.1.clamp(region.start.1, render_area.1 as i32);
+        if region.start == region.end {
+            return Ok(());
+        }
+
+        let color_type = match color_format {
+            Some(format) if crate::surface::is_pixel_format_signed_integer(format) => {
+                MetalClearColorType::Sint
+            }
+            Some(format) if crate::surface::is_pixel_format_integer(format) => {
+                MetalClearColorType::Uint
+            }
+            _ => MetalClearColorType::Float,
+        };
+        let mut signed_color = [0; 4];
+        let mut unsigned_color = [0; 4];
+        if let Some(format) =
+            color_format.filter(|format| crate::surface::is_pixel_format_integer(*format))
+        {
+            let bits = crate::surface::pixel_component_size_bits_integer(format);
+            if crate::surface::is_pixel_format_signed_integer(format) {
+                let scale = (((bits - 1) as i64) << 1) as f32;
+                signed_color = state
+                    .color
+                    .map(|component| (scale * (component - 0.5)) as i32);
+            } else {
+                let scale = ((bits as u64) << 1) as f32;
+                unsigned_color = state.color.map(|component| (scale * component) as u32);
+            }
+        }
+        for layer in 0..layer_count.max(1) {
+            let render_pass = {
+                let framebuffer = self.texture_cache.base.get_framebuffer()?;
+                framebuffer.render_pass_descriptor_for_layer(clear_layer + layer)
+            };
+            self.blit_image.clear_attachments(
+                self.scheduler.as_mut(),
+                &render_pass,
+                signature,
+                color_present.then_some(color_attachment as u8),
+                color_type,
+                color_mask,
+                depth_present,
+                stencil_present,
+                stencil_mask,
+                MetalClearParameters {
+                    region,
+                    render_area,
+                    color: state.color,
+                    signed_color,
+                    unsigned_color,
+                    depth: state.depth,
+                    stencil: state.stencil as u32,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Port of Eden `RasterizerVulkan::DispatchCompute` using one native
+    /// Metal compute encoder in the scheduler's guest-order command buffer.
+    pub fn dispatch_compute(
+        &mut self,
+        dispatch: &DispatchCall,
+    ) -> Result<(), MetalRasterizerError> {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        let Some(pipeline) = self
+            .pipeline_cache
+            .current_compute_pipeline(&mut self.shader_cache)?
+        else {
+            return Ok(());
+        };
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return Ok(());
+        };
+        let read_gpu = |address: u64, output: &mut [u8]| {
+            memory_manager.lock().read_block_unsafe(address, output);
+        };
+        let buffer_cache_mutex: *const _ = Arc::as_ptr(&self.common_buffer_cache.mutex);
+        let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(
+            buffer_cache_mutex,
+            texture_cache_mutex,
+            _buffer_cache_guard,
+            _texture_cache_guard
+        );
+        let prepared = configure_compute_resources(
+            &self.device,
+            &pipeline,
+            dispatch,
+            self.common_buffer_cache.as_mut(),
+            self.texture_cache.as_mut(),
+            read_gpu,
+        )?;
+
+        let workgroup = pipeline.key().workgroup_size;
+        let maximum = self.device.profile().max_threads_per_threadgroup;
+        let total_threads = workgroup
+            .iter()
+            .fold(1u64, |total, value| total.saturating_mul(*value as u64));
+        if workgroup[0] as usize > maximum.0
+            || workgroup[1] as usize > maximum.1
+            || workgroup[2] as usize > maximum.2
+            || total_threads > pipeline.state().maxTotalThreadsPerThreadgroup() as u64
+        {
+            return Err(MetalRasterizerError::UnsupportedComputeWorkgroup {
+                requested: workgroup,
+                maximum,
+            });
+        }
+        let threads_per_threadgroup = MTLSize {
+            width: workgroup[0].max(1) as usize,
+            height: workgroup[1].max(1) as usize,
+            depth: workgroup[2].max(1) as usize,
+        };
+        let pipeline_state = pipeline.retained_state();
+
+        if let Some(indirect_address) = dispatch.indirect_compute_address {
+            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
+                indirect_address,
+                12,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DiscardWrite,
+            );
+            let Some(indirect_buffer) = self
+                .common_buffer_cache
+                .backend_buffer(buffer_id)
+                .map(|buffer| buffer.handle())
+            else {
+                return Ok(());
+            };
+            self.scheduler.with_compute_encoder(|encoder| unsafe {
+                encoder.setComputePipelineState(&pipeline_state);
+                bind_compute_resources(encoder, &prepared);
+                encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    indirect_buffer.handle(),
+                    offset as usize,
+                    threads_per_threadgroup,
+                );
+            })?;
+            return Ok(());
+        }
+
+        let grid = &dispatch.launch_description;
+        let threadgroups_per_grid = MTLSize {
+            width: grid.grid_dim_x as usize,
+            height: grid.grid_dim_y as usize,
+            depth: grid.grid_dim_z as usize,
+        };
+        self.scheduler.with_compute_encoder(|encoder| {
+            encoder.setComputePipelineState(&pipeline_state);
+            bind_compute_resources(encoder, &prepared);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                threadgroups_per_grid,
+                threads_per_threadgroup,
+            );
+        })?;
+        Ok(())
+    }
+
+    pub fn tick_frame(&mut self) {
+        self.texture_cache.tick_frame();
+        self.common_buffer_cache.tick_frame();
+    }
+
+    pub fn finish(&mut self) -> Result<(), MetalRasterizerError> {
+        self.scheduler.finish_all()?;
+        Ok(())
+    }
+
+    fn create_fence(&mut self, is_stubbed: bool) -> MetalFence {
+        if is_stubbed || !self.scheduler.has_active_work() {
+            return MetalFence::stubbed();
+        }
+        MetalFence::from_command_buffer(
+            self.scheduler
+                .active_command_buffer()
+                .expect("Metal fence command buffer allocation failed"),
+        )
+    }
+
+    fn flush_commands_for_fence(&mut self) {
+        if let Err(error) = self.scheduler.flush() {
+            log::error!("Metal fence submission failed: {error}");
+        }
+    }
+
+    fn invalidate_gpu_cache_callback(&self) {
+        if let Some(callback) = &self.invalidate_gpu_cache_callback {
+            callback();
+        }
+    }
+}
+
+impl RasterizerInterface for MetalRasterizer {
+    fn load_disk_resources(
+        &mut self,
+        title_id: u64,
+        stop_loading: crate::rasterizer_interface::DiskResourceLoadStop,
+        callback: crate::rasterizer_interface::DiskResourceLoadCallback,
+    ) {
+        let shader_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir);
+        self.pipeline_cache
+            .load_disk_resources(title_id, &shader_dir, stop_loading, callback);
+    }
+
+    fn draw(&mut self, mut draw_view: Maxwell3DDrawView<'_>, instance_count: u32) {
+        if let Err(error) = MetalRasterizer::draw(self, &mut draw_view, instance_count) {
+            log::error!("Metal draw failed: {error}");
+        }
+    }
+
+    fn draw_indirect(&mut self, mut indirect_view: Maxwell3DIndirectView<'_>) {
+        if let Err(error) = MetalRasterizer::draw_indirect(self, &mut indirect_view) {
+            log::error!("Metal indirect draw failed: {error}");
+        }
+    }
+
+    fn draw_texture(&mut self, draw_texture_view: Maxwell3DDrawTextureView<'_>) {
+        if let Err(error) = MetalRasterizer::draw_texture(self, draw_texture_view) {
+            log::error!("Metal draw-texture failed: {error}");
+        }
+    }
+
+    fn clear(&mut self, clear_view: Maxwell3DClearView<'_>, layer_count: u32) {
+        if let Err(error) = MetalRasterizer::clear(self, clear_view, layer_count) {
+            log::error!("Metal clear failed: {error}");
+        }
+    }
+
+    fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
+        if let Err(error) = MetalRasterizer::dispatch_compute(self, dispatch) {
+            log::error!("Metal compute dispatch failed: {error}");
+        }
+    }
+
+    fn reset_counter(&mut self, query_type: u32) {
+        self.query_cache.reset_counter(query_type);
+    }
+
+    fn query(
+        &mut self,
+        gpu_addr: u64,
+        query_type: u32,
+        flags: QueryPropertiesFlags,
+        payload: u32,
+        _subreport: u32,
+    ) {
+        let report = self.query_cache.report(
+            self.scheduler.as_mut(),
+            self.channel_memory_manager.clone(),
+            self.gpu_ticks_getter.clone(),
+            gpu_addr,
+            query_type,
+            flags,
+            payload,
+        );
+        match report {
+            Ok(MetalQueryReport::Complete) => {}
+            Ok(MetalQueryReport::SignalFence(operation)) => self.signal_fence(operation),
+            Ok(MetalQueryReport::SyncOperation(operation)) => self.sync_operation(operation),
+            Err(error) => log::error!("Metal query report failed: {error}"),
+        }
+    }
+
+    fn bind_graphics_uniform_buffer(&mut self, stage: usize, index: u32, gpu_addr: u64, size: u32) {
+        self.common_buffer_cache
+            .bind_graphics_uniform_buffer(stage, index, gpu_addr, size);
+    }
+
+    fn disable_graphics_uniform_buffer(&mut self, stage: usize, index: u32) {
+        self.common_buffer_cache
+            .disable_graphics_uniform_buffer(stage, index);
+    }
+
+    fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
+        let this = self as *mut Self;
+        self.fence_manager.signal_fence(
+            func,
+            move |is_stubbed| unsafe { (*this).create_fence(is_stubbed) },
+            |_fence| {},
+            || false,
+            |fence| fence.is_signaled(),
+            || {},
+            move || unsafe { (*this).scheduler.has_active_work() },
+            || {},
+            move || unsafe { (*this).flush_commands_for_fence() },
+            move || unsafe { (*this).invalidate_gpu_cache_callback() },
+        );
+    }
+
+    fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
+        self.fence_manager.sync_operation(func);
+    }
+
+    fn signal_sync_point(&mut self, value: u32) {
+        let this = self as *mut Self;
+        let syncpoints = Arc::clone(&self.syncpoints);
+        self.fence_manager.signal_sync_point(
+            value,
+            {
+                let syncpoints = Arc::clone(&syncpoints);
+                move |id| syncpoints.increment_guest(id)
+            },
+            move |id| syncpoints.increment_host(id),
+            move |is_stubbed| unsafe { (*this).create_fence(is_stubbed) },
+            |_fence| {},
+            || false,
+            |fence| fence.is_signaled(),
+            || {},
+            move || unsafe { (*this).scheduler.has_active_work() },
+            || {},
+            move || unsafe { (*this).flush_commands_for_fence() },
+            move || unsafe { (*this).invalidate_gpu_cache_callback() },
+        );
+    }
+
+    fn signal_reference(&mut self) {
+        let this = self as *mut Self;
+        self.fence_manager.signal_reference(
+            move |is_stubbed| unsafe { (*this).create_fence(is_stubbed) },
+            |_fence| {},
+            || false,
+            |fence| fence.is_signaled(),
+            || {},
+            move || unsafe { (*this).scheduler.has_active_work() },
+            || {},
+            move || unsafe { (*this).flush_commands_for_fence() },
+            move || unsafe { (*this).invalidate_gpu_cache_callback() },
+        );
+    }
+
+    fn release_fences(&mut self, force: bool) {
+        let this = self as *mut Self;
+        self.fence_manager.wait_pending_fences(
+            force,
+            move |is_stubbed| unsafe { (*this).create_fence(is_stubbed) },
+            |_fence| {},
+            || false,
+            |fence| fence.is_signaled(),
+            |fence| fence.wait_for_fence(),
+            || {},
+            move || unsafe { (*this).scheduler.has_active_work() },
+            || {},
+            move || unsafe { (*this).flush_commands_for_fence() },
+            move || unsafe { (*this).invalidate_gpu_cache_callback() },
+        );
+    }
+
+    fn flush_all(&mut self) {}
+
+    fn flush_region(&mut self, addr: u64, size: u64, which: CacheType) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        if which.contains(CacheType::TEXTURE_CACHE) {
+            let mutex: *const _ = &self.texture_cache.base.mutex;
+            let _guard = unsafe { (*mutex).lock() };
+            self.texture_cache.base.download_memory(addr, size as usize);
+        }
+        if which.contains(CacheType::BUFFER_CACHE) {
+            let mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _guard = unsafe { (*mutex).lock() };
+            self.common_buffer_cache.download_memory(addr, size);
+        }
+    }
+
+    fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool {
+        if which.contains(CacheType::BUFFER_CACHE) {
+            let _guard = self.common_buffer_cache.mutex.lock();
+            if self
+                .common_buffer_cache
+                .is_region_gpu_modified(addr, size as usize)
+            {
+                return true;
+            }
+        }
+        if !common::settings::is_gpu_level_high(&common::settings::values()) {
+            return false;
+        }
+        if which.contains(CacheType::TEXTURE_CACHE) {
+            let _guard = self.texture_cache.base.mutex.lock();
+            return self
+                .texture_cache
+                .base
+                .is_region_gpu_modified(addr, size as usize);
+        }
+        false
+    }
+
+    fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+        let mutex: *const _ = &self.texture_cache.base.mutex;
+        let _guard = unsafe { (*mutex).lock() };
+        let cache = &*self.texture_cache as *const MetalTextureCache as *mut MetalTextureCache;
+        if let Some(area) = unsafe { (*cache).base.get_flush_area(addr, size as usize) } {
+            return area;
+        }
+        const PAGE: u64 = 4096;
+        RasterizerDownloadArea {
+            start_address: addr & !(PAGE - 1),
+            end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
+            preemtive: true,
+        }
+    }
+
+    fn invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        if which.contains(CacheType::TEXTURE_CACHE) {
+            let mutex: *const _ = &self.texture_cache.base.mutex;
+            let _guard = unsafe { (*mutex).lock() };
+            self.texture_cache.base.write_memory(addr, size as usize);
+        }
+        if which.contains(CacheType::BUFFER_CACHE) {
+            let mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _guard = unsafe { (*mutex).lock() };
+            self.common_buffer_cache.write_memory(addr, size);
+        }
+        if which.contains(CacheType::SHADER_CACHE) {
+            self.shader_cache.invalidate_region(addr, size as usize);
+        }
+    }
+
+    fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        for &(addr, size) in sequences {
+            self.texture_cache.base.write_memory(addr, size);
+        }
+        drop(_texture_guard);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let _buffer_guard = unsafe { (*buffer_mutex).lock() };
+        for &(addr, size) in sequences {
+            self.common_buffer_cache.write_memory(addr, size as u64);
+        }
+        drop(_buffer_guard);
+        for &(addr, size) in sequences {
+            self.shader_cache.invalidate_region(addr, size);
+        }
+    }
+
+    fn on_cache_invalidation(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.write_memory(addr, size as usize);
+        drop(_texture_guard);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let _buffer_guard = unsafe { (*buffer_mutex).lock() };
+        self.common_buffer_cache.write_memory(addr, size);
+        drop(_buffer_guard);
+        self.shader_cache.on_cache_invalidation(addr, size as usize);
+    }
+
+    fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
+        debug_assert!(addr != 0 || size != 0);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let _buffer_guard = unsafe { (*buffer_mutex).lock() };
+        let handled = self.common_buffer_cache.on_cpu_write(addr, size);
+        drop(_buffer_guard);
+        if handled {
+            return true;
+        }
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.write_memory(addr, size as usize);
+        drop(_texture_guard);
+        self.shader_cache.invalidate_region(addr, size as usize);
+        false
+    }
+
+    fn invalidate_gpu_cache(&mut self) {
+        self.invalidate_gpu_cache_callback();
+    }
+
+    fn unmap_memory(&mut self, addr: u64, size: u64) {
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.unmap_memory(addr, size as usize);
+        drop(_texture_guard);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let _buffer_guard = unsafe { (*buffer_mutex).lock() };
+        self.common_buffer_cache.write_memory(addr, size);
+        drop(_buffer_guard);
+        self.shader_cache.on_cache_invalidation(addr, size as usize);
+    }
+
+    fn modify_gpu_memory(&mut self, as_id: usize, addr: u64, size: u64) {
+        let mutex: *const _ = &self.texture_cache.base.mutex;
+        let _guard = unsafe { (*mutex).lock() };
+        self.texture_cache
+            .base
+            .unmap_gpu_memory(as_id, addr, size as usize);
+    }
+
+    fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
+        if common::settings::is_gpu_level_high(&common::settings::values()) {
+            self.flush_region(addr, size, which);
+        }
+        self.invalidate_region(addr, size, which);
+    }
+
+    fn wait_for_idle(&mut self) {
+        self.scheduler
+            .request_outside_render_pass_operation_context();
+        let this = self as *mut Self;
+        self.fence_manager.signal_ordering(
+            || false,
+            |fence| fence.is_signaled(),
+            || {},
+            move || unsafe { (*this).common_buffer_cache.flush_cached_writes() },
+        );
+    }
+
+    fn fragment_barrier(&mut self) {
+        self.scheduler
+            .request_outside_render_pass_operation_context();
+    }
+
+    fn tiled_cache_barrier(&mut self) {}
+
+    fn flush_commands(&mut self) {
+        self.flush_commands_for_fence();
+    }
+
+    fn tick_frame(&mut self) {
+        self.fence_manager.tick_frame();
+        MetalRasterizer::tick_frame(self);
+    }
+
+    fn access_accelerate_dma(&mut self) -> &mut dyn AccelerateDMAInterface {
+        &mut self.accelerate_dma
+    }
+
+    fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
+        debug_assert!(copy_size <= memory.len());
+        if copy_size == 0 {
+            return;
+        }
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let memory = unsafe { std::slice::from_raw_parts(memory.as_ptr(), copy_size) };
+        let manager = memory_manager.lock();
+        let cpu_addr = manager.gpu_to_cpu_address(address);
+        if cpu_addr.is_none() {
+            manager.write_block(address, memory);
+            return;
+        }
+        manager.write_block_unsafe(address, memory);
+        drop(manager);
+        let cpu_addr = cpu_addr.unwrap();
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let _buffer_guard = unsafe { (*buffer_mutex).lock() };
+        if !self
+            .common_buffer_cache
+            .inline_memory(cpu_addr, copy_size, memory)
+        {
+            self.common_buffer_cache
+                .write_memory(cpu_addr, copy_size as u64);
+        }
+        drop(_buffer_guard);
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.write_memory(cpu_addr, copy_size);
+        drop(_texture_guard);
+        self.shader_cache.invalidate_region(cpu_addr, copy_size);
+    }
+
+    fn initialize_channel(&mut self, channel: &mut ChannelState) {
+        MetalRasterizer::initialize_channel(self, channel);
+    }
+
+    fn bind_channel(&mut self, channel: &mut ChannelState) {
+        MetalRasterizer::bind_channel(self, channel);
+    }
+
+    fn release_channel(&mut self, channel_id: i32) {
+        MetalRasterizer::release_channel(self, channel_id);
+    }
+}
+
+fn patch_render_area(
+    prepared: &mut MetalPreparedGraphics,
+    stages: &super::metal_pipeline_cache::MetalGraphicsShaderStages,
+    render_area: (u32, u32),
+) {
+    let words = [render_area.0 as f32, render_area.1 as f32, 0.0, 0.0];
+    let bytes = bytemuck::cast_slice::<f32, u8>(&words);
+    if stages.stage_infos()[0].uses_render_area {
+        if let Some((_, data)) = prepared.vertex.push_constants.as_mut() {
+            data[..16].copy_from_slice(bytes);
+        }
+    }
+    if stages.stage_infos()[4].uses_render_area {
+        if let Some((_, data)) = prepared.fragment.push_constants.as_mut() {
+            data[..16].copy_from_slice(bytes);
+        }
+    }
+}
+
+fn metal_viewport(draw: &Maxwell3DDrawView<'_>, render_area: (u32, u32)) -> MTLViewport {
+    let surface = draw.surface_clip();
+    if !draw.viewport_scale_offset_enabled() {
+        return MTLViewport {
+            originX: surface.x as f64,
+            originY: surface.y as f64,
+            width: surface.width.max(1).min(render_area.0.max(1)) as f64,
+            height: surface.height.max(1).min(render_area.1.max(1)) as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        };
+    }
+    let source = draw.viewport_transform(0);
+    let mut x = source.translate_x - source.scale_x;
+    let mut y = source.translate_y - source.scale_y;
+    let mut width = source.scale_x * 2.0;
+    let mut height = source.scale_y * 2.0;
+    if width < 0.0 {
+        x += width;
+        width = -width;
+    }
+    if height < 0.0 {
+        y += height;
+        height = -height;
+    }
+    let reduce_z = if draw.depth_mode() == crate::engines::maxwell_3d::DepthMode::MinusOneToOne {
+        1.0
+    } else {
+        0.0
+    };
+    MTLViewport {
+        originX: x.max(0.0) as f64,
+        originY: y.max(0.0) as f64,
+        width: width.max(1.0).min(render_area.0.max(1) as f32) as f64,
+        height: height.max(1.0).min(render_area.1.max(1) as f32) as f64,
+        znear: (source.translate_z - source.scale_z * reduce_z).clamp(0.0, 1.0) as f64,
+        zfar: (source.translate_z + source.scale_z).clamp(0.0, 1.0) as f64,
+    }
+}
+
+fn metal_scissor(draw: &Maxwell3DDrawView<'_>, render_area: (u32, u32)) -> MTLScissorRect {
+    let source = draw.scissor(0);
+    if !source.enabled {
+        return MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: render_area.0.max(1) as usize,
+            height: render_area.1.max(1) as usize,
+        };
+    }
+    let min_x = source.min_x.min(render_area.0);
+    let min_y = source.min_y.min(render_area.1);
+    let max_x = source.max_x.min(render_area.0).max(min_x);
+    let max_y = source.max_y.min(render_area.1).max(min_y);
+    MTLScissorRect {
+        x: min_x as usize,
+        y: min_y as usize,
+        width: max_x.saturating_sub(min_x).max(1) as usize,
+        height: max_y.saturating_sub(min_y).max(1) as usize,
+    }
+}
+
+impl Drop for MetalRasterizer {
+    fn drop(&mut self) {
+        <Self as RasterizerInterface>::release_fences(self, true);
+        if let Err(error) = self.scheduler.finish_all() {
+            log::error!("Metal rasterizer shutdown failed: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owns_one_scheduler_and_shared_cache_runtime() {
+        let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let syncpoints = Arc::new(SyncpointManager::new());
+        let mut rasterizer = MetalRasterizer::new(device, syncpoints, device_memory).unwrap();
+
+        let initial_tick = rasterizer.scheduler().current_tick();
+        rasterizer.tick_frame();
+        rasterizer.finish().unwrap();
+        assert_eq!(rasterizer.scheduler().current_tick(), initial_tick);
+    }
+}

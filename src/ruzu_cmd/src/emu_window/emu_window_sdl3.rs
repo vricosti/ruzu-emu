@@ -18,8 +18,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use common::settings_enums::FullscreenMode;
-use hid_core::frontend::emulated_controller::set_simple_npad_button;
-use hid_core::hid_types::NpadButton;
 use input_common::drivers::mouse::MouseButton;
 use input_common::InputSubsystem;
 use ruzu_core::core::SystemRef;
@@ -31,97 +29,6 @@ use ruzu_core::perf_stats::PerfStatsResults;
 // SDL_TOUCH_MOUSEID is defined in SDL_touch.h as ((Uint32)-1).
 // It is not exported by sdl3-sys as a Rust constant, so we define it here.
 const SDL_TOUCH_MOUSEID: sdl::SDL_MouseID = sdl::SDL_TOUCH_MOUSEID;
-
-/// Schedule an environment-gated L+R press for frontend diagnostics.
-///
-/// This uses the diagnostic Player1 NPad bridge, avoiding host
-/// accessibility/automation permissions while testing title-screen input.
-pub fn schedule_auto_lr_if_requested() {
-    let Some(delay_ms) = std::env::var("RUZU_AUTO_LR_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
-        return;
-    };
-    let repeat_count = std::env::var("RUZU_AUTO_LR_REPEAT_COUNT")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(1)
-        .max(1);
-    let repeat_ms = std::env::var("RUZU_AUTO_LR_REPEAT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(2_000);
-
-    let _ = std::thread::Builder::new()
-        .name("AutoInput".to_string())
-        .spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-            for attempt in 1..=repeat_count {
-                log::info!("[AUTO_INPUT] pressing L+R attempt={attempt}/{repeat_count}");
-                set_simple_npad_button(NpadButton::L, true);
-                set_simple_npad_button(NpadButton::R, true);
-                std::thread::sleep(Duration::from_millis(350));
-                set_simple_npad_button(NpadButton::R, false);
-                set_simple_npad_button(NpadButton::L, false);
-                if attempt != repeat_count {
-                    std::thread::sleep(Duration::from_millis(repeat_ms));
-                }
-            }
-        });
-}
-
-/// Schedule environment-gated A presses for frontend diagnostics.
-///
-/// This is kept separate from the L+R trigger so a test can select the first
-/// highlighted Mii after the title-screen input has been accepted.
-pub fn schedule_auto_a_if_requested() {
-    let Some(delay_ms) = std::env::var("RUZU_AUTO_A_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
-        return;
-    };
-    let repeat_count = std::env::var("RUZU_AUTO_A_REPEAT_COUNT")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(1)
-        .max(1);
-    let repeat_ms = std::env::var("RUZU_AUTO_A_REPEAT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(2_000);
-    let marker = std::env::var_os("RUZU_AUTO_A_MARKER");
-    let marker_attempt = std::env::var("RUZU_AUTO_A_MARKER_ATTEMPT")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(repeat_count);
-    let marker_delay_ms = std::env::var("RUZU_AUTO_A_MARKER_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(500);
-
-    let _ = std::thread::Builder::new()
-        .name("AutoInputA".to_string())
-        .spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-            for attempt in 1..=repeat_count {
-                log::info!("[AUTO_INPUT] pressing A attempt={attempt}/{repeat_count}");
-                set_simple_npad_button(NpadButton::A, true);
-                std::thread::sleep(Duration::from_millis(350));
-                set_simple_npad_button(NpadButton::A, false);
-                if attempt == marker_attempt {
-                    if let Some(path) = marker.as_ref() {
-                        std::thread::sleep(Duration::from_millis(marker_delay_ms));
-                        let _ = std::fs::write(path, b"ready\n");
-                    }
-                }
-                if attempt != repeat_count {
-                    std::thread::sleep(Duration::from_millis(repeat_ms));
-                }
-            }
-        });
-}
 
 /// Whether the environment-gated benchmark sampler owns the destructive
 /// `PerfStats` read. The title bar reuses its last sample while this is set.
@@ -685,7 +592,10 @@ impl Drop for EmuWindowSdl3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hid_core::frontend::emulated_controller::get_simple_npad_button_state;
+    use hid_core::frontend::emulated_controller::{
+        get_simple_npad_button_state, set_simple_npad_button,
+    };
+    use hid_core::hid_types::NpadButton;
 
     #[test]
     fn key_events_do_not_update_the_diagnostic_npad_bridge() {

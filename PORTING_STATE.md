@@ -637,6 +637,35 @@
   payload instead of System V lane registers. Native `LDR Q`, `STR Q`, `LDXP`
   and `STXP` execution regressions pass, both native and MinGW checks pass, and
   the touched files emit no warning in either check.
+## 2026-08-21 — native Metal renderer for macOS
+
+- Status: implementing prerequisites on `dev/metal-renderer-macos`.
+- Interrupted slice: construct `RendererMetal` / `RasterizerMetal` and run a
+  commercial title through a visible race using Metal directly.
+- Confirmed structural constraint: Eden has no native Metal backend. Its
+  `RendererBase`, `RasterizerInterface`, Maxwell state and common cache
+  lifecycles remain authoritative, but Vulkan render passes, layouts,
+  descriptors and barriers cannot be transliterated into Metal concepts.
+- Completed prerequisites: native Metal device/queue ownership with a runtime capability profile,
+  generation-independent fallback policies, batched command scheduling with monotonic completion
+  ticks and exclusive encoder ownership, CAMetalLayer presentation, shared and private buffers,
+  private images, aspect-correct per-subresource image views, samplers, an upstream-ordered
+  timeline-safe staging pool, device-aware direct format mapping and SPIR-V-to-MSL translation
+  with explicit Metal resource indices. Shader-recompiler SPIR-V now compiles through MSL into
+  native `MTLLibrary`/`MTLFunction` objects, and native render/compute pipeline states are keyed,
+  compiled and cache-tested. Direct resource bindings are reflected per module, compacted into
+  independent Metal namespaces, device-limit checked and retained as the runtime shader ABI.
+- Current prerequisite: implement the Metal buffer/texture cache runtimes and make draw/dispatch
+  consume the retained shader binding layout. This requires native
+  UInt8/quad index conversion, encoder-consumable buffer bindings, non-native format conversion,
+  ImageId/ImageViewId lifecycle integration and tick-deferred resource destruction. Native
+  buffer/image upload, download, image copy and framebuffer attachment ownership are implemented
+  and GPU-round-trip tested.
+- Forbidden shortcut: the new backend must not contain Vulkan/MoltenVK/OpenGL
+  objects or delegate rasterization to another backend.
+- Resume condition: once those services are implemented and verified, wire
+  `RasterizerMetal`, then `RendererMetal`, and validate visible content in a
+  race as recorded in `GOAL.md`.
 
 ## 2026-08-21 — NCM content-service parity
 
@@ -1070,7 +1099,6 @@
   regressions and the prior closed-reply regression pass, post-implementation
   upstream re-verification is complete, `ARCHI_CHOICES.md` documents the Rust
   adaptation, and the release build succeeds. Runtime validation remains.
-
 ## 2026-08-21 — interrupted real-VFS file-reference parity
 
 - Interrupted slice: port Eden's retained `IOFile` references, LRU eviction, trait-level open/create
@@ -1083,7 +1111,6 @@
 - Status: prerequisite implemented and verified; the VFS slice resumed and both retained-handle
   and root-escape regressions pass. Full `core` validation is currently red on three unrelated,
   independently reproducible `k_process` tests; the VFS-focused tests remain green.
-
 ## 2026-08-21 — interrupted rdynarmic warning cleanup on scalar FCMEQ parity
 
 - Interrupted slice: classify and remove unused x64 vector fallback warnings after checking each
@@ -1225,7 +1252,6 @@
   manager sets over the shared dynamic pool, reserves all but 64 remaining pages for page tables,
   publishes both `KSystemResource` owners, and default processes retain the matching resource.
   The original reserved-page warning and its structural debt are resolved.
-
 ## 2026-08-22 — system-settings persistence interrupted by format-default prerequisites
 
 - Interrupted slice: use `SETTINGS_MAGIC` and `SETTINGS_VERSION` by porting
@@ -1426,3 +1452,60 @@
   register-allocation panic, access violation, or unmapped-memory message. The diagnostic process
   was then closed and no Ruzu process remains.
 - Status: prerequisite completed and LM3's previously observed startup crashes runtime-verified.
+
+## 2026-08-21 — Native Metal buffer-cache runtime
+
+- Added `renderer_metal/metal_buffer_cache.rs` as the Metal-owned counterpart of Eden `renderer_vulkan/vk_buffer_cache.{h,cpp}`.
+- Implemented common-cache buffer allocation, usage/tick tracking, staging allocation, ordered copy/clear operations, null bindings, vertex/index/uniform/storage/texel/transform-feedback binding state, `uint8` index expansion, and indexed/non-indexed quad emulation.
+- The next slice is the native rasterizer owner. It must consume this runtime state together with `MetalShaderBindingLayout`; it must not create a second CPU-address-keyed buffer store.
+
+## 2026-08-21 — Native Metal typed texture-cache integration
+
+- Completed prerequisite: `MetalTextureCacheParams` now binds native images, views, samplers, framebuffers, scheduler, and staging allocations to the shared `TextureCacheBase`. The backend no longer needs a parallel CPU-address-keyed render-target store.
+- Completed transfer slice: byte-compatible uploads/copies preserve common `ImageCopy` ordering, and full color MSAA-to-single-sample copies use a native Metal render-pass resolve. Focused native GPU tests cover copy and resolve readback.
+- Interrupted slice: construct `MetalRasterizer` and encode Maxwell draw/dispatch work.
+- Exact next prerequisite: the rasterizer-owned descriptor consumer must combine `MetalShaderBindingLayout`, `MetalCommonBufferCache` binding state, and `MetalTextureCache` `ImageViewId`/`SamplerId` payloads on one render or compute encoder. It must also own concrete null buffer/texture bindings and materialize buffer image views at the final cache offset.
+- Deferred prerequisites that do not block the initial native-resolution draw path: the Metal blit/compute helper for format conversion, scaling, reinterpretation, and partial/reverse-MSAA copies; sampler border-color emulation; async downloads and applet capture.
+- Resume condition: implement the resource-binding owner in `renderer_metal/metal_rasterizer.rs`, then port Eden rasterizer draw preparation/order without introducing an alternate image or buffer identity map.
+
+## 2026-08-21 — Native Metal live graphics-shader lookup
+
+- Completed prerequisite: `MetalPipelineCache::current_graphics_shaders` now mirrors Eden `PipelineCache::CurrentGraphicsPipeline` through stage refresh, complete fixed-state keying, environment collection, exact shared stage translation, and cached native Metal shader-module creation.
+- The existing Vulkan compiler path was only mechanically parameterized by `Profile` and `HostTranslateInfo`; Vulkan retains the same stage compiler, order, and outputs. Metal does not construct or invoke Vulkan runtime objects.
+- Interrupted slice remains `MetalRasterizer`: consume shader binding layouts together with the common buffer/texture cache state, construct the complete native render-pipeline descriptor, and encode draws in Eden `PrepareDraw`/`ConfigureImpl` order.
+- Exact next prerequisite: add vertex-layout and Maxwell fixed-state conversion to `MetalPipelineCache`, because Metal bakes those states into `MTLRenderPipelineState` and cannot encode a correct guest draw with the current partial key.
+
+## 2026-08-21 — Native Metal rasterizer ownership
+
+- Completed prerequisite: `MetalRasterizer` now owns one stable scheduler, staging pool, pipeline cache, shader cache, common buffer cache, and common texture cache. Construction and destruction preserve Eden's service order and drain the native queue.
+- Completed lifecycle: create/bind/release channel reaches every currently owned cache under the shared buffer/texture lock order, and binding installs the channel GPU-memory adapter used by common-buffer address resolution.
+- The type is intentionally not exposed through `RasterizerInterface` while required behavior is absent; this avoids converting missing draw/cache/query methods into callable stubs.
+- Resume condition: complete fixed-state and vertex-layout conversion in `metal_pipeline_cache.rs`, then implement descriptor/resource preparation and render-command encoding in this owner before wiring the renderer frontend.
+
+## 2026-08-21 — Native Metal vertex-input pipeline state
+
+- Completed prerequisite: `MetalPipelineCache` now converts only the Maxwell attributes actually
+  consumed by the compiled vertex shader, matching Eden's `stage_infos[0].loads.Generic(index)`
+  filter and `MaxwellToVK::VertexFormat` behavior.
+- Metal vertex streams are compacted after the native shader's buffer resources because Metal uses
+  one vertex-stage buffer namespace for both. The source-to-native map is part of the render
+  pipeline key and is covered by focused limit, divisor, and shared-stream tests.
+- Interrupted slice remains native draw encoding in `MetalRasterizer`.
+- Exact next prerequisite: finish the render-pipeline key from the active framebuffer and Maxwell
+  fixed state, then bind common-buffer vertex/index/resource state using the retained Metal slot
+  maps before issuing a draw on the rasterizer-owned scheduler.
+
+## 2026-08-21 — Native Metal render and depth/stencil pipeline state
+
+- Completed prerequisite: `MetalRenderPipelineKey` now owns framebuffer formats/sample count,
+  Maxwell blend/write-mask state, topology class, multisample alpha controls, rasterization enable,
+  and the compiled vertex-input descriptor.
+- Completed prerequisite: `MetalPipelineCache` now caches native `MTLDepthStencilState` objects with
+  exact Maxwell comparison/stencil operations and front/back read/write masks. Combined
+  depth/stencil framebuffers use one Metal render-attachment format for both aspects.
+- Validation: all 11 focused Metal pipeline-cache tests pass, including native render/compute
+  pipeline creation and the new depth/stencil regressions.
+- Interrupted slice remains native draw encoding in `MetalRasterizer`.
+- Exact next prerequisite: consume `MetalShaderBindingLayout`, common buffer bindings, common texture
+  cache image/sampler slots, the render/depth pipeline states, and the vertex-stream remap in Eden's
+  `ConfigureImpl` ordering before recording indexed/non-indexed draws on `MetalScheduler`.

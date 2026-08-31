@@ -140,7 +140,7 @@ impl Attribute {
 
     /// Whether this is a generic attribute.
     pub fn is_generic(self) -> bool {
-        (32..=156).contains(&self.0)
+        (32..160).contains(&self.0)
     }
 
     /// Whether this is a legacy fixed-function varying.
@@ -182,6 +182,21 @@ impl Attribute {
     pub fn clip_distance_index(self) -> u32 {
         debug_assert!(self.is_clip_distance());
         self.0 - Self::CLIP_DISTANCE_0.0
+    }
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    use super::Attribute;
+
+    #[test]
+    fn generic31_includes_all_four_components() {
+        for component in 0..4 {
+            let attribute = Attribute::generic(31, component);
+            assert!(attribute.is_generic());
+            assert_eq!(attribute.generic_index(), 31);
+            assert_eq!(attribute.generic_element(), component);
+        }
     }
 }
 

@@ -216,6 +216,7 @@ fn translate_renderer(backend: settings_enums::RendererBackend) -> &'static str 
         | settings_enums::RendererBackend::OpenGlGlasm
         | settings_enums::RendererBackend::OpenGlSpirV => "OpenGL",
         settings_enums::RendererBackend::Vulkan => "Vulkan",
+        settings_enums::RendererBackend::Metal => "Metal",
         settings_enums::RendererBackend::Null => "Null",
     }
 }

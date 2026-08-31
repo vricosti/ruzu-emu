@@ -2314,14 +2314,13 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
 }
 
 fn precolor(program: &mut ir::Program) {
-    let mut phi_moves: Vec<(u32, Inst)> = Vec::new();
-    let mut references: Vec<(u32, Inst)> = Vec::new();
     let block_count = program.blocks.len() as u32;
     for block_index in 0..block_count {
         let phi_indices: Vec<u32> = program
             .block(block_index)
             .indexed_iter()
-            .filter_map(|(index, inst)| (inst.opcode == Opcode::Phi).then_some(index))
+            .take_while(|(_, inst)| inst.opcode == Opcode::Phi)
+            .map(|(index, _)| index)
             .collect();
         for phi_index in phi_indices {
             let phi_ref = InstRef {
@@ -2329,26 +2328,28 @@ fn precolor(program: &mut ir::Program) {
                 inst: phi_index,
             };
             let phi_args = program.block(block_index).inst(phi_index).phi_args.clone();
-            for (pred, value) in phi_args {
-                phi_moves.push((
-                    pred,
-                    Inst::new(Opcode::PhiMove, vec![Value::Inst(phi_ref), value]),
-                ));
-                references.push((
-                    pred,
-                    Inst::new(Opcode::Reference, vec![Value::Inst(phi_ref)]),
-                ));
+            for &(pred, value) in &phi_args {
+                let insert_before = program
+                    .block(pred)
+                    .indexed_rev_iter()
+                    .take_while(|(_, inst)| inst.opcode == Opcode::Reference)
+                    .last()
+                    .map(|(index, _)| index);
+                let phi_move = Inst::new(Opcode::PhiMove, vec![Value::Inst(phi_ref), value]);
+                if let Some(insert_before) = insert_before {
+                    program
+                        .block_mut(pred)
+                        .insert_inst_before(insert_before, phi_move);
+                } else {
+                    program.block_mut(pred).append_inst(phi_move);
+                }
+            }
+            for (pred, _) in phi_args {
+                program
+                    .block_mut(pred)
+                    .append_inst(Inst::new(Opcode::Reference, vec![Value::Inst(phi_ref)]));
             }
         }
-    }
-
-    // Upstream inserts PhiMove before trailing Reference instructions. Stable
-    // instruction slots cannot be shifted, so append all moves before refs.
-    for (block_index, inst) in phi_moves {
-        program.block_mut(block_index).append_inst(inst);
-    }
-    for (block_index, inst) in references {
-        program.block_mut(block_index).append_inst(inst);
     }
 }
 
@@ -2508,7 +2509,7 @@ mod tests {
     use super::{precolor, recompute_emit_use_counts};
 
     #[test]
-    fn precolor_appends_all_phi_moves_before_references_and_recounts_uses() {
+    fn precolor_inserts_all_phi_moves_before_trailing_references_and_recounts_uses() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         program.blocks.push(Block::new());
@@ -2519,6 +2520,13 @@ mod tests {
         let src1 = program
             .block_mut(0)
             .append_inst(Inst::new(Opcode::UndefU32, Vec::new()));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::Reference,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: src0,
+            })],
+        ));
         let phi0 = program
             .block_mut(1)
             .append_new_inst(Opcode::Phi, Vec::new());
@@ -2555,11 +2563,12 @@ mod tests {
                 Opcode::PhiMove,
                 Opcode::Reference,
                 Opcode::Reference,
+                Opcode::Reference,
             ]
         );
         // Each source remains used by its Phi operand and is additionally
         // consumed by the PhiMove inserted by upstream PrecolorInst.
-        assert_eq!(program.block(0).inst(src0).use_count, 2);
+        assert_eq!(program.block(0).inst(src0).use_count, 3);
         assert_eq!(program.block(0).inst(src1).use_count, 2);
         assert_eq!(program.block(1).inst(phi0).use_count, 2);
         assert_eq!(program.block(1).inst(phi1).use_count, 2);

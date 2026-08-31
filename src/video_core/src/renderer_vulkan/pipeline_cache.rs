@@ -370,9 +370,9 @@ fn fill_transform_feedback_runtime_info(info: &mut RuntimeInfo, state: &FixedPip
 
 /// Port of `MakeRuntimeInfo` in Eden `vk_pipeline_cache.cpp`.
 #[derive(Clone, Copy)]
-struct RuntimeInfoDeviceFeatures {
-    transform_feedback: bool,
-    molten_vk: bool,
+pub(crate) struct RuntimeInfoDeviceFeatures {
+    pub(crate) transform_feedback: bool,
+    pub(crate) molten_vk: bool,
 }
 
 fn make_runtime_info_with_features(
@@ -550,6 +550,66 @@ pub(super) fn compile_graphics_stages_from_environments(
     key: &GraphicsPipelineKey,
     environments: &mut GraphicsEnvironments,
 ) -> Option<[Option<CompiledShader>; 5]> {
+    compile_graphics_stages_from_environments_with_features(
+        profile,
+        host_info,
+        key,
+        environments,
+        RuntimeInfoDeviceFeatures {
+            transform_feedback: device.is_ext_transform_feedback_supported(),
+            molten_vk: device.is_molten_vk(),
+        },
+    )
+}
+
+pub(crate) fn compile_graphics_stages_from_environments_with_features(
+    profile: &Profile,
+    host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey,
+    environments: &mut GraphicsEnvironments,
+    device_features: RuntimeInfoDeviceFeatures,
+) -> Option<[Option<CompiledShader>; 5]> {
+    let translated = translate_graphics_stages_from_environments_with_features(
+        host_info,
+        key,
+        environments,
+        device_features,
+    )?;
+    let mut bindings = Bindings::default();
+    let mut compiled_stages: [Option<CompiledShader>; 5] = std::array::from_fn(|_| None);
+    for (index, translated_stage) in translated.into_iter().enumerate() {
+        let Some(translated_stage) = translated_stage else {
+            continue;
+        };
+        let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
+            &translated_stage.program,
+            profile,
+            &translated_stage.runtime_info,
+            &mut bindings,
+        );
+        compiled_stages[index] = Some(CompiledShader {
+            spirv_words,
+            info: translated_stage.program.info.clone(),
+            stage: translated_stage.program.stage,
+        });
+    }
+    compiled_stages[0].as_ref()?;
+    Some(compiled_stages)
+}
+
+pub(crate) struct TranslatedGraphicsShader {
+    pub(crate) program: Program,
+    pub(crate) runtime_info: RuntimeInfo,
+}
+
+pub(crate) const NUM_GRAPHICS_STAGES: usize = 5;
+
+pub(crate) fn translate_graphics_stages_from_environments_with_features(
+    host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey,
+    environments: &mut GraphicsEnvironments,
+    device_features: RuntimeInfoDeviceFeatures,
+) -> Option<[Option<TranslatedGraphicsShader>; NUM_GRAPHICS_STAGES]> {
     let uses_vertex_a = key.unique_hashes[0] != 0;
     let uses_vertex_b = key.unique_hashes[1] != 0;
     if !uses_vertex_b {
@@ -610,8 +670,7 @@ pub(super) fn compile_graphics_stages_from_environments(
         programs[program_index] = Some(program);
     }
 
-    let mut bindings = Bindings::default();
-    let mut compiled_stages: [Option<CompiledShader>; 5] = std::array::from_fn(|_| None);
+    let mut runtime_infos: [Option<RuntimeInfo>; NUM_PROGRAMS] = std::array::from_fn(|_| None);
     let mut previous_stage_index: Option<usize> = None;
     let first_program = if uses_vertex_a && uses_vertex_b { 1 } else { 0 };
     for program_index in first_program..NUM_PROGRAMS {
@@ -623,28 +682,35 @@ pub(super) fn compile_graphics_stages_from_environments(
             return None;
         }
 
-        let runtime_info = {
+        runtime_infos[program_index] = Some({
             let program = programs[program_index].as_ref()?;
             let previous_program = previous_stage_index.and_then(|index| programs[index].as_ref());
-            make_runtime_info(&programs, key, program, previous_program, device)
-        };
-        let program = programs[program_index].as_mut()?;
-        convert_legacy_to_generic(program, &runtime_info);
-        let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
-            program,
-            profile,
-            &runtime_info,
-            &mut bindings,
-        );
-        compiled_stages[program_index - 1] = Some(CompiledShader {
-            spirv_words,
-            info: program.info.clone(),
-            stage: program.stage,
+            make_runtime_info_with_features(
+                &programs,
+                key,
+                program,
+                previous_program,
+                device_features,
+            )
         });
         previous_stage_index = Some(program_index);
     }
-    compiled_stages[0].as_ref()?;
-    Some(compiled_stages)
+
+    let mut translated: [Option<TranslatedGraphicsShader>; NUM_GRAPHICS_STAGES] =
+        std::array::from_fn(|_| None);
+    for program_index in first_program..NUM_PROGRAMS {
+        let Some(runtime_info) = runtime_infos[program_index].take() else {
+            continue;
+        };
+        let mut program = programs[program_index].take()?;
+        convert_legacy_to_generic(&mut program, &runtime_info);
+        translated[program_index - 1] = Some(TranslatedGraphicsShader {
+            program,
+            runtime_info,
+        });
+    }
+    translated[0].as_ref()?;
+    Some(translated)
 }
 
 fn shader_stage_for_program(program_index: usize) -> Option<ShaderStage> {
@@ -774,7 +840,9 @@ pub(super) fn compile_graphics_stages_from_file_environments(
     Some(compiled_stages)
 }
 
-fn stage_infos_from_compiled(compiled_stages: &[Option<CompiledShader>; 5]) -> [ShaderInfo; 5] {
+pub(crate) fn stage_infos_from_compiled(
+    compiled_stages: &[Option<CompiledShader>; 5],
+) -> [ShaderInfo; 5] {
     std::array::from_fn(|index| {
         compiled_stages[index]
             .as_ref()

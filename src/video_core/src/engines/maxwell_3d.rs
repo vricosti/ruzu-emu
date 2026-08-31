@@ -50,6 +50,11 @@ unsafe impl Send for Maxwell3DPtr {}
 /// Number of user clip distances exposed by Maxwell registers.
 pub const NUM_CLIP_DISTANCES: u32 = 8;
 
+/// Maximum size of a Maxwell constant buffer.
+///
+/// Matches upstream `Engines::Maxwell3D::MaxConstBufferSize`.
+pub const MAX_CONST_BUFFER_SIZE: usize = 0x10000;
+
 /// Render target array base. 8 targets, 0x10 words (0x40 bytes) each.
 /// Convert upstream byte offset (from ASSERT_REG_POSITION) to word index.
 /// Matches upstream `MAXWELL3D_REG_INDEX(field) = offsetof(Regs, field) / sizeof(u32)`.

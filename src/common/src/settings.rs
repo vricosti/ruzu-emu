@@ -904,7 +904,7 @@ impl Default for Values {
                     RendererBackend::Vulkan
                 },
                 RendererBackend::OpenGlGlsl,
-                RendererBackend::OpenGlSpirV,
+                RendererBackend::Metal,
                 "backend",
                 Renderer,
             ),

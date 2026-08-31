@@ -732,21 +732,44 @@ fn run_boot(
                     );
                 }
             }
-            common::settings_enums::RendererBackend::Vulkan => Box::new(
-                video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
-                    // SAFETY: this renderer is immediately bound to `gpu` below;
-                    // `Gpu` drops the renderer before its shader notifier.
-                    unsafe { gpu.shader_notify_handle() },
-                    &window_info,
-                    Arc::clone(&shown_state),
-                    Arc::clone(&framebuffer_layout),
-                    frame_displayed_notify,
-                    frame_end_notify,
-                    syncpoints.clone(),
-                    Arc::clone(&device_memory),
+            common::settings_enums::RendererBackend::Vulkan => {
+                Box::new(
+                    video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
+                        // SAFETY: this renderer is immediately bound to `gpu` below;
+                        // `Gpu` drops the renderer before its shader notifier.
+                        unsafe { gpu.shader_notify_handle() },
+                        &window_info,
+                        Arc::clone(&shown_state),
+                        Arc::clone(&framebuffer_layout),
+                        frame_displayed_notify,
+                        frame_end_notify,
+                        syncpoints.clone(),
+                        Arc::clone(&device_memory),
+                    )
+                    .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
                 )
-                .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
-            ),
+            }
+            common::settings_enums::RendererBackend::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    Box::new(
+                        video_core::renderer_metal::renderer_metal::RendererMetal::new(
+                            &window_info,
+                            Arc::clone(&shown_state),
+                            Arc::clone(&framebuffer_layout),
+                            frame_displayed_notify,
+                            frame_end_notify,
+                            syncpoints.clone(),
+                            Arc::clone(&device_memory),
+                        )
+                        .map_err(|error| format!("Failed to create Metal renderer: {error}"))?,
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err("The Metal renderer is available only on macOS".to_owned());
+                }
+            }
             common::settings_enums::RendererBackend::Null => Box::new(
                 video_core::renderer_null::renderer_null::RendererNull::new(
                     syncpoints.clone(),
@@ -1194,7 +1217,12 @@ fn renderer_backend_unavailable_detail(
 ) -> Option<&'static str> {
     use common::settings_enums::RendererBackend;
 
-    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    if backend == RendererBackend::Metal && !cfg!(target_os = "macos") {
+        Some(
+            "The video renderer could not be initialized.\n\
+             The Metal renderer is available only on macOS. Select another renderer in Configure > Graphics.",
+        )
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && matches!(
             backend,
             RendererBackend::OpenGlGlsl
@@ -1204,8 +1232,8 @@ fn renderer_backend_unavailable_detail(
     {
         Some(
             "The video renderer could not be initialized.\n\
-             On Apple Silicon, only the Vulkan renderer is supported. \
-             Select Vulkan in Configure > Graphics.",
+             On Apple Silicon, only the Vulkan and Metal renderers are supported. \
+             Select Vulkan or Metal in Configure > Graphics.",
         )
     } else {
         None
@@ -1377,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_error_is_specific_to_opengl_on_apple_silicon() {
+    fn renderer_error_is_specific_to_platform_backend_support() {
         use common::settings_enums::RendererBackend;
 
         let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
@@ -1390,7 +1418,7 @@ mod tests {
             assert_eq!(detail.is_some(), apple_silicon);
             if let Some(detail) = detail {
                 assert!(detail.contains("Apple Silicon"));
-                assert!(detail.contains("only the Vulkan renderer is supported"));
+                assert!(detail.contains("Vulkan and Metal"));
                 assert!(detail.contains('\n'));
             }
         }
@@ -1402,5 +1430,10 @@ mod tests {
             renderer_backend_unavailable_detail(RendererBackend::Null),
             None
         );
+        let metal_detail = renderer_backend_unavailable_detail(RendererBackend::Metal);
+        assert_eq!(metal_detail.is_some(), !cfg!(target_os = "macos"));
+        if let Some(detail) = metal_detail {
+            assert!(detail.contains("only on macOS"));
+        }
     }
 }

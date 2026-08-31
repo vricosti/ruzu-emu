@@ -419,23 +419,28 @@ mod tests {
     }
 
     #[test]
-    fn graphics_api_rows_and_discriminants_match_eden() {
-        assert_eq!(
-            tr::labels(tr::GRAPHICS_API),
-            [
-                "Vulkan",
-                "OpenGL GLSL",
-                "OpenGL GLASM (Assembly Shaders, NVIDIA Only)",
-                "OpenGL SPIR-V (Experimental, AMD/Mesa Only)",
-                "Null",
-            ]
-        );
+    fn graphics_api_rows_preserve_eden_and_expose_metal_only_on_macos() {
+        let mut expected_labels = vec!["Vulkan"];
+        let mut expected_values = vec![1];
+        #[cfg(target_os = "macos")]
+        {
+            expected_labels.push("Metal");
+            expected_values.push(5);
+        }
+        expected_labels.extend([
+            "OpenGL GLSL",
+            "OpenGL GLASM (Assembly Shaders, NVIDIA Only)",
+            "OpenGL SPIR-V (Experimental, AMD/Mesa Only)",
+            "Null",
+        ]);
+        expected_values.extend([0, 3, 4, 2]);
+        assert_eq!(tr::labels(tr::GRAPHICS_API), expected_labels);
         assert_eq!(
             tr::GRAPHICS_API
                 .iter()
                 .map(|(value, _)| *value as u32)
                 .collect::<Vec<_>>(),
-            [1, 0, 3, 4, 2]
+            expected_values
         );
     }
 
@@ -469,6 +474,7 @@ mod tests {
             RendererBackend::OpenGlGlsl,
             RendererBackend::OpenGlGlasm,
             RendererBackend::OpenGlSpirV,
+            RendererBackend::Metal,
             RendererBackend::Null,
         ] {
             assert!(!updates_vulkan_device(backend));

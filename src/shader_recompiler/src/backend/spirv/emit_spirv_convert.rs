@@ -412,9 +412,22 @@ pub fn emit_convert_f64_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 // ── Float-to-float conversions ───────────────────────────────────────────
 
-/// ConvertF16F32: `OpFConvert` F32 -> F16.
+/// ConvertF16F32: `OpFConvert` F32 -> F16, with upstream's non-Android
+/// overflow normalization.
 pub fn emit_convert_f16_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder.f_convert(ctx.f16_type, None, value).unwrap()
+    let result = ctx.builder.f_convert(ctx.f16_type, None, value).unwrap();
+    #[cfg(target_os = "android")]
+    {
+        result
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let is_overflowing = ctx.builder.is_nan(ctx.bool_type, None, result).unwrap();
+        let zero = ctx.builder.constant_bit32(ctx.f16_type, 0);
+        ctx.builder
+            .select(ctx.f16_type, None, is_overflowing, zero, result)
+            .unwrap()
+    }
 }
 
 /// ConvertF32F16: `OpFConvert` F16 -> F32.

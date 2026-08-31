@@ -29,6 +29,9 @@ pub fn new_sink_handle(sink: SinkBox) -> SinkHandle {
     Arc::new(Mutex::new(sink))
 }
 
-pub fn new_stream_handle(stream: SinkStream) -> SinkStreamHandle {
-    Arc::new(Mutex::new(stream))
+pub fn new_stream_handle<T>(stream: T) -> SinkStreamHandle
+where
+    T: SinkStream + 'static,
+{
+    Arc::new(stream)
 }

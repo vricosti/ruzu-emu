@@ -291,7 +291,7 @@ mod tests {
         let stream = sink
             .lock()
             .acquire_sink_stream(system, 2, "BuiltInHeadset-0", StreamType::In);
-        stream.lock().process_audio_in(&[10, 11, 12, 13], 2);
+        stream.process_audio_in(&[10, 11, 12, 13], 2);
 
         assert!(buffers.release_buffers(1234, &session, true));
 

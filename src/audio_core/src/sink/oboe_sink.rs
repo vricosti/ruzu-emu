@@ -12,7 +12,7 @@
 // - or a C++ interop layer
 
 use crate::sink::sink::{new_stream_handle, Sink};
-use crate::sink::sink_stream::{SinkStream, SinkStreamHandle, StreamType};
+use crate::sink::sink_stream::{BaseSinkStream, SinkStreamHandle, StreamType};
 use crate::SharedSystem;
 use log::warn;
 
@@ -42,11 +42,13 @@ impl Sink for OboeSink {
         stream_type: StreamType,
     ) -> SinkStreamHandle {
         self.system_channels = system_channels;
-        let mut stream = SinkStream::new(system, stream_type);
-        stream.system_channels = system_channels;
-        stream.device_channels = self.device_channels;
-        stream.name = name.to_string();
-        let handle = new_stream_handle(stream);
+        let handle = new_stream_handle(BaseSinkStream::new(
+            system,
+            stream_type,
+            system_channels,
+            self.device_channels,
+            name.to_string(),
+        ));
         self.streams.push(handle.clone());
         handle
     }
@@ -62,7 +64,7 @@ impl Sink for OboeSink {
 
     fn get_device_volume(&self) -> f32 {
         if let Some(entry) = self.streams.first() {
-            entry.lock().get_device_volume()
+            entry.get_device_volume()
         } else {
             1.0
         }
@@ -70,13 +72,13 @@ impl Sink for OboeSink {
 
     fn set_device_volume(&mut self, volume: f32) {
         for entry in &self.streams {
-            entry.lock().set_device_volume(volume);
+            entry.set_device_volume(volume);
         }
     }
 
     fn set_system_volume(&mut self, volume: f32) {
         for entry in &self.streams {
-            entry.lock().set_system_volume(volume);
+            entry.set_system_volume(volume);
         }
     }
 

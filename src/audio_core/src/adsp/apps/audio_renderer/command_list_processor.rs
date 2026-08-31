@@ -597,7 +597,7 @@ mod tests {
         let _ = processor.process(0);
 
         assert_eq!(processor.get_remaining_command_count(), 0);
-        assert_eq!(stream.lock().release_buffer(4), vec![0, 0, 0, 0]);
+        assert_eq!(stream.release_buffer(4), vec![0, 0, 0, 0]);
         assert!(samples.iter().all(|&sample| sample == 0));
     }
 
@@ -881,7 +881,7 @@ mod tests {
         let _ = processor.process(0);
 
         assert_eq!(
-            stream.lock().release_buffer(8),
+            stream.release_buffer(8),
             vec![175, 65, 275, 75, 375, 85, 475, 95]
         );
     }
@@ -935,7 +935,7 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        let released = stream.lock().release_buffer(240);
+        let released = stream.release_buffer(240);
         assert_eq!(released.len(), 240);
         assert!(released.iter().any(|&sample| sample != 0));
         assert_eq!(*released.last().unwrap(), 300);
@@ -990,7 +990,7 @@ mod tests {
         let _ = processor.process(0);
 
         assert_eq!(
-            stream.lock().release_buffer(8),
+            stream.release_buffer(8),
             vec![50, 60, 100, 120, 150, 180, 200, 240]
         );
     }

@@ -258,14 +258,10 @@ pub fn process_device_command(
             samples.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         }
     }
-    let profile = std::env::var_os("RUZU_PROFILE_DEVICE_SINK").is_some();
-    let t_lock = std::time::Instant::now();
-    let mut stream = stream_handle.lock();
-    let lock_us = t_lock.elapsed().as_micros();
     let t_work = std::time::Instant::now();
-    stream.set_system_channels(input_count as u32);
+    stream_handle.set_system_channels(input_count as u32);
     let sample_tag = samples.as_ptr() as u64;
-    stream.append_buffer(
+    stream_handle.append_buffer(
         SinkBuffer {
             frames: frames as u64,
             frames_played: 0,
@@ -274,20 +270,19 @@ pub fn process_device_command(
         },
         &samples,
     );
-    let should_start = stream.is_paused();
+    let should_start = stream_handle.is_paused();
+    let profile = std::env::var_os("RUZU_PROFILE_DEVICE_SINK").is_some();
     if profile {
         let work_us = t_work.elapsed().as_micros();
-        if lock_us > 1000 || work_us > 1000 {
+        if work_us > 1000 {
             log::info!(
-                "PROFILE_DEVICE_SINK lock_us={} work_us={} frames={} input_count={}",
-                lock_us,
+                "PROFILE_DEVICE_SINK work_us={} frames={} input_count={}",
                 work_us,
                 frames,
                 input_count
             );
         }
     }
-    drop(stream);
     if should_start {
         start_sink_stream(stream_handle, false);
     }
@@ -318,10 +313,9 @@ pub fn dump_device_command(payload: &DeviceSinkPayload, dump: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sink::sink_stream::{SinkStream, StreamType};
+    use crate::sink::sink::new_stream_handle;
+    use crate::sink::sink_stream::{BaseSinkStream, StreamType};
     use crate::SharedSystem;
-    use parking_lot::Mutex;
-    use std::sync::Arc;
 
     fn make_system() -> SharedSystem {
         crate::make_test_system()
@@ -342,7 +336,13 @@ mod tests {
     #[test]
     fn process_uses_target_sample_count_frames() {
         let system = make_system();
-        let stream = Arc::new(Mutex::new(SinkStream::new(system, StreamType::Render)));
+        let stream = new_stream_handle(BaseSinkStream::new(
+            system,
+            StreamType::Render,
+            2,
+            2,
+            String::new(),
+        ));
         let samples = vec![123i32; (TARGET_SAMPLE_COUNT as usize) * 4];
         let payload = DeviceSinkPayload {
             session_id: 0,
@@ -355,7 +355,7 @@ mod tests {
 
         payload.process(&stream, 2);
 
-        let stream = stream.lock();
+        let stream = stream.base().lock();
         assert_eq!(stream.get_queue_size(), 1);
         assert_eq!(
             stream.queued_buffer_front().unwrap().frames,

@@ -1,9 +1,13 @@
 use crate::common::common::{TARGET_SAMPLE_COUNT, TARGET_SAMPLE_RATE};
 use crate::sink::sink::{new_stream_handle, Sink, AUTO_DEVICE_NAME};
-use crate::sink::sink_stream::{SinkStream, SinkStreamHandle, StreamType};
+use crate::sink::sink_stream::{
+    SharedSinkStreamBase, SinkStream, SinkStreamBase, SinkStreamHandle, SinkStreamLifecycleState,
+    StreamType,
+};
 use crate::SharedSystem;
 use cubeb::{Context, DeviceState, DeviceType, SampleFormat, StreamParamsBuilder};
 use log::{error, info, warn};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -42,11 +46,111 @@ fn should_trace_cubeb_callback() -> bool {
     std::env::var_os("RUZU_TRACE_CUBEB_CALLBACK").is_some()
 }
 
-struct CubebStream {
-    handle: SinkStreamHandle,
-    _backend: cubeb::Stream<i16>,
+struct CubebSinkStream {
+    base: SharedSinkStreamBase,
+    lifecycle: Mutex<CubebLifecycle>,
     #[cfg(windows)]
     _com_apartment: StreamComApartment,
+}
+
+struct CubebLifecycle {
+    stream: Option<cubeb::Stream<i16>>,
+    state: SinkStreamLifecycleState,
+}
+
+// cubeb streams are designed for cross-thread lifecycle control. The Rust
+// wrapper carries raw pointers and therefore does not derive these traits.
+unsafe impl Send for CubebSinkStream {}
+unsafe impl Sync for CubebSinkStream {}
+
+impl SinkStream for CubebSinkStream {
+    fn base(&self) -> &SharedSinkStreamBase {
+        &self.base
+    }
+
+    fn finalize(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state == SinkStreamLifecycleState::Finalized {
+            return;
+        }
+
+        if lifecycle.state == SinkStreamLifecycleState::Running {
+            lifecycle.state = SinkStreamLifecycleState::Stopping;
+            if self.base.lock().signal_stop() {
+                if let Some(stream) = lifecycle.stream.as_ref() {
+                    if let Err(error) = stream.stop() {
+                        log::error!("Error stopping cubeb stream: {:?}", error);
+                    }
+                }
+            }
+            lifecycle.state = SinkStreamLifecycleState::Stopped;
+        }
+
+        // Dropping the native stream unregisters its callbacks. The callback's
+        // Arc<SinkStreamBase> remains alive until that teardown is complete.
+        lifecycle.stream.take();
+        lifecycle.state = SinkStreamLifecycleState::Finalized;
+    }
+
+    fn start(&self, _resume: bool) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != SinkStreamLifecycleState::Stopped || lifecycle.stream.is_none() {
+            return;
+        }
+        if !self.base.lock().signal_start() {
+            return;
+        }
+
+        lifecycle.state = SinkStreamLifecycleState::Starting;
+        if let Some(stream) = lifecycle.stream.as_ref() {
+            if let Err(error) = stream.start() {
+                // Eden also leaves `paused` false when cubeb_stream_start fails.
+                log::error!("Error starting cubeb stream: {:?}", error);
+            }
+        }
+        lifecycle.state = SinkStreamLifecycleState::Running;
+    }
+
+    fn stop(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != SinkStreamLifecycleState::Running || lifecycle.stream.is_none() {
+            return;
+        }
+
+        lifecycle.state = SinkStreamLifecycleState::Stopping;
+        if self.base.lock().signal_stop() {
+            if let Some(stream) = lifecycle.stream.as_ref() {
+                if let Err(error) = stream.stop() {
+                    log::error!("Error stopping cubeb stream: {:?}", error);
+                }
+            }
+        }
+        lifecycle.state = SinkStreamLifecycleState::Stopped;
+    }
+}
+
+impl CubebSinkStream {
+    fn new(
+        base: SharedSinkStreamBase,
+        stream: Option<cubeb::Stream<i16>>,
+        #[cfg(windows)] com_apartment: StreamComApartment,
+    ) -> Self {
+        Self {
+            base,
+            lifecycle: Mutex::new(CubebLifecycle {
+                stream,
+                state: SinkStreamLifecycleState::Stopped,
+            }),
+            #[cfg(windows)]
+            _com_apartment: com_apartment,
+        }
+    }
+}
+
+impl Drop for CubebSinkStream {
+    fn drop(&mut self) {
+        self.finalize();
+    }
 }
 
 pub struct CubebSink {
@@ -55,7 +159,7 @@ pub struct CubebSink {
     input_device: cubeb::DeviceId,
     device_channels: u32,
     system_channels: u32,
-    streams: Vec<CubebStream>,
+    streams: Vec<SinkStreamHandle>,
     #[cfg(windows)]
     com_init_result: i32,
 }
@@ -71,7 +175,7 @@ fn should_trace_cubeb_state() -> bool {
 }
 
 fn process_stream_callback(
-    stream_handle: &SinkStreamHandle,
+    base: &SharedSinkStreamBase,
     stream_type: StreamType,
     device_channels: u32,
     input: &[i16],
@@ -79,13 +183,14 @@ fn process_stream_callback(
 ) -> isize {
     let num_channels = device_channels as usize;
     let frame_size = num_channels.max(1);
-    let num_frames = if frame_size > 0 {
-        output.len() / frame_size
+    let sample_count = if stream_type == StreamType::In {
+        input.len()
     } else {
         output.len()
     };
+    let num_frames = sample_count / frame_size;
 
-    let mut stream = stream_handle.lock();
+    let mut stream = base.lock();
     let queue_before = stream.get_queue_size();
     if stream_type == StreamType::In {
         stream.process_audio_in(input, num_frames);
@@ -219,27 +324,30 @@ impl Sink for CubebSink {
         stream_type: StreamType,
     ) -> SinkStreamHandle {
         self.system_channels = system_channels;
-
-        let Some(ref ctx) = self.ctx else {
-            // Fallback: return a stream without cubeb backend
-            let mut stream = SinkStream::new(system, stream_type);
-            stream.system_channels = system_channels;
-            stream.device_channels = self.device_channels;
-            stream.name = name.to_string();
-            return new_stream_handle(stream);
-        };
-
         #[cfg(windows)]
         let com_apartment = {
             let _ = initialize_com_multithreaded();
             StreamComApartment
         };
 
-        let mut sink_stream = SinkStream::new(system, stream_type);
-        sink_stream.system_channels = system_channels;
-        sink_stream.device_channels = self.device_channels;
-        sink_stream.name = name.to_string();
-        let handle = new_stream_handle(sink_stream);
+        let base = Arc::new(Mutex::new(SinkStreamBase::new(
+            system,
+            stream_type,
+            system_channels,
+            self.device_channels,
+            name.to_string(),
+        )));
+
+        let Some(ref ctx) = self.ctx else {
+            let handle = new_stream_handle(CubebSinkStream::new(
+                base,
+                None,
+                #[cfg(windows)]
+                com_apartment,
+            ));
+            self.streams.push(handle.clone());
+            return handle;
+        };
 
         // Build cubeb stream params
         let layout = match self.device_channels {
@@ -281,7 +389,7 @@ impl Sink for CubebSink {
             name, stream_type, TARGET_SAMPLE_RATE, self.device_channels, system_channels, minimum_latency
         );
 
-        let stream_handle = handle.clone();
+        let callback_base = Arc::clone(&base);
         let device_channels = self.device_channels;
         let st = stream_type;
 
@@ -313,12 +421,11 @@ impl Sink for CubebSink {
             } else {
                 unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr(), output.len() * chans) }
             };
-            process_stream_callback(&stream_handle, st, device_channels, in_full, out_full)
+            process_stream_callback(&callback_base, st, device_channels, in_full, out_full)
         };
 
         let callback_name = name.to_string();
         let callback_type = stream_type;
-        let state_stream_handle = handle.clone();
         let state_callback = move |state: cubeb::State| {
             if should_trace_cubeb_state() {
                 log::info!(
@@ -327,9 +434,6 @@ impl Sink for CubebSink {
                     callback_type,
                     state
                 );
-            }
-            if state == cubeb::State::Drained {
-                state_stream_handle.lock().signal_pause();
             }
         };
 
@@ -348,58 +452,50 @@ impl Sink for CubebSink {
 
         match builder.init(ctx) {
             Ok(backend) => {
-                // Extract the raw cubeb_stream pointer for start/stop control.
-                // The backend is stored in CubebStream and outlives the callback.
-                let raw_ptr = backend.as_ptr() as usize;
-                let ctl_name = name.to_string();
-                let ctl_type = stream_type;
-                handle.lock().set_backend_ctl(Box::new(move |start| unsafe {
-                    let ptr = raw_ptr as *mut cubeb::ffi::cubeb_stream;
-                    if should_trace_cubeb_state() {
-                        log::info!(
-                            "CubebSink backend_ctl name={} type={:?} start={}",
-                            ctl_name,
-                            ctl_type,
-                            start
-                        );
-                    }
-                    if start {
-                        if cubeb::ffi::cubeb_stream_start(ptr) != 0 {
-                            log::error!("Error starting cubeb stream");
-                        }
-                    } else {
-                        if cubeb::ffi::cubeb_stream_stop(ptr) != 0 {
-                            log::error!("Error stopping cubeb stream");
-                        }
-                    }
-                }));
-                self.streams.push(CubebStream {
-                    handle: handle.clone(),
-                    _backend: backend,
+                let handle = new_stream_handle(CubebSinkStream::new(
+                    base,
+                    Some(backend),
                     #[cfg(windows)]
-                    _com_apartment: com_apartment,
-                });
+                    com_apartment,
+                ));
+                self.streams.push(handle.clone());
+                handle
             }
             Err(e) => {
                 error!("Error initializing cubeb stream: {:?}", e);
+                let handle = new_stream_handle(CubebSinkStream::new(
+                    base,
+                    None,
+                    #[cfg(windows)]
+                    com_apartment,
+                ));
+                self.streams.push(handle.clone());
+                handle
             }
         }
-
-        handle
     }
 
     fn close_stream(&mut self, stream: &SinkStreamHandle) {
-        self.streams
-            .retain(|entry| !Arc::ptr_eq(&entry.handle, stream));
+        if let Some(index) = self
+            .streams
+            .iter()
+            .position(|entry| Arc::ptr_eq(entry, stream))
+        {
+            self.streams[index].finalize();
+            self.streams.remove(index);
+        }
     }
 
     fn close_streams(&mut self) {
+        for stream in &self.streams {
+            stream.finalize();
+        }
         self.streams.clear();
     }
 
     fn get_device_volume(&self) -> f32 {
         if let Some(entry) = self.streams.first() {
-            entry.handle.lock().get_device_volume()
+            entry.get_device_volume()
         } else {
             1.0
         }
@@ -407,13 +503,13 @@ impl Sink for CubebSink {
 
     fn set_device_volume(&mut self, volume: f32) {
         for entry in &self.streams {
-            entry.handle.lock().set_device_volume(volume);
+            entry.set_device_volume(volume);
         }
     }
 
     fn set_system_volume(&mut self, volume: f32) {
         for entry in &self.streams {
-            entry.handle.lock().set_system_volume(volume);
+            entry.set_system_volume(volume);
         }
     }
 
@@ -437,10 +533,14 @@ mod tests {
     #[test]
     fn cubeb_callback_returns_frame_count_not_sample_count() {
         let system = make_system();
-        let mut stream = SinkStream::new(system, StreamType::Out);
-        stream.device_channels = 2;
-        stream.system_channels = 2;
-        stream.append_buffer(
+        let handle = Arc::new(parking_lot::Mutex::new(SinkStreamBase::new(
+            system,
+            StreamType::Out,
+            2,
+            2,
+            String::new(),
+        )));
+        handle.lock().append_buffer(
             SinkBuffer {
                 frames: 2,
                 frames_played: 0,
@@ -449,13 +549,30 @@ mod tests {
             },
             &[1, 2, 3, 4],
         );
-        let handle = Arc::new(parking_lot::Mutex::new(stream));
         let mut output = [0i16; 4];
 
         let written = process_stream_callback(&handle, StreamType::Out, 2, &[], &mut output);
 
         assert_eq!(written, 2);
         assert_eq!(output, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cubeb_input_callback_uses_the_input_frame_count() {
+        let handle = Arc::new(parking_lot::Mutex::new(SinkStreamBase::new(
+            make_system(),
+            StreamType::In,
+            2,
+            2,
+            String::new(),
+        )));
+        let mut output = [];
+
+        let written =
+            process_stream_callback(&handle, StreamType::In, 2, &[1, 2, 3, 4], &mut output);
+
+        assert_eq!(written, 2);
+        assert_eq!(handle.lock().release_buffer(4), vec![8, 16, 24, 32]);
     }
 }
 

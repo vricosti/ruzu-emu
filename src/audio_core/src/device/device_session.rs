@@ -2,7 +2,7 @@ use crate::audio_event::Type as AudioEventType;
 use crate::audio_manager::AudioManager;
 use crate::common::common::SampleFormat;
 use crate::device::guest_memory::SharedGuestMemory;
-use crate::sink::{SinkHandle, SinkStreamHandle, StreamType};
+use crate::sink::{start_sink_stream, stop_sink_stream, SinkHandle, SinkStreamHandle, StreamType};
 use crate::SharedSystem;
 use log::warn;
 use ruzu_core::core_timing::{create_event, EventType, UnscheduleEventType};
@@ -125,7 +125,7 @@ impl DeviceSession {
             return;
         }
         if let Some(stream) = &self.stream {
-            stream.lock().start(false);
+            start_sink_stream(stream, false);
             if self.thread_event.is_none() {
                 self.thread_event = Some(self.make_thread_event(stream.clone()));
             }
@@ -146,7 +146,7 @@ impl DeviceSession {
             return;
         }
         if let Some(stream) = &self.stream {
-            stream.lock().stop();
+            stop_sink_stream(stream);
             if let Some(thread_event) = &self.thread_event {
                 self.system
                     .get()

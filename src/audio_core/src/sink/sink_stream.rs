@@ -28,7 +28,31 @@ pub type SinkStreamHandle = Arc<Mutex<SinkStream>>;
 
 /// Callback to start/stop the audio backend (e.g. cubeb_stream_start/stop).
 /// Matches upstream CubebSinkStream::Start/Stop which call cubeb_stream_start/stop.
-pub type BackendStartStopFn = Box<dyn Fn(bool) + Send + Sync>;
+pub type BackendStartStopFn = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// Start a sink stream without holding its state mutex while entering the
+/// backend. Audio backends may wait for an in-flight callback, and that
+/// callback also needs the state mutex.
+pub fn start_sink_stream(stream: &SinkStreamHandle, _resume: bool) {
+    let transition = Arc::clone(&stream.lock().backend_transition);
+    let _transition_guard = transition.lock();
+    let backend_ctl = stream.lock().prepare_start();
+    if let Some(backend_ctl) = backend_ctl {
+        backend_ctl(true);
+    }
+}
+
+/// Stop a sink stream without holding its state mutex while entering the
+/// backend. This preserves upstream's ordering: mark the stream paused, then
+/// synchronously stop the native stream.
+pub fn stop_sink_stream(stream: &SinkStreamHandle) {
+    let transition = Arc::clone(&stream.lock().backend_transition);
+    let _transition_guard = transition.lock();
+    let backend_ctl = stream.lock().prepare_stop();
+    if let Some(backend_ctl) = backend_ctl {
+        backend_ctl(false);
+    }
+}
 
 /// Shared synchronization state for wait_free_space / buffer release.
 /// This is extracted so the ADSP thread can wait without holding the
@@ -118,6 +142,9 @@ pub struct SinkStream {
     pub release: Arc<ReleaseSync>,
     /// Backend start/stop callback. Called with `true` to start, `false` to stop.
     backend_ctl: Option<BackendStartStopFn>,
+    /// Serializes native start/stop calls without blocking the audio callback
+    /// from accessing the stream state.
+    backend_transition: Arc<Mutex<()>>,
 }
 
 impl SinkStream {
@@ -143,6 +170,7 @@ impl SinkStream {
             discard_buffers: false,
             release: Arc::new(ReleaseSync::new()),
             backend_ctl: None,
+            backend_transition: Arc::new(Mutex::new(())),
         }
     }
 
@@ -150,8 +178,8 @@ impl SinkStream {
 
     /// Set the backend start/stop callback. Called by the cubeb sink after creating
     /// the backend stream.
-    pub fn set_backend_ctl(&mut self, ctl: BackendStartStopFn) {
-        self.backend_ctl = Some(ctl);
+    pub fn set_backend_ctl(&mut self, ctl: Box<dyn Fn(bool) + Send + Sync>) {
+        self.backend_ctl = Some(Arc::from(ctl));
     }
 
     pub fn set_discard_buffers(&mut self, discard: bool) {
@@ -164,26 +192,20 @@ impl SinkStream {
             .store(enabled, Ordering::Release);
     }
 
-    /// Matches upstream CubebSinkStream::Start → cubeb_stream_start.
-    pub fn start(&mut self, _resume: bool) {
+    fn prepare_start(&mut self) -> Option<BackendStartStopFn> {
         if !self.release.paused.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         self.release.paused.store(false, Ordering::Release);
-        if let Some(ref ctl) = self.backend_ctl {
-            ctl(true);
-        }
+        self.backend_ctl.clone()
     }
 
-    /// Matches upstream CubebSinkStream::Stop → cubeb_stream_stop.
-    pub fn stop(&mut self) {
+    fn prepare_stop(&mut self) -> Option<BackendStartStopFn> {
         if self.release.paused.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         self.signal_pause();
-        if let Some(ref ctl) = self.backend_ctl {
-            ctl(false);
-        }
+        self.backend_ctl.clone()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -650,5 +672,27 @@ mod tests {
         stream.samples.extend([10, -20]);
 
         assert_eq!(stream.release_buffer(2), vec![80, -160]);
+    }
+
+    #[test]
+    fn backend_start_stop_runs_without_holding_stream_mutex() {
+        let stream = Arc::new(Mutex::new(SinkStream::new(make_system(), StreamType::Out)));
+        let weak_stream = Arc::downgrade(&stream);
+        let calls = Arc::new(AtomicU32::new(0));
+        let callback_calls = Arc::clone(&calls);
+        stream.lock().set_backend_ctl(Box::new(move |_| {
+            let stream = weak_stream.upgrade().expect("stream must remain alive");
+            assert!(
+                stream.try_lock().is_some(),
+                "backend control called while holding the stream mutex"
+            );
+            callback_calls.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        start_sink_stream(&stream, false);
+        stop_sink_stream(&stream);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(stream.lock().is_paused());
     }
 }

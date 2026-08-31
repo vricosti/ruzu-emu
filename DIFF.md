@@ -18881,3 +18881,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: no guest or host structure layout changed; the fix only changes synchronization ordering.
+## 2026-08-31 — `src/audio_core/src/sink/sink_stream.rs` vs Eden `src/audio_core/sink/{sink_stream.h,cubeb_sink.cpp,sdl3_sink.cpp}`
+
+### Intentional differences
+
+- Rust sink streams are shared as `Arc<Mutex<SinkStream>>`. The backend start/stop callback is
+  therefore cloned while the state mutex is held and invoked after releasing that mutex. Eden's
+  `CubebSinkStream` has no equivalent outer mutex, so its direct backend call cannot block its own
+  audio callback in the same way.
+- A separate backend-transition mutex preserves Eden's total ordering between concurrent start and
+  stop operations without being acquired by the native audio callback.
+
+### Unintentional differences (to fix)
+
+- None. Start still clears `paused` before entering the backend; stop still calls `SignalPause`
+  before synchronously stopping the backend, matching Eden's lifecycle order.
+
+### Missing items
+
+- None in the start/stop ownership and ordering slice.
+
+### Binary layout verification
+
+- N/A: this changes host-side synchronization only and does not alter guest-visible audio payloads.

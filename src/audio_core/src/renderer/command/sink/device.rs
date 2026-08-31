@@ -1,6 +1,6 @@
 use crate::common::common::{CpuAddr, MAX_CHANNELS, TARGET_SAMPLE_COUNT};
 use crate::renderer::command::util::write_copy;
-use crate::sink::sink_stream::{SinkBuffer, SinkStreamHandle};
+use crate::sink::sink_stream::{start_sink_stream, SinkBuffer, SinkStreamHandle};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -236,7 +236,7 @@ impl DeviceSinkPayload {
 
 pub fn process_device_command(
     payload: &DeviceSinkPayload,
-    stream: &SinkStreamHandle,
+    stream_handle: &SinkStreamHandle,
     buffer_count: i16,
 ) {
     let input_count = payload.input_count as usize;
@@ -260,7 +260,7 @@ pub fn process_device_command(
     }
     let profile = std::env::var_os("RUZU_PROFILE_DEVICE_SINK").is_some();
     let t_lock = std::time::Instant::now();
-    let mut stream = stream.lock();
+    let mut stream = stream_handle.lock();
     let lock_us = t_lock.elapsed().as_micros();
     let t_work = std::time::Instant::now();
     stream.set_system_channels(input_count as u32);
@@ -274,9 +274,7 @@ pub fn process_device_command(
         },
         &samples,
     );
-    if stream.is_paused() {
-        stream.start(false);
-    }
+    let should_start = stream.is_paused();
     if profile {
         let work_us = t_work.elapsed().as_micros();
         if lock_us > 1000 || work_us > 1000 {
@@ -288,6 +286,10 @@ pub fn process_device_command(
                 input_count
             );
         }
+    }
+    drop(stream);
+    if should_start {
+        start_sink_stream(stream_handle, false);
     }
 }
 

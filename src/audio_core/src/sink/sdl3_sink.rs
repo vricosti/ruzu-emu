@@ -13,7 +13,7 @@ use sdl3::sys::everything as sdl;
 
 use crate::common::common::{TARGET_SAMPLE_COUNT, TARGET_SAMPLE_RATE};
 use crate::sink::sink::{new_stream_handle, Sink, AUTO_DEVICE_NAME};
-use crate::sink::sink_stream::{SinkStream, SinkStreamHandle, StreamType};
+use crate::sink::sink_stream::{stop_sink_stream, SinkStream, SinkStreamHandle, StreamType};
 use crate::SharedSystem;
 
 fn sdl_error() -> String {
@@ -133,7 +133,7 @@ impl Drop for SDLStream {
         if self.stream.is_null() {
             return;
         }
-        self.handle.lock().stop();
+        stop_sink_stream(&self.handle);
         unsafe {
             let _ = sdl::SDL_ClearAudioStream(self.stream);
             sdl::SDL_DestroyAudioStream(self.stream);

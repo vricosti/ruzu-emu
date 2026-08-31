@@ -2,7 +2,7 @@ use crate::adsp::apps::audio_renderer::command_buffer::{CommandBuffer, ProcessHa
 use crate::adsp::apps::audio_renderer::command_list_processor::CommandListProcessor;
 use crate::adsp::mailbox::{AppMailboxId, Direction, Mailbox};
 use crate::common::common::MAX_RENDERER_SESSIONS;
-use crate::sink::{SinkHandle, SinkStreamHandle, StreamType};
+use crate::sink::{stop_sink_stream, SinkHandle, SinkStreamHandle, StreamType};
 use crate::SharedSystem;
 use common::thread::{set_current_thread_name, set_current_thread_priority, ThreadPriority};
 use log::{error, warn};
@@ -277,7 +277,7 @@ impl AudioRenderer {
         let mut shared = self.shared.lock();
         for stream in &mut shared.streams {
             if let Some(handle) = stream.take() {
-                handle.lock().stop();
+                stop_sink_stream(&handle);
                 sink.close_stream(&handle);
             }
         }
@@ -748,9 +748,9 @@ mod tests {
         );
 
         let stream = renderer.shared.lock().streams[0].as_ref().unwrap().clone();
+        crate::sink::start_sink_stream(&stream, false);
         {
             let mut stream = stream.lock();
-            stream.start(false);
             stream.set_ring_size(1);
             stream.append_buffer(
                 SinkBuffer {

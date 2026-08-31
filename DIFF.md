@@ -18857,3 +18857,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: frontend presentation only.
+
+## 2026-08-31 — `src/video_core/src/renderer_{vulkan,opengl}/*_rasterizer.rs` vs Eden `src/video_core/renderer_{vulkan,opengl}/*_rasterizer.cpp` (`OnCPUWrite`)
+
+### Intentional differences
+
+- Before marking an overlapping texture CPU-modified, Ruzu synchronously downloads any safe
+  GPU-modified image covering the write. Eden calls `WriteMemory` directly. Because texture dirty
+  state is image-wide rather than range-based, a small CPU write otherwise causes the next refresh
+  to upload stale guest bytes over the GPU-newer remainder of the image. The download still uses
+  the existing backend-owned `DownloadMemory` implementation, preserves modification-tick order,
+  and runs under the same texture-cache mutex.
+
+### Unintentional differences (to fix)
+
+- Resolved: partial CPU writes could replace recent GPU render-target contents with stale guest
+  backing when the image was refreshed.
+
+### Missing items
+
+- None in the reviewed CPU-write texture-coherency path.
+
+### Binary layout verification
+
+- PASS: no guest or host structure layout changed; the fix only changes synchronization ordering.

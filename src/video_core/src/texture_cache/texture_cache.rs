@@ -6068,7 +6068,7 @@ mod tests {
     }
 
     #[test]
-    fn download_memory_selects_only_upstream_safe_images_and_clears_gpu_modified() {
+    fn cpu_write_coherency_downloads_gpu_image_before_marking_it_cpu_modified() {
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::{Arc, Mutex};
@@ -6113,12 +6113,17 @@ mod tests {
             panic!("texture downloads must write through channel GPU memory")
         }));
 
-        cache.download_memory(0x8000, 0x2000);
+        assert!(cache.is_region_gpu_modified(0x8004, 4));
+        cache.download_memory(0x8004, 4);
+        cache.write_memory(0x8004, 4);
 
         assert_eq!(*downloaded.lock().unwrap(), vec![safe_id]);
         assert!(!cache.slot_images[safe_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
+        assert!(cache.slot_images[safe_id]
+            .flags
+            .contains(ImageFlagBits::CPU_MODIFIED));
         assert!(cache.slot_images[cpu_modified_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));

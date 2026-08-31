@@ -3088,6 +3088,17 @@ impl RasterizerInterface for RasterizerOpenGL {
         unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
+            // `write_memory` marks an entire overlapping image CPU-modified,
+            // even when the CPU only changes a few bytes. Preserve the
+            // GPU-newer remainder before the guest write occurs; otherwise a
+            // later refresh uploads stale guest backing over the render target.
+            if self
+                .texture_cache
+                .base
+                .is_region_gpu_modified(addr, size as usize)
+            {
+                self.texture_cache.download_memory(addr, size as usize);
+            }
             self.texture_cache.write_memory(addr, size as usize);
         }
         self.shader_cache.invalidate_region(addr, size as usize);

@@ -9,11 +9,15 @@ use std::ffi::{c_void, CStr};
 use std::sync::Arc;
 
 use log::{error, info};
+use parking_lot::Mutex;
 use sdl3::sys::everything as sdl;
 
 use crate::common::common::{TARGET_SAMPLE_COUNT, TARGET_SAMPLE_RATE};
 use crate::sink::sink::{new_stream_handle, Sink, AUTO_DEVICE_NAME};
-use crate::sink::sink_stream::{stop_sink_stream, SinkStream, SinkStreamHandle, StreamType};
+use crate::sink::sink_stream::{
+    SharedSinkStreamBase, SinkStream, SinkStreamBase, SinkStreamHandle, SinkStreamLifecycleState,
+    StreamType,
+};
 use crate::SharedSystem;
 
 fn sdl_error() -> String {
@@ -66,7 +70,7 @@ fn find_audio_device_by_name(device_name: &str, capture: bool) -> sdl::SDL_Audio
 }
 
 struct SDLCallbackState {
-    handle: SinkStreamHandle,
+    base: SharedSinkStreamBase,
     stream_type: StreamType,
     device_channels: usize,
 }
@@ -96,7 +100,7 @@ unsafe extern "C" fn data_callback(
         }
         let samples = bytes_read as usize / size_of::<i16>();
         state
-            .handle
+            .base
             .lock()
             .process_audio_in(&input[..samples], samples / frame_size);
     } else {
@@ -111,34 +115,96 @@ unsafe extern "C" fn data_callback(
         let mut output = vec![0i16; bytes_requested as usize / size_of::<i16>()];
         let frames = output.len() / frame_size;
         state
-            .handle
+            .base
             .lock()
             .process_audio_out_and_render(&mut output, frames);
         let _ = sdl::SDL_PutAudioStreamData(stream, output.as_ptr().cast(), bytes_requested);
     }
 }
 
-struct SDLStream {
-    handle: SinkStreamHandle,
+struct SDLLifecycle {
     stream: *mut sdl::SDL_AudioStream,
+    state: SinkStreamLifecycleState,
     // Must outlive `stream`: SDL stores this address as callback userdata.
-    _callback_state: Box<SDLCallbackState>,
+    callback_state: Option<Box<SDLCallbackState>>,
 }
 
-unsafe impl Send for SDLStream {}
-unsafe impl Sync for SDLStream {}
+unsafe impl Send for SDLLifecycle {}
+unsafe impl Sync for SDLLifecycle {}
 
-impl Drop for SDLStream {
-    fn drop(&mut self) {
-        if self.stream.is_null() {
+struct SDLSinkStream {
+    base: SharedSinkStreamBase,
+    lifecycle: Mutex<SDLLifecycle>,
+}
+
+unsafe impl Send for SDLSinkStream {}
+unsafe impl Sync for SDLSinkStream {}
+
+impl SinkStream for SDLSinkStream {
+    fn base(&self) -> &SharedSinkStreamBase {
+        &self.base
+    }
+
+    fn finalize(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state == SinkStreamLifecycleState::Finalized {
             return;
         }
-        stop_sink_stream(&self.handle);
-        unsafe {
-            let _ = sdl::SDL_ClearAudioStream(self.stream);
-            sdl::SDL_DestroyAudioStream(self.stream);
+
+        if lifecycle.state == SinkStreamLifecycleState::Running {
+            lifecycle.state = SinkStreamLifecycleState::Stopping;
+            if self.base.lock().signal_stop() && !lifecycle.stream.is_null() {
+                unsafe {
+                    let _ = sdl::SDL_PauseAudioStreamDevice(lifecycle.stream);
+                }
+            }
+            lifecycle.state = SinkStreamLifecycleState::Stopped;
         }
-        self.stream = std::ptr::null_mut();
+
+        if !lifecycle.stream.is_null() {
+            unsafe {
+                let _ = sdl::SDL_ClearAudioStream(lifecycle.stream);
+                sdl::SDL_DestroyAudioStream(lifecycle.stream);
+            }
+        }
+        lifecycle.stream = std::ptr::null_mut();
+        lifecycle.callback_state.take();
+        lifecycle.state = SinkStreamLifecycleState::Finalized;
+    }
+
+    fn start(&self, _resume: bool) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != SinkStreamLifecycleState::Stopped
+            || lifecycle.stream.is_null()
+            || !self.base.lock().signal_start()
+        {
+            return;
+        }
+        lifecycle.state = SinkStreamLifecycleState::Starting;
+        unsafe {
+            let _ = sdl::SDL_ResumeAudioStreamDevice(lifecycle.stream);
+        }
+        lifecycle.state = SinkStreamLifecycleState::Running;
+    }
+
+    fn stop(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != SinkStreamLifecycleState::Running || lifecycle.stream.is_null() {
+            return;
+        }
+        lifecycle.state = SinkStreamLifecycleState::Stopping;
+        if self.base.lock().signal_stop() {
+            unsafe {
+                let _ = sdl::SDL_PauseAudioStreamDevice(lifecycle.stream);
+            }
+        }
+        lifecycle.state = SinkStreamLifecycleState::Stopped;
+    }
+}
+
+impl Drop for SDLSinkStream {
+    fn drop(&mut self) {
+        self.finalize();
     }
 }
 
@@ -147,7 +213,7 @@ pub struct SDLSink {
     input_device: String,
     device_channels: u32,
     system_channels: u32,
-    streams: Vec<SDLStream>,
+    streams: Vec<SinkStreamHandle>,
 }
 
 unsafe impl Send for SDLSink {}
@@ -181,13 +247,28 @@ impl Sink for SDLSink {
         stream_type: StreamType,
     ) -> SinkStreamHandle {
         self.system_channels = system_channels;
-        let mut sink_stream = SinkStream::new(system, stream_type);
-        sink_stream.system_channels = system_channels;
-        sink_stream.device_channels = self.device_channels;
-        sink_stream.name = name.to_string();
-        let handle = new_stream_handle(sink_stream);
+        let base = Arc::new(Mutex::new(SinkStreamBase::new(
+            system,
+            stream_type,
+            system_channels,
+            self.device_channels,
+            name.to_string(),
+        )));
 
         if !ensure_audio_initialized() {
+            let handle = new_stream_handle(SDLSinkStream {
+                base: Arc::clone(&base),
+                lifecycle: Mutex::new(SDLLifecycle {
+                    stream: std::ptr::null_mut(),
+                    state: SinkStreamLifecycleState::Stopped,
+                    callback_state: Some(Box::new(SDLCallbackState {
+                        base,
+                        stream_type,
+                        device_channels: self.device_channels as usize,
+                    })),
+                }),
+            });
+            self.streams.push(handle.clone());
             return handle;
         }
 
@@ -212,7 +293,7 @@ impl Sink for SDLSink {
             freq: TARGET_SAMPLE_RATE as i32,
         };
         let mut callback_state = Box::new(SDLCallbackState {
-            handle: handle.clone(),
+            base: Arc::clone(&base),
             stream_type,
             device_channels: self.device_channels as usize,
         });
@@ -226,64 +307,67 @@ impl Sink for SDLSink {
         };
         if stream.is_null() {
             error!("Error opening SDL audio device: {}", sdl_error());
-            return handle;
-        }
-
-        let mut stream_in = sdl::SDL_AudioSpec::default();
-        let mut stream_out = sdl::SDL_AudioSpec::default();
-        unsafe {
-            let _ = sdl::SDL_GetAudioStreamFormat(stream, &mut stream_in, &mut stream_out);
-        }
-        info!(
-            "Opening SDL stream {:?} with: rate {} channels {} (system channels {}) format {}",
-            stream,
-            stream_out.freq,
-            stream_out.channels,
-            system_channels,
-            stream_out.format.value()
-        );
-
-        let stream_address = stream as usize;
-        handle.lock().set_backend_ctl(Box::new(move |start| unsafe {
-            let stream = stream_address as *mut sdl::SDL_AudioStream;
-            if start {
-                let _ = sdl::SDL_ResumeAudioStreamDevice(stream);
-            } else {
-                let _ = sdl::SDL_PauseAudioStreamDevice(stream);
+        } else {
+            let mut stream_in = sdl::SDL_AudioSpec::default();
+            let mut stream_out = sdl::SDL_AudioSpec::default();
+            unsafe {
+                let _ = sdl::SDL_GetAudioStreamFormat(stream, &mut stream_in, &mut stream_out);
             }
-        }));
-        self.streams.push(SDLStream {
-            handle: handle.clone(),
-            stream,
-            _callback_state: callback_state,
+            info!(
+                "Opening SDL stream {:?} with: rate {} channels {} (system channels {}) format {}",
+                stream,
+                stream_out.freq,
+                stream_out.channels,
+                system_channels,
+                stream_out.format.value()
+            );
+        }
+
+        let handle = new_stream_handle(SDLSinkStream {
+            base,
+            lifecycle: Mutex::new(SDLLifecycle {
+                stream,
+                state: SinkStreamLifecycleState::Stopped,
+                callback_state: Some(callback_state),
+            }),
         });
+        self.streams.push(handle.clone());
         handle
     }
 
     fn close_stream(&mut self, stream: &SinkStreamHandle) {
-        self.streams
-            .retain(|entry| !Arc::ptr_eq(&entry.handle, stream));
+        if let Some(index) = self
+            .streams
+            .iter()
+            .position(|entry| Arc::ptr_eq(entry, stream))
+        {
+            self.streams[index].finalize();
+            self.streams.remove(index);
+        }
     }
 
     fn close_streams(&mut self) {
+        for stream in &self.streams {
+            stream.finalize();
+        }
         self.streams.clear();
     }
 
     fn get_device_volume(&self) -> f32 {
         self.streams
             .first()
-            .map_or(1.0, |stream| stream.handle.lock().get_device_volume())
+            .map_or(1.0, |stream| stream.get_device_volume())
     }
 
     fn set_device_volume(&mut self, volume: f32) {
         for stream in &self.streams {
-            stream.handle.lock().set_device_volume(volume);
+            stream.set_device_volume(volume);
         }
     }
 
     fn set_system_volume(&mut self, volume: f32) {
         for stream in &self.streams {
-            stream.handle.lock().set_system_volume(volume);
+            stream.set_system_volume(volume);
         }
     }
 

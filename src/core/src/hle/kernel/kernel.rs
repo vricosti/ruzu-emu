@@ -2305,6 +2305,7 @@ impl KernelCore {
                     // FastmemPatchTable HashMap/SipHash lookup can overflow the
                     // stack into a secondary SIGSEGV (silent exit 139). Mirrors
                     // the CPU-core registration in cpu_manager.rs.
+                    #[cfg(target_arch = "x86_64")]
                     rdynarmic::backend::x64::exception_handler::register_thread_signal_stack();
                     log::info!("Host service thread '{}' started", thread_name);
                     func();

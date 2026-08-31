@@ -18881,26 +18881,76 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: no guest or host structure layout changed; the fix only changes synchronization ordering.
-## 2026-08-31 — `src/audio_core/src/sink/sink_stream.rs` vs Eden `src/audio_core/sink/{sink_stream.h,cubeb_sink.cpp,sdl3_sink.cpp}`
+## 2026-08-31 — `src/audio_core/src/sink/{sink_stream,sink,null_sink,cubeb_sink,sdl3_sink}.rs` vs Eden `src/audio_core/sink/{sink_stream.h,sink_stream.cpp,sink.h,null_sink.h,cubeb_sink.cpp,sdl3_sink.cpp}`
 
 ### Intentional differences
 
-- Rust sink streams are shared as `Arc<Mutex<SinkStream>>`. The backend start/stop callback is
-  therefore cloned while the state mutex is held and invoked after releasing that mutex. Eden's
-  `CubebSinkStream` has no equivalent outer mutex, so its direct backend call cannot block its own
-  audio callback in the same way.
-- A separate backend-transition mutex preserves Eden's total ordering between concurrent start and
-  stop operations without being acquired by the native audio callback.
+- Eden's virtual `SinkStream` base is represented by an object-safe Rust `SinkStream` trait. Its
+  common callback-visible data lives in `SinkStreamBase`, shared through
+  `Arc<parking_lot::Mutex<_>>`; concrete backend streams and native handles are not inside that
+  mutex.
+- Eden gives service users a non-owning pointer into the sink's `unique_ptr` vector. Rust uses
+  `Arc<dyn SinkStream>` handles. `CloseStream` therefore calls `Finalize` before removing the
+  sink-owned handle, making native resource destruction occur at the same lifecycle edge even if a
+  service temporarily retains another `Arc`.
+- Cubeb and SDL callbacks retain only the shared common base rather than a pointer to the complete
+  concrete stream. This makes callback lifetime explicit and prevents native `Stop` from holding a
+  lock needed by the callback it waits to finish.
+- The backend lifecycle `Mutex` serializes explicit
+  `Stopped -> Starting -> Running -> Stopping -> Finalized` transitions and native start, stop, and
+  finalize calls. Eden relies on its caller lifecycle for this serialization; the state machine is
+  a Rust shared-ownership adaptation and is never acquired by an audio callback.
+- The existing test-only recording Null sink uses `BaseSinkStream` so command-processing tests can
+  inspect samples. Production `NullSinkStreamImpl` retains Eden's no-op append/release behavior.
 
 ### Unintentional differences (to fix)
 
-- None. Start still clears `paused` before entering the backend; stop still calls `SignalPause`
-  before synchronously stopping the backend, matching Eden's lifecycle order.
+- Corrected: lifecycle ownership previously lived in generic `backend_ctl` closures attached to a
+  globally locked common stream. `CubebSinkStream` and `SDLSinkStream` now own their native handles
+  and implement `Finalize`, `Start`, and `Stop` in their upstream-owned modules.
+- Corrected: calling native Cubeb/SDL stop while holding the common stream mutex could deadlock when
+  the native API waited for a callback that needed the same mutex.
+- Corrected: production `NullSink` created one stream per name/type instead of returning its single
+  `NullSinkStreamImpl` for every acquisition.
+- Corrected: the Cubeb input callback derived its frame count from the empty output span instead of
+  the input span.
+- Corrected: Cubeb's state callback marked the stream paused on `Drained`; Eden's callback is
+  behaviorally empty.
+- Corrected: SDL callback userdata remained retained after `SDL_DestroyAudioStream` when another
+  `Arc<dyn SinkStream>` outlived `CloseStream`. Finalization now releases callback state only after
+  native stream destruction, preserving Eden's teardown order.
 
 ### Missing items
 
-- None in the start/stop ownership and ordering slice.
+- The common Rust base still uses mutex-protected `VecDeque` storage where Eden uses `RingBuffer`
+  and `SPSCQueue`. This is pre-existing common-stream implementation debt, not backend lifecycle
+  ownership, but remains a performance/structure difference.
+- The Android Oboe backend remains a base-only stub as documented in `oboe_sink.rs`.
 
 ### Binary layout verification
 
-- N/A: this changes host-side synchronization only and does not alter guest-visible audio payloads.
+- N/A: sink stream classes and synchronization state are host-only. Guest-visible command and
+  buffer payload layouts are unchanged.
+
+## 2026-08-31 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs`, `src/core/src/{cpu_manager.rs,hle/kernel/kernel.rs}`, and `src/rdynarmic/src/backend/arm64/jit_state.rs` vs host-backend ownership
+
+### Intentional differences
+
+- Per-thread alternate signal-stack registration is compiled only for the x64 backend that owns
+  `exception_handler`; the ARM64 backend has no corresponding x64 signal handler.
+- ARM64 diagnostic state reads use the ARM64 `A64JitState` and expose direct accessors for its native
+  NZCV, FPCR, FPSR, vector array, and PC offset.
+
+### Unintentional differences (to fix)
+
+- Corrected: unconditional imports and calls into `rdynarmic::backend::x64` made `origin/main`
+  fail to compile on Apple Silicon before `audio_core` could be validated.
+
+### Missing items
+
+- None in the reviewed target-selection/buildability slice.
+
+### Binary layout verification
+
+- PASS: the ARM64 state layout is unchanged; only accessors and `Deref` views were added. Existing
+  ARM64 layout assertions still cover offsets and total size.

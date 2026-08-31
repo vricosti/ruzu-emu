@@ -159,7 +159,7 @@ impl DeviceSession {
 
     pub fn clear_buffers(&self) {
         if let Some(stream) = &self.stream {
-            stream.lock().clear_queue();
+            stream.clear_queue();
         }
     }
 
@@ -167,7 +167,6 @@ impl DeviceSession {
         let Some(stream) = &self.stream else {
             return;
         };
-        let mut stream = stream.lock();
         for buffer in buffers {
             let frames =
                 buffer.size / (self.channel_count as u64 * std::mem::size_of::<i16>() as u64);
@@ -227,7 +226,7 @@ impl DeviceSession {
             return;
         }
         let num_samples = buffer.size / std::mem::size_of::<i16>() as u64;
-        let samples = stream.lock().release_buffer(num_samples);
+        let samples = stream.release_buffer(num_samples);
         if !self.write_guest_samples(buffer.samples, &samples) {
             warn!(
                 "audio_core: failed to write {} input samples back to guest at {:#x}",
@@ -243,7 +242,7 @@ impl DeviceSession {
 
     pub fn set_volume(&self, volume: f32) {
         if let Some(stream) = &self.stream {
-            stream.lock().set_system_volume(volume);
+            stream.set_system_volume(volume);
         }
     }
 
@@ -253,7 +252,7 @@ impl DeviceSession {
 
     pub fn set_ring_size(&self, ring_size: u32) {
         if let Some(stream) = &self.stream {
-            stream.lock().set_ring_size(ring_size);
+            stream.set_ring_size(ring_size);
         }
     }
 
@@ -290,7 +289,7 @@ impl DeviceSession {
         create_event(
             format!("AudioDeviceSampleTick-{}", self.session_id),
             Box::new(move |_, _| {
-                let played = stream.lock().get_expected_played_sample_count();
+                let played = stream.get_expected_played_sample_count();
                 played_sample_count.store(played, Ordering::SeqCst);
                 if let (Some(audio_manager), Some(event_type)) = (&audio_manager, audio_event_type)
                 {
@@ -373,7 +372,7 @@ mod tests {
         let stream = sink
             .lock()
             .acquire_sink_stream(system, 2, "DeviceOut-0", StreamType::Out);
-        let samples = stream.lock().release_buffer(4);
+        let samples = stream.release_buffer(4);
         assert_eq!(samples, vec![1, 2, 3, 4]);
     }
 
@@ -400,7 +399,7 @@ mod tests {
         let stream = sink
             .lock()
             .acquire_sink_stream(system, 2, "BuiltInHeadset-1", StreamType::In);
-        stream.lock().process_audio_in(&[5, 6, 7, 8], 2);
+        stream.process_audio_in(&[5, 6, 7, 8], 2);
         session.release_buffer(AudioBuffer {
             start_timestamp: 0,
             end_timestamp: 2,
@@ -444,7 +443,7 @@ mod tests {
             sink.lock()
                 .acquire_sink_stream(system.clone(), 2, "DeviceOut-2", StreamType::Out);
         let mut rendered = [0i16; 4];
-        stream.lock().process_audio_out_and_render(&mut rendered, 2);
+        stream.process_audio_out_and_render(&mut rendered, 2);
 
         session.start();
         let _ = system.get().core_timing().advance();
@@ -493,7 +492,7 @@ mod tests {
             sink.lock()
                 .acquire_sink_stream(system.clone(), 2, "DeviceOut-3", StreamType::Out);
         let mut rendered = [0i16; 4];
-        stream.lock().process_audio_out_and_render(&mut rendered, 2);
+        stream.process_audio_out_and_render(&mut rendered, 2);
 
         let event = session.make_thread_event(stream.clone());
         {

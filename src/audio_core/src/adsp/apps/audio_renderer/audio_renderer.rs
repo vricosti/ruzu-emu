@@ -267,7 +267,7 @@ impl AudioRenderer {
                 &name,
                 StreamType::Render,
             );
-            handle.lock().set_ring_size(4);
+            handle.set_ring_size(4);
             shared.streams[index] = Some(handle);
         }
     }
@@ -384,7 +384,6 @@ impl AudioRenderer {
                         };
 
                         if should_trace_adsp_audio() && index == 0 {
-                            let stream_guard = stream.lock();
                             log::info!(
                                 "ADSP::AudioRenderer pre-process session={} buffer=0x{:X} size={} remaining={} reset={} queue={} paused={}",
                                 index,
@@ -392,8 +391,8 @@ impl AudioRenderer {
                                 buffer_state.size,
                                 buffer_state.remaining_command_count,
                                 buffer_state.reset_buffer,
-                                stream_guard.get_queue_size(),
-                                stream_guard.is_paused()
+                                stream.get_queue_size(),
+                                stream.is_paused()
                             );
                         }
 
@@ -418,7 +417,7 @@ impl AudioRenderer {
                         }
 
                         if buffer_state.reset_buffer && !buffers_reset[index] {
-                            stream.lock().clear_queue();
+                            stream.clear_queue();
                             buffers_reset[index] = true;
                         }
 
@@ -439,7 +438,7 @@ impl AudioRenderer {
                         if index == 0 {
                             // Wait without holding the stream lock — the sink
                             // callback needs the lock to consume buffers.
-                            let release = stream.lock().release.clone();
+                            let release = stream.base().lock().release.clone();
                             if should_trace_adsp_audio() {
                                 let queued = release.queued_buffers.load(Ordering::Acquire);
                                 let max = release.max_queue_size.load(Ordering::Acquire);
@@ -481,14 +480,13 @@ impl AudioRenderer {
                         buffer.remaining_command_count = processor.get_remaining_command_count();
                         buffer.render_time_taken_us = end_time.saturating_sub(start_time);
                         if should_trace_adsp_audio() && index == 0 {
-                            let stream_guard = stream.lock();
                             log::info!(
                                 "ADSP::AudioRenderer post-process session={} remaining={} render_time_us={} queue={} paused={}",
                                 index,
                                 buffer.remaining_command_count,
                                 buffer.render_time_taken_us,
-                                stream_guard.get_queue_size(),
-                                stream_guard.is_paused()
+                                stream.get_queue_size(),
+                                stream.is_paused()
                             );
                         }
                     }
@@ -573,7 +571,7 @@ mod tests {
         );
 
         let stream = renderer.shared.lock().streams[0].as_ref().unwrap().clone();
-        stream.lock().append_buffer(
+        stream.append_buffer(
             SinkBuffer {
                 frames: 2,
                 frames_played: 0,
@@ -582,7 +580,7 @@ mod tests {
             },
             &[1, 2, 3, 4],
         );
-        assert_eq!(stream.lock().get_queue_size(), 1);
+        assert_eq!(stream.get_queue_size(), 1);
 
         renderer.set_command_buffer(
             0,
@@ -596,7 +594,7 @@ mod tests {
         renderer.signal();
         renderer.wait();
 
-        assert_eq!(stream.lock().get_queue_size(), 0);
+        assert_eq!(stream.get_queue_size(), 0);
         let shared = renderer.shared.lock();
         assert_eq!(shared.command_buffers[0].buffer, 0);
         assert!(!shared.command_buffers[0].reset_buffer);
@@ -666,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn start_creates_distinct_paused_streams_per_session() {
+    fn null_sink_reuses_its_single_paused_stream_like_upstream() {
         let system = make_system();
         let sink = new_sink_handle(Box::new(NullSink::new("test")));
         let mut renderer = AudioRenderer::new(system, sink);
@@ -676,9 +674,9 @@ mod tests {
         let shared = renderer.shared.lock();
         let stream0 = shared.streams[0].as_ref().unwrap().clone();
         let stream1 = shared.streams[1].as_ref().unwrap().clone();
-        assert!(!Arc::ptr_eq(&stream0, &stream1));
-        assert!(stream0.lock().is_paused());
-        assert!(stream1.lock().is_paused());
+        assert!(Arc::ptr_eq(&stream0, &stream1));
+        assert!(stream0.is_paused());
+        assert!(stream1.is_paused());
     }
 
     #[test]
@@ -749,19 +747,16 @@ mod tests {
 
         let stream = renderer.shared.lock().streams[0].as_ref().unwrap().clone();
         crate::sink::start_sink_stream(&stream, false);
-        {
-            let mut stream = stream.lock();
-            stream.set_ring_size(1);
-            stream.append_buffer(
-                SinkBuffer {
-                    frames: 2,
-                    frames_played: 0,
-                    tag: 1,
-                    consumed: false,
-                },
-                &[1, 2, 3, 4],
-            );
-        }
+        stream.set_ring_size(1);
+        stream.append_buffer(
+            SinkBuffer {
+                frames: 2,
+                frames_played: 0,
+                tag: 1,
+                consumed: false,
+            },
+            &[1, 2, 3, 4],
+        );
 
         renderer.set_command_buffer(
             0,

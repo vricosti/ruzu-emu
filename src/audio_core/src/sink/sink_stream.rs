@@ -24,34 +24,122 @@ pub struct SinkBuffer {
     pub consumed: bool,
 }
 
-pub type SinkStreamHandle = Arc<Mutex<SinkStream>>;
+pub type SharedSinkStreamBase = Arc<Mutex<SinkStreamBase>>;
+pub type SinkStreamHandle = Arc<dyn SinkStream>;
 
-/// Callback to start/stop the audio backend (e.g. cubeb_stream_start/stop).
-/// Matches upstream CubebSinkStream::Start/Stop which call cubeb_stream_start/stop.
-pub type BackendStartStopFn = Arc<dyn Fn(bool) + Send + Sync>;
+/// Lifecycle state serialized by each concrete backend stream.
+///
+/// Eden serializes these transitions through stream ownership. Rust exposes
+/// streams through shared `Arc` handles, so the concrete backends make the
+/// same ordering explicit without exposing this state to audio callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SinkStreamLifecycleState {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Finalized,
+}
 
-/// Start a sink stream without holding its state mutex while entering the
-/// backend. Audio backends may wait for an in-flight callback, and that
-/// callback also needs the state mutex.
-pub fn start_sink_stream(stream: &SinkStreamHandle, _resume: bool) {
-    let transition = Arc::clone(&stream.lock().backend_transition);
-    let _transition_guard = transition.lock();
-    let backend_ctl = stream.lock().prepare_start();
-    if let Some(backend_ctl) = backend_ctl {
-        backend_ctl(true);
+/// Rust counterpart of upstream's virtual `SinkStream` interface.
+///
+/// Backend lifecycle methods remain owned by the concrete backend stream. The
+/// shared base contains only the callback-visible queue and stream state, so a
+/// synchronous native `stop` never holds a lock needed by the callback it is
+/// waiting to finish.
+pub trait SinkStream: Send + Sync {
+    fn base(&self) -> &SharedSinkStreamBase;
+
+    fn finalize(&self) {}
+    fn start(&self, _resume: bool) {}
+    fn stop(&self) {}
+
+    fn is_paused(&self) -> bool {
+        self.base().lock().is_paused()
+    }
+
+    fn get_system_channels(&self) -> u32 {
+        self.base().lock().get_system_channels()
+    }
+
+    fn set_system_channels(&self, channels: u32) {
+        self.base().lock().set_system_channels(channels);
+    }
+
+    fn get_device_channels(&self) -> u32 {
+        self.base().lock().get_device_channels()
+    }
+
+    fn get_system_volume(&self) -> f32 {
+        self.base().lock().get_system_volume()
+    }
+
+    fn get_device_volume(&self) -> f32 {
+        self.base().lock().get_device_volume()
+    }
+
+    fn set_system_volume(&self, volume: f32) {
+        self.base().lock().set_system_volume(volume);
+    }
+
+    fn set_device_volume(&self, volume: f32) {
+        self.base().lock().set_device_volume(volume);
+    }
+
+    fn get_queue_size(&self) -> u32 {
+        self.base().lock().get_queue_size()
+    }
+
+    fn set_ring_size(&self, ring_size: u32) {
+        self.base().lock().set_ring_size(ring_size);
+    }
+
+    fn append_buffer(&self, buffer: SinkBuffer, samples: &[i16]) {
+        self.base().lock().append_buffer(buffer, samples);
+    }
+
+    fn release_buffer(&self, num_samples: u64) -> Vec<i16> {
+        self.base().lock().release_buffer(num_samples)
+    }
+
+    fn clear_queue(&self) {
+        self.base().lock().clear_queue();
+    }
+
+    fn process_audio_in(&self, input_buffer: &[i16], num_frames: usize) {
+        self.base()
+            .lock()
+            .process_audio_in(input_buffer, num_frames);
+    }
+
+    fn process_audio_out_and_render(&self, output_buffer: &mut [i16], num_frames: usize) {
+        self.base()
+            .lock()
+            .process_audio_out_and_render(output_buffer, num_frames);
+    }
+
+    fn get_expected_played_sample_count(&self) -> u64 {
+        self.base().lock().get_expected_played_sample_count()
+    }
+
+    fn wait_free_space(&self) {
+        let release = Arc::clone(&self.base().lock().release);
+        static NOT_STOPPED: AtomicBool = AtomicBool::new(false);
+        release.wait_free_space_with_stop(&NOT_STOPPED);
+    }
+
+    fn wait_free_space_with_stop(&self, stop_requested: &AtomicBool) {
+        let release = Arc::clone(&self.base().lock().release);
+        release.wait_free_space_with_stop(stop_requested);
     }
 }
 
-/// Stop a sink stream without holding its state mutex while entering the
-/// backend. This preserves upstream's ordering: mark the stream paused, then
-/// synchronously stop the native stream.
+pub fn start_sink_stream(stream: &SinkStreamHandle, resume: bool) {
+    stream.start(resume);
+}
+
 pub fn stop_sink_stream(stream: &SinkStreamHandle) {
-    let transition = Arc::clone(&stream.lock().backend_transition);
-    let _transition_guard = transition.lock();
-    let backend_ctl = stream.lock().prepare_stop();
-    if let Some(backend_ctl) = backend_ctl {
-        backend_ctl(false);
-    }
+    stream.stop();
 }
 
 /// Shared synchronization state for wait_free_space / buffer release.
@@ -122,7 +210,7 @@ impl ReleaseSync {
     }
 }
 
-pub struct SinkStream {
+pub struct SinkStreamBase {
     pub system: SharedSystem,
     pub stream_type: StreamType,
     pub system_channels: u32,
@@ -140,21 +228,22 @@ pub struct SinkStream {
     discard_buffers: bool,
     /// Shared release synchronization (atomics + condvar).
     pub release: Arc<ReleaseSync>,
-    /// Backend start/stop callback. Called with `true` to start, `false` to stop.
-    backend_ctl: Option<BackendStartStopFn>,
-    /// Serializes native start/stop calls without blocking the audio callback
-    /// from accessing the stream state.
-    backend_transition: Arc<Mutex<()>>,
 }
 
-impl SinkStream {
-    pub fn new(system: SharedSystem, stream_type: StreamType) -> Self {
+impl SinkStreamBase {
+    pub fn new(
+        system: SharedSystem,
+        stream_type: StreamType,
+        system_channels: u32,
+        device_channels: u32,
+        name: String,
+    ) -> Self {
         Self {
             system,
             stream_type,
-            system_channels: 2,
-            device_channels: 2,
-            name: String::new(),
+            system_channels,
+            device_channels,
+            name,
             queue: VecDeque::new(),
             playing_buffer: SinkBuffer {
                 consumed: true,
@@ -169,17 +258,7 @@ impl SinkStream {
             device_volume: 1.0,
             discard_buffers: false,
             release: Arc::new(ReleaseSync::new()),
-            backend_ctl: None,
-            backend_transition: Arc::new(Mutex::new(())),
         }
-    }
-
-    pub fn finalize(&mut self) {}
-
-    /// Set the backend start/stop callback. Called by the cubeb sink after creating
-    /// the backend stream.
-    pub fn set_backend_ctl(&mut self, ctl: Box<dyn Fn(bool) + Send + Sync>) {
-        self.backend_ctl = Some(Arc::from(ctl));
     }
 
     pub fn set_discard_buffers(&mut self, discard: bool) {
@@ -192,24 +271,24 @@ impl SinkStream {
             .store(enabled, Ordering::Release);
     }
 
-    fn prepare_start(&mut self) -> Option<BackendStartStopFn> {
-        if !self.release.paused.load(Ordering::Acquire) {
-            return None;
-        }
-        self.release.paused.store(false, Ordering::Release);
-        self.backend_ctl.clone()
-    }
-
-    fn prepare_stop(&mut self) -> Option<BackendStartStopFn> {
-        if self.release.paused.load(Ordering::Acquire) {
-            return None;
-        }
-        self.signal_pause();
-        self.backend_ctl.clone()
-    }
-
     pub fn is_paused(&self) -> bool {
         self.release.paused.load(Ordering::Acquire)
+    }
+
+    pub fn signal_start(&mut self) -> bool {
+        if !self.is_paused() {
+            return false;
+        }
+        self.release.paused.store(false, Ordering::Release);
+        true
+    }
+
+    pub fn signal_stop(&mut self) -> bool {
+        if self.is_paused() {
+            return false;
+        }
+        self.signal_pause();
+        true
     }
 
     pub fn get_system_channels(&self) -> u32 {
@@ -565,6 +644,38 @@ impl SinkStream {
     }
 }
 
+/// Base-only stream used when a selected backend could not create a native
+/// stream. Concrete working backends own their own stream type instead.
+pub struct BaseSinkStream {
+    base: SharedSinkStreamBase,
+}
+
+impl BaseSinkStream {
+    pub fn new(
+        system: SharedSystem,
+        stream_type: StreamType,
+        system_channels: u32,
+        device_channels: u32,
+        name: String,
+    ) -> Self {
+        Self {
+            base: Arc::new(Mutex::new(SinkStreamBase::new(
+                system,
+                stream_type,
+                system_channels,
+                device_channels,
+                name,
+            ))),
+        }
+    }
+}
+
+impl SinkStream for BaseSinkStream {
+    fn base(&self) -> &SharedSinkStreamBase {
+        &self.base
+    }
+}
+
 fn clamp_i16(sample: f32) -> i16 {
     sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
@@ -579,9 +690,7 @@ mod tests {
     #[test]
     fn expected_played_sample_count_is_tracked_in_frames() {
         let system = make_system();
-        let mut stream = SinkStream::new(system, StreamType::Out);
-        stream.device_channels = 2;
-        stream.system_channels = 2;
+        let mut stream = SinkStreamBase::new(system, StreamType::Out, 2, 2, String::new());
         stream.append_buffer(
             SinkBuffer {
                 frames: 2,
@@ -605,8 +714,7 @@ mod tests {
     #[test]
     fn process_audio_in_captures_frames_without_queued_buffers() {
         let system = make_system();
-        let mut stream = SinkStream::new(system, StreamType::In);
-        stream.device_channels = 2;
+        let mut stream = SinkStreamBase::new(system, StreamType::In, 2, 2, String::new());
         stream.append_buffer(
             SinkBuffer {
                 frames: 2,
@@ -628,9 +736,7 @@ mod tests {
     #[test]
     fn append_buffer_downmixes_six_channels_to_two() {
         let system = make_system();
-        let mut stream = SinkStream::new(system, StreamType::Render);
-        stream.system_channels = 6;
-        stream.device_channels = 2;
+        let mut stream = SinkStreamBase::new(system, StreamType::Render, 6, 2, String::new());
 
         stream.append_buffer(
             SinkBuffer {
@@ -648,9 +754,7 @@ mod tests {
     #[test]
     fn append_buffer_expands_two_channels_to_six() {
         let system = make_system();
-        let mut stream = SinkStream::new(system, StreamType::Render);
-        stream.system_channels = 2;
-        stream.device_channels = 6;
+        let mut stream = SinkStreamBase::new(system, StreamType::Render, 2, 6, String::new());
 
         stream.append_buffer(
             SinkBuffer {
@@ -668,31 +772,53 @@ mod tests {
     #[test]
     fn release_buffer_applies_audio_in_gain() {
         let system = make_system();
-        let mut stream = SinkStream::new(system, StreamType::In);
+        let mut stream = SinkStreamBase::new(system, StreamType::In, 2, 2, String::new());
         stream.samples.extend([10, -20]);
 
         assert_eq!(stream.release_buffer(2), vec![80, -160]);
     }
 
     #[test]
-    fn backend_start_stop_runs_without_holding_stream_mutex() {
-        let stream = Arc::new(Mutex::new(SinkStream::new(make_system(), StreamType::Out)));
-        let weak_stream = Arc::downgrade(&stream);
+    fn backend_lifecycle_is_owned_by_the_concrete_stream() {
+        struct TestStream {
+            base: SharedSinkStreamBase,
+            calls: Arc<AtomicU32>,
+        }
+
+        impl SinkStream for TestStream {
+            fn base(&self) -> &SharedSinkStreamBase {
+                &self.base
+            }
+
+            fn start(&self, _resume: bool) {
+                assert!(self.base.lock().signal_start());
+                assert!(self.base.try_lock().is_some());
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn stop(&self) {
+                assert!(self.base.lock().signal_stop());
+                assert!(self.base.try_lock().is_some());
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         let calls = Arc::new(AtomicU32::new(0));
-        let callback_calls = Arc::clone(&calls);
-        stream.lock().set_backend_ctl(Box::new(move |_| {
-            let stream = weak_stream.upgrade().expect("stream must remain alive");
-            assert!(
-                stream.try_lock().is_some(),
-                "backend control called while holding the stream mutex"
-            );
-            callback_calls.fetch_add(1, Ordering::Relaxed);
-        }));
+        let stream: SinkStreamHandle = Arc::new(TestStream {
+            base: Arc::new(Mutex::new(SinkStreamBase::new(
+                make_system(),
+                StreamType::Out,
+                2,
+                2,
+                String::new(),
+            ))),
+            calls: Arc::clone(&calls),
+        });
 
         start_sink_stream(&stream, false);
         stop_sink_stream(&stream);
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert!(stream.lock().is_paused());
+        assert!(stream.is_paused());
     }
 }

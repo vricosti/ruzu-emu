@@ -17,6 +17,9 @@ use crate::memory::memory::Memory;
 use common::page_table::PageInfo;
 use common::settings_enums::CpuAccuracy;
 
+#[cfg(target_arch = "aarch64")]
+use rdynarmic::backend::arm64::jit_state::A64JitState;
+#[cfg(target_arch = "x86_64")]
 use rdynarmic::backend::x64::a64_jitstate::A64JitState;
 use rdynarmic::interface::a64::config::{
     Exception as A64Exception, InstructionCacheOperation, UserCallbacks as A64UserCallbacks,

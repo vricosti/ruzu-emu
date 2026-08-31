@@ -20,6 +20,20 @@ impl Default for A32ExtRegs {
 #[derive(Clone, Copy)]
 pub struct A64VecRegs(pub [u64; 64]);
 
+impl core::ops::Deref for A64VecRegs {
+    type Target = [u64; 64];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for A64VecRegs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl Default for A64VecRegs {
     fn default() -> Self {
         Self([0; 64])
@@ -155,6 +169,22 @@ impl A64JitState {
         let fpcr_u64 = ((self.fpcr & A64_FPCR_MASK) as u64) << A64_FPCR_SHIFT;
         let pc_u64 = self.pc & A64_PC_MASK;
         LocationDescriptor::new(pc_u64 | fpcr_u64)
+    }
+
+    pub const fn offset_of_pc() -> usize {
+        core::mem::offset_of!(Self, pc)
+    }
+
+    pub fn get_pstate(&self) -> u32 {
+        self.cpsr_nzcv
+    }
+
+    pub fn get_fpcr(&self) -> u32 {
+        self.fpcr
+    }
+
+    pub fn get_fpsr(&self) -> u32 {
+        self.fpsr
     }
 }
 

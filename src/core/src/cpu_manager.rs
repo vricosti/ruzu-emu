@@ -2024,6 +2024,7 @@ impl CpuManager {
         // the small fiber stack and can overflow it, producing a secondary
         // scene-transition texture burst). Each CPU-core OS thread needs its
         // own altstack.
+        #[cfg(target_arch = "x86_64")]
         rdynarmic::backend::x64::exception_handler::register_thread_signal_stack();
 
         let name = if is_multicore {

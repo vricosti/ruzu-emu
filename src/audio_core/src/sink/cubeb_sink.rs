@@ -574,6 +574,26 @@ mod tests {
         assert_eq!(written, 2);
         assert_eq!(handle.lock().release_buffer(4), vec![8, 16, 24, 32]);
     }
+
+    #[test]
+    #[ignore = "requires a host Cubeb output device"]
+    fn native_stop_and_finalize_complete_while_callbacks_are_active() {
+        let mut sink = CubebSink::new(AUTO_DEVICE_NAME);
+        let stream =
+            sink.acquire_sink_stream(make_system(), 2, "CubebLifecycleTest", StreamType::Out);
+
+        stream.start(false);
+        assert!(!stream.is_paused());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        stream.stop();
+        assert!(stream.is_paused());
+        sink.close_stream(&stream);
+
+        // A retained service handle may outlive Sink::CloseStream. Finalize
+        // must remain idempotent after the native stream has been destroyed.
+        stream.finalize();
+    }
 }
 
 /// Get a list of connected devices from cubeb.

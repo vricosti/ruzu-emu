@@ -18838,3 +18838,22 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - N/A: these are host ownership adapters. Focused regressions keep the owning non-reentrant mutex
   locked while graphics-pipeline and buffer-cache reads use the stable pointer, and verify that the
   tick scope-exit does not increase the callback `Arc` strong count.
+## 2026-08-31 — `src/ruzu/src/gtk_compat.rs` vs Eden `src/yuzu/main_window.cpp` (`MainWindow::question`)
+
+### Intentional differences
+
+- Eden assigns the question title to a Qt window title. Ruzu omits the equivalent GTK window-title
+  property on Linux because GTK's client-side decoration renders it immediately above the identical
+  primary message label; Windows and macOS retain the distinct native window title.
+
+### Unintentional differences (to fix)
+
+- Corrected: Linux question dialogs displayed the emulator name twice in adjacent headings.
+
+### Missing items
+
+- None for the reviewed dialog-title presentation.
+
+### Binary layout verification
+
+- N/A: frontend presentation only.

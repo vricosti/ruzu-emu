@@ -156,14 +156,16 @@ pub fn ask_question<P: IsA<gtk::Window>>(
     let detail = crate::i18n::tr(detail);
     let cancel_label = crate::i18n::tr(cancel_label);
     let accept_label = crate::i18n::tr(accept_label);
-    let dialog = gtk::MessageDialog::builder()
-        .title(title)
+    let mut builder = gtk::MessageDialog::builder()
         .modal(true)
         .message_type(MessageType::Question)
         .buttons(ButtonsType::None)
         .text(&message)
-        .secondary_text(&detail)
-        .build();
+        .secondary_text(&detail);
+    if let Some(title) = question_window_title(title) {
+        builder = builder.title(title);
+    }
+    let dialog = builder.build();
     if let Some(parent) = parent {
         dialog.set_transient_for(Some(parent));
     }
@@ -190,6 +192,18 @@ pub fn ask_question<P: IsA<gtk::Window>>(
         glib::Propagation::Proceed
     });
     dialog.present();
+}
+
+fn question_window_title(title: &str) -> Option<&str> {
+    // GTK renders its own client-side title on Linux. Repeating the same text
+    // as the primary MessageDialog label produces two adjacent headings there.
+    // Windows and macOS use a distinct native title bar, where retaining the
+    // window title keeps the existing platform presentation.
+    if cfg!(target_os = "linux") {
+        None
+    } else {
+        Some(title)
+    }
 }
 
 type QuestionCallback = Rc<RefCell<Option<Box<dyn FnOnce(bool)>>>>;
@@ -223,6 +237,15 @@ mod tests {
 
         assert_eq!(calls.get(), 1);
         assert!(accepted.get());
+    }
+
+    #[test]
+    fn question_title_is_not_duplicated_by_linux_client_side_decorations() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(question_window_title("ruzu"), None);
+        } else {
+            assert_eq!(question_window_title("ruzu"), Some("ruzu"));
+        }
     }
 }
 

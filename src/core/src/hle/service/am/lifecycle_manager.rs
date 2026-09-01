@@ -5,8 +5,9 @@
 //! Port of zuyu/src/core/hle/service/am/lifecycle_manager.cpp
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_thread::KScopedDisableDispatch;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 use crate::hle::service::os::event::Event;
 
@@ -40,10 +41,92 @@ pub enum SuspendMode {
     ForceSuspend = 2,
 }
 
+/// Thread-safe endpoint for the frontend-owned exit request.
+///
+/// Eden protects these fields with `Applet::lock`. Ruzu executes HLE service
+/// handlers on guest fibers, so that lock can remain on a suspended fiber's
+/// stack. Keeping the exit transition and the system-event cache behind a
+/// dedicated endpoint lets the frontend deliver the same lifecycle message
+/// without acquiring the rest of the applet state.
+pub(crate) struct LifecycleExitRequest {
+    system_event: Arc<Event>,
+    state: Mutex<LifecycleExitState>,
+}
+
+struct LifecycleExitState {
+    requested: bool,
+    acknowledged: bool,
+    applet_message_available: bool,
+}
+
+impl LifecycleExitRequest {
+    fn new(system_event: Arc<Event>) -> Self {
+        Self {
+            system_event,
+            state: Mutex::new(LifecycleExitState {
+                requested: false,
+                acknowledged: false,
+                applet_message_available: false,
+            }),
+        }
+    }
+
+    pub(crate) fn request(&self) {
+        let dispatch_guard = Self::disable_dispatch();
+        let mut state = self.state.lock().unwrap();
+        state.requested = true;
+
+        // RequestExit never clears the event: another lifecycle message may
+        // already be pending. It only makes a newly pending Exit observable.
+        if state.requested != state.acknowledged && !state.applet_message_available {
+            state.applet_message_available = true;
+            self.system_event.signal();
+        }
+        drop(state);
+        drop(dispatch_guard);
+    }
+
+    fn get_requested(&self) -> bool {
+        self.state.lock().unwrap().requested
+    }
+
+    fn acknowledge_if_pending(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.requested == state.acknowledged {
+            return false;
+        }
+        state.acknowledged = state.requested;
+        true
+    }
+
+    fn update_system_event(&self, other_message_pending: bool) {
+        let dispatch_guard = Self::disable_dispatch();
+        let mut state = self.state.lock().unwrap();
+        let should_signal = other_message_pending || state.requested != state.acknowledged;
+
+        if state.applet_message_available != should_signal {
+            state.applet_message_available = should_signal;
+            if should_signal {
+                self.system_event.signal();
+            } else {
+                self.system_event.clear();
+            }
+        }
+        drop(state);
+        drop(dispatch_guard);
+    }
+
+    fn disable_dispatch() -> Option<KScopedDisableDispatch> {
+        let current_thread = crate::hle::kernel::kernel::get_current_emu_thread()?;
+        Some(KScopedDisableDispatch::new(&current_thread))
+    }
+}
+
 pub struct LifecycleManager {
     // Matches upstream: Event m_system_event, Event m_operation_mode_changed_system_event
     system_event: Arc<Event>,
     operation_mode_changed_system_event: Arc<Event>,
+    exit_request: Arc<LifecycleExitRequest>,
 
     unordered_messages: VecDeque<AppletMessage>,
 
@@ -67,10 +150,6 @@ pub struct LifecycleManager {
     has_operation_mode_changed: bool,
     has_requested_request_to_prepare_sleep: bool,
     has_acknowledged_request_to_prepare_sleep: bool,
-    has_requested_exit: bool,
-    has_acknowledged_exit: bool,
-    applet_message_available: bool,
-
     forced_suspend: bool,
     focus_handling_mode: FocusHandlingMode,
     activity_state: ActivityState,
@@ -81,8 +160,10 @@ pub struct LifecycleManager {
 
 impl LifecycleManager {
     pub fn new(is_application: bool) -> Self {
+        let system_event = Arc::new(Event::new());
         Self {
-            system_event: Arc::new(Event::new()),
+            exit_request: Arc::new(LifecycleExitRequest::new(Arc::clone(&system_event))),
+            system_event,
             operation_mode_changed_system_event: Arc::new(Event::new()),
             unordered_messages: VecDeque::new(),
             is_application,
@@ -104,9 +185,6 @@ impl LifecycleManager {
             has_operation_mode_changed: false,
             has_requested_request_to_prepare_sleep: false,
             has_acknowledged_request_to_prepare_sleep: false,
-            has_requested_exit: false,
-            has_acknowledged_exit: false,
-            applet_message_available: false,
             forced_suspend: false,
             focus_handling_mode: FocusHandlingMode::SuspendHomeSleep,
             activity_state: ActivityState::ForegroundVisible,
@@ -152,7 +230,11 @@ impl LifecycleManager {
     }
 
     pub fn get_exit_requested(&self) -> bool {
-        self.has_requested_exit
+        self.exit_request.get_requested()
+    }
+
+    pub(crate) fn exit_request_handle(&self) -> Arc<LifecycleExitRequest> {
+        Arc::clone(&self.exit_request)
     }
 
     pub fn get_activity_state(&self) -> ActivityState {
@@ -172,9 +254,8 @@ impl LifecycleManager {
         self.signal_system_event_if_needed();
     }
 
-    pub fn request_exit(&mut self) {
-        self.has_requested_exit = true;
-        self.signal_system_event_if_needed();
+    pub fn request_exit(&self) {
+        self.exit_request.request();
     }
 
     pub fn request_resume_notification(&mut self) {
@@ -287,11 +368,11 @@ impl LifecycleManager {
 
         match self.suspend_mode {
             SuspendMode::NoOverride => {}
-            SuspendMode::ForceResume => return self.has_requested_exit,
+            SuspendMode::ForceResume => return self.get_exit_requested(),
             SuspendMode::ForceSuspend => return false,
         }
 
-        if self.has_requested_exit {
+        if self.get_exit_requested() {
             return true;
         }
 
@@ -326,6 +407,9 @@ impl LifecycleManager {
 
         if new_state != self.requested_focus_state {
             self.requested_focus_state = new_state;
+            if self.is_application {
+                self.has_focus_state_changed = true;
+            }
             true
         } else {
             false
@@ -333,17 +417,8 @@ impl LifecycleManager {
     }
 
     pub fn signal_system_event_if_needed(&mut self) {
-        let applet_message_available = self.applet_message_available;
-
-        if applet_message_available != self.should_signal_system_event() {
-            if !applet_message_available {
-                self.applet_message_available = true;
-                self.system_event.signal();
-            } else {
-                self.applet_message_available = false;
-                self.system_event.clear();
-            }
-        }
+        let other_message_pending = self.should_signal_system_event_without_exit();
+        self.exit_request.update_system_event(other_message_pending);
     }
 
     pub fn push_unordered_message(&mut self, message: AppletMessage) {
@@ -393,8 +468,7 @@ impl LifecycleManager {
             return AppletMessage::Resume;
         }
 
-        if self.has_acknowledged_exit != self.has_requested_exit {
-            self.has_acknowledged_exit = self.has_requested_exit;
+        if self.exit_request.acknowledge_if_pending() {
             return AppletMessage::Exit;
         }
 
@@ -478,7 +552,7 @@ impl LifecycleManager {
         AppletMessage::None
     }
 
-    fn should_signal_system_event(&self) -> bool {
+    fn should_signal_system_event_without_exit(&self) -> bool {
         if self.focus_state_changed_notification_enabled {
             if !self.is_application {
                 if self.requested_focus_state != self.acknowledged_focus_state {
@@ -491,7 +565,6 @@ impl LifecycleManager {
 
         !self.unordered_messages.is_empty()
             || self.has_resume
-            || (self.has_requested_exit != self.has_acknowledged_exit)
             || (self.has_requested_request_to_prepare_sleep
                 != self.has_acknowledged_request_to_prepare_sleep)
             || self.has_operation_mode_changed
@@ -513,7 +586,7 @@ mod tests {
 
     #[test]
     fn request_exit_signals_then_pop_clears_system_event() {
-        let mut lifecycle = LifecycleManager::new(true);
+        let mut lifecycle = LifecycleManager::new(false);
         assert!(!lifecycle.system_event.is_signaled());
 
         lifecycle.request_exit();
@@ -522,6 +595,22 @@ mod tests {
         let mut message = AppletMessage::None;
         assert!(lifecycle.pop_message(&mut message));
         assert_eq!(message, AppletMessage::Exit);
+        assert!(!lifecycle.system_event.is_signaled());
+    }
+
+    #[test]
+    fn exit_acknowledgement_preserves_another_pending_message() {
+        let mut lifecycle = LifecycleManager::new(false);
+        lifecycle.push_unordered_message(AppletMessage::ApplicationExited);
+        lifecycle.request_exit();
+
+        let mut message = AppletMessage::None;
+        assert!(lifecycle.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::Exit);
+        assert!(lifecycle.system_event.is_signaled());
+
+        assert!(lifecycle.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::ApplicationExited);
         assert!(!lifecycle.system_event.is_signaled());
     }
 
@@ -563,5 +652,18 @@ mod tests {
 
         assert!(lifecycle.has_resume);
         assert!(!lifecycle.get_system_event().is_signaled());
+    }
+
+    #[test]
+    fn application_focus_update_marks_the_focus_message_pending() {
+        let mut lifecycle = LifecycleManager::new(true);
+        let mut message = AppletMessage::None;
+        assert!(lifecycle.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::FocusStateChanged);
+        assert!(!lifecycle.has_focus_state_changed);
+
+        lifecycle.set_activity_state(ActivityState::BackgroundVisible);
+        assert!(lifecycle.update_requested_focus_state());
+        assert!(lifecycle.has_focus_state_changed);
     }
 }

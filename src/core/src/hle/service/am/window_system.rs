@@ -11,7 +11,7 @@ use super::am_results;
 use super::am_types::*;
 use super::applet::Applet;
 use super::event_observer::EventObserver;
-use super::lifecycle_manager::ActivityState;
+use super::lifecycle_manager::{ActivityState, LifecycleExitRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonPressDuration {
@@ -55,6 +55,11 @@ struct WindowSystemInner {
 
     /// Applet map by aruid — upstream: std::map<u64, std::shared_ptr<Applet>>
     applets: BTreeMap<u64, Arc<Mutex<Applet>>>,
+
+    /// Rust guest fibers can suspend while retaining `Applet`'s host mutex.
+    /// Keep the lifecycle-owned exit endpoints separately reachable so the
+    /// frontend can still reproduce `LifecycleManager::RequestExit`.
+    exit_requests: BTreeMap<u64, Arc<LifecycleExitRequest>>,
 }
 
 impl WindowSystem {
@@ -69,6 +74,7 @@ impl WindowSystem {
                 application_aruid: None,
                 overlay_display_aruid: None,
                 applets: BTreeMap::new(),
+                exit_requests: BTreeMap::new(),
             }),
         }
     }
@@ -116,9 +122,9 @@ impl WindowSystem {
 
     /// Upstream: void TrackApplet(std::shared_ptr<Applet> applet, bool is_application)
     pub fn track_applet(&self, applet: Arc<Mutex<Applet>>, is_application: bool) {
-        let aruid = {
+        let (aruid, exit_request) = {
             let a = applet.lock().unwrap();
-            a.aruid.pid
+            (a.aruid.pid, a.lifecycle_manager.exit_request_handle())
         };
 
         let mut inner = self.lock.lock().unwrap();
@@ -145,6 +151,7 @@ impl WindowSystem {
         }
 
         inner.applets.insert(aruid, applet);
+        inner.exit_requests.insert(aruid, exit_request);
     }
 
     /// Upstream: std::shared_ptr<Applet> GetByAppletResourceUserId(u64 aruid)
@@ -229,9 +236,8 @@ impl WindowSystem {
     /// Upstream: void OnExitRequested()
     pub fn on_exit_requested(&self) {
         let inner = self.lock.lock().unwrap();
-        for (_aruid, applet) in &inner.applets {
-            let mut a = applet.lock().unwrap();
-            a.lifecycle_manager.request_exit();
+        for exit_request in inner.exit_requests.values() {
+            exit_request.request();
         }
     }
 
@@ -381,6 +387,7 @@ impl WindowSystem {
             // Unlink.
             drop(a);
             inner.applets.remove(&aruid);
+            inner.exit_requests.remove(&aruid);
         }
 
         // If the last applet has exited, exit the system.
@@ -552,5 +559,46 @@ mod tests {
         window_system.update();
 
         assert!(window_system.get_by_applet_resource_user_id(0).is_none());
+        assert!(window_system.lock.lock().unwrap().exit_requests.is_empty());
+    }
+
+    #[test]
+    fn exit_request_reaches_a_busy_applet_fiber() {
+        let window_system = WindowSystem::new(crate::core::SystemRef::null());
+
+        let mut busy_applet = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        busy_applet.aruid = AppletResourceUserId { pid: 1 };
+        let busy_applet = Arc::new(Mutex::new(busy_applet));
+        window_system.track_applet(Arc::clone(&busy_applet), false);
+
+        let mut available_applet =
+            Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        available_applet.aruid = AppletResourceUserId { pid: 2 };
+        let available_applet = Arc::new(Mutex::new(available_applet));
+        window_system.track_applet(Arc::clone(&available_applet), false);
+
+        let busy_guard = busy_applet.lock().unwrap();
+        window_system.on_exit_requested();
+
+        assert!(busy_guard.lifecycle_manager.get_exit_requested());
+        assert!(busy_guard
+            .lifecycle_manager
+            .get_system_event()
+            .is_signaled());
+        assert!(available_applet
+            .lock()
+            .unwrap()
+            .lifecycle_manager
+            .get_exit_requested());
+
+        drop(busy_guard);
+        let mut busy_applet = busy_applet.lock().unwrap();
+        let mut message = AppletMessage::None;
+        assert!(busy_applet.lifecycle_manager.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::Exit);
+        assert!(!busy_applet
+            .lifecycle_manager
+            .get_system_event()
+            .is_signaled());
     }
 }

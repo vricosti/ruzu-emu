@@ -19134,3 +19134,17 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - N/A: these changes alter host-side API ownership and Metal state only; no guest payload or disk
   cache representation changes.
+## 2026-09-01 — `src/core/src/hle/service/am/{lifecycle_manager.rs,window_system.rs}` vs Eden `src/core/hle/service/am/{lifecycle_manager,window_system}.{h,cpp}`
+
+### Intentional differences
+- Eden protects lifecycle exit state with `Applet::lock`. Ruzu executes HLE handlers on guest fibers, and releasing the scheduler lock may suspend such a fiber while it still owns the Rust `Mutex<Applet>`. `LifecycleManager` therefore owns an `Arc<LifecycleExitRequest>` containing the requested/acknowledged/event-cache state, and `WindowSystem` keeps a matching handle for each tracked applet. `OnExitRequested` retains Eden's window-system lock and iteration order but delivers the same `Exit` transition without acquiring the rest of the applet state.
+- `LifecycleExitRequest` disables guest dispatch while its small state lock spans `Event::signal` or `Event::clear`. The event keeps its existing Rust lock order before acquiring the recursive scheduler lock; the lifecycle state is released before dispatch is enabled and a fiber switch becomes possible.
+
+### Unintentional differences (to fix)
+- None in this shutdown slice.
+
+### Missing items
+- None in this shutdown slice.
+
+### Binary layout verification
+- N/A: lifecycle state is host-only and no shared binary payload or disk format changed.

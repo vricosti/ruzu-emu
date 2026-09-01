@@ -204,16 +204,24 @@ impl HIDCore {
     }
 
     pub fn reload_input_devices(&mut self) {
-        self.player_1.lock().reload_from_settings();
-        self.player_2.lock().reload_from_settings();
-        self.player_3.lock().reload_from_settings();
-        self.player_4.lock().reload_from_settings();
-        self.player_5.lock().reload_from_settings();
-        self.player_6.lock().reload_from_settings();
-        self.player_7.lock().reload_from_settings();
-        self.player_8.lock().reload_from_settings();
-        self.other.lock().reload_from_settings();
-        self.handheld.lock().reload_from_settings();
+        fn reload(controller: &EmulatedControllerHandle) {
+            let callbacks = controller.lock().reload_from_settings_deferred();
+            for callback in callbacks {
+                callback.dispatch();
+            }
+            controller.lock().reload_input();
+        }
+
+        reload(&self.player_1);
+        reload(&self.player_2);
+        reload(&self.player_3);
+        reload(&self.player_4);
+        reload(&self.player_5);
+        reload(&self.player_6);
+        reload(&self.player_7);
+        reload(&self.player_8);
+        reload(&self.other);
+        reload(&self.handheld);
         self.console.reload_from_settings();
         self.devices.reload_from_settings();
     }

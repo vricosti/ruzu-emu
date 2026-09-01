@@ -70,7 +70,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         service_manager.clone(),
         system,
     )));
-    time_manager.lock().unwrap().initialize();
+    time_manager.lock().unwrap().initialize(service_manager);
     log::info!("Glue::LoopProcess: TimeManager initialized");
 
     // Time services — upstream creates a shared TimeManager and passes it

@@ -15,6 +15,90 @@ use super::k_process::ProcessLock;
 use super::k_thread::KThreadLock;
 use super::k_thread::ThreadState;
 
+std::thread_local! {
+    /// Rust-only host-fiber boundary for an HLE IPC transaction.
+    ///
+    /// Eden updates guest scheduling state from a service callback without
+    /// suspending the native stack that owns the callback's temporary locks.
+    /// Ruzu uses cooperative host fibers, so only the eventual host-fiber
+    /// switch must be deferred until the IPC transaction has fully returned.
+    static HLE_IPC_HOST_FIBER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static HLE_IPC_HOST_FIBER_SWITCH_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the dynamic extent in which an HLE IPC transaction owns temporary
+/// Rust guards. Scheduler queues and guest thread state are still updated
+/// immediately; switch sites use `defer_hle_ipc_host_fiber_switch` to postpone
+/// only the cooperative host-fiber handoff.
+pub(crate) struct HleIpcHostFiberContext {
+    active: bool,
+}
+
+impl HleIpcHostFiberContext {
+    pub(crate) fn enter() -> Self {
+        HLE_IPC_HOST_FIBER_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_add(1)
+                    .expect("HLE IPC nesting overflow"),
+            );
+        });
+        Self { active: true }
+    }
+
+    /// Finish the current nesting level without performing a fiber switch.
+    /// Returns true only to the outermost owner when a switch was requested.
+    #[must_use = "the outermost owner must consume a requested host-fiber switch"]
+    pub(crate) fn finish(mut self) -> bool {
+        self.active = false;
+        leave_hle_ipc_host_fiber_context()
+    }
+
+    pub(crate) fn is_active() -> bool {
+        HLE_IPC_HOST_FIBER_DEPTH.with(|depth| depth.get() != 0)
+    }
+}
+
+impl Drop for HleIpcHostFiberContext {
+    fn drop(&mut self) {
+        if self.active {
+            // Never switch from Drop: unwinding may still own unrelated Rust
+            // guards. Discarding the request on panic is safer than yielding
+            // from a partially unwound IPC transaction.
+            let _ = leave_hle_ipc_host_fiber_context();
+        }
+    }
+}
+
+fn leave_hle_ipc_host_fiber_context() -> bool {
+    HLE_IPC_HOST_FIBER_DEPTH.with(|depth| {
+        let current = depth.get();
+        assert!(current > 0, "unbalanced HLE IPC host-fiber context");
+        let remaining = current - 1;
+        depth.set(remaining);
+        remaining == 0 && HLE_IPC_HOST_FIBER_SWITCH_PENDING.with(|pending| pending.replace(false))
+    })
+}
+
+/// Return true when the caller must omit a preemptive host-fiber handoff. A
+/// non-runnable current thread must switch immediately: its caller is waiting
+/// for an operation such as `KLightLock::LockSlowPath` to complete and cannot
+/// continue the IPC transaction until that wait has ended.
+fn defer_hle_ipc_host_fiber_switch(current_state: ThreadState) -> bool {
+    if current_state != ThreadState::RUNNABLE {
+        return false;
+    }
+
+    HLE_IPC_HOST_FIBER_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            return false;
+        }
+        HLE_IPC_HOST_FIBER_SWITCH_PENDING.with(|pending| pending.set(true));
+        true
+    })
+}
+
 fn trace_sched_state_filter() -> &'static Option<Vec<u64>> {
     static FILTER: OnceLock<Option<Vec<u64>>> = OnceLock::new();
     FILTER.get_or_init(|| {
@@ -255,6 +339,65 @@ mod tests {
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::KThread;
+
+    #[test]
+    fn nested_hle_ipc_context_coalesces_host_fiber_switch_requests() {
+        let outer = HleIpcHostFiberContext::enter();
+        let inner = HleIpcHostFiberContext::enter();
+
+        assert!(HleIpcHostFiberContext::is_active());
+        assert!(defer_hle_ipc_host_fiber_switch(ThreadState::RUNNABLE));
+        assert!(!inner.finish());
+        assert!(HleIpcHostFiberContext::is_active());
+        assert!(outer.finish());
+        assert!(!HleIpcHostFiberContext::is_active());
+    }
+
+    #[test]
+    fn hle_ipc_context_without_a_switch_request_finishes_without_rescheduling() {
+        let context = HleIpcHostFiberContext::enter();
+
+        assert!(HleIpcHostFiberContext::is_active());
+        assert!(!context.finish());
+        assert!(!HleIpcHostFiberContext::is_active());
+    }
+
+    #[test]
+    fn hle_ipc_context_never_defers_a_required_wait_handoff() {
+        let context = HleIpcHostFiberContext::enter();
+
+        assert!(!defer_hle_ipc_host_fiber_switch(ThreadState::WAITING));
+        assert!(!context.finish());
+    }
+
+    #[test]
+    fn current_core_reschedule_preserves_guest_request_while_host_switch_is_deferred() {
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.set_state(ThreadState::RUNNABLE);
+            thread.disable_dispatch();
+        }
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
+        let context = HleIpcHostFiberContext::enter();
+        let mut scheduler = KScheduler::new(0);
+        scheduler
+            .state
+            .needs_scheduling
+            .store(true, Ordering::SeqCst);
+
+        scheduler.reschedule_current_core();
+
+        assert!(scheduler.state.needs_scheduling.load(Ordering::SeqCst));
+        assert!(scheduler.switch_fiber.is_none());
+        assert_eq!(
+            current_thread.lock().unwrap().get_disable_dispatch_count(),
+            0
+        );
+        assert!(context.finish());
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
 
     #[test]
     fn thread_context_guard_stays_locked_until_explicit_unlock() {
@@ -942,6 +1085,35 @@ pub struct KScheduler {
 }
 
 impl KScheduler {
+    /// Consume a host-fiber switch requested while an HLE IPC transaction was
+    /// active. The caller invokes this only after the callback, reply, and all
+    /// transaction-local guards have been destroyed.
+    pub(crate) fn consume_deferred_hle_ipc_host_fiber_switch() {
+        debug_assert!(!HleIpcHostFiberContext::is_active());
+
+        let Some(kernel) = super::kernel::get_kernel_ref() else {
+            return;
+        };
+
+        if let Some(scheduler) = kernel.current_scheduler() {
+            if !kernel.is_phantom_mode_for_single_core() {
+                let scheduler_ptr = {
+                    let mut scheduler = scheduler.lock().unwrap();
+                    &mut *scheduler as *mut KScheduler
+                };
+                unsafe {
+                    Self::reschedule_current_core_raw(scheduler_ptr);
+                }
+                return;
+            }
+        }
+
+        debug_assert!(
+            false,
+            "deferred IPC fiber switch lost its originating core scheduler"
+        );
+    }
+
     fn resolve_thread_for_switch(&self, next_thread_id: u64) -> Option<Arc<KThreadLock>> {
         if self.idle_thread_id == Some(next_thread_id) {
             if let Some(idle_thread) = self.idle_thread.as_ref().and_then(Weak::upgrade) {
@@ -1666,6 +1838,17 @@ impl KScheduler {
         // reply has already balanced the dummy/current-thread dispatch count.
         // Guard the decrement so those host-fiber re-entries do not underflow;
         // the explicit `needs_scheduling` reschedule call below still runs.
+        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+            let current_state = cur_thread.lock().unwrap().get_state();
+            if defer_hle_ipc_host_fiber_switch(current_state) {
+                let mut thread = cur_thread.lock().unwrap();
+                if thread.get_disable_dispatch_count() > 0 {
+                    thread.enable_dispatch();
+                }
+                return;
+            }
+        }
+
         if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
             let mut t = cur_thread.lock().unwrap();
             if t.get_disable_dispatch_count() > 0 {

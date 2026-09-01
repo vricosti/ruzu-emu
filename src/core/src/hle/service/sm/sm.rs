@@ -352,7 +352,10 @@ fn validate_service_name(name: &str) -> ResultCode {
 /// Constructor: `SM(ServiceManager& service_manager_, Core::System& system_)`.
 pub struct Sm {
     system: SystemRef,
-    service_manager: Arc<Mutex<ServiceManager>>,
+    // Upstream stores `ServiceManager&`: the service does not own its manager.
+    // A strong Arc here forms `ServiceManager -> factory -> Sm -> ServiceManager`
+    // and keeps every service from the previous emulation session alive.
+    service_manager: std::sync::Weak<Mutex<ServiceManager>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -419,10 +422,16 @@ impl Sm {
 
         Self {
             system,
-            service_manager,
+            service_manager: Arc::downgrade(&service_manager),
             handlers,
             handlers_tipc,
         }
+    }
+
+    fn service_manager_owner(&self) -> Arc<Mutex<ServiceManager>> {
+        self.service_manager
+            .upgrade()
+            .expect("SM request outlived its ServiceManager")
     }
 
     // --- Handler trampolines (fn pointers that downcast from &dyn ServiceFramework) ---
@@ -552,7 +561,8 @@ impl Sm {
         log::info!("  GetService: looking up \"{}\"", name);
 
         let (port, handler, parent_server_manager, parent_queue, parent_wakeup) = {
-            let sm = self.service_manager.lock().unwrap();
+            let service_manager = self.service_manager_owner();
+            let sm = service_manager.lock().unwrap();
             let port_result = sm.get_service_port_entry(&name);
             let handler = sm.get_service(&name);
             // Use the TARGET service's owning ServerManager — not the caller's.
@@ -781,7 +791,8 @@ impl Sm {
         );
 
         let (result, deferral_event) = {
-            let mut sm = self.service_manager.lock().unwrap();
+            let service_manager = self.service_manager_owner();
+            let mut sm = service_manager.lock().unwrap();
             // Upstream passes nullptr as handler factory for guest-registered services.
             let factory: SessionRequestHandlerFactory =
                 Box::new(|| -> SessionRequestHandlerPtr { panic!("null factory called") });
@@ -824,7 +835,8 @@ impl Sm {
         {
             let mut process = owner_process.lock().unwrap();
             if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
-                let mut sm = self.service_manager.lock().unwrap();
+                let service_manager = self.service_manager_owner();
+                let mut sm = service_manager.lock().unwrap();
                 sm.unregister_service(&name);
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(RESULT_INVALID_STATE);
@@ -835,7 +847,7 @@ impl Sm {
         }
         kernel.register_kernel_object(client_port_object_id);
         kernel.register_kernel_object(server_port_object_id);
-        self.service_manager
+        self.service_manager_owner()
             .lock()
             .unwrap()
             .set_service_port_client_port_object_id(&name, client_port_object_id);
@@ -861,7 +873,7 @@ impl Sm {
         log::debug!("SM::UnregisterService called with name={}", name);
 
         let result = self
-            .service_manager
+            .service_manager_owner()
             .lock()
             .unwrap()
             .unregister_service(&name);
@@ -898,7 +910,7 @@ impl ServiceFramework for Sm {
     }
 
     fn service_manager(&self) -> Option<Arc<Mutex<ServiceManager>>> {
-        Some(self.service_manager.clone())
+        self.service_manager.upgrade()
     }
 }
 
@@ -1088,6 +1100,23 @@ mod tests {
         // Unregister again should fail.
         let result4 = sm.unregister_service("test_svc");
         assert_eq!(result4, RESULT_NOT_REGISTERED);
+    }
+
+    #[test]
+    fn sm_factory_does_not_keep_its_service_manager_alive() {
+        let manager = Arc::new(Mutex::new(ServiceManager::new()));
+        let weak_manager = Arc::downgrade(&manager);
+        let service = Arc::new(Sm::new(Arc::clone(&manager), SystemRef::null()));
+        let factory: SessionRequestHandlerFactory = Box::new(move || service.clone());
+        assert!(manager
+            .lock()
+            .unwrap()
+            .register_service("sm:".to_string(), 64, factory)
+            .is_success());
+
+        drop(manager);
+
+        assert!(weak_manager.upgrade().is_none());
     }
 
     #[test]

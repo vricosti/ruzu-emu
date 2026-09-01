@@ -28,7 +28,6 @@ pub struct TimeManager {
     pub time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
     pub psc_time: Arc<Mutex<crate::hle::service::psc::time::manager::TimeManager>>,
     pub time_sm: Arc<PscStaticService>,
-    service_manager: Arc<Mutex<ServiceManager>>,
 }
 
 impl TimeManager {
@@ -67,7 +66,6 @@ impl TimeManager {
             time_zone_binary,
             psc_time,
             time_sm: time_m.get_static_service_as_service_manager(),
-            service_manager,
         }
     }
 
@@ -75,18 +73,18 @@ impl TimeManager {
         PscStaticService::with_time_manager(setup_info, Arc::clone(&self.psc_time))
     }
 
-    pub fn initialize(&mut self) {
+    pub fn initialize(&mut self, service_manager: &Arc<Mutex<ServiceManager>>) {
         log::info!("Glue::Time::TimeManager: starting initialization");
 
         let set_sys_handler =
-            ServiceManager::get_service_blocking(&self.service_manager, self.system, "set:sys");
+            ServiceManager::get_service_blocking(service_manager, self.system, "set:sys");
         let set_sys = set_sys_handler
             .as_any()
             .downcast_ref::<SystemSettingsService>()
             .expect("set:sys is not an ISystemSettingsServer");
 
         let time_m_handler =
-            ServiceManager::get_service_blocking(&self.service_manager, self.system, "time:m");
+            ServiceManager::get_service_blocking(service_manager, self.system, "time:m");
         let time_m = time_m_handler
             .as_any()
             .downcast_ref::<TimeServiceManager>()

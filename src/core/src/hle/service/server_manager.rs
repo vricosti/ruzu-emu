@@ -25,6 +25,7 @@ use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::{HleIpcHostFiberContext, KScheduler};
 use crate::hle::kernel::k_server_session::KServerSession;
 use crate::hle::kernel::svc::svc_results::RESULT_SESSION_CLOSED as KERNEL_RESULT_SESSION_CLOSED;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -1381,6 +1382,24 @@ impl ServerManager {
     fn complete_sync_request_shared(
         manager_owner: &Arc<Mutex<ServerManager>>,
         event: SharedSessionEvent,
+        context: HLERequestContext,
+    ) -> bool {
+        let host_fiber_context = HleIpcHostFiberContext::enter();
+        let result = Self::complete_sync_request_transaction_shared(manager_owner, event, context);
+
+        // `complete_sync_request_transaction_shared` has returned, so every
+        // callback-local borrow and mutex guard, response buffer guard,
+        // ServerManager guard, and wakeup-event guard has been destroyed.
+        // Only this outer owner may now perform the deferred host-fiber switch.
+        if host_fiber_context.finish() {
+            KScheduler::consume_deferred_hle_ipc_host_fiber_switch();
+        }
+        result
+    }
+
+    fn complete_sync_request_transaction_shared(
+        manager_owner: &Arc<Mutex<ServerManager>>,
+        event: SharedSessionEvent,
         mut context: HLERequestContext,
     ) -> bool {
         let mut phase_last = ipc_phase_timer();
@@ -1817,6 +1836,7 @@ mod tests {
         owner: Weak<Mutex<ServerManager>>,
         server_session: Arc<Mutex<KServerSession>>,
         calls: AtomicUsize,
+        observed_host_fiber_context: AtomicBool,
         manager_was_unlocked: AtomicBool,
         request_addresses: Mutex<Vec<u64>>,
         defer_first: bool,
@@ -1824,6 +1844,8 @@ mod tests {
 
     impl crate::hle::service::hle_ipc::SessionRequestHandler for RecordingDispatchHandler {
         fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+            self.observed_host_fiber_context
+                .fetch_or(HleIpcHostFiberContext::is_active(), Ordering::Relaxed);
             let manager_is_unlocked = self
                 .owner
                 .upgrade()
@@ -1866,6 +1888,7 @@ mod tests {
             owner: Arc::downgrade(&owner),
             server_session: Arc::clone(&server_session),
             calls: AtomicUsize::new(0),
+            observed_host_fiber_context: AtomicBool::new(false),
             manager_was_unlocked: AtomicBool::new(true),
             request_addresses: Mutex::new(Vec::new()),
             defer_first,
@@ -1956,6 +1979,28 @@ mod tests {
     }
 
     #[test]
+    fn host_fiber_switch_deferral_spans_the_complete_transaction() {
+        let (owner, server_session, _request_manager, handler) = setup_recording_dispatch(false);
+        let _client_thread = enqueue_waiting_request(&server_session, 1, 0x1800);
+        unlink_first_session_holder(&owner);
+
+        assert!(ServerManager::process_session_event_shared(
+            &owner,
+            first_shared_session_event(&owner),
+        ));
+
+        assert_eq!(handler.calls.load(Ordering::Relaxed), 1);
+        assert!(
+            handler.observed_host_fiber_context.load(Ordering::Relaxed),
+            "the host fiber must not switch while the IPC callback is active"
+        );
+        assert!(
+            !HleIpcHostFiberContext::is_active(),
+            "the host-fiber deferral context must end after reply and relink finalization"
+        );
+    }
+
+    #[test]
     fn deferred_dispatch_reuses_the_same_transaction_and_replies_on_retry() {
         let (owner, server_session, _request_manager, handler) = setup_recording_dispatch(true);
         let client_thread = enqueue_waiting_request(&server_session, 1, 0x2000);
@@ -1980,6 +2025,7 @@ mod tests {
         assert!(ServerManager::process_deferral_event_shared(&owner));
 
         assert_eq!(handler.calls.load(Ordering::Relaxed), 2);
+        assert!(handler.observed_host_fiber_context.load(Ordering::Relaxed));
         assert!(handler.manager_was_unlocked.load(Ordering::Relaxed));
         assert_eq!(
             handler.request_addresses.lock().unwrap().as_slice(),

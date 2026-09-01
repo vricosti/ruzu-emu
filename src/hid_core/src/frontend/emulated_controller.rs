@@ -240,6 +240,17 @@ pub struct ControllerUpdateCallback {
     pub is_npad_service: bool,
 }
 
+pub(crate) struct DeferredControllerCallback {
+    callback: Arc<dyn Fn(ControllerTriggerType) + Send + Sync>,
+    trigger_type: ControllerTriggerType,
+}
+
+impl DeferredControllerCallback {
+    pub(crate) fn dispatch(self) {
+        (self.callback)(self.trigger_type);
+    }
+}
+
 /// State needed by input-device callbacks after `EmulatedController` has
 /// handed them to a driver thread.
 struct ControllerEventContext {
@@ -932,6 +943,8 @@ pub struct EmulatedController {
     mutex: Mutex<()>,
     event_context: Arc<ControllerEventContext>,
     last_callback_key: i32,
+    defer_callback_dispatch: bool,
+    deferred_callbacks: Vec<DeferredControllerCallback>,
 
     // The parameters each input device is built from — upstream's
     // `button_params`, `stick_params`, `motion_params`, `trigger_params`,
@@ -1046,6 +1059,8 @@ impl EmulatedController {
             mutex: Mutex::new(()),
             event_context,
             last_callback_key: 0,
+            defer_callback_dispatch: false,
+            deferred_callbacks: Vec::new(),
             button_params: vec![
                 ParamPackage::default();
                 settings_input::native_button::NUM_BUTTONS
@@ -1650,6 +1665,11 @@ impl EmulatedController {
 
     /// Port of EmulatedController::ReloadFromSettings.
     pub fn reload_from_settings(&mut self) {
+        self.reload_from_settings_before_input_reload();
+        self.reload_input();
+    }
+
+    fn reload_from_settings_before_input_reload(&mut self) {
         let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
         let (buttons, analogs, motions, ringcon_analog, controller_type, connected) = {
             let settings = common::settings::values();
@@ -1696,8 +1716,18 @@ impl EmulatedController {
         if connected {
             self.connect(false);
         }
+    }
 
-        self.reload_input();
+    /// Perform `ReloadFromSettings` while retaining the callbacks that Eden
+    /// invokes after each state transition. `HIDCore` dispatches the returned
+    /// callbacks only after releasing the Rust controller-owner mutex; Eden's
+    /// controller pointer has no equivalent outer mutex to re-enter.
+    pub(crate) fn reload_from_settings_deferred(&mut self) -> Vec<DeferredControllerCallback> {
+        assert!(!self.defer_callback_dispatch);
+        self.defer_callback_dispatch = true;
+        self.reload_from_settings_before_input_reload();
+        self.defer_callback_dispatch = false;
+        std::mem::take(&mut self.deferred_callbacks)
     }
 
     /// Port of EmulatedController::SetButtonParam.
@@ -2397,7 +2427,21 @@ impl EmulatedController {
         }
     }
 
-    fn trigger_on_change(&self, trigger_type: ControllerTriggerType, is_service_update: bool) {
+    fn trigger_on_change(&mut self, trigger_type: ControllerTriggerType, is_service_update: bool) {
+        if self.defer_callback_dispatch {
+            self.deferred_callbacks.extend(
+                self.event_context
+                    .callback_list
+                    .lock()
+                    .values()
+                    .filter(|callback| is_service_update || !callback.is_npad_service)
+                    .map(|callback| DeferredControllerCallback {
+                        callback: Arc::clone(&callback.on_change),
+                        trigger_type,
+                    }),
+            );
+            return;
+        }
         trigger_on_change(&self.event_context, trigger_type, is_service_update);
     }
 }
@@ -2406,6 +2450,32 @@ impl EmulatedController {
 mod tests {
     use super::*;
     use common::input::{AnalogStatus, InputType};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn deferred_callbacks_run_after_the_controller_owner_is_released() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        controller.set_callback(ControllerUpdateCallback {
+            on_change: Arc::new(move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            }),
+            is_npad_service: false,
+        });
+
+        controller.defer_callback_dispatch = true;
+        controller.trigger_on_change(ControllerTriggerType::Disconnected, true);
+        controller.defer_callback_dispatch = false;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let callbacks = std::mem::take(&mut controller.deferred_callbacks);
+        drop(controller);
+        for callback in callbacks {
+            callback.dispatch();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     struct PollingOutputDevice {
         calls: Arc<Mutex<Vec<PollingMode>>>,

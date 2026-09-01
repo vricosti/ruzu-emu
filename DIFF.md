@@ -19148,3 +19148,129 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 - N/A: lifecycle state is host-only and no shared binary payload or disk format changed.
+
+## 2026-09-01 — `src/core/src/hle/service/server_manager.rs`, `src/core/src/hle/kernel/{svc/svc_ipc.rs,k_server_session.rs}` vs Eden `src/core/hle/{service/server_manager.cpp,kernel/svc/svc_ipc.cpp,kernel/k_server_session.cpp}`
+
+### Intentional differences
+
+- Eden's stable `Session*` and independent deferred-list mutex are represented by stable session
+  identifiers inside `Arc<Mutex<ServerManager>>`. Ruzu captures the selected session under that
+  mutex, releases it for `CompleteSyncRequest`, then reacquires it only to store a deferral,
+  remove a closed session, or relink the holder.
+- Relinking still occurs at Eden's transaction boundary, but the bridged wakeup event is signaled
+  after releasing `Mutex<ServerManager>` because the Rust event bridge can enter the scheduler and
+  switch a host fiber.
+- Unit-test systems synchronously drain the real shared ServerManager event loop because they do
+  not start host fibers. The adapter only selects/transports events and invokes the same
+  `complete_sync_request_shared` transaction as runtime.
+- The Rust SVC retains an `Arc` to the calling thread while it waits. Eden obtains the same result
+  through the blocking `KClientSession::SendSyncRequest`; retaining the owner explicitly avoids
+  consulting a thread-local pointer after the scheduler handoff.
+
+### Unintentional differences (to fix)
+
+- Corrected: initial requests and deferred retries used separate transaction implementations, and
+  the deferred path could execute a service callback while holding the global ServerManager mutex.
+- Corrected: ownerless sessions could make `svc_ipc.rs` execute the HLE callback, response write,
+  and reply inline instead of returning `ResultInvalidHandle` as an invalid routing state.
+- Corrected: the test `sm:` setup published the ServiceManager after managed-port registration, so
+  sessions created through that port lacked their ServerManager queue, wakeup, and owner links.
+
+### Missing items
+
+- None in the reviewed HLE dispatch-ownership slice.
+
+### Binary layout verification
+
+- N/A: the change affects host-side ownership, locking, and event-loop routing only.
+
+## 2026-09-01 — `src/core/src/hle/kernel/k_scheduler.rs`, `src/core/src/hle/service/server_manager.rs` vs Eden `src/core/hle/kernel/k_scheduler.{h,cpp}`, `src/core/hle/service/server_manager.{h,cpp}`
+
+### Intentional differences
+
+- Eden's native service callback stack is not suspended when a scheduler-lock release changes the
+  selected guest thread. Ruzu's cooperative fibers share the callback's Rust stack, so an
+  `HleIpcHostFiberContext` records only the current host-fiber handoff while the unified IPC
+  transaction is active. Guest thread state and priority queues are still updated under the
+  scheduler lock, and `RescheduleOtherCores` still interrupts other cores immediately.
+- The pending state is thread-local and nesting-aware because nested HLE IPC callbacks execute on
+  the same host thread. Only the outer transaction consumes the coalesced handoff request.
+- Only preemption of a still-runnable guest-core service fiber is deferred. A service thread that
+  has entered `Waiting` (for example in `KLightLock::LockSlowPath`) must switch immediately so the
+  operation that owns the wait cannot continue before acquiring its lock. Native HLE dummy-thread
+  waits also remain immediate; they block their OS thread rather than moving the Rust callback
+  stack to another cooperative fiber.
+- `complete_sync_request_shared` has a private transaction-body helper so callback, response,
+  deferred/closed handling, relinking, wakeup, and all temporary Rust guards return before the
+  outer function may enter `reschedule_current_core_raw`. Eden does not need this extra lexical
+  boundary because its callback stack is not moved between cooperative fibers.
+
+### Unintentional differences (to fix)
+
+- Corrected: `RescheduleCurrentCore` and `RescheduleCurrentHLEThread` could suspend an HLE service
+  fiber from a scheduler-lock release before the service callback returned. A callback such as a
+  host syncpoint action could therefore leave its Rust mutex locked while another service fiber on
+  the same host thread re-entered that mutex.
+- Corrected during validation: the initial deferral also intercepted mandatory waits. In MK8D a
+  contended `KLightLock` marked `HLE:nvservices` as waiting, but the IPC context let execution
+  continue without lock ownership; waiter metadata was then corrupted and `RemoveWaiterImpl`
+  panicked. Required wait handoffs and native dummy-thread waits now retain Eden's immediate order.
+
+### Missing items
+
+- Explicit waits that invoke `reschedule_current_core_raw`, and implicit waits identified by a
+  non-runnable current thread at `RescheduleCurrentCore`, remain immediate handoff points; they are
+  not converted into IPC preemption deferrals by this slice.
+
+### Binary layout verification
+
+- N/A: the context contains host thread-local depth/pending state only and changes no guest-visible
+  structure, IPC payload, or cache format.
+
+## 2026-09-01 — `src/core/src/hle/service/sm/sm.rs`, `src/core/src/hle/service/glue/time/manager.rs` vs Eden `src/core/hle/service/sm/sm.{h,cpp}`, `src/core/hle/service/glue/time/manager.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `SM` stores a non-owning `ServiceManager&`. Ruzu represents that reference as
+  `Weak<Mutex<ServiceManager>>`, upgrading it only for the duration of an IPC operation.
+- Ruzu's existing split construction passes a borrowed service-manager handle to
+  `TimeManager::initialize`; it is not retained in `TimeManager`, matching Eden's member layout.
+
+### Unintentional differences (to fix)
+
+- Corrected: `SM` and `Glue::TimeManager` retained strong `Arc` ownership of the same
+  `ServiceManager` whose registered factories owned those services. The resulting cycles prevented
+  service destruction between emulation sessions, leaving `TimeWorker` threads and NFC callbacks
+  alive; a later controller reload could then deadlock in the stale NFC callback.
+
+### Missing items
+
+- None for this ownership correction.
+
+### Binary layout verification
+
+- N/A: these are host-only Rust ownership handles and contain no guest-visible or serialized data.
+
+## 2026-09-01 — `src/hid_core/src/{hid_core.rs,frontend/emulated_controller.rs}` vs Eden `src/hid_core/{hid_core.cpp,frontend/emulated_controller.cpp}`
+
+### Intentional differences
+
+- Eden stores each `EmulatedController` behind a pointer and its NFC callback can call back into
+  that controller during `ReloadFromSettings`. Ruzu's controller owner is an outer
+  `Arc<Mutex<EmulatedController>>`; `HIDCore::reload_input_devices` therefore retains the same
+  disconnected/connected callbacks, releases that outer mutex, dispatches them in their original
+  order, then reacquires it for Eden's following `ReloadInput` step.
+
+### Unintentional differences (to fix)
+
+- Corrected: Ruzu dispatched the NFC disconnected callback while
+  `HIDCore::reload_input_devices` still owned the controller mutex. `NfcDevice::Finalize` then
+  re-entered the same controller and permanently blocked the boot thread.
+
+### Missing items
+
+- None in the `HIDCore::ReloadInputDevices` callback-ordering slice.
+
+### Binary layout verification
+
+- N/A: deferred callback owners and trigger values are host-only synchronization state.

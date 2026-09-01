@@ -2909,10 +2909,27 @@ impl System {
     /// `current_process_arc`, `scheduler_arc`, etc.
     pub fn new_for_test() -> Self {
         let mut system = Self::new();
+        system.initialize_for_test();
+        system
+    }
+
+    /// Construct a test System at a stable address before creating the
+    /// internal `SystemRef` links used by service managers.
+    ///
+    /// Tests that exercise those stored links must use this constructor;
+    /// moving the value returned by `new_for_test` invalidates its raw
+    /// self-reference.
+    pub fn new_boxed_for_test() -> Box<Self> {
+        let mut system = Box::new(Self::new());
+        system.initialize_for_test();
+        system
+    }
+
+    fn initialize_for_test(&mut self) {
         // Kernel (provides object/thread ID allocation). Don't call
         // initialize() — that creates timers, physical cores, etc.
         let mut kernel = KernelCore::new();
-        kernel.set_system_ref(SystemRef::from_ref(&system));
+        kernel.set_system_ref(SystemRef::from_ref(self));
         // Pre-advance ID counters past values that test setups manually assign
         // to pre-existing threads (typically object_id 1..2, thread_id 1..2).
         // This prevents collision when SVC handlers allocate new IDs.
@@ -2921,20 +2938,21 @@ impl System {
             kernel.create_new_thread_id();
         }
         kernel.ensure_object_name_global_data_for_test();
-        system.kernel = Some(kernel);
+        self.kernel = Some(kernel);
         let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
+        // Publish the SM owner before `setup_sm_for_test`: managed-port setup
+        // resolves it through the stable `SystemRef` to attach the owning
+        // ServerManager endpoints to newly-created sessions.
+        self.service_manager = Some(Arc::clone(&service_manager));
         // Register "sm:" port so connect_to_named_port tests work without
         // entering the blocking SM ServerManager event loop.
-        let sys_ref = SystemRef::from_ref(&system);
+        let sys_ref = SystemRef::from_ref(self);
         let sm_server_manager =
             crate::hle::service::sm::sm::setup_sm_for_test(&service_manager, sys_ref);
-        system
-            .kernel
+        self.kernel
             .as_ref()
             .unwrap()
             .track_server_manager_for_test(sm_server_manager);
-        system.service_manager = Some(service_manager);
-        system
     }
 
     /// Initialize performance stats for a specific title.

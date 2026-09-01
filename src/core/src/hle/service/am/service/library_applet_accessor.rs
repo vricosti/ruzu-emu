@@ -191,7 +191,6 @@ impl ILibraryAppletAccessor {
         {
             let mut applet = service.applet.lock().unwrap();
             applet.process.run();
-            applet.is_process_running = true;
         }
         service.frontend_execute();
 
@@ -220,7 +219,6 @@ impl ILibraryAppletAccessor {
         {
             let mut applet = service.applet.lock().unwrap();
             applet.process.terminate();
-            applet.is_process_running = false;
         }
         service.frontend_request_exit();
 
@@ -442,5 +440,28 @@ impl ServiceFramework for ILibraryAppletAccessor {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::service::am::applet::Applet;
+    use crate::hle::service::os::process::Process;
+
+    #[test]
+    fn frontend_start_does_not_fake_a_running_guest_process() {
+        let applet = Arc::new(Mutex::new(Applet::new(
+            SystemRef::null(),
+            Process::new(),
+            false,
+        )));
+        let broker = Arc::new(AppletDataBroker::new());
+        let accessor = ILibraryAppletAccessor::new(SystemRef::null(), broker, Arc::clone(&applet));
+        let mut ctx = HLERequestContext::new();
+
+        ILibraryAppletAccessor::start_handler(&accessor, &mut ctx);
+
+        assert!(!applet.lock().unwrap().is_process_running);
     }
 }

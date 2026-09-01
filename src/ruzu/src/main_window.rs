@@ -314,6 +314,9 @@ pub struct GMainWindow {
     /// GUI controller applet installed for each boot unless explicitly disabled.
     /// Upstream owner: `GMainWindow` through `QtControllerSelector`.
     controller_applet: Arc<crate::applets::controller::GtkControllerSelector>,
+    /// GUI error applet installed for each boot.
+    /// Upstream owner: `GMainWindow` through `QtErrorDisplay`.
+    error_applet: Arc<crate::applets::error::GtkErrorDisplay>,
     /// GUI software keyboard applet installed for each boot.
     /// Upstream owner: `GMainWindow` through `QtSoftwareKeyboard`.
     software_keyboard: Arc<crate::applets::software_keyboard::GtkSoftwareKeyboard>,
@@ -1092,6 +1095,9 @@ impl GMainWindow {
             Rc::clone(&input_subsystem),
             controller_applet_requests,
         );
+        let (error_applet, error_applet_requests) = crate::applets::error::GtkErrorDisplay::new();
+        let error_applet_frontend =
+            crate::applets::error::ErrorAppletFrontend::new(&window, error_applet_requests);
         let (software_keyboard, software_keyboard_requests) =
             crate::applets::software_keyboard::GtkSoftwareKeyboard::new();
         let software_keyboard_frontend =
@@ -1132,10 +1138,12 @@ impl GMainWindow {
             input_subsystem,
             hid_core,
             controller_applet,
+            error_applet,
             software_keyboard,
         });
 
         controller_applet_frontend.start();
+        error_applet_frontend.start();
         software_keyboard_frontend.start();
 
         // Eden's `OnToggleGpuAccuracy` applies the new setting to the active
@@ -3177,6 +3185,13 @@ impl GMainWindow {
             >)
     }
 
+    fn error_applet_for_boot(
+        &self,
+    ) -> Option<Arc<dyn ruzu_core::frontend::applets::error::ErrorApplet>> {
+        Some(Arc::clone(&self.error_applet)
+            as Arc<dyn ruzu_core::frontend::applets::error::ErrorApplet>)
+    }
+
     /// Eden connects both `EmulationStarting` and `EmulationStopping` to
     /// `MainWindow::SoftwareKeyboardExit`.  The GTK frontend is persistent,
     /// so explicitly release any dialog and its initialized state at the same
@@ -3365,6 +3380,7 @@ impl GMainWindow {
             None,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
+            self.error_applet_for_boot(),
             self.software_keyboard_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
@@ -3558,6 +3574,7 @@ impl GMainWindow {
                 .map(crate::boot::OpenGLContextSource::from_glx),
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
+            self.error_applet_for_boot(),
             self.software_keyboard_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
@@ -3738,6 +3755,7 @@ impl GMainWindow {
             None,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
+            self.error_applet_for_boot(),
             self.software_keyboard_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,

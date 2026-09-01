@@ -229,6 +229,9 @@ impl Error {
         self.completion
             .frontend_executing
             .store(false, Ordering::Release);
+        if self.completion.complete.load(Ordering::Acquire) {
+            Self::exit(&self.applet);
+        }
     }
 }
 
@@ -486,7 +489,7 @@ mod tests {
         assert_eq!(frontend.0.load(Ordering::Acquire), expected);
         assert!(applet.is_initialized());
         assert!(applet.is_complete());
-        assert!(!owner.lock().unwrap().is_completed);
+        assert!(owner.lock().unwrap().is_completed);
         assert_eq!(broker.get_out_data().pop().unwrap(), vec![0; 0x1000]);
     }
 

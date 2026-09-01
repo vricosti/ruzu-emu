@@ -455,7 +455,7 @@ impl Bsd {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        assert!(addr.len() == std::mem::size_of::<SockAddrIn>());
+        assert!(addr.len() >= std::mem::size_of::<SockAddrIn>());
 
         let mut guest_addr = SockAddrIn::default();
         unsafe {
@@ -478,7 +478,7 @@ impl Bsd {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        assert!(addr.len() == std::mem::size_of::<SockAddrIn>());
+        assert!(addr.len() >= std::mem::size_of::<SockAddrIn>());
 
         let mut guest_addr = SockAddrIn::default();
         unsafe {
@@ -491,7 +491,12 @@ impl Bsd {
         let net_addr = translate_sockaddr_to_network(&guest_addr);
 
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        translate_errno(descriptor.socket.connect(net_addr))
+        let result = translate_errno(descriptor.socket.connect(net_addr));
+        if result == Errno::ISCONN {
+            log::debug!("returned ISCONN - socket already connected");
+            return Errno::SUCCESS;
+        }
+        result
     }
 
     /// GetPeerNameImpl
@@ -1054,13 +1059,17 @@ impl Bsd {
         let nfds = rp.pop_i32();
         let timeout = rp.pop_i32();
 
+        log::debug!("BSD::Poll called. nfds={} timeout={}", nfds, timeout);
+
         let read_buffer = ctx.read_buffer(0);
         let write_size = ctx.get_write_buffer_size(0);
         let mut write_buffer = vec![0u8; write_size];
 
         let (ret, bsd_errno) = bsd.poll_impl(&mut write_buffer, &read_buffer, nfds, timeout);
 
-        ctx.write_buffer(&write_buffer, 0);
+        if !write_buffer.is_empty() {
+            ctx.write_buffer(&write_buffer, 0);
+        }
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_i32(ret);
@@ -1494,6 +1503,33 @@ mod tests {
         assert_eq!(bsd.close_impl(fd), Errno::SUCCESS);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn connecting_an_already_connected_socket_matches_upstream_success() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let guest_address = SockAddrIn {
+            len: std::mem::size_of::<SockAddrIn>() as u8,
+            family: Domain::INET.0 as u8,
+            portno: port.swap_bytes(),
+            ip: std::net::Ipv4Addr::LOCALHOST.octets(),
+            zeroes: [0; 8],
+        };
+        let address = unsafe {
+            std::slice::from_raw_parts(
+                &guest_address as *const SockAddrIn as *const u8,
+                std::mem::size_of::<SockAddrIn>(),
+            )
+        };
+
+        let mut bsd = Bsd::new("bsd:u", true);
+        let (fd, error) = bsd.socket_impl(Domain::INET, Type::STREAM, Protocol::TCP);
+        assert_eq!(error, Errno::SUCCESS);
+        assert_eq!(bsd.connect_impl(fd, address), Errno::SUCCESS);
+        assert_eq!(bsd.connect_impl(fd, address), Errno::SUCCESS);
+        assert_eq!(bsd.close_impl(fd), Errno::SUCCESS);
+    }
+
     #[test]
     fn shared_bsd_handler_exposes_one_descriptor_table() {
         let handler: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:u", true)));
@@ -1514,5 +1550,19 @@ mod tests {
             .downcast_ref::<Mutex<Bsd>>()
             .expect("same shared BSD handler");
         assert!(second.lock().unwrap().get_socket(fd).is_some());
+    }
+
+    #[test]
+    fn zero_descriptor_poll_returns_without_an_output_buffer() {
+        let bsd = Bsd::new("bsd:u", true);
+        let mut ctx = HLERequestContext::new();
+        ctx.command_buffer_mut()[2] = 0;
+        ctx.command_buffer_mut()[3] = 0;
+
+        Bsd::poll_handler(&bsd, &mut ctx);
+
+        assert_eq!(ctx.command_buffer()[6], RESULT_SUCCESS.get_inner_value());
+        assert_eq!(ctx.command_buffer()[8], (-1_i32) as u32);
+        assert_eq!(ctx.command_buffer()[9], Errno::SUCCESS as u32);
     }
 }

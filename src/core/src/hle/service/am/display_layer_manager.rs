@@ -138,6 +138,19 @@ impl DisplayLayerManager {
             process.lock().unwrap().get_process_id(),
         )?;
         manager_display_service.set_layer_visibility(self.visible, layer_id)?;
+
+        if self.applet_id != AppletId::Application {
+            let _ = manager_display_service.set_layer_blending(self.blending_enabled, layer_id);
+            if self.applet_id == AppletId::OverlayDisplay {
+                let _ = manager_display_service.set_layer_z_index(-1, layer_id);
+                let _ = display_service
+                    .get_container()
+                    .set_layer_is_overlay(layer_id, true);
+            } else {
+                let _ = manager_display_service.set_layer_z_index(1, layer_id);
+            }
+        }
+
         self.managed_display_layers.insert(layer_id);
         Ok(layer_id)
     }
@@ -184,6 +197,17 @@ impl DisplayLayerManager {
         self.buffer_sharing_enabled = true;
         let _ =
             manager_display_service.set_layer_visibility(self.visible, self.system_shared_layer_id);
+        let _ = manager_display_service
+            .set_layer_blending(self.blending_enabled, self.system_shared_layer_id);
+        let initial_z = if self.applet_id == AppletId::OverlayDisplay {
+            let _ = display_service
+                .get_container()
+                .set_layer_is_overlay(self.system_shared_layer_id, true);
+            -1
+        } else {
+            1
+        };
+        let _ = manager_display_service.set_layer_z_index(initial_z, self.system_shared_layer_id);
         RESULT_SUCCESS
     }
 
@@ -212,6 +236,26 @@ impl DisplayLayerManager {
 
     pub fn get_window_visibility(&self) -> bool {
         self.visible
+    }
+
+    pub fn set_overlay_z_index(&mut self, z_index: i32) {
+        let Some(manager_display_service) = self.manager_display_service.as_ref() else {
+            return;
+        };
+
+        if self.system_shared_layer_id != 0 {
+            let _ = manager_display_service.set_layer_z_index(z_index, self.system_shared_layer_id);
+            log::info!(
+                "called, shared_layer={} z={}",
+                self.system_shared_layer_id,
+                z_index
+            );
+        }
+
+        for &layer_id in &self.managed_display_layers {
+            let _ = manager_display_service.set_layer_z_index(z_index, layer_id);
+            log::info!("called, managed_layer={} z={}", layer_id, z_index);
+        }
     }
 
     pub fn write_applet_capture_buffer(&mut self) -> Result<(bool, i32), ResultCode> {

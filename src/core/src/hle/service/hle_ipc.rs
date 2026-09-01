@@ -285,12 +285,11 @@ impl SessionRequestManager {
 
     pub fn append_domain_handler(&mut self, handler: SessionRequestHandlerPtr) {
         let trace = std::env::var_os("RUZU_DOMAIN_TRACE").is_some();
-        let name = handler.service_name().to_string();
         let next_index = self.domain_handlers.len() + 1;
         if trace {
-            log::info!("DOMAIN_SLOT append index={} handler={}", next_index, name);
+            log::info!("DOMAIN_SLOT append index={}", next_index);
         } else {
-            log::debug!("AppendDomainHandler: index={} handler={}", next_index, name);
+            log::debug!("AppendDomainHandler: index={}", next_index);
         }
         self.domain_handlers.push(Some(handler));
     }
@@ -361,17 +360,15 @@ impl SessionRequestManager {
                     if let Some(Some(handler)) = self.domain_handlers.get(object_id - 1) {
                         if trace_dom {
                             log::info!(
-                                "DOMAIN_SLOT dispatch object_id={} handler={} cmd={}",
+                                "DOMAIN_SLOT dispatch object_id={} cmd={}",
                                 object_id,
-                                handler.service_name(),
                                 context.get_command()
                             );
                         }
                         log::debug!(
-                            "HandleDomainSyncRequest: object_id={} cmd={} handler={}",
+                            "HandleDomainSyncRequest: object_id={} cmd={}",
                             object_id,
-                            context.get_command(),
-                            handler.service_name()
+                            context.get_command()
                         );
                         return PreparedSyncRequest::Domain(handler.clone());
                     }
@@ -2525,6 +2522,65 @@ mod tests {
         fn service_name(&self) -> &str {
             "DummyHandler"
         }
+    }
+
+    struct LockingNameHandler {
+        gate: Arc<Mutex<()>>,
+    }
+
+    impl SessionRequestHandler for LockingNameHandler {
+        fn handle_sync_request(&self, _context: &mut HLERequestContext) -> ResultCode {
+            RESULT_SUCCESS
+        }
+
+        fn service_name(&self) -> &str {
+            let _guard = self.gate.lock().unwrap();
+            "LockingNameHandler"
+        }
+    }
+
+    #[test]
+    fn domain_dispatch_selection_does_not_lock_the_service_handler() {
+        let gate = Arc::new(Mutex::new(()));
+        let gate_guard = gate.lock().unwrap();
+        let handler: SessionRequestHandlerPtr = Arc::new(LockingNameHandler {
+            gate: Arc::clone(&gate),
+        });
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        {
+            let mut manager_guard = manager.lock().unwrap();
+            manager_guard.set_session_handler(handler);
+            manager_guard.convert_to_domain();
+        }
+
+        let mut context = HLERequestContext::new();
+        let mut domain_header = ipc::DomainMessageHeader::default();
+        domain_header.set_command(ipc::DomainCommandType::SendMessage);
+        domain_header.set_object_id(1);
+        context.domain_message_header = Some(domain_header);
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let manager_for_thread = Arc::clone(&manager);
+        let worker = std::thread::spawn(move || {
+            let dispatch = manager_for_thread
+                .lock()
+                .unwrap()
+                .prepare_sync_request(&context);
+            completed_tx
+                .send(matches!(dispatch, PreparedSyncRequest::Domain(_)))
+                .unwrap();
+        });
+
+        let completed_without_service_lock = completed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap_or(false);
+        drop(gate_guard);
+        worker.join().unwrap();
+
+        assert!(
+            completed_without_service_lock,
+            "selecting a domain handler while holding the session-manager lock must not call into the service"
+        );
     }
 
     #[test]

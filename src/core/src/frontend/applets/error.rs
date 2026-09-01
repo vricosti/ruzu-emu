@@ -44,16 +44,17 @@ impl Applet for DefaultErrorApplet {
 }
 
 impl ErrorApplet for DefaultErrorApplet {
-    fn show_error(&self, error: ResultCode, _finished: FinishedCallback) {
+    fn show_error(&self, error: ResultCode, finished: FinishedCallback) {
         log::error!(
             "Application requested error display: {:04}-{:04} (raw={:08X})",
             error.get_module_raw(),
             error.get_description(),
             error.get_inner_value()
         );
+        finished();
     }
 
-    fn show_error_with_timestamp(&self, error: ResultCode, time: i64, _finished: FinishedCallback) {
+    fn show_error_with_timestamp(&self, error: ResultCode, time: i64, finished: FinishedCallback) {
         log::error!(
             "Application requested error display: {:04X}-{:04X} (raw={:08X}) with timestamp={:016X}",
             error.get_module_raw(),
@@ -61,6 +62,7 @@ impl ErrorApplet for DefaultErrorApplet {
             error.get_inner_value(),
             time
         );
+        finished();
     }
 
     fn show_custom_error_text(
@@ -68,7 +70,7 @@ impl ErrorApplet for DefaultErrorApplet {
         error: ResultCode,
         main_text: String,
         detail_text: String,
-        _finished: FinishedCallback,
+        finished: FinishedCallback,
     ) {
         log::error!(
             "Application requested custom error with error_code={:04X}-{:04X} (raw={:08X})",
@@ -78,5 +80,29 @@ impl ErrorApplet for DefaultErrorApplet {
         );
         log::error!("    Main Text: {}", main_text);
         log::error!("    Detail Text: {}", detail_text);
+        finished();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn default_frontend_completes_after_logging() {
+        let completion_count = Arc::new(AtomicUsize::new(0));
+        let callback_count = Arc::clone(&completion_count);
+
+        DefaultErrorApplet.show_error(
+            ResultCode::new(110 | (42 << 9)),
+            Box::new(move || {
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        assert_eq!(completion_count.load(Ordering::Relaxed), 1);
     }
 }

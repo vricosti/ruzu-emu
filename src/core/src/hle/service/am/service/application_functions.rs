@@ -546,7 +546,7 @@ impl IApplicationFunctions {
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let version_bytes = service.get_display_version();
 
-        log::info!(
+        log::debug!(
             "GetDisplayVersion: returning '{}'",
             std::str::from_utf8(&version_bytes)
                 .unwrap_or("?")

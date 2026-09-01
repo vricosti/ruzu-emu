@@ -49,6 +49,7 @@ enum NetDbError {
 }
 
 const BLOCKED_DOMAINS: &[&str] = &[
+    "nintendo.net",
     "srv.nintendo.net",
     "nintendo.es",
     "nintendowifi.net",
@@ -93,6 +94,13 @@ const BLOCKED_DOMAINS: &[&str] = &[
 
 fn is_blocked_host(host: &str) -> bool {
     BLOCKED_DOMAINS.iter().any(|domain| host.contains(domain))
+}
+
+/// NSD resolution expands Nintendo service identifiers and environment placeholders before DNS.
+/// Until that resolver is implemented, fail those requests before host DNS resolution. Reporting
+/// a successful loopback resolution would incorrectly move the guest into its connection path.
+fn should_block_nsd_resolution(use_nsd_resolve: u8) -> bool {
+    use_nsd_resolve != 0
 }
 
 /// Corresponds to `GetAddrInfoErrorToNetDbError` in upstream sfdnsres.cpp.
@@ -293,20 +301,28 @@ impl Sfdnsres {
         let parameters: DnsInputParameters = rp.pop_raw();
 
         log::warn!(
-            "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
-            parameters.use_nsd_resolve,
+            "called with ignored parameters: cancel_handle={}, process_id={}; use_nsd_resolve={}",
             parameters.cancel_handle,
-            parameters.process_id
+            parameters.process_id,
+            parameters.use_nsd_resolve
         );
 
         let host_buffer = ctx.read_buffer(0);
         let host = common::string_util::string_from_buffer(&host_buffer);
         // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
 
-        // Prevent resolution of Nintendo servers.
+        if should_block_nsd_resolution(parameters.use_nsd_resolve) {
+            log::warn!(
+                "Blocking unresolved NSD hostname request {:?}, returning EAI_AGAIN",
+                host
+            );
+            return (0, GetAddrInfoError::AGAIN);
+        }
+
+        // Prevent direct resolution of Nintendo servers.
         if is_blocked_host(&host) {
             log::warn!(
-                "Resolution of hostname {} requested, returning EAI_AGAIN",
+                "Resolution of hostname {:?} requested, returning EAI_AGAIN",
                 host
             );
             return (0, GetAddrInfoError::AGAIN);
@@ -348,28 +364,18 @@ impl Sfdnsres {
         let parameters: DnsInputParameters = rp.pop_raw();
 
         log::warn!(
-            "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
-            parameters.use_nsd_resolve,
+            "called with ignored parameters: cancel_handle={}, process_id={}; use_nsd_resolve={}",
             parameters.cancel_handle,
-            parameters.process_id
+            parameters.process_id,
+            parameters.use_nsd_resolve
         );
 
-        // Upstream: if use_nsd_resolve is true, the hostname should be passed through
-        // NSD::Resolve before DNS lookup. NSD service integration is not yet available
-        // in the Rust port, so we skip this step (matching upstream's effective behavior
-        // since NSD::Resolve is also a stub in upstream for most titles).
+        // Upstream passes NSD service identifiers through NSD::Resolve before DNS lookup.
+        // The Rust port does not yet expand those identifiers; the safety path below handles
+        // them without exposing an official hostname to the host resolver.
 
         let host_buffer = ctx.read_buffer(0);
         let host = common::string_util::string_from_buffer(&host_buffer);
-
-        // Prevent resolution of Nintendo servers.
-        if is_blocked_host(&host) {
-            log::warn!(
-                "Resolution of hostname {} requested, returning EAI_AGAIN",
-                host
-            );
-            return (0, GetAddrInfoError::AGAIN);
-        }
 
         let service: Option<String> = if ctx.can_read_buffer(1) {
             let service_buffer = ctx.read_buffer(1);
@@ -377,6 +383,23 @@ impl Sfdnsres {
         } else {
             None
         };
+
+        if should_block_nsd_resolution(parameters.use_nsd_resolve) {
+            log::warn!(
+                "Blocking unresolved NSD addrinfo request {:?}, returning EAI_AGAIN",
+                host
+            );
+            return (0, GetAddrInfoError::AGAIN);
+        }
+
+        // Prevent direct resolution of Nintendo servers.
+        if is_blocked_host(&host) {
+            log::warn!(
+                "Resolution of hostname {:?} requested, returning EAI_AGAIN",
+                host
+            );
+            return (0, GetAddrInfoError::AGAIN);
+        }
 
         // Serialized hints are also passed in a buffer, but are ignored for now.
 
@@ -694,8 +717,16 @@ mod tests {
     #[test]
     fn blocked_host_matching_uses_edens_substring_policy() {
         assert!(is_blocked_host("sun.hac.lp1.d4c.nintendo.net"));
+        assert!(is_blocked_host("accounts.nintendo.net"));
         assert!(is_blocked_host("subdomain.nintendo.com.example.org"));
         assert!(is_blocked_host("api.epicgames.dev"));
         assert!(!is_blocked_host("libretro.com"));
+    }
+
+    #[test]
+    fn nsd_resolution_is_blocked_before_host_dns() {
+        assert!(should_block_nsd_resolution(1));
+        assert!(should_block_nsd_resolution(u8::MAX));
+        assert!(!should_block_nsd_resolution(0));
     }
 }

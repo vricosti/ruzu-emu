@@ -96,6 +96,7 @@ pub struct Applet {
     pub is_activity_runnable: bool,
     pub is_interactible: bool,
     pub window_visible: bool,
+    pub overlay_in_foreground: bool,
 
     // Events
     pub gpu_error_detected_event: Option<Arc<Mutex<KReadableEvent>>>,
@@ -180,6 +181,7 @@ impl Applet {
             is_activity_runnable: false,
             is_interactible: true,
             window_visible: true,
+            overlay_in_foreground: false,
             gpu_error_detected_event: None,
             gpu_error_detected_event_handle: None,
             friend_invitation_storage_channel_event: None,

@@ -383,6 +383,7 @@ pub fn boot_game(
     opengl_context_source: Option<OpenGLContextSource>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
+    error_applet: Option<Arc<dyn ruzu_core::frontend::applets::error::ErrorApplet>>,
     software_keyboard: Option<
         Arc<dyn ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet>,
     >,
@@ -415,6 +416,7 @@ pub fn boot_game(
                 opengl_context_source,
                 hid_core,
                 controller_applet,
+                error_applet,
                 software_keyboard,
                 tas,
                 filepath,
@@ -457,6 +459,7 @@ fn run_boot(
     opengl_context_source: Option<OpenGLContextSource>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
+    error_applet: Option<Arc<dyn ruzu_core::frontend::applets::error::ErrorApplet>>,
     software_keyboard: Option<
         Arc<dyn ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet>,
     >,
@@ -499,17 +502,18 @@ fn run_boot(
     let mut system = System::new_with_hid_core(hid_core);
     let _ = exit_locked_tx.send(system.exit_locked_state());
     system.initialize();
-    if controller_applet.is_some() || software_keyboard.is_some() {
+    if controller_applet.is_some() || error_applet.is_some() || software_keyboard.is_some() {
         log::info!(
-            "Installing GUI frontend applets (controller={} software_keyboard={})",
+            "Installing GUI frontend applets (controller={} error={} software_keyboard={})",
             controller_applet.is_some(),
+            error_applet.is_some(),
             software_keyboard.is_some()
         );
         system.set_frontend_applet_set(
             ruzu_core::hle::service::am::frontend::applets::FrontendAppletSet {
                 cabinet: None,
                 controller: controller_applet,
-                error: None,
+                error: error_applet,
                 parental_controls: None,
                 photo_viewer: None,
                 profile_select: None,

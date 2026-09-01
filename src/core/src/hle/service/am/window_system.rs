@@ -101,21 +101,42 @@ impl WindowSystem {
             return;
         }
 
+        let overlay_blocks_input = inner
+            .overlay_display_aruid
+            .and_then(|aruid| inner.applets.get(&aruid))
+            .is_some_and(|applet| applet.lock().unwrap().overlay_in_foreground);
+
         // Recursively update each applet root.
         let home_menu_aruid = inner.home_menu_aruid;
         let application_aruid = inner.application_aruid;
+        let overlay_display_aruid = inner.overlay_display_aruid;
         let foreground = inner.foreground_requested_aruid;
 
         if let Some(aruid) = home_menu_aruid {
             let is_foreground = foreground == Some(aruid);
             if let Some(applet) = inner.applets.get(&aruid).cloned() {
-                self.update_applet_state_locked(&inner, &applet, is_foreground);
+                self.update_applet_state_locked(
+                    &inner,
+                    &applet,
+                    is_foreground,
+                    overlay_blocks_input,
+                );
             }
         }
         if let Some(aruid) = application_aruid {
             let is_foreground = foreground == Some(aruid);
             if let Some(applet) = inner.applets.get(&aruid).cloned() {
-                self.update_applet_state_locked(&inner, &applet, is_foreground);
+                self.update_applet_state_locked(
+                    &inner,
+                    &applet,
+                    is_foreground,
+                    overlay_blocks_input,
+                );
+            }
+        }
+        if let Some(aruid) = overlay_display_aruid {
+            if let Some(applet) = inner.applets.get(&aruid).cloned() {
+                self.update_applet_state_locked(&inner, &applet, true, false);
             }
         }
     }
@@ -450,6 +471,7 @@ impl WindowSystem {
         inner: &WindowSystemInner,
         applet: &Arc<Mutex<Applet>>,
         is_foreground: bool,
+        overlay_blocking: bool,
     ) {
         let mut a = applet.lock().unwrap();
 
@@ -483,12 +505,21 @@ impl WindowSystem {
         };
 
         // Update visibility state.
-        let window_visible = a.window_visible;
+        let should_be_visible = if a.applet_id == AppletId::OverlayDisplay {
+            a.window_visible
+        } else {
+            is_foreground && a.window_visible
+        };
         a.display_layer_manager
-            .set_window_visibility(is_foreground && window_visible);
+            .set_window_visibility(should_be_visible);
 
         // Update interactibility state.
-        a.set_interactible_locked(is_foreground && window_visible);
+        let should_be_interactible = if a.applet_id == AppletId::OverlayDisplay {
+            a.overlay_in_foreground
+        } else {
+            is_foreground && a.window_visible && !overlay_blocking
+        };
+        a.set_interactible_locked(should_be_interactible);
 
         // Update focus state and suspension.
         let is_obscured = has_obscuring_child_applets || !a.window_visible;
@@ -502,11 +533,26 @@ impl WindowSystem {
             a.update_suspension_state_locked(true);
         }
 
+        let z_index = if a.applet_id == AppletId::OverlayDisplay {
+            if a.overlay_in_foreground {
+                100_000
+            } else {
+                -1
+            }
+        } else if inherited_foreground && !is_obscured {
+            2
+        } else if inherited_foreground {
+            1
+        } else {
+            0
+        };
+        a.display_layer_manager.set_overlay_z_index(z_index);
+
         // Recurse into child applets.
         let children = a.child_applets.clone();
         drop(a);
         for child in &children {
-            self.update_applet_state_locked(inner, child, is_foreground);
+            self.update_applet_state_locked(inner, child, is_foreground, overlay_blocking);
         }
     }
 }
@@ -600,5 +646,42 @@ mod tests {
             .lifecycle_manager
             .get_system_event()
             .is_signaled());
+    }
+
+    #[test]
+    fn foreground_overlay_owns_input_without_hiding_the_application() {
+        let window_system = WindowSystem::new(crate::core::SystemRef::null());
+
+        let mut application = Applet::new(crate::core::SystemRef::null(), Process::new(), true);
+        application.aruid = AppletResourceUserId { pid: 1 };
+        application.applet_id = AppletId::Application;
+        application.is_process_running = true;
+        let application = Arc::new(Mutex::new(application));
+
+        let mut overlay = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        overlay.aruid = AppletResourceUserId { pid: 2 };
+        overlay.applet_id = AppletId::OverlayDisplay;
+        overlay.is_process_running = true;
+        overlay.overlay_in_foreground = true;
+        let overlay = Arc::new(Mutex::new(overlay));
+
+        window_system.track_applet(Arc::clone(&application), true);
+        window_system.track_applet(Arc::clone(&overlay), false);
+        window_system.request_application_to_get_foreground();
+        window_system.update();
+
+        assert!(!application.lock().unwrap().is_interactible);
+        assert!(application
+            .lock()
+            .unwrap()
+            .display_layer_manager
+            .get_window_visibility());
+        assert!(overlay.lock().unwrap().is_interactible);
+
+        overlay.lock().unwrap().overlay_in_foreground = false;
+        window_system.update();
+
+        assert!(application.lock().unwrap().is_interactible);
+        assert!(!overlay.lock().unwrap().is_interactible);
     }
 }

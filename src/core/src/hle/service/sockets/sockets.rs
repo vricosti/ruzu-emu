@@ -162,6 +162,7 @@ pub enum Errno {
     TIMEDOUT = 110,
     CONNREFUSED = 111,
     INPROGRESS = 115,
+    ISCONN = 106,
 }
 
 /// GetAddrInfoError codes matching upstream.

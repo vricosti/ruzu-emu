@@ -120,10 +120,11 @@ fn from_sockaddr_in(addr: &libc::sockaddr_in) -> SockAddrIn {
     }
 }
 
-/// Get the last socket error as an Errno.
+/// Translate a native socket error to the cross-platform network errno.
+///
+/// Corresponds to upstream `TranslateNativeError` in network.cpp.
 #[cfg(unix)]
-fn get_last_error() -> Errno {
-    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+fn translate_native_error(err: i32) -> Errno {
     match err {
         0 => Errno::Success,
         value if value == libc::EWOULDBLOCK || value == libc::EAGAIN => Errno::Again,
@@ -141,11 +142,31 @@ fn get_last_error() -> Errno {
         libc::EHOSTUNREACH => Errno::Hostunreach,
         libc::ENETDOWN => Errno::Netdown,
         libc::ENETUNREACH => Errno::Netunreach,
+        libc::EISCONN => Errno::Isconn,
         _ => {
             log::warn!("Unmapped socket errno: {}", err);
             Errno::Other
         }
     }
+}
+
+/// Get and translate the last native socket error.
+#[cfg(unix)]
+fn get_last_error() -> Errno {
+    let native_error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let error = translate_native_error(native_error);
+    if matches!(error, Errno::Again | Errno::Timedout | Errno::Inprogress) {
+        log::debug!(
+            "Socket operation error: {}",
+            std::io::Error::from_raw_os_error(native_error)
+        );
+    } else {
+        log::error!(
+            "Socket operation error: {}",
+            std::io::Error::from_raw_os_error(native_error)
+        );
+    }
+    error
 }
 
 #[cfg(unix)]
@@ -246,6 +267,34 @@ mod tests {
     }
 
     #[test]
+    fn native_error_translation_includes_already_connected() {
+        assert_eq!(translate_native_error(libc::EISCONN), Errno::Isconn);
+    }
+
+    #[test]
+    fn socket_options_are_forwarded_to_the_host_socket() {
+        let mut socket = Socket::new();
+        assert_eq!(
+            socket.initialize(Domain::INET, Type::STREAM, Protocol::TCP),
+            Errno::Success
+        );
+
+        assert_eq!(socket.set_linger(true, 1), Errno::Success);
+        assert_eq!(socket.set_reuse_addr(true), Errno::Success);
+        assert_eq!(socket.set_keep_alive(true), Errno::Success);
+        assert_eq!(socket.set_broadcast(true), Errno::Success);
+        assert_eq!(socket.set_snd_buf(32 * 1024), Errno::Success);
+        assert_eq!(socket.set_rcv_buf(32 * 1024), Errno::Success);
+        assert_eq!(socket.get_pending_error(), (Errno::Success, Errno::Success));
+    }
+
+    #[test]
+    fn pending_error_reports_getsockopt_failure() {
+        let socket = Socket::new();
+        assert_eq!(socket.get_pending_error(), (Errno::Success, Errno::Badf));
+    }
+
+    #[test]
     fn pending_poll_is_cancelled_by_network_interrupt() {
         let _test_guard = INTERRUPT_TEST_LOCK.lock().unwrap();
         let first_instance = NetworkInstance::new();
@@ -324,6 +373,47 @@ impl Socket {
             is_non_blocking: false,
         }
     }
+
+    /// Corresponds to upstream `Socket::SetSockOpt` in network.cpp.
+    #[cfg(unix)]
+    fn set_sock_opt<T>(&self, option: i32, value: &T) -> Errno {
+        let result = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                option,
+                value as *const T as *const libc::c_void,
+                std::mem::size_of::<T>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Errno::Success
+        } else {
+            get_last_error()
+        }
+    }
+
+    /// Corresponds to upstream `Socket::GetSockOpt` in network.cpp.
+    #[cfg(unix)]
+    fn get_sock_opt<T: Default>(&self, option: i32) -> (T, Errno) {
+        let mut value = T::default();
+        let mut length = std::mem::size_of::<T>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                option,
+                &mut value as *mut T as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        if result == 0 {
+            assert_eq!(length as usize, std::mem::size_of::<T>());
+            (value, Errno::Success)
+        } else {
+            (value, get_last_error())
+        }
+    }
 }
 
 impl Drop for Socket {
@@ -364,7 +454,7 @@ impl SocketBase for Socket {
             if self.fd != INVALID_SOCKET {
                 return Errno::Success;
             }
-            return Errno::Other;
+            return get_last_error();
         }
         #[cfg(not(unix))]
         {
@@ -376,8 +466,8 @@ impl SocketBase for Socket {
     fn close(&mut self) -> Errno {
         if self.fd != INVALID_SOCKET {
             #[cfg(unix)]
-            unsafe {
-                libc::close(self.fd);
+            if unsafe { libc::close(self.fd) } != 0 {
+                log::warn!("close failed, socket may already be closed");
             }
             self.fd = INVALID_SOCKET;
         }
@@ -581,6 +671,7 @@ impl SocketBase for Socket {
     fn recv(&mut self, flags: i32, message: &mut [u8]) -> (i32, Errno) {
         #[cfg(unix)]
         {
+            assert_eq!(flags, 0);
             let result = unsafe {
                 libc::recv(
                     self.fd,
@@ -610,6 +701,7 @@ impl SocketBase for Socket {
     ) -> (i32, Errno) {
         #[cfg(unix)]
         {
+            assert_eq!(flags, 0);
             let mut addr_in: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
             let (p_addr, p_addrlen) = if addr.is_some() {
@@ -650,12 +742,13 @@ impl SocketBase for Socket {
     fn send(&mut self, message: &[u8], flags: i32) -> (i32, Errno) {
         #[cfg(unix)]
         {
+            assert_eq!(flags, 0);
             let result = unsafe {
                 libc::send(
                     self.fd,
                     message.as_ptr() as *const libc::c_void,
                     message.len(),
-                    flags,
+                    libc::MSG_NOSIGNAL,
                 )
             };
             if result >= 0 {
@@ -674,17 +767,15 @@ impl SocketBase for Socket {
     fn send_to(&mut self, flags: u32, message: &[u8], addr: Option<&SockAddrIn>) -> (i32, Errno) {
         #[cfg(unix)]
         {
-            let (p_addr, addrlen) = if let Some(a) = addr {
-                let addr_in = to_sockaddr_in(a);
-                // Need to keep addr_in alive — use a local and pass pointer.
-                let boxed = Box::new(addr_in);
-                let ptr = Box::into_raw(boxed);
-                (
-                    ptr as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
+            assert_eq!(flags, 0);
+            let addr_in = addr.map(to_sockaddr_in);
+            let p_addr = addr_in.as_ref().map_or(std::ptr::null(), |value| {
+                value as *const libc::sockaddr_in as *const libc::sockaddr
+            });
+            let addrlen = if addr_in.is_some() {
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
             } else {
-                (std::ptr::null(), 0)
+                0
             };
 
             let result = unsafe {
@@ -692,18 +783,11 @@ impl SocketBase for Socket {
                     self.fd,
                     message.as_ptr() as *const libc::c_void,
                     message.len(),
-                    flags as i32,
+                    0,
                     p_addr,
                     addrlen,
                 )
             };
-
-            // Clean up the boxed addr if we allocated one.
-            if !p_addr.is_null() {
-                unsafe {
-                    let _ = Box::from_raw(p_addr as *mut libc::sockaddr_in);
-                }
-            }
 
             if result >= 0 {
                 (result as i32, Errno::Success)
@@ -718,29 +802,97 @@ impl SocketBase for Socket {
         }
     }
 
-    fn set_linger(&mut self, _enable: bool, _linger: u32) -> Errno {
-        Errno::Other
+    fn set_linger(&mut self, enable: bool, linger: u32) -> Errno {
+        #[cfg(unix)]
+        {
+            let value = libc::linger {
+                l_onoff: i32::from(enable),
+                l_linger: linger as i32,
+            };
+            self.set_sock_opt(libc::SO_LINGER, &value)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (enable, linger);
+            Errno::Other
+        }
     }
-    fn set_reuse_addr(&mut self, _enable: bool) -> Errno {
-        Errno::Other
+    fn set_reuse_addr(&mut self, enable: bool) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_REUSEADDR, &u32::from(enable))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = enable;
+            Errno::Other
+        }
     }
-    fn set_keep_alive(&mut self, _enable: bool) -> Errno {
-        Errno::Other
+    fn set_keep_alive(&mut self, enable: bool) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_KEEPALIVE, &u32::from(enable))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = enable;
+            Errno::Other
+        }
     }
-    fn set_broadcast(&mut self, _enable: bool) -> Errno {
-        Errno::Other
+    fn set_broadcast(&mut self, enable: bool) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_BROADCAST, &u32::from(enable))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = enable;
+            Errno::Other
+        }
     }
-    fn set_snd_buf(&mut self, _value: u32) -> Errno {
-        Errno::Other
+    fn set_snd_buf(&mut self, value: u32) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_SNDBUF, &value)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = value;
+            Errno::Other
+        }
     }
-    fn set_rcv_buf(&mut self, _value: u32) -> Errno {
-        Errno::Other
+    fn set_rcv_buf(&mut self, value: u32) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_RCVBUF, &value)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = value;
+            Errno::Other
+        }
     }
-    fn set_snd_timeo(&mut self, _value: u32) -> Errno {
-        Errno::Other
+    fn set_snd_timeo(&mut self, value: u32) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_SNDTIMEO, &value)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = value;
+            Errno::Other
+        }
     }
-    fn set_rcv_timeo(&mut self, _value: u32) -> Errno {
-        Errno::Other
+    fn set_rcv_timeo(&mut self, value: u32) -> Errno {
+        #[cfg(unix)]
+        {
+            self.set_sock_opt(libc::SO_RCVTIMEO, &value)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = value;
+            Errno::Other
+        }
     }
 
     fn set_non_block(&mut self, enable: bool) -> Errno {
@@ -759,14 +911,22 @@ impl SocketBase for Socket {
                 self.is_non_blocking = enable;
                 return Errno::Success;
             }
-            return Errno::Other;
+            return get_last_error();
         }
         #[cfg(not(unix))]
         Errno::Other
     }
 
     fn get_pending_error(&self) -> (Errno, Errno) {
-        (Errno::Success, Errno::Success)
+        #[cfg(unix)]
+        {
+            let (pending_error, get_sock_opt_error) = self.get_sock_opt::<i32>(libc::SO_ERROR);
+            (translate_native_error(pending_error), get_sock_opt_error)
+        }
+        #[cfg(not(unix))]
+        {
+            (Errno::Success, Errno::Other)
+        }
     }
 
     fn is_opened(&self) -> bool {
@@ -805,7 +965,12 @@ pub fn poll(pollfds: &mut [PollFD], timeout: i32) -> (i32, Errno) {
 
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
 
-        if result >= 0 {
+        if result == 0 {
+            assert!(fds.iter().all(|fd| fd.revents == 0));
+            return (0, Errno::Success);
+        }
+
+        if result > 0 {
             for (i, fd) in fds.iter().take(num).enumerate() {
                 pollfds[i].revents = translate_poll_revents(fd.revents).bits();
             }

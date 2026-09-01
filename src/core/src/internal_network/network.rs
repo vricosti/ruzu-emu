@@ -110,6 +110,7 @@ pub enum Errno {
     Timedout,
     Msgsize,
     Inprogress,
+    Isconn,
     Other,
 }
 

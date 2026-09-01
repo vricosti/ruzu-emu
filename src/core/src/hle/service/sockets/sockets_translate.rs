@@ -30,6 +30,7 @@ pub fn translate_errno(value: NetErrno) -> Errno {
         NetErrno::Connaborted => Errno::CONNABORTED,
         NetErrno::Connreset => Errno::CONNRESET,
         NetErrno::Inprogress => Errno::INPROGRESS,
+        NetErrno::Isconn => Errno::ISCONN,
         _ => {
             log::warn!("Unimplemented errno={value:?}");
             Errno::SUCCESS
@@ -212,12 +213,6 @@ pub fn translate_poll_events_from_network(mut flags: NetPollEvents) -> PollEvent
 
 /// Corresponds to `Translate(SockAddrIn)` in upstream.
 pub fn translate_sockaddr_to_network(value: &SockAddrIn) -> NetSockAddrIn {
-    // Homebrew can pass 6 because libnx uses it when deserializing
-    // getaddrinfo results.
-    assert!(
-        value.len == 0 || value.len == std::mem::size_of::<SockAddrIn>() as u8 || value.len == 6
-    );
-
     NetSockAddrIn {
         family: Some(translate_domain(Domain(value.family as u32))),
         ip: value.ip,
@@ -269,6 +264,11 @@ mod tests {
     }
 
     #[test]
+    fn already_connected_errno_matches_upstream() {
+        assert_eq!(translate_errno(NetErrno::Isconn), Errno::ISCONN);
+    }
+
+    #[test]
     fn sockaddr_translation_preserves_upstream_layout_and_byte_order() {
         let guest = SockAddrIn {
             len: 16,
@@ -281,5 +281,20 @@ mod tests {
         assert_eq!(network.family, Some(NetDomain::INET));
         assert_eq!(network.portno, 0x1234);
         assert_eq!(translate_sockaddr_from_network(&network).portno, 0x3412);
+    }
+
+    #[test]
+    fn sockaddr_translation_accepts_every_length_like_upstream() {
+        let mut guest = SockAddrIn {
+            family: Domain::INET.0 as u8,
+            ..SockAddrIn::default()
+        };
+        for length in u8::MIN..=u8::MAX {
+            guest.len = length;
+            assert_eq!(
+                translate_sockaddr_to_network(&guest).family,
+                Some(NetDomain::INET)
+            );
+        }
     }
 }

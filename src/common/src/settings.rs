@@ -617,7 +617,7 @@ impl Default for Values {
                 LibraryApplet,
             ),
             error_applet_mode: SwitchableSetting::new(
-                AppletMode::LLE,
+                AppletMode::HLE,
                 "error_applet_mode",
                 LibraryApplet,
             ),
@@ -2226,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn library_applet_category_matches_upstream_switchability_and_defaults() {
+    fn library_applet_category_matches_switchability_and_selected_defaults() {
         let mut values = Values::default();
         let mut entries = Vec::new();
         values.for_each_setting_in_category_mut(Category::LibraryApplet, |setting| {
@@ -2262,6 +2262,7 @@ mod tests {
                 .any(|entry| entry == &(label.to_string(), false)));
         }
         assert_eq!(*values.net_connect_applet_mode.get_value(), AppletMode::LLE);
+        assert_eq!(*values.error_applet_mode.get_value(), AppletMode::HLE);
         assert_eq!(
             *values.player_select_applet_mode.get_value(),
             AppletMode::LLE

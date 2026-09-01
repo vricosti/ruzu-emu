@@ -8,6 +8,7 @@
 
 use super::ns_types::*;
 use crate::core::SystemRef;
+use crate::file_sys::romfs_factory::StorageId;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -350,6 +351,7 @@ impl IApplicationManagerInterface {
             .iter()
             .map(|&(command_id, _, name)| {
                 let handler = match command_id {
+                    71 => Some(Self::get_storage_size_handler as _),
                     2520 => {
                         Some(Self::is_qualification_transition_supported_by_process_id_handler as _)
                     }
@@ -363,6 +365,45 @@ impl IApplicationManagerInterface {
             handlers: build_handler_map(&functions),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn parse_storage_id(raw: u8) -> Option<StorageId> {
+        match raw {
+            0 => Some(StorageId::None),
+            1 => Some(StorageId::Host),
+            2 => Some(StorageId::GameCard),
+            3 => Some(StorageId::NandSystem),
+            4 => Some(StorageId::NandUser),
+            5 => Some(StorageId::SdCard),
+            _ => None,
+        }
+    }
+
+    /// Port of `IApplicationManagerInterface::GetStorageSize`.
+    fn get_storage_size(&self, storage_id: StorageId) -> (i64, i64) {
+        let controller = self.system.get().get_filesystem_controller();
+        let controller = controller.lock().unwrap();
+        (
+            controller.get_total_space_size(storage_id) as i64,
+            controller.get_free_space_size(storage_id) as i64,
+        )
+    }
+
+    fn get_storage_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IApplicationManagerInterface)
+        };
+        let mut rp = RequestParser::new(ctx);
+        let raw_storage_id = rp.pop_u8();
+        let storage_id = Self::parse_storage_id(raw_storage_id)
+            .unwrap_or_else(|| panic!("invalid StorageId={raw_storage_id}"));
+        log::info!("GetStorageSize called, storage_id={storage_id:?}");
+
+        let (total_space_size, free_space_size) = this.get_storage_size(storage_id);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i64(total_space_size);
+        rb.push_i64(free_space_size);
     }
 
     fn is_qualification_transition_supported_by_process_id_handler(
@@ -463,5 +504,20 @@ mod tests {
             .and_then(|info| info.handler_callback)
             .is_some());
         assert!(is_qualification_transition_supported_by_process_id(0x51));
+    }
+
+    #[test]
+    fn storage_size_command_matches_upstream_registration_and_output_order() {
+        let system = crate::core::System::new();
+        let service = IApplicationManagerInterface::new(SystemRef::from_ref(&system));
+
+        assert!(service
+            .handlers()
+            .get(&71)
+            .and_then(|info| info.handler_callback)
+            .is_some());
+
+        let (total, free) = service.get_storage_size(StorageId::None);
+        assert_eq!((total, free), (0, 0));
     }
 }

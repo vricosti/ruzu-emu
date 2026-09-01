@@ -610,7 +610,7 @@ impl IRequest {
         let out = vec![0u8; ctx.get_write_buffer_size(0)];
         ctx.write_buffer(&out, 0);
 
-        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(0);
         rb.push_u32(0);

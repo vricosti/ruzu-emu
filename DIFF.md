@@ -19274,3 +19274,276 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: deferred callback owners and trigger values are host-only synchronization state.
+
+## 2026-09-01 — NIFM applet reply and POSIX socket error parity
+
+### Intentional differences
+
+- `src/core/src/hle/service/sockets/sfdnsres.rs` rejects unresolved NSD service identifiers with
+  `EAI_AGAIN` and blocks the parent `nintendo.net` domain. Eden leaves NSD expansion as a TODO and
+  otherwise delegates to host DNS; Ruzu deliberately keeps official service names away from the
+  host resolver and reports resolution as temporarily unavailable.
+- Upstream defines native `Socket` bodies in the monolithic `core/internal_network/network.cpp`.
+  Ruzu keeps the same `Socket` ownership together with its `SocketBase` trait in
+  `src/core/src/internal_network/sockets.rs`, while process-wide initialization remains in
+  `network.rs`.
+
+### Unintentional differences (to fix)
+
+- Corrected `IRequest::GetAppletInfo` from a five-word to Eden's six-word IPC response.
+- Corrected `BSD::PollWork::Response` parity by skipping `WriteBuffer` when the guest supplied no
+  output buffer; the former unconditional call produced an unbounded warning loop for zero-buffer
+  polls.
+- Corrected the POSIX socket backend to query `SO_ERROR`, forward Eden's supported `SOL_SOCKET`
+  options, translate `EISCONN`, suppress `SIGPIPE` on send, preserve poll's zero-result validation,
+  and return the native error when socket creation or nonblocking setup fails.
+- Corrected BSD connect handling so `ISCONN` becomes success, and accepted every guest sockaddr
+  length as Eden does instead of asserting on lengths other than 0, 6, or 16.
+
+### Missing items
+
+- Full NSD service-identifier and environment-placeholder expansion is not ported; NSD-marked
+  requests use the safety failure above.
+- The native Windows socket backend remains outside this POSIX correction slice.
+
+### Binary layout verification
+
+- PASS: service `Errno::ISCONN` is `repr(u32)` value 106 as upstream, and the NIFM reply now
+  reserves the six words required for `ResultSuccess` plus three `u32` values. No serialized DNS
+  payload structure was reordered.
+
+## 2026-09-01 — `src/core/src/hle/service/ns/application_manager_interface.rs` vs Eden `src/core/hle/service/ns/application_manager_interface.{h,cpp}`
+
+### Intentional differences
+
+- Rust decodes the guest `u8` into the existing `StorageId` enum before calling the filesystem
+  controller; valid values retain Eden's raw enum representation and behavior.
+
+### Unintentional differences (to fix)
+
+- Corrected command 71, `GetStorageSize`, which was advertised as implemented but had no handler.
+  It now returns total size followed by free size from `FileSystemController`, matching Eden.
+
+### Missing items
+
+- Other command-table entries marked implemented but still lacking handlers remain outside this
+  runtime-failure slice.
+
+### Binary layout verification
+
+- PASS: `StorageId` remains `repr(u8)` and the response contains `ResultSuccess`, `s64` total size,
+  then `s64` free size in six normal parameter words.
+
+## 2026-09-01 — `src/core/src/hle/service/am/frontend/applet_error.rs` vs Eden `src/core/hle/service/am/frontend/applet_error.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu defers `Exit` while a synchronous frontend callback is executing so the callback cannot
+  re-enter the Rust-owned applet mutex. It performs the deferred `Exit` immediately after the
+  frontend call returns.
+
+### Unintentional differences (to fix)
+
+- Corrected synchronous error frontends marking completion without ever executing `Exit`; the
+  owner applet is now completed and its state-change event is signalled as in Eden.
+
+### Missing items
+
+- None in this callback-completion slice.
+
+### Binary layout verification
+
+- PASS: no guest-visible error argument or output layout changed; completion still emits Eden's
+  zero-initialized 0x1000-byte output storage.
+
+## 2026-09-01 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}`
+
+### Intentional differences
+
+- None in this logging-level correction.
+
+### Unintentional differences (to fix)
+
+- Corrected `GetDisplayVersion` logging from info to debug. Eden uses `LOG_DEBUG`; the former info
+  level flooded ordinary diagnostic runs when software repeatedly queried the version.
+
+### Missing items
+
+- None in this handler slice.
+
+### Binary layout verification
+
+- PASS: `DisplayVersion` remains a zero-initialized 0x10-byte response with its last byte forced to
+  NUL; only host logging changed.
+
+## 2026-09-01 — `src/core/src/hle/service/am/{applet.rs,display_layer_manager.rs,window_system.rs}` vs Eden `src/core/hle/service/am/{applet,display_layer_manager,window_system}.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu identifies applets by ARUID in `WindowSystemInner` and upgrades them from the owned map,
+  instead of retaining Eden's non-owning `Applet*` root pointers. The ordering and applet state
+  transitions remain owned by `window_system.rs`.
+- Fallible VI calls whose Eden return value is explicitly discarded are likewise discarded with
+  `let _ =` in Rust.
+
+### Unintentional differences (to fix)
+
+- Corrected managed and shared library-applet layer creation to apply Eden's blending, initial
+  z-index, and overlay-layer classification.
+- Corrected `WindowSystem::Update` to update the overlay root, preserve its visibility, and prevent
+  a foreground overlay from sharing guest input with the application.
+- Corrected every applet-state update to apply Eden's foreground/obscured z-index to both managed
+  and system-shared layers. This removes nondeterministic composition ordering between an
+  application and a foreground library applet.
+
+### Missing items
+
+- Eden's reserved-applet winding state is not yet represented in Ruzu's `Applet`, so
+  `UpdateAppletStateLocked` cannot yet treat an `is_winding` child as obscuring its parent.
+- Eden's current `OnSystemButtonPress` routing and long-home overlay foreground toggle are not yet
+  ported; `overlay_in_foreground` therefore retains its default false state unless another owner
+  changes it.
+
+### Binary layout verification
+
+- PASS: `Applet` is host-owned and is neither raw-copied nor serialized. The added boolean has no
+  guest ABI or cache-format representation.
+
+## 2026-09-01 — `src/core/src/hle/service/hle_ipc.rs` vs Eden `src/core/hle/service/hle_ipc.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `SessionRequestHandler` is not protected by a Rust mutex. Ruzu therefore logs domain slot
+  indices and command IDs while holding `Mutex<SessionRequestManager>`, and obtains the service
+  name only after releasing that mutex in `complete_sync_request`.
+
+### Unintentional differences (to fix)
+
+- Corrected domain dispatch selection and domain-handler insertion so they no longer call
+  `service_name()` while holding the session-manager mutex. With a shared mutex-backed service,
+  two concurrent domain requests could otherwise invert the manager/service lock order and stop
+  the service permanently before either IPC response was written.
+
+### Missing items
+
+- None in the domain-handler selection and insertion lock-order slice.
+
+### Binary layout verification
+
+- PASS: no command, domain header, response, or serialized payload layout changed.
+
+## 2026-09-01 — `src/ruzu/src/applets/error.rs` and frontend wiring vs Eden `src/yuzu/applets/qt_error.{h,cpp}`
+
+### Intentional differences
+
+- GTK requests cross an `mpsc` channel polled by the main loop instead of queued Qt signals. The
+  ownership and ordering remain the same: the emulation thread stores the completion callback,
+  the UI thread owns the dialog, and dismissing the dialog invokes the callback exactly once.
+- The timestamp fallback displays Unix seconds because the GTK frontend does not currently own an
+  upstream-equivalent locale-aware date formatter.
+
+### Unintentional differences (to fix)
+
+- Corrected the missing GUI error frontend. Ruzu previously installed no `ErrorApplet` frontend,
+  so selecting HLE fell back to `DefaultErrorApplet`, which logged the error but never invoked its
+  completion callback.
+
+### Missing items
+
+- Locale-aware date and time formatting equivalent to `QDateTime::fromSecsSinceEpoch` remains to
+  be added to the GTK-only timestamp presentation path.
+
+### Binary layout verification
+
+- PASS: the GTK frontend consumes `ResultCode` and host strings only. Guest error arguments and
+  the 0x1000-byte applet output storage remain owned by `applet_error.rs` and are unchanged.
+
+## 2026-09-01 — `src/core/src/frontend/applets/error.rs` vs Eden `src/core/frontend/applets/error.{h,cpp}`
+
+### Intentional differences
+
+- After logging an error, Ruzu's non-graphical fallback invokes the supplied completion callback.
+  Eden's default frontend ignores it, which leaves an HLE Error applet permanently incomplete.
+  This keeps the HLE default usable by frontends such as `ruzu-cmd` that do not install a graphical
+  error display.
+
+### Unintentional differences (to fix)
+
+- None in this fallback-completion slice.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: the frontend receives host-owned values and callbacks only; no guest-visible structure or
+  serialized payload changed.
+
+## 2026-09-01 — `src/common/src/settings.rs` vs Eden `src/common/settings.h`
+
+### Intentional differences
+
+- Ruzu now defaults `error_applet_mode` to HLE. Eden defaults to the real LLE applet, but both Eden
+  and the former Ruzu path leave the tested system Error applet alive after its Close action. The
+  HLE default uses the frontend callback contract and returns control to the caller; users can
+  still select the real applet explicitly for LLE parity testing.
+
+### Unintentional differences (to fix)
+
+- None in this setting-default slice.
+
+### Missing items
+
+- The underlying LLE Error applet exit incompatibility remains; changing the explicit per-title or
+  global preference to `Real applet` can still reproduce it.
+
+### Binary layout verification
+
+- PASS: `AppletMode` remains `repr(u32)` and no serialized or cache structure changed.
+
+## 2026-09-01 — `src/core/src/hle/service/am/service/library_applet_accessor.rs` vs Eden `src/core/hle/service/am/service/library_applet_accessor.{h,cpp}`
+
+### Intentional differences
+
+- None in the process-state tracking correction.
+
+### Unintentional differences (to fix)
+
+- Corrected `Start` and `Terminate` so they no longer assign `Applet::is_process_running`
+  directly. Eden delegates process-state observation to `EventObserver`; in particular, a frontend
+  applet has no guest process and must never be marked as running. The former assignment could
+  leave its caller obscured and non-interactive after the frontend dialog completed.
+
+### Missing items
+
+- None in this lifecycle slice.
+
+### Binary layout verification
+
+- PASS: no IPC response or guest-visible structure changed; only host-side process-state ownership
+  was restored to the event observer.
+
+## 2026-09-01 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h`
+
+### Intentional differences
+
+- Ruzu retains an `Arc<Mutex<MemoryManager>>` for channel ownership and a lifetime-coupled,
+  non-owning `MemoryManagerHandle` for upstream-equivalent cache callbacks. Eden stores the
+  non-owning `Tegra::MemoryManager*` directly.
+
+### Unintentional differences (to fix)
+
+- Corrected DMA download writeback in `write_downloaded_buffer` to use the existing non-owning
+  channel memory handle, matching Eden's direct `gpu_memory->WriteBlockUnsafe` call. Locking the
+  owning `Arc<Mutex<MemoryManager>>` while the fencing thread already owned the rasterizer inverted
+  the safe-read `MemoryManager -> Rasterizer` order and could deadlock both GPU threads.
+
+### Missing items
+
+- None in the DMA buffer writeback slice.
+
+### Binary layout verification
+
+- PASS: staging bytes and GPU virtual-address translation are unchanged; the correction only
+  removes an extra Rust ownership lock from Eden's unsafe cache-managed writeback path.

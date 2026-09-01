@@ -1040,6 +1040,15 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Common writeback half of upstream `gpu_memory->WriteBlockUnsafe`
     /// in `TextureCache<P>::PopAsyncFlushes` for DMA buffer downloads.
     pub fn write_downloaded_buffer(&mut self, gpu_addr: GPUVAddr, staging: &[u8]) -> bool {
+        if let Some(gpu_memory) = self.channel_gpu_memory_handle {
+            // SAFETY: `update_channel_gpu_memory` derives this non-owning handle from the Arc
+            // retained by `channel_gpu_memory`. Upstream performs this cache-owned writeback
+            // directly through its `Tegra::MemoryManager*`; taking the Rust channel mutex here
+            // inverts the MemoryManager -> Rasterizer order used by safe guest-memory reads.
+            let gpu_memory = unsafe { gpu_memory.as_ref() };
+            let _ = gpu_memory.write_block_unsafe(gpu_addr, staging);
+            return true;
+        }
         if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
             let gpu_memory = gpu_memory.lock();
             let _ = gpu_memory.write_block_unsafe(gpu_addr, staging);
@@ -6702,6 +6711,42 @@ mod tests {
             writes.is_empty(),
             "a held channel lock must not lose GPU-address translation"
         );
+        assert_eq!(&backing[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_downloaded_buffer_uses_gpu_mapping_when_channel_memory_is_locked() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = test_cache();
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x5000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut memory_manager = MemoryManager::new_with_geometry_and_device_memory(
+            7,
+            device_memory,
+            22,
+            1 << 22,
+            16,
+            12,
+        );
+        memory_manager.map(0x4000, 0x9000_0000, 0x1000, 0, false);
+        let gpu_memory = Arc::new(ParkingMutex::new(memory_manager));
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+
+        let _held_channel_lock = gpu_memory.lock();
+        assert!(cache.write_downloaded_buffer(0x4000, &[1, 2, 3, 4]));
         assert_eq!(&backing[..4], &[1, 2, 3, 4]);
     }
 

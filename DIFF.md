@@ -19148,3 +19148,38 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Binary layout verification
 - N/A: lifecycle state is host-only and no shared binary payload or disk format changed.
+
+## 2026-09-01 — `src/core/src/hle/service/server_manager.rs`, `src/core/src/hle/kernel/{svc/svc_ipc.rs,k_server_session.rs}` vs Eden `src/core/hle/{service/server_manager.cpp,kernel/svc/svc_ipc.cpp,kernel/k_server_session.cpp}`
+
+### Intentional differences
+
+- Eden's stable `Session*` and independent deferred-list mutex are represented by stable session
+  identifiers inside `Arc<Mutex<ServerManager>>`. Ruzu captures the selected session under that
+  mutex, releases it for `CompleteSyncRequest`, then reacquires it only to store a deferral,
+  remove a closed session, or relink the holder.
+- Relinking still occurs at Eden's transaction boundary, but the bridged wakeup event is signaled
+  after releasing `Mutex<ServerManager>` because the Rust event bridge can enter the scheduler and
+  switch a host fiber.
+- Unit-test systems synchronously drain the real shared ServerManager event loop because they do
+  not start host fibers. The adapter only selects/transports events and invokes the same
+  `complete_sync_request_shared` transaction as runtime.
+- The Rust SVC retains an `Arc` to the calling thread while it waits. Eden obtains the same result
+  through the blocking `KClientSession::SendSyncRequest`; retaining the owner explicitly avoids
+  consulting a thread-local pointer after the scheduler handoff.
+
+### Unintentional differences (to fix)
+
+- Corrected: initial requests and deferred retries used separate transaction implementations, and
+  the deferred path could execute a service callback while holding the global ServerManager mutex.
+- Corrected: ownerless sessions could make `svc_ipc.rs` execute the HLE callback, response write,
+  and reply inline instead of returning `ResultInvalidHandle` as an invalid routing state.
+- Corrected: the test `sm:` setup published the ServiceManager after managed-port registration, so
+  sessions created through that port lacked their ServerManager queue, wakeup, and owner links.
+
+### Missing items
+
+- None in the reviewed HLE dispatch-ownership slice.
+
+### Binary layout verification
+
+- N/A: the change affects host-side ownership, locking, and event-loop routing only.

@@ -17,7 +17,8 @@ use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::kernel::trace_format;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
+#[cfg(test)]
+use crate::hle::service::hle_ipc::HLERequestContext;
 
 fn should_trace_reply_receive_debug() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -51,11 +52,6 @@ fn should_trace_sync_handle(session_handle: Handle) -> bool {
 fn profile_ipc_phases_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some())
-}
-
-fn trace_svc_ipc_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SVC_IPC").is_some())
 }
 
 fn dump_ssr_enabled() -> bool {
@@ -219,19 +215,6 @@ fn format_ipc_trace_words(system: &System, message_address: u64, words: usize) -
     Some(formatted.trim_end().to_string())
 }
 
-fn format_ipc_trace_slice(words: &[u32]) -> Option<String> {
-    if words.is_empty() {
-        return None;
-    }
-
-    let mut formatted = String::with_capacity(words.len() * 9);
-    for word in words {
-        use std::fmt::Write;
-        let _ = write!(formatted, "{:08x} ", word.swap_bytes());
-    }
-    Some(formatted.trim_end().to_string())
-}
-
 fn trace_ipc_buffer(system: &System, label: &str, message_address: u64) {
     if !trace_format::is_svc_trace_enabled() {
         return;
@@ -244,45 +227,6 @@ fn trace_ipc_buffer(system: &System, label: &str, message_address: u64) {
         "[{:>10.6}] {} [0x{:x}]: {}",
         trace_format::elapsed_secs(),
         label,
-        message_address,
-        payload
-    );
-}
-
-/// TLS_RSP_BUF: response bytes as staged in the HLERequestContext command buffer
-/// *before* guest-memory writeback. Useful for inspecting what a handler intended
-/// to send regardless of partial-writeback behavior.
-fn trace_ipc_response_buffer(context: &HLERequestContext, message_address: u64) {
-    if !trace_format::is_svc_trace_enabled() {
-        return;
-    }
-
-    let words = &context.command_buffer()[..16];
-    let Some(payload) = format_ipc_trace_slice(words) else {
-        return;
-    };
-    eprintln!(
-        "[{:>10.6}] TLS_RSP_BUF [0x{:x}]: {}",
-        trace_format::elapsed_secs(),
-        message_address,
-        payload
-    );
-}
-
-/// TLS_RSP_TLS: response bytes as observed in guest TLS *after* writeback. This
-/// matches what the client thread will actually read back from its message
-/// buffer and is what zuyu's single-label `TLS_RSP` trace captures.
-fn trace_ipc_response_tls(system: &System, message_address: u64) {
-    if !trace_format::is_svc_trace_enabled() {
-        return;
-    }
-
-    let Some(payload) = format_ipc_trace_words(system, message_address, 16) else {
-        return;
-    };
-    eprintln!(
-        "[{:>10.6}] TLS_RSP_TLS [0x{:x}]: {}",
-        trace_format::elapsed_secs(),
         message_address,
         payload
     );
@@ -301,6 +245,13 @@ fn send_sync_request_impl(
     session_handle: Handle,
     message_address: u64,
 ) -> ResultCode {
+    // The calling thread is the owner of the synchronous wait result. Keep a
+    // stable reference across the scheduler hand-off: after the thread enters
+    // WAITING, the thread-local "current thread" may already name the next
+    // scheduled thread (or be empty in the host-fiber-free test harness).
+    let Some(calling_thread) = system.current_thread() else {
+        return RESULT_INVALID_HANDLE;
+    };
     OWNER_FAIL_STAGE.with(|s| s.set(""));
     // `RUZU_PROFILE_IPC_PHASES=1` — time each phase of send_sync_request_impl
     // so we can see which Mutex acquisition or sub-step is the bottleneck.
@@ -375,8 +326,8 @@ fn send_sync_request_impl(
     // `SendReplyHLE` → `client_thread->EndWait()`. Ruzu mirrors that by
     // parking the guest and yielding the fiber. Session registration belongs
     // to the owning ServerManager and happens before the client endpoint is
-    // exposed, matching upstream. The inline path below is retained only for
-    // ownerless unit-test fixtures.
+    // exposed, matching upstream. Sessions without that owner are invalid;
+    // the SVC never dispatches an HLE handler directly.
     let server_session_and_manager: Option<(
         Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
@@ -466,14 +417,16 @@ fn send_sync_request_impl(
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
         crate::hle::service::hle_ipc::PendingRegistrationQueue,
         Arc<crate::hle::service::os::event::Event>,
+        Arc<Mutex<crate::hle::service::server_manager::ServerManager>>,
     )> = server_session_and_manager
         .as_ref()
         .and_then(|(server_session, manager)| {
-            let (queue, wakeup) = {
+            let (queue, wakeup, server_manager) = {
                 let g = manager.lock().unwrap();
                 (
                     g.pending_registrations().cloned(),
                     g.server_wakeup().cloned(),
+                    g.get_server_manager(),
                 )
             };
             if queue.is_none() {
@@ -486,6 +439,7 @@ fn send_sync_request_impl(
                 Arc::clone(manager),
                 queue?,
                 wakeup?,
+                server_manager?,
             ))
         });
     let has_server_manager = server_session_and_manager
@@ -501,7 +455,9 @@ fn send_sync_request_impl(
         None
     };
 
-    if let Some((server_session, manager, queue, wakeup)) = host_thread_targets {
+    if let Some((server_session, manager, queue, wakeup, server_manager)) = host_thread_targets {
+        #[cfg(not(test))]
+        let _ = &server_manager;
         trace_host_thread_ipc("enqueue_begin", session_handle);
         record_phase("host_02_resolve_owner", &mut phase_last);
 
@@ -586,10 +542,25 @@ fn send_sync_request_impl(
         // so the owning ServerManager can receive and reply.
         trace_host_thread_ipc("client_begin_wait", session_handle);
 
+        // Unit-test systems intentionally do not start host fibers. Pump the
+        // same shared ServerManager loop synchronously; this is transport-only
+        // test infrastructure and does not duplicate the dispatch transaction.
+        #[cfg(test)]
+        {
+            let processed = crate::hle::service::server_manager::ServerManager::process_available_events_for_test(
+                &server_manager,
+            );
+            assert!(
+                processed > 0,
+                "test ServerManager did not consume the enqueued IPC request"
+            );
+        }
+
         // Yield the current fiber. The owning ServerManager's host fiber
         // processes the request and `send_reply` ends the wait on the
         // client. The scheduler eventually re-picks this fiber and we
         // resume just after this call.
+        #[cfg(not(test))]
         if let Some(kernel) = system.kernel() {
             if let Some(scheduler) = kernel.current_scheduler() {
                 let sched_ptr = {
@@ -606,10 +577,7 @@ fn send_sync_request_impl(
         record_phase("host_07_client_wait", &mut phase_last);
         trace_host_thread_ipc("client_resumed", session_handle);
 
-        let result = system
-            .current_thread()
-            .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
-            .unwrap_or(RESULT_INVALID_HANDLE);
+        let result = ResultCode::new(calling_thread.lock().unwrap().get_wait_result());
         if crate::hle::kernel::handle_forensics::enabled()
             && result.get_inner_value() == RESULT_INVALID_HANDLE.get_inner_value()
         {
@@ -623,345 +591,13 @@ fn send_sync_request_impl(
         record_phase("host_08_wait_result", &mut phase_last);
         return result;
     }
-    // Inline fallback: orphan session (no ServerManager wiring). Used by
-    // unit tests that drive `send_sync_request` directly without spinning
-    // up a host fiber. Behavior is non-upstream but converges with the
-    // host-thread path because the same handler runs end-to-end.
-    let (request_manager, mut context, request_message_address) = {
-        let (server_session, manager, request) = {
-            let _lo_p = common::lock_order::guard("process");
-            let process_arc = system.current_process_arc();
-            let mut process = process_arc.lock().unwrap();
-            record_phase("02_process_lock_2", &mut phase_last);
-            trace_svc_ipc_progress(
-                3,
-                session_handle,
-                session_object_id,
-                message_address,
-                0,
-                0,
-                0,
-            );
-            if trace_sync {
-                log::info!("svc::SendSyncRequest stage=enqueue_request");
-            }
-            let request = Arc::new(Mutex::new(
-                crate::hle::kernel::k_session_request::KSessionRequest::new(),
-            ));
-            request.lock().unwrap().initialize_with_process(
-                &mut process,
-                None,
-                message_address as usize,
-                0,
-            );
-            record_phase("03_prepare_inline_request", &mut phase_last);
-            let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
-                if trace_sync {
-                    log::info!(
-                        "svc::SendSyncRequest stage=missing_parent_session parent_id={:#x}",
-                        parent_id
-                    );
-                }
-                if crate::hle::kernel::handle_forensics::enabled() {
-                    eprintln!(
-                        "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=inline_parent_session_none",
-                        session_handle, parent_id
-                    );
-                }
-                return RESULT_INVALID_HANDLE;
-            };
-            let server_session = parent_session.lock().unwrap().get_server_session().clone();
-            let manager = match server_session.lock().unwrap().get_manager().cloned() {
-                Some(manager) => manager,
-                None => {
-                    if trace_sync {
-                        log::info!(
-                            "svc::SendSyncRequest stage=missing_server_manager parent_id={:#x}",
-                            parent_id
-                        );
-                    }
-                    if crate::hle::kernel::handle_forensics::enabled() {
-                        eprintln!(
-                            "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=inline_manager_none",
-                            session_handle, parent_id
-                        );
-                    }
-                    return RESULT_INVALID_HANDLE;
-                }
-            };
-            (server_session, manager, request)
-        };
-        if trace_sync {
-            log::info!("svc::SendSyncRequest stage=receive_request_hle_begin");
-        }
-
-        // Do not notify the host ServerManager on the inline fallback path.
-        // This path consumes the request synchronously on the caller's host
-        // thread; waking the real ServerManager exposes the same request to two
-        // dispatch paths and can make a stale SFCO reply look like a new IPC.
-        // `receive_inline_request_hle` pushes and receives under the same
-        // `KServerSession` mutex, while the owner `KProcess` mutex is already
-        // released to avoid the current-thread parent lookup deadlock.
-        record_phase("04_resolve_server_session_manager", &mut phase_last);
-        trace_svc_ipc_progress(
-            4,
-            session_handle,
-            session_object_id,
-            message_address,
-            0,
-            0,
-            0,
-        );
-        // Upstream `KClientSession::SendSyncRequest` enqueues the request
-        // before the client waits, even when another request is currently
-        // being handled. Preserve that FIFO property in the inline fallback:
-        // enqueue exactly once, then wait until this same request reaches the
-        // front and `current_request` is free. Retrying by enqueueing only
-        // after the session becomes idle lets host lock timing reorder guest
-        // threads that share one service session.
-        let receive_result = {
-            let enqueue_result = {
-                let mut server_session = server_session.lock().unwrap();
-                server_session.enqueue_inline_request_hle(Arc::clone(&request))
-            };
-            if let Err(code) = enqueue_result {
-                return ResultCode::new(code);
-            }
-            let mut waited_us: u64 = 0;
-            loop {
-                let attempt = {
-                    let mut server_session = server_session.lock().unwrap();
-                    server_session.receive_queued_inline_request_hle(&request, &manager)
-                };
-                match attempt {
-                    Err(code) if code == RESULT_NOT_FOUND.get_inner_value() => {
-                        if waited_us == 1_000_000 {
-                            log::error!(
-                                "svc::SendSyncRequest inline: session busy >1s (handle={:#x}); still waiting",
-                                session_handle
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_micros(5));
-                        waited_us += 5;
-                        continue;
-                    }
-                    other => break other,
-                }
-            }
-        };
-        record_phase("05_receive_request_hle", &mut phase_last);
-        match receive_result {
-            Ok((context, manager, request_message_address)) => {
-                trace_svc_ipc_progress(
-                    5,
-                    session_handle,
-                    session_object_id,
-                    message_address,
-                    request_message_address,
-                    0,
-                    0,
-                );
-                if trace_sync {
-                    log::info!("svc::SendSyncRequest stage=receive_request_hle_end");
-                }
-                (manager, context, request_message_address)
-            }
-            Err(code) => {
-                if crate::hle::kernel::handle_forensics::enabled() {
-                    eprintln!(
-                        "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=inline_receive_err code=0x{:X}",
-                        session_handle, parent_id, code
-                    );
-                }
-                return ResultCode::new(code);
-            }
-        }
-    };
-
-    let service_manager = system.service_manager().unwrap();
-    context.set_service_manager(service_manager);
-
-    let trace_svc_ipc = trace_svc_ipc_enabled();
-    let dump_ssr = dump_ssr_enabled();
-    let trace_handler_context = (log::log_enabled!(log::Level::Trace) || trace_svc_ipc || dump_ssr)
-        .then(|| {
-            let manager = request_manager.lock().unwrap();
-            let handler_name = manager
-                .session_handler()
-                .map(|handler| handler.service_name().to_string())
-                .unwrap_or_else(|| "<none>".to_string());
-            (manager.is_domain(), handler_name)
-        });
-
-    if let Some((is_domain, session_handler_name)) = trace_handler_context.as_ref() {
-        log::trace!(
-            "  SendSyncRequest: handle={:#x} message={:#x} service={} cmd_type={:?} is_domain={} parsed_cmd={}",
-            session_handle,
-            request_message_address,
-            session_handler_name,
-            context.get_command_type(),
-            is_domain,
-            context.get_command(),
-        );
-        if dump_ssr {
-            let svc_id = common::trace::intern_service(session_handler_name);
-            common::trace::emit(
-                common::trace::cat::SSR_IPC,
-                &[
-                    0, // stage: enter
-                    system.current_thread_id().unwrap_or(0),
-                    session_handle as u64,
-                    context.get_command() as u64,
-                    context.get_command_type() as u64,
-                    0, // result: n/a on enter
-                    svc_id as u64,
-                ],
-            );
-        }
-    }
-    // Env-gated SVC-level trace: every SendSyncRequest with ASCII-decoded
-    // request TLS preview. Useful when an IPC is suspected lost between libnx
-    // and the service dispatcher: this fires BEFORE any service routing, so
-    // any guest-issued SendSyncRequest will appear here.
-    if trace_svc_ipc {
-        let (is_domain, session_handler_name) = trace_handler_context
-            .as_ref()
-            .expect("trace handler context must be resolved when SVC IPC trace is enabled");
-        let mut printable = String::new();
-        let mem_opt = (|| -> Option<_> {
-            let thread = system.current_thread()?;
-            let parent = {
-                let g = thread.lock().unwrap();
-                g.parent.as_ref()?.clone()
-            }
-            .upgrade()?;
-            let process = parent.lock().unwrap();
-            process.page_table.get_base().m_memory.clone()
-        })();
-        if let Some(mem_arc) = mem_opt {
-            let mem = mem_arc.lock().unwrap();
-            for i in 0..256u64 {
-                let word = mem.read_32(request_message_address + i);
-                let b = (word & 0xff) as u8;
-                if b >= 0x20 && b < 0x7f {
-                    printable.push(b as char);
-                } else if b == 0 && !printable.is_empty() && !printable.ends_with(' ') {
-                    printable.push(' ');
-                }
-            }
-        }
-        eprintln!(
-            "[SVC_IPC] handle={:#x} service={} cmd={} dom={} ascii={:?}",
-            session_handle,
-            session_handler_name,
-            context.get_command(),
-            is_domain,
-            printable.trim(),
-        );
-    }
-
-    if trace_sync {
-        log::info!("svc::SendSyncRequest stage=complete_sync_request_begin");
-    }
-    trace_svc_ipc_progress(
-        6,
-        session_handle,
-        session_object_id,
-        message_address,
-        request_message_address,
-        context.get_command() as u64,
-        0,
+    OWNER_FAIL_STAGE.with(|stage| stage.set("server_manager_none"));
+    trace_host_thread_ipc("missing_server_manager_owner", session_handle);
+    log::error!(
+        "SendSyncRequest: session handle {:#x} has no owning ServerManager",
+        session_handle
     );
-    let service_profile = ipc_service_profile_enabled().then(std::time::Instant::now);
-    let service_profile_key = service_profile.as_ref().map(|_| {
-        let manager = request_manager.lock().unwrap();
-        let service_name = manager
-            .session_handler()
-            .map(|handler| handler.service_name().to_string())
-            .unwrap_or_else(|| "<none>".to_string());
-        (service_name, context.get_command())
-    });
-    let result = complete_sync_request(&request_manager, &mut context);
-    if let (Some(start), Some((service_name, command))) = (service_profile, service_profile_key) {
-        record_ipc_service_profile(&service_name, command, start.elapsed());
-    }
-    trace_svc_ipc_progress(
-        7,
-        session_handle,
-        session_object_id,
-        message_address,
-        request_message_address,
-        context.get_command() as u64,
-        result.get_inner_value() as u64,
-    );
-    record_phase("06_complete_sync_request_handler", &mut phase_last);
-    if trace_sync {
-        log::info!(
-            "svc::SendSyncRequest stage=complete_sync_request_end result={:#x}",
-            result.get_inner_value()
-        );
-    }
-    // Write-back is performed inside ServiceFrameworkBase::handle_sync_request_impl,
-    // matching upstream where only service.cpp:148 calls WriteToOutgoingCommandBuffer.
-    // The remaining Rust-only explicit write-back is the `StubSuccess` fallback in
-    // `complete_sync_request`.
-    //
-    // Emit both response views so `scripts/svc_diff.py` can pick whichever one
-    // lines up with the zuyu reference trace for a given investigation pass.
-    trace_ipc_response_buffer(&context, message_address);
-    trace_ipc_response_tls(system, message_address);
-
-    if let Some(parent_session) = system
-        .current_process_arc()
-        .lock()
-        .unwrap()
-        .get_session_by_object_id(parent_id)
-    {
-        let server_session = parent_session.lock().unwrap().get_server_session().clone();
-        if trace_sync {
-            log::info!("svc::SendSyncRequest stage=send_reply_begin");
-        }
-        trace_svc_ipc_progress(
-            8,
-            session_handle,
-            session_object_id,
-            message_address,
-            request_message_address,
-            0,
-            0,
-        );
-        let _ = crate::hle::kernel::k_server_session::KServerSession::send_reply_hle_unlocked(
-            &server_session,
-        );
-        trace_svc_ipc_progress(
-            9,
-            session_handle,
-            session_object_id,
-            message_address,
-            request_message_address,
-            0,
-            0,
-        );
-        if trace_sync {
-            log::info!("svc::SendSyncRequest stage=send_reply_end");
-        }
-    }
-    record_phase("07_send_reply", &mut phase_last);
-
-    if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
-        return RESULT_SUCCESS;
-    }
-
-    trace_svc_ipc_progress(
-        10,
-        session_handle,
-        session_object_id,
-        message_address,
-        result.get_inner_value() as u64,
-        0,
-        0,
-    );
-    result
+    RESULT_INVALID_HANDLE
 }
 
 /// Makes a blocking IPC call to a service.
@@ -969,9 +605,9 @@ fn send_sync_request_impl(
 /// Matches upstream `SendSyncRequest` → `SendSyncRequestImpl`:
 /// 1. Get current thread and TLS address
 /// 2. Resolve client session from handle
-/// 3. Create HLERequestContext with thread/memory references
-/// 4. Read command buffer from TLS, dispatch to handler
-/// 5. Write response back to TLS (inside write_to_outgoing_command_buffer)
+/// 3. Enqueue the request through `KClientSession`
+/// 4. Wait for the owning `ServerManager` to dispatch and reply
+/// 5. Return the client thread's wait result
 pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode {
     let tls_address = match system.current_thread() {
         Some(thread) => thread.lock().unwrap().get_tls_address().get(),
@@ -979,10 +615,10 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     };
     // `RUZU_TRACE_IPC_DIFF=<path>` — dump every IPC's TLS bytes (request
     // before dispatch, response after) to <path> as JSON Lines. Used to
-    // byte-diff two runs (inline vs host-thread) via scripts/ipc_diff.py
-    // and find the first IPC that diverges. Capture is path-agnostic: same
-    // wrapper for inline and host-thread routing, since both eventually
-    // return from send_sync_request_impl with the response written back to
+    // byte-diff two runs via scripts/ipc_diff.py and find the first IPC that
+    // diverges. Capture is path-agnostic: same
+    // wrapper around the sole ServerManager-routed dispatch path, which
+    // returns from send_sync_request_impl with the response written back to
     // the same TLS address.
     let diff_capture_req = if ipc_diff_capture_enabled() {
         Some(read_tls_bytes(system, tls_address, 256))
@@ -1038,9 +674,8 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
 /// dispatch) and response bytes (after dispatch) to a JSONL file. Each line:
 ///   {"seq":N,"handle":"0xXXXX","tid":T,"req_len":L,"rsp_len":L,"req":"hex","rsp":"hex","result":0xR}
 ///
-/// Used by `scripts/ipc_diff.py` to byte-diff two runs (inline vs
-/// host-thread) and find the first IPC where they diverge — the most
-/// actionable diagnostic for chasing the host-thread deadlock.
+/// Used by `scripts/ipc_diff.py` to byte-diff two runs and find the first IPC
+/// where they diverge.
 static IPC_DIFF_FILE: std::sync::OnceLock<
     Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
 > = std::sync::OnceLock::new();
@@ -1153,12 +788,16 @@ static IPC_SERVICE_PROFILE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, u32), IpcProfileEntry>>,
 > = std::sync::OnceLock::new();
 
-fn ipc_service_profile_enabled() -> bool {
+pub(crate) fn ipc_service_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC_SERVICE").is_some())
 }
 
-fn record_ipc_service_profile(service: &str, command: u32, elapsed: std::time::Duration) {
+pub(crate) fn record_ipc_service_profile(
+    service: &str,
+    command: u32,
+    elapsed: std::time::Duration,
+) {
     let map =
         IPC_SERVICE_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let ns = elapsed.as_nanos() as u64;
@@ -1272,7 +911,7 @@ pub fn dump_ipc_service_profile() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::System;
+    use crate::core::{System, SystemRef};
     use crate::device_memory::DeviceMemory;
     use crate::hle::ipc;
     use crate::hle::kernel::k_memory_block::{
@@ -1283,7 +922,7 @@ mod tests {
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use crate::hle::kernel::svc::svc_port;
     use crate::hle::result::RESULT_SUCCESS;
-    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::hle_ipc::{SessionRequestHandlerPtr, SessionRequestManager};
     use crate::memory::memory::Memory;
     use common::page_table::{PageTable, PageType};
     use std::sync::atomic::Ordering;
@@ -1325,8 +964,8 @@ mod tests {
         memory
     }
 
-    fn test_system() -> System {
-        let mut system = System::new_for_test();
+    fn test_system() -> Box<System> {
+        let mut system = System::new_boxed_for_test();
 
         let mut process = KProcess::new();
         process.process_id = 100;
@@ -1430,6 +1069,45 @@ mod tests {
         write_test_8(system, address + name.len() as u64, 0);
     }
 
+    /// Create a service session through a real owning ServerManager.
+    ///
+    /// Runtime-created child sessions inherit these endpoints from the
+    /// request that creates them. Tests constructing a context directly must
+    /// provide the same parent owner explicitly; an ownerless session is not
+    /// a valid input to the single ServerManager dispatch path.
+    fn create_test_service_session(
+        system: &System,
+        message_address: u64,
+        handler: SessionRequestHandlerPtr,
+    ) -> Handle {
+        let owner = crate::hle::service::server_manager::ServerManager::new_shared(
+            SystemRef::from_ref(system),
+        );
+        let (queue, wakeup) = {
+            let guard = owner.lock().unwrap();
+            (guard.pending_registrations_arc(), guard.wakeup_event_arc())
+        };
+        system
+            .kernel()
+            .unwrap()
+            .track_server_manager_for_test(Arc::clone(&owner));
+
+        let parent_manager = Arc::new(Mutex::new(
+            SessionRequestManager::new_with_server_manager_full(owner, queue, wakeup),
+        ));
+        let current_thread = system
+            .current_process_arc()
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(1)
+            .unwrap();
+        let mut request_context =
+            HLERequestContext::new_with_thread(current_thread, message_address);
+        request_context.set_service_manager(system.service_manager().unwrap());
+        request_context.set_session_request_manager(parent_manager);
+        request_context.create_session_for_service(handler).unwrap()
+    }
+
     fn write_sm_initialize_request(system: &System) {
         let tls_base = get_tls_base(system);
         let request_type = ipc::CommandType::Request as u32;
@@ -1500,19 +1178,8 @@ mod tests {
     fn send_sync_request_dispatches_control_query_pointer_buffer_size_for_service_session() {
         let system = test_system();
         let tls_base = get_tls_base(&system);
-        let current_thread = system
-            .current_process_arc()
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(1)
-            .unwrap();
-        let mut request_context = HLERequestContext::new_with_thread(current_thread, tls_base);
-        let service_manager = system.service_manager().unwrap();
-        request_context.set_service_manager(service_manager);
         let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
-        let lm_handle = request_context
-            .create_session_for_service(lm_handler)
-            .unwrap();
+        let lm_handle = create_test_service_session(&system, tls_base, lm_handler);
 
         write_control_query_pointer_buffer_size_request(&system);
         assert_eq!(send_sync_request(&system, lm_handle), RESULT_SUCCESS);
@@ -1529,19 +1196,8 @@ mod tests {
     fn send_sync_request_uses_server_session_manager() {
         let system = test_system();
         let tls_base = get_tls_base(&system);
-        let current_thread = system
-            .current_process_arc()
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(1)
-            .unwrap();
-        let mut request_context = HLERequestContext::new_with_thread(current_thread, tls_base);
-        let service_manager = system.service_manager().unwrap();
-        request_context.set_service_manager(service_manager);
         let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
-        let lm_handle = request_context
-            .create_session_for_service(lm_handler)
-            .unwrap();
+        let lm_handle = create_test_service_session(&system, tls_base, lm_handler);
 
         {
             let process = system.current_process_arc();
@@ -1572,21 +1228,11 @@ mod tests {
     }
 
     #[test]
-    fn send_sync_request_inline_propagates_session_closed() {
+    fn send_sync_request_server_manager_propagates_session_closed() {
         let system = test_system();
         let tls_base = get_tls_base(&system);
-        let current_thread = system
-            .current_process_arc()
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(1)
-            .unwrap();
-        let mut request_context = HLERequestContext::new_with_thread(current_thread, tls_base);
-        request_context.set_service_manager(system.service_manager().unwrap());
         let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
-        let lm_handle = request_context
-            .create_session_for_service(lm_handler)
-            .unwrap();
+        let lm_handle = create_test_service_session(&system, tls_base, lm_handler);
 
         {
             let process = system.current_process_arc();
@@ -1636,19 +1282,8 @@ mod tests {
                 );
         }
 
-        let current_thread = system
-            .current_process_arc()
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(1)
-            .unwrap();
-        let mut request_context = HLERequestContext::new_with_thread(current_thread, message);
-        let service_manager = system.service_manager().unwrap();
-        request_context.set_service_manager(service_manager);
         let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
-        let lm_handle = request_context
-            .create_session_for_service(lm_handler)
-            .unwrap();
+        let lm_handle = create_test_service_session(&system, message, lm_handler);
 
         write_control_query_pointer_buffer_size_request_at(&system, message);
         assert_eq!(
@@ -1668,19 +1303,8 @@ mod tests {
     fn send_async_request_with_user_buffer_returns_real_readable_event_handle() {
         let system = test_system();
         let tls_base = get_tls_base(&system);
-        let current_thread = system
-            .current_process_arc()
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(1)
-            .unwrap();
-        let mut request_context = HLERequestContext::new_with_thread(current_thread, tls_base);
-        let service_manager = system.service_manager().unwrap();
-        request_context.set_service_manager(service_manager);
         let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
-        let lm_handle = request_context
-            .create_session_for_service(lm_handler)
-            .unwrap();
+        let lm_handle = create_test_service_session(&system, tls_base, lm_handler);
 
         let mut out_event_handle = 0;
         assert_eq!(
@@ -1713,7 +1337,17 @@ mod tests {
         let server_session = parent_session.lock().unwrap().get_server_session().clone();
         drop(process);
 
-        assert_eq!(server_session.lock().unwrap().receive_request(), 0);
+        let manager = server_session
+            .lock()
+            .unwrap()
+            .get_manager()
+            .cloned()
+            .expect("async service session manager");
+        server_session
+            .lock()
+            .unwrap()
+            .receive_request_hle(manager)
+            .expect("async HLE request");
         let current_request = server_session
             .lock()
             .unwrap()

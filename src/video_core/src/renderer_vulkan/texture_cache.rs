@@ -2303,6 +2303,37 @@ impl TextureCacheRuntime {
             return true;
         }
 
+        if matches!(
+            (dst.base().info.format, src.base().info.format),
+            (PixelFormat::R32G32Float, PixelFormat::D32FloatS8Uint)
+                | (PixelFormat::D32FloatS8Uint, PixelFormat::R32G32Float)
+        ) {
+            // SAFETY: both service pointers refer to independently boxed
+            // objects owned by RasterizerVulkan for the runtime lifetime.
+            return unsafe {
+                self.blit_image_helper.as_mut().reinterpret_d32s8_rg32(
+                    self.render_pass_cache.as_ref(),
+                    dst.handle(),
+                    dst.base().info.format,
+                    dst.base().info.image_type,
+                    BlitExtent3D {
+                        width: dst.base().info.size.width,
+                        height: dst.base().info.size.height,
+                        depth: dst.base().info.size.depth,
+                    },
+                    src.handle(),
+                    src.base().info.format,
+                    src.base().info.image_type,
+                    BlitExtent3D {
+                        width: src.base().info.size.width,
+                        height: src.base().info.size.height,
+                        depth: src.base().info.size.depth,
+                    },
+                    copies,
+                )
+            };
+        }
+
         let src_aspect = src.aspect_mask();
         let dst_aspect = dst.aspect_mask();
         let bpp_in = crate::surface::bytes_per_block(src.base().info.format)

@@ -165,6 +165,14 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
             "convert_s8d24_to_abgr8.frag",
         ),
         (
+            "CONVERT_D32S8_TO_RG32_FRAG_SPV",
+            "convert_d32s8_to_rg32.frag",
+        ),
+        (
+            "CONVERT_RG32_TO_D32S8_FRAG_SPV",
+            "convert_rg32_to_d32s8.frag",
+        ),
+        (
             "CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV",
             "convert_msaa_to_non_msaa.frag",
         ),

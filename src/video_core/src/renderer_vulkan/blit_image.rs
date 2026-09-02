@@ -17,11 +17,12 @@ use crate::host_shaders::spirv_shaders::{
     BLIT_COLOR_FLOAT_FRAG_SPV, BLIT_COLOR_MSAA_FRAG_SPV, BLIT_DEPTH_MSAA_FRAG_SPV,
     BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV,
     CONVERT_ABGR8_TO_D32F_FRAG_SPV, CONVERT_D24S8_TO_ABGR8_FRAG_SPV,
-    CONVERT_D32F_TO_ABGR8_FRAG_SPV, CONVERT_DEPTH_TO_FLOAT_FRAG_SPV,
-    CONVERT_FLOAT_TO_DEPTH_FRAG_SPV, CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV,
-    CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV, CONVERT_S8D24_TO_ABGR8_FRAG_SPV,
-    FULL_SCREEN_TRIANGLE_VERT_SPV, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV,
-    VULKAN_COLOR_CLEAR_VERT_SPV, VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
+    CONVERT_D32F_TO_ABGR8_FRAG_SPV, CONVERT_D32S8_TO_RG32_FRAG_SPV,
+    CONVERT_DEPTH_TO_FLOAT_FRAG_SPV, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV,
+    CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV, CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV,
+    CONVERT_RG32_TO_D32S8_FRAG_SPV, CONVERT_S8D24_TO_ABGR8_FRAG_SPV, FULL_SCREEN_TRIANGLE_VERT_SPV,
+    VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV, VULKAN_COLOR_CLEAR_VERT_SPV,
+    VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
 };
 use crate::renderer_vulkan::descriptor_pool::{
     DescriptorAllocator, DescriptorBankInfo, DescriptorPool,
@@ -32,7 +33,7 @@ use crate::renderer_vulkan::shader_util::build_shader;
 use crate::renderer_vulkan::state_tracker::StateTracker;
 use crate::surface::{PixelFormat, SurfaceType};
 use crate::texture_cache::samples_helper::samples_log2;
-use crate::texture_cache::types::{ImageCopy, SubresourceRange, NUM_RT};
+use crate::texture_cache::types::{ImageCopy, ImageType, SubresourceRange, NUM_RT};
 use crate::vulkan_common::vulkan_device::{Device, FormatType};
 
 // ---------------------------------------------------------------------------
@@ -100,6 +101,35 @@ struct MsaaCopyResources {
     src_view: vk::ImageView,
     dst_view: vk::ImageView,
     framebuffer: vk::Framebuffer,
+}
+
+/// Transient views and framebuffer retained until the recorded reinterpret
+/// draw has completed on the GPU.
+struct ReinterpretResources {
+    tick: u64,
+    views: [vk::ImageView; 3],
+    framebuffer: vk::Framebuffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D32S8Rg32Direction {
+    DepthStencilToColor,
+    ColorToDepthStencil,
+}
+
+fn d32s8_rg32_direction(
+    dst_format: PixelFormat,
+    src_format: PixelFormat,
+) -> Option<D32S8Rg32Direction> {
+    match (dst_format, src_format) {
+        (PixelFormat::R32G32Float, PixelFormat::D32FloatS8Uint) => {
+            Some(D32S8Rg32Direction::DepthStencilToColor)
+        }
+        (PixelFormat::D32FloatS8Uint, PixelFormat::R32G32Float) => {
+            Some(D32S8Rg32Direction::ColorToDepthStencil)
+        }
+        _ => None,
+    }
 }
 
 /// Minimal framebuffer view consumed by `BlitImageHelper`, matching the
@@ -461,6 +491,42 @@ fn make_msaa_copy_view(
     unsafe { device.create_image_view(&create_info, None) }
 }
 
+fn make_reinterpret_view(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    aspect_mask: vk::ImageAspectFlags,
+    base_level: u32,
+    base_layer: u32,
+) -> Result<vk::ImageView, vk::Result> {
+    let create_info = vk::ImageViewCreateInfo::builder()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping {
+            r: vk::ComponentSwizzle::IDENTITY,
+            g: vk::ComponentSwizzle::IDENTITY,
+            b: vk::ComponentSwizzle::IDENTITY,
+            a: vk::ComponentSwizzle::IDENTITY,
+        })
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask,
+            base_mip_level: base_level,
+            level_count: 1,
+            base_array_layer: base_layer,
+            layer_count: 1,
+        })
+        .build();
+    unsafe { device.create_image_view(&create_info, None) }
+}
+
+fn mip_extent(size: Extent3D, level: u32) -> vk::Extent2D {
+    vk::Extent2D {
+        width: (size.width >> level).max(1),
+        height: (size.height >> level).max(1),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BlitImageHelper
 // ---------------------------------------------------------------------------
@@ -505,6 +571,8 @@ pub struct BlitImageHelper {
     convert_d32f_to_abgr8_frag: vk::ShaderModule,
     convert_d24s8_to_abgr8_frag: vk::ShaderModule,
     convert_s8d24_to_abgr8_frag: vk::ShaderModule,
+    convert_d32s8_to_rg32_frag: vk::ShaderModule,
+    convert_rg32_to_d32s8_frag: vk::ShaderModule,
     convert_msaa_to_non_msaa_frag: vk::ShaderModule,
     convert_non_msaa_to_msaa_frag: vk::ShaderModule,
 
@@ -530,6 +598,7 @@ pub struct BlitImageHelper {
     resolve_depth_stencil_keys: Vec<vk::RenderPass>,
     resolve_depth_stencil_pipelines: Vec<vk::Pipeline>,
     msaa_copy_resources: VecDeque<MsaaCopyResources>,
+    reinterpret_resources: VecDeque<ReinterpretResources>,
 
     // Conversion pipelines (lazily created)
     convert_d32_to_r32_pipeline: vk::Pipeline,
@@ -541,6 +610,8 @@ pub struct BlitImageHelper {
     convert_d32f_to_abgr8_pipeline: vk::Pipeline,
     convert_d24s8_to_abgr8_pipeline: vk::Pipeline,
     convert_s8d24_to_abgr8_pipeline: vk::Pipeline,
+    convert_d32s8_to_rg32_pipeline: vk::Pipeline,
+    convert_rg32_to_d32s8_pipeline: vk::Pipeline,
 }
 
 impl BlitImageHelper {
@@ -736,6 +807,14 @@ impl BlitImageHelper {
             .expect("Failed to build convert_d24s8_to_abgr8.frag");
         let convert_s8d24_to_abgr8_frag = build_shader(&device, CONVERT_S8D24_TO_ABGR8_FRAG_SPV)
             .expect("Failed to build convert_s8d24_to_abgr8.frag");
+        let convert_d32s8_to_rg32_frag = build_shader(&device, CONVERT_D32S8_TO_RG32_FRAG_SPV)
+            .expect("Failed to build convert_d32s8_to_rg32.frag");
+        let convert_rg32_to_d32s8_frag = if shader_stencil_export_supported {
+            build_shader(&device, CONVERT_RG32_TO_D32S8_FRAG_SPV)
+                .expect("Failed to build convert_rg32_to_d32s8.frag")
+        } else {
+            vk::ShaderModule::null()
+        };
         let convert_msaa_to_non_msaa_frag =
             build_shader(&device, CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV)
                 .expect("Failed to build convert_msaa_to_non_msaa.frag");
@@ -808,6 +887,8 @@ impl BlitImageHelper {
             convert_d32f_to_abgr8_frag,
             convert_d24s8_to_abgr8_frag,
             convert_s8d24_to_abgr8_frag,
+            convert_d32s8_to_rg32_frag,
+            convert_rg32_to_d32s8_frag,
             convert_msaa_to_non_msaa_frag,
             convert_non_msaa_to_msaa_frag,
             linear_sampler,
@@ -829,6 +910,7 @@ impl BlitImageHelper {
             resolve_depth_stencil_keys: Vec::new(),
             resolve_depth_stencil_pipelines: Vec::new(),
             msaa_copy_resources: VecDeque::new(),
+            reinterpret_resources: VecDeque::new(),
             convert_d32_to_r32_pipeline: vk::Pipeline::null(),
             convert_r32_to_d32_pipeline: vk::Pipeline::null(),
             convert_d16_to_r16_pipeline: vk::Pipeline::null(),
@@ -838,6 +920,8 @@ impl BlitImageHelper {
             convert_d32f_to_abgr8_pipeline: vk::Pipeline::null(),
             convert_d24s8_to_abgr8_pipeline: vk::Pipeline::null(),
             convert_s8d24_to_abgr8_pipeline: vk::Pipeline::null(),
+            convert_d32s8_to_rg32_pipeline: vk::Pipeline::null(),
+            convert_rg32_to_d32s8_pipeline: vk::Pipeline::null(),
         }
     }
 
@@ -1433,6 +1517,144 @@ impl BlitImageHelper {
         self.convert_depth_stencil(pipeline, dst_framebuffer, src_image_view)
     }
 
+    /// Converts the raw two-word representation of a D32S8 texel into RG32.
+    /// The first word preserves the depth float bits and the low byte of the
+    /// second word preserves stencil. This replaces a Vulkan-invalid combined
+    /// depth/stencil buffer copy while retaining the guest byte layout.
+    fn convert_d32s8_to_rg32(
+        &mut self,
+        dst_framebuffer: BlitFramebufferInfo,
+        src_image_view: BlitImageView,
+        dst_region: Region2D,
+        src_region: Region2D,
+    ) -> bool {
+        let pipeline = match self.convert_pipeline_ex(
+            self.convert_d32s8_to_rg32_pipeline,
+            dst_framebuffer.render_pass,
+            self.convert_d32s8_to_rg32_frag,
+            false,
+            false,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::warn!("BlitImageHelper: failed to create D32S8->RG32 pipeline: {err:?}");
+                return false;
+            }
+        };
+        self.convert_d32s8_to_rg32_pipeline = pipeline;
+        let layout = self.two_textures_pipeline_layout;
+        let sampler = self.nearest_sampler;
+        let descriptor_allocator = self.two_textures_descriptor_allocator.reference();
+        let src_depth_view = src_image_view.depth_view;
+        let src_stencil_view = src_image_view.stencil_view;
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: dst_framebuffer.render_area,
+        };
+        let device = self.device.clone();
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
+        scheduler.request_renderpass_raw(
+            dst_framebuffer.framebuffer,
+            dst_framebuffer.render_pass,
+            render_area,
+            &[],
+            &dst_framebuffer.images[..dst_framebuffer.num_images],
+            &dst_framebuffer.image_ranges[..dst_framebuffer.num_images],
+        );
+        scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate D32S8->RG32 descriptor set");
+            update_two_textures_descriptor_set(
+                &device,
+                descriptor_set,
+                sampler,
+                src_depth_view,
+                src_stencil_view,
+            );
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            bind_blit_state(&device, cmdbuf, layout, dst_region, src_region, None);
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+        });
+        scheduler.invalidate_state();
+        true
+    }
+
+    /// Restores D32S8 depth/stencil from the two raw words held by RG32.
+    fn convert_rg32_to_d32s8(
+        &mut self,
+        dst_framebuffer: BlitFramebufferInfo,
+        src_image_view: BlitImageView,
+        dst_region: Region2D,
+        src_region: Region2D,
+    ) -> bool {
+        if !self.shader_stencil_export_supported {
+            log::warn!("BlitImageHelper: RG32->D32S8 requires shader_stencil_export");
+            return false;
+        }
+        let pipeline = match self.convert_pipeline_ex(
+            self.convert_rg32_to_d32s8_pipeline,
+            dst_framebuffer.render_pass,
+            self.convert_rg32_to_d32s8_frag,
+            true,
+            true,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::warn!("BlitImageHelper: failed to create RG32->D32S8 pipeline: {err:?}");
+                return false;
+            }
+        };
+        self.convert_rg32_to_d32s8_pipeline = pipeline;
+        let layout = self.one_texture_pipeline_layout;
+        let sampler = self.nearest_sampler;
+        let descriptor_allocator = self.one_texture_descriptor_allocator.reference();
+        let src_view = src_image_view.color_view;
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: dst_framebuffer.render_area,
+        };
+        let device = self.device.clone();
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        record_shader_read_barrier(&self.device, scheduler, src_image_view);
+        scheduler.request_renderpass_raw(
+            dst_framebuffer.framebuffer,
+            dst_framebuffer.render_pass,
+            render_area,
+            &[],
+            &dst_framebuffer.images[..dst_framebuffer.num_images],
+            &dst_framebuffer.image_ranges[..dst_framebuffer.num_images],
+        );
+        scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("Failed to allocate RG32->D32S8 descriptor set");
+            update_one_texture_descriptor_set(&device, descriptor_set, sampler, src_view);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            bind_blit_state(&device, cmdbuf, layout, dst_region, src_region, None);
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+        });
+        scheduler.invalidate_state();
+        true
+    }
+
     /// Port of `BlitImageHelper::ClearColor`.
     ///
     /// Clears a region of the color attachment using a fragment shader that
@@ -1710,6 +1932,353 @@ impl BlitImageHelper {
             device.cmd_draw(cmdbuf, 3, 1, 0, 0);
         });
         scheduler.invalidate_state();
+        true
+    }
+
+    /// Reinterprets the raw D32S8/RG32 two-word texel representation through
+    /// shader loads and attachment stores. Vulkan buffer-image copies cannot
+    /// address depth and stencil together in one region, so the upstream
+    /// buffer round trip is invalid for this format pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reinterpret_d32s8_rg32(
+        &mut self,
+        render_pass_cache: &RenderPassCache,
+        dst_image: vk::Image,
+        dst_format: PixelFormat,
+        dst_type: ImageType,
+        dst_size: Extent3D,
+        src_image: vk::Image,
+        src_format: PixelFormat,
+        src_type: ImageType,
+        src_size: Extent3D,
+        copies: &[ImageCopy],
+    ) -> bool {
+        let Some(direction) = d32s8_rg32_direction(dst_format, src_format) else {
+            return false;
+        };
+        if direction == D32S8Rg32Direction::ColorToDepthStencil
+            && !self.shader_stencil_export_supported
+        {
+            log::warn!("D32S8 reinterpretation requires shader_stencil_export");
+            return false;
+        }
+
+        while self
+            .reinterpret_resources
+            .front()
+            .is_some_and(|resource| unsafe { self.scheduler.as_ref() }.is_free(resource.tick))
+        {
+            let resource = self.reinterpret_resources.pop_front().unwrap();
+            unsafe {
+                self.device.destroy_framebuffer(resource.framebuffer, None);
+                for view in resource.views {
+                    if view != vk::ImageView::null() {
+                        self.device.destroy_image_view(view, None);
+                    }
+                }
+            }
+        }
+
+        let mut render_pass_key = RenderPassKey::default();
+        match direction {
+            D32S8Rg32Direction::DepthStencilToColor => {
+                render_pass_key.color_formats[0] = PixelFormat::R32G32Uint;
+            }
+            D32S8Rg32Direction::ColorToDepthStencil => {
+                render_pass_key.depth_format = PixelFormat::D32FloatS8Uint;
+            }
+        }
+        let render_pass = match render_pass_cache.get(&render_pass_key) {
+            Ok(render_pass) => render_pass,
+            Err(err) => {
+                log::warn!("D32S8 reinterpretation render pass creation failed: {err:?}");
+                return false;
+            }
+        };
+
+        for copy in copies {
+            if copy.src_subresource.base_level < 0
+                || copy.dst_subresource.base_level < 0
+                || copy.src_subresource.base_layer < 0
+                || copy.dst_subresource.base_layer < 0
+                || copy.src_subresource.num_layers <= 0
+                || copy.dst_subresource.num_layers <= 0
+                || copy.src_offset.x < 0
+                || copy.src_offset.y < 0
+                || copy.src_offset.z < 0
+                || copy.dst_offset.x < 0
+                || copy.dst_offset.y < 0
+                || copy.dst_offset.z < 0
+                || copy.extent.width == 0
+                || copy.extent.height == 0
+                || copy.extent.depth == 0
+            {
+                log::warn!("D32S8 reinterpretation received an invalid copy region");
+                return false;
+            }
+            let src_slices = if src_type == ImageType::E3D {
+                copy.extent.depth
+            } else {
+                copy.src_subresource.num_layers as u32
+            };
+            let dst_slices = if dst_type == ImageType::E3D {
+                copy.extent.depth
+            } else {
+                copy.dst_subresource.num_layers as u32
+            };
+            if src_slices != dst_slices {
+                log::warn!(
+                    "D32S8 reinterpretation layer mismatch: src={} dst={}",
+                    src_slices,
+                    dst_slices
+                );
+                return false;
+            }
+
+            let src_level = copy.src_subresource.base_level as u32;
+            let dst_level = copy.dst_subresource.base_level as u32;
+            let src_mip_extent = mip_extent(src_size, src_level);
+            let dst_mip_extent = mip_extent(dst_size, dst_level);
+            let src_region = Region2D {
+                start: Offset2D {
+                    x: copy.src_offset.x,
+                    y: copy.src_offset.y,
+                },
+                end: Offset2D {
+                    x: copy.src_offset.x + copy.extent.width as i32,
+                    y: copy.src_offset.y + copy.extent.height as i32,
+                },
+            };
+            let dst_region = Region2D {
+                start: Offset2D {
+                    x: copy.dst_offset.x,
+                    y: copy.dst_offset.y,
+                },
+                end: Offset2D {
+                    x: copy.dst_offset.x + copy.extent.width as i32,
+                    y: copy.dst_offset.y + copy.extent.height as i32,
+                },
+            };
+
+            for slice in 0..src_slices {
+                let src_layer = if src_type == ImageType::E3D {
+                    copy.src_offset.z as u32 + slice
+                } else {
+                    copy.src_subresource.base_layer as u32 + slice
+                };
+                let dst_layer = if dst_type == ImageType::E3D {
+                    copy.dst_offset.z as u32 + slice
+                } else {
+                    copy.dst_subresource.base_layer as u32 + slice
+                };
+
+                let mut views = [vk::ImageView::null(); 3];
+                let (src_view, dst_view, dst_aspect) = match direction {
+                    D32S8Rg32Direction::DepthStencilToColor => {
+                        views[0] = match make_reinterpret_view(
+                            &self.device,
+                            src_image,
+                            vk::Format::D32_SFLOAT_S8_UINT,
+                            vk::ImageAspectFlags::DEPTH,
+                            src_level,
+                            src_layer,
+                        ) {
+                            Ok(view) => view,
+                            Err(err) => {
+                                log::warn!("D32S8 depth view creation failed: {err:?}");
+                                return false;
+                            }
+                        };
+                        views[1] = match make_reinterpret_view(
+                            &self.device,
+                            src_image,
+                            vk::Format::D32_SFLOAT_S8_UINT,
+                            vk::ImageAspectFlags::STENCIL,
+                            src_level,
+                            src_layer,
+                        ) {
+                            Ok(view) => view,
+                            Err(err) => {
+                                unsafe { self.device.destroy_image_view(views[0], None) };
+                                log::warn!("D32S8 stencil view creation failed: {err:?}");
+                                return false;
+                            }
+                        };
+                        views[2] = match make_reinterpret_view(
+                            &self.device,
+                            dst_image,
+                            vk::Format::R32G32_UINT,
+                            vk::ImageAspectFlags::COLOR,
+                            dst_level,
+                            dst_layer,
+                        ) {
+                            Ok(view) => view,
+                            Err(err) => {
+                                unsafe {
+                                    self.device.destroy_image_view(views[0], None);
+                                    self.device.destroy_image_view(views[1], None);
+                                }
+                                log::warn!("RG32 target view creation failed: {err:?}");
+                                return false;
+                            }
+                        };
+                        (
+                            BlitImageView {
+                                image: src_image,
+                                subresource_range: vk::ImageSubresourceRange {
+                                    aspect_mask: vk::ImageAspectFlags::DEPTH
+                                        | vk::ImageAspectFlags::STENCIL,
+                                    base_mip_level: src_level,
+                                    level_count: 1,
+                                    base_array_layer: src_layer,
+                                    layer_count: 1,
+                                },
+                                color_view: vk::ImageView::null(),
+                                depth_view: views[0],
+                                stencil_view: views[1],
+                                size: Extent3D {
+                                    width: src_mip_extent.width,
+                                    height: src_mip_extent.height,
+                                    depth: 1,
+                                },
+                                is_rescaled: false,
+                            },
+                            views[2],
+                            vk::ImageAspectFlags::COLOR,
+                        )
+                    }
+                    D32S8Rg32Direction::ColorToDepthStencil => {
+                        views[0] = match make_reinterpret_view(
+                            &self.device,
+                            src_image,
+                            vk::Format::R32G32_UINT,
+                            vk::ImageAspectFlags::COLOR,
+                            src_level,
+                            src_layer,
+                        ) {
+                            Ok(view) => view,
+                            Err(err) => {
+                                log::warn!("RG32 source view creation failed: {err:?}");
+                                return false;
+                            }
+                        };
+                        views[1] = match make_reinterpret_view(
+                            &self.device,
+                            dst_image,
+                            vk::Format::D32_SFLOAT_S8_UINT,
+                            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                            dst_level,
+                            dst_layer,
+                        ) {
+                            Ok(view) => view,
+                            Err(err) => {
+                                unsafe { self.device.destroy_image_view(views[0], None) };
+                                log::warn!("D32S8 target view creation failed: {err:?}");
+                                return false;
+                            }
+                        };
+                        (
+                            BlitImageView {
+                                image: src_image,
+                                subresource_range: vk::ImageSubresourceRange {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    base_mip_level: src_level,
+                                    level_count: 1,
+                                    base_array_layer: src_layer,
+                                    layer_count: 1,
+                                },
+                                color_view: views[0],
+                                depth_view: vk::ImageView::null(),
+                                stencil_view: vk::ImageView::null(),
+                                size: Extent3D {
+                                    width: src_mip_extent.width,
+                                    height: src_mip_extent.height,
+                                    depth: 1,
+                                },
+                                is_rescaled: false,
+                            },
+                            views[1],
+                            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                        )
+                    }
+                };
+
+                let attachments = [dst_view];
+                let framebuffer_info = vk::FramebufferCreateInfo::builder()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(dst_mip_extent.width)
+                    .height(dst_mip_extent.height)
+                    .layers(1)
+                    .build();
+                let framebuffer = match unsafe {
+                    self.device.create_framebuffer(&framebuffer_info, None)
+                } {
+                    Ok(framebuffer) => framebuffer,
+                    Err(err) => {
+                        unsafe {
+                            for view in views {
+                                if view != vk::ImageView::null() {
+                                    self.device.destroy_image_view(view, None);
+                                }
+                            }
+                        }
+                        log::warn!("D32S8 reinterpretation framebuffer creation failed: {err:?}");
+                        return false;
+                    }
+                };
+                let mut images = [vk::Image::null(); NUM_RT + 1];
+                images[0] = dst_image;
+                let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
+                image_ranges[0] = vk::ImageSubresourceRange {
+                    aspect_mask: dst_aspect,
+                    base_mip_level: dst_level,
+                    level_count: 1,
+                    base_array_layer: dst_layer,
+                    layer_count: 1,
+                };
+                let dst_framebuffer = BlitFramebufferInfo {
+                    framebuffer,
+                    render_pass,
+                    render_area: dst_mip_extent,
+                    images,
+                    image_ranges,
+                    num_images: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    has_stencil: dst_aspect.contains(vk::ImageAspectFlags::STENCIL),
+                };
+                let converted = match direction {
+                    D32S8Rg32Direction::DepthStencilToColor => self.convert_d32s8_to_rg32(
+                        dst_framebuffer,
+                        src_view,
+                        dst_region,
+                        src_region,
+                    ),
+                    D32S8Rg32Direction::ColorToDepthStencil => self.convert_rg32_to_d32s8(
+                        dst_framebuffer,
+                        src_view,
+                        dst_region,
+                        src_region,
+                    ),
+                };
+                if !converted {
+                    unsafe {
+                        self.device.destroy_framebuffer(framebuffer, None);
+                        for view in views {
+                            if view != vk::ImageView::null() {
+                                self.device.destroy_image_view(view, None);
+                            }
+                        }
+                    }
+                    return false;
+                }
+                self.reinterpret_resources.push_back(ReinterpretResources {
+                    tick: unsafe { self.scheduler.as_ref() }.current_tick(),
+                    views,
+                    framebuffer,
+                });
+            }
+        }
         true
     }
 
@@ -2860,6 +3429,8 @@ impl Drop for BlitImageHelper {
             // destructor: conversion pipelines, retained MSAA resources,
             // cached pipelines, samplers, shaders, then layouts.
             for pipeline in [
+                &mut self.convert_rg32_to_d32s8_pipeline,
+                &mut self.convert_d32s8_to_rg32_pipeline,
                 &mut self.convert_s8d24_to_abgr8_pipeline,
                 &mut self.convert_d24s8_to_abgr8_pipeline,
                 &mut self.convert_d32f_to_abgr8_pipeline,
@@ -2873,6 +3444,15 @@ impl Drop for BlitImageHelper {
                 if *pipeline != vk::Pipeline::null() {
                     self.device.destroy_pipeline(*pipeline, None);
                     *pipeline = vk::Pipeline::null();
+                }
+            }
+
+            for resource in self.reinterpret_resources.drain(..) {
+                self.device.destroy_framebuffer(resource.framebuffer, None);
+                for view in resource.views {
+                    if view != vk::ImageView::null() {
+                        self.device.destroy_image_view(view, None);
+                    }
                 }
             }
 
@@ -2909,6 +3489,8 @@ impl Drop for BlitImageHelper {
             }
 
             for shader in [
+                &mut self.convert_rg32_to_d32s8_frag,
+                &mut self.convert_d32s8_to_rg32_frag,
                 &mut self.convert_non_msaa_to_msaa_frag,
                 &mut self.convert_msaa_to_non_msaa_frag,
                 &mut self.convert_s8d24_to_abgr8_frag,
@@ -3037,5 +3619,75 @@ mod tests {
             assert_eq!(stencil.write_mask, u32::MAX);
             assert_eq!(stencil.reference, 0);
         }
+    }
+
+    #[test]
+    fn d32s8_rg32_reinterpretation_is_selected_only_for_the_raw_64_bit_pair() {
+        assert_eq!(
+            d32s8_rg32_direction(PixelFormat::R32G32Float, PixelFormat::D32FloatS8Uint),
+            Some(D32S8Rg32Direction::DepthStencilToColor)
+        );
+        assert_eq!(
+            d32s8_rg32_direction(PixelFormat::D32FloatS8Uint, PixelFormat::R32G32Float),
+            Some(D32S8Rg32Direction::ColorToDepthStencil)
+        );
+        assert_eq!(
+            d32s8_rg32_direction(PixelFormat::R32Float, PixelFormat::D32FloatS8Uint),
+            None
+        );
+        assert!(crate::compatible_formats::is_view_compatible(
+            PixelFormat::R32G32Float,
+            PixelFormat::R32G32Uint,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn d32s8_rg32_raw_words_preserve_depth_bits_and_stencil_byte() {
+        for (depth_bits, stencil) in [
+            (0x0000_0000_u32, 0_u8),
+            (0x3f80_0000, 1),
+            (0x3f00_0000, 0x7f),
+            (0x3f7f_ffff, 0xff),
+        ] {
+            // These are the exact integer operations performed by the two
+            // conversion shaders around the RG32_UINT attachment view.
+            let rg_words = [depth_bits, u32::from(stencil)];
+            let restored_depth = rg_words[0];
+            let restored_stencil = (rg_words[1] & 0xff) as u8;
+            assert_eq!(restored_depth, depth_bits);
+            assert_eq!(restored_stencil, stencil);
+        }
+    }
+
+    #[test]
+    fn reinterpretation_mip_extent_never_reaches_zero() {
+        let size = Extent3D {
+            width: 17,
+            height: 9,
+            depth: 1,
+        };
+        assert_eq!(
+            mip_extent(size, 0),
+            vk::Extent2D {
+                width: 17,
+                height: 9
+            }
+        );
+        assert_eq!(
+            mip_extent(size, 4),
+            vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        );
+        assert_eq!(
+            mip_extent(size, 12),
+            vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        );
     }
 }

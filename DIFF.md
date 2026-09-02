@@ -19554,3 +19554,56 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: staging bytes and GPU virtual-address translation are unchanged; the correction only
   removes an extra Rust ownership lock from Eden's unsafe cache-managed writeback path.
+
+## 2026-09-02 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
+
+### Intentional differences
+
+- For the raw 64-bit depth/stencil-to-color reinterpretation pair, Ruzu routes through
+  `BlitImageHelper` instead of Eden's temporary-buffer round trip. Vulkan requires a
+  buffer-image copy region to select one depth or stencil aspect, so Eden's combined-aspect region
+  is invalid and can leave the destination depth attachment unchanged on conforming drivers.
+
+### Unintentional differences (to fix)
+
+- The former Rust port reproduced Eden's invalid combined depth/stencil transfer literally. The
+  affected pair now uses explicit depth and stencil views while all other reinterpretation pairs
+  retain the upstream ordering and buffer path.
+
+### Missing items
+
+- Devices without `VK_EXT_shader_stencil_export` retain the pre-existing limitation for restoring
+  per-fragment stencil values through a shader; the conversion reports failure instead of issuing
+  an invalid Vulkan copy.
+
+### Binary layout verification
+
+- PASS: the conversion preserves the first 32-bit word as raw depth bits and the low byte of the
+  second 32-bit word as stencil. No serialized cache, guest structure, or IPC layout changed.
+
+## 2026-09-02 — `src/video_core/src/renderer_vulkan/blit_image.rs` vs Eden `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
+
+### Intentional differences
+
+- `reinterpret_d32s8_rg32` and its two conversion pipelines are a Vulkan-correct extension to
+  Eden's helper. They create per-mip, per-layer views and retain transient framebuffers until the
+  scheduler tick completes, following the existing `CopyMSAA` resource lifetime model.
+- The color attachment is viewed as `R32G32_UINT`: shaders use `floatBitsToUint` and
+  `uintBitsToFloat`, avoiding floating-point conversion or denormal flushing while preserving the
+  raw two-word texel representation.
+
+### Unintentional differences (to fix)
+
+- The pre-existing conversion helper had no path for this depth/stencil alias pair. Focused tests
+  now cover direction selection, compatible integer attachment views, raw bit preservation, and
+  mip extents.
+
+### Missing items
+
+- A non-extension fallback capable of scattering the second word's low byte into the stencil plane
+  would be required for devices without fragment-shader stencil export.
+
+### Binary layout verification
+
+- PASS: transient host resource records are not serialized; shader conversion preserves all depth
+  bits and the guest-visible stencil byte exactly.

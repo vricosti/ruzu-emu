@@ -976,21 +976,23 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Intentional differences
 
-- The GTK shutdown-only counterpart is an undecorated transient window sized to Eden's visible
-  780-by-300 regular-text panel proportions. Eden uses a parent-sized translucent Qt dialog whose
-  internal grid draws that panel; a GTK top-level is required to remain above ruzu's native render
-  child window.
-- The GTK module implements only the non-interactive regular-text configuration used by
-  `OnShutdownBeginDialog`; controller navigation and rich text belong to Eden's other overlay uses.
+- GTK uses undecorated transient windows because they must remain above ruzu's native render child.
+  The shutdown configuration keeps the visible 780-by-300 regular-text panel proportions; the
+  interactive error configuration uses Eden's parent-sized dark backdrop and centered panel.
+- Eden's `InputInterpreter` reads the aggregated NPad service state. Its Rust counterpart is not
+  wired to that resource yet, so the interactive GTK overlay polls the same player/handheld
+  emulated controllers every 50 ms and preserves the same rising-edge A/B and horizontal-input
+  behavior.
 
 ### Unintentional differences (to fix)
 
-- None in the Stop/Restart lifecycle: the panel is created only after a successful asynchronous
-  stop request and is closed when `StopComplete` reaches `on_emulation_stopped`.
+- None in the reviewed shutdown and single-action regular-text configurations. The error action
+  owns the initial focus border, Return/Escape and controller A/B activate it, and dismissal occurs
+  before the applet completion callback resumes guest execution.
 
 ### Missing items
 
-- Generic interactive and rich-text overlay modes are outside this shutdown-dialog slice.
+- The two-action and rich-text overlay configurations remain outside this slice.
 
 ### Binary layout verification
 
@@ -18975,6 +18977,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden assigns the question title to a Qt window title. Ruzu omits the equivalent GTK window-title
   property on Linux because GTK's client-side decoration renders it immediately above the identical
   primary message label; Windows and macOS retain the distinct native window title.
+- GTK standard compatibility dialogs set their response as both the default and focused widget,
+  repeating focus after native surface mapping because `present()` is asynchronous.
 
 ### Unintentional differences (to fix)
 
@@ -19439,6 +19443,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - GTK requests cross an `mpsc` channel polled by the main loop instead of queued Qt signals. The
   ownership and ordering remain the same: the emulation thread stores the completion callback,
   the UI thread owns the dialog, and dismissing the dialog invokes the callback exactly once.
+- The error request is displayed through the GTK `ErrorOverlayDialog` counterpart of Eden's
+  `OverlayDialog`, rather than a native message box. Its full-width action row owns the visible
+  focus border and accepts mouse, keyboard, and controller A/B input while emulation is running.
 - The timestamp fallback displays Unix seconds because the GTK frontend does not currently own an
   upstream-equivalent locale-aware date formatter.
 

@@ -140,6 +140,28 @@ fn show_pretranslated_message_with_type_then<P: IsA<gtk::Window>>(
         }
     });
     dialog.present();
+    focus_dialog_response(&dialog, ResponseType::Ok);
+}
+
+/// Make a dialog response both the Enter-key default and the focused widget.
+/// GTK's generated `ButtonsType::Ok` button is not guaranteed to receive
+/// keyboard focus when a modal dialog is presented.
+pub(crate) fn focus_dialog_response<D: IsA<gtk::Dialog> + Clone + 'static>(
+    dialog: &D,
+    response: ResponseType,
+) {
+    dialog.set_default_response(response);
+    if let Some(widget) = dialog.widget_for_response(response) {
+        widget.grab_focus();
+    }
+
+    let dialog = dialog.clone().upcast::<gtk::Dialog>();
+    glib::idle_add_local_once(move || {
+        if let Some(widget) = dialog.widget_for_response(response) {
+            gtk::prelude::GtkWindowExt::set_focus(&dialog, Some(&widget));
+            widget.grab_focus();
+        }
+    });
 }
 
 /// Show a two-button modal question and report whether the accept button won.

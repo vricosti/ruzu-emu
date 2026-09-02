@@ -11,8 +11,9 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
-use gtk::prelude::*;
-use gtk::{glib, ButtonsType, MessageType};
+use gtk::glib;
+use hid_core::hid_core::HIDCore;
+use parking_lot::Mutex;
 use ruzu_core::frontend::applets::applet::Applet;
 use ruzu_core::frontend::applets::error::{ErrorApplet, FinishedCallback};
 use ruzu_core::hle::result::ResultCode;
@@ -109,7 +110,7 @@ impl ErrorApplet for GtkErrorDisplay {
 }
 
 struct ActiveDialog {
-    dialog: gtk::MessageDialog,
+    dialog: Rc<crate::overlay_dialog::ErrorOverlayDialog>,
     finished: Rc<RefCell<Option<FinishedCallback>>>,
 }
 
@@ -117,6 +118,7 @@ struct ActiveDialog {
 /// slots and `OverlayDialog` lifetime.
 pub(crate) struct ErrorAppletFrontend {
     parent: gtk::ApplicationWindow,
+    hid_core: Arc<Mutex<HIDCore>>,
     receiver: Receiver<ErrorAppletRequest>,
     active: RefCell<Option<ActiveDialog>>,
 }
@@ -124,10 +126,12 @@ pub(crate) struct ErrorAppletFrontend {
 impl ErrorAppletFrontend {
     pub(crate) fn new(
         parent: &gtk::ApplicationWindow,
+        hid_core: Arc<Mutex<HIDCore>>,
         receiver: Receiver<ErrorAppletRequest>,
     ) -> Rc<Self> {
         Rc::new(Self {
             parent: parent.clone(),
+            hid_core,
             receiver,
             active: RefCell::new(None),
         })
@@ -162,18 +166,16 @@ impl ErrorAppletFrontend {
     ) {
         self.finish_active(false);
 
-        let dialog = gtk::MessageDialog::builder()
-            .transient_for(&self.parent)
-            .modal(true)
-            .message_type(MessageType::Error)
-            .buttons(ButtonsType::Ok)
-            .text(error_code)
-            .secondary_text(error_text)
-            .build();
+        let dialog = crate::overlay_dialog::ErrorOverlayDialog::new(
+            &self.parent,
+            Arc::clone(&self.hid_core),
+            &error_code,
+            &error_text,
+        );
         let finished = Rc::new(RefCell::new(Some(finished)));
 
         let weak = Rc::downgrade(self);
-        dialog.connect_response(move |_, _| {
+        dialog.connect_accepted(move || {
             if let Some(this) = weak.upgrade() {
                 this.finish_active(true);
             }
@@ -183,7 +185,6 @@ impl ErrorAppletFrontend {
             dialog: dialog.clone(),
             finished,
         });
-        dialog.present();
     }
 
     fn finish_active(&self, invoke_callback: bool) {

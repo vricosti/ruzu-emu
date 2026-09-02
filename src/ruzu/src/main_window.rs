@@ -1096,8 +1096,11 @@ impl GMainWindow {
             controller_applet_requests,
         );
         let (error_applet, error_applet_requests) = crate::applets::error::GtkErrorDisplay::new();
-        let error_applet_frontend =
-            crate::applets::error::ErrorAppletFrontend::new(&window, error_applet_requests);
+        let error_applet_frontend = crate::applets::error::ErrorAppletFrontend::new(
+            &window,
+            Arc::clone(&hid_core),
+            error_applet_requests,
+        );
         let (software_keyboard, software_keyboard_requests) =
             crate::applets::software_keyboard::GtkSoftwareKeyboard::new();
         let software_keyboard_frontend =

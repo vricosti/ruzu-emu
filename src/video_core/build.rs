@@ -95,6 +95,7 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
             shader_dir.join(include).display()
         );
     }
+    #[rustfmt::skip]
     let shaders = [
         ("VULKAN_PRESENT_VERT_SPV", "vulkan_present.vert"),
         ("VULKAN_PRESENT_FRAG_SPV", "vulkan_present.frag"),
@@ -102,132 +103,45 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("FXAA_FRAG_SPV", "fxaa.frag"),
         ("SMAA_EDGE_DETECTION_VERT_SPV", "smaa_edge_detection.vert"),
         ("SMAA_EDGE_DETECTION_FRAG_SPV", "smaa_edge_detection.frag"),
-        (
-            "SMAA_BLENDING_WEIGHT_CALCULATION_VERT_SPV",
-            "smaa_blending_weight_calculation.vert",
-        ),
-        (
-            "SMAA_BLENDING_WEIGHT_CALCULATION_FRAG_SPV",
-            "smaa_blending_weight_calculation.frag",
-        ),
-        (
-            "SMAA_NEIGHBORHOOD_BLENDING_VERT_SPV",
-            "smaa_neighborhood_blending.vert",
-        ),
-        (
-            "SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV",
-            "smaa_neighborhood_blending.frag",
-        ),
+        ("SMAA_BLENDING_WEIGHT_CALCULATION_VERT_SPV", "smaa_blending_weight_calculation.vert"),
+        ("SMAA_BLENDING_WEIGHT_CALCULATION_FRAG_SPV", "smaa_blending_weight_calculation.frag"),
+        ("SMAA_NEIGHBORHOOD_BLENDING_VERT_SPV", "smaa_neighborhood_blending.vert"),
+        ("SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV", "smaa_neighborhood_blending.frag"),
         ("FULL_SCREEN_TRIANGLE_VERT_SPV", "full_screen_triangle.vert"),
         ("BLIT_COLOR_FLOAT_FRAG_SPV", "blit_color_float.frag"),
         ("BLIT_COLOR_MSAA_FRAG_SPV", "blit_color_msaa.frag"),
         ("BLIT_DEPTH_MSAA_FRAG_SPV", "blit_depth_msaa.frag"),
-        (
-            "BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV",
-            "blit_depth_stencil_msaa.frag",
-        ),
-        (
-            "VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV",
-            "vulkan_blit_depth_stencil.frag",
-        ),
+        ("BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV", "blit_depth_stencil_msaa.frag"),
+        ("VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV", "vulkan_blit_depth_stencil.frag"),
         ("VULKAN_COLOR_CLEAR_VERT_SPV", "vulkan_color_clear.vert"),
         ("VULKAN_COLOR_CLEAR_FRAG_SPV", "vulkan_color_clear.frag"),
-        (
-            "VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV",
-            "vulkan_depthstencil_clear.frag",
-        ),
-        (
-            "CONVERT_DEPTH_TO_FLOAT_FRAG_SPV",
-            "convert_depth_to_float.frag",
-        ),
-        (
-            "CONVERT_FLOAT_TO_DEPTH_FRAG_SPV",
-            "convert_float_to_depth.frag",
-        ),
-        (
-            "CONVERT_ABGR8_TO_D24S8_FRAG_SPV",
-            "convert_abgr8_to_d24s8.frag",
-        ),
-        (
-            "CONVERT_ABGR8_TO_D32F_FRAG_SPV",
-            "convert_abgr8_to_d32f.frag",
-        ),
-        (
-            "CONVERT_D32F_TO_ABGR8_FRAG_SPV",
-            "convert_d32f_to_abgr8.frag",
-        ),
-        (
-            "CONVERT_D24S8_TO_ABGR8_FRAG_SPV",
-            "convert_d24s8_to_abgr8.frag",
-        ),
-        (
-            "CONVERT_S8D24_TO_ABGR8_FRAG_SPV",
-            "convert_s8d24_to_abgr8.frag",
-        ),
-        (
-            "CONVERT_D32S8_TO_RG32_FRAG_SPV",
-            "convert_d32s8_to_rg32.frag",
-        ),
-        (
-            "CONVERT_RG32_TO_D32S8_FRAG_SPV",
-            "convert_rg32_to_d32s8.frag",
-        ),
-        (
-            "CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV",
-            "convert_msaa_to_non_msaa.frag",
-        ),
-        (
-            "CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV",
-            "convert_non_msaa_to_msaa.frag",
-        ),
-        (
-            "CONVERT_MSAA_TO_NON_MSAA_COMP_SPV",
-            "convert_msaa_to_non_msaa.comp",
-        ),
-        (
-            "CONVERT_NON_MSAA_TO_MSAA_COMP_SPV",
-            "convert_non_msaa_to_msaa.comp",
-        ),
+        ("VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV", "vulkan_depthstencil_clear.frag"),
+        ("CONVERT_DEPTH_TO_FLOAT_FRAG_SPV", "convert_depth_to_float.frag"),
+        ("CONVERT_FLOAT_TO_DEPTH_FRAG_SPV", "convert_float_to_depth.frag"),
+        ("CONVERT_ABGR8_TO_D24S8_FRAG_SPV", "convert_abgr8_to_d24s8.frag"),
+        ("CONVERT_ABGR8_TO_D32F_FRAG_SPV", "convert_abgr8_to_d32f.frag"),
+        ("CONVERT_D32F_TO_ABGR8_FRAG_SPV", "convert_d32f_to_abgr8.frag"),
+        ("CONVERT_D24S8_TO_ABGR8_FRAG_SPV", "convert_d24s8_to_abgr8.frag"),
+        ("CONVERT_S8D24_TO_ABGR8_FRAG_SPV", "convert_s8d24_to_abgr8.frag"),
+        ("CONVERT_D32S8_TO_RG32_FRAG_SPV", "convert_d32s8_to_rg32.frag"),
+        ("CONVERT_RG32_TO_D32S8_FRAG_SPV", "convert_rg32_to_d32s8.frag"),
+        ("CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV", "convert_msaa_to_non_msaa.frag"),
+        ("CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV", "convert_non_msaa_to_msaa.frag"),
+        ("CONVERT_MSAA_TO_NON_MSAA_COMP_SPV", "convert_msaa_to_non_msaa.comp"),
+        ("CONVERT_NON_MSAA_TO_MSAA_COMP_SPV", "convert_non_msaa_to_msaa.comp"),
         ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
-        (
-            "BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV",
-            "block_linear_unswizzle_3d_bcn.comp",
-        ),
+        ("BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV", "block_linear_unswizzle_3d_bcn.comp"),
         ("VULKAN_QUAD_INDEXED_COMP_SPV", "vulkan_quad_indexed.comp"),
         ("VULKAN_UINT8_COMP_SPV", "vulkan_uint8.comp"),
-        (
-            "QUERIES_PREFIX_SCAN_SUM_COMP_SPV",
-            "queries_prefix_scan_sum.comp",
-        ),
-        (
-            "QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV",
-            "queries_prefix_scan_sum_nosubgroups.comp",
-        ),
-        (
-            "RESOLVE_CONDITIONAL_RENDER_COMP_SPV",
-            "resolve_conditional_render.comp",
-        ),
+        ("QUERIES_PREFIX_SCAN_SUM_COMP_SPV", "queries_prefix_scan_sum.comp"),
+        ("QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV", "queries_prefix_scan_sum_nosubgroups.comp"),
+        ("RESOLVE_CONDITIONAL_RENDER_COMP_SPV", "resolve_conditional_render.comp"),
         ("VULKAN_TURBO_MODE_COMP_SPV", "vulkan_turbo_mode.comp"),
-        (
-            "VULKAN_FIDELITYFX_FSR_VERT_SPV",
-            "vulkan_fidelityfx_fsr.vert",
-        ),
-        (
-            "VULKAN_FIDELITYFX_FSR_EASU_FP32_FRAG_SPV",
-            "vulkan_fidelityfx_fsr_easu_fp32.frag",
-        ),
-        (
-            "VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV",
-            "vulkan_fidelityfx_fsr_easu_fp16.frag",
-        ),
-        (
-            "VULKAN_FIDELITYFX_FSR_RCAS_FP32_FRAG_SPV",
-            "vulkan_fidelityfx_fsr_rcas_fp32.frag",
-        ),
-        (
-            "VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV",
-            "vulkan_fidelityfx_fsr_rcas_fp16.frag",
-        ),
+        ("VULKAN_FIDELITYFX_FSR_VERT_SPV", "vulkan_fidelityfx_fsr.vert"),
+        ("VULKAN_FIDELITYFX_FSR_EASU_FP32_FRAG_SPV", "vulkan_fidelityfx_fsr_easu_fp32.frag"),
+        ("VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV", "vulkan_fidelityfx_fsr_easu_fp16.frag"),
+        ("VULKAN_FIDELITYFX_FSR_RCAS_FP32_FRAG_SPV", "vulkan_fidelityfx_fsr_rcas_fp32.frag"),
+        ("VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV", "vulkan_fidelityfx_fsr_rcas_fp16.frag"),
         ("PRESENT_BICUBIC_FRAG_SPV", "present_bicubic.frag"),
         ("PRESENT_GAUSSIAN_FRAG_SPV", "present_gaussian.frag"),
         ("PRESENT_AREA_FRAG_SPV", "present_area.frag"),
@@ -239,18 +153,9 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("PRESENT_ZERO_TANGENT_FRAG_SPV", "present_zero_tangent.frag"),
         ("SGSR1_SHADER_VERT_SPV", "sgsr1_shader.vert"),
         ("SGSR1_SHADER_MOBILE_FRAG_SPV", "sgsr1_shader_mobile.frag"),
-        (
-            "SGSR1_SHADER_MOBILE_EDGE_DIRECTION_FRAG_SPV",
-            "sgsr1_shader_mobile_edge_direction.frag",
-        ),
-        (
-            "VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV",
-            "vulkan_present_scaleforce_fp16.frag",
-        ),
-        (
-            "VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV",
-            "vulkan_present_scaleforce_fp32.frag",
-        ),
+        ("SGSR1_SHADER_MOBILE_EDGE_DIRECTION_FRAG_SPV", "sgsr1_shader_mobile_edge_direction.frag"),
+        ("VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV", "vulkan_present_scaleforce_fp16.frag"),
+        ("VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV", "vulkan_present_scaleforce_fp32.frag"),
     ];
 
     let glslang = std::env::var("GLSLANGVALIDATOR").unwrap_or_else(|_| "glslangValidator".into());

@@ -177,7 +177,7 @@ pub fn emit_two_op_fallback_with_fpcr_arg(
         .unwrap();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(fpcr_controlled).value() as i32,
         )
         .unwrap();
@@ -341,7 +341,7 @@ pub fn emit_three_op_fallback(
         .unwrap();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(fpcr_controlled).value() as i32,
         )
         .unwrap();
@@ -439,7 +439,7 @@ pub fn emit_fp_one_arg_fallback_with_params(
         .unwrap();
     ra.asm
         .mov(
-            Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().get_idx()),
+            Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().index()),
             ctx.fpcr(fpcr_controlled).value() as i32,
         )
         .unwrap();
@@ -525,7 +525,7 @@ pub fn emit_three_op_fallback_without_reg_alloc(
     )
     .unwrap();
     asm.mov(
-        Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().get_idx()),
+        Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().index()),
         fpcr_value as i32,
     )
     .unwrap();
@@ -816,7 +816,7 @@ pub fn emit_four_op_fallback(
     {
         ra.asm
             .mov(
-                Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().get_idx()),
+                Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().index()),
                 ctx.fpcr(fpcr_controlled).value() as i32,
             )
             .unwrap();

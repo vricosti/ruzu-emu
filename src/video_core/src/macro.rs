@@ -1625,7 +1625,7 @@ mod macro_jit_x64 {
             };
             jit.compile()
                 .expect("MacroJITx64 must compile valid uploaded macro code");
-            jit.program = Some(unsafe { jit.assembler.get_code::<ProgramType>() });
+            jit.program = Some(unsafe { jit.assembler.as_fn::<ProgramType>() });
             jit
         }
 

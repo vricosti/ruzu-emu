@@ -460,11 +460,11 @@ impl BlockOfCode {
     pub fn emit_zero_extend_from(&mut self, bitsize: usize, reg: Reg) -> rxbyak::Result<()> {
         match bitsize {
             8 => {
-                let r32 = Reg::gpr32(reg.get_idx());
+                let r32 = Reg::gpr32(reg.index());
                 // For idx 4..7 use new_ext8 (SPL/BPL/SIL/DIL) so the encoder
                 // emits REX. `gpr8(4..7)` without REX = AH/CH/DH/BH. Same
                 // bug class as host_call's U8 zero-extend fix.
-                let idx = reg.get_idx();
+                let idx = reg.index();
                 let r8 = if (4..8).contains(&idx) {
                     Reg::new_ext8(idx)
                 } else {
@@ -473,13 +473,13 @@ impl BlockOfCode {
                 self.asm.movzx(r32, r8)?;
             }
             16 => {
-                let r32 = Reg::gpr32(reg.get_idx());
-                let r16 = Reg::gpr16(reg.get_idx());
+                let r32 = Reg::gpr32(reg.index());
+                let r16 = Reg::gpr16(reg.index());
                 self.asm.movzx(r32, r16)?;
             }
             32 => {
                 // mov r32, r32 implicitly zero-extends to 64 bits
-                let r32 = Reg::gpr32(reg.get_idx());
+                let r32 = Reg::gpr32(reg.index());
                 self.asm.mov(r32, r32)?;
             }
             64 => {

@@ -467,7 +467,7 @@ fn emit_read_fallback_128(
         abi::push_caller_save_registers_and_adjust_stack_except(asm, Some(HostLoc::Xmm(value_idx)))
             .unwrap();
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
-    if vaddr_idx != vaddr_param.get_idx() {
+    if vaddr_idx != vaddr_param.index() {
         asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
     }
     if ordered {
@@ -490,7 +490,7 @@ fn emit_write_fallback_128(
 ) {
     let saved = abi::push_caller_save_registers_and_adjust_stack(asm).unwrap();
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
-    if vaddr_idx != vaddr_param.get_idx() {
+    if vaddr_idx != vaddr_param.index() {
         asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
     }
     if value_idx != 1 {
@@ -543,7 +543,7 @@ fn emit_read_fallback(
             .unwrap();
 
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
-    if vaddr_idx != vaddr_param.get_idx() {
+    if vaddr_idx != vaddr_param.index() {
         asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
     }
     if ordered {
@@ -559,7 +559,7 @@ fn emit_read_fallback(
     };
     callback.emit_call_simple(asm).unwrap();
 
-    if value_idx != RAX.get_idx() {
+    if value_idx != RAX.index() {
         asm.mov(value_reg, RAX).unwrap();
     }
 
@@ -618,8 +618,8 @@ fn emit_write_fallback(
     // upstream's order avoids overwriting a source we still need.
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
     let value_param = abi::ABI_PARAMS[2].to_reg64();
-    let value_param_idx = value_param.get_idx();
-    let vaddr_param_idx = vaddr_param.get_idx();
+    let value_param_idx = value_param.index();
+    let vaddr_param_idx = vaddr_param.index();
 
     if vaddr_idx == value_param_idx && value_idx == vaddr_param_idx {
         asm.xchg(vaddr_param, value_param).unwrap();
@@ -672,7 +672,7 @@ pub(crate) fn emit_exclusive_write_fallback(
 ) {
     let (saved, local) = abi::push_caller_save_registers_and_adjust_stack_except_with_local(
         asm,
-        Some(HostLoc::Gpr(RAX.get_idx())),
+        Some(HostLoc::Gpr(RAX.index())),
         32,
     )
     .unwrap();
@@ -721,7 +721,7 @@ fn emit_exclusive_write_fallback_128(
 ) {
     let saved = abi::push_caller_save_registers_and_adjust_stack_except(
         asm,
-        Some(HostLoc::Gpr(RAX.get_idx())),
+        Some(HostLoc::Gpr(RAX.index())),
     )
     .unwrap();
     if value_idx != 1 {
@@ -735,7 +735,7 @@ fn emit_exclusive_write_fallback_128(
         asm.punpcklqdq(Reg::xmm(2), Reg::xmm(0)).unwrap();
     }
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
-    if vaddr_idx != vaddr_param.get_idx() {
+    if vaddr_idx != vaddr_param.index() {
         asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
     }
     emit_call_to_offset(asm, accessor_offset);
@@ -751,7 +751,7 @@ fn emit_exclusive_write_fallback_128(
 /// for idx 4..=7 to access SPL/BPL/SIL/DIL instead of AH/CH/DH/BH).
 /// `bitsize == 64`: no-op.
 fn emit_zero_extend(asm: &mut CodeAssembler, bitsize: usize, reg: Reg) {
-    let idx = reg.get_idx();
+    let idx = reg.index();
     match bitsize {
         8 => {
             let r32 = Reg::gpr32(idx);
@@ -878,10 +878,10 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     }
 
     if ordered && BITSIZE == 128 {
-        ra.scratch_gpr_at(HostLoc::Gpr(RAX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RBX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RCX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RDX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RAX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RBX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RCX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RDX.index()));
     }
 
     // Allocate vaddr (use) + value (scratch).
@@ -891,8 +891,8 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     } else {
         ra.scratch_gpr()
     };
-    let vaddr_idx = vaddr.get_idx();
-    let value_idx = value.get_idx();
+    let vaddr_idx = vaddr.index();
+    let value_idx = value.index();
 
     // RUZU_TRAP_LDR_BYTE5_21=1 — trap if the load address (vaddr) has the
     // STK corrupt pattern (byte 5 = 0x21, byte 4 = 0x01, bytes 6,7 = 0).
@@ -1171,10 +1171,10 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     }
 
     if ordered && BITSIZE == 128 {
-        ra.scratch_gpr_at(HostLoc::Gpr(RAX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RBX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RCX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RDX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RAX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RBX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RCX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RDX.index()));
     }
 
     // Allocate vaddr (use) + value (use).
@@ -1202,8 +1202,8 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     } else {
         ra.use_gpr(&mut args[2])
     };
-    let vaddr_idx = vaddr.get_idx();
-    let value_idx = value.get_idx();
+    let vaddr_idx = vaddr.index();
+    let value_idx = value.index();
 
     let fallbacks = unsafe {
         &*(ctx
@@ -1944,9 +1944,9 @@ mod tests {
         let raw_callbacks = dummy_raw_callbacks();
         let (_, table) = generate_fallbacks(&mut asm, &callbacks, &raw_callbacks);
 
-        let vaddr_idx = abi::ABI_PARAMS[1].to_reg64().get_idx();
-        let value_idx = abi::ABI_PARAMS[2].to_reg64().get_idx();
-        let read_offset = table.read_stub(false, 32, vaddr_idx, RAX.get_idx());
+        let vaddr_idx = abi::ABI_PARAMS[1].to_reg64().index();
+        let value_idx = abi::ABI_PARAMS[2].to_reg64().index();
+        let read_offset = table.read_stub(false, 32, vaddr_idx, RAX.index());
         let write_offset = table.write_stub(false, 32, vaddr_idx, value_idx);
         let read: unsafe extern "C" fn(u64, u64) -> u64 =
             unsafe { core::mem::transmute(asm.top().add(read_offset)) };

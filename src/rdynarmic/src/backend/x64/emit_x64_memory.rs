@@ -314,8 +314,8 @@ pub fn emit_detect_misaligned_vaddr(
     asm.jne(&detect_boundary, rxbyak::JmpType::Near).unwrap();
     asm.bind(&resume).unwrap();
 
-    let vaddr_idx = vaddr.get_idx();
-    let tmp_idx = tmp.get_idx();
+    let vaddr_idx = vaddr.index();
+    let tmp_idx = tmp.index();
     ctx.deferred_emits
         .borrow_mut()
         .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {

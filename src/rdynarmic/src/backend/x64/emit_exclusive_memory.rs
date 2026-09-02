@@ -460,10 +460,10 @@ fn emit_a64_exclusive_read_inline(
     let value_ptr = exclusive_value_ptr(ctx, pid).expect("global monitor required");
 
     if bitsize == 128 {
-        ra.scratch_gpr_at(HostLoc::Gpr(RAX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RBX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RCX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RDX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RAX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RBX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RCX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RDX.index()));
     }
     let vaddr = ra.use_gpr(&mut args[1]);
     let value = if bitsize == 128 {
@@ -473,8 +473,8 @@ fn emit_a64_exclusive_read_inline(
     };
     let tmp = ra.scratch_gpr();
     let tmp2 = ra.scratch_gpr();
-    let vaddr_idx = vaddr.get_idx();
-    let value_idx = value.get_idx();
+    let vaddr_idx = vaddr.index();
+    let value_idx = value.index();
 
     let fallbacks = unsafe {
         &*(ctx
@@ -571,11 +571,11 @@ fn emit_a64_exclusive_write_inline(
     let addr_ptr = exclusive_address_ptr(ctx, pid).expect("global monitor required");
     let value_ptr = exclusive_value_ptr(ctx, pid).expect("global monitor required");
 
-    let rax = ra.scratch_gpr_at(HostLoc::Gpr(RAX.get_idx()));
+    let rax = ra.scratch_gpr_at(HostLoc::Gpr(RAX.index()));
     if bitsize == 128 {
-        ra.scratch_gpr_at(HostLoc::Gpr(RBX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RCX.get_idx()));
-        ra.scratch_gpr_at(HostLoc::Gpr(RDX.get_idx()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RBX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RCX.index()));
+        ra.scratch_gpr_at(HostLoc::Gpr(RDX.index()));
     }
     let value = if bitsize == 128 {
         ra.use_xmm(&mut args[2])
@@ -585,8 +585,8 @@ fn emit_a64_exclusive_write_inline(
     let vaddr = ra.use_gpr(&mut args[1]);
     let status = ra.scratch_gpr();
     let tmp = ra.scratch_gpr();
-    let vaddr_idx = vaddr.get_idx();
-    let value_idx = value.get_idx();
+    let vaddr_idx = vaddr.index();
+    let value_idx = value.index();
 
     let fallbacks = unsafe {
         &*(ctx

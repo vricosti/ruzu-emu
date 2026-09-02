@@ -80,7 +80,7 @@ fn emit_fp_estimate_call(
     let fpsr_param = abi::ABI_PARAMS[2].to_reg64();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(true).value() as i32,
         )
         .unwrap();
@@ -112,7 +112,7 @@ fn emit_fp_step_fused_call(
     let fpsr_param = abi::ABI_PARAMS[3].to_reg64();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(true).value() as i32,
         )
         .unwrap();
@@ -142,12 +142,12 @@ fn emit_fp_convert_call(
     let fpsr_param = abi::ABI_PARAMS[3].to_reg64();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(true).value() as i32,
         )
         .unwrap();
     ra.asm
-        .mov(Reg::gpr32(rounding_param.get_idx()), rounding as i32)
+        .mov(Reg::gpr32(rounding_param.index()), rounding as i32)
         .unwrap();
     ra.asm
         .lea(
@@ -406,7 +406,7 @@ fn emit_fp_min_max(
     let fpsr_param = abi::ABI_PARAMS[3].to_reg64();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(true).value() as i32,
         )
         .unwrap();
@@ -757,7 +757,7 @@ fn emit_fp_round_int(
         .unwrap();
     ra.asm
         .mov(
-            Reg::gpr32(fpcr_param.get_idx()),
+            Reg::gpr32(fpcr_param.index()),
             ctx.fpcr(true).value() as i32,
         )
         .unwrap();
@@ -902,7 +902,7 @@ fn emit_fp_mul_add(
                 dctx.asm.sub(RSP, 8).unwrap();
                 let frame = abi::push_caller_save_registers_and_adjust_stack_except(
                     dctx.asm,
-                    Some(HostLoc::Xmm(result.get_idx())),
+                    Some(HostLoc::Xmm(result.index())),
                 )
                 .unwrap();
                 dctx.asm
@@ -1009,7 +1009,7 @@ fn emit_fp_mul_add(
     );
     ra.asm
         .mov(
-            Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().get_idx()),
+            Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().index()),
             fpcr.value() as i32,
         )
         .unwrap();
@@ -1279,7 +1279,7 @@ fn emit_fp_to_fixed_s32(
             .unwrap();
         ra.asm
             .mov(
-                Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+                Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().index()),
                 ctx.fpcr(true).value() as i32,
             )
             .unwrap();
@@ -1388,7 +1388,7 @@ fn emit_fp_to_fixed_s64(
             .unwrap();
         ra.asm
             .mov(
-                Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+                Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().index()),
                 ctx.fpcr(true).value() as i32,
             )
             .unwrap();
@@ -1610,7 +1610,7 @@ fn emit_fp_to_fixed_unsigned(
         .unwrap();
     ra.asm
         .mov(
-            Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+            Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().index()),
             ctx.fpcr(true).value() as i32,
         )
         .unwrap();
@@ -1982,7 +1982,7 @@ fn emit_fp_recip_step_fused(
                 dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
                 let frame = abi::push_caller_save_registers_and_adjust_stack_except(
                     dctx.asm,
-                    Some(HostLoc::Xmm(result.get_idx())),
+                    Some(HostLoc::Xmm(result.index())),
                 )
                 .unwrap();
                 dctx.asm
@@ -1993,7 +1993,7 @@ fn emit_fp_recip_step_fused(
                     .unwrap();
                 dctx.asm
                     .mov(
-                        Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+                        Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().index()),
                         fpcr_value as i32,
                     )
                     .unwrap();
@@ -2264,7 +2264,7 @@ fn emit_fp_rsqrt_step_fused(
                 dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
                 let frame = abi::push_caller_save_registers_and_adjust_stack_except(
                     dctx.asm,
-                    Some(HostLoc::Xmm(result.get_idx())),
+                    Some(HostLoc::Xmm(result.index())),
                 )
                 .unwrap();
                 dctx.asm
@@ -2275,7 +2275,7 @@ fn emit_fp_rsqrt_step_fused(
                     .unwrap();
                 dctx.asm
                     .mov(
-                        Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+                        Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().index()),
                         fpcr_value as i32,
                     )
                     .unwrap();

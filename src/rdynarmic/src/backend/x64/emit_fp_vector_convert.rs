@@ -389,7 +389,7 @@ fn emit_fp_vector_muladd(
                 let (frame, local_base) =
                     abi::push_caller_save_registers_and_adjust_stack_except_with_local(
                         dctx.asm,
-                        Some(HostLoc::Xmm(result.get_idx())),
+                        Some(HostLoc::Xmm(result.index())),
                         STACK_ARGS_SIZE + 64,
                     )
                     .unwrap();
@@ -447,7 +447,7 @@ fn emit_fp_vector_muladd(
                 {
                     dctx.asm
                         .mov(
-                            Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().get_idx()),
+                            Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().index()),
                             fpcr_value as i32,
                         )
                         .unwrap();
@@ -728,7 +728,7 @@ fn emit_fp_vector_recip_step_fused(
                 dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
                 let frame = abi::push_caller_save_registers_and_adjust_stack_except(
                     dctx.asm,
-                    Some(HostLoc::Xmm(result.get_idx())),
+                    Some(HostLoc::Xmm(result.index())),
                 )
                 .unwrap();
                 emit_three_op_fallback_without_reg_alloc(
@@ -1084,7 +1084,7 @@ fn emit_fp_vector_rsqrt_step_fused(
                 dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
                 let frame = abi::push_caller_save_registers_and_adjust_stack_except(
                     dctx.asm,
-                    Some(HostLoc::Xmm(result.get_idx())),
+                    Some(HostLoc::Xmm(result.index())),
                 )
                 .unwrap();
                 emit_three_op_fallback_without_reg_alloc(

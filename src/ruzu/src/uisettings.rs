@@ -44,6 +44,86 @@ pub struct GameDir {
     pub expanded: bool,
 }
 
+/// One configured frontend shortcut — upstream `UISettings::Shortcut` and
+/// `UISettings::ContextualShortcut`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    pub name: String,
+    pub group: String,
+    pub keyseq: String,
+    pub controller_keyseq: String,
+    pub context: i32,
+    pub repeat: bool,
+}
+
+/// Static counterpart of upstream `UISettings::default_hotkeys`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultHotkey {
+    pub name: &'static str,
+    pub group: &'static str,
+    pub keyseq: &'static str,
+    pub controller_keyseq: &'static str,
+    pub context: i32,
+    pub repeat: bool,
+}
+
+const WINDOW_SHORTCUT: i32 = 1;
+const APPLICATION_SHORTCUT: i32 = 2;
+const WIDGET_WITH_CHILDREN_SHORTCUT: i32 = 3;
+
+/// Kept in the exact upstream positional order required by its shortcut
+/// serializer (including recently appended entries at the end).
+#[rustfmt::skip]
+pub const DEFAULT_HOTKEYS: &[DefaultHotkey] = &[
+    DefaultHotkey { name: "Audio Mute/Unmute", group: "Main Window", keyseq: "Ctrl+M", controller_keyseq: "Home+Dpad_Right", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Audio Volume Down", group: "Main Window", keyseq: "-", controller_keyseq: "Home+Dpad_Down", context: APPLICATION_SHORTCUT, repeat: true },
+    DefaultHotkey { name: "Audio Volume Up", group: "Main Window", keyseq: "=", controller_keyseq: "Home+Dpad_Up", context: APPLICATION_SHORTCUT, repeat: true },
+    DefaultHotkey { name: "Capture Screenshot", group: "Main Window", keyseq: "Ctrl+P", controller_keyseq: "Screenshot", context: WIDGET_WITH_CHILDREN_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Change Adapting Filter", group: "Main Window", keyseq: "F8", controller_keyseq: "Home+L", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Change Docked Mode", group: "Main Window", keyseq: "F10", controller_keyseq: "Home+X", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Change GPU Mode", group: "Main Window", keyseq: "F9", controller_keyseq: "Home+R", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Configure", group: "Main Window", keyseq: "Ctrl+,", controller_keyseq: "", context: WIDGET_WITH_CHILDREN_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Configure Current Game", group: "Main Window", keyseq: "Ctrl+.", controller_keyseq: "", context: WIDGET_WITH_CHILDREN_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Continue/Pause Emulation", group: "Main Window", keyseq: "F4", controller_keyseq: "Home+Plus", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Exit Fullscreen", group: "Main Window", keyseq: "Esc", controller_keyseq: "", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Exit ruzu", group: "Main Window", keyseq: "Ctrl+Q", controller_keyseq: "Home+Minus", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Fullscreen", group: "Main Window", keyseq: "F11", controller_keyseq: "Home+B", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Load File", group: "Main Window", keyseq: "Ctrl+O", controller_keyseq: "", context: WIDGET_WITH_CHILDREN_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Load/Remove Amiibo", group: "Main Window", keyseq: "F2", controller_keyseq: "Home+A", context: WIDGET_WITH_CHILDREN_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Browse Public Game Lobby", group: "Main Window", keyseq: "Ctrl+B", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Create Room", group: "Main Window", keyseq: "Ctrl+N", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Direct Connect to Room", group: "Main Window", keyseq: "Ctrl+C", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Leave Room", group: "Main Window", keyseq: "Ctrl+L", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Show Current Room", group: "Main Window", keyseq: "Ctrl+R", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Restart Emulation", group: "Main Window", keyseq: "F6", controller_keyseq: "R+Plus+Minus", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Stop Emulation", group: "Main Window", keyseq: "F5", controller_keyseq: "L+Plus+Minus", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "TAS Record", group: "Main Window", keyseq: "Ctrl+F7", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "TAS Reset", group: "Main Window", keyseq: "Ctrl+F6", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "TAS Start/Stop", group: "Main Window", keyseq: "Ctrl+F5", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Filter Bar", group: "Main Window", keyseq: "Ctrl+F", controller_keyseq: "", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Framerate Limit", group: "Main Window", keyseq: "Ctrl+U", controller_keyseq: "Home+Y", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Turbo Speed", group: "Main Window", keyseq: "Ctrl+Z", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Slow Speed", group: "Main Window", keyseq: "Ctrl+X", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Mouse Panning", group: "Main Window", keyseq: "Ctrl+F9", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Renderdoc Capture", group: "Main Window", keyseq: "", controller_keyseq: "", context: APPLICATION_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Status Bar", group: "Main Window", keyseq: "Ctrl+S", controller_keyseq: "", context: WINDOW_SHORTCUT, repeat: false },
+    DefaultHotkey { name: "Toggle Performance Overlay", group: "Main Window", keyseq: "Ctrl+V", controller_keyseq: "", context: WINDOW_SHORTCUT, repeat: false },
+];
+
+pub fn default_shortcuts() -> Vec<Shortcut> {
+    DEFAULT_HOTKEYS
+        .iter()
+        .map(|hotkey| Shortcut {
+            name: hotkey.name.to_owned(),
+            group: hotkey.group.to_owned(),
+            keyseq: hotkey.keyseq.to_owned(),
+            controller_keyseq: hotkey.controller_keyseq.to_owned(),
+            context: hotkey.context,
+            repeat: hotkey.repeat,
+        })
+        .collect()
+}
+
 impl GameDir {
     /// Whether this entry is a real filesystem directory rather than one of the
     /// `SDMC` / `UserNAND` / `SysNAND` provider tokens.
@@ -66,6 +146,9 @@ pub struct Values {
     /// plain `QVector<u64>` written through `BeginArray`/`EndArray` rather than
     /// through the settings registry, so it is not a `Setting<T>` here either.
     pub favorited_ids: Vec<u64>,
+
+    /// Frontend shortcuts — upstream `UISettings::values.shortcuts`.
+    pub shortcuts: Vec<Shortcut>,
 
     // ── Ui ──────────────────────────────────────────────────────────────
     pub single_window_mode: Setting<bool>,
@@ -130,6 +213,7 @@ impl Default for Values {
         Self {
             game_dirs: Vec::new(),
             favorited_ids: Vec::new(),
+            shortcuts: default_shortcuts(),
 
             single_window_mode: Setting::new(true, "singleWindowMode", Ui),
             fullscreen: Setting::new(false, "fullscreen", Ui),

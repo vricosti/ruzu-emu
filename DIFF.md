@@ -19607,3 +19607,95 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - PASS: transient host resource records are not serialized; shader conversion preserves all depth
   bits and the guest-visible stencil byte exactly.
+
+## 2026-09-03 — `src/ruzu/src/configuration/configure_hotkeys.rs` vs Eden `src/yuzu/configuration/configure_hotkeys.{h,cpp}`
+
+### Intentional differences
+
+- GTK `ColumnView` cells use gesture controllers and an asynchronous sequence-dialog callback in
+  place of Qt's `QTreeView::doubleClicked` signal and blocking `QDialog::exec`; the action and
+  keyboard-binding columns retain Eden's ownership and both select the keyboard binding.
+- GTK list cells are recycled, so each binding tracks weak label references while visible. This
+  keeps Clear All and Restore Defaults model-driven without retaining GTK widgets past unbind.
+
+### Unintentional differences (to fix)
+
+- None in keyboard hotkey editing, conflict detection, apply, Clear All, or Restore Defaults.
+
+### Missing items
+
+- Controller-hotkey polling and the per-row Restore/Clear context menu remain unported.
+
+### Binary layout verification
+
+- PASS: shortcuts are frontend-owned strings and do not cross a guest ABI boundary.
+
+## 2026-09-03 — `src/ruzu/src/util/sequence_dialog.rs` vs Eden `src/yuzu/util/sequence_dialog/sequence_dialog.{h,cpp}`
+
+### Intentional differences
+
+- The GTK dialog returns its single captured chord through a completion callback rather than a
+  nested blocking event loop. Modifier-only presses and focus traversal are consumed so Tab and
+  other keys can be assigned, matching Eden's `focusNextPrevChild(false)` behavior.
+
+### Unintentional differences (to fix)
+
+- None in the single-chord keyboard capture slice.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: no binary payload or serialized structure is involved.
+
+## 2026-09-03 — `src/ruzu/src/uisettings.rs`, `src/ruzu/src/configuration/qt_config.rs` vs Eden `src/qt_common/config/uisettings.{h,cpp}`, `src/qt_common/config/qt_config.cpp`
+
+### Intentional differences
+
+- Rust flattens `ContextualShortcut` into `Shortcut` while retaining the same name, group,
+  keyboard sequence, controller sequence, context, and repeat fields. The static defaults remain
+  owned by `uisettings` and preserve Eden's positional order.
+- The frontend writes the QSettings-compatible `Shortcuts` INI section through its existing Rust
+  INI adapter rather than Qt's `BeginGroup`/`Write*Setting` API.
+- The product-specific default action is named `Exit ruzu`; all other action names, values,
+  contexts, repeat flags, and ordering match Eden.
+
+### Unintentional differences (to fix)
+
+- None in shortcut defaulting, loading, or saving.
+
+### Missing items
+
+- None in the shortcut persistence slice.
+
+### Binary layout verification
+
+- PASS: shortcut persistence is key/value INI data; no raw structure layout is serialized.
+
+## 2026-09-03 — `src/ruzu/src/hotkeys.rs` vs Eden `src/yuzu/hotkeys.{h,cpp}`
+
+### Intentional differences
+
+- GTK application accelerators replace Qt `QShortcut` instances. Window-owned emulation input
+  uses the same registry values through an explicit match because the native render surface is not
+  a GTK widget and its capture-phase key handler intentionally stops event propagation.
+- GTK native keypad labels such as `KP\u{2009}-` are normalized to stable GDK key names such as
+  `KP_Subtract` only at the runtime registry boundary. The user-facing and persisted native label
+  remains unchanged, matching Eden's display-oriented shortcut storage.
+- Ruzu currently registers accelerators only for frontend actions that have functional GTK action
+  counterparts; reapplying a changed binding replaces or clears the former accelerator.
+
+### Unintentional differences (to fix)
+
+- None in the connected keyboard-hotkey slice.
+
+### Missing items
+
+- Controller-shortcut parsing, HID callbacks, repeat dispatch, and GTK action counterparts for the
+  remaining default actions are not yet ported.
+
+### Binary layout verification
+
+- PASS: the registry contains frontend strings and flags only; it does not cross a guest ABI.

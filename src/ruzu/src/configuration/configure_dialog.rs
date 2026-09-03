@@ -331,6 +331,9 @@ impl ConfigureDialog {
         if let Err(error) = super::qt_config::save_control_values() {
             log::error!("Failed to save control settings: {error}");
         }
+        if let Err(error) = super::qt_config::save_shortcut_values() {
+            log::error!("Failed to save shortcut settings: {error}");
+        }
         if let Err(error) = super::qt_config::save_ui_language() {
             log::error!("Failed to save interface language: {error}");
         }

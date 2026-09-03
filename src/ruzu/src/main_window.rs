@@ -114,11 +114,25 @@ fn stop_confirmation(setting: ConfirmStop, exit_locked: bool) -> StopConfirmatio
     }
 }
 
+#[cfg(test)]
 fn fullscreen_hotkey(keyval: gtk::gdk::Key) -> Option<FullscreenHotkey> {
     match keyval {
         gtk::gdk::Key::F11 => Some(FullscreenHotkey::Toggle),
         gtk::gdk::Key::Escape => Some(FullscreenHotkey::Exit),
         _ => None,
+    }
+}
+
+fn configured_fullscreen_hotkey(
+    keyval: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+) -> Option<FullscreenHotkey> {
+    if crate::hotkeys::matches("Fullscreen", keyval, state) {
+        Some(FullscreenHotkey::Toggle)
+    } else if crate::hotkeys::matches("Exit Fullscreen", keyval, state) {
+        Some(FullscreenHotkey::Exit)
+    } else {
+        None
     }
 }
 
@@ -1287,6 +1301,7 @@ impl GMainWindow {
         // here rather than in the app-startup registration.
         this.register_boot_actions(app);
         this.register_view_actions(app);
+        crate::hotkeys::apply_accelerators(app);
 
         // Keep the checkable menu action and the window chrome synchronized
         // when the compositor exits fullscreen independently.
@@ -1727,11 +1742,19 @@ impl GMainWindow {
             glib::Propagation::Proceed,
             move |_, keyval, _keycode, state| {
                 if this.session.borrow().is_some() {
-                    if keyval == gtk::gdk::Key::F5 {
+                    if crate::hotkeys::matches("Continue/Pause Emulation", keyval, state) {
+                        this.on_pause_continue_game();
+                        return glib::Propagation::Stop;
+                    }
+                    if crate::hotkeys::matches("Stop Emulation", keyval, state) {
                         this.on_stop_game();
                         return glib::Propagation::Stop;
                     }
-                    if let Some(hotkey) = fullscreen_hotkey(keyval) {
+                    if crate::hotkeys::matches("Restart Emulation", keyval, state) {
+                        this.on_restart_game();
+                        return glib::Propagation::Stop;
+                    }
+                    if let Some(hotkey) = configured_fullscreen_hotkey(keyval, state) {
                         if let Some(app) = this.window.application() {
                             match hotkey {
                                 FullscreenHotkey::Toggle => this.toggle_fullscreen(&app),
@@ -1771,7 +1794,10 @@ impl GMainWindow {
             self,
             move |_, keyval, _keycode, state| {
                 if this.session.borrow().is_some()
-                    && (keyval == gtk::gdk::Key::F5 || fullscreen_hotkey(keyval).is_some())
+                    && (crate::hotkeys::matches("Continue/Pause Emulation", keyval, state)
+                        || crate::hotkeys::matches("Stop Emulation", keyval, state)
+                        || crate::hotkeys::matches("Restart Emulation", keyval, state)
+                        || configured_fullscreen_hotkey(keyval, state).is_some())
                 {
                     return;
                 }
@@ -2248,6 +2274,7 @@ impl GMainWindow {
 
         if completion.selection.configuration {
             crate::configuration::qt_config::load_control_values();
+            crate::configuration::qt_config::load_shortcut_values();
             crate::configuration::qt_config::load_ui_language();
             let interface_language =
                 crate::uisettings::with(|values| values.language.get_value().clone());
@@ -3071,6 +3098,9 @@ impl GMainWindow {
             move || {
                 if let Some(session) = this.session.borrow().as_ref() {
                     let _ = session.apply_renderer_settings();
+                }
+                if let Some(app) = this.window.application() {
+                    crate::hotkeys::apply_accelerators(&app);
                 }
                 this.status_bar.refresh();
                 if crate::uisettings::take_game_list_reload_pending() {

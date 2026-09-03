@@ -76,6 +76,92 @@ pub fn save_global_values() -> io::Result<()> {
     config.write_to_ini()
 }
 
+/// Read frontend shortcuts through upstream `QtConfig::ReadShortcutValues`.
+pub fn load_shortcut_values() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let shortcuts = parse_shortcut_values(&contents);
+    uisettings::with_mut(|ui| ui.shortcuts = shortcuts);
+}
+
+fn parse_shortcut_values(contents: &str) -> Vec<uisettings::Shortcut> {
+    let values = parse_section_values(&contents, "Shortcuts");
+    uisettings::DEFAULT_HOTKEYS
+        .iter()
+        .map(|default| {
+            let prefix = format!("{}\\{}", default.group, default.name);
+            uisettings::Shortcut {
+                name: default.name.to_owned(),
+                group: default.group.to_owned(),
+                keyseq: read_section_string_setting(
+                    &values,
+                    &format!("{prefix}\\KeySeq"),
+                    default.keyseq,
+                ),
+                controller_keyseq: read_section_string_setting(
+                    &values,
+                    &format!("{prefix}\\Controller_KeySeq"),
+                    default.controller_keyseq,
+                ),
+                // Upstream deliberately takes context from the default rather
+                // than the INI because the historical serialized Qt enum was
+                // ambiguous for WidgetWithChildrenShortcut.
+                context: default.context,
+                repeat: values
+                    .get(&format!("{prefix}\\Repeat"))
+                    .filter(|_| {
+                        values
+                            .get(&format!("{prefix}\\Repeat\\default"))
+                            .is_some_and(|value| !is_true(value))
+                    })
+                    .map(|value| is_true(value))
+                    .unwrap_or(default.repeat),
+            }
+        })
+        .collect()
+}
+
+/// Persist frontend shortcuts through upstream `QtConfig::SaveShortcutValues`.
+pub fn save_shortcut_values() -> io::Result<()> {
+    let path = config_path();
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let shortcuts = uisettings::with(|ui| ui.shortcuts.clone());
+    for (shortcut, default) in shortcuts.iter().zip(uisettings::DEFAULT_HOTKEYS) {
+        let prefix = format!("{}\\{}", shortcut.group, shortcut.name);
+        contents = replace_section_setting(
+            &contents,
+            "Shortcuts",
+            &format!("{prefix}\\KeySeq"),
+            &shortcut.keyseq,
+            shortcut.keyseq == default.keyseq,
+        );
+        contents = replace_section_setting(
+            &contents,
+            "Shortcuts",
+            &format!("{prefix}\\Controller_KeySeq"),
+            &shortcut.controller_keyseq,
+            shortcut.controller_keyseq == default.controller_keyseq,
+        );
+        contents = replace_section_setting(
+            &contents,
+            "Shortcuts",
+            &format!("{prefix}\\Context"),
+            &shortcut.context.to_string(),
+            shortcut.context == default.context,
+        );
+        contents = replace_section_setting(
+            &contents,
+            "Shortcuts",
+            &format!("{prefix}\\Repeat"),
+            &shortcut.repeat.to_string(),
+            shortcut.repeat == default.repeat,
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
+}
+
 /// Persist the three settings owned by upstream `ConfigureTasDialog`.
 pub fn save_tas_values() -> io::Result<()> {
     let path = config_path();
@@ -456,6 +542,23 @@ fn read_ui_string_setting(contents: &str, key: &str, default: &str) -> String {
         .get(key)
         .map(|value| unquote(value).to_string())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn read_section_string_setting(
+    values: &std::collections::BTreeMap<String, String>,
+    key: &str,
+    default: &str,
+) -> String {
+    if values
+        .get(&format!("{key}\\default"))
+        .is_none_or(|value| is_true(value))
+    {
+        return default.to_owned();
+    }
+    values
+        .get(key)
+        .map(|value| unquote(value).to_owned())
+        .unwrap_or_else(|| default.to_owned())
 }
 
 fn replace_ui_string_setting(contents: &str, key: &str, value: &str, default: &str) -> String {
@@ -1438,6 +1541,24 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_reader_honors_default_markers_and_custom_empty_bindings() {
+        let input = concat!(
+            "[Shortcuts]\n",
+            "Main Window\\Audio Mute/Unmute\\KeySeq\\default=false\n",
+            "Main Window\\Audio Mute/Unmute\\KeySeq=Ctrl+F12\n",
+            "Main Window\\Audio Volume Down\\KeySeq\\default=true\n",
+            "Main Window\\Audio Volume Down\\KeySeq=F1\n",
+            "Main Window\\Audio Volume Up\\KeySeq\\default=false\n",
+            "Main Window\\Audio Volume Up\\KeySeq=\n",
+        );
+        let shortcuts = parse_shortcut_values(input);
+
+        assert_eq!(shortcuts[0].keyseq, "Ctrl+F12");
+        assert_eq!(shortcuts[1].keyseq, "-");
+        assert_eq!(shortcuts[2].keyseq, "");
+    }
 
     #[test]
     fn view_boolean_settings_honor_default_markers() {

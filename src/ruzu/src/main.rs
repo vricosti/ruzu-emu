@@ -27,6 +27,7 @@ mod gtk_compat;
 #[cfg(target_os = "linux")]
 mod gui_settings;
 mod homebrew_vfs;
+mod hotkeys;
 mod i18n;
 mod loading_screen;
 mod main_window;
@@ -217,6 +218,7 @@ fn main() -> glib::ExitCode {
     // an empty mapping even though one was saved last session.
     configuration::qt_config::load_global_values();
     configuration::qt_config::load_control_values();
+    configuration::qt_config::load_shortcut_values();
 
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command

@@ -629,7 +629,7 @@ impl<'a> RegAlloc<'a> {
                     let reg = args_hostloc[i].to_reg64();
                     match arg.get_type() {
                         Type::U8 => {
-                            let r32 = Reg::gpr32(reg.get_idx());
+                            let r32 = Reg::gpr32(reg.index());
                             // For idx 4..7 we must use `new_ext8` to emit the
                             // REX prefix. `gpr8(4..7)` without REX encodes as
                             // AH/CH/DH/BH (high-byte registers) instead of
@@ -638,7 +638,7 @@ impl<'a> RegAlloc<'a> {
                             // `movzx esi, dh` → fbits ended up as whatever DH
                             // happened to contain, triggering saturation to
                             // 0xFFFFFFFF and cascading the divergence.
-                            let idx = reg.get_idx();
+                            let idx = reg.index();
                             let r8 = if (4..8).contains(&idx) {
                                 Reg::new_ext8(idx)
                             } else {
@@ -647,12 +647,12 @@ impl<'a> RegAlloc<'a> {
                             let _ = self.asm.movzx(r32, r8);
                         }
                         Type::U16 => {
-                            let r32 = Reg::gpr32(reg.get_idx());
-                            let r16 = Reg::gpr16(reg.get_idx());
+                            let r32 = Reg::gpr32(reg.index());
+                            let r16 = Reg::gpr16(reg.index());
                             let _ = self.asm.movzx(r32, r16);
                         }
                         Type::U32 => {
-                            let r32 = Reg::gpr32(reg.get_idx());
+                            let r32 = Reg::gpr32(reg.index());
                             let _ = self.asm.mov(r32, r32);
                         }
                         _ => {}
@@ -945,7 +945,7 @@ impl<'a> RegAlloc<'a> {
             let reg = host_loc.to_reg64();
             let imm_value = imm.get_imm_as_u64();
             if imm_value == 0 {
-                let r32 = Reg::gpr32(reg.get_idx());
+                let r32 = Reg::gpr32(reg.index());
                 let _ = self.asm.xor_(r32, r32);
             } else {
                 let _ = self.asm.mov(reg, imm_value as i64);
@@ -1226,8 +1226,8 @@ impl<'a> RegAlloc<'a> {
 
 /// Convert an rxbyak Reg to a HostLoc.
 fn reg_to_hostloc(reg: Reg) -> HostLoc {
-    let idx = reg.get_idx();
-    let bit = reg.get_bit();
+    let idx = reg.index();
+    let bit = reg.bit_width();
     if bit >= 128 {
         // XMM register
         HostLoc::Xmm(idx)
@@ -1393,7 +1393,7 @@ mod tests {
         let mut ra = RegAlloc::new_default(&mut asm, vec![]);
 
         let reg = ra.scratch_gpr();
-        assert!(reg.get_bit() == 64 || reg.get_bit() == 32);
+        assert!(reg.bit_width() == 64 || reg.bit_width() == 32);
         // The location should be write-locked
         let loc = reg_to_hostloc(reg);
         assert!(ra.loc_info(loc).is_locked());
@@ -1425,7 +1425,7 @@ mod tests {
         let args = [Value::Inst(InstRef(0))];
         let mut arg_info = ra.get_argument_info(InstRef(1), &args, 1);
         let used_reg = ra.use_gpr(&mut arg_info[0]);
-        assert!(used_reg.get_bit() == 64);
+        assert!(used_reg.bit_width() == 64);
         ra.end_of_alloc_scope();
 
         // After last use (total_uses=1), the value should be cleaned up

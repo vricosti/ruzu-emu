@@ -64,8 +64,8 @@ mod tests {
             let mut op_arg = OpArg::from(RAX);
             op_arg.set_bit(bits);
             let reg = op_arg.operand().as_reg().copied().expect("register");
-            assert_eq!(reg.get_idx(), RAX.get_idx());
-            assert_eq!(reg.get_bit(), bits);
+            assert_eq!(reg.index(), RAX.index());
+            assert_eq!(reg.bit_width(), bits);
         }
     }
 
@@ -76,8 +76,8 @@ mod tests {
         op_arg.set_bit(32);
         let changed = op_arg.operand();
         let changed = changed.as_mem().expect("memory");
-        assert_eq!(changed.get_bit(), 32);
-        assert_eq!(changed.get_reg_exp(), address.get_reg_exp());
+        assert_eq!(changed.bit_width(), 32);
+        assert_eq!(changed.register_expression(), address.register_expression());
     }
 
     #[test]

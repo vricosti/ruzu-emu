@@ -2423,7 +2423,7 @@ mod tests {
             ra.asm.ret().unwrap();
             ra.asm.ready().unwrap();
 
-            let function: extern "C" fn() -> u64 = unsafe { ra.asm.get_code() };
+            let function: extern "C" fn() -> u64 = unsafe { ra.asm.as_fn() };
             function()
         }
 

@@ -201,7 +201,7 @@ pub fn emit_packed_select(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRe
         ra.asm.and_(from, ge).unwrap();
         ra.asm.andn(to, ge, to).unwrap();
         ra.asm.or_(from, to).unwrap();
-        ra.define_value(inst_ref, Reg::gpr64(from.get_idx()));
+        ra.define_value(inst_ref, Reg::gpr64(from.index()));
     } else {
         let ge = ra.use_scratch_gpr(&mut args[0]).cvt32().unwrap();
         let to = ra.use_gpr(&mut args[1]).cvt32().unwrap();
@@ -210,7 +210,7 @@ pub fn emit_packed_select(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRe
         ra.asm.not_(ge).unwrap();
         ra.asm.and_(ge, to).unwrap();
         ra.asm.or_(from, ge).unwrap();
-        ra.define_value(inst_ref, Reg::gpr64(from.get_idx()));
+        ra.define_value(inst_ref, Reg::gpr64(from.index()));
     }
 }
 

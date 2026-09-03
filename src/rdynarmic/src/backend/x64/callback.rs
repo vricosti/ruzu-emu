@@ -198,14 +198,14 @@ mod tests {
         let callback_parameter = Cell::new(u8::MAX);
         ArgCallback::new(0xCAFE_BABE, 42)
             .emit_call(&mut code, &|_, params| {
-                callback_parameter.set(params[0].get_idx());
+                callback_parameter.set(params[0].index());
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(
             callback_parameter.get(),
-            abi::ABI_PARAMS[1].to_reg64().get_idx()
+            abi::ABI_PARAMS[1].to_reg64().index()
         );
     }
 
@@ -218,14 +218,14 @@ mod tests {
         let return_register = Cell::new(u8::MAX);
         ArgCallback::new(0xCAFE_BABE, 42)
             .emit_call_with_return_pointer(&mut code, &|_, ret, _| {
-                return_register.set(ret.get_idx());
+                return_register.set(ret.index());
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(
             return_register.get(),
-            abi::ABI_PARAMS[1].to_reg64().get_idx()
+            abi::ABI_PARAMS[1].to_reg64().index()
         );
     }
 }

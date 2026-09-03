@@ -123,7 +123,7 @@ fn emit_read_fallback(
         abi::push_caller_save_registers_and_adjust_stack_except(asm, Some(HostLoc::Gpr(value_idx)))
             .unwrap();
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
-    if vaddr_idx != vaddr_param.get_idx() {
+    if vaddr_idx != vaddr_param.index() {
         asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
     }
     if ordered {
@@ -138,7 +138,7 @@ fn emit_read_fallback(
     }
     .emit_call_simple(asm)
     .unwrap();
-    if value_idx != RAX.get_idx() {
+    if value_idx != RAX.index() {
         asm.mov(value, RAX).unwrap();
     }
     abi::pop_caller_save_registers_and_adjust_stack(asm, &saved).unwrap();
@@ -149,18 +149,18 @@ fn emit_read_fallback(
 fn marshal_a32_write_arguments(asm: &mut CodeAssembler, vaddr_idx: u8, value_idx: u8) -> Reg {
     let vaddr_param = abi::ABI_PARAMS[1].to_reg64();
     let value_param = abi::ABI_PARAMS[2].to_reg64();
-    if vaddr_idx == value_param.get_idx() && value_idx == vaddr_param.get_idx() {
+    if vaddr_idx == value_param.index() && value_idx == vaddr_param.index() {
         asm.xchg(vaddr_param, value_param).unwrap();
-    } else if vaddr_idx == value_param.get_idx() {
+    } else if vaddr_idx == value_param.index() {
         asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
-        if value_idx != value_param.get_idx() {
+        if value_idx != value_param.index() {
             asm.mov(value_param, Reg::gpr64(value_idx)).unwrap();
         }
     } else {
-        if value_idx != value_param.get_idx() {
+        if value_idx != value_param.index() {
             asm.mov(value_param, Reg::gpr64(value_idx)).unwrap();
         }
-        if vaddr_idx != vaddr_param.get_idx() {
+        if vaddr_idx != vaddr_param.index() {
             asm.mov(vaddr_param, Reg::gpr64(vaddr_idx)).unwrap();
         }
     }
@@ -203,7 +203,7 @@ fn emit_exclusive_write_fallback(
 ) {
     let saved = abi::push_caller_save_registers_and_adjust_stack_except(
         asm,
-        Some(HostLoc::Gpr(RAX.get_idx())),
+        Some(HostLoc::Gpr(RAX.index())),
     )
     .unwrap();
     let value_param = marshal_a32_write_arguments(asm, vaddr_idx, value_idx);
@@ -601,8 +601,8 @@ fn emit_a32_memory_read(
         // faults on unmapped memory.
         let vaddr = ra.use_gpr(&mut args[1]);
         let result = ra.scratch_gpr();
-        let vaddr_idx = vaddr.get_idx();
-        let result_idx = result.get_idx();
+        let vaddr_idx = vaddr.index();
+        let result_idx = result.index();
         let addr = RegExp::from(rxbyak::R13) + vaddr;
         if ordered {
             // xor zero-extends the 64-bit register too (Intel SDM:
@@ -697,8 +697,8 @@ fn emit_a32_memory_read(
         // calling the callback unconditionally.
         let vaddr = ra.use_gpr(&mut args[1]);
         let result = ra.scratch_gpr();
-        let vaddr_idx = vaddr.get_idx();
-        let result_idx = result.get_idx();
+        let vaddr_idx = vaddr.index();
+        let result_idx = result.index();
         let fallbacks = unsafe {
             &*(ctx
                 .fastmem_fallbacks
@@ -788,8 +788,8 @@ fn emit_a32_memory_write(
         } else {
             ra.use_gpr(&mut args[2])
         };
-        let vaddr_idx = vaddr.get_idx();
-        let value_idx = value.get_idx();
+        let vaddr_idx = vaddr.index();
+        let value_idx = value.index();
         let addr = RegExp::from(rxbyak::R13) + vaddr;
         let inst_offset = ra.asm.size();
         if let Some(expected) = parse_trap_fastmem_write_value_env().filter(|_| bitsize == 32) {
@@ -1044,8 +1044,8 @@ fn emit_a32_memory_write(
         } else {
             ra.use_gpr(&mut args[2])
         };
-        let vaddr_idx = vaddr.get_idx();
-        let value_idx = value.get_idx();
+        let vaddr_idx = vaddr.index();
+        let value_idx = value.index();
         let fallbacks = unsafe {
             &*(ctx
                 .fastmem_fallbacks
@@ -1392,8 +1392,8 @@ fn emit_a32_exclusive_read_inline(
     ra.asm.mov(tmp, addr_ptr as u64 as i64).unwrap();
     ra.asm.mov(qword_ptr(RegExp::from(tmp)), vaddr).unwrap();
 
-    let vaddr_idx = vaddr.get_idx();
-    let result_idx = result.get_idx();
+    let vaddr_idx = vaddr.index();
+    let result_idx = result.index();
     let fallbacks = unsafe {
         &*(ctx
             .fastmem_fallbacks
@@ -1608,8 +1608,8 @@ fn emit_a32_exclusive_write_inline(
         .mov(_rax_reservation, qword_ptr(RegExp::from(tmp)))
         .unwrap();
 
-    let vaddr_idx = vaddr.get_idx();
-    let value_idx = value.get_idx();
+    let vaddr_idx = vaddr.index();
+    let value_idx = value.index();
     let fallbacks = unsafe {
         &*(ctx
             .fastmem_fallbacks

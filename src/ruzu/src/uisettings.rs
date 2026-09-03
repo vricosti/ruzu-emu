@@ -150,6 +150,10 @@ pub struct Values {
     /// Frontend shortcuts — upstream `UISettings::values.shortcuts`.
     pub shortcuts: Vec<Shortcut>,
 
+    /// Last directory used by the load/install file choosers — upstream
+    /// `UISettings::values.roms_path`.
+    pub roms_path: String,
+
     // ── Ui ──────────────────────────────────────────────────────────────
     pub single_window_mode: Setting<bool>,
     pub fullscreen: Setting<bool>,
@@ -214,6 +218,7 @@ impl Default for Values {
             game_dirs: Vec::new(),
             favorited_ids: Vec::new(),
             shortcuts: default_shortcuts(),
+            roms_path: String::new(),
 
             single_window_mode: Setting::new(true, "singleWindowMode", Ui),
             fullscreen: Setting::new(false, "fullscreen", Ui),

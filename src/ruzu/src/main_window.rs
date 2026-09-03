@@ -17,6 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
@@ -76,6 +77,31 @@ const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md";
 const MISSING_KEYS_TITLE: &str = "Derivation Components Missing";
 const MISSING_KEYS_DETAIL: &str = "Decryption keys are missing. Install them now?";
+
+#[derive(Clone)]
+struct NandInstallRequest {
+    path: std::path::PathBuf,
+    title_type: Option<ruzu_core::file_sys::nca_metadata::TitleType>,
+}
+
+#[derive(Default)]
+struct NandInstallSummary {
+    new_files: Vec<String>,
+    overwritten_files: Vec<String>,
+    failed_files: Vec<String>,
+    detected_base_install: bool,
+}
+
+enum NandInstallEvent {
+    Progress {
+        file_index: usize,
+        file_count: usize,
+        file_name: String,
+        total: usize,
+        processed: usize,
+    },
+    Finished(NandInstallSummary),
+}
 
 /// Upstream `StartGameType` from `yuzu/main.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +257,29 @@ fn render_geometry(x: f32, y: f32, width: f32, height: f32, scale: i32) -> Optio
     })
 }
 
+fn nand_install_results_text(summary: &NandInstallSummary) -> String {
+    let mut lines = Vec::new();
+    if !summary.new_files.is_empty() {
+        lines.push(
+            crate::i18n::tr("%n file(s) were newly installed")
+                .replace("%n", &summary.new_files.len().to_string()),
+        );
+    }
+    if !summary.overwritten_files.is_empty() {
+        lines.push(
+            crate::i18n::tr("%n file(s) were overwritten")
+                .replace("%n", &summary.overwritten_files.len().to_string()),
+        );
+    }
+    if !summary.failed_files.is_empty() {
+        lines.push(
+            crate::i18n::tr("%n file(s) failed to install")
+                .replace("%n", &summary.failed_files.len().to_string()),
+        );
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod render_geometry_tests {
     use super::*;
@@ -251,6 +300,20 @@ mod render_geometry_tests {
             render_geometry(0.0, 24.0, 1280.0, 672.0, 2).unwrap()
         );
         assert_eq!(render_geometry(0.0, 0.0, 0.0, 672.0, 1), None);
+    }
+
+    #[test]
+    fn nand_install_summary_omits_empty_result_classes() {
+        let summary = NandInstallSummary {
+            new_files: vec!["free-update.nsp".to_owned()],
+            overwritten_files: Vec::new(),
+            failed_files: vec!["invalid.nca".to_owned()],
+            detected_base_install: false,
+        };
+        assert_eq!(
+            nand_install_results_text(&summary),
+            "1 file(s) were newly installed\n1 file(s) failed to install"
+        );
     }
 }
 
@@ -1398,6 +1461,14 @@ impl GMainWindow {
     /// game in-process. Mirrors upstream `connect_menu(action_Load_File,
     /// OnMenuLoadFile)` etc., but the handler lives on the window.
     fn register_boot_actions(self: &Rc<Self>, app: &Application) {
+        let install_file_nand = gio::SimpleAction::new("install_file_nand", None);
+        install_file_nand.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.on_menu_install_to_nand()
+        ));
+        app.add_action(&install_file_nand);
+
         let load_file = gio::SimpleAction::new("load_file", None);
         load_file.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
@@ -3122,6 +3193,358 @@ impl GMainWindow {
         *self.configure_dialog.borrow_mut() = Some(dialog);
     }
 
+    /// Upstream `GMainWindow::OnMenuInstallToNAND`: select one or more
+    /// installable containers, confirm the checked subset, then install it.
+    fn on_menu_install_to_nand(self: &Rc<Self>) {
+        if self.session.borrow().is_some() {
+            return;
+        }
+
+        let installable = gtk::FileFilter::new();
+        installable.set_name(Some(&crate::i18n::tr(
+            "Installable Switch File (*.nca *.nsp *.xci)",
+        )));
+        for extension in ["nca", "nsp", "xci"] {
+            installable.add_pattern(&format!("*.{extension}"));
+        }
+        let nca = gtk::FileFilter::new();
+        nca.set_name(Some(&crate::i18n::tr("Nintendo Content Archive (*.nca)")));
+        nca.add_pattern("*.nca");
+        let nsp = gtk::FileFilter::new();
+        nsp.set_name(Some(&crate::i18n::tr(
+            "Nintendo Submission Package (*.nsp)",
+        )));
+        nsp.add_pattern("*.nsp");
+        let xci = gtk::FileFilter::new();
+        xci.set_name(Some(&crate::i18n::tr("NX Cartridge Image (*.xci)")));
+        xci.add_pattern("*.xci");
+
+        let initial_folder = crate::uisettings::with(|values| {
+            (!values.roms_path.is_empty()).then(|| std::path::PathBuf::from(&values.roms_path))
+        });
+        crate::gtk_compat::open_files(
+            Some(&self.window),
+            "Install Files",
+            initial_folder.as_deref(),
+            &[installable.clone(), nca, nsp, xci],
+            Some(&installable),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |files| {
+                    let files = files
+                        .into_iter()
+                        .filter_map(|file| file.path())
+                        .collect::<Vec<_>>();
+                    let Some(first) = files.first() else { return };
+                    let selected_directory = first.parent().map(std::path::Path::to_path_buf);
+                    crate::install_dialog::present(
+                        &this.window,
+                        files,
+                        glib::clone!(
+                            #[weak(rename_to = this)]
+                            this,
+                            move |files| {
+                                if !files.is_empty() {
+                                    if let Some(parent) = selected_directory {
+                                        crate::uisettings::with_mut(|values| {
+                                            values.roms_path = parent.to_string_lossy().into_owned()
+                                        });
+                                        if let Err(error) =
+                                            crate::configuration::qt_config::save_roms_path()
+                                        {
+                                            log::warn!(
+                                                "Could not save the last install directory: {error}"
+                                            );
+                                        }
+                                    }
+                                    this.prepare_nand_install_requests(files);
+                                }
+                            }
+                        ),
+                    );
+                }
+            ),
+        );
+    }
+
+    fn prepare_nand_install_requests(self: &Rc<Self>, files: Vec<std::path::PathBuf>) {
+        let this = Rc::clone(self);
+        glib::MainContext::default().spawn_local(async move {
+            let mut requests = Vec::with_capacity(files.len());
+            for path in files {
+                let is_nsp = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("nsp"));
+                let title_type = if is_nsp {
+                    None
+                } else {
+                    this.select_nca_install_type().await
+                };
+                requests.push(NandInstallRequest { path, title_type });
+            }
+            this.start_nand_installation(requests);
+        });
+    }
+
+    /// The asynchronous GTK equivalent of the title-type selection owned by
+    /// upstream `GMainWindow::InstallNCA`.
+    async fn select_nca_install_type(
+        self: &Rc<Self>,
+    ) -> Option<ruzu_core::file_sys::nca_metadata::TitleType> {
+        use ruzu_core::file_sys::nca_metadata::TitleType;
+
+        const TYPES: [TitleType; 9] = [
+            TitleType::SystemProgram,
+            TitleType::SystemDataArchive,
+            TitleType::SystemUpdate,
+            TitleType::FirmwarePackageA,
+            TitleType::FirmwarePackageB,
+            TitleType::Application,
+            TitleType::Update,
+            TitleType::AOC,
+            TitleType::DeltaTitle,
+        ];
+        let labels = [
+            "System Application",
+            "System Archive",
+            "System Application Update",
+            "Firmware Package (Type A)",
+            "Firmware Package (Type B)",
+            "Game",
+            "Game Update",
+            "Game DLC",
+            "Delta Title",
+        ]
+        .map(crate::i18n::tr);
+        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let choices = gtk::DropDown::from_strings(&label_refs);
+        choices.set_selected(5);
+
+        let dialog = gtk::Dialog::builder()
+            .title(crate::i18n::tr("Select NCA Install Type..."))
+            .modal(true)
+            .transient_for(&self.window)
+            .default_width(440)
+            .build();
+        let content = dialog.content_area();
+        content.set_spacing(8);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+        let description = gtk::Label::new(Some(&crate::i18n::tr(
+            "Please select the type of title you would like to install this NCA as:\n(In most instances, the default 'Game' is fine.)",
+        )));
+        description.set_wrap(true);
+        description.set_xalign(0.0);
+        content.append(&description);
+        content.append(&choices);
+        dialog.add_button(&crate::i18n::tr("Cancel"), gtk::ResponseType::Cancel);
+        dialog.add_button(&crate::i18n::tr("OK"), gtk::ResponseType::Accept);
+
+        let response = dialog.run_future().await;
+        let selected = choices.selected() as usize;
+        dialog.close();
+        if response != gtk::ResponseType::Accept {
+            self.alert(
+                "Failed to Install",
+                "The title type you selected for the NCA is invalid.",
+            );
+            return None;
+        }
+        TYPES.get(selected).copied()
+    }
+
+    fn start_nand_installation(self: &Rc<Self>, requests: Vec<NandInstallRequest>) {
+        if let Some(action) = self
+            .window
+            .application()
+            .and_then(|app| app.lookup_action("install_file_nand"))
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_enabled(false);
+        }
+
+        let (progress, cancelled) =
+            ProgressWindow::new_cancellable(&self.window, "Installing files...");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use frontend_common::content_manager::{self, InstallResult};
+            use ruzu_core::file_sys::romfs_factory::StorageId;
+
+            let vfs = ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+            let mut filesystem =
+                ruzu_core::hle::service::filesystem::filesystem::FileSystemController::new();
+            filesystem.create_factories(Arc::clone(&vfs), false);
+            let file_count = requests.len();
+            let mut summary = NandInstallSummary::default();
+
+            for (file_index, request) in requests.into_iter().enumerate() {
+                let file_name = request
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let progress_sender = sender.clone();
+                let progress_name = file_name.clone();
+                let callback = |total, processed| {
+                    let _ = progress_sender.send(NandInstallEvent::Progress {
+                        file_index,
+                        file_count,
+                        file_name: progress_name.clone(),
+                        total,
+                        processed,
+                    });
+                    cancelled.load(Ordering::Relaxed)
+                };
+                let filename = request.path.to_string_lossy();
+                let is_nsp = request
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("nsp"));
+                let result = if is_nsp {
+                    content_manager::install_nsp(&mut filesystem, &vfs, &filename, &callback)
+                } else if let Some(title_type) = request.title_type {
+                    let storage = if title_type as u8
+                        >= ruzu_core::file_sys::nca_metadata::TitleType::Application as u8
+                    {
+                        StorageId::NandUser
+                    } else {
+                        StorageId::NandSystem
+                    };
+                    filesystem
+                        .get_registered_cache_for_storage(storage)
+                        .map(|cache| {
+                            content_manager::install_nca(
+                                &vfs, &filename, cache, title_type, &callback,
+                            )
+                        })
+                        .unwrap_or(InstallResult::Failure)
+                } else {
+                    InstallResult::Failure
+                };
+
+                match result {
+                    InstallResult::Success => summary.new_files.push(file_name),
+                    InstallResult::Overwrite => summary.overwritten_files.push(file_name),
+                    InstallResult::Failure => summary.failed_files.push(file_name),
+                    InstallResult::BaseInstallAttempted => {
+                        summary.failed_files.push(file_name);
+                        summary.detected_base_install = true;
+                    }
+                }
+            }
+            let _ = sender.send(NandInstallEvent::Finished(summary));
+        });
+
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(50),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(NandInstallEvent::Progress {
+                                file_index,
+                                file_count,
+                                file_name,
+                                total,
+                                processed,
+                            }) => {
+                                let within_file = if total == 0 {
+                                    0.0
+                                } else {
+                                    processed as f64 / total as f64
+                                };
+                                progress.set_fraction(
+                                    (file_index as f64 + within_file) / file_count.max(1) as f64,
+                                );
+                                progress.set_message(&crate::i18n::tr_args(
+                                    "Installing file \"%1\"...",
+                                    &[file_name],
+                                ));
+                                progress.set_title(
+                                    &crate::i18n::tr("%n file(s) remaining").replace(
+                                        "%n",
+                                        &file_count.saturating_sub(file_index).to_string(),
+                                    ),
+                                );
+                            }
+                            Ok(NandInstallEvent::Finished(summary)) => {
+                                progress.close();
+                                this.finish_nand_installation(summary);
+                                return glib::ControlFlow::Break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                progress.close();
+                                if let Some(action) = this
+                                    .window
+                                    .application()
+                                    .and_then(|app| app.lookup_action("install_file_nand"))
+                                    .and_downcast::<gio::SimpleAction>()
+                                {
+                                    action.set_enabled(true);
+                                }
+                                this.alert(
+                                    "Install Results",
+                                    "The installation worker stopped unexpectedly.",
+                                );
+                                return glib::ControlFlow::Break;
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
+    fn finish_nand_installation(self: &Rc<Self>, summary: NandInstallSummary) {
+        let results = nand_install_results_text(&summary);
+        let show_results = {
+            let this = Rc::clone(self);
+            move || {
+                let complete = Rc::clone(&this);
+                this.alert_then("Install Results", &results, move || {
+                    complete.complete_nand_installation()
+                });
+            }
+        };
+        if summary.detected_base_install {
+            self.alert_then(
+                "Install Results",
+                "To avoid possible conflicts, we discourage users from installing base games to the NAND.\nPlease, only use this feature to install updates and DLC.",
+                show_results,
+            );
+        } else {
+            show_results();
+        }
+    }
+
+    fn complete_nand_installation(&self) {
+        crate::util::game::reset_metadata(Some(self.window.upcast_ref()), false);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.reload();
+            game_list.refresh_external_content();
+        }
+        if let Some(action) = self
+            .window
+            .application()
+            .and_then(|app| app.lookup_action("install_file_nand"))
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_enabled(true);
+        }
+    }
+
     /// Upstream `OnMenuLoadFile`: choose a Switch executable, then boot it.
     fn on_menu_load_file(self: &Rc<Self>) {
         let filter = gtk::FileFilter::new();
@@ -4577,11 +5000,26 @@ fn gdk_key_to_switch_key(keyval: gtk::gdk::Key) -> i32 {
 /// it the window would never paint.
 struct ProgressWindow {
     window: gtk::Window,
+    label: gtk::Label,
     bar: gtk::ProgressBar,
 }
 
 impl ProgressWindow {
     fn new(parent: &gtk::ApplicationWindow, message: &str) -> Self {
+        Self::new_with_cancel_flag(parent, message, None)
+    }
+
+    fn new_cancellable(parent: &gtk::ApplicationWindow, message: &str) -> (Self, Arc<AtomicBool>) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let progress = Self::new_with_cancel_flag(parent, message, Some(Arc::clone(&cancelled)));
+        (progress, cancelled)
+    }
+
+    fn new_with_cancel_flag(
+        parent: &gtk::ApplicationWindow,
+        message: &str,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let bar = gtk::ProgressBar::new();
         bar.set_show_text(true);
         bar.set_hexpand(true);
@@ -4595,6 +5033,15 @@ impl ProgressWindow {
         label.set_xalign(0.0);
         content.append(&label);
         content.append(&bar);
+        if let Some(cancelled) = cancelled {
+            let cancel = gtk::Button::with_label(&crate::i18n::tr("Cancel"));
+            cancel.set_halign(gtk::Align::End);
+            cancel.connect_clicked(move |button| {
+                cancelled.store(true, Ordering::Relaxed);
+                button.set_sensitive(false);
+            });
+            content.append(&cancel);
+        }
 
         let window = gtk::Window::builder()
             .title(message)
@@ -4606,9 +5053,17 @@ impl ProgressWindow {
             .build();
         window.present();
 
-        let this = Self { window, bar };
+        let this = Self { window, label, bar };
         this.pump();
         this
+    }
+
+    fn set_title(&self, title: &str) {
+        self.window.set_title(Some(title));
+    }
+
+    fn set_message(&self, message: &str) {
+        self.label.set_text(message);
     }
 
     fn set_fraction(&self, fraction: f64) {
@@ -5074,6 +5529,7 @@ pub fn update_menu_state(app: &Application, emulation_running: bool, is_paused: 
 
     set_enabled("install_firmware_folder", !emulation_running);
     set_enabled("install_firmware_zip", !emulation_running);
+    set_enabled("install_file_nand", !emulation_running);
     set_enabled("install_keys", !emulation_running);
     set_enabled("migration_tool", !emulation_running);
 

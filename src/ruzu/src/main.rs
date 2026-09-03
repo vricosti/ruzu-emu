@@ -29,6 +29,7 @@ mod gui_settings;
 mod homebrew_vfs;
 mod hotkeys;
 mod i18n;
+mod install_dialog;
 mod loading_screen;
 mod main_window;
 mod migration_worker;
@@ -198,6 +199,7 @@ fn main() -> glib::ExitCode {
     let game_dirs = configuration::qt_config::load_game_dirs();
     log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
     uisettings::with_mut(|v| v.game_dirs = game_dirs);
+    configuration::qt_config::load_roms_path();
     configuration::qt_config::load_external_content_dirs();
 
     // Upstream `Config::ReadUIGamelistValues` reads the favorites array in the same

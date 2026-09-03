@@ -7,7 +7,18 @@
 //! (DLC, updates, mods, NSP, NCA) and verifying game integrity.
 
 use ruzu_core::crypto::key_manager::KeyManager;
-use ruzu_core::file_sys::registered_cache::{ContentProvider, RegisteredCache};
+use std::sync::Arc;
+
+use ruzu_core::file_sys::content_archive::NCA;
+use ruzu_core::file_sys::fs_filesystem::OpenMode;
+use ruzu_core::file_sys::nca_metadata::TitleType;
+use ruzu_core::file_sys::registered_cache::{
+    ContentProvider, InstallResult as CacheInstallResult, RegisteredCache,
+};
+use ruzu_core::file_sys::romfs_factory::StorageId;
+use ruzu_core::file_sys::submission_package::NSP;
+use ruzu_core::file_sys::vfs::vfs::VfsFile;
+use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
 use ruzu_core::loader::loader::{AppLoader, ResultStatus};
 use ruzu_core::loader::nca::AppLoaderNca;
@@ -123,13 +134,40 @@ pub fn remove_mod(_program_id: u64, _mod_name: &str) -> bool {
 /// * `filename` - Path to the NSP file.
 /// * `callback` - Callback to report progress. Returns true to cancel.
 ///
-/// NOTE: Requires `Core::System` and VFS; stubbed.
-pub fn install_nsp(_filename: &str, _callback: &dyn Fn(usize, usize) -> bool) -> InstallResult {
-    // NOTE: Full implementation opens the NSP as a VFS partition, iterates its
-    // NCA files and installs them into the system registered cache via
-    // Core::System's content manager.
-    log::warn!("install_nsp: Core::System/VFS not integrated, returning Failure");
-    InstallResult::Failure
+pub fn install_nsp(
+    filesystem: &mut FileSystemController,
+    vfs: &Arc<RealVfsFilesystem>,
+    filename: &str,
+    callback: &(dyn Fn(usize, usize) -> bool + Send + Sync),
+) -> InstallResult {
+    let copy = |src: &dyn VfsFile, dest: &dyn VfsFile, block_size: usize| {
+        copy_with_progress(src, dest, block_size, callback)
+    };
+
+    let Some(file) = vfs.arc_open_file(filename, OpenMode::READ) else {
+        return InstallResult::Failure;
+    };
+    if !file.get_name().to_ascii_lowercase().ends_with("nsp") {
+        return InstallResult::Failure;
+    }
+
+    let nsp = NSP::new(file, 0, 0);
+    if nsp.is_extracted_type()
+        || nsp.get_status() != ruzu_core::file_sys::partition_filesystem::ResultStatus::Success
+    {
+        return InstallResult::Failure;
+    }
+
+    let Some(registered_cache) = filesystem.get_registered_cache_for_storage(StorageId::NandUser)
+    else {
+        return InstallResult::Failure;
+    };
+    match registered_cache.install_entry_nsp(&nsp, true, &copy) {
+        CacheInstallResult::Success => InstallResult::Success,
+        CacheInstallResult::OverwriteExisting => InstallResult::Overwrite,
+        CacheInstallResult::ErrorBaseInstall => InstallResult::BaseInstallAttempted,
+        _ => InstallResult::Failure,
+    }
 }
 
 /// Installs an NCA.
@@ -140,10 +178,60 @@ pub fn install_nsp(_filename: &str, _callback: &dyn Fn(usize, usize) -> bool) ->
 /// * `filename` - Path to the NCA file.
 /// * `callback` - Callback to report progress. Returns true to cancel.
 ///
-/// NOTE: Requires VFS and RegisteredCache; stubbed.
-pub fn install_nca(_filename: &str, _callback: &dyn Fn(usize, usize) -> bool) -> InstallResult {
-    log::warn!("install_nca: VFS and RegisteredCache not integrated, returning Failure");
-    InstallResult::Failure
+pub fn install_nca(
+    vfs: &Arc<RealVfsFilesystem>,
+    filename: &str,
+    registered_cache: &mut RegisteredCache,
+    title_type: TitleType,
+    callback: &(dyn Fn(usize, usize) -> bool + Send + Sync),
+) -> InstallResult {
+    let copy = |src: &dyn VfsFile, dest: &dyn VfsFile, block_size: usize| {
+        copy_with_progress(src, dest, block_size, callback)
+    };
+
+    let Some(file) = vfs.arc_open_file(filename, OpenMode::READ) else {
+        return InstallResult::Failure;
+    };
+    let nca = NCA::new(file, None);
+    if !matches!(
+        nca.get_status(),
+        ruzu_core::file_sys::partition_filesystem::ResultStatus::Success
+            | ruzu_core::file_sys::partition_filesystem::ResultStatus::ErrorMissingBKTRBaseRomFS
+    ) {
+        return InstallResult::Failure;
+    }
+
+    match registered_cache.install_entry_nca(&nca, title_type, true, &copy) {
+        CacheInstallResult::Success => InstallResult::Success,
+        CacheInstallResult::OverwriteExisting => InstallResult::Overwrite,
+        _ => InstallResult::Failure,
+    }
+}
+
+/// The identical raw-copy lambda used by upstream `InstallNSP` and
+/// `InstallNCA`, kept in their owning module while avoiding two independent
+/// Rust copies of the same mechanical adaptation.
+fn copy_with_progress(
+    src: &dyn VfsFile,
+    dest: &dyn VfsFile,
+    _block_size: usize,
+    callback: &(dyn Fn(usize, usize) -> bool + Send + Sync),
+) -> bool {
+    if !dest.resize(src.get_size()) {
+        return false;
+    }
+
+    const COPY_BUFFER_SIZE: usize = 1024 * 1024;
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+    for offset in (0..src.get_size()).step_by(COPY_BUFFER_SIZE) {
+        if callback(src.get_size(), offset) {
+            dest.resize(0);
+            return false;
+        }
+        let read = src.read(&mut buffer, COPY_BUFFER_SIZE, offset);
+        dest.write(&buffer, read, offset);
+    }
+    true
 }
 
 /// Verifies the installed contents.
@@ -266,6 +354,8 @@ pub fn are_keys_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruzu_core::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Mutex;
 
     #[test]
     fn test_install_result_values() {
@@ -286,5 +376,44 @@ mod tests {
             GameVerificationResult::Failed,
             GameVerificationResult::NotImplemented
         );
+    }
+
+    #[test]
+    fn install_copy_reports_each_mebibyte_and_preserves_bytes() {
+        let data = (0..(1024 * 1024 + 17))
+            .map(|offset| (offset % 251) as u8)
+            .collect::<Vec<_>>();
+        let source = VectorVfsFile::new(data.clone(), "source.nsp".to_owned(), None);
+        let destination = VectorVfsFile::new(Vec::new(), "destination.nca".to_owned(), None);
+        let progress = Mutex::new(Vec::new());
+
+        assert!(copy_with_progress(
+            &source,
+            &destination,
+            0x1000,
+            &|total, current| {
+                progress.lock().unwrap().push((total, current));
+                false
+            },
+        ));
+        assert_eq!(destination.read_all_bytes(), data);
+        assert_eq!(
+            *progress.lock().unwrap(),
+            vec![(1024 * 1024 + 17, 0), (1024 * 1024 + 17, 1024 * 1024)]
+        );
+    }
+
+    #[test]
+    fn cancelled_install_copy_truncates_partial_destination() {
+        let source = VectorVfsFile::new(vec![0x5a; 1024 * 1024 + 1], "source.nsp".to_owned(), None);
+        let destination = VectorVfsFile::new(Vec::new(), "destination.nca".to_owned(), None);
+
+        assert!(!copy_with_progress(
+            &source,
+            &destination,
+            0x1000,
+            &|_, current| current != 0,
+        ));
+        assert_eq!(destination.get_size(), 0);
     }
 }

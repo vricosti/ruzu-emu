@@ -7,8 +7,8 @@
 //
 // The window-dependent File actions (Load File / Load Folder → in-process boot)
 // live on `GMainWindow` (see `main_window.rs`), since they need the render
-// surface, loading screen, and stack. The remaining stubs (Install Files to
-// NAND, Load/Remove Amiibo, Recent Files) keep their logging placeholders.
+// surface, loading screen, and stack. Recent Files remains a dynamic menu
+// placeholder.
 
 use gtk::prelude::*;
 use gtk::{gio, glib, Application};

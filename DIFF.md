@@ -19699,3 +19699,117 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: the registry contains frontend strings and flags only; it does not cross a guest ABI.
+
+## 2026-09-03 — `src/frontend_common/src/content_manager.rs` vs Eden `src/frontend_common/content_manager.h`
+
+### Intentional differences
+
+- `install_nsp` receives the launcher's `FileSystemController` directly instead of a complete
+  `Core::System`; the idle GTK frontend does not retain a booted system, while the controller owns
+  the same User NAND `RegisteredCache` used by upstream.
+- The duplicated upstream raw-copy lambdas are represented by one mechanical private helper in the
+  same module. It retains the 1 MiB buffer, callback order, partial-output truncation on cancel, and
+  ignored VFS write result exactly.
+- Installation callbacks require `Send + Sync` because the GTK frontend performs disk work on its
+  install worker rather than capturing GUI objects in the copy callback.
+
+### Unintentional differences (to fix)
+
+- None in `install_nsp` or `install_nca`.
+
+### Missing items
+
+- The pre-existing `remove_dlc`, `remove_all_dlc`, `remove_update`, `remove_base_content`,
+  `remove_mod`, and `verify_game_contents` stubs remain outside this installation slice.
+
+### Binary layout verification
+
+- PASS: installation copies opaque VFS bytes; the implementation introduces no serialized struct.
+
+## 2026-09-03 — `src/ruzu/src/install_dialog.rs` vs Eden `src/yuzu/install_dialog.{h,cpp}`
+
+### Intentional differences
+
+- GTK returns the checked paths through a response callback instead of Qt's blocking `exec()` and
+  `GetFiles()` call. Every selected file is still checked initially and only checked paths are
+  returned.
+- A scrolling `GtkListBox` with a fixed initial dialog size replaces Qt's list-column size hint and
+  `GetMinimumWidth`; this is toolkit layout mechanics only.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: this dialog owns only host paths and widgets.
+
+## 2026-09-03 — `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` (`OnMenuInstallToNAND`, `InstallNCA`)
+
+### Intentional differences
+
+- GTK's asynchronous chooser and dialogs collect NCA title-type choices before showing progress;
+  Eden obtains each choice inside its blocking install loop. File order, default `Game` selection,
+  title-type mapping, NAND selection, and per-file result classification remain the same.
+- Ruzu runs the complete install batch on a worker and polls progress on the GTK main loop. Eden
+  uses `QtConcurrent` only for NSP files and installs NCA files synchronously; keeping VFS work off
+  GTK avoids retaining GUI borrows across the copy callback without changing install ordering.
+- Progress uses exact per-file byte fractions instead of Eden's integer count of 1 MiB callback
+  steps. Cancellation is still observed at the same copy-block boundaries.
+
+### Unintentional differences (to fix)
+
+- None in the wired install action.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: the frontend passes paths, enum values, progress counters, and result classifications; no
+  guest ABI payload is involved.
+
+## 2026-09-03 — `src/ruzu/src/{uisettings.rs,configuration/qt_config.rs}` vs Eden `src/qt_common/config/{uisettings.h,qt_config.cpp}` (`roms_path`)
+
+### Intentional differences
+
+- The plain `roms_path` value is loaded and saved by focused Rust functions rather than as part of
+  Qt's monolithic `ReadPathValues` / `SavePathValues` pass. Its `Paths\\romsPath` key, default
+  marker, and update-after-confirmation ordering match upstream.
+
+### Unintentional differences (to fix)
+
+- None in `roms_path` persistence.
+
+### Missing items
+
+- None in this setting slice.
+
+### Binary layout verification
+
+- PASS: `roms_path` is an INI string and does not cross a binary ABI.
+
+## 2026-09-03 — `src/ruzu/src/gtk_compat.rs` vs Eden `src/yuzu/main_window.cpp` (`QFileDialog::getOpenFileNames`)
+
+### Intentional differences
+
+- `GtkFileChooserNative` with `select_multiple=true` replaces Qt's static multi-file chooser and
+  reports its `GFile` list asynchronously. Filters, initial folder, modality, acceptance, and
+  cancellation semantics are preserved.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: the adapter returns host filesystem handles only.

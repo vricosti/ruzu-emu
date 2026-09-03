@@ -308,6 +308,58 @@ pub fn open_file<P: IsA<gtk::Window>>(
     });
 }
 
+/// Open a native multi-file chooser. This is the pre-4.10 counterpart of
+/// `FileDialog::open_multiple` and the GTK equivalent of Qt's
+/// `QFileDialog::getOpenFileNames`.
+pub fn open_files<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    title: &str,
+    initial_folder: Option<&std::path::Path>,
+    filters: &[gtk::FileFilter],
+    default_filter: Option<&gtk::FileFilter>,
+    callback: impl FnOnce(Vec<gio::File>) + 'static,
+) {
+    let title = crate::i18n::tr(title);
+    let dialog = gtk::FileChooserNative::new(
+        Some(&title),
+        parent,
+        FileChooserAction::Open,
+        Some(&crate::i18n::tr("Open")),
+        Some(&crate::i18n::tr("Cancel")),
+    );
+    dialog.set_modal(true);
+    dialog.set_select_multiple(true);
+    for filter in filters {
+        dialog.add_filter(filter);
+    }
+    if let Some(filter) = default_filter {
+        dialog.set_filter(filter);
+    }
+    if let Some(initial_folder) = initial_folder {
+        if let Err(error) = dialog.set_current_folder(Some(&gio::File::for_path(initial_folder))) {
+            log::debug!(
+                "Could not select initial file-chooser folder {}: {error}",
+                initial_folder.display()
+            );
+        }
+    }
+
+    let keep_alive = dialog.clone();
+    dialog.run_async(move |dialog, response| {
+        let files = if response == ResponseType::Accept {
+            let model = dialog.files();
+            (0..model.n_items())
+                .filter_map(|index| model.item(index)?.downcast::<gio::File>().ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        dialog.destroy();
+        drop(keep_alive);
+        callback(files);
+    });
+}
+
 /// Open a native save-file chooser and return the selected file, or `None`
 /// when cancelled. This is the pre-4.10 counterpart of `FileDialog::save`.
 #[cfg(target_os = "windows")]

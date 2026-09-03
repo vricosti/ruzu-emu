@@ -256,6 +256,13 @@ pub fn load_ui_language() {
     uisettings::with_mut(|values| values.language.set_value(language));
 }
 
+/// Read `UISettings::values.roms_path` from upstream `QtConfig::ReadPathValues`.
+pub fn load_roms_path() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let roms_path = read_ui_string_setting(&contents, "Paths\\romsPath", "");
+    uisettings::with_mut(|values| values.roms_path = roms_path);
+}
+
 /// Read upstream's checkable `View` action state from `Category::Ui`.
 pub fn load_view_values() {
     let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
@@ -524,6 +531,19 @@ pub fn save_ui_language() -> io::Result<()> {
     let contents = std::fs::read_to_string(&path).unwrap_or_default();
     let language = uisettings::with(|values| values.language.get_value().clone());
     let updated = replace_ui_string_setting(&contents, "Paths\\language", &language, "");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
+}
+
+/// Persist `UISettings::values.roms_path` through upstream
+/// `QtConfig::SavePathValues`'s `romsPath` key.
+pub fn save_roms_path() -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let roms_path = uisettings::with(|values| values.roms_path.clone());
+    let updated = replace_ui_string_setting(&contents, "Paths\\romsPath", &roms_path, "");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1658,6 +1678,22 @@ mod tests {
         assert!(updated.contains("Paths\\language=ja_JP"));
         assert!(updated.contains("[System]\nlanguage_index=2"));
         assert_eq!(updated.matches("Paths\\language=").count(), 1);
+    }
+
+    #[test]
+    fn roms_path_uses_upstream_paths_key_and_default_marker() {
+        let updated = replace_ui_string_setting(
+            "[UI]\nPaths\\language=en\n",
+            "Paths\\romsPath",
+            "/games/homebrew",
+            "",
+        );
+        assert_eq!(
+            read_ui_string_setting(&updated, "Paths\\romsPath", ""),
+            "/games/homebrew"
+        );
+        assert!(updated.contains("Paths\\romsPath\\default=false"));
+        assert_eq!(updated.matches("Paths\\romsPath=").count(), 1);
     }
 
     /// Upstream defaults `player.connected` to `player_index == 0`, and applies

@@ -847,7 +847,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF210_0110,
-                id: ArmInstId::ASIMD_VBIC_reg,
+                id: ArmInstId::AsimdVbicReg,
             },
             arm_asimd_vbic_reg,
         );
@@ -860,7 +860,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF310_0110,
-                id: ArmInstId::ASIMD_VBSL,
+                id: ArmInstId::AsimdVbsl,
             },
             arm_asimd_vbsl,
         );
@@ -875,14 +875,14 @@ mod tests {
         let vbit = translate_with(
             DecodedArm {
                 raw: 0xF320_0110,
-                id: ArmInstId::ASIMD_VBIT,
+                id: ArmInstId::AsimdVbit,
             },
             arm_asimd_vbit,
         );
         let vbif = translate_with(
             DecodedArm {
                 raw: 0xF330_0110,
-                id: ArmInstId::ASIMD_VBIF,
+                id: ArmInstId::AsimdVbif,
             },
             arm_asimd_vbif,
         );
@@ -895,14 +895,14 @@ mod tests {
         let vabd = translate_with(
             DecodedArm {
                 raw: 0xF200_0700,
-                id: ArmInstId::ASIMD_VABD_int,
+                id: ArmInstId::AsimdVabdInt,
             },
             arm_asimd_vabd_int,
         );
         let vaba = translate_with(
             DecodedArm {
                 raw: 0xF200_0710,
-                id: ArmInstId::ASIMD_VABA,
+                id: ArmInstId::AsimdVaba,
             },
             arm_asimd_vaba,
         );
@@ -916,7 +916,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF320_0D00,
-                id: ArmInstId::ASIMD_VABD_float,
+                id: ArmInstId::AsimdVabdFloat,
             },
             arm_asimd_vabd_float,
         );
@@ -929,7 +929,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF300_0300,
-                id: ArmInstId::ASIMD_VCGT_reg_int,
+                id: ArmInstId::AsimdVcgtRegInt,
             },
             arm_asimd_vcgt_reg_int,
         );

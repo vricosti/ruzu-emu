@@ -256,10 +256,10 @@ mod tests {
     use crate::ir::value::Value;
 
     const PATTERNS: &[(u32, u32, Thumb32InstId)] = &[
-        (0xffe0_f0f0, 0xfa00_f000, Thumb32InstId::LSL_reg),
-        (0xffe0_f0f0, 0xfa20_f000, Thumb32InstId::LSR_reg),
-        (0xffe0_f0f0, 0xfa40_f000, Thumb32InstId::ASR_reg),
-        (0xffe0_f0f0, 0xfa60_f000, Thumb32InstId::ROR_reg),
+        (0xffe0_f0f0, 0xfa00_f000, Thumb32InstId::LslReg),
+        (0xffe0_f0f0, 0xfa20_f000, Thumb32InstId::LsrReg),
+        (0xffe0_f0f0, 0xfa40_f000, Thumb32InstId::AsrReg),
+        (0xffe0_f0f0, 0xfa60_f000, Thumb32InstId::RorReg),
         (0xffff_f0c0, 0xfa0f_f080, Thumb32InstId::SXTH),
         (0xfff0_f0c0, 0xfa00_f080, Thumb32InstId::SXTAH),
         (0xffff_f0c0, 0xfa1f_f080, Thumb32InstId::UXTH),

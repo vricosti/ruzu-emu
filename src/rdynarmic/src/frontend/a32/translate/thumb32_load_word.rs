@@ -190,7 +190,7 @@ mod tests {
         let location = thumb_location(0x1002, 0);
         let mut block = Block::new(location.to_location());
         let inst = decode_thumb32(0xF8DF, 0x2004);
-        assert_eq!(inst.id, Thumb32InstId::LDR_lit);
+        assert_eq!(inst.id, Thumb32InstId::LdrLit);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(thumb32_ldr_lit(&mut ir, &inst));
@@ -205,7 +205,7 @@ mod tests {
         let location = thumb_location(0x1002, 0);
         let mut block = Block::new(location.to_location());
         let inst = decode_thumb32(0xF85F, 0xF004);
-        assert_eq!(inst.id, Thumb32InstId::LDR_lit);
+        assert_eq!(inst.id, Thumb32InstId::LdrLit);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(!thumb32_ldr_lit(&mut ir, &inst));
@@ -222,11 +222,11 @@ mod tests {
         for (raw, id, translate) in [
             (
                 0xF8DF_F004,
-                Thumb32InstId::LDR_lit,
+                Thumb32InstId::LdrLit,
                 thumb32_ldr_lit as fn(&mut A32IREmitter<'_>, &DecodedThumb32) -> bool,
             ),
-            (0xF8D1_F004, Thumb32InstId::LDR_imm_t3, thumb32_ldr_imm12),
-            (0xF851_F003, Thumb32InstId::LDR_reg, thumb32_ldr_reg),
+            (0xF8D1_F004, Thumb32InstId::LdrImmT3, thumb32_ldr_imm12),
+            (0xF851_F003, Thumb32InstId::LdrReg, thumb32_ldr_reg),
         ] {
             let location = thumb_location(0x1000, 0x0c);
             let mut block = Block::new(location.to_location());
@@ -243,7 +243,7 @@ mod tests {
     fn register_load_preserves_rm_then_rn_order_and_zero_shift() {
         let location = thumb_location(0x1000, 0);
         let mut block = Block::new(location.to_location());
-        let inst = decoded(0xF851_2003, Thumb32InstId::LDR_reg);
+        let inst = decoded(0xF851_2003, Thumb32InstId::LdrReg);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(thumb32_ldr_reg(&mut ir, &inst));
@@ -278,7 +278,7 @@ mod tests {
         ] {
             let location = thumb_location(0x1000, if raw >> 12 & 0xf == 0xf { 0x0c } else { 0 });
             let mut block = Block::new(location.to_location());
-            let inst = decoded(raw, Thumb32InstId::LDR_imm_t4);
+            let inst = decoded(raw, Thumb32InstId::LdrImmT4);
             {
                 let mut ir = A32IREmitter::with_location(&mut block, location);
                 assert!(!thumb32_ldr_imm8(&mut ir, &inst));
@@ -291,7 +291,7 @@ mod tests {
     fn pop_load_writes_back_before_pc_and_sets_rsb_hint() {
         let location = thumb_location(0x1000, 0);
         let mut block = Block::new(location.to_location());
-        let inst = decoded(0xF85D_FB04, Thumb32InstId::LDR_imm_t4);
+        let inst = decoded(0xF85D_FB04, Thumb32InstId::LdrImmT4);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(!thumb32_ldr_imm8(&mut ir, &inst));

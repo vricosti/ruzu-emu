@@ -216,6 +216,7 @@ fn first_pcs_lengths() -> &'static [std::sync::atomic::AtomicUsize; 16] {
 /// PC equals the most recently captured one (cheap consecutive-dedup) so the
 /// fixed-cap buffer doesn't fill up with `0xADDR ×N` from a hot self-cold-
 /// entered loop. Not a full dedup — non-adjacent repeats still appear.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn record_first_pc(core_index: usize, pc: u64) {
     let cap = first_pcs_capacity();
     if cap == 0 {
@@ -394,6 +395,7 @@ pub fn a32_pc_trace_target() -> Option<u64> {
 }
 
 /// Aggregated capture state: per-(r6 value) hit counts + last seen GPR snapshot.
+#[cfg(target_arch = "x86_64")]
 struct A32PcTraceAgg {
     total: u64,
     by_tag: std::collections::HashMap<u64, u64>,
@@ -408,6 +410,7 @@ struct A32PcTraceAgg {
     last: [u32; 16],
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_agg() -> &'static std::sync::Mutex<A32PcTraceAgg> {
     use std::sync::OnceLock;
     static AGG: OnceLock<std::sync::Mutex<A32PcTraceAgg>> = OnceLock::new();
@@ -434,6 +437,7 @@ fn a32_pc_trace_agg() -> &'static std::sync::Mutex<A32PcTraceAgg> {
 /// `(r0, r1, r2, r3, r4, r5, lr)` tuples for calls that return to LR. This is
 /// useful for PLT/helper targets such as `__aeabi_ldivmod`, where the caller
 /// PC identifies the site and the arguments are the real signal.
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_lr_filter() -> Option<u32> {
     use std::sync::OnceLock;
     static LR: OnceLock<Option<u32>> = OnceLock::new();
@@ -471,6 +475,7 @@ pub fn a32_pc_trace_after_insts() -> &'static Vec<usize> {
 /// Optional guest-memory probe spec from RUZU_A32_PC_TRACE_MEM:
 /// "BASEREG+OFF[,...]" where BASEREG is r0..r15 (e.g. "r8+0x54,r8+0x40").
 /// Read via fastmem_base (passed from the JIT's R13) so we see live object state.
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_mem_probes() -> &'static Vec<(usize, i64)> {
     use std::sync::OnceLock;
     static P: OnceLock<Vec<(usize, i64)>> = OnceLock::new();
@@ -515,6 +520,7 @@ fn a32_pc_trace_mem_probes() -> &'static Vec<(usize, i64)> {
 /// directly from fastmem at the same hook point as the GPR snapshot, which lets
 /// us distinguish "guest memory changed" from "the emitted load/register state
 /// is corrupt" without adding per-SVC dumps.
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_abs_mem_probes() -> &'static Vec<(u64, usize)> {
     use std::sync::OnceLock;
     static P: OnceLock<Vec<(u64, usize)>> = OnceLock::new();
@@ -546,6 +552,7 @@ fn a32_pc_trace_abs_mem_probes() -> &'static Vec<(u64, usize)> {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_first_hits() -> u64 {
     use std::sync::OnceLock;
     static N: OnceLock<u64> = OnceLock::new();
@@ -557,6 +564,7 @@ fn a32_pc_trace_first_hits() -> u64 {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn parse_optional_u32_env(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|s| {
         let s = s.trim();
@@ -570,42 +578,49 @@ fn parse_optional_u32_env(name: &str) -> Option<u32> {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_r0() -> Option<u32> {
     use std::sync::OnceLock;
     static VALUE: OnceLock<Option<u32>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_optional_u32_env("RUZU_A32_PC_TRACE_MATCH_R0"))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_r1() -> Option<u32> {
     use std::sync::OnceLock;
     static VALUE: OnceLock<Option<u32>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_optional_u32_env("RUZU_A32_PC_TRACE_MATCH_R1"))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_r2() -> Option<u32> {
     use std::sync::OnceLock;
     static VALUE: OnceLock<Option<u32>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_optional_u32_env("RUZU_A32_PC_TRACE_MATCH_R2"))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_r3() -> Option<u32> {
     use std::sync::OnceLock;
     static VALUE: OnceLock<Option<u32>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_optional_u32_env("RUZU_A32_PC_TRACE_MATCH_R3"))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_r10() -> Option<u32> {
     use std::sync::OnceLock;
     static VALUE: OnceLock<Option<u32>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_optional_u32_env("RUZU_A32_PC_TRACE_MATCH_R10"))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_r11() -> Option<u32> {
     use std::sync::OnceLock;
     static VALUE: OnceLock<Option<u32>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_optional_u32_env("RUZU_A32_PC_TRACE_MATCH_R11"))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_log_limit() -> u64 {
     use std::sync::OnceLock;
     static N: OnceLock<u64> = OnceLock::new();
@@ -617,6 +632,7 @@ fn a32_pc_trace_match_log_limit() -> u64 {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn a32_pc_trace_match_count() -> &'static std::sync::atomic::AtomicU64 {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     &COUNT
@@ -626,6 +642,7 @@ fn a32_pc_trace_match_count() -> &'static std::sync::atomic::AtomicU64 {
 /// `jit_state_ptr` = A32JitState (R15); `fastmem_base` = R13 (guest→host base).
 /// Reads the 16 GPRs, tallies r0/r6, and (if RUZU_A32_PC_TRACE_MEM set) reads
 /// guest memory at [rN+off] via fastmem_base. Buffered aggregate; no per-hit I/O.
+#[cfg(target_arch = "x86_64")]
 pub(crate) extern "C" fn a32_pc_trace_hook(jit_state_ptr: u64, fastmem_base: u64, tag: u64) {
     if a32_pc_trace_target().is_none() {
         return;
@@ -893,6 +910,7 @@ pub(crate) extern "C" fn a32_pc_trace_hook(jit_state_ptr: u64, fastmem_base: u64
 /// Called from env-gated A32 fastmem-write instrumentation when a direct store
 /// hits RUZU_TRACE_FASTMEM_W_RANGE. This catches writes that bypass the normal
 /// memory_write_* callbacks.
+#[cfg(target_arch = "x86_64")]
 pub(crate) extern "C" fn a32_fastmem_write_trace_hook(
     jit_state_ptr: u64,
     block_pc: u64,
@@ -925,6 +943,7 @@ pub(crate) extern "C" fn a32_fastmem_write_trace_hook(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn watch_write_target() -> Option<(u64, u64)> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
@@ -941,6 +960,7 @@ pub(crate) fn watch_write_target() -> Option<(u64, u64)> {
 }
 
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn block_trace_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();

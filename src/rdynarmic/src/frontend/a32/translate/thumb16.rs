@@ -17,73 +17,73 @@ pub fn translate_thumb16(
     use Thumb16InstId::*;
     match inst.id {
         // Shift immediate
-        LSL_imm => thumb16_lsl_imm(ir, inst),
-        LSR_imm => thumb16_lsr_imm(ir, inst),
-        ASR_imm => thumb16_asr_imm(ir, inst),
+        LslImm => thumb16_lsl_imm(ir, inst),
+        LsrImm => thumb16_lsr_imm(ir, inst),
+        AsrImm => thumb16_asr_imm(ir, inst),
 
         // Add/Sub
-        ADD_reg_t1 => thumb16_add_reg(ir, inst),
-        SUB_reg => thumb16_sub_reg(ir, inst),
-        ADD_imm_t1 => thumb16_add_imm3(ir, inst),
-        SUB_imm_t1 => thumb16_sub_imm3(ir, inst),
-        MOV_imm => thumb16_mov_imm(ir, inst),
-        CMP_imm => thumb16_cmp_imm(ir, inst),
-        ADD_imm_t2 => thumb16_add_imm8(ir, inst),
-        SUB_imm_t2 => thumb16_sub_imm8(ir, inst),
+        AddRegT1 => thumb16_add_reg(ir, inst),
+        SubReg => thumb16_sub_reg(ir, inst),
+        AddImmT1 => thumb16_add_imm3(ir, inst),
+        SubImmT1 => thumb16_sub_imm3(ir, inst),
+        MovImm => thumb16_mov_imm(ir, inst),
+        CmpImm => thumb16_cmp_imm(ir, inst),
+        AddImmT2 => thumb16_add_imm8(ir, inst),
+        SubImmT2 => thumb16_sub_imm8(ir, inst),
 
         // Data processing
-        AND_reg => thumb16_and_reg(ir, inst),
-        EOR_reg => thumb16_eor_reg(ir, inst),
-        LSL_reg => thumb16_lsl_reg(ir, inst),
-        LSR_reg => thumb16_lsr_reg(ir, inst),
-        ASR_reg => thumb16_asr_reg(ir, inst),
-        ADC_reg => thumb16_adc_reg(ir, inst),
-        SBC_reg => thumb16_sbc_reg(ir, inst),
-        ROR_reg => thumb16_ror_reg(ir, inst),
-        TST_reg => thumb16_tst_reg(ir, inst),
-        RSB_imm => thumb16_rsb_imm(ir, inst),
-        CMP_reg_t1 => thumb16_cmp_reg(ir, inst),
-        CMN_reg => thumb16_cmn_reg(ir, inst),
-        ORR_reg => thumb16_orr_reg(ir, inst),
-        MUL_reg => thumb16_mul_reg(ir, inst),
-        BIC_reg => thumb16_bic_reg(ir, inst),
-        MVN_reg => thumb16_mvn_reg(ir, inst),
+        AndReg => thumb16_and_reg(ir, inst),
+        EorReg => thumb16_eor_reg(ir, inst),
+        LslReg => thumb16_lsl_reg(ir, inst),
+        LsrReg => thumb16_lsr_reg(ir, inst),
+        AsrReg => thumb16_asr_reg(ir, inst),
+        AdcReg => thumb16_adc_reg(ir, inst),
+        SbcReg => thumb16_sbc_reg(ir, inst),
+        RorReg => thumb16_ror_reg(ir, inst),
+        TstReg => thumb16_tst_reg(ir, inst),
+        RsbImm => thumb16_rsb_imm(ir, inst),
+        CmpRegT1 => thumb16_cmp_reg(ir, inst),
+        CmnReg => thumb16_cmn_reg(ir, inst),
+        OrrReg => thumb16_orr_reg(ir, inst),
+        MulReg => thumb16_mul_reg(ir, inst),
+        BicReg => thumb16_bic_reg(ir, inst),
+        MvnReg => thumb16_mvn_reg(ir, inst),
 
         // Special data
-        ADD_reg_t2 => thumb16_add_reg_t2(ir, inst),
-        CMP_reg_t2 => thumb16_cmp_reg_t2(ir, inst),
-        MOV_reg => thumb16_mov_reg(ir, inst),
+        AddRegT2 => thumb16_add_reg_t2(ir, inst),
+        CmpRegT2 => thumb16_cmp_reg_t2(ir, inst),
+        MovReg => thumb16_mov_reg(ir, inst),
 
         // Branch
         BX => thumb16_bx(ir, inst.rm_hi()),
-        BLX_reg => thumb16_blx_reg(ir, inst),
-        B_t1 => thumb16_b_cond(ir, inst),
-        B_t2 => thumb16_b_uncond(ir, inst),
+        BlxReg => thumb16_blx_reg(ir, inst),
+        BT1 => thumb16_b_cond(ir, inst),
+        BT2 => thumb16_b_uncond(ir, inst),
 
         // Load/Store
-        LDR_literal => thumb16_ldr_literal(ir, inst),
-        LDR_reg => thumb16_ldr_reg(ir, inst),
-        LDR_imm_t1 => thumb16_ldr_imm_t1(ir, inst),
-        LDR_imm_t2 => thumb16_ldr_imm_t2(ir, inst),
-        STR_reg => thumb16_str_reg(ir, inst),
-        STR_imm_t1 => thumb16_str_imm_t1(ir, inst),
-        STR_imm_t2 => thumb16_str_imm_t2(ir, inst),
-        LDRB_reg => thumb16_ldrb_reg(ir, inst),
-        LDRB_imm => thumb16_ldrb_imm(ir, inst),
-        STRB_reg => thumb16_strb_reg(ir, inst),
-        STRB_imm => thumb16_strb_imm(ir, inst),
-        LDRH_reg => thumb16_ldrh_reg(ir, inst),
-        LDRH_imm => thumb16_ldrh_imm(ir, inst),
-        STRH_reg => thumb16_strh_reg(ir, inst),
-        STRH_imm => thumb16_strh_imm(ir, inst),
-        LDRSB_reg => thumb16_ldrsb_reg(ir, inst),
-        LDRSH_reg => thumb16_ldrsh_reg(ir, inst),
+        LdrLiteral => thumb16_ldr_literal(ir, inst),
+        LdrReg => thumb16_ldr_reg(ir, inst),
+        LdrImmT1 => thumb16_ldr_imm_t1(ir, inst),
+        LdrImmT2 => thumb16_ldr_imm_t2(ir, inst),
+        StrReg => thumb16_str_reg(ir, inst),
+        StrImmT1 => thumb16_str_imm_t1(ir, inst),
+        StrImmT2 => thumb16_str_imm_t2(ir, inst),
+        LdrbReg => thumb16_ldrb_reg(ir, inst),
+        LdrbImm => thumb16_ldrb_imm(ir, inst),
+        StrbReg => thumb16_strb_reg(ir, inst),
+        StrbImm => thumb16_strb_imm(ir, inst),
+        LdrhReg => thumb16_ldrh_reg(ir, inst),
+        LdrhImm => thumb16_ldrh_imm(ir, inst),
+        StrhReg => thumb16_strh_reg(ir, inst),
+        StrhImm => thumb16_strh_imm(ir, inst),
+        LdrsbReg => thumb16_ldrsb_reg(ir, inst),
+        LdrshReg => thumb16_ldrsh_reg(ir, inst),
 
         // Address generation
         ADR => thumb16_adr(ir, inst),
-        ADD_sp_t1 => thumb16_add_sp_imm_t1(ir, inst),
-        ADD_sp_t2 => thumb16_add_sp_imm_t2(ir, inst),
-        SUB_sp => thumb16_sub_sp(ir, inst),
+        AddSpT1 => thumb16_add_sp_imm_t1(ir, inst),
+        AddSpT2 => thumb16_add_sp_imm_t2(ir, inst),
+        SubSp => thumb16_sub_sp(ir, inst),
 
         // Extensions
         SXTH => thumb16_sxth(ir, inst),
@@ -125,7 +125,7 @@ pub fn translate_thumb16(
         IT => thumb16_it(ir, inst),
 
         // CBZ/CBNZ
-        CBZ_CBNZ => thumb16_cbz_cbnz(ir, inst),
+        CbzCbnz => thumb16_cbz_cbnz(ir, inst),
 
         SETEND | CPS => true, // Privileged, ignore
         Unknown => super::raise_exception_with_instruction_size(
@@ -896,7 +896,7 @@ fn thumb16_uxtb(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 // --- Load/Store multiple ---
 
 fn thumb16_push(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
-    let mut reglist = inst.register_list() as u16;
+    let mut reglist = inst.register_list();
     let lr_bit = (inst.raw >> 8) & 1 != 0;
     if lr_bit {
         reglist |= 1 << 14;
@@ -927,7 +927,7 @@ fn thumb16_push(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 }
 
 fn thumb16_pop(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
-    let mut reglist = inst.register_list() as u16;
+    let mut reglist = inst.register_list();
     let pc_bit = (inst.raw >> 8) & 1 != 0;
     if pc_bit {
         reglist |= 1 << 15;
@@ -962,7 +962,7 @@ fn thumb16_pop(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 
 fn thumb16_stmia(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn = inst.rt_hi();
-    let reglist = inst.register_list() as u16;
+    let reglist = inst.register_list();
 
     let base = ir.get_register(rn);
     let mut addr = base;
@@ -986,7 +986,7 @@ fn thumb16_stmia(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 
 fn thumb16_ldmia(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
     let rn = inst.rt_hi();
-    let reglist = inst.register_list() as u16;
+    let reglist = inst.register_list();
 
     let base = ir.get_register(rn);
     let mut addr = base;
@@ -1173,7 +1173,7 @@ mod tests {
             &mut A32IREmitter::with_location(&mut logical, loc),
             &DecodedThumb16 {
                 raw: 0x4008,
-                id: Thumb16InstId::AND_reg,
+                id: Thumb16InstId::AndReg,
             },
         ));
         assert!(logical
@@ -1190,7 +1190,7 @@ mod tests {
             &mut A32IREmitter::with_location(&mut arithmetic, loc),
             &DecodedThumb16 {
                 raw: 0x1808,
-                id: Thumb16InstId::ADD_reg_t1,
+                id: Thumb16InstId::AddRegT1,
             },
         ));
         assert!(arithmetic
@@ -1228,7 +1228,7 @@ mod tests {
         let mut ir = A32IREmitter::with_location(&mut block, loc);
         let inst = DecodedThumb16 {
             raw: 0x47F0,
-            id: Thumb16InstId::BLX_reg,
+            id: Thumb16InstId::BlxReg,
         };
 
         assert!(!thumb16_blx_reg(&mut ir, &inst));

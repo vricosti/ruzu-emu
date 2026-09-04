@@ -41,6 +41,7 @@ pub use shader_recompiler::backend::msl::{
 use shader_recompiler::ir::Program;
 use shader_recompiler::profile::Profile;
 use shader_recompiler::runtime_info::RuntimeInfo;
+#[cfg(any(test, feature = "metal-spirv-validation"))]
 use shader_recompiler::stage::Stage;
 
 use super::metal_device::MetalDeviceProfile;

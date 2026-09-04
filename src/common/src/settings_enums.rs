@@ -8,7 +8,7 @@ macro_rules! settings_enum {
     (
         $(#[$meta:meta])*
         $vis:vis enum $name:ident {
-            $($variant:ident),+ $(,)?
+            $($variant:ident $(=> $canonical:literal)?),+ $(,)?
         }
     ) => {
         $(#[$meta])*
@@ -22,14 +22,14 @@ macro_rules! settings_enum {
             /// Returns the string name of this enum variant.
             pub fn canonicalize(self) -> &'static str {
                 match self {
-                    $(Self::$variant => stringify!($variant)),+
+                    $(Self::$variant => settings_enum!(@canonical $variant $(, $canonical)?)),+
                 }
             }
 
             /// Parse a variant from its string name (case-sensitive).
             pub fn from_string(s: &str) -> Option<Self> {
                 match s {
-                    $(stringify!($variant) => Some(Self::$variant),)+
+                    $(settings_enum!(@canonical $variant $(, $canonical)?) => Some(Self::$variant),)+
                     _ => None,
                 }
             }
@@ -49,7 +49,7 @@ macro_rules! settings_enum {
             /// Returns all variants as a slice of (name, value) pairs.
             pub fn canonicalizations() -> &'static [(&'static str, Self)] {
                 &[
-                    $((stringify!($variant), Self::$variant)),+
+                    $((settings_enum!(@canonical $variant $(, $canonical)?), Self::$variant)),+
                 ]
             }
         }
@@ -94,6 +94,12 @@ macro_rules! settings_enum {
     (@first $first:ident $(, $rest:ident)*) => {
         Self::$first
     };
+    (@canonical $variant:ident, $canonical:literal) => {
+        $canonical
+    };
+    (@canonical $variant:ident) => {
+        stringify!($variant)
+    };
 }
 
 // AudioEngine has special canonicalizations (lowercase), defined separately
@@ -105,6 +111,12 @@ pub enum AudioEngine {
     Sdl3 = 2,
     Null = 3,
     Oboe = 4,
+}
+
+impl Default for AudioEngine {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl AudioEngine {
@@ -138,12 +150,6 @@ impl AudioEngine {
             4 => Some(Self::Oboe),
             _ => None,
         }
-    }
-}
-
-impl Default for AudioEngine {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
@@ -261,11 +267,11 @@ settings_enum! {
 
 settings_enum! {
     pub enum FramePacingMode {
-        Target_Auto,
-        Target_30,
-        Target_60,
-        Target_90,
-        Target_120,
+        TargetAuto => "Target_Auto",
+        Target30 => "Target_30",
+        Target60 => "Target_60",
+        Target90 => "Target_90",
+        Target120 => "Target_120",
     }
 }
 
@@ -320,6 +326,12 @@ pub enum RendererBackend {
     /// Native Apple Metal renderer. Appended after Eden's serialized values
     /// so existing configuration files retain their exact numeric meaning.
     Metal = 5,
+}
+
+impl Default for RendererBackend {
+    fn default() -> Self {
+        Self::OpenGlGlsl
+    }
 }
 
 impl RendererBackend {
@@ -397,12 +409,6 @@ impl crate::settings_setting::SettingType for RendererBackend {
 
     fn is_enum_type() -> bool {
         true
-    }
-}
-
-impl Default for RendererBackend {
-    fn default() -> Self {
-        Self::OpenGlGlsl
     }
 }
 
@@ -688,7 +694,7 @@ impl Category {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuAccuracy, RendererBackend, ScalingFilter};
+    use super::{FramePacingMode, GpuAccuracy, RendererBackend, ScalingFilter};
     use std::str::FromStr;
 
     #[test]
@@ -702,6 +708,22 @@ mod tests {
         assert_eq!(GpuAccuracy::from_str("0"), Ok(GpuAccuracy::Low));
         assert_eq!(GpuAccuracy::from_str("1"), Ok(GpuAccuracy::High));
         assert!(GpuAccuracy::from_str("2").is_err());
+    }
+
+    #[test]
+    fn frame_pacing_rust_names_preserve_canonical_config_strings() {
+        let expected = [
+            (FramePacingMode::TargetAuto, "Target_Auto"),
+            (FramePacingMode::Target30, "Target_30"),
+            (FramePacingMode::Target60, "Target_60"),
+            (FramePacingMode::Target90, "Target_90"),
+            (FramePacingMode::Target120, "Target_120"),
+        ];
+        for (index, (mode, canonical)) in expected.into_iter().enumerate() {
+            assert_eq!(mode as u32, index as u32);
+            assert_eq!(mode.canonicalize(), canonical);
+            assert_eq!(FramePacingMode::from_string(canonical), Some(mode));
+        }
     }
 
     #[test]

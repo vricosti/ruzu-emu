@@ -262,6 +262,7 @@ impl A64Interface {
         String::new()
     }
 
+    #[cfg(test)]
     pub(crate) fn current_address_space(&self) -> &A64AddressSpace {
         &self.current_address_space
     }

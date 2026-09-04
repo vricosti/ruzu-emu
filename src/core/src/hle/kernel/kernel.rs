@@ -509,14 +509,14 @@ extern "C" fn sigurg_handler(_signum: libc::c_int) {
 fn install_sigusr1_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigusr1_handler as usize;
+        sa.sa_sigaction = sigusr1_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = libc::SA_RESTART;
         let _ = libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
 
         // Also install SIGURG handler for per-thread backtrace dump.
         let mut sa2: libc::sigaction = std::mem::zeroed();
-        sa2.sa_sigaction = sigurg_handler as usize;
+        sa2.sa_sigaction = sigurg_handler as *const () as usize;
         libc::sigemptyset(&mut sa2.sa_mask);
         // Don't set SA_RESTART — we want the blocked futex to return EINTR so
         // the signal handler runs. After the handler the thread returns to the

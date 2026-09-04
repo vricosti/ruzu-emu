@@ -66,6 +66,7 @@ pub struct MetalRenderPassKey {
 }
 
 impl MetalRenderPassKey {
+    #[cfg(test)]
     pub(crate) fn with_visibility_result_buffer(mut self, identity: usize) -> Self {
         self.visibility_result_buffer = identity;
         self
@@ -193,12 +194,10 @@ impl MetalFramebuffer {
             attachment.setLoadAction(MTLLoadAction::Load);
             attachment.setStoreAction(MTLStoreAction::Store);
         }
-        unsafe {
-            descriptor.setRenderTargetWidth(self.render_area.0 as usize);
-            descriptor.setRenderTargetHeight(self.render_area.1 as usize);
-            descriptor.setRenderTargetArrayLength(self.layers);
-            descriptor.setDefaultRasterSampleCount(self.samples as usize);
-        }
+        descriptor.setRenderTargetWidth(self.render_area.0 as usize);
+        descriptor.setRenderTargetHeight(self.render_area.1 as usize);
+        descriptor.setRenderTargetArrayLength(self.layers);
+        descriptor.setDefaultRasterSampleCount(self.samples as usize);
         descriptor
     }
 
@@ -239,16 +238,16 @@ impl MetalFramebuffer {
                     .objectAtIndexedSubscript(index)
             };
             if attachment.texture().is_some() {
-                unsafe { attachment.setSlice(layer as usize) };
+                attachment.setSlice(layer as usize);
             }
         }
         if descriptor.depthAttachment().texture().is_some() {
-            unsafe { descriptor.depthAttachment().setSlice(layer as usize) };
+            descriptor.depthAttachment().setSlice(layer as usize);
         }
         if descriptor.stencilAttachment().texture().is_some() {
-            unsafe { descriptor.stencilAttachment().setSlice(layer as usize) };
+            descriptor.stencilAttachment().setSlice(layer as usize);
         }
-        unsafe { descriptor.setRenderTargetArrayLength(1) };
+        descriptor.setRenderTargetArrayLength(1);
         descriptor
     }
 
@@ -276,7 +275,7 @@ impl MetalFramebuffer {
                     blue: value[2] as f64,
                     alpha: value[3] as f64,
                 });
-                unsafe { attachment.setSlice(clear.base_layer as usize) };
+                attachment.setSlice(clear.base_layer as usize);
             }
         }
         if let Some(value) = clear.depth {
@@ -286,7 +285,7 @@ impl MetalFramebuffer {
                 attachment.setLoadAction(MTLLoadAction::Clear);
                 attachment.setStoreAction(MTLStoreAction::Store);
                 attachment.setClearDepth(value as f64);
-                unsafe { attachment.setSlice(clear.base_layer as usize) };
+                attachment.setSlice(clear.base_layer as usize);
             }
         }
         if let Some(value) = clear.stencil {
@@ -296,15 +295,13 @@ impl MetalFramebuffer {
                 attachment.setLoadAction(MTLLoadAction::Clear);
                 attachment.setStoreAction(MTLStoreAction::Store);
                 attachment.setClearStencil(value);
-                unsafe { attachment.setSlice(clear.base_layer as usize) };
+                attachment.setSlice(clear.base_layer as usize);
             }
         }
-        unsafe {
-            descriptor.setRenderTargetWidth(self.render_area.0 as usize);
-            descriptor.setRenderTargetHeight(self.render_area.1 as usize);
-            descriptor.setRenderTargetArrayLength(clear.layer_count.max(1) as usize);
-            descriptor.setDefaultRasterSampleCount(self.samples as usize);
-        }
+        descriptor.setRenderTargetWidth(self.render_area.0 as usize);
+        descriptor.setRenderTargetHeight(self.render_area.1 as usize);
+        descriptor.setRenderTargetArrayLength(clear.layer_count.max(1) as usize);
+        descriptor.setDefaultRasterSampleCount(self.samples as usize);
         descriptor
     }
 

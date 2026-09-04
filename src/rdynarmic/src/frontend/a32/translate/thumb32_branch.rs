@@ -122,10 +122,10 @@ mod tests {
     #[test]
     fn all_four_upstream_branch_patterns_translate() {
         for (raw, expected) in [
-            (0xF000_D000, Thumb32InstId::BL_imm),
-            (0xF000_C000, Thumb32InstId::BLX_imm),
+            (0xF000_D000, Thumb32InstId::BlImm),
+            (0xF000_C000, Thumb32InstId::BlxImm),
             (0xF000_9000, Thumb32InstId::B),
-            (0xF000_8000, Thumb32InstId::B_cond),
+            (0xF000_8000, Thumb32InstId::BCond),
         ] {
             let inst = decode_thumb32((raw >> 16) as u16, raw as u16);
             assert_eq!(inst.id, expected);

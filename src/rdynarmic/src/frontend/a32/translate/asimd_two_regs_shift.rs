@@ -307,7 +307,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF389_0410,
-                id: ArmInstId::ASIMD_VSRI,
+                id: ArmInstId::AsimdVsri,
             },
             arm_asimd_vsri,
         );
@@ -321,7 +321,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF389_0510,
-                id: ArmInstId::ASIMD_VSLI,
+                id: ArmInstId::AsimdVsli,
             },
             arm_asimd_vsli,
         );
@@ -335,7 +335,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF389_0710,
-                id: ArmInstId::ASIMD_VQSHL_imm,
+                id: ArmInstId::AsimdVqshlImm,
             },
             arm_asimd_vqshl_imm,
         );
@@ -348,7 +348,7 @@ mod tests {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF2E0_3830,
-                id: ArmInstId::ASIMD_VSHRN,
+                id: ArmInstId::AsimdVshrn,
             },
             arm_asimd_vshrn,
         );

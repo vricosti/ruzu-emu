@@ -148,7 +148,7 @@ fn adv_simd_expand_imm(op: bool, cmode: u32, imm8: u32) -> u64 {
                 } else {
                     result |= 0x4000_0000;
                 }
-                result |= ((imm8 & 0x3F) as u32) << 19;
+                result |= (imm8 & 0x3F) << 19;
                 rep32(result as u64)
             } else {
                 // cmode_lo == 1 && op: VMOV.F64 immediate (single element, not replicated)
@@ -1527,7 +1527,7 @@ mod tests {
 
     #[test]
     fn vtbl_emits_table_lookup64_for_regression_opcode() {
-        let opcodes = translate_with(0xF3F8_19AC, ArmInstId::ASIMD_VTBL, arm_asimd_vtbl);
+        let opcodes = translate_with(0xF3F8_19AC, ArmInstId::AsimdVtbl, arm_asimd_vtbl);
         assert_eq!(
             opcodes
                 .iter()
@@ -1542,7 +1542,7 @@ mod tests {
 
     #[test]
     fn vtbx_uses_destination_as_lookup_default() {
-        let opcodes = translate_with(0xF3F8_19EC, ArmInstId::ASIMD_VTBX, arm_asimd_vtbx);
+        let opcodes = translate_with(0xF3F8_19EC, ArmInstId::AsimdVtbx, arm_asimd_vtbx);
         assert_eq!(
             opcodes
                 .iter()
@@ -1557,7 +1557,7 @@ mod tests {
 
     #[test]
     fn vneg_float_emits_fp_vector_neg_for_regression_opcode() {
-        let opcodes = translate_with(0xF3F9_67E6, ArmInstId::ASIMD_VNEG_int, arm_asimd_vneg_int);
+        let opcodes = translate_with(0xF3F9_67E6, ArmInstId::AsimdVnegInt, arm_asimd_vneg_int);
         assert!(opcodes.contains(&Opcode::FPVectorNeg32));
         assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
         assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[test]
     fn vabs_float_emits_fp_vector_abs() {
-        let opcodes = translate_with(0xF3F9_6766, ArmInstId::ASIMD_VABS_int, arm_asimd_vabs_int);
+        let opcodes = translate_with(0xF3F9_6766, ArmInstId::AsimdVabsInt, arm_asimd_vabs_int);
         assert!(opcodes.contains(&Opcode::FPVectorAbs32));
         assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
         assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
@@ -1574,7 +1574,7 @@ mod tests {
     #[test]
     fn vzip_q_emits_both_interleaves_for_regression_opcodes() {
         for raw in [0xF3FA_21E0, 0xF3FA_41E6] {
-            let opcodes = translate_with(raw, ArmInstId::ASIMD_VZIP, arm_asimd_vzip);
+            let opcodes = translate_with(raw, ArmInstId::AsimdVzip, arm_asimd_vzip);
             assert!(opcodes.contains(&Opcode::VectorInterleaveLower32));
             assert!(opcodes.contains(&Opcode::VectorInterleaveUpper32));
             assert_eq!(
@@ -1589,7 +1589,7 @@ mod tests {
 
     #[test]
     fn vzip_d_splits_interleaved_result_into_two_registers() {
-        let opcodes = translate_with(0xF3B6_0181, ArmInstId::ASIMD_VZIP, arm_asimd_vzip);
+        let opcodes = translate_with(0xF3B6_0181, ArmInstId::AsimdVzip, arm_asimd_vzip);
         assert!(opcodes.contains(&Opcode::VectorInterleaveLower16));
         assert_eq!(
             opcodes
@@ -1610,7 +1610,7 @@ mod tests {
     #[test]
     fn vrsqrte_emits_fp_estimate_for_regression_opcodes() {
         for raw in [0xF3FB_05E2, 0xF3FB_85E4, 0xF3FB_E5E6] {
-            let opcodes = translate_with(raw, ArmInstId::ASIMD_VRSQRTE, arm_asimd_vrsqrte);
+            let opcodes = translate_with(raw, ArmInstId::AsimdVrsqrte, arm_asimd_vrsqrte);
             assert!(opcodes.contains(&Opcode::FPVectorRSqrtEstimate32));
             assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
             assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn vrecpe_emits_fp_estimate() {
-        let opcodes = translate_with(0xF3FB_0562, ArmInstId::ASIMD_VRECPE, arm_asimd_vrecpe);
+        let opcodes = translate_with(0xF3FB_0562, ArmInstId::AsimdVrecpe, arm_asimd_vrecpe);
         assert!(opcodes.contains(&Opcode::FPVectorRecipEstimate32));
         assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
         assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
@@ -1628,7 +1628,7 @@ mod tests {
     #[test]
     fn vceq_zero_emits_fp_equal_for_regression_opcodes() {
         for raw in [0xF3B9_6562, 0xF3B9_4564, 0xF3B9_2566] {
-            let opcodes = translate_with(raw, ArmInstId::ASIMD_VCEQ_zero, arm_asimd_vceq_zero);
+            let opcodes = translate_with(raw, ArmInstId::AsimdVceqZero, arm_asimd_vceq_zero);
             assert!(opcodes.contains(&Opcode::FPVectorEqual32));
             assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
             assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
@@ -1637,23 +1637,23 @@ mod tests {
 
     #[test]
     fn compare_and_estimate_undefined_encodings_stop_translation() {
-        assert_undefined_translation(0xF3BD_6562, ArmInstId::ASIMD_VCEQ_zero, arm_asimd_vceq_zero);
-        assert_undefined_translation(0xF3F3_0562, ArmInstId::ASIMD_VRECPE, arm_asimd_vrecpe);
-        assert_undefined_translation(0xF3F3_05E2, ArmInstId::ASIMD_VRSQRTE, arm_asimd_vrsqrte);
+        assert_undefined_translation(0xF3BD_6562, ArmInstId::AsimdVceqZero, arm_asimd_vceq_zero);
+        assert_undefined_translation(0xF3F3_0562, ArmInstId::AsimdVrecpe, arm_asimd_vrecpe);
+        assert_undefined_translation(0xF3F3_05E2, ArmInstId::AsimdVrsqrte, arm_asimd_vrsqrte);
     }
 
     #[test]
     fn vtrn_undefined_size_stops_translation() {
         // sz==0b11 is UNDEFINED: previously returned `true` without a terminal,
         // letting the block keep translating past a raised exception.
-        assert_undefined_translation(0xF3BE_0080, ArmInstId::ASIMD_VTRN, arm_asimd_vtrn);
+        assert_undefined_translation(0xF3BE_0080, ArmInstId::AsimdVtrn, arm_asimd_vtrn);
     }
 
     #[test]
     fn vrhadd_undefined_size_stops_translation() {
         // sz==0b11 is UNDEFINED (upstream raises UndefinedInstruction, not
         // Unpredictable); either way it must stop translation with a terminal.
-        assert_undefined_translation(0xF230_0100, ArmInstId::ASIMD_VRHADD, arm_asimd_vrhadd);
+        assert_undefined_translation(0xF230_0100, ArmInstId::AsimdVrhadd, arm_asimd_vrhadd);
     }
 
     #[test]
@@ -1661,11 +1661,7 @@ mod tests {
         // 0xF4E32CBF: VLD1.32 {d[]} broadcast, T=1 → regs=2, nelem=1, m=R15
         // (no writeback). Must emit exactly one 32-bit read + one 32-bit
         // broadcast, written to both destination D regs, no exception, and no
-        let opcodes = translate_with(
-            0xF4E3_2CBF,
-            ArmInstId::V8_VLD_all_lanes,
-            arm_v8_vld_all_lanes,
-        );
+        let opcodes = translate_with(0xF4E3_2CBF, ArmInstId::V8VldAllLanes, arm_v8_vld_all_lanes);
         assert!(opcodes.contains(&Opcode::VectorBroadcast32));
         assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
         assert_eq!(
@@ -1690,11 +1686,7 @@ mod tests {
     fn vld_all_lanes_immediate_writeback_updates_base() {
         // Same as above but m=R13 (SP) → immediate writeback (nelem*ebytes).
         // Encoding: swap m from 0xF to 0xD.
-        let opcodes = translate_with(
-            0xF4E3_2CBD,
-            ArmInstId::V8_VLD_all_lanes,
-            arm_v8_vld_all_lanes,
-        );
+        let opcodes = translate_with(0xF4E3_2CBD, ArmInstId::V8VldAllLanes, arm_v8_vld_all_lanes);
         assert!(opcodes.contains(&Opcode::VectorBroadcast32));
         // Writeback rewrites the base register exactly once.
         assert_eq!(
@@ -1710,7 +1702,7 @@ mod tests {
     fn vld_single_sets_one_lane() {
         // VLD1.32 {d[0]}: 111101001 D 10 nnnn dddd 10 00 0000 mmmm
         // sz=0b10, nn=0 (nelem=1), index_align=0 → index 0, m=R15 (no writeback).
-        let opcodes = translate_with(0xF4A0_080F, ArmInstId::V8_VLD_single, arm_v8_vld_single);
+        let opcodes = translate_with(0xF4A0_080F, ArmInstId::V8VldSingle, arm_v8_vld_single);
         assert!(opcodes.contains(&Opcode::A32ReadMemory32));
         assert!(opcodes.contains(&Opcode::VectorSetElement32));
         assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
@@ -1727,7 +1719,7 @@ mod tests {
     #[test]
     fn vst_single_stores_one_lane() {
         // VST1.32 {d[0]}: 111101001 D 00 nnnn dddd 10 00 0000 mmmm, m=R15.
-        let opcodes = translate_with(0xF480_080F, ArmInstId::V8_VST_single, arm_v8_vst_single);
+        let opcodes = translate_with(0xF480_080F, ArmInstId::V8VstSingle, arm_v8_vst_single);
         assert!(opcodes.contains(&Opcode::VectorGetElement32));
         assert!(opcodes.contains(&Opcode::A32WriteMemory32));
         assert!(!opcodes.contains(&Opcode::A32ExceptionRaised));
@@ -1753,7 +1745,7 @@ mod tests {
         // Encoding: 1111001Q1Dzznnnndddd0o0FN1M0mmmm with zz=0b11.
         assert_exception_translation(
             0xF2F0_0140,
-            ArmInstId::ASIMD_VMLA_scalar,
+            ArmInstId::AsimdVmlaScalar,
             arm_asimd_vmla_scalar,
             crate::frontend::a32::types::Exception::DecodeError,
         );

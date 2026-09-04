@@ -2853,6 +2853,7 @@ impl MacroEngine {
     }
 
     /// Port of upstream `MacroEngine::Compile`.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
     fn compile_backend(is_interpreted: bool, code: &[u32]) -> AnyCachedMacro {
         #[cfg(target_arch = "x86_64")]
         if !is_interpreted {

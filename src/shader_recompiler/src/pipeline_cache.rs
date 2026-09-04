@@ -746,13 +746,8 @@ pub fn compile_shader_from_env_with_host_info(
     runtime_info: &RuntimeInfo,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
-    let program = translate_shader_from_env_with_host_info(
-        code,
-        base_offset,
-        env,
-        runtime_info,
-        host_info,
-    );
+    let program =
+        translate_shader_from_env_with_host_info(code, base_offset, env, runtime_info, host_info);
     let stage = program.stage;
     let spirv_words = backend::emit_spirv(&program, profile, runtime_info);
     CompiledShader {
@@ -771,13 +766,8 @@ pub fn compile_shader_from_env_with_bindings_and_host_info(
     bindings: &mut backend::bindings::Bindings,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
-    let program = translate_shader_from_env_with_host_info(
-        code,
-        base_offset,
-        env,
-        runtime_info,
-        host_info,
-    );
+    let program =
+        translate_shader_from_env_with_host_info(code, base_offset, env, runtime_info, host_info);
     let stage = program.stage;
     let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
     CompiledShader {

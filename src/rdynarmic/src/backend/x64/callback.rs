@@ -223,9 +223,6 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            return_register.get(),
-            abi::ABI_PARAMS[1].to_reg64().index()
-        );
+        assert_eq!(return_register.get(), abi::ABI_PARAMS[1].to_reg64().index());
     }
 }

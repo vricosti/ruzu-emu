@@ -17,9 +17,7 @@ use crate::buffer_cache::buffer_cache_base::{
     self as base, BufferCacheAsyncBuffer, BufferCacheBuffer, BufferCopy, HostBindings,
 };
 use crate::buffer_cache::usage_tracker::UsageTracker;
-use crate::engines::maxwell_3d::{
-    IndexFormat, PrimitiveTopology, MAX_CONST_BUFFER_SIZE,
-};
+use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology, MAX_CONST_BUFFER_SIZE};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::PixelFormat;
 

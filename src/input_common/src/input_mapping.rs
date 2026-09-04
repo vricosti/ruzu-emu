@@ -10,13 +10,13 @@ use std::collections::VecDeque;
 use common::param_package::ParamPackage;
 
 use crate::input_engine::{EngineInputType, MappingData};
-use crate::main_common::Polling;
+use crate::main_common::polling;
 
 /// Port of `MappingFactory` class from input_mapping.h / input_mapping.cpp
 pub struct MappingFactory {
     /// FIFO counterpart of upstream's `Common::SPSCQueue`.
     input_queue: VecDeque<ParamPackage>,
-    input_type: Polling::InputType,
+    input_type: polling::InputType,
     is_enabled: bool,
     first_axis: i32,
     second_axis: i32,
@@ -27,7 +27,7 @@ impl MappingFactory {
     pub fn new() -> Self {
         Self {
             input_queue: VecDeque::new(),
-            input_type: Polling::InputType::None,
+            input_type: polling::InputType::None,
             is_enabled: false,
             first_axis: -1,
             second_axis: -1,
@@ -36,7 +36,7 @@ impl MappingFactory {
 
     /// Resets all variables to begin the mapping process.
     /// Port of MappingFactory::BeginMapping
-    pub fn begin_mapping(&mut self, input_type: Polling::InputType) {
+    pub fn begin_mapping(&mut self, input_type: polling::InputType) {
         self.is_enabled = true;
         self.input_type = input_type;
         self.input_queue.clear();
@@ -61,9 +61,9 @@ impl MappingFactory {
         }
 
         match self.input_type {
-            Polling::InputType::Button => self.register_button(data),
-            Polling::InputType::Stick => self.register_stick(data),
-            Polling::InputType::Motion => self.register_motion(data),
+            polling::InputType::Button => self.register_button(data),
+            polling::InputType::Stick => self.register_stick(data),
+            polling::InputType::Motion => self.register_motion(data),
             _ => {}
         }
     }
@@ -72,7 +72,7 @@ impl MappingFactory {
     /// Port of MappingFactory::StopMapping
     pub fn stop_mapping(&mut self) {
         self.is_enabled = false;
-        self.input_type = Polling::InputType::None;
+        self.input_type = polling::InputType::None;
         self.input_queue.clear();
     }
 
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn get_next_input_preserves_upstream_fifo_order() {
         let mut factory = MappingFactory::new();
-        factory.begin_mapping(Polling::InputType::Button);
+        factory.begin_mapping(polling::InputType::Button);
         factory.register_input(&button("sdl", 1));
         factory.register_input(&button("keyboard", 2));
 

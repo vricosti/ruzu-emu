@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +15,7 @@ use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
 use ruzu_core::loader::loader::{get_loader, ResultStatus, System as LoaderSystem};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum ShortcutTarget {
     Desktop,
     Applications,
@@ -225,6 +227,10 @@ fn get_ruzu_command() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ruzu"))
 }
 
+#[cfg_attr(
+    any(target_os = "macos", target_os = "android"),
+    allow(unused_variables)
+)]
 pub fn get_shortcut_path(target: ShortcutTarget) -> Option<PathBuf> {
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
     {
@@ -420,6 +426,7 @@ fn desktop_entry_contents(
     contents
 }
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 static APPIMAGE_SHORTCUT_ALREADY_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]

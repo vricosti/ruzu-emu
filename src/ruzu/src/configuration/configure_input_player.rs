@@ -516,10 +516,10 @@ impl PlayerPage {
 
         let input_type = match target {
             CaptureTarget::Button(_) | CaptureTarget::AnalogModifier(_) => {
-                input_common::Polling::InputType::Button
+                input_common::polling::InputType::Button
             }
-            CaptureTarget::Analog(..) => input_common::Polling::InputType::Stick,
-            CaptureTarget::Motion(_) => input_common::Polling::InputType::Motion,
+            CaptureTarget::Analog(..) => input_common::polling::InputType::Stick,
+            CaptureTarget::Motion(_) => input_common::polling::InputType::Motion,
         };
         subsystem.borrow_mut().begin_mapping(input_type);
 

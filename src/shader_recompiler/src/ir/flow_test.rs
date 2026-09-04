@@ -35,12 +35,12 @@ pub enum FlowTest {
     SFT = 21,
     HS = 22,
     OFT = 23,
-    CSM_TA = 24,
-    CSM_TR = 25,
-    CSM_MX = 26,
-    FCSM_TA = 27,
-    FCSM_TR = 28,
-    FCSM_MX = 29,
+    CsmTa = 24,
+    CsmTr = 25,
+    CsmMx = 26,
+    FcsmTa = 27,
+    FcsmTr = 28,
+    FcsmMx = 29,
     RLE = 30,
     RGT = 31,
 }
@@ -72,12 +72,12 @@ impl FlowTest {
             21 => Some(FlowTest::SFT),
             22 => Some(FlowTest::HS),
             23 => Some(FlowTest::OFT),
-            24 => Some(FlowTest::CSM_TA),
-            25 => Some(FlowTest::CSM_TR),
-            26 => Some(FlowTest::CSM_MX),
-            27 => Some(FlowTest::FCSM_TA),
-            28 => Some(FlowTest::FCSM_TR),
-            29 => Some(FlowTest::FCSM_MX),
+            24 => Some(FlowTest::CsmTa),
+            25 => Some(FlowTest::CsmTr),
+            26 => Some(FlowTest::CsmMx),
+            27 => Some(FlowTest::FcsmTa),
+            28 => Some(FlowTest::FcsmTr),
+            29 => Some(FlowTest::FcsmMx),
             30 => Some(FlowTest::RLE),
             31 => Some(FlowTest::RGT),
             _ => None,
@@ -110,12 +110,12 @@ impl FlowTest {
             FlowTest::SFT => "SFT",
             FlowTest::HS => "HS",
             FlowTest::OFT => "OFT",
-            FlowTest::CSM_TA => "CSM_TA",
-            FlowTest::CSM_TR => "CSM_TR",
-            FlowTest::CSM_MX => "CSM_MX",
-            FlowTest::FCSM_TA => "FCSM_TA",
-            FlowTest::FCSM_TR => "FCSM_TR",
-            FlowTest::FCSM_MX => "FCSM_MX",
+            FlowTest::CsmTa => "CSM_TA",
+            FlowTest::CsmTr => "CSM_TR",
+            FlowTest::CsmMx => "CSM_MX",
+            FlowTest::FcsmTa => "FCSM_TA",
+            FlowTest::FcsmTr => "FCSM_TR",
+            FlowTest::FcsmMx => "FCSM_MX",
             FlowTest::RLE => "RLE",
             FlowTest::RGT => "RGT",
         }
@@ -125,5 +125,27 @@ impl FlowTest {
 impl fmt::Display for FlowTest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlowTest;
+
+    #[test]
+    fn rust_names_preserve_maxwell_values_and_display_names() {
+        let expected = [
+            (FlowTest::CsmTa, 24, "CSM_TA"),
+            (FlowTest::CsmTr, 25, "CSM_TR"),
+            (FlowTest::CsmMx, 26, "CSM_MX"),
+            (FlowTest::FcsmTa, 27, "FCSM_TA"),
+            (FlowTest::FcsmTr, 28, "FCSM_TR"),
+            (FlowTest::FcsmMx, 29, "FCSM_MX"),
+        ];
+        for (flow_test, raw, name) in expected {
+            assert_eq!(flow_test as u64, raw);
+            assert_eq!(FlowTest::from_u64(raw), Some(flow_test));
+            assert_eq!(flow_test.name(), name);
+        }
     }
 }

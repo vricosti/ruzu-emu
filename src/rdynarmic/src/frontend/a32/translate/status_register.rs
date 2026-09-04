@@ -85,7 +85,7 @@ mod tests {
         let mut ir = A32IREmitter::with_location(&mut block, loc);
         let inst = DecodedArm {
             raw: (0xE << 28) | (0b0110 << 16),
-            id: ArmInstId::MSR_reg,
+            id: ArmInstId::MsrReg,
         };
 
         assert!(!arm_msr_reg(&mut ir, &inst));

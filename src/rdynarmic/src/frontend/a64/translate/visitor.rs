@@ -199,6 +199,7 @@ impl<'a> TranslatorVisitor<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sign_extend(&mut self, value: Value, to_size: usize) -> Value {
         match to_size {
             32 => self.ir.ir().sign_extend_to_word(value),

@@ -1069,9 +1069,9 @@ impl Default for Values {
                 true,
             ),
             frame_pacing_mode: SwitchableSetting::ranged_with_options(
-                FramePacingMode::Target_Auto,
-                FramePacingMode::Target_Auto,
-                FramePacingMode::Target_120,
+                FramePacingMode::TargetAuto,
+                FramePacingMode::TargetAuto,
+                FramePacingMode::Target120,
                 "frame_pacing_mode",
                 RendererAdvanced,
                 Specialization::DEFAULT,
@@ -2042,7 +2042,7 @@ mod tests {
         assert_eq!(*values.accelerate_astc.get_value(), AstcDecodeMode::Gpu);
         assert_eq!(
             *values.frame_pacing_mode.get_value(),
-            FramePacingMode::Target_Auto
+            FramePacingMode::TargetAuto
         );
         assert_eq!(
             *values.astc_recompression.get_value(),

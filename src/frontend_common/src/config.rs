@@ -1749,7 +1749,7 @@ mod tests {
                 .set_value(AstcDecodeMode::CpuAsynchronous);
             values
                 .frame_pacing_mode
-                .set_value(FramePacingMode::Target_90);
+                .set_value(FramePacingMode::Target90);
             values.astc_recompression.set_value(AstcRecompression::Bc3);
             values.sync_memory_operations.set_value(true);
             values.renderer_force_max_clock.set_value(true);
@@ -1844,7 +1844,7 @@ mod tests {
             );
             assert_eq!(
                 *values.frame_pacing_mode.get_value(),
-                FramePacingMode::Target_90
+                FramePacingMode::Target90
             );
             assert_eq!(
                 *values.astc_recompression.get_value(),

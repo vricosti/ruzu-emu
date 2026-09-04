@@ -6687,26 +6687,36 @@ mod tests {
         assert_ne!(primary, 0);
         assert_ne!(secondary, 0);
         for (id, index) in [(primary, 0), (secondary, 1)] {
-            assert!(ctx.builder.module_ref().annotations.iter().any(|annotation| {
-                matches!(
-                    annotation.operands.as_slice(),
-                    [
-                        Operand::IdRef(target),
-                        Operand::Decoration(spirv::Decoration::Location),
-                        Operand::LiteralBit32(0)
-                    ] if *target == id
-                )
-            }));
-            assert!(ctx.builder.module_ref().annotations.iter().any(|annotation| {
-                matches!(
-                    annotation.operands.as_slice(),
-                    [
-                        Operand::IdRef(target),
-                        Operand::Decoration(spirv::Decoration::Index),
-                        Operand::LiteralBit32(value)
-                    ] if *target == id && *value == index
-                )
-            }));
+            assert!(ctx
+                .builder
+                .module_ref()
+                .annotations
+                .iter()
+                .any(|annotation| {
+                    matches!(
+                        annotation.operands.as_slice(),
+                        [
+                            Operand::IdRef(target),
+                            Operand::Decoration(spirv::Decoration::Location),
+                            Operand::LiteralBit32(0)
+                        ] if *target == id
+                    )
+                }));
+            assert!(ctx
+                .builder
+                .module_ref()
+                .annotations
+                .iter()
+                .any(|annotation| {
+                    matches!(
+                        annotation.operands.as_slice(),
+                        [
+                            Operand::IdRef(target),
+                            Operand::Decoration(spirv::Decoration::Index),
+                            Operand::LiteralBit32(value)
+                        ] if *target == id && *value == index
+                    )
+                }));
         }
     }
 
@@ -7252,16 +7262,11 @@ mod tests {
             .info
             .stores
             .set(Attribute::CLIP_DISTANCE_0.0 as usize, true);
-        let mut ctx = SpirvEmitContext::new(
-            &program,
-            &Profile::default(),
-            &RuntimeInfo::default(),
-        );
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
 
-        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.emit_program(&program)
-        }))
-        .expect_err("upstream rejects fragment ClipDistance stores");
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.emit_program(&program)))
+                .expect_err("upstream rejects fragment ClipDistance stores");
         let error = payload
             .downcast_ref::<crate::exception::NotImplementedException>()
             .expect("typed NotImplementedException");

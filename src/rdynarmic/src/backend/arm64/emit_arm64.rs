@@ -1163,17 +1163,6 @@ fn emit_ir_instruction(
         | Opcode::VectorExtract
         | Opcode::VectorExtractLower
         | Opcode::ZeroVector => emit_vector_instruction(code, ctx, inst_ref),
-        Opcode::A64SetPC => {
-            let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
-            let mut pc = ctx.reg_alloc.read_x(args[0]);
-            let pc_reg = pc.realize(code, ctx.block)? as u8;
-            code.write_u32(inst::str_x_unsigned(
-                pc_reg,
-                crate::backend::arm64::abi::XSTATE,
-                core::mem::offset_of!(A64JitState, pc) as u32,
-            ))?;
-            Ok(())
-        }
         Opcode::A32SetCheckBit => emit_a32_set_check_bit(code, ctx, inst_ref),
         Opcode::A32GetRegister => emit_a32_get_register(code, ctx, inst_ref),
         Opcode::A32SetRegister => emit_a32_set_register(code, ctx, inst_ref),

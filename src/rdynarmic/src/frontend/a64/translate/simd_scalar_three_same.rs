@@ -668,7 +668,7 @@ mod tests {
         ];
 
         for (raw, expected_name) in cases {
-            let (name, block, should_continue) = translate_one(raw);
+            let (name, _block, should_continue) = translate_one(raw);
             assert_eq!(name, expected_name, "encoding 0x{raw:08x}");
             assert!(should_continue, "encoding 0x{raw:08x}");
         }

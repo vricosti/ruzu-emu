@@ -264,10 +264,7 @@ mod tests {
         sph.raw[6] = 0b10_10_10_10;
         {
             let mut visitor = TranslatorVisitor::new_with_sph(&mut program, block, Some(sph));
-            ipa(
-                &mut visitor,
-                ipa_insn(Attribute::generic(0, 0), 0, false),
-            );
+            ipa(&mut visitor, ipa_insn(Attribute::generic(0, 0), 0, false));
         }
 
         crate::ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut program);

@@ -9,14 +9,15 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions, MTLDevice, MTLDrawable,
     MTLLanguageVersion, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLSamplerDescriptor,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLStoreAction, MTLTexture,
+    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
+    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState,
+    MTLStoreAction, MTLTexture,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use thiserror::Error;
 
-use super::metal_layer::MetalLayer;
 use super::metal_device::MetalDevice;
+use super::metal_layer::MetalLayer;
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 
 #[derive(Debug, Error)]

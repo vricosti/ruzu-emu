@@ -22,7 +22,7 @@ use input_common::drivers::mouse::MouseButton;
 use input_common::InputSubsystem;
 use ruzu_core::core::SystemRef;
 use ruzu_core::frontend::framebuffer_layout::{
-    default_frame_layout, FramebufferLayout, ScreenUndocked,
+    default_frame_layout, screen_undocked, FramebufferLayout,
 };
 use ruzu_core::perf_stats::PerfStatsResults;
 
@@ -181,8 +181,8 @@ impl EmuWindowSdl3 {
             is_shown: true,
             shown_state: Arc::new(AtomicBool::new(true)),
             framebuffer_layout: Arc::new(RwLock::new(default_frame_layout(
-                ScreenUndocked::WIDTH,
-                ScreenUndocked::HEIGHT,
+                screen_undocked::WIDTH,
+                screen_undocked::HEIGHT,
             ))),
             last_time: 0,
             system,
@@ -607,8 +607,8 @@ mod tests {
             is_shown: true,
             shown_state: Arc::new(AtomicBool::new(true)),
             framebuffer_layout: Arc::new(RwLock::new(default_frame_layout(
-                ScreenUndocked::WIDTH,
-                ScreenUndocked::HEIGHT,
+                screen_undocked::WIDTH,
+                screen_undocked::HEIGHT,
             ))),
             last_time: 0,
             system: SystemRef::null(),

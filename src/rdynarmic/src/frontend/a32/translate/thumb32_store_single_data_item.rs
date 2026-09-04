@@ -316,21 +316,21 @@ mod tests {
         for (raw, id, translate, truncate, write) in [
             (
                 0xF801_2034,
-                Thumb32InstId::STRB_reg,
+                Thumb32InstId::StrbReg,
                 thumb32_strb as fn(&mut A32IREmitter<'_>, &DecodedThumb32) -> bool,
                 Some(Opcode::LeastSignificantByte),
                 Opcode::A32WriteMemory8,
             ),
             (
                 0xF821_2034,
-                Thumb32InstId::STRH_reg,
+                Thumb32InstId::StrhReg,
                 thumb32_strh,
                 Some(Opcode::LeastSignificantHalf),
                 Opcode::A32WriteMemory16,
             ),
             (
                 0xF841_2034,
-                Thumb32InstId::STR_reg,
+                Thumb32InstId::StrReg,
                 thumb32_str_reg,
                 None,
                 Opcode::A32WriteMemory32,
@@ -362,7 +362,7 @@ mod tests {
     fn immediate_store_writes_memory_before_base_writeback() {
         let location = thumb_location();
         let mut block = Block::new(location.to_location());
-        let inst = decoded(0xF841_2B34, Thumb32InstId::STR_imm_1);
+        let inst = decoded(0xF841_2B34, Thumb32InstId::StrImm1);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(thumb32_str_imm_1(&mut ir, &inst));
@@ -392,14 +392,14 @@ mod tests {
         for (raw, id, translate, address_op, has_writeback) in [
             (
                 0xF801_2C34u32,
-                Thumb32InstId::STRB_imm_2,
+                Thumb32InstId::StrbImm2,
                 thumb32_strb_imm_2 as fn(&mut A32IREmitter<'_>, &DecodedThumb32) -> bool,
                 Opcode::Sub32,
                 false,
             ),
             (
                 0xF8A1_2234,
-                Thumb32InstId::STRH_imm_3,
+                Thumb32InstId::StrhImm3,
                 thumb32_strh_imm_3,
                 Opcode::Add32,
                 false,
@@ -439,25 +439,25 @@ mod tests {
         for (raw, id, translate, expected) in [
             (
                 0xF84F_2B34,
-                Thumb32InstId::STR_imm_1,
+                Thumb32InstId::StrImm1,
                 thumb32_str_imm_1 as fn(&mut A32IREmitter<'_>, &DecodedThumb32) -> bool,
                 Exception::UndefinedInstruction,
             ),
             (
                 0xF841_FB34,
-                Thumb32InstId::STR_imm_1,
+                Thumb32InstId::StrImm1,
                 thumb32_str_imm_1,
                 Exception::UnpredictableInstruction,
             ),
             (
                 0xF842_2B34,
-                Thumb32InstId::STR_imm_1,
+                Thumb32InstId::StrImm1,
                 thumb32_str_imm_1,
                 Exception::UnpredictableInstruction,
             ),
             (
                 0xF841_200F,
-                Thumb32InstId::STR_reg,
+                Thumb32InstId::StrReg,
                 thumb32_str_reg,
                 Exception::UnpredictableInstruction,
             ),

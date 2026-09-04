@@ -2653,8 +2653,8 @@ impl RasterizerInterface for RasterizerVulkan {
                 memory_manager.as_ref().read_block(gpu_va, output);
             }
         };
-        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
+        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| unsafe {
+            memory_manager.as_ref().read_block_unsafe(gpu_va, output)
         };
         if let Some(mut dirty_flags) = draw_view.dirty_flags_ptr() {
             // SAFETY: production draws execute synchronously on the GPU thread.
@@ -2701,13 +2701,11 @@ impl RasterizerInterface for RasterizerVulkan {
 
         self.draw_sequence = self.draw_sequence.wrapping_add(1);
         let zpass_pixel_count_enabled = indirect_view.draw_view_mut().zpass_pixel_count_enabled();
-        let read_gpu = |gpu_va: u64, output: &mut [u8]| {
-            unsafe {
-                memory_manager.as_ref().read_block(gpu_va, output);
-            }
+        let read_gpu = |gpu_va: u64, output: &mut [u8]| unsafe {
+            memory_manager.as_ref().read_block(gpu_va, output);
         };
-        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
+        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| unsafe {
+            memory_manager.as_ref().read_block_unsafe(gpu_va, output)
         };
         let cache_params = crate::buffer_cache::buffer_cache_base::DrawIndirectParams {
             indirect_start_address: params.indirect_start_address,
@@ -2771,8 +2769,8 @@ impl RasterizerInterface for RasterizerVulkan {
             log::warn!("RasterizerVulkan::draw_texture skipped: no bound channel memory manager");
             return;
         };
-        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
+        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| unsafe {
+            memory_manager.as_ref().read_block_unsafe(gpu_va, output)
         };
 
         // Upstream keeps TextureCache::mutex locked from descriptor
@@ -2944,8 +2942,8 @@ impl RasterizerInterface for RasterizerVulkan {
             warn!("RasterizerVulkan::clear skipped: no bound channel memory manager");
             return;
         };
-        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
-            unsafe { memory_manager.as_ref().read_block_unsafe(gpu_va, output) }
+        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| unsafe {
+            memory_manager.as_ref().read_block_unsafe(gpu_va, output)
         };
         let clear_scissor = clear_view.use_scissor().then(|| {
             let scissor = clear_view.scissor(0);
@@ -3222,8 +3220,8 @@ impl RasterizerInterface for RasterizerVulkan {
         let Some(memory_manager) = self.channel_memory_manager_handle else {
             return;
         };
-        let read_gpu = |address: u64, output: &mut [u8]| {
-            unsafe { memory_manager.as_ref().read_block_unsafe(address, output) }
+        let read_gpu = |address: u64, output: &mut [u8]| unsafe {
+            memory_manager.as_ref().read_block_unsafe(address, output)
         };
         let buffer_cache_mutex: *const _ = Arc::as_ptr(&self.common_buffer_cache.mutex);
         let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;

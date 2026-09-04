@@ -130,11 +130,11 @@ pub const DMA_ACCURACY: &[(DmaAccuracy, &str)] = &[
 ];
 
 pub const FRAME_PACING_MODE: &[(FramePacingMode, &str)] = &[
-    (FramePacingMode::Target_Auto, "Auto"),
-    (FramePacingMode::Target_30, "30 FPS"),
-    (FramePacingMode::Target_60, "60 FPS"),
-    (FramePacingMode::Target_90, "90 FPS"),
-    (FramePacingMode::Target_120, "120 FPS"),
+    (FramePacingMode::TargetAuto, "Auto"),
+    (FramePacingMode::Target30, "30 FPS"),
+    (FramePacingMode::Target60, "60 FPS"),
+    (FramePacingMode::Target90, "90 FPS"),
+    (FramePacingMode::Target120, "120 FPS"),
 ];
 
 pub const GPU_FENCE_BEHAVIOR: &[(GpuFenceBehavior, &str)] = &[

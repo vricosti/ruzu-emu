@@ -316,15 +316,15 @@ impl<'a> Emitter<'a> {
                 let not_z = self.logical_not(z);
                 self.logical_and(not_s, not_z)
             }
-            FlowTest::FCSM_TR => {
+            FlowTest::FcsmTr => {
                 log::warn!("(STUBBED) FCSM_TR flow test");
                 self.imm_u1(false)
             }
-            FlowTest::CSM_TA
-            | FlowTest::CSM_TR
-            | FlowTest::CSM_MX
-            | FlowTest::FCSM_TA
-            | FlowTest::FCSM_MX => panic!("Unimplemented flow test {test}"),
+            FlowTest::CsmTa
+            | FlowTest::CsmTr
+            | FlowTest::CsmMx
+            | FlowTest::FcsmTa
+            | FlowTest::FcsmMx => panic!("Unimplemented flow test {test}"),
         }
     }
 

@@ -18,10 +18,10 @@ pub const BPP_LOG2: u32 = 2;
 pub const PIXEL_FORMAT: crate::surface::PixelFormat = crate::surface::PixelFormat::B8G8R8A8Unorm;
 
 /// Linear width derived from the undocked screen layout.
-pub const LINEAR_WIDTH: u32 = ruzu_core::frontend::framebuffer_layout::ScreenUndocked::WIDTH;
+pub const LINEAR_WIDTH: u32 = ruzu_core::frontend::framebuffer_layout::screen_undocked::WIDTH;
 
 /// Linear height derived from the undocked screen layout.
-pub const LINEAR_HEIGHT: u32 = ruzu_core::frontend::framebuffer_layout::ScreenUndocked::HEIGHT;
+pub const LINEAR_HEIGHT: u32 = ruzu_core::frontend::framebuffer_layout::screen_undocked::HEIGHT;
 
 /// Linear depth.
 pub const LINEAR_DEPTH: u32 = 1;

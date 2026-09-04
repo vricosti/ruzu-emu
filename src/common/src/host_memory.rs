@@ -765,6 +765,7 @@ impl HostMemoryImpl {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn enable_direct_mapped_address(&mut self) {
         self.virtual_base = ptr::null_mut();
     }

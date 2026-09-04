@@ -271,9 +271,9 @@ fn round_int16_fallback(rounding: u8, exact: bool) -> usize {
     macro_rules! select_exact {
         ($rounding:expr) => {
             if exact {
-                fallback_fp_vector_round_int16::<$rounding, true> as usize
+                fallback_fp_vector_round_int16::<$rounding, true> as *const () as usize
             } else {
-                fallback_fp_vector_round_int16::<$rounding, false> as usize
+                fallback_fp_vector_round_int16::<$rounding, false> as *const () as usize
             }
         };
     }

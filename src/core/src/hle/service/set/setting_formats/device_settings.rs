@@ -34,7 +34,7 @@ pub struct DeviceSettings {
     pub analog_user_stick_calibration_r: [u8; 0x10],
 
     /// Reserved
-    pub _reserved_0xB0: [u8; 0x20],
+    pub _reserved_0x_b0: [u8; 0x20],
 
     /// nn::settings::system::ConsoleSixAxisSensorAccelerationBias
     pub console_six_axis_sensor_acceleration_bias: [f32; 3],

@@ -18,4 +18,4 @@ pub use input_engine::{
     BasicMotion, EngineInputType, InputEngine, InputIdentifier, MappingCallback, MappingData,
     PadIdentifier, UpdateCallback, VibrationRequest,
 };
-pub use main_common::{InputSubsystem, Polling};
+pub use main_common::{polling, InputSubsystem};

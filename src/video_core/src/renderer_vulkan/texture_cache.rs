@@ -33,9 +33,9 @@ use crate::texture_cache::texture_cache_base::{
     TextureCacheBase as CommonTextureCache,
 };
 use crate::texture_cache::types::{
-    BufferImageCopy, Extent2D, Extent3D, FramebufferId, ImageCopy, ImageId, ImageType, ImageViewId,
-    ImageViewType, Offset3D, Region2D as CommonRegion2D, SamplerId, SubresourceRange,
-    NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
+    BufferImageCopy, Extent3D, FramebufferId, ImageCopy, ImageId, ImageType, ImageViewId, Offset3D,
+    Region2D as CommonRegion2D, SamplerId, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID,
+    NULL_SAMPLER_ID, NUM_RT,
 };
 use crate::texture_cache::util::full_download_copies;
 use crate::textures::texture::{
@@ -4517,9 +4517,8 @@ impl TextureCache {
             // returned, and no new staging allocation occurs while this slice
             // is consumed. This is the Rust equivalent of Eden passing
             // `map.mapped_span` directly to `SwizzleImage`.
-            let staging_bytes = unsafe {
-                std::slice::from_raw_parts(staging.mapped.cast_const(), staging_size)
-            };
+            let staging_bytes =
+                unsafe { std::slice::from_raw_parts(staging.mapped.cast_const(), staging_size) };
             let copies = full_download_copies(&image_base.info);
             self.base
                 .write_downloaded_image(&image_base, &copies, staging_bytes);
@@ -5885,7 +5884,9 @@ fn make_copy_image_barriers(
 mod tests {
     use super::*;
     use crate::texture_cache::image_view_info::SwizzleSource;
-    use crate::texture_cache::types::{Extent3D, Offset3D, SubresourceExtent, SubresourceLayers};
+    use crate::texture_cache::types::{
+        Extent3D, ImageViewType, Offset3D, SubresourceExtent, SubresourceLayers,
+    };
     use ash::vk::Handle;
 
     fn rgba_swizzle() -> [u8; 4] {

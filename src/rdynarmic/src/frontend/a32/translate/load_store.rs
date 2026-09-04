@@ -810,49 +810,49 @@ mod tests {
         // 0x24 as imm8a:imm8b.
         assert_literal_address(
             0xE59F_0014,
-            ArmInstId::LDR_lit,
+            ArmInstId::LdrLit,
             arm_ldr_lit,
             Opcode::A32ReadMemory32,
             0x101C,
         );
         assert_literal_address(
             0xE51F_0014,
-            ArmInstId::LDR_lit,
+            ArmInstId::LdrLit,
             arm_ldr_lit,
             Opcode::A32ReadMemory32,
             0x0FF4,
         );
         assert_literal_address(
             0xE5DF_0024,
-            ArmInstId::LDRB_lit,
+            ArmInstId::LdrbLit,
             arm_ldrb_lit,
             Opcode::A32ReadMemory8,
             0x102C,
         );
         assert_literal_address(
             0xE1DF_02B4,
-            ArmInstId::LDRH_lit,
+            ArmInstId::LdrhLit,
             arm_ldrh_lit,
             Opcode::A32ReadMemory16,
             0x102C,
         );
         assert_literal_address(
             0xE1DF_02D4,
-            ArmInstId::LDRSB_lit,
+            ArmInstId::LdrsbLit,
             arm_ldrsb_lit,
             Opcode::A32ReadMemory8,
             0x102C,
         );
         assert_literal_address(
             0xE1DF_02F4,
-            ArmInstId::LDRSH_lit,
+            ArmInstId::LdrshLit,
             arm_ldrsh_lit,
             Opcode::A32ReadMemory16,
             0x102C,
         );
         assert_literal_address(
             0xE1CF_02D4,
-            ArmInstId::LDRD_lit,
+            ArmInstId::LdrdLit,
             arm_ldrd_lit,
             Opcode::A32ReadMemory64,
             0x102C,
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn arm_ldr_literal_to_pc_uses_fast_dispatch_hint() {
-        let (block, result) = translate_literal(0xE59F_F000, ArmInstId::LDR_lit, arm_ldr_lit);
+        let (block, result) = translate_literal(0xE59F_F000, ArmInstId::LdrLit, arm_ldr_lit);
         assert!(!result);
         assert!(matches!(block.terminal, Terminal::FastDispatchHint));
         assert!(block
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn arm_nonword_literal_to_pc_is_unpredictable() {
-        let (block, result) = translate_literal(0xE5DF_F000, ArmInstId::LDRB_lit, arm_ldrb_lit);
+        let (block, result) = translate_literal(0xE5DF_F000, ArmInstId::LdrbLit, arm_ldrb_lit);
         assert!(!result);
         assert!(block
             .instructions
@@ -886,14 +886,14 @@ mod tests {
         for (raw, id, visitor) in [
             (
                 0xE59F_0000,
-                ArmInstId::LDR_imm,
+                ArmInstId::LdrImm,
                 arm_ldr_imm as fn(&mut A32IREmitter, &DecodedArm) -> bool,
             ),
-            (0xE5DF_0000, ArmInstId::LDRB_imm, arm_ldrb_imm),
-            (0xE1DF_00B0, ArmInstId::LDRH_imm, arm_ldrh_imm),
-            (0xE1DF_00D0, ArmInstId::LDRSB_imm, arm_ldrsb_imm),
-            (0xE1DF_00F0, ArmInstId::LDRSH_imm, arm_ldrsh_imm),
-            (0xE1CF_00D0, ArmInstId::LDRD_imm, arm_ldrd_imm),
+            (0xE5DF_0000, ArmInstId::LdrbImm, arm_ldrb_imm),
+            (0xE1DF_00B0, ArmInstId::LdrhImm, arm_ldrh_imm),
+            (0xE1DF_00D0, ArmInstId::LdrsbImm, arm_ldrsb_imm),
+            (0xE1DF_00F0, ArmInstId::LdrshImm, arm_ldrsh_imm),
+            (0xE1CF_00D0, ArmInstId::LdrdImm, arm_ldrd_imm),
         ] {
             assert_unpredictable_load(raw, id, visitor);
         }
@@ -903,14 +903,14 @@ mod tests {
         let register_fields = (1 << 24) | (1 << 23) | (1 << 16) | 15;
         for (id, visitor) in [
             (
-                ArmInstId::LDR_reg,
+                ArmInstId::LdrReg,
                 arm_ldr_reg as fn(&mut A32IREmitter, &DecodedArm) -> bool,
             ),
-            (ArmInstId::LDRB_reg, arm_ldrb_reg),
-            (ArmInstId::LDRH_reg, arm_ldrh_reg),
-            (ArmInstId::LDRSB_reg, arm_ldrsb_reg),
-            (ArmInstId::LDRSH_reg, arm_ldrsh_reg),
-            (ArmInstId::LDRD_reg, arm_ldrd_reg),
+            (ArmInstId::LdrbReg, arm_ldrb_reg),
+            (ArmInstId::LdrhReg, arm_ldrh_reg),
+            (ArmInstId::LdrsbReg, arm_ldrsb_reg),
+            (ArmInstId::LdrshReg, arm_ldrsh_reg),
+            (ArmInstId::LdrdReg, arm_ldrd_reg),
         ] {
             assert_unpredictable_load(register_fields, id, visitor);
         }
@@ -948,7 +948,7 @@ mod tests {
                     &mut ir,
                     &DecodedArm {
                         raw: 0xE1CF_00D0,
-                        id: ArmInstId::LDRD_lit,
+                        id: ArmInstId::LdrdLit,
                     },
                 ));
             }
@@ -976,7 +976,7 @@ mod tests {
         let mut ir = A32IREmitter::with_location(&mut block, loc);
         let inst = DecodedArm {
             raw: 0xE1A1_20F4,
-            id: ArmInstId::STRD_imm,
+            id: ArmInstId::StrdImm,
         };
 
         assert!(arm_strd_imm(&mut ir, &inst));
@@ -1005,7 +1005,7 @@ mod tests {
         let mut ir = A32IREmitter::with_location(&mut block, loc);
         let inst = DecodedArm {
             raw: 0xE1B1_20D4,
-            id: ArmInstId::LDRD_imm,
+            id: ArmInstId::LdrdImm,
         };
 
         assert!(arm_ldrd_imm(&mut ir, &inst));

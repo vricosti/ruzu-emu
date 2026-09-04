@@ -48,22 +48,22 @@ enum DpOp {
 fn classify(id: ArmInstId) -> Option<(DpOp, DpCategory)> {
     use ArmInstId::*;
     match id {
-        AND_imm | AND_reg | AND_rsr => Some((DpOp::And, DpCategory::TwoOp)),
-        EOR_imm | EOR_reg | EOR_rsr => Some((DpOp::Eor, DpCategory::TwoOp)),
-        SUB_imm | SUB_reg | SUB_rsr => Some((DpOp::Sub, DpCategory::TwoOp)),
-        RSB_imm | RSB_reg | RSB_rsr => Some((DpOp::Rsb, DpCategory::TwoOp)),
-        ADD_imm | ADD_reg | ADD_rsr => Some((DpOp::Add, DpCategory::TwoOp)),
-        ORR_imm | ORR_reg | ORR_rsr => Some((DpOp::Orr, DpCategory::TwoOp)),
-        BIC_imm | BIC_reg | BIC_rsr => Some((DpOp::Bic, DpCategory::TwoOp)),
-        ADC_imm | ADC_reg | ADC_rsr => Some((DpOp::Adc, DpCategory::TwoOpCarry)),
-        SBC_imm | SBC_reg | SBC_rsr => Some((DpOp::Sbc, DpCategory::TwoOpCarry)),
-        RSC_imm | RSC_reg | RSC_rsr => Some((DpOp::Rsc, DpCategory::TwoOpCarry)),
-        MOV_imm | MOV_reg | MOV_rsr => Some((DpOp::Mov, DpCategory::MovOp)),
-        MVN_imm | MVN_reg | MVN_rsr => Some((DpOp::Mvn, DpCategory::MvnOp)),
-        TST_imm | TST_reg | TST_rsr => Some((DpOp::Tst, DpCategory::TestOp)),
-        TEQ_imm | TEQ_reg | TEQ_rsr => Some((DpOp::Teq, DpCategory::TestOp)),
-        CMP_imm | CMP_reg | CMP_rsr => Some((DpOp::Cmp, DpCategory::CompareOp)),
-        CMN_imm | CMN_reg | CMN_rsr => Some((DpOp::Cmn, DpCategory::CompareOp)),
+        AndImm | AndReg | AndRsr => Some((DpOp::And, DpCategory::TwoOp)),
+        EorImm | EorReg | EorRsr => Some((DpOp::Eor, DpCategory::TwoOp)),
+        SubImm | SubReg | SubRsr => Some((DpOp::Sub, DpCategory::TwoOp)),
+        RsbImm | RsbReg | RsbRsr => Some((DpOp::Rsb, DpCategory::TwoOp)),
+        AddImm | AddReg | AddRsr => Some((DpOp::Add, DpCategory::TwoOp)),
+        OrrImm | OrrReg | OrrRsr => Some((DpOp::Orr, DpCategory::TwoOp)),
+        BicImm | BicReg | BicRsr => Some((DpOp::Bic, DpCategory::TwoOp)),
+        AdcImm | AdcReg | AdcRsr => Some((DpOp::Adc, DpCategory::TwoOpCarry)),
+        SbcImm | SbcReg | SbcRsr => Some((DpOp::Sbc, DpCategory::TwoOpCarry)),
+        RscImm | RscReg | RscRsr => Some((DpOp::Rsc, DpCategory::TwoOpCarry)),
+        MovImm | MovReg | MovRsr => Some((DpOp::Mov, DpCategory::MovOp)),
+        MvnImm | MvnReg | MvnRsr => Some((DpOp::Mvn, DpCategory::MvnOp)),
+        TstImm | TstReg | TstRsr => Some((DpOp::Tst, DpCategory::TestOp)),
+        TeqImm | TeqReg | TeqRsr => Some((DpOp::Teq, DpCategory::TestOp)),
+        CmpImm | CmpReg | CmpRsr => Some((DpOp::Cmp, DpCategory::CompareOp)),
+        CmnImm | CmnReg | CmnRsr => Some((DpOp::Cmn, DpCategory::CompareOp)),
         _ => None,
     }
 }
@@ -126,7 +126,7 @@ pub fn arm_dp_reg(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     };
 
     // Upstream: GetCFlag is called for the barrel shifter.
-    // For MOV_reg with LSL#0 and S=0, upstream still calls GetCFlag
+    // For MovReg with LSL#0 and S=0, upstream still calls GetCFlag
     // because EmitImmShift always takes carry_in. Match upstream.
     let carry_in = ir.get_c_flag();
     let rm_val = ir.get_register(rm);
@@ -288,10 +288,10 @@ mod tests {
 
     #[test]
     fn immediate_expansion_matches_upstream_carry_reads() {
-        let add = immediate_opcodes(0xe280_1001, ArmInstId::ADD_imm);
+        let add = immediate_opcodes(0xe280_1001, ArmInstId::AddImm);
         assert!(!add.contains(&Opcode::A32GetCFlag));
 
-        let adc = immediate_opcodes(0xe2a0_1001, ArmInstId::ADC_imm);
+        let adc = immediate_opcodes(0xe2a0_1001, ArmInstId::AdcImm);
         assert_eq!(
             adc.iter()
                 .filter(|opcode| **opcode == Opcode::A32GetCFlag)
@@ -308,7 +308,7 @@ mod tests {
             .expect("ADC carry read");
         assert!(register_read < carry_read);
 
-        let and = immediate_opcodes(0xe200_1001, ArmInstId::AND_imm);
+        let and = immediate_opcodes(0xe200_1001, ArmInstId::AndImm);
         assert_eq!(and.first(), Some(&Opcode::A32GetCFlag));
         assert_eq!(
             and.iter()
@@ -317,7 +317,7 @@ mod tests {
             1
         );
 
-        let bic = immediate_opcodes(0xe3c0_1001, ArmInstId::BIC_imm);
+        let bic = immediate_opcodes(0xe3c0_1001, ArmInstId::BicImm);
         assert!(bic.contains(&Opcode::AndNot32));
         assert!(!bic.contains(&Opcode::Not32));
     }
@@ -332,7 +332,7 @@ mod tests {
                 &mut ir,
                 &DecodedArm {
                     raw: 0xe290_f001,
-                    id: ArmInstId::ADD_imm,
+                    id: ArmInstId::AddImm,
                 },
             ));
         }
@@ -352,7 +352,7 @@ mod tests {
                 &mut ir,
                 &DecodedArm {
                     raw: 0xe0a0_f211,
-                    id: ArmInstId::ADC_rsr,
+                    id: ArmInstId::AdcRsr,
                 },
             ));
         }
@@ -371,7 +371,7 @@ mod tests {
                 &mut ir,
                 &DecodedArm {
                     raw: 0xe0a0_1213,
-                    id: ArmInstId::ADC_rsr,
+                    id: ArmInstId::AdcRsr,
                 },
             ));
         }

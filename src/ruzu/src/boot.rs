@@ -456,7 +456,7 @@ fn run_boot(
     window_info: WindowSystemInfo,
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
-    #[cfg_attr(target_os = "macos", allow(unused_variables))] opengl_context_source: Option<
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] opengl_context_source: Option<
         OpenGLContextSource,
     >,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,

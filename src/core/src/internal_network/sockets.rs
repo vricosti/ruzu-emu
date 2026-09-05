@@ -6,9 +6,10 @@
 
 #[cfg(unix)]
 use crate::internal_network::network::get_interrupt_socket;
+#[cfg(unix)]
+use crate::internal_network::network::PollEvents as NetworkPollEvents;
 use crate::internal_network::network::{
-    Domain, Errno, PollEvents as NetworkPollEvents, Protocol, ProxyPacket, ShutdownHow, SockAddrIn,
-    Type,
+    Domain, Errno, Protocol, ProxyPacket, ShutdownHow, SockAddrIn, Type,
 };
 
 /// Socket base trait.
@@ -77,6 +78,9 @@ impl Default for AcceptResult {
 /// Corresponds to upstream `Network::Socket`.
 pub struct Socket {
     fd: i32,
+    // Eden owns this state on every platform. Ruzu's native Windows socket
+    // backend is still pending, so only Unix currently reads it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     is_non_blocking: bool,
 }
 
@@ -459,6 +463,7 @@ impl SocketBase for Socket {
         #[cfg(not(unix))]
         {
             // TODO: Windows socket creation
+            let _ = (domain, type_, protocol);
             Errno::Other
         }
     }
@@ -914,7 +919,10 @@ impl SocketBase for Socket {
             return get_last_error();
         }
         #[cfg(not(unix))]
-        Errno::Other
+        {
+            let _ = enable;
+            Errno::Other
+        }
     }
 
     fn get_pending_error(&self) -> (Errno, Errno) {

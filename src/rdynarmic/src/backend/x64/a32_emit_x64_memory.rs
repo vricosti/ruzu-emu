@@ -508,7 +508,7 @@ fn emit_preserved_a32_fastmem_write_trace_hook(
     ra.asm
         .mov(
             RAX,
-            crate::jit::a32_fastmem_write_trace_hook as usize as i64,
+            crate::jit::a32_fastmem_write_trace_hook as *const () as usize as i64,
         )
         .unwrap();
     ra.asm.call_reg(RAX).unwrap();

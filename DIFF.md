@@ -19813,3 +19813,201 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: the adapter returns host filesystem handles only.
+
+## 2026-09-04 — `src/common/src/host_memory.rs` vs Eden `src/common/host_memory.{h,cpp}`
+
+### Intentional differences
+
+- The Windows Rust constructor combines Eden's `Impl` constructor and `Init`; consequently the
+  constructor argument performs the allocations directly while the parity-owned `backing_size`
+  field is retained but not read later. A local `dead_code` allowance documents that ownership
+  difference without removing upstream state.
+
+### Unintentional differences (to fix)
+
+- None introduced by this warning cleanup.
+
+### Missing items
+
+- None in this warning-only slice.
+
+### Binary layout verification
+
+- PASS: `HostMemoryImpl` is host-only state and is not serialized or exposed through a guest ABI.
+
+## 2026-09-04 — `src/common/{build.rs,src/scm_rev.rs}` vs Eden `CMakeModules/GenerateSCMRev.cmake` and `src/common/scm_rev.cpp.in`
+
+### Intentional differences
+
+- Eden receives `CMAKE_CXX_COMPILER_ID` and `CMAKE_CXX_COMPILER_VERSION` directly from CMake. Ruzu
+  queries the explicitly configured `CXX` first and, for an MSVC target without a developer-shell
+  `PATH`, locates the latest installed Visual C++ toolset through Microsoft's `vswhere` before
+  parsing `cl /Bv`. This reports the compiler that Cargo's native dependencies select instead of a
+  hard-coded Visual Studio release.
+
+### Unintentional differences (to fix)
+
+- None. A normal PowerShell Cargo build no longer falls back to `Unknown compiler` when Visual
+  Studio is installed but `cl.exe` is not globally discoverable.
+
+### Missing items
+
+- None in compiler identity generation.
+
+### Binary layout verification
+
+- PASS: compiler identity is build-time UTF-8 metadata only. The `common` compiler-identity
+  regression test now passes with the installed MSVC toolset.
+
+## 2026-09-04 — `src/core/src/arm/dynarmic/dynarmic_cp15.rs` vs Eden `src/core/arm/dynarmic/dynarmic_cp15.{h,cpp}`
+
+### Intentional differences
+
+- The unused Rust `fence` import is now selected only for the platforms that use it. The MSVC x64
+  path continues to use its dedicated barrier, matching Eden's MSVC-intrinsic versus
+  `__sync_synchronize` platform split.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None in this warning-only slice.
+
+### Binary layout verification
+
+- PASS: no CP15 storage or payload layout changed.
+
+## 2026-09-04 — `src/core/src/file_sys/vfs/vfs_real.rs` vs Eden `src/core/file_sys/vfs/vfs_real.{h,cpp}` (`RealVfsDirectory::GetFileTimeStamp`)
+
+### Intentional differences
+
+- Rust obtains the same Windows creation, access, and write timestamps through
+  `std::os::windows::fs::MetadataExt` instead of Eden's `_wstat64`. `FILETIME` values are converted
+  from 100 ns ticks since 1601 to signed Unix seconds before preserving Eden's signed-to-unsigned
+  bit pattern.
+
+### Unintentional differences (to fix)
+
+- None. The former Windows default-value result has been replaced with the upstream behavior.
+
+### Missing items
+
+- None in this method.
+
+### Binary layout verification
+
+- PASS: all four `FileTimeStampRaw` fields are initialized, including zeroed padding; a Windows
+  regression test covers the epoch, a positive offset, and the pre-epoch unsigned wrap.
+
+## 2026-09-04 — `src/core/src/internal_network/sockets.rs` vs Eden `src/core/internal_network/{sockets.h,network.cpp}`
+
+### Intentional differences
+
+- Unix-only imports and unused stub parameters are now conditionally consumed. The
+  `is_non_blocking` field remains owned by `Socket` on every platform, as in Eden, with a localized
+  allowance on platforms where Ruzu's backend cannot read it yet.
+
+### Unintentional differences (to fix)
+
+- Ruzu's native Windows socket operations remain stubs, whereas Eden implements them. This is a
+  pre-existing subsystem-sized parity gap and was not replaced with warning suppression at module
+  scope.
+
+### Missing items
+
+- Native Windows initialization, non-blocking mode, polling, and the other WinSock-backed socket
+  operations remain to be ported.
+
+### Binary layout verification
+
+- PASS: socket state is host-only and no serialized layout changed.
+
+## 2026-09-04 — `src/core/src/hle/service/sockets/bsd.rs` vs Eden `src/core/hle/service/sockets/bsd.cpp` (`DuplicateSocketImpl`)
+
+### Intentional differences
+
+- The source OS descriptor local is now compiled only on Unix, where it is consumed. Runtime
+  behavior is unchanged.
+
+### Unintentional differences (to fix)
+
+- Eden duplicates the service's shared `Socket` ownership; Ruzu currently duplicates the Unix OS
+  descriptor and returns failure on Windows. This pre-existing ownership/platform divergence needs
+  a dedicated socket-lifecycle parity pass.
+
+### Missing items
+
+- Windows duplication and exact shared-socket ownership parity.
+
+### Binary layout verification
+
+- PASS: no IPC request or response structure changed.
+
+## 2026-09-04 — `src/rdynarmic/src/backend/x64/{a32_emit_a32.rs,a32_emit_x64_memory.rs,a32_interface.rs,a64_emit_x64.rs,a64_emit_x64_memory.rs,a64_interface.rs,abi.rs,block_of_code.rs,emit.rs,emit_aes.rs,emit_crc32.rs,emit_floating_point.rs,emit_fp_vector.rs,emit_fp_vector_convert.rs,emit_packed.rs,emit_vector_basic.rs,emit_vector_misc.rs,emit_vector_multiply.rs,emit_vector_saturated.rs,emit_vector_shift.rs,exception_handler.rs}`
+
+### Intentional differences
+
+- Rust function items passed to generated x64 code are now converted explicitly through
+  `*const ()` before their integer address representation. This is the compiler-recommended,
+  type-explicit spelling of the existing address conversion and preserves every emitted target
+  address.
+- Windows `CONTEXT` offsets used solely by the SEH unwind regression test are test-gated. The live
+  RSP/RIP offsets remain available to the exception handler.
+- The unused explanatory `UWRC_RSP` constant and unreachable global `unregister_all` helper were
+  removed. Per-code-buffer registration is still paired with `unregister_code_block` from
+  `BlockOfCode::drop`, so registration lifecycle and ordering are unchanged.
+
+### Unintentional differences (to fix)
+
+- None introduced by this warning cleanup.
+
+### Missing items
+
+- No upstream-owned method or constant was removed; the Rust Windows SEH integration has no Eden
+  source-file counterpart to compare line-for-line.
+
+### Binary layout verification
+
+- PASS: function addresses retain the same machine-width bit pattern, unwind record bytes are
+  unchanged, and all 1,133 `rdynarmic` library tests execute successfully (1,129 passed, 4 ignored).
+
+## 2026-09-04 — `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}` (`MacroJIT_SendThunk`, `MacroJIT_ErrorThunk`)
+
+### Intentional differences
+
+- The two thunk function items now pass explicitly through `*const ()` before becoming the host
+  integer address consumed by the far-call emitter. The address and call sequence are unchanged.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None in these thunk call sites.
+
+### Binary layout verification
+
+- PASS: generated call targets retain identical pointer bits; no macro state layout changed.
+
+## 2026-09-04 — `src/ruzu/src/boot.rs` vs platform renderer context ownership
+
+### Intentional differences
+
+- `opengl_context_source` is now allowed to be unused on every non-Linux target, matching the
+  existing Linux-only GLX consumption. This GTK frontend is outside the excluded Qt `yuzu`
+  source-tree parity contract.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None in this warning-only slice.
+
+### Binary layout verification
+
+- PASS: frontend renderer handles are host-only and no serialized layout changed.

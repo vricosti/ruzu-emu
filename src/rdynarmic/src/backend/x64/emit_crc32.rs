@@ -46,7 +46,7 @@ fn emit_crc32_castagnoli(
             inst_ref,
             inst,
             bitsize,
-            crc32::compute_crc32_castagnoli as usize,
+            crc32::compute_crc32_castagnoli as *const () as usize,
         );
         return;
     }
@@ -133,7 +133,7 @@ fn emit_crc32_iso(
             inst_ref,
             inst,
             bitsize,
-            crc32::compute_crc32_iso as usize,
+            crc32::compute_crc32_iso as *const () as usize,
         );
         return;
     }

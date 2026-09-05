@@ -905,6 +905,7 @@ impl Bsd {
         // wrapping the same underlying fd via Socket::from_fd. Note: this means the two
         // FileDescriptors share the same OS fd, matching upstream shared_ptr semantics.
         let src = self.file_descriptors[fd as usize].as_ref().unwrap();
+        #[cfg(unix)]
         let src_fd_val = src.socket.get_fd();
         // Duplicate the OS-level file descriptor so both can close independently
         #[cfg(unix)]

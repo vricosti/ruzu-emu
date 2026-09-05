@@ -302,16 +302,40 @@ fn emit_fp_vector_min_max(
 }
 
 pub fn emit_fp_vector_max32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_max32 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_max32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_max64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_max64 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_max64 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_min32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_min32 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_min32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_min64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_min64 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_min64 as *const () as usize,
+    );
 }
 
 pub fn emit_fp_vector_max_numeric32(
@@ -320,7 +344,13 @@ pub fn emit_fp_vector_max_numeric32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_maxnm32 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_maxnm32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_max_numeric64(
     ctx: &EmitContext,
@@ -328,7 +358,13 @@ pub fn emit_fp_vector_max_numeric64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_maxnm64 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_maxnm64 as *const () as usize,
+    );
 }
 
 pub fn emit_fp_vector_min_numeric32(
@@ -337,7 +373,13 @@ pub fn emit_fp_vector_min_numeric32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_minnm32 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_minnm32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_min_numeric64(
     ctx: &EmitContext,
@@ -345,7 +387,13 @@ pub fn emit_fp_vector_min_numeric64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, fallback_fp_minnm64 as usize);
+    emit_fp_vector_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_minnm64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +443,12 @@ pub fn emit_fp_vector_equal16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_equal16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_equal16 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_equal32(
     _ctx: &EmitContext,
@@ -403,7 +456,12 @@ pub fn emit_fp_vector_equal32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_equal32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_equal32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_equal64(
     _ctx: &EmitContext,
@@ -411,7 +469,12 @@ pub fn emit_fp_vector_equal64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_equal64 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_equal64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +492,12 @@ pub fn emit_fp_vector_greater32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_greater32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_greater32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_greater64(
     _ctx: &EmitContext,
@@ -437,7 +505,12 @@ pub fn emit_fp_vector_greater64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_greater64 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_greater64 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_greater_equal32(
     _ctx: &EmitContext,
@@ -449,7 +522,7 @@ pub fn emit_fp_vector_greater_equal32(
         ra,
         inst_ref,
         inst,
-        fallback_fp_vector_greater_equal32 as usize,
+        fallback_fp_vector_greater_equal32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_greater_equal64(
@@ -462,7 +535,7 @@ pub fn emit_fp_vector_greater_equal64(
         ra,
         inst_ref,
         inst,
-        fallback_fp_vector_greater_equal64 as usize,
+        fallback_fp_vector_greater_equal64 as *const () as usize,
     );
 }
 
@@ -516,7 +589,12 @@ pub fn emit_fp_vector_mulx32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_mulx32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_mulx32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_mulx64(
     _ctx: &EmitContext,
@@ -524,7 +602,12 @@ pub fn emit_fp_vector_mulx64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_fp_vector_mulx64 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_vector_mulx64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +725,13 @@ pub fn emit_fp_vector_paired_add32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_paired_add32 as usize);
+    emit_three_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_paired_add32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_paired_add64(
     ctx: &EmitContext,
@@ -650,7 +739,13 @@ pub fn emit_fp_vector_paired_add64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_paired_add64 as usize);
+    emit_three_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_paired_add64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -712,7 +807,7 @@ pub fn emit_fp_vector_paired_add_lower32(
         ra,
         inst_ref,
         inst,
-        fallback_fp_paired_add_lower32 as usize,
+        fallback_fp_paired_add_lower32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_paired_add_lower64(
@@ -726,7 +821,7 @@ pub fn emit_fp_vector_paired_add_lower64(
         ra,
         inst_ref,
         inst,
-        fallback_fp_paired_add_lower64 as usize,
+        fallback_fp_paired_add_lower64 as *const () as usize,
     );
 }
 

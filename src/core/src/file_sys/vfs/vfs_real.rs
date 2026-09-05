@@ -15,6 +15,14 @@ use common::fs::path_util;
 
 use super::vfs::{VfsDirectory, VfsEntryType, VfsFile, VfsFilesystem};
 use super::vfs_types::{FileTimeStampRaw, VirtualDir, VirtualFile};
+
+#[cfg(windows)]
+fn windows_file_time_to_unix_seconds(file_time: u64) -> u64 {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
+    const TICKS_PER_SECOND: i128 = 10_000_000;
+    let seconds = (i128::from(file_time) - WINDOWS_TO_UNIX_EPOCH_100NS) / TICKS_PER_SECOND;
+    seconds as i64 as u64
+}
 use crate::file_sys::fs_filesystem::OpenMode;
 
 // ============================================================================
@@ -688,8 +696,25 @@ impl VfsDirectory for RealVfsDirectory {
             }
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
+            use std::os::windows::fs::MetadataExt;
+
+            let metadata = match std::fs::metadata(&full_path) {
+                Ok(metadata) => metadata,
+                Err(_) => return FileTimeStampRaw::default(),
+            };
+            FileTimeStampRaw {
+                created: windows_file_time_to_unix_seconds(metadata.creation_time()),
+                accessed: windows_file_time_to_unix_seconds(metadata.last_access_time()),
+                modified: windows_file_time_to_unix_seconds(metadata.last_write_time()),
+                padding: 0,
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = full_path;
             FileTimeStampRaw::default()
         }
     }
@@ -884,5 +909,17 @@ mod tests {
         std::fs::remove_file(outside).unwrap();
         std::fs::remove_dir(root).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_time_conversion_matches_unix_epoch_seconds() {
+        const EPOCH: u64 = 116_444_736_000_000_000;
+        assert_eq!(windows_file_time_to_unix_seconds(EPOCH), 0);
+        assert_eq!(windows_file_time_to_unix_seconds(EPOCH + 30_000_000), 3);
+        assert_eq!(
+            windows_file_time_to_unix_seconds(EPOCH - 10_000_000),
+            u64::MAX
+        );
     }
 }

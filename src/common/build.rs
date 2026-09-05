@@ -60,11 +60,75 @@ fn msvc_version_in(text: &str) -> Option<String> {
         .or_else(|| Some(primary.clone()))
 }
 
+fn msvc_target_directory(target_arch: &str) -> Option<&'static str> {
+    match target_arch {
+        "x86_64" => Some("x64"),
+        "x86" => Some("x86"),
+        "aarch64" => Some("arm64"),
+        "arm" => Some("arm"),
+        _ => None,
+    }
+}
+
+fn find_msvc_compiler(repository: &Path) -> Option<OsString> {
+    let vswhere = env::var_os("VSWHERE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            env::var_os("ProgramFiles(x86)")
+                .map(PathBuf::from)
+                .map(|path| path.join("Microsoft Visual Studio/Installer/vswhere.exe"))
+                .filter(|path| path.is_file())
+        })
+        .or_else(|| {
+            env::var_os("ProgramFiles")
+                .map(PathBuf::from)
+                .map(|path| path.join("Microsoft Visual Studio/Installer/vswhere.exe"))
+                .filter(|path| path.is_file())
+        })?;
+    let installation = command_text(
+        &vswhere.into_os_string(),
+        &[
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        repository,
+    )?;
+    let tools_root = PathBuf::from(installation).join("VC/Tools/MSVC");
+    let mut toolsets = std::fs::read_dir(tools_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .collect::<Vec<_>>();
+    toolsets.sort_by_key(|entry| entry.file_name());
+
+    let host = if cfg!(target_arch = "x86_64") {
+        "Hostx64"
+    } else {
+        "Hostx86"
+    };
+    let target = msvc_target_directory(&env::var("CARGO_CFG_TARGET_ARCH").ok()?)?;
+    toolsets.into_iter().rev().find_map(|toolset| {
+        let compiler = toolset
+            .path()
+            .join("bin")
+            .join(host)
+            .join(target)
+            .join("cl.exe");
+        compiler.is_file().then(|| compiler.into_os_string())
+    })
+}
+
 fn compiler_id(repository: &Path) -> String {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let compiler = env::var_os("CXX").unwrap_or_else(|| {
         if target_env == "msvc" {
-            OsString::from("cl.exe")
+            find_msvc_compiler(repository).unwrap_or_else(|| OsString::from("cl.exe"))
         } else {
             OsString::from("c++")
         }
@@ -167,6 +231,7 @@ fn main() {
         .unwrap_or(&manifest_dir);
     track_git_head(repository);
     println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=VSWHERE");
     println!("cargo:rerun-if-env-changed=GIT_REV");
     println!("cargo:rerun-if-env-changed=GIT_BRANCH");
 

@@ -47,7 +47,13 @@ pub fn emit_vector_signed_saturated_abs8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_abs8 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_abs8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_abs16(
     _ctx: &EmitContext,
@@ -55,7 +61,13 @@ pub fn emit_vector_signed_saturated_abs16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_abs16 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_abs16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_abs32(
     _ctx: &EmitContext,
@@ -63,7 +75,13 @@ pub fn emit_vector_signed_saturated_abs32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_abs32 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_abs32 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_abs64(
     _ctx: &EmitContext,
@@ -71,7 +89,13 @@ pub fn emit_vector_signed_saturated_abs64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_abs64 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_abs64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +135,13 @@ pub fn emit_vector_signed_saturated_neg8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_neg8 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_neg8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_neg16(
     _ctx: &EmitContext,
@@ -119,7 +149,13 @@ pub fn emit_vector_signed_saturated_neg16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_neg16 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_neg16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_neg32(
     _ctx: &EmitContext,
@@ -127,7 +163,13 @@ pub fn emit_vector_signed_saturated_neg32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_neg32 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_neg32 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_neg64(
     _ctx: &EmitContext,
@@ -135,7 +177,13 @@ pub fn emit_vector_signed_saturated_neg64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_neg64 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_neg64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +228,13 @@ pub fn emit_vector_signed_saturated_accumulate_unsigned8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_su8 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_su8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_accumulate_unsigned16(
     _ctx: &EmitContext,
@@ -188,7 +242,13 @@ pub fn emit_vector_signed_saturated_accumulate_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_su16 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_su16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_accumulate_unsigned32(
     _ctx: &EmitContext,
@@ -196,7 +256,13 @@ pub fn emit_vector_signed_saturated_accumulate_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_su32 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_su32 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_accumulate_unsigned64(
     _ctx: &EmitContext,
@@ -204,7 +270,13 @@ pub fn emit_vector_signed_saturated_accumulate_unsigned64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_su64 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_su64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +321,13 @@ pub fn emit_vector_unsigned_saturated_accumulate_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_us8 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_us8 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_accumulate_signed16(
     _ctx: &EmitContext,
@@ -257,7 +335,13 @@ pub fn emit_vector_unsigned_saturated_accumulate_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_us16 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_us16 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_accumulate_signed32(
     _ctx: &EmitContext,
@@ -265,7 +349,13 @@ pub fn emit_vector_unsigned_saturated_accumulate_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_us32 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_us32 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_accumulate_signed64(
     _ctx: &EmitContext,
@@ -273,7 +363,13 @@ pub fn emit_vector_unsigned_saturated_accumulate_signed64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_accum_us64 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_accum_us64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +411,13 @@ pub fn emit_vector_signed_saturated_narrow_to_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_ss16 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_ss16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_narrow_to_signed32(
     _ctx: &EmitContext,
@@ -323,7 +425,13 @@ pub fn emit_vector_signed_saturated_narrow_to_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_ss32 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_ss32 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_narrow_to_signed64(
     _ctx: &EmitContext,
@@ -331,7 +439,13 @@ pub fn emit_vector_signed_saturated_narrow_to_signed64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_ss64 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_ss64 as *const () as usize,
+    );
 }
 
 // VectorSignedSaturatedNarrowToUnsigned
@@ -371,7 +485,13 @@ pub fn emit_vector_signed_saturated_narrow_to_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_su16 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_su16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_narrow_to_unsigned32(
     _ctx: &EmitContext,
@@ -379,7 +499,13 @@ pub fn emit_vector_signed_saturated_narrow_to_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_su32 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_su32 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_narrow_to_unsigned64(
     _ctx: &EmitContext,
@@ -387,7 +513,13 @@ pub fn emit_vector_signed_saturated_narrow_to_unsigned64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_su64 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_su64 as *const () as usize,
+    );
 }
 
 // VectorUnsignedSaturatedNarrow
@@ -424,7 +556,13 @@ pub fn emit_vector_unsigned_saturated_narrow16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_uu16 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_uu16 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_narrow32(
     _ctx: &EmitContext,
@@ -432,7 +570,13 @@ pub fn emit_vector_unsigned_saturated_narrow32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_uu32 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_uu32 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_narrow64(
     _ctx: &EmitContext,
@@ -440,7 +584,13 @@ pub fn emit_vector_unsigned_saturated_narrow64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_narrow_uu64 as usize);
+    emit_one_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_narrow_uu64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +655,13 @@ pub fn emit_vector_signed_saturated_shift_left8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_s8 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_shift_left16(
     _ctx: &EmitContext,
@@ -513,7 +669,13 @@ pub fn emit_vector_signed_saturated_shift_left16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_s16 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_shift_left32(
     _ctx: &EmitContext,
@@ -521,7 +683,13 @@ pub fn emit_vector_signed_saturated_shift_left32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_s32 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_shift_left64(
     _ctx: &EmitContext,
@@ -529,7 +697,13 @@ pub fn emit_vector_signed_saturated_shift_left64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_s64 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_s64 as *const () as usize,
+    );
 }
 
 // VectorSignedSaturatedShiftLeftUnsigned — shift left with unsigned saturation
@@ -588,7 +762,7 @@ pub fn emit_vector_signed_saturated_shift_left_unsigned8(
         ra,
         inst_ref,
         inst,
-        fallback_sat_shlu_s8 as usize,
+        fallback_sat_shlu_s8 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_shift_left_unsigned16(
@@ -602,7 +776,7 @@ pub fn emit_vector_signed_saturated_shift_left_unsigned16(
         ra,
         inst_ref,
         inst,
-        fallback_sat_shlu_s16 as usize,
+        fallback_sat_shlu_s16 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_shift_left_unsigned32(
@@ -616,7 +790,7 @@ pub fn emit_vector_signed_saturated_shift_left_unsigned32(
         ra,
         inst_ref,
         inst,
-        fallback_sat_shlu_s32 as usize,
+        fallback_sat_shlu_s32 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_shift_left_unsigned64(
@@ -630,7 +804,7 @@ pub fn emit_vector_signed_saturated_shift_left_unsigned64(
         ra,
         inst_ref,
         inst,
-        fallback_sat_shlu_s64 as usize,
+        fallback_sat_shlu_s64 as *const () as usize,
     );
 }
 
@@ -685,7 +859,13 @@ pub fn emit_vector_unsigned_saturated_shift_left8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_u8 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_u8 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_shift_left16(
     _ctx: &EmitContext,
@@ -693,7 +873,13 @@ pub fn emit_vector_unsigned_saturated_shift_left16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_u16 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_shift_left32(
     _ctx: &EmitContext,
@@ -701,7 +887,13 @@ pub fn emit_vector_unsigned_saturated_shift_left32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_u32 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_u32 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_saturated_shift_left64(
     _ctx: &EmitContext,
@@ -709,7 +901,13 @@ pub fn emit_vector_unsigned_saturated_shift_left64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_sat_shl_u64 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_sat_shl_u64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +954,7 @@ pub fn emit_vector_signed_saturated_doubling_multiply_high16(
         ra,
         inst_ref,
         inst,
-        fallback_sat_dbl_mul_high16 as usize,
+        fallback_sat_dbl_mul_high16 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_doubling_multiply_high32(
@@ -770,7 +968,7 @@ pub fn emit_vector_signed_saturated_doubling_multiply_high32(
         ra,
         inst_ref,
         inst,
-        fallback_sat_dbl_mul_high32 as usize,
+        fallback_sat_dbl_mul_high32 as *const () as usize,
     );
 }
 
@@ -815,7 +1013,7 @@ pub fn emit_vector_signed_saturated_doubling_multiply_high_rounding16(
         ra,
         inst_ref,
         inst,
-        fallback_sat_dbl_mul_high_round16 as usize,
+        fallback_sat_dbl_mul_high_round16 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_doubling_multiply_high_rounding32(
@@ -829,7 +1027,7 @@ pub fn emit_vector_signed_saturated_doubling_multiply_high_rounding32(
         ra,
         inst_ref,
         inst,
-        fallback_sat_dbl_mul_high_round32 as usize,
+        fallback_sat_dbl_mul_high_round32 as *const () as usize,
     );
 }
 
@@ -899,7 +1097,7 @@ pub fn emit_vector_signed_saturated_doubling_multiply_long16(
         ra,
         inst_ref,
         inst,
-        fallback_sat_dbl_mul_long16 as usize,
+        fallback_sat_dbl_mul_long16 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_doubling_multiply_long32(
@@ -913,7 +1111,7 @@ pub fn emit_vector_signed_saturated_doubling_multiply_long32(
         ra,
         inst_ref,
         inst,
-        fallback_sat_dbl_mul_long32 as usize,
+        fallback_sat_dbl_mul_long32 as *const () as usize,
     );
 }
 
@@ -956,7 +1154,12 @@ pub fn emit_vector_halving_add_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_add_s8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_add_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_add_signed16(
     _ctx: &EmitContext,
@@ -964,7 +1167,12 @@ pub fn emit_vector_halving_add_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_add_s16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_add_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_add_signed32(
     _ctx: &EmitContext,
@@ -972,7 +1180,12 @@ pub fn emit_vector_halving_add_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_add_s32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_add_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_add_unsigned8(
     _ctx: &EmitContext,
@@ -980,7 +1193,12 @@ pub fn emit_vector_halving_add_unsigned8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_add_u8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_add_u8 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_add_unsigned16(
     _ctx: &EmitContext,
@@ -988,7 +1206,12 @@ pub fn emit_vector_halving_add_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_add_u16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_add_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_add_unsigned32(
     _ctx: &EmitContext,
@@ -996,7 +1219,12 @@ pub fn emit_vector_halving_add_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_add_u32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_add_u32 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_sub_signed8(
     _ctx: &EmitContext,
@@ -1004,7 +1232,12 @@ pub fn emit_vector_halving_sub_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_sub_s8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_sub_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_sub_signed16(
     _ctx: &EmitContext,
@@ -1012,7 +1245,12 @@ pub fn emit_vector_halving_sub_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_sub_s16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_sub_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_sub_signed32(
     _ctx: &EmitContext,
@@ -1020,7 +1258,12 @@ pub fn emit_vector_halving_sub_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_sub_s32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_sub_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_sub_unsigned8(
     _ctx: &EmitContext,
@@ -1028,7 +1271,12 @@ pub fn emit_vector_halving_sub_unsigned8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_sub_u8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_sub_u8 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_sub_unsigned16(
     _ctx: &EmitContext,
@@ -1036,7 +1284,12 @@ pub fn emit_vector_halving_sub_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_sub_u16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_sub_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_halving_sub_unsigned32(
     _ctx: &EmitContext,
@@ -1044,7 +1297,12 @@ pub fn emit_vector_halving_sub_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_halving_sub_u32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_halving_sub_u32 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,7 +1488,13 @@ pub fn emit_vector_signed_saturated_add8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_signed_sat_add_8 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_signed_sat_add_8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_add16(
     _ctx: &EmitContext,
@@ -1243,7 +1507,7 @@ pub fn emit_vector_signed_saturated_add16(
         ra,
         inst_ref,
         inst,
-        fallback_signed_sat_add_16 as usize,
+        fallback_signed_sat_add_16 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_add32(
@@ -1257,7 +1521,7 @@ pub fn emit_vector_signed_saturated_add32(
         ra,
         inst_ref,
         inst,
-        fallback_signed_sat_add_32 as usize,
+        fallback_signed_sat_add_32 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_add64(
@@ -1271,7 +1535,7 @@ pub fn emit_vector_signed_saturated_add64(
         ra,
         inst_ref,
         inst,
-        fallback_signed_sat_add_64 as usize,
+        fallback_signed_sat_add_64 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_sub8(
@@ -1280,7 +1544,13 @@ pub fn emit_vector_signed_saturated_sub8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback_saturated(_ctx, ra, inst_ref, inst, fallback_signed_sat_sub_8 as usize);
+    emit_two_arg_fallback_saturated(
+        _ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_signed_sat_sub_8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_saturated_sub16(
     _ctx: &EmitContext,
@@ -1293,7 +1563,7 @@ pub fn emit_vector_signed_saturated_sub16(
         ra,
         inst_ref,
         inst,
-        fallback_signed_sat_sub_16 as usize,
+        fallback_signed_sat_sub_16 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_sub32(
@@ -1307,7 +1577,7 @@ pub fn emit_vector_signed_saturated_sub32(
         ra,
         inst_ref,
         inst,
-        fallback_signed_sat_sub_32 as usize,
+        fallback_signed_sat_sub_32 as *const () as usize,
     );
 }
 pub fn emit_vector_signed_saturated_sub64(
@@ -1321,7 +1591,7 @@ pub fn emit_vector_signed_saturated_sub64(
         ra,
         inst_ref,
         inst,
-        fallback_signed_sat_sub_64 as usize,
+        fallback_signed_sat_sub_64 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_add8(
@@ -1335,7 +1605,7 @@ pub fn emit_vector_unsigned_saturated_add8(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_add_8 as usize,
+        fallback_unsigned_sat_add_8 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_add16(
@@ -1349,7 +1619,7 @@ pub fn emit_vector_unsigned_saturated_add16(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_add_16 as usize,
+        fallback_unsigned_sat_add_16 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_add32(
@@ -1363,7 +1633,7 @@ pub fn emit_vector_unsigned_saturated_add32(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_add_32 as usize,
+        fallback_unsigned_sat_add_32 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_add64(
@@ -1377,7 +1647,7 @@ pub fn emit_vector_unsigned_saturated_add64(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_add_64 as usize,
+        fallback_unsigned_sat_add_64 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_sub8(
@@ -1391,7 +1661,7 @@ pub fn emit_vector_unsigned_saturated_sub8(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_sub_8 as usize,
+        fallback_unsigned_sat_sub_8 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_sub16(
@@ -1405,7 +1675,7 @@ pub fn emit_vector_unsigned_saturated_sub16(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_sub_16 as usize,
+        fallback_unsigned_sat_sub_16 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_sub32(
@@ -1419,7 +1689,7 @@ pub fn emit_vector_unsigned_saturated_sub32(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_sub_32 as usize,
+        fallback_unsigned_sat_sub_32 as *const () as usize,
     );
 }
 pub fn emit_vector_unsigned_saturated_sub64(
@@ -1433,7 +1703,7 @@ pub fn emit_vector_unsigned_saturated_sub64(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_sat_sub_64 as usize,
+        fallback_unsigned_sat_sub_64 as *const () as usize,
     );
 }
 

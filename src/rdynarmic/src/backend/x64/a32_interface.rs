@@ -219,15 +219,15 @@ impl A32Jit {
 
         let run_callbacks = RunCodeCallbacks {
             lookup_block: Box::new(ArgCallback::new(
-                a32_lookup_block_trampoline as usize as u64,
+                a32_lookup_block_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             add_ticks: Box::new(ArgCallback::new(
-                a32_add_ticks_trampoline as usize as u64,
+                a32_add_ticks_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             get_ticks_remaining: Box::new(ArgCallback::new(
-                a32_get_ticks_remaining_trampoline as usize as u64,
+                a32_get_ticks_remaining_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             enable_cycle_counting: config.enable_cycle_counting,
@@ -239,119 +239,119 @@ impl A32Jit {
 
         let emit_callbacks = EmitCallbacks {
             memory_read_8: Box::new(ArgCallback::new(
-                a32_memory_read_8_trampoline as usize as u64,
+                a32_memory_read_8_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_read_16: Box::new(ArgCallback::new(
-                a32_memory_read_16_trampoline as usize as u64,
+                a32_memory_read_16_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_read_32: Box::new(ArgCallback::new(
-                a32_memory_read_32_trampoline as usize as u64,
+                a32_memory_read_32_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_read_64: Box::new(ArgCallback::new(
-                a32_memory_read_64_trampoline as usize as u64,
+                a32_memory_read_64_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_read_128: Box::new(ArgCallback::new(
-                a32_unreachable_read_128_trampoline as usize as u64,
+                a32_unreachable_read_128_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_write_8: Box::new(ArgCallback::new(
-                a32_memory_write_8_trampoline as usize as u64,
+                a32_memory_write_8_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_write_16: Box::new(ArgCallback::new(
-                a32_memory_write_16_trampoline as usize as u64,
+                a32_memory_write_16_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_write_32: Box::new(ArgCallback::new(
-                a32_memory_write_32_trampoline as usize as u64,
+                a32_memory_write_32_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_write_64: Box::new(ArgCallback::new(
-                a32_memory_write_64_trampoline as usize as u64,
+                a32_memory_write_64_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             memory_write_128: Box::new(ArgCallback::new(
-                a32_unreachable_write_128_trampoline as usize as u64,
+                a32_unreachable_write_128_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             call_supervisor: Box::new(ArgCallback::new(
-                a32_call_supervisor_trampoline as usize as u64,
+                a32_call_supervisor_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exception_raised: Box::new(ArgCallback::new(
-                a32_exception_raised_trampoline as usize as u64,
+                a32_exception_raised_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             data_cache_operation: Box::new(ArgCallback::new(
-                a32_unreachable_cache_operation_trampoline as usize as u64,
+                a32_unreachable_cache_operation_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             instruction_cache_operation: Box::new(ArgCallback::new(
-                a32_unreachable_cache_operation_trampoline as usize as u64,
+                a32_unreachable_cache_operation_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             instruction_synchronization_barrier: Box::new(ArgCallback::new(
-                a32_instruction_synchronization_barrier_trampoline as usize as u64,
+                a32_instruction_synchronization_barrier_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             add_ticks: Box::new(ArgCallback::new(
-                a32_add_ticks_trampoline as usize as u64,
+                a32_add_ticks_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             get_ticks_remaining: Box::new(ArgCallback::new(
-                a32_get_ticks_remaining_trampoline as usize as u64,
+                a32_get_ticks_remaining_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             get_cntpct: Box::new(ArgCallback::new(
-                a32_unreachable_get_cntpct_trampoline as usize as u64,
+                a32_unreachable_get_cntpct_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_clear: Box::new(ArgCallback::new(
-                a32_exclusive_clear_trampoline as usize as u64,
+                a32_exclusive_clear_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_read_8: Box::new(ArgCallback::new(
-                a32_exclusive_read_8_trampoline as usize as u64,
+                a32_exclusive_read_8_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_read_16: Box::new(ArgCallback::new(
-                a32_exclusive_read_16_trampoline as usize as u64,
+                a32_exclusive_read_16_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_read_32: Box::new(ArgCallback::new(
-                a32_exclusive_read_32_trampoline as usize as u64,
+                a32_exclusive_read_32_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_read_64: Box::new(ArgCallback::new(
-                a32_exclusive_read_64_trampoline as usize as u64,
+                a32_exclusive_read_64_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_read_128: Box::new(ArgCallback::new(
-                a32_unreachable_read_128_trampoline as usize as u64,
+                a32_unreachable_read_128_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_8: Box::new(ArgCallback::new(
-                a32_exclusive_write_8_trampoline as usize as u64,
+                a32_exclusive_write_8_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_16: Box::new(ArgCallback::new(
-                a32_exclusive_write_16_trampoline as usize as u64,
+                a32_exclusive_write_16_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_32: Box::new(ArgCallback::new(
-                a32_exclusive_write_32_trampoline as usize as u64,
+                a32_exclusive_write_32_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_64: Box::new(ArgCallback::new(
-                a32_exclusive_write_64_trampoline as usize as u64,
+                a32_exclusive_write_64_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
             exclusive_write_128: Box::new(ArgCallback::new(
-                a32_unreachable_write_128_trampoline as usize as u64,
+                a32_unreachable_write_128_trampoline as *const () as usize as u64,
                 inner_ptr,
             )),
         };
@@ -361,23 +361,23 @@ impl A32Jit {
             callbacks: emit_callbacks,
             raw_exclusive_write_callbacks: Some(RawExclusiveWriteCallbacks {
                 write_8: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_8_trampoline as usize as u64,
+                    a32_raw_exclusive_write_8_trampoline as *const () as usize as u64,
                     inner_ptr,
                 )),
                 write_16: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_16_trampoline as usize as u64,
+                    a32_raw_exclusive_write_16_trampoline as *const () as usize as u64,
                     inner_ptr,
                 )),
                 write_32: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_32_trampoline as usize as u64,
+                    a32_raw_exclusive_write_32_trampoline as *const () as usize as u64,
                     inner_ptr,
                 )),
                 write_64: Box::new(ArgCallback::new(
-                    a32_raw_exclusive_write_64_trampoline as usize as u64,
+                    a32_raw_exclusive_write_64_trampoline as *const () as usize as u64,
                     inner_ptr,
                 )),
                 write_128: Box::new(ArgCallback::new(
-                    a32_unreachable_raw_exclusive_write_128_trampoline as usize as u64,
+                    a32_unreachable_raw_exclusive_write_128_trampoline as *const () as usize as u64,
                     inner_ptr,
                 )),
             }),

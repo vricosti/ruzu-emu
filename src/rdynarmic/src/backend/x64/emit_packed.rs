@@ -388,7 +388,12 @@ pub fn emit_packed_halving_add_u8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_add_u8 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_add_u8 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_add_s8(
     _ctx: &EmitContext,
@@ -396,7 +401,12 @@ pub fn emit_packed_halving_add_s8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_add_s8 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_add_s8 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_add_u16(
     _ctx: &EmitContext,
@@ -404,7 +414,12 @@ pub fn emit_packed_halving_add_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_add_u16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_add_u16 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_add_s16(
     _ctx: &EmitContext,
@@ -412,7 +427,12 @@ pub fn emit_packed_halving_add_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_add_s16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_add_s16 as *const () as usize,
+    );
 }
 
 // Halving sub
@@ -422,7 +442,12 @@ pub fn emit_packed_halving_sub_u8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_sub_u8 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_sub_u8 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_sub_s8(
     _ctx: &EmitContext,
@@ -430,7 +455,12 @@ pub fn emit_packed_halving_sub_s8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_sub_s8 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_sub_s8 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_sub_u16(
     _ctx: &EmitContext,
@@ -438,7 +468,12 @@ pub fn emit_packed_halving_sub_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_sub_u16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_sub_u16 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_sub_s16(
     _ctx: &EmitContext,
@@ -446,7 +481,12 @@ pub fn emit_packed_halving_sub_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_sub_s16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_sub_s16 as *const () as usize,
+    );
 }
 
 // AddSub / SubAdd
@@ -456,7 +496,7 @@ pub fn emit_packed_add_sub_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_add_sub_u16 as usize);
+    emit_packed_host_call(ra, inst_ref, inst, packed_add_sub_u16 as *const () as usize);
 }
 pub fn emit_packed_add_sub_s16(
     _ctx: &EmitContext,
@@ -464,7 +504,7 @@ pub fn emit_packed_add_sub_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_add_sub_s16 as usize);
+    emit_packed_host_call(ra, inst_ref, inst, packed_add_sub_s16 as *const () as usize);
 }
 pub fn emit_packed_sub_add_u16(
     _ctx: &EmitContext,
@@ -472,7 +512,7 @@ pub fn emit_packed_sub_add_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_sub_add_u16 as usize);
+    emit_packed_host_call(ra, inst_ref, inst, packed_sub_add_u16 as *const () as usize);
 }
 pub fn emit_packed_sub_add_s16(
     _ctx: &EmitContext,
@@ -480,7 +520,7 @@ pub fn emit_packed_sub_add_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_sub_add_s16 as usize);
+    emit_packed_host_call(ra, inst_ref, inst, packed_sub_add_s16 as *const () as usize);
 }
 
 // Halving AddSub / SubAdd
@@ -490,7 +530,12 @@ pub fn emit_packed_halving_add_sub_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_add_sub_u16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_add_sub_u16 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_add_sub_s16(
     _ctx: &EmitContext,
@@ -498,7 +543,12 @@ pub fn emit_packed_halving_add_sub_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_add_sub_s16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_add_sub_s16 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_sub_add_u16(
     _ctx: &EmitContext,
@@ -506,7 +556,12 @@ pub fn emit_packed_halving_sub_add_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_sub_add_u16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_sub_add_u16 as *const () as usize,
+    );
 }
 pub fn emit_packed_halving_sub_add_s16(
     _ctx: &EmitContext,
@@ -514,7 +569,12 @@ pub fn emit_packed_halving_sub_add_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_packed_host_call(ra, inst_ref, inst, packed_halving_sub_add_s16 as usize);
+    emit_packed_host_call(
+        ra,
+        inst_ref,
+        inst,
+        packed_halving_sub_add_s16 as *const () as usize,
+    );
 }
 
 #[cfg(test)]

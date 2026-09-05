@@ -855,9 +855,9 @@ mod tests {
     fn test_gen_run_code_no_cycles() {
         let mut boc = BlockOfCode::with_size(4 * 1024 * 1024).unwrap();
         let cb = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
@@ -877,9 +877,9 @@ mod tests {
     fn test_gen_run_code_with_cycles() {
         let mut boc = BlockOfCode::with_size(4 * 1024 * 1024).unwrap();
         let cb = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,
@@ -923,9 +923,9 @@ mod tests {
     fn test_clear_cache_preserves_prelude() {
         let mut boc = BlockOfCode::with_size(4 * 1024 * 1024).unwrap();
         let cb = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
@@ -949,9 +949,9 @@ mod tests {
         // for the halt_reason read-and-clear sequence.
         let mut boc = BlockOfCode::with_size(4 * 1024 * 1024).unwrap();
         let cb = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
@@ -999,9 +999,9 @@ mod tests {
     fn test_step_code_offset_differs_from_run_code() {
         let mut boc = BlockOfCode::with_size(4 * 1024 * 1024).unwrap();
         let cb = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,
@@ -1023,9 +1023,9 @@ mod tests {
         // step_code should contain LOCK (0xF0) prefix for atomic STEP set
         let mut boc = BlockOfCode::with_size(4 * 1024 * 1024).unwrap();
         let cb = RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,

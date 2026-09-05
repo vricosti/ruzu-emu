@@ -2000,7 +2000,7 @@ mod macro_jit_x64 {
             )?;
             self.assembler.mov(ABI_PARAM2.cvt32()?, METHOD_ADDRESS)?;
             self.assembler.mov(ABI_PARAM3.cvt32()?, value)?;
-            self.emit_far_call(macro_jit_send_thunk as usize)?;
+            self.emit_far_call(macro_jit_send_thunk as *const () as usize)?;
             self.pop_persistent_caller_saved()?;
 
             let dont_process = self.assembler.create_label();
@@ -2072,7 +2072,7 @@ mod macro_jit_x64 {
             self.push_persistent_caller_saved()?;
             self.assembler.mov(ABI_PARAM1, PARAMETERS)?;
             self.assembler.mov(ABI_PARAM2, MAX_PARAMETER)?;
-            self.emit_far_call(macro_jit_error_thunk as usize)?;
+            self.emit_far_call(macro_jit_error_thunk as *const () as usize)?;
             self.pop_persistent_caller_saved()?;
             self.assembler.bind(&parameter_ok)?;
             self.assembler

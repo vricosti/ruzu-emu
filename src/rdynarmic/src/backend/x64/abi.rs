@@ -232,6 +232,7 @@ pub fn pop_caller_save_registers_and_adjust_stack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     use rxbyak::{qword_ptr, RAX, RDI, XMM1, XMM14};
 
     #[test]
@@ -298,7 +299,7 @@ mod tests {
         code.mov(RAX, expected_xmm14 as i64).unwrap();
         code.movq(XMM14, RAX).unwrap();
         let frame = push_caller_save_registers_and_adjust_stack(&mut code).unwrap();
-        code.mov(RAX, clobber_caller_save_xmms as usize as i64)
+        code.mov(RAX, clobber_caller_save_xmms as *const () as usize as i64)
             .unwrap();
         code.call_reg(RAX).unwrap();
         pop_caller_save_registers_and_adjust_stack(&mut code, &frame).unwrap();

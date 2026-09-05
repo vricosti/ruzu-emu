@@ -42,7 +42,12 @@ pub fn emit_vector_signed_absolute_difference8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_signed_abs_diff8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_signed_abs_diff8 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_absolute_difference16(
     _ctx: &EmitContext,
@@ -50,7 +55,12 @@ pub fn emit_vector_signed_absolute_difference16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_signed_abs_diff16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_signed_abs_diff16 as *const () as usize,
+    );
 }
 pub fn emit_vector_signed_absolute_difference32(
     _ctx: &EmitContext,
@@ -58,7 +68,12 @@ pub fn emit_vector_signed_absolute_difference32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_signed_abs_diff32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_signed_abs_diff32 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +110,12 @@ pub fn emit_vector_unsigned_absolute_difference8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_unsigned_abs_diff8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_unsigned_abs_diff8 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_absolute_difference16(
     _ctx: &EmitContext,
@@ -103,7 +123,12 @@ pub fn emit_vector_unsigned_absolute_difference16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_unsigned_abs_diff16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_unsigned_abs_diff16 as *const () as usize,
+    );
 }
 pub fn emit_vector_unsigned_absolute_difference32(
     _ctx: &EmitContext,
@@ -111,7 +136,12 @@ pub fn emit_vector_unsigned_absolute_difference32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_unsigned_abs_diff32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_unsigned_abs_diff32 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +427,10 @@ fn emit_vector_table_lookup(
         )
         .unwrap();
     ra.asm
-        .mov(rxbyak::RAX, fallback_vector_table_lookup as usize as i64)
+        .mov(
+            rxbyak::RAX,
+            fallback_vector_table_lookup as *const () as usize as i64,
+        )
         .unwrap();
     ra.asm.call_reg(rxbyak::RAX).unwrap();
 
@@ -474,7 +507,7 @@ pub fn emit_vector_unsigned_recip_estimate(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_recip_estimate as usize,
+        fallback_unsigned_recip_estimate as *const () as usize,
     );
 }
 
@@ -514,7 +547,7 @@ pub fn emit_vector_unsigned_recip_sqrt_estimate(
         ra,
         inst_ref,
         inst,
-        fallback_unsigned_recip_sqrt_estimate as usize,
+        fallback_unsigned_recip_sqrt_estimate as *const () as usize,
     );
 }
 

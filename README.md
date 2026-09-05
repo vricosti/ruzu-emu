@@ -218,14 +218,15 @@ installation. Packaging additionally requires
 [NSIS 3](https://nsis.sourceforge.io/Download); the portable runtime directory
 and installer are then generated with:
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dist\package-windows.ps1
+```bat
+build.bat package
 ```
 
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
-and installer under `target\package`. Use `-StageOnly` to produce only the
-self-contained directory, or `-SkipBuild` to package existing release binaries.
+and installer under `target\package`. The advanced staging-only and existing-
+binary modes remain available by invoking `dist\package-windows.ps1` directly
+with `-StageOnly` or `-SkipBuild`.
 
 There is also a headless command-line frontend:
 

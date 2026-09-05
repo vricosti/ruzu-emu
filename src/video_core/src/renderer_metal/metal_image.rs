@@ -17,6 +17,9 @@ use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::types::{BufferImageCopy, ImageType};
 use shader_recompiler::shader_info::TextureType;
 
+use super::metal_blit_helper::{
+    MetalBlitError, MetalDepthStencilBufferCopy, MetalDepthStencilCopy,
+};
 use super::metal_buffer::MetalBuffer;
 use super::metal_device::MetalDevice;
 use super::metal_format::{is_format_supported, surface_format, texture_usage, MetalFormat};
@@ -24,6 +27,8 @@ use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 
 #[derive(Debug, Error)]
 pub enum MetalImageError {
+    #[error(transparent)]
+    Blit(#[from] MetalBlitError),
     #[error("guest image format {0:?} has no Metal representation")]
     UnsupportedFormat(crate::surface::PixelFormat),
     #[error("buffer images must be created as views over a Metal buffer")]
@@ -370,6 +375,9 @@ impl MetalImage {
         base_offset: usize,
         copies: &[BufferImageCopy],
     ) -> Result<(), MetalImageError> {
+        if self.guest_format == PixelFormat::D32FloatS8Uint {
+            return Err(MetalImageError::ConversionRequired(self.guest_format));
+        }
         let native_copies = self.native_buffer_copies(source, base_offset, copies)?;
         let slice_copies = self
             .slice_texture
@@ -538,6 +546,9 @@ impl MetalImage {
         base_offset: usize,
         copies: &[BufferImageCopy],
     ) -> Result<(), MetalImageError> {
+        if self.guest_format == PixelFormat::D32FloatS8Uint {
+            return Err(MetalImageError::ConversionRequired(self.guest_format));
+        }
         self.ensure_native_storage(scheduler)?;
         let native_copies = self.native_buffer_copies(destination, base_offset, copies)?;
         scheduler.request_outside_render_pass_operation_context();
@@ -558,6 +569,48 @@ impl MetalImage {
                 }
             }
         })?;
+        Ok(())
+    }
+
+    /// Transfers guest D32S8 words through Metal's separate depth/stencil
+    /// planes. The runtime supplies its cached conversion pipelines.
+    pub fn transfer_depth32_stencil8_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        helper: &MetalDepthStencilCopy,
+        buffer: &MetalBuffer,
+        base_offset: usize,
+        copies: &[BufferImageCopy],
+        upload: bool,
+    ) -> Result<(), MetalImageError> {
+        if self.guest_format != PixelFormat::D32FloatS8Uint {
+            return Err(MetalImageError::InvalidCopy(
+                "D32S8 transfer requires D32S8 image",
+            ));
+        }
+        if !upload {
+            self.ensure_native_storage(scheduler)?;
+        }
+        for copy in self.native_buffer_copies(buffer, base_offset, copies)? {
+            helper.copy(
+                scheduler,
+                self.handle(),
+                buffer,
+                MetalDepthStencilBufferCopy {
+                    buffer_offset: copy.buffer_offset,
+                    bytes_per_row: copy.bytes_per_row,
+                    bytes_per_image: copy.bytes_per_image,
+                    slice: copy.slice,
+                    level: copy.level,
+                    origin: copy.origin,
+                    size: copy.size,
+                },
+                upload,
+            )?;
+        }
+        if upload {
+            self.mark_native_modified();
+        }
         Ok(())
     }
 

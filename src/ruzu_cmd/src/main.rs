@@ -40,33 +40,24 @@ use sdl_config::SdlConfig;
 fn resolve_renderer_backend(
     renderer_override: Option<&str>,
     configured_backend: RendererBackend,
-) -> &'static str {
-    let configured_name = match configured_backend {
-        RendererBackend::OpenGlGlsl
-        | RendererBackend::OpenGlGlasm
-        | RendererBackend::OpenGlSpirV => "opengl",
-        RendererBackend::Vulkan => "vulkan",
-        RendererBackend::Metal => "metal",
-        RendererBackend::Null => "null",
-    };
-
+) -> RendererBackend {
     let Some(renderer_override) = renderer_override else {
-        return configured_name;
+        return configured_backend;
     };
 
     match renderer_override.to_lowercase().as_str() {
-        "opengl" | "gl" | "0" => "opengl",
-        "vulkan" | "vk" | "1" => "vulkan",
-        "null" | "2" => "null",
+        "opengl" | "gl" | "0" => RendererBackend::OpenGlGlsl,
+        "vulkan" | "vk" | "1" => RendererBackend::Vulkan,
+        "null" | "2" => RendererBackend::Null,
         #[cfg(target_os = "macos")]
-        "metal" | "mtl" | "5" => "metal",
+        "metal" | "mtl" | "5" => RendererBackend::Metal,
         other => {
             log::warn!(
                 "Unknown renderer '{}', using configured backend {}",
                 other,
-                configured_name
+                configured_backend
             );
-            configured_name
+            configured_backend
         }
     }
 }
@@ -82,19 +73,19 @@ mod tests {
     fn configured_renderer_is_used_without_cli_override() {
         assert_eq!(
             resolve_renderer_backend(None, RendererBackend::OpenGlGlsl),
-            "opengl"
+            RendererBackend::OpenGlGlsl
         );
         assert_eq!(
             resolve_renderer_backend(None, RendererBackend::Vulkan),
-            "vulkan"
+            RendererBackend::Vulkan
         );
         assert_eq!(
             resolve_renderer_backend(None, RendererBackend::Null),
-            "null"
+            RendererBackend::Null
         );
         assert_eq!(
             resolve_renderer_backend(None, RendererBackend::Metal),
-            "metal"
+            RendererBackend::Metal
         );
     }
 
@@ -102,17 +93,25 @@ mod tests {
     fn cli_renderer_overrides_configured_renderer() {
         assert_eq!(
             resolve_renderer_backend(Some("vulkan"), RendererBackend::OpenGlGlsl),
-            "vulkan"
+            RendererBackend::Vulkan
         );
         assert_eq!(
             resolve_renderer_backend(Some("GL"), RendererBackend::Vulkan),
-            "opengl"
+            RendererBackend::OpenGlGlsl
         );
         #[cfg(target_os = "macos")]
         assert_eq!(
             resolve_renderer_backend(Some("metal"), RendererBackend::Vulkan),
-            "metal"
+            RendererBackend::Metal
         );
+    }
+
+    #[test]
+    fn absent_or_invalid_override_preserves_opengl_shader_backend() {
+        for backend in [RendererBackend::OpenGlGlasm, RendererBackend::OpenGlSpirV] {
+            assert_eq!(resolve_renderer_backend(None, backend), backend);
+            assert_eq!(resolve_renderer_backend(Some("invalid"), backend), backend);
+        }
     }
 
     #[test]
@@ -926,6 +925,15 @@ fn main() {
         }
     }
 
+    // The CLI renderer override must update the setting shared by window
+    // creation and VideoCore::CreateGPU, like upstream's force-null override.
+    let configured_backend = *common::settings::values().renderer_backend.get_value();
+    let renderer_backend = resolve_renderer_backend(args.renderer.as_deref(), configured_backend);
+    common::settings::values_mut()
+        .renderer_backend
+        .set_value(renderer_backend);
+    log::info!("Renderer backend: {}", renderer_backend);
+
     // Log configuration settings.
     // Matches upstream: Settings::LogSettings() called in EmuWindow constructor.
     common::settings::log_settings(&common::settings::values());
@@ -934,12 +942,6 @@ fn main() {
     // Maps to C++ `Core::System system{}; system.Initialize();`.
     let mut system = ruzu_core::core::System::new();
     system.initialize();
-
-    // Determine renderer backend.
-    // Maps to C++ switch on `Settings::values.renderer_backend.GetValue()`.
-    let configured_backend = *common::settings::values().renderer_backend.get_value();
-    let renderer_backend = resolve_renderer_backend(args.renderer.as_deref(), configured_backend);
-    log::info!("Renderer backend: {}", renderer_backend);
 
     // -----------------------------------------------------------------------
     // Step 3 (upstream): Create emu_window BEFORE loading.
@@ -958,11 +960,15 @@ fn main() {
 
     let emu_window_system_ref = ruzu_core::core::SystemRef::from_ref(&system);
     let mut emu_window = match renderer_backend {
-        "opengl" => EmuWindow::Gl(EmuWindowSdl3Gl::new(emu_window_system_ref, args.fullscreen)),
-        "vulkan" | "metal" => {
+        RendererBackend::OpenGlGlsl
+        | RendererBackend::OpenGlGlasm
+        | RendererBackend::OpenGlSpirV => {
+            EmuWindow::Gl(EmuWindowSdl3Gl::new(emu_window_system_ref, args.fullscreen))
+        }
+        RendererBackend::Vulkan | RendererBackend::Metal => {
             EmuWindow::Vk(EmuWindowSdl3Vk::new(emu_window_system_ref, args.fullscreen))
         }
-        _ => EmuWindow::Null(EmuWindowSdl3Null::new(
+        RendererBackend::Null => EmuWindow::Null(EmuWindowSdl3Null::new(
             emu_window_system_ref,
             args.fullscreen,
         )),

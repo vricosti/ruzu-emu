@@ -2220,8 +2220,37 @@ mod tests {
         assert!(source.contains("v_2_0 = 0x0000000Au;"));
         assert!(source.contains("if (v_0_0) {"));
         assert!(source.contains("v_2_0 = 0x00000014u;"));
-        assert!(source.contains("uint v_2_1 = v_2_0;"));
+        assert!(source.contains("uint v_2_1 = uint(0);"));
+        assert!(source.contains("v_2_1 = v_2_0;"));
         assert!(source.contains("return;"));
+    }
+
+    #[test]
+    fn loop_exit_values_have_function_scope_without_hoisting_the_calculation() {
+        let mut program = structured_loop_program();
+        let value = program.blocks[1]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(19), Value::ImmU32(23)]);
+        program.blocks[3].append_new_inst(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef {
+                block: 1,
+                inst: value,
+            })],
+        );
+        let source = emit_msl(&program, &Profile::default(), &RuntimeInfo::default())
+            .unwrap()
+            .source
+            .source;
+        let declaration = source.find("uint v_1_1 = uint(0);").unwrap();
+        let loop_start = source.find("for (;;) {").unwrap();
+        let calculation = source
+            .find("v_1_1 = (0x00000013u) + (0x00000017u);")
+            .unwrap();
+        let loop_end = source.find("if (--loop0").unwrap();
+        let use_after_exit = source.find("v_3_0 = v_1_1;").unwrap();
+        assert!(declaration < loop_start);
+        assert!(loop_start < calculation && calculation < loop_end);
+        assert!(loop_end < use_after_exit);
     }
 
     #[test]

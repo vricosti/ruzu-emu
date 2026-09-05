@@ -3,6 +3,7 @@
 
 //! Native Metal texture views for common texture-cache image views.
 
+use std::cell::OnceCell;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
@@ -43,6 +44,8 @@ pub struct MetalImageView {
     render_target: Retained<ProtocolObject<dyn MTLTexture>>,
     depth_view: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     stencil_view: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    blit_depth_view: OnceCell<Retained<ProtocolObject<dyn MTLTexture>>>,
+    blit_stencil_view: OnceCell<Retained<ProtocolObject<dyn MTLTexture>>>,
     samples: u32,
 }
 
@@ -208,6 +211,8 @@ impl MetalImageView {
             render_target,
             depth_view,
             stencil_view,
+            blit_depth_view: OnceCell::new(),
+            blit_stencil_view: OnceCell::new(),
             samples: image.samples(),
         })
     }
@@ -257,6 +262,41 @@ impl MetalImageView {
 
     pub fn samples(&self) -> u32 {
         self.samples
+    }
+
+    /// Eden's lazily-created DepthView/StencilView are 2D blit views. Keep
+    /// these separate from Metal's layered render-pass attachment views.
+    pub fn depth_blit_view(&self) -> Option<&ProtocolObject<dyn MTLTexture>> {
+        self.blit_aspect_view(&self.blit_depth_view, self.depth_view.as_deref()?)
+    }
+
+    pub fn stencil_blit_view(&self) -> Option<&ProtocolObject<dyn MTLTexture>> {
+        self.blit_aspect_view(&self.blit_stencil_view, self.stencil_view.as_deref()?)
+    }
+
+    fn blit_aspect_view<'a>(
+        &'a self,
+        cached: &'a OnceCell<Retained<ProtocolObject<dyn MTLTexture>>>,
+        source: &ProtocolObject<dyn MTLTexture>,
+    ) -> Option<&'a ProtocolObject<dyn MTLTexture>> {
+        if cached.get().is_none() {
+            let texture_type = if self.samples > 1 {
+                MTLTextureType::Type2DMultisample
+            } else {
+                MTLTextureType::Type2D
+            };
+            // Offsets are relative to the already mip/layer-restricted view.
+            let view = unsafe {
+                source.newTextureViewWithPixelFormat_textureType_levels_slices(
+                    source.pixelFormat(),
+                    texture_type,
+                    NSRange::new(0, 1),
+                    NSRange::new(0, 1),
+                )
+            }?;
+            let _ = cached.set(view);
+        }
+        cached.get().map(|view| &**view)
     }
 }
 

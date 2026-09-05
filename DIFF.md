@@ -9,6 +9,39 @@ Omit empty audit categories, "nothing to fix" statements, generic unchanged-layo
 successful build/test totals, launch commands, binary paths, and temporary logs. Keep unresolved
 test failures and validation limits. Do not append an entry for documentation-only cleanup.
 
+## 2026-09-05 - src/rdynarmic/src/backend/arm64/a64_address_space.rs vs Eden dynarmic/backend/arm64/a64_address_space.{h,cpp}
+
+### Intentional differences
+
+- The production A64 prelude now installs Eden's return-to-dispatcher callback:
+  check halt/cycle budget, resolve the current location with GetOrEmit, and
+  branch to the resulting block without leaving Run. Rust reuses the shared
+  prelude emitter and uses a named extern-C function instead of the C++ lambda.
+- Callback compilation errors abort at the generated-code boundary rather than
+  unwinding through machine code. Rust's standalone, movable address-space
+  constructor retains its bootstrap-only prelude; the execution interface uses
+  the stable-owner constructor and installs the real dispatcher before use.
+
+## 2026-09-05 - src/rdynarmic/src/backend/arm64/a64_interface.rs vs Eden dynarmic/backend/arm64/a64_interface.cpp and interface/A64/a64.h
+
+### Intentional differences
+
+- Prelude generation occurs after allocation of the existing boxed interface
+  state, before callback thunks and guest compilation. Unlike the C++ Impl
+  constructor, a Rust constructor can move its return value; embedding the
+  address-space and callback-context pointers earlier would invalidate them.
+  Halt checks, cycle accounting, single stepping, and deferred invalidation
+  remain owned by the same prelude/interface boundaries as upstream.
+
+### Validation limits
+
+- The full rdynarmic suite still stops in the previously documented A32
+  prelude-size assertion and A32 core SIGABRT; this change does not certify
+  the full crate. The broader A64 module run also aborts in its synthetic
+  `run_existing_block_calls_arm64_prelude` test, which exercises the unchanged
+  bootstrap-only path. Runtime performance validation covers A64 guests on
+  ARM64 hosts, not A32 guests or the x64 backend.
+
 ## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
 
 ### Intentional differences

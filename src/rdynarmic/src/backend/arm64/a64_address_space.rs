@@ -16,7 +16,7 @@ use crate::ir::opt;
 use super::address_space::AddressSpace;
 use super::emit_arm64::{CodePtr, EmitConfig};
 use super::jit_state::A64JitState;
-use super::prelude::{PreludeIsa, PreludeOptions};
+use super::prelude::{DispatcherCallback, PreludeIsa, PreludeOptions, TickCallbacks};
 
 fn trace_a64_exclusive_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -508,17 +508,53 @@ extern "C" fn a64_arm64_exclusive_write_128(
 
 impl A64AddressSpace {
     pub fn new(conf: impl Into<UserConfig>) -> Result<Self, String> {
+        let mut address_space = Self::new_without_prelude(conf)?;
+        emit_prelude(&mut address_space.address_space, &address_space.conf)?;
+        Ok(address_space)
+    }
+
+    pub(crate) fn new_without_prelude(conf: impl Into<UserConfig>) -> Result<Self, String> {
         let conf = conf.into();
         let code_cache_size = conf.code_cache_size as usize;
-
-        let mut address_space = AddressSpace::new(code_cache_size)?;
-        emit_prelude(&mut address_space, &conf)?;
+        let address_space = AddressSpace::new(code_cache_size)?;
 
         Ok(Self {
             address_space,
             conf,
             block_ranges: BlockRangeInformation::default(),
         })
+    }
+
+    /// Complete Eden's A64AddressSpace::EmitPrelude after the owner is heap-stable.
+    ///
+    /// # Safety
+    /// This address space and the callback context must not move or be destroyed
+    /// while their generated prelude can execute.
+    pub(crate) unsafe fn emit_prelude_with_dispatcher(
+        &mut self,
+        callback_context_ptr: *const c_void,
+        fns: A64CallbackFns,
+    ) -> Result<(), String> {
+        let ticks = self.conf.enable_cycle_counting.then_some(TickCallbacks {
+            this_ptr: callback_context_ptr,
+            add_ticks_fn_ptr: fns.add_ticks,
+            get_ticks_remaining_fn_ptr: fns.get_ticks_remaining,
+        });
+        let dispatcher = DispatcherCallback {
+            this_ptr: (self as *mut Self).cast(),
+            fn_ptr: a64_return_to_dispatcher as *const () as *const c_void,
+            ticks,
+        };
+        self.address_space
+            .emit_bootstrap_prelude_with_options(PreludeOptions {
+                isa: PreludeIsa::A64,
+                dispatcher: Some(dispatcher),
+                return_stack_buffer: self
+                    .conf
+                    .has_optimization(OptimizationFlag::RETURN_STACK_BUFFER),
+                page_table_pointer: self.conf.page_table.map_or(0, |p| p as u64),
+                fastmem_pointer: self.conf.fastmem_pointer.map_or(0, |p| p as u64),
+            })
     }
 
     pub fn address_space(&self) -> &AddressSpace {
@@ -784,6 +820,24 @@ impl A64AddressSpace {
     #[cfg(test)]
     pub fn block_ranges(&self) -> &[(RangeInclusive<u64>, LocationDescriptor)] {
         self.block_ranges.ranges()
+    }
+}
+
+extern "C" fn a64_return_to_dispatcher(
+    address_space: *mut c_void,
+    thread_ctx: *mut c_void,
+) -> CodePtr {
+    let result = unsafe {
+        let address_space = &mut *address_space.cast::<A64AddressSpace>();
+        let thread_ctx = &*thread_ctx.cast::<A64JitState>();
+        address_space.get_or_emit(thread_ctx.get_location_descriptor())
+    };
+    match result {
+        Ok(code_ptr) => code_ptr,
+        Err(error) => {
+            eprintln!("A64 ARM64 return_to_dispatcher failed: {error}");
+            std::process::abort();
+        }
     }
 }
 

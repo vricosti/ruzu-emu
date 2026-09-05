@@ -50,7 +50,7 @@ struct A64Invalidation {
 impl A64Interface {
     pub fn new(config: impl Into<UserConfig>) -> Result<Self, String> {
         let config = config.into();
-        let current_address_space = A64AddressSpace::new(config)?;
+        let current_address_space = A64AddressSpace::new_without_prelude(config)?;
         let core = A64Core::new(current_address_space.config());
         let mut interface = Self {
             inner: Box::new(A64InterfaceInner {
@@ -329,6 +329,14 @@ impl A64Interface {
             .expect("A64 callback context was just installed")
             as *mut A64CallbackContext
             as *const std::ffi::c_void;
+        // Both pointers embedded in the prelude belong to this stable Box.
+        // Emit it before callback thunks and before any guest block can compile.
+        unsafe {
+            inner.current_address_space.emit_prelude_with_dispatcher(
+                callback_context_ptr,
+                A64CallbackContext::callback_fns(),
+            )?;
+        }
         inner
             .current_address_space
             .emit_callback_trampolines(callback_context_ptr, A64CallbackContext::callback_fns())
@@ -346,15 +354,19 @@ mod tests {
     struct PointerState {
         halt_reason_ptr: usize,
         pc_ptr: usize,
+        ticks_added: u64,
+        svc_calls: u32,
     }
 
     struct TestCallbacks {
         pointers: Option<Arc<Mutex<PointerState>>>,
+        code: std::collections::BTreeMap<u64, u32>,
+        tick_budget: u64,
     }
 
     impl UserCallbacks for TestCallbacks {
-        fn memory_read_code(&self, _vaddr: u64) -> Option<u32> {
-            None
+        fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+            self.code.get(&vaddr).copied()
         }
 
         fn memory_read_8(&self, _vaddr: u64) -> u8 {
@@ -383,12 +395,25 @@ mod tests {
         fn memory_write_64(&mut self, _vaddr: u64, _value: u64) {}
         fn memory_write_128(&mut self, _vaddr: u64, _value: A64Vector) {}
 
-        fn call_svc(&mut self, _svc_num: u32) {}
+        fn call_svc(&mut self, _svc_num: u32) {
+            if let Some(pointers) = &self.pointers {
+                let mut pointers = pointers.lock().unwrap();
+                pointers.svc_calls += 1;
+                unsafe {
+                    (&*(pointers.halt_reason_ptr as *const AtomicU32))
+                        .fetch_or(HaltReason::SVC.bits(), Ordering::SeqCst);
+                }
+            }
+        }
         fn exception_raised(&mut self, _pc: u64, _exception: A64Exception) {}
-        fn add_ticks(&mut self, _ticks: u64) {}
+        fn add_ticks(&mut self, ticks: u64) {
+            if let Some(pointers) = &self.pointers {
+                pointers.lock().unwrap().ticks_added += ticks;
+            }
+        }
 
         fn get_ticks_remaining(&self) -> u64 {
-            0
+            self.tick_budget
         }
 
         fn get_cntpct(&self) -> u64 {
@@ -409,7 +434,11 @@ mod tests {
     }
 
     fn config_with_pointers(pointers: Option<Arc<Mutex<PointerState>>>) -> UserConfig {
-        let mut config = UserConfig::new(Box::new(TestCallbacks { pointers }));
+        let mut config = UserConfig::new(Box::new(TestCallbacks {
+            pointers,
+            code: Default::default(),
+            tick_budget: 0,
+        }));
         config.enable_cycle_counting = false;
         config.code_cache_size = 4096;
         config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
@@ -418,6 +447,71 @@ mod tests {
 
     fn config() -> UserConfig {
         config_with_pointers(None)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn dispatcher_interface(cycle_counting: bool) -> (A64Interface, Arc<Mutex<PointerState>>) {
+        let pointers = Arc::new(Mutex::new(PointerState::default()));
+        let mut config = UserConfig::new(Box::new(TestCallbacks {
+            pointers: Some(pointers.clone()),
+            code: std::collections::BTreeMap::from([
+                (0x1000, 0x9100_0400), // add x0, x0, #1
+                (0x1004, 0xd61f_0020), // br x1
+                (0x2000, 0x9100_0800), // add x0, x0, #2
+                (0x2004, 0xd400_0001), // svc #0
+            ]),
+            tick_budget: 1,
+        }));
+        config.enable_cycle_counting = cycle_counting;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.code_cache_size = 1024 * 1024;
+        let mut interface = A64Interface::new(config).unwrap();
+        interface.set_pc(0x1000);
+        interface.set_register(1, 0x2000);
+        (interface, pointers)
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dispatcher_continues_unlinked_blocks_until_svc_after_move_and_cache_clear() {
+        let (interface, pointers) = dispatcher_interface(false);
+        let mut moved = vec![interface];
+        let interface = &mut moved[0];
+        for iteration in 0..3 {
+            if iteration == 2 {
+                interface.clear_cache();
+            }
+            interface.set_pc(0x1000);
+            interface.set_register(0, 0);
+            assert_eq!(interface.run().unwrap(), HaltReason::SVC);
+            assert_eq!(interface.get_register(0), 3);
+            assert_eq!(interface.pc(), 0x2008);
+        }
+        assert_eq!(pointers.lock().unwrap().svc_calls, 3);
+        assert_eq!(pointers.lock().unwrap().ticks_added, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dispatcher_respects_cycle_budget_before_entering_next_block() {
+        let (mut interface, pointers) = dispatcher_interface(true);
+        assert_eq!(interface.run().unwrap(), HaltReason::empty());
+        assert_eq!(interface.get_register(0), 1);
+        assert_eq!(interface.pc(), 0x2000);
+        assert_eq!(pointers.lock().unwrap().svc_calls, 0);
+        assert_eq!(pointers.lock().unwrap().ticks_added, 2);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dispatcher_single_step_returns_before_branch_then_run_reaches_svc() {
+        let (mut interface, pointers) = dispatcher_interface(false);
+        assert_eq!(interface.step().unwrap(), HaltReason::STEP);
+        assert_eq!(interface.pc(), 0x1004);
+        assert_eq!(interface.get_register(0), 1);
+        assert_eq!(pointers.lock().unwrap().svc_calls, 0);
+        assert_eq!(interface.run().unwrap(), HaltReason::SVC);
+        assert_eq!(interface.get_register(0), 3);
     }
 
     #[test]

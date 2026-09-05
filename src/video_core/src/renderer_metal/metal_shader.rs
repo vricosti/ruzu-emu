@@ -991,6 +991,28 @@ mod tests {
         program
     }
 
+    #[test]
+    fn direct_msl_loop_value_remains_visible_after_loop_exit() {
+        let device = MetalDevice::new().unwrap();
+        let mut program = structured_loop_program();
+        let value = program.blocks[1]
+            .append_new_inst(Opcode::IAdd32, vec![Value::ImmU32(19), Value::ImmU32(23)]);
+        program.blocks[3].append_new_inst(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef {
+                block: 1,
+                inst: value,
+            })],
+        );
+        let artifact = shader_recompiler::backend::msl::emit_msl(
+            &program,
+            &make_shader_profile(device.profile()),
+            &RuntimeInfo::default(),
+        )
+        .unwrap();
+        compile_native_msl_artifact(device.device(), artifact).unwrap();
+    }
+
     fn sample_coordinates(program: &mut Program, texture_type: TextureType) -> Value {
         match texture_type {
             TextureType::Color1D => Value::ImmF32(0.25),

@@ -30,6 +30,8 @@ use super::{
 pub struct MslEmitContext {
     stage: Stage,
     source: String,
+    local_declarations: String,
+    local_declarations_offset: Option<usize>,
     definitions: HashMap<InstRef, String>,
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
@@ -657,9 +659,12 @@ impl MslEmitContext {
             source.push_str("    bool helper_invocation = simd_is_helper_thread();\n");
         }
 
+        let local_declarations_offset = (!program.syntax_list.is_empty()).then_some(source.len());
         Ok(Self {
             stage,
             source,
+            local_declarations: String::new(),
+            local_declarations_offset,
             definitions: HashMap::new(),
             constant_buffers,
             storage_buffers,
@@ -1795,10 +1800,19 @@ impl MslEmitContext {
     ) -> Result<(), MslError> {
         let name = format!("v_{}_{}", inst_ref.block, inst_ref.inst);
         debug_assert!(!precise, "precision must be expressed by the MSL operation");
-        self.source.push_str(&format!(
-            "    {} {name} = {expression};\n",
-            Self::type_name(ty)?
-        ));
+        let type_name = Self::type_name(ty)?;
+        if self.local_declarations_offset.is_some() {
+            // SSA block dominance is not C++ lexical scope: a value defined in
+            // a loop can dominate its exit. Like GLSL DefineVariables, keep
+            // structured-program locals at function scope, but not their work.
+            self.local_declarations
+                .push_str(&format!("    {type_name} {name} = {type_name}(0);\n"));
+            self.source
+                .push_str(&format!("    {name} = {expression};\n"));
+        } else {
+            self.source
+                .push_str(&format!("    {type_name} {name} = {expression};\n"));
+        }
         self.definitions.insert(inst_ref, name);
         Ok(())
     }
@@ -2056,6 +2070,9 @@ impl MslEmitContext {
     }
 
     pub fn finish(mut self) -> MslShaderArtifact {
+        if let Some(offset) = self.local_declarations_offset {
+            self.source.insert_str(offset, &self.local_declarations);
+        }
         if self.returns_output && !self.terminal_return_emitted {
             self.source.push_str("    return output;\n");
         }

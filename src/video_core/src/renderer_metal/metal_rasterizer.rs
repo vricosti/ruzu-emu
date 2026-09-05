@@ -354,7 +354,7 @@ pub struct MetalRasterizer {
     query_cache: MetalQueryCache,
     state_tracker: MetalStateTracker,
     fence_manager: MetalFenceManager,
-    blit_image: MetalBlitHelper,
+    blit_image: Box<MetalBlitHelper>,
     accelerate_dma: AccelerateDMA,
     syncpoints: Arc<SyncpointManager>,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
@@ -384,18 +384,19 @@ impl MetalRasterizer {
             device_memory: Arc::clone(&device_memory),
         }));
 
+        let mut blit_image = Box::new(MetalBlitHelper::new(&device)?);
         let texture_cache = Box::new(MetalTextureCache::new(
             device.clone(),
             Arc::clone(&device_memory),
             scheduler.as_mut(),
             staging_pool.as_mut(),
+            blit_image.as_mut(),
         ));
         let shader_cache = ShaderCache::new(device_memory);
         let pipeline_cache = MetalPipelineCache::new(device.clone());
         let query_cache = MetalQueryCache::new(&device)?;
         let state_tracker = MetalStateTracker::new();
         let fence_manager = MetalFenceManager::new(false);
-        let blit_image = MetalBlitHelper::new(&device)?;
         let accelerate_dma = AccelerateDMA::new(common_buffer_cache.as_mut());
 
         Ok(Self {
@@ -1326,6 +1327,17 @@ impl MetalRasterizer {
 }
 
 impl RasterizerInterface for MetalRasterizer {
+    fn accelerate_surface_copy(
+        &mut self,
+        src: &crate::engines::fermi_2d::Surface,
+        dst: &crate::engines::fermi_2d::Surface,
+        copy: &crate::engines::fermi_2d::Config,
+    ) -> bool {
+        let mutex: *const _ = &self.texture_cache.base.mutex;
+        let _guard = unsafe { &*mutex }.lock();
+        self.texture_cache.blit_image(dst, src, copy)
+    }
+
     fn load_disk_resources(
         &mut self,
         title_id: u64,

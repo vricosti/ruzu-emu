@@ -13,8 +13,9 @@ use objc2_metal::{
 use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::BufferCacheAsyncBuffer;
+use crate::engines::fermi_2d::{Filter, Operation};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-use crate::surface::PixelFormat;
+use crate::surface::{get_format_type, PixelFormat, SurfaceType};
 use crate::texture_cache::image_base::ImageBase;
 use crate::texture_cache::image_view_base::ImageViewBase;
 use crate::texture_cache::image_view_info::ImageViewInfo;
@@ -23,11 +24,15 @@ use crate::texture_cache::texture_cache_base::{
     DescriptorSyncRegs, ImageViewInOut, TextureCacheBase as CommonTextureCache, TextureCacheParams,
 };
 use crate::texture_cache::types::{
-    BufferImageCopy, ImageCopy, ImageId, ImageType, ImageViewId, ImageViewType, SamplerId,
-    NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
+    BufferImageCopy, FramebufferId, ImageCopy, ImageId, ImageType, ImageViewId, ImageViewType,
+    Region2D, SamplerId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
 };
 use shader_recompiler::shader_info::TextureType;
 
+use super::metal_blit_helper::{
+    MetalBlitError, MetalBlitHelper, MetalBlitRegion, MetalDepthStencilBufferCopy,
+    MetalDepthStencilCopy,
+};
 use super::metal_buffer::{MetalBuffer, MetalBufferError};
 use super::metal_device::MetalDevice;
 use super::metal_framebuffer::{MetalFramebuffer, MetalFramebufferError};
@@ -41,6 +46,8 @@ use super::metal_staging_buffer_pool::{
 
 #[derive(Debug, Error)]
 pub enum MetalTextureCacheError {
+    #[error(transparent)]
+    Blit(#[from] MetalBlitError),
     #[error(transparent)]
     Scheduler(#[from] MetalSchedulerError),
     #[error(transparent)]
@@ -63,6 +70,8 @@ pub struct MetalTextureCacheRuntime {
     device: MetalDevice,
     scheduler: NonNull<MetalScheduler>,
     staging_buffer_pool: NonNull<MetalStagingBufferPool>,
+    blit_image_helper: NonNull<MetalBlitHelper>,
+    depth_stencil_copy: Option<MetalDepthStencilCopy>,
 }
 
 impl MetalTextureCacheRuntime {
@@ -70,11 +79,14 @@ impl MetalTextureCacheRuntime {
         device: MetalDevice,
         scheduler: &mut MetalScheduler,
         staging_buffer_pool: &mut MetalStagingBufferPool,
+        blit_image_helper: &mut MetalBlitHelper,
     ) -> Self {
         Self {
             device,
             scheduler: NonNull::from(scheduler),
             staging_buffer_pool: NonNull::from(staging_buffer_pool),
+            blit_image_helper: NonNull::from(blit_image_helper),
+            depth_stencil_copy: None,
         }
     }
 
@@ -119,6 +131,116 @@ impl MetalTextureCacheRuntime {
         let scheduler = unsafe { self.scheduler.as_mut() };
         let pool = unsafe { self.staging_buffer_pool.as_mut() };
         pool.tick_frame(scheduler)?;
+        Ok(())
+    }
+
+    pub fn transfer_depth32_stencil8_memory(
+        &mut self,
+        image: &MetalImage,
+        buffer: &MetalBuffer,
+        base_offset: usize,
+        copies: &[BufferImageCopy],
+        upload: bool,
+    ) -> Result<(), MetalImageError> {
+        if self.depth_stencil_copy.is_none() {
+            self.depth_stencil_copy = Some(MetalDepthStencilCopy::new(&self.device)?);
+        }
+        image.transfer_depth32_stencil8_memory(
+            unsafe { self.scheduler.as_mut() },
+            self.depth_stencil_copy.as_ref().unwrap(),
+            buffer,
+            base_offset,
+            copies,
+            upload,
+        )
+    }
+
+    /// Native counterpart of TextureCacheRuntime::BlitImage. The common cache
+    /// has already resolved image identity, subresources, scaling and aliases.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_image(
+        &mut self,
+        framebuffer: &MetalFramebuffer,
+        destination: &MetalImageView,
+        source: &MetalImageView,
+        dst_region: MetalBlitRegion,
+        src_region: MetalBlitRegion,
+        filter: Filter,
+        operation: Operation,
+    ) -> Result<(), MetalTextureCacheError> {
+        let aspect = get_format_type(source.base().format);
+        if aspect != get_format_type(destination.base().format) {
+            return Err(MetalTextureCacheError::InvalidCopy("blit aspects differ"));
+        }
+        let source_msaa = source.samples() > 1;
+        let destination_msaa = destination.samples() > 1;
+        if (destination_msaa && !source_msaa)
+            || (source_msaa && destination_msaa && source.samples() != destination.samples())
+        {
+            return Err(MetalTextureCacheError::InvalidCopy(
+                "incompatible blit sample counts",
+            ));
+        }
+        let color = aspect == SurfaceType::ColorTexture;
+        if color {
+            let numeric_type = |format| {
+                (
+                    crate::surface::is_pixel_format_integer(format),
+                    crate::surface::is_pixel_format_signed_integer(format),
+                )
+            };
+            let source_type = numeric_type(source.base().format);
+            if source_type != numeric_type(destination.base().format)
+                || (source_type.0 && filter != Filter::Point)
+            {
+                return Err(MetalTextureCacheError::InvalidCopy(
+                    "integer blits require matching numeric types and point filtering",
+                ));
+            }
+        }
+        if !color || source_msaa || destination_msaa {
+            if source.base().format != destination.base().format || operation != Operation::SrcCopy
+            {
+                return Err(MetalTextureCacheError::InvalidCopy(
+                    "non-color/MSAA blits require matching formats and SrcCopy",
+                ));
+            }
+        }
+        if !color && filter != Filter::Point {
+            return Err(MetalTextureCacheError::InvalidCopy(
+                "depth/stencil blits require point filtering",
+            ));
+        }
+        // Both pointers refer to stable, independently boxed rasterizer owners.
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let helper = unsafe { self.blit_image_helper.as_mut() };
+        if color {
+            if source_msaa {
+                helper.blit_color_msaa(scheduler, framebuffer, source, dst_region, src_region)?;
+            } else {
+                helper.blit_color(
+                    scheduler,
+                    framebuffer,
+                    source,
+                    dst_region,
+                    src_region,
+                    filter,
+                    operation,
+                )?;
+            }
+        } else if source_msaa && !destination_msaa {
+            helper.resolve_depth_stencil(scheduler, framebuffer, source, dst_region, src_region)?;
+        } else {
+            helper.blit_depth_stencil(
+                scheduler,
+                framebuffer,
+                source,
+                dst_region,
+                src_region,
+                filter,
+                operation,
+            )?;
+        }
         Ok(())
     }
 
@@ -215,6 +337,72 @@ impl MetalTextureCacheRuntime {
             offset = offset.saturating_add(bytes_per_image.saturating_mul(copy.source_size.depth));
         }
         let intermediate = MetalBuffer::new_private(&self.device, offset)?;
+        if matches!(
+            (source.guest_format(), destination.guest_format()),
+            (PixelFormat::D32FloatS8Uint, PixelFormat::R32G32Float)
+                | (PixelFormat::R32G32Float, PixelFormat::D32FloatS8Uint)
+        ) {
+            if self.depth_stencil_copy.is_none() {
+                self.depth_stencil_copy = Some(MetalDepthStencilCopy::new(&self.device)?);
+            }
+            let helper = self.depth_stencil_copy.as_ref().unwrap();
+            // The scheduler is independently owned by the rasterizer.
+            let scheduler = unsafe { self.scheduler.as_mut() };
+            for layout in &layouts {
+                let copy = layout.image;
+                if source.guest_format() == PixelFormat::D32FloatS8Uint {
+                    helper.copy(
+                        scheduler,
+                        source.handle(),
+                        &intermediate,
+                        MetalDepthStencilBufferCopy {
+                            buffer_offset: layout.buffer_offset,
+                            bytes_per_row: layout.bytes_per_row,
+                            bytes_per_image: layout.bytes_per_image,
+                            slice: copy.source_slice,
+                            level: copy.source_level,
+                            origin: copy.source_origin,
+                            size: copy.source_size,
+                        },
+                        false,
+                    )?;
+                } else {
+                    scheduler.with_blit_encoder(|encoder| unsafe {
+                        encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                            source.handle(), copy.source_slice, copy.source_level, copy.source_origin, copy.source_size,
+                            intermediate.handle(), layout.buffer_offset, layout.bytes_per_row, layout.bytes_per_image);
+                    })?;
+                }
+            }
+            for layout in &layouts {
+                let copy = layout.image;
+                if destination.guest_format() == PixelFormat::D32FloatS8Uint {
+                    helper.copy(
+                        scheduler,
+                        destination.handle(),
+                        &intermediate,
+                        MetalDepthStencilBufferCopy {
+                            buffer_offset: layout.buffer_offset,
+                            bytes_per_row: layout.bytes_per_row,
+                            bytes_per_image: layout.bytes_per_image,
+                            slice: copy.destination_slice,
+                            level: copy.destination_level,
+                            origin: copy.destination_origin,
+                            size: copy.destination_size,
+                        },
+                        true,
+                    )?;
+                } else {
+                    scheduler.with_blit_encoder(|encoder| unsafe {
+                        encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            intermediate.handle(), layout.buffer_offset, layout.bytes_per_row, layout.bytes_per_image, copy.destination_size,
+                            destination.handle(), copy.destination_slice, copy.destination_level, copy.destination_origin);
+                    })?;
+                }
+            }
+            destination.mark_native_modified();
+            return Ok(());
+        }
         let scheduler = self.scheduler();
         scheduler.request_outside_render_pass_operation_context();
         scheduler.with_blit_encoder(|encoder| {
@@ -388,7 +576,7 @@ impl TextureCacheParams for MetalTextureCacheParams {
     type BufferType = Arc<MetalBuffer>;
 
     const ENABLE_VALIDATION: bool = true;
-    const FRAMEBUFFER_BLITS: bool = false;
+    const FRAMEBUFFER_BLITS: bool = true;
     const HAS_EMULATED_COPIES: bool = false;
     const HAS_DEVICE_MEMORY_INFO: bool = false;
     const IMPLEMENTS_ASYNC_DOWNLOADS: bool = false;
@@ -401,6 +589,60 @@ impl TextureCacheParams for MetalTextureCacheParams {
         let runtime = runtime.expect("Metal texture-cache runtime must be bound");
         MetalImage::new(runtime.device(), &unsafe { base.as_ref() }.info)
             .unwrap_or_else(|error| panic!("Metal image construction failed: {error}"))
+    }
+
+    fn blit_image(
+        cache: &mut CommonTextureCache<Self>,
+        dst_framebuffer_id: FramebufferId,
+        _src_framebuffer_id: FramebufferId,
+        dst_view_id: ImageViewId,
+        src_view_id: ImageViewId,
+        dst_region: Region2D,
+        src_region: Region2D,
+        filter: Filter,
+        operation: Operation,
+    ) {
+        let src_image_id = cache.slot_image_views[src_view_id].image_id;
+        let dst_image_id = cache.slot_image_views[dst_view_id].image_id;
+        for image_id in [src_image_id, dst_image_id] {
+            if !synchronize_image_storage(cache, image_id, TextureType::Color2D, false) {
+                log::error!("Metal blit image storage preparation failed");
+                return;
+            }
+        }
+        let source = cache.slot_image_views[src_view_id]
+            .backend
+            .as_ref()
+            .and_then(MetalCachedImageView::image)
+            .expect("common blit source view must exist");
+        let destination = cache.slot_image_views[dst_view_id]
+            .backend
+            .as_ref()
+            .and_then(MetalCachedImageView::image)
+            .expect("common blit destination view must exist");
+        let region = |region: Region2D| MetalBlitRegion {
+            start: (region.start.x, region.start.y),
+            end: (region.end.x, region.end.y),
+        };
+        // Disjoint field borrows keep the views/framebuffer alive across runtime recording.
+        let result = cache
+            .runtime
+            .as_deref_mut()
+            .expect("Metal runtime must be bound")
+            .blit_image(
+                &cache.slot_framebuffers[dst_framebuffer_id],
+                destination,
+                source,
+                region(dst_region),
+                region(src_region),
+                filter,
+                operation,
+            );
+        if let Err(error) = result {
+            log::error!("Metal TextureCacheRuntime::BlitImage failed: {error}");
+        } else if let Some(image) = cache.slot_images[dst_image_id].backend.as_ref() {
+            image.mark_modified_for_texture_type(TextureType::Color2D);
+        }
     }
 
     fn set_image_allocation_tick(image: &mut Self::Image, allocation_tick: u64) {
@@ -542,6 +784,13 @@ impl TextureCacheParams for MetalTextureCacheParams {
             .take()
             .expect("Metal image backend must be materialized");
         let result = match image.guest_format() {
+            PixelFormat::D32FloatS8Uint => cache.runtime_mut().transfer_depth32_stencil8_memory(
+                &image,
+                &staging.buffer,
+                staging.offset,
+                copies,
+                true,
+            ),
             PixelFormat::D24UnormS8Uint | PixelFormat::S8UintD24Unorm => {
                 let converted_size = converted_depth_stencil_linear_size(copies);
                 let mut converted = cache
@@ -898,6 +1147,7 @@ impl MetalTextureCache {
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         scheduler: &mut MetalScheduler,
         staging_buffer_pool: &mut MetalStagingBufferPool,
+        blit_image_helper: &mut MetalBlitHelper,
     ) -> Self {
         let mut base = CommonTextureCache::<MetalTextureCacheParams>::new_with_caps_for_backend(
             device_memory,
@@ -908,6 +1158,7 @@ impl MetalTextureCache {
             device,
             scheduler,
             staging_buffer_pool,
+            blit_image_helper,
         ));
         let null_view_base = NonNull::from(base.slot_image_views[NULL_IMAGE_VIEW_ID].base.as_mut());
         base.slot_image_views[NULL_IMAGE_VIEW_ID].backend =
@@ -923,6 +1174,15 @@ impl MetalTextureCache {
 
     pub fn create_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
         self.base.create_channel(channel);
+    }
+
+    pub fn blit_image(
+        &mut self,
+        dst: &crate::engines::fermi_2d::Surface,
+        src: &crate::engines::fermi_2d::Surface,
+        copy: &crate::engines::fermi_2d::Config,
+    ) -> bool {
+        self.base.blit_image(dst, src, copy)
     }
 
     pub fn bind_to_channel(&mut self, channel_id: i32) {
@@ -1354,7 +1614,7 @@ mod tests {
     #[test]
     fn policy_matches_native_metal_cache_contract() {
         assert!(MetalTextureCacheParams::ENABLE_VALIDATION);
-        assert!(!MetalTextureCacheParams::FRAMEBUFFER_BLITS);
+        assert!(MetalTextureCacheParams::FRAMEBUFFER_BLITS);
         assert!(!MetalTextureCacheParams::HAS_EMULATED_COPIES);
         assert!(!MetalTextureCacheParams::HAS_DEVICE_MEMORY_INFO);
         assert!(!MetalTextureCacheParams::IMPLEMENTS_ASYNC_DOWNLOADS);
@@ -1367,13 +1627,119 @@ mod tests {
         let mut staging_buffer_pool = MetalStagingBufferPool::new(&device).unwrap();
         let scheduler_address = std::ptr::from_ref(&scheduler);
         let staging_address = std::ptr::from_ref(&staging_buffer_pool);
-        let mut runtime =
-            MetalTextureCacheRuntime::new(device, &mut scheduler, &mut staging_buffer_pool);
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_buffer_pool,
+            &mut blit_helper,
+        );
         assert_eq!(std::ptr::from_ref(runtime.scheduler()), scheduler_address);
         assert_eq!(
             std::ptr::from_ref(runtime.staging_buffer_pool()),
             staging_address
         );
+    }
+
+    #[test]
+    fn common_fermi_blit_uses_native_cache_images_without_cpu_roundtrip() {
+        use crate::engines::fermi_2d::{Config, MemoryLayout, Surface};
+        use crate::texture_cache::image_base::ImageFlagBits;
+        let device = MetalDevice::new().unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        let mut staging = MetalStagingBufferPool::new(&device).unwrap();
+        let mut blit = MetalBlitHelper::new(&device).unwrap();
+        let mut cache = MetalTextureCache::new(
+            device.clone(),
+            Arc::new(MaxwellDeviceMemoryManager::default()),
+            &mut scheduler,
+            &mut staging,
+            &mut blit,
+        );
+        let memory = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new(17),
+        ));
+        memory.lock().map(0x10000, 0x100000, 0x10000, 0, true);
+        memory.lock().map(0x20000, 0x200000, 0x10000, 0, true);
+        cache.base.set_channel_gpu_memory(memory);
+        let surface = |address| Surface {
+            format: crate::gpu::RenderTargetFormat::A8B8G8R8Unorm as u32,
+            linear: MemoryLayout::Pitch as u32,
+            block_dimensions: 0,
+            depth: 1,
+            layer: 0,
+            pitch: 16,
+            width: 4,
+            height: 4,
+            addr_upper: 0,
+            addr_lower: address,
+        };
+        let source = surface(0x10000);
+        let destination = surface(0x20000);
+        let config = Config {
+            operation: Operation::SrcCopy,
+            filter: Filter::Point,
+            must_accelerate: true,
+            src_x0: 0,
+            src_y0: 0,
+            src_x1: 4,
+            src_y1: 4,
+            dst_x0: 0,
+            dst_y0: 0,
+            dst_x1: 4,
+            dst_y1: 4,
+        };
+        let images = cache
+            .base
+            .get_blit_images(&destination, &source, &config)
+            .unwrap();
+        let input = MetalBuffer::new(&device, 64).unwrap();
+        let output = MetalBuffer::new(&device, 64).unwrap();
+        let zero = MetalBuffer::new(&device, 64).unwrap();
+        zero.write(0, &[0; 64]).unwrap();
+        let pixels: Vec<u8> = (0..64).map(|i| (i * 3) as u8).collect();
+        input.write(0, &pixels).unwrap();
+        let copy = BufferImageCopy {
+            buffer_size: 64,
+            image_extent: Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            ..BufferImageCopy::default()
+        };
+        for id in [images.src_id, images.dst_id] {
+            let image = &mut cache.base.slot_images[id];
+            // GPU-owned input has no CPU backing. Any accidental refresh would
+            // replace the nonzero pixels and fail the comparison below.
+            image.flags.remove(ImageFlagBits::CPU_MODIFIED);
+            image.flags.insert(ImageFlagBits::GPU_MODIFIED);
+            image
+                .backend
+                .as_ref()
+                .unwrap()
+                .upload_memory(
+                    &mut scheduler,
+                    if id == images.src_id { &input } else { &zero },
+                    0,
+                    &[copy],
+                )
+                .unwrap();
+        }
+        assert!(cache.blit_image(&destination, &source, &config));
+        assert!(cache.base.slot_images[images.dst_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED));
+        cache.base.slot_images[images.dst_id]
+            .backend
+            .as_ref()
+            .unwrap()
+            .download_memory(&mut scheduler, &output, 0, &[copy])
+            .unwrap();
+        scheduler.finish_all().unwrap();
+        let mut actual = [0; 64];
+        output.read(0, &mut actual).unwrap();
+        assert_eq!(actual.as_slice(), pixels);
     }
 
     #[test]
@@ -1402,8 +1768,13 @@ mod tests {
         };
         let mut scheduler = MetalScheduler::new(&device);
         let mut staging_buffer_pool = MetalStagingBufferPool::new(&device).unwrap();
-        let mut runtime =
-            MetalTextureCacheRuntime::new(device, &mut scheduler, &mut staging_buffer_pool);
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_buffer_pool,
+            &mut blit_helper,
+        );
         source_image
             .upload_memory(runtime.scheduler(), &upload, 0, &[buffer_copy])
             .unwrap();
@@ -1445,8 +1816,13 @@ mod tests {
         };
         let mut scheduler = MetalScheduler::new(&device);
         let mut staging_buffer_pool = MetalStagingBufferPool::new(&device).unwrap();
-        let mut runtime =
-            MetalTextureCacheRuntime::new(device, &mut scheduler, &mut staging_buffer_pool);
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_buffer_pool,
+            &mut blit_helper,
+        );
 
         source_image
             .upload_memory(runtime.scheduler(), &upload, 0, &[buffer_copy])
@@ -1462,6 +1838,196 @@ mod tests {
         let mut result = vec![0; 64];
         download.read(0, &mut result).unwrap();
         assert_eq!(result, pixels);
+    }
+
+    #[test]
+    fn reinterprets_d32s8_rg32_without_float_conversion() {
+        test_depth_stencil_reinterpretation(false);
+    }
+
+    #[test]
+    fn reinterprets_d32s8_rg32_partial_mip_and_array_layers() {
+        test_depth_stencil_reinterpretation(true);
+    }
+
+    #[test]
+    fn transfers_packed_d32s8_memory_with_pitched_rows() {
+        let device = MetalDevice::new().unwrap();
+        let depth = image_with_format(&device, PixelFormat::D32FloatS8Uint);
+        let upload = MetalBuffer::new(&device, 512).unwrap();
+        let download = MetalBuffer::new(&device, 512).unwrap();
+        let input = (0..512).map(|index| (index * 37) as u8).collect::<Vec<_>>();
+        upload.write(0, &input).unwrap();
+        download.write(0, &[0x55; 512]).unwrap();
+        let copy = BufferImageCopy {
+            buffer_offset: 16,
+            buffer_size: 192,
+            buffer_row_length: 6,
+            buffer_image_height: 4,
+            image_extent: Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            ..BufferImageCopy::default()
+        };
+        let mut scheduler = MetalScheduler::new(&device);
+        let mut staging_pool = MetalStagingBufferPool::new(&device).unwrap();
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_pool,
+            &mut blit_helper,
+        );
+        runtime
+            .transfer_depth32_stencil8_memory(&depth, &upload, 256, &[copy], true)
+            .unwrap();
+        runtime
+            .transfer_depth32_stencil8_memory(&depth, &download, 256, &[copy], false)
+            .unwrap();
+        runtime.finish().unwrap();
+        let mut result = vec![0; 512];
+        download.read(0, &mut result).unwrap();
+        let mut expected = vec![0x55; 512];
+        for y in 0..4 {
+            for x in 0..4 {
+                let offset = 272 + y * 48 + x * 8;
+                expected[offset..offset + 5].copy_from_slice(&input[offset..offset + 5]);
+                expected[offset + 5..offset + 8].fill(0);
+            }
+        }
+        assert_eq!(result, expected);
+    }
+
+    fn test_depth_stencil_reinterpretation(partial: bool) {
+        let device = MetalDevice::new().unwrap();
+        let make_image = |format| {
+            MetalImage::new(
+                &device,
+                &ImageInfo {
+                    format,
+                    image_type: ImageType::E2D,
+                    resources: SubresourceExtent {
+                        levels: 3,
+                        layers: 3,
+                    },
+                    size: Extent3D {
+                        width: 8,
+                        height: 8,
+                        depth: 1,
+                    },
+                    num_samples: 1,
+                    ..ImageInfo::default()
+                },
+            )
+            .unwrap()
+        };
+        let source = make_image(PixelFormat::R32G32Float);
+        let depth = make_image(PixelFormat::D32FloatS8Uint);
+        let destination = make_image(PixelFormat::R32G32Float);
+        let upload = MetalBuffer::new(&device, 256).unwrap();
+        let initial = MetalBuffer::new(&device, 256).unwrap();
+        let download = MetalBuffer::new(&device, 256).unwrap();
+        // Include signed zero, denormals, infinities and NaN payloads. None
+        // may be sampled or converted as float during a bit reinterpretation.
+        let depths = [
+            0,
+            0x8000_0000,
+            1,
+            0x007f_ffff,
+            0x3f00_0000,
+            0x3f80_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0xffc0_5678,
+            0x7f80_0001,
+        ];
+        let mut input = Vec::new();
+        for index in 0..32 {
+            input.extend_from_slice(&u32::to_le_bytes(depths[index % depths.len()]));
+            input.extend_from_slice(&(0xabcd_0000u32 | ((index as u32 * 37) & 255)).to_le_bytes());
+        }
+        upload.write(0, &input).unwrap();
+        initial.write(0, &[0x55; 256]).unwrap();
+        let buffer_copy = BufferImageCopy {
+            buffer_size: 256,
+            image_subresource: SubresourceLayers {
+                base_level: 1,
+                base_layer: 1,
+                num_layers: 2,
+            },
+            image_extent: Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            ..BufferImageCopy::default()
+        };
+        let extent = if partial { 2 } else { 4 };
+        let origin = if partial { 1 } else { 0 };
+        let to_depth = ImageCopy {
+            src_subresource: buffer_copy.image_subresource,
+            dst_subresource: buffer_copy.image_subresource,
+            src_offset: crate::texture_cache::types::Offset3D {
+                x: origin,
+                y: origin,
+                z: 0,
+            },
+            dst_offset: crate::texture_cache::types::Offset3D {
+                x: 0,
+                y: origin,
+                z: 0,
+            },
+            extent: Extent3D {
+                width: extent,
+                height: extent,
+                depth: 1,
+            },
+        };
+        let from_depth = ImageCopy {
+            src_offset: to_depth.dst_offset,
+            dst_offset: to_depth.src_offset,
+            ..to_depth
+        };
+        let mut scheduler = MetalScheduler::new(&device);
+        let mut staging_pool = MetalStagingBufferPool::new(&device).unwrap();
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_pool,
+            &mut blit_helper,
+        );
+        source
+            .upload_memory(runtime.scheduler(), &upload, 0, &[buffer_copy])
+            .unwrap();
+        destination
+            .upload_memory(runtime.scheduler(), &initial, 0, &[buffer_copy])
+            .unwrap();
+        runtime.copy_image(&depth, &source, &[to_depth]).unwrap();
+        runtime
+            .copy_image(&destination, &depth, &[from_depth])
+            .unwrap();
+        destination
+            .download_memory(runtime.scheduler(), &download, 0, &[buffer_copy])
+            .unwrap();
+        // There is no finish/readback between the two conversion directions.
+        runtime.finish().unwrap();
+        let mut result = vec![0; 256];
+        download.read(0, &mut result).unwrap();
+        let mut expected = vec![0x55; 256];
+        for layer in 0..2 {
+            for y in origin as usize..origin as usize + extent as usize {
+                for x in origin as usize..origin as usize + extent as usize {
+                    let offset = (layer * 16 + y * 4 + x) * 8;
+                    expected[offset..offset + 5].copy_from_slice(&input[offset..offset + 5]);
+                    expected[offset + 5..offset + 8].fill(0);
+                }
+            }
+        }
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -1501,8 +2067,13 @@ mod tests {
         };
         let mut scheduler = MetalScheduler::new(&device);
         let mut staging_buffer_pool = MetalStagingBufferPool::new(&device).unwrap();
-        let mut runtime =
-            MetalTextureCacheRuntime::new(device, &mut scheduler, &mut staging_buffer_pool);
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_buffer_pool,
+            &mut blit_helper,
+        );
 
         uncompressed
             .upload_memory(runtime.scheduler(), &upload, 0, &[buffer_copy])
@@ -1587,8 +2158,13 @@ mod tests {
         };
         let mut scheduler = MetalScheduler::new(&device);
         let mut staging_buffer_pool = MetalStagingBufferPool::new(&device).unwrap();
-        let mut runtime =
-            MetalTextureCacheRuntime::new(device, &mut scheduler, &mut staging_buffer_pool);
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device,
+            &mut scheduler,
+            &mut staging_buffer_pool,
+            &mut blit_helper,
+        );
 
         let clear_pass = MTLRenderPassDescriptor::renderPassDescriptor();
         let attachment = unsafe { clear_pass.colorAttachments().objectAtIndexedSubscript(0) };

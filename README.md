@@ -222,6 +222,15 @@ and installer are then generated with:
 build.bat package
 ```
 
+To deliberately create a test package from another branch, use:
+
+```bat
+build.bat package -ForcePackage
+```
+
+`-ForcePackage` bypasses only the Git `main`-branch checks and prints a warning;
+all build, dependency, runtime-file, and NSIS validations remain enabled.
+
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
 and installer under `target\package`. Packaging is accepted only when Ruzu and

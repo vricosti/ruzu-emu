@@ -94,6 +94,7 @@ echo Ruzu was built successfully:
 echo   %RUZU_BINARY%
 set "RUZU_BUILD_PROFILE="
 set "RUZU_BUILD_ACTION="
+set "RUZU_FORCE_PACKAGE="
 set "RUZU_BINARY="
 set "RUZU_CARGO_BINARY="
 set "RUZU_OUTPUT_DIR="
@@ -111,8 +112,14 @@ if /i "%RUZU_BUILD_PROFILE%"=="debug" (
 
 echo.
 echo Building the self-contained Windows package and NSIS installer...
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release
+if "%RUZU_FORCE_PACKAGE%"=="1" (
+    echo WARNING: Git main-branch checks are disabled for this package.
+    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release -ForcePackage
+) else (
+    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release
+)
 set "RUZU_PACKAGE_EXIT=%ERRORLEVEL%"
 set "RUZU_BUILD_ACTION="
 set "RUZU_BUILD_PROFILE="
+set "RUZU_FORCE_PACKAGE="
 exit /b %RUZU_PACKAGE_EXIT%

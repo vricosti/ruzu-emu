@@ -18105,6 +18105,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   and conventional locations; otherwise it installs under `%LOCALAPPDATA%\Ruzu\vcpkg`. Release is
   the default, Debug is explicit, and the executable plus runtime DLLs are staged under
   `build\x86_64-pc-windows-msvc\<profile>`.
+- `build.bat package -ForcePackage` is an explicit test-release escape hatch that bypasses only
+  the Git `main`-branch checks. The default package path remains strict, and dependency, staging,
+  runtime-file, and NSIS validation are never bypassed.
 
 ### Unintentional differences (to fix)
 

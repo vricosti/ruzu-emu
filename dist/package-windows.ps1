@@ -19,6 +19,7 @@ param(
     [string]$Version,
     [ValidateSet("release", "release-lto")]
     [string]$Profile = "release",
+    [switch]$ForcePackage,
     [switch]$SkipBuild,
     [switch]$StageOnly,
     [switch]$ValidateOnly
@@ -226,7 +227,12 @@ if (-not $isWindowsPlatform) {
     throw "Ruzu's Windows package must be built on Windows with the MSVC toolchain."
 }
 
-Assert-ReleaseBranches
+if ($ForcePackage) {
+    Write-Warning "Git main-branch checks were explicitly disabled with -ForcePackage."
+}
+else {
+    Assert-ReleaseBranches
+}
 
 $makeNsis = if (-not $StageOnly) {
     Resolve-MakeNsis

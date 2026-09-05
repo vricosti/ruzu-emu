@@ -224,9 +224,11 @@ build.bat package
 
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
-and installer under `target\package`. The advanced staging-only and existing-
-binary modes remain available by invoking `dist\package-windows.ps1` directly
-with `-StageOnly` or `-SkipBuild`.
+and installer under `target\package`. Packaging is accepted only when Ruzu and
+all initialized project submodules are checked out on their `main` branches and
+the submodules match the commits recorded by Ruzu. The advanced staging-only
+and existing-binary modes remain available by invoking
+`dist\package-windows.ps1` directly with `-StageOnly` or `-SkipBuild`.
 
 There is also a headless command-line frontend:
 

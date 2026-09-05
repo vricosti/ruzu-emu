@@ -122,6 +122,66 @@ function Resolve-MakeNsis {
     throw "makensis.exe was not found. Install NSIS 3 and retry."
 }
 
+function Assert-MainBranch {
+    param(
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string]$GitExecutable
+    )
+
+    $branch = & $GitExecutable -C $Repository branch --show-current
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to determine the current Git branch for $DisplayName."
+    }
+    $branch = ($branch -join "`n").Trim()
+    if ($branch -ne "main") {
+        $actual = if ($branch) { $branch } else { "detached HEAD" }
+        throw "$DisplayName must be checked out on branch main before packaging (current: $actual)."
+    }
+}
+
+function Assert-ReleaseBranches {
+    $git = Get-Command git.exe -ErrorAction SilentlyContinue
+    if (-not $git) {
+        throw "git.exe was not found; Git is required to verify release branches."
+    }
+
+    Assert-MainBranch `
+        -Repository $ProjectRoot `
+        -DisplayName "Ruzu" `
+        -GitExecutable $git.Source
+
+    $submoduleEntries = @(
+        & $git.Source -C $ProjectRoot config --file .gitmodules --get-regexp '^submodule\..*\.path$'
+    )
+    if ($LASTEXITCODE -gt 1) {
+        throw "Unable to read Ruzu's Git submodule configuration."
+    }
+
+    foreach ($entry in $submoduleEntries) {
+        $parts = $entry -split '\s+', 2
+        if ($parts.Count -ne 2) {
+            throw "Invalid Git submodule entry: $entry"
+        }
+        $relativePath = $parts[1]
+        $repository = Join-Path $ProjectRoot $relativePath
+        $status = @(& $git.Source -C $ProjectRoot submodule status -- $relativePath)
+        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 1) {
+            throw "Unable to inspect Git submodule $relativePath."
+        }
+        if ($status[0].StartsWith("-")) {
+            throw "Git submodule $relativePath must be initialized before packaging."
+        }
+        if ($status[0].StartsWith("+") -or $status[0].StartsWith("U")) {
+            throw "Git submodule $relativePath must match the commit recorded by Ruzu before packaging."
+        }
+        Assert-MainBranch `
+            -Repository $repository `
+            -DisplayName "Git submodule $relativePath" `
+            -GitExecutable $git.Source
+    }
+}
+
 function Copy-RuntimeTree {
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -165,6 +225,8 @@ else {
 if (-not $isWindowsPlatform) {
     throw "Ruzu's Windows package must be built on Windows with the MSVC toolchain."
 }
+
+Assert-ReleaseBranches
 
 $makeNsis = if (-not $StageOnly) {
     Resolve-MakeNsis

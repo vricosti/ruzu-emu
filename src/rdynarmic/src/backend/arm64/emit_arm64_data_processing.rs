@@ -2338,11 +2338,18 @@ fn emit_add_sub_imm<const BITSIZE: usize, const SUB: bool>(
     } else {
         if BITSIZE == 32 {
             emit_mov_w_imm(code, XSCRATCH0, adjusted as u32)?;
-            emit_add_sub_reg::<32, SUB>(code, rd, rn, XSCRATCH0, carry)?;
         } else {
             emit_mov_x_imm(code, XSCRATCH0, adjusted)?;
-            emit_add_sub_reg::<64, SUB>(code, rd, rn, XSCRATCH0, carry)?;
         }
+        // MaybeAddSubImm materializes an already-adjusted operand; do not
+        // complement it again through the unadjusted register-operand path.
+        code.write_u32(match (BITSIZE, carry) {
+            (32, false) => inst::add_w_reg(rd, rn, XSCRATCH0),
+            (64, false) => inst::add_x_reg(rd, rn, XSCRATCH0),
+            (32, true) => inst::sub_w_reg(rd, rn, XSCRATCH0),
+            (64, true) => inst::sub_x_reg(rd, rn, XSCRATCH0),
+            _ => unreachable!(),
+        })?;
     }
     Ok(())
 }
@@ -2382,11 +2389,16 @@ fn emit_add_sub_imm_flags<const BITSIZE: usize, const SUB: bool>(
     } else {
         if BITSIZE == 32 {
             emit_mov_w_imm(code, XSCRATCH0, adjusted as u32)?;
-            emit_add_sub_reg_flags::<32, SUB>(code, rd, rn, XSCRATCH0, carry)?;
         } else {
             emit_mov_x_imm(code, XSCRATCH0, adjusted)?;
-            emit_add_sub_reg_flags::<64, SUB>(code, rd, rn, XSCRATCH0, carry)?;
         }
+        code.write_u32(match (BITSIZE, carry) {
+            (32, false) => inst::adds_w_reg(rd, rn, XSCRATCH0),
+            (64, false) => inst::adds_x_reg(rd, rn, XSCRATCH0),
+            (32, true) => inst::subs_w_reg(rd, rn, XSCRATCH0),
+            (64, true) => inst::subs_x_reg(rd, rn, XSCRATCH0),
+            _ => unreachable!(),
+        })?;
     }
     Ok(())
 }
@@ -2631,5 +2643,73 @@ fn emit_add_sub_reg_flags<const BITSIZE: usize, const SUB: bool>(
             Ok(())
         }
         _ => unreachable!(),
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    fn check_immediate_arithmetic<const BITS: usize, const SUB: bool>() {
+        for carry in [false, true] {
+            for flags in [false, true] {
+                for imm in [0, 1, 16, 0x12345, 0x1234_5678, u64::MAX] {
+                    let mut code = BlockOfCode::with_size(4096).unwrap();
+                    if flags {
+                        emit_add_sub_imm_flags::<BITS, SUB>(&mut code, 0, 0, imm, carry).unwrap();
+                    } else {
+                        emit_add_sub_imm::<BITS, SUB>(&mut code, 0, 0, imm, carry).unwrap();
+                    }
+                    code.write_u32(inst::mrs_nzcv(2)).unwrap();
+                    code.write_u32(inst::str_w_unsigned(2, 1, 0)).unwrap();
+                    code.write_u32(inst::ret_lr()).unwrap();
+                    code.seal();
+                    // Only caller-saved registers and NZCV are modified.
+                    let run: unsafe extern "C" fn(u64, *mut u32) -> u64 =
+                        unsafe { std::mem::transmute(code.code_base_ptr()) };
+                    for lhs in [
+                        0u64,
+                        1,
+                        0x7fff_ffff,
+                        0x8000_0000,
+                        0x7fff_ffff_ffff_ffff,
+                        0x8000_0000_0000_0000,
+                        u64::MAX,
+                    ] {
+                        let mut actual_flags = 0;
+                        let expected = if SUB {
+                            lhs.wrapping_sub(imm).wrapping_sub(u64::from(!carry))
+                        } else {
+                            lhs.wrapping_add(imm).wrapping_add(u64::from(carry))
+                        };
+                        assert_eq!(
+                            unsafe { run(lhs, &mut actual_flags) },
+                            mask_add_sub_imm::<BITS>(expected),
+                            "bits={BITS} sub={SUB} carry={carry} flags={flags} imm={imm:#x} lhs={lhs:#x}"
+                        );
+                        if flags {
+                            let a = mask_add_sub_imm::<BITS>(lhs);
+                            let b = mask_add_sub_imm::<BITS>(if SUB { !imm } else { imm });
+                            let sum = a as u128 + b as u128 + u128::from(carry);
+                            let result = mask_add_sub_imm::<BITS>(expected);
+                            let sign = 1u64 << (BITS - 1);
+                            let expected_flags = (u32::from(result & sign != 0) << 31)
+                                | (u32::from(result == 0) << 30)
+                                | (u32::from(sum >> BITS != 0) << 29)
+                                | (u32::from((!(a ^ b) & (a ^ result) & sign) != 0) << 28);
+                            assert_eq!(actual_flags, expected_flags);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_arithmetic_preserves_carry_when_materializing_constant() {
+        check_immediate_arithmetic::<32, false>();
+        check_immediate_arithmetic::<32, true>();
+        check_immediate_arithmetic::<64, false>();
+        check_immediate_arithmetic::<64, true>();
     }
 }

@@ -586,6 +586,9 @@ impl A64AddressSpace {
         }
         if self.conf.has_optimization(OptimizationFlag::MISC_IR_OPT) {}
         block.recompute_use_counts();
+        // Callback expansion inserts instructions and clears pseudo-op links.
+        // Restore upstream Inst::Use/UndoUse's invariant before flag emission.
+        block.rebuild_pseudo_op_links();
         #[cfg(debug_assertions)]
         opt::verification_pass(&block);
 
@@ -1004,6 +1007,38 @@ mod tests {
             get_cntpct: ptr,
             add_ticks: ptr,
             get_ticks_remaining: ptr,
+        }
+    }
+
+    #[test]
+    fn generate_ir_preserves_arithmetic_pseudo_op_links() {
+        use crate::ir::opcode::Opcode;
+        for optimizations in [
+            OptimizationFlag::NO_OPTIMIZATIONS,
+            OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+        ] {
+            let mut config = config(vec![
+                0xd50b_7423, // dc zva,x3 (expanded into memory writes)
+                0xf101_0042, // subs x2,x2,#64
+                0x54ff_ffc8, // b.hi -8
+            ]);
+            config.optimizations = optimizations;
+            let address_space = A64AddressSpace::new(config).unwrap();
+            let block =
+                address_space.generate_ir(A64LocationDescriptor::new(0, 0, false).to_location());
+            let (index, flags) = block
+                .instructions
+                .iter()
+                .enumerate()
+                .find(|(_, inst)| inst.opcode == Opcode::GetNZCVFromOp)
+                .expect("SUBS must produce flags");
+            assert_eq!(
+                block.get_associated_pseudo_operation(
+                    flags.args[0].inst_ref(),
+                    Opcode::GetNZCVFromOp
+                ),
+                Some(crate::ir::value::InstRef(index as u32)),
+            );
         }
     }
 

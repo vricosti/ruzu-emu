@@ -20225,3 +20225,70 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - N/A: version and compiler identities are build-time UTF-8 metadata and are not guest-visible.
+
+## 2026-09-05 - src/rdynarmic/src/backend/arm64/a64_address_space.rs vs dynarmic/backend/arm64/a64_address_space.{h,cpp}
+
+### Intentional differences
+
+- Eden maintains producer/pseudo-operation links incrementally through
+  `IR::Inst::Use/UndoUse` in `ir/microinstruction.{h,cpp}`. Rust's indexed arena
+  rebuilds them after IR transformations, as its A32 path already does. A64 now
+  restores the same invariant after callback expansion and optimization, before
+  verification and emission.
+
+### Unintentional differences (to fix)
+
+- None remaining in this repair: expanding `DC ZVA` inserts instructions and
+  clears links; without the final rebuild, `GetNZCVFromOp` was no longer visible
+  to the arithmetic producer. `SUBS` became `SUB` followed by `TST`, losing C/V
+  and causing a following `B.HI` to take the wrong path.
+
+### Missing items
+
+- No new prerequisite missing in this slice. This audit does not claim full
+  A64 address-space parity.
+
+### Binary layout verification
+
+- N/A: no guest state, ABI, or instruction representation layout changes.
+- Regression: `DC ZVA; SUBS; B.HI` must retain the subtraction-to-NZCV link with
+  optimizations disabled and enabled. The test failed before and passes after
+  the repair.
+
+## 2026-09-05 - src/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs vs dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+
+- Rust encodes the register-materialization fallback explicitly rather than
+  passing an immediate/register variant through upstream's `MaybeAddSubImm`
+  lambda. The instruction selection and operand bits follow `EmitAddSub`.
+
+### Unintentional differences (to fix)
+
+- None remaining in the immediate add/sub fallback: the already complemented
+  operand is no longer complemented a second time by the raw-register helper.
+  Carry-in selects ADD/ADDS or SUB/SUBS exactly as upstream does, in both widths.
+
+### Missing items
+
+- No new prerequisite missing in this slice; other emitters are outside this audit.
+
+### Binary layout verification
+
+- PASS: native execution tests verify 32/64-bit results and NZCV, both carry-in
+  values, addition/subtraction, encodable/materialized constants, and signed
+  boundary operands. No ABI or serialized layout changes.
+
+### Validation
+
+- Release GUI bundle rebuilt. Two Freebrick launches reached the rendered menu
+  at approximately 60 FPS, with window-specific screenshots, and remained alive
+  until the deliberate 90-second and 45-second test limits. Temporary JIT
+  tracing was removed before rebuilding. Gameplay beyond the menu is not validated.
+- 125 focused tests passed: A64 address space (5), ARM64 emitter (29), IR (90),
+  and native immediate arithmetic (1).
+- Full `cargo test -p rdynarmic --release -- --test-threads=1` did not pass:
+  `normal_callback_trampolines_populate_prelude_and_extend_cache_base` failed
+  with 768 versus 800, followed by SIGABRT in the A32
+  `run_existing_block_calls_arm64_prelude` test. These failures are outside the
+  repaired A64 callback-expansion path; the full crate is not certified green.

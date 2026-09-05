@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/frontend/emu_window.h and emu_window.cpp
 //! Emulator window abstract interface.
 
-use crate::frontend::framebuffer_layout::{self, FramebufferLayout, MinimumSize};
+use crate::frontend::framebuffer_layout::{self, minimum_size, FramebufferLayout};
 use crate::frontend::graphics_context::GraphicsContext;
 
 /// Information for the Graphics Backends signifying what type of screen pointer is in
@@ -44,7 +44,7 @@ impl Default for WindowConfig {
             fullscreen: false,
             res_width: 0,
             res_height: 0,
-            min_client_area_size: (MinimumSize::WIDTH, MinimumSize::HEIGHT),
+            min_client_area_size: (minimum_size::WIDTH, minimum_size::HEIGHT),
         }
     }
 }

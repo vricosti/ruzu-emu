@@ -345,7 +345,8 @@ impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
 pub struct MetalRasterizer {
     device: MetalDevice,
     scheduler: Box<MetalScheduler>,
-    staging_pool: Box<MetalStagingBufferPool>,
+    // Owns the storage referenced by cache runtimes through stable pointers.
+    _staging_pool: Box<MetalStagingBufferPool>,
     pipeline_cache: MetalPipelineCache,
     shader_cache: ShaderCache,
     common_buffer_cache: Box<MetalCommonBufferCache>,
@@ -400,7 +401,7 @@ impl MetalRasterizer {
         Ok(Self {
             device,
             scheduler,
-            staging_pool,
+            _staging_pool: staging_pool,
             pipeline_cache,
             shader_cache,
             common_buffer_cache,

@@ -270,7 +270,7 @@ mod tests {
         // AnimH: `FMOV V0.4S, #<fpimm>` = 0x4F03F600 (cmode=0b1111,
         // op=0, Q=1). Must decode to MOVI and translate to a vector immediate,
         // NOT fall back to the interpreter (PrefetchAbort at runtime).
-        let (block, should_continue) = translate_one(0x4F03F600);
+        let (_block, should_continue) = translate_one(0x4F03F600);
         assert!(should_continue);
     }
 

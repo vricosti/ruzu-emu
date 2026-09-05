@@ -88,7 +88,7 @@ pub fn thumb32_udf(ir: &mut A32IREmitter) -> bool {
 pub fn thumb32_msr_reg(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
     let write_spsr = ((inst.raw >> 20) & 1) != 0;
     let n = inst.rn();
-    let mask = ((inst.raw >> 8) & 0xF) as u32;
+    let mask = (inst.raw >> 8) & 0xF;
 
     // Upstream `thumb32_MSR_reg`: mask==0 and n==PC are UnpredictableInstruction;
     // write_spsr is UndefinedInstruction. All stop translation (return false)
@@ -318,7 +318,7 @@ mod tests {
         let mut ir = A32IREmitter::with_location(&mut block, loc);
         let inst = DecodedThumb32 {
             raw: (1 << 9) | (1 << 8),
-            id: Thumb32InstId::MSR_reg,
+            id: Thumb32InstId::MsrReg,
         };
 
         assert!(!thumb32_msr_reg(&mut ir, &inst));

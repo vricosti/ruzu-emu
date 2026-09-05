@@ -215,21 +215,6 @@ impl<'a> TranslatorVisitor<'a> {
         self.scalar_min_max(inst, ScalarMinMaxOperation::Min, Signedness::Unsigned)
     }
 
-    fn read_and_extend_to_u64(
-        &mut self,
-        esize: usize,
-        operand: crate::ir::value::Value,
-        index: usize,
-    ) -> crate::ir::value::Value {
-        let elem = self.ir.ir().vector_get_element(esize, operand, index as u8);
-        match esize {
-            8 => self.ir.ir().zero_extend_byte_to_long(elem),
-            16 => self.ir.ir().zero_extend_half_to_long(elem),
-            32 => self.ir.ir().zero_extend_word_to_long(elem),
-            _ => unreachable!("esize {} not supported by ADDV", esize),
-        }
-    }
-
     fn read_and_extend_to_u64_signedness(
         &mut self,
         esize: usize,

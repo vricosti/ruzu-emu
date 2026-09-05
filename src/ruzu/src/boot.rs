@@ -456,7 +456,9 @@ fn run_boot(
     window_info: WindowSystemInfo,
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
-    opengl_context_source: Option<OpenGLContextSource>,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] opengl_context_source: Option<
+        OpenGLContextSource,
+    >,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
     error_applet: Option<Arc<dyn ruzu_core::frontend::applets::error::ErrorApplet>>,

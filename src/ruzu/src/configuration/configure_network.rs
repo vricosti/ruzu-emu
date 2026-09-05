@@ -22,16 +22,26 @@ pub fn page() -> Page {
     let entries = available_network_interfaces();
     let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
 
-    let current = common::settings::values()
+    let configured = common::settings::values()
         .network_interface
         .get_value()
         .clone();
-    let selected = entries
-        .iter()
-        .position(|name| *name == current)
-        .unwrap_or(0) as u32;
+    let selected_name =
+        ruzu_core::internal_network::network_interface::get_selected_network_interface()
+            .map(|interface| interface.name)
+            .or_else(|| (!configured.is_empty()).then_some(configured));
+    let selected = selected_name
+        .as_ref()
+        .and_then(|selected_name| entries.iter().position(|name| name == selected_name));
 
-    let (interface_row, interface) = w::combo_row("Network Interface", &entry_refs, selected);
+    let (interface_row, interface) = w::combo_row(
+        "Network Interface",
+        &entry_refs,
+        selected.unwrap_or(0) as u32,
+    );
+    if selected.is_none() {
+        interface.set_selected(gtk::INVALID_LIST_POSITION);
+    }
     general.append(&interface_row);
     let airplane_mode = w::check_row(
         "Enable Airplane Mode",

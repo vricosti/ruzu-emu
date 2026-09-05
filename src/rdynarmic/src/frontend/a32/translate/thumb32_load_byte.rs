@@ -298,7 +298,7 @@ mod tests {
         let location = thumb_location(0x1002);
         let mut block = Block::new(location.to_location());
         let positive = decode_thumb32(0xF89F, 0x1004);
-        assert_eq!(positive.id, Thumb32InstId::LDRB_lit);
+        assert_eq!(positive.id, Thumb32InstId::LdrbLit);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(thumb32_ldrb_lit(&mut ir, &positive));
@@ -318,7 +318,7 @@ mod tests {
         let location = thumb_location(0x1002);
         let mut block = Block::new(location.to_location());
         let negative = decode_thumb32(0xF91F, 0x2204);
-        assert_eq!(negative.id, Thumb32InstId::LDRSB_lit);
+        assert_eq!(negative.id, Thumb32InstId::LdrsbLit);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(thumb32_ldrsb_lit(&mut ir, &negative));
@@ -339,7 +339,7 @@ mod tests {
     fn immediate_writeback_occurs_after_destination_write() {
         let location = thumb_location(0x1000);
         let mut block = Block::new(location.to_location());
-        let inst = decoded(0xF811_2B04, Thumb32InstId::LDRB_imm_t3);
+        let inst = decoded(0xF811_2B04, Thumb32InstId::LdrbImmT3);
         {
             let mut ir = A32IREmitter::with_location(&mut block, location);
             assert!(thumb32_ldrb_imm8(&mut ir, &inst));
@@ -374,7 +374,7 @@ mod tests {
         ] {
             let location = thumb_location(0x1000);
             let mut block = Block::new(location.to_location());
-            let inst = decoded(raw, Thumb32InstId::LDRB_imm_t3);
+            let inst = decoded(raw, Thumb32InstId::LdrbImmT3);
             {
                 let mut ir = A32IREmitter::with_location(&mut block, location);
                 assert!(!thumb32_ldrb_imm8(&mut ir, &inst));
@@ -397,8 +397,8 @@ mod tests {
     fn register_and_preload_pc_checks_run_before_hook_or_load() {
         let location = thumb_location(0x1000);
         for (inst, preload) in [
-            (decoded(0xF811_200F, Thumb32InstId::LDRB_reg), false),
-            (decoded(0xF811_F00F, Thumb32InstId::PLD_reg), true),
+            (decoded(0xF811_200F, Thumb32InstId::LdrbReg), false),
+            (decoded(0xF811_F00F, Thumb32InstId::PldReg), true),
         ] {
             let mut block = Block::new(location.to_location());
             {

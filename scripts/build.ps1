@@ -12,6 +12,10 @@ built and managed by vcpkg. Cargo builds SDL3 statically from source.
 
 [CmdletBinding()]
 param(
+    [Parameter(Position = 0)]
+    [ValidateSet("build", "package")]
+    [string]$Action = "build",
+
     [switch]$Yes,
 
     [ValidateNotNullOrEmpty()]
@@ -28,6 +32,7 @@ $ProgressPreference = "SilentlyContinue"
 $RustMinimum = [version]"1.85.0"
 $RustToolchain = "stable-x86_64-pc-windows-msvc"
 $VcpkgTriplet = "x64-windows-ruzu"
+$BuildAction = $Action.ToLowerInvariant()
 # -Debug is the standard switch supplied by CmdletBinding.
 $BuildProfile = if ($PSBoundParameters.ContainsKey("Debug")) {
     "debug"
@@ -725,6 +730,7 @@ function Configure-NativeEnvironment {
         "set `"PKG_CONFIG_PATH=$pkgConfigPath`""
         "set `"OPENSSL_DIR=$installed`""
         "set `"GSETTINGS_SCHEMA_DIR=$gsettingsSchemaDirectory`""
+        "set `"RUZU_BUILD_ACTION=$BuildAction`""
         "set `"RUZU_BUILD_PROFILE=$BuildProfile`""
         "set `"PATH=$($pathEntries -join ';');%PATH%`""
     )

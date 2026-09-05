@@ -398,6 +398,7 @@ struct GameListView {
     on_activate: Rc<dyn Fn(String, StartGameType)>,
     /// GTK equivalent of Eden's `GameList::CreateShortcut` signal. The owner
     /// remains `GMainWindow::OnGameListCreateShortcut`.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     on_create_shortcut: Rc<dyn Fn(u64, String, crate::util::game::ShortcutTarget)>,
     on_refresh: Rc<dyn Fn()>,
     refresh_button: gtk::Button,

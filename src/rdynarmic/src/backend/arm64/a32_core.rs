@@ -65,8 +65,6 @@ mod tests {
         Exception as A32Exception, UserCallbacks as A32UserCallbacks,
     };
     use crate::interface::optimization_flags::OptimizationFlag;
-    use crate::ir::location::LocationDescriptor;
-    use std::collections::HashMap;
 
     struct TestCallbacks;
 

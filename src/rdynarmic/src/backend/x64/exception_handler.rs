@@ -512,7 +512,6 @@ mod windows_seh {
 
     // Register codes for UWOP_PUSH_NONVOL / UWOP_SAVE_XMM128
     const UWRC_RBX: u8 = 3;
-    const UWRC_RSP: u8 = 4; // unused but kept for clarity
     const UWRC_RBP: u8 = 5;
     const UWRC_RSI: u8 = 6;
     const UWRC_RDI: u8 = 7;
@@ -528,17 +527,23 @@ mod windows_seh {
     const EXCEPTION_CONTINUE_EXECUTION: i32 = 0;
     const EXCEPTION_CONTINUE_SEARCH: i32 = 1;
 
-    // Windows CONTEXT struct offsets (x64, from WinNT.h):
-    //   DWORD64 Rbx at +0x90 through R15 at +0xF0,
-    //   DWORD64 Rsp at +0x98, DWORD64 Rip at +0xF8.
+    // Windows CONTEXT struct offsets (x64, from WinNT.h).
+    #[cfg(test)]
     const CTX_RBX_OFF: usize = 0x90;
     const CTX_RSP_OFF: usize = 0x98;
+    #[cfg(test)]
     const CTX_RBP_OFF: usize = 0xA0;
+    #[cfg(test)]
     const CTX_RSI_OFF: usize = 0xA8;
+    #[cfg(test)]
     const CTX_RDI_OFF: usize = 0xB0;
+    #[cfg(test)]
     const CTX_R12_OFF: usize = 0xD8;
+    #[cfg(test)]
     const CTX_R13_OFF: usize = 0xE0;
+    #[cfg(test)]
     const CTX_R14_OFF: usize = 0xE8;
+    #[cfg(test)]
     const CTX_R15_OFF: usize = 0xF0;
     const CTX_RIP_OFF: usize = 0xF8;
 
@@ -692,8 +697,6 @@ mod windows_seh {
     /// - `stack_allocation_size`: exact byte count subtracted from RSP
     ///
     /// # Returns
-    /// The byte offset (from `code_buf_base`) of the `RUNTIME_FUNCTION` entry, so
-    /// the caller can later call `RtlDeleteFunctionTable` via `unregister_all`.
     pub fn setup_seh_in_code_buffer(
         code_buf_base: *mut u8,
         total_capacity: usize,
@@ -745,7 +748,7 @@ mod windows_seh {
         align_to(current_size, 16);
         let with_cb_rva = *current_size as u32;
 
-        let dispatch_addr = seh_fastmem_dispatch as usize as u64;
+        let dispatch_addr = seh_fastmem_dispatch as *const () as usize as u64;
         let mut stub: Vec<u8> = vec![
             0x48, 0x83, 0xEC, 0x28, // sub rsp, 0x28
             0x4C, 0x89, 0xC1, // mov rcx, r8
@@ -854,15 +857,6 @@ mod windows_seh {
             .position(|jit| jit.code_begin == code_begin as u64)
         {
             let jit = guard.remove(index);
-            if !jit.runtime_fn_ptr.is_null() {
-                unsafe { RtlDeleteFunctionTable(jit.runtime_fn_ptr) };
-            }
-        }
-    }
-
-    pub fn unregister_all() {
-        let mut guard = WIN_SEH.lock().unwrap();
-        for jit in guard.drain(..) {
             if !jit.runtime_fn_ptr.is_null() {
                 unsafe { RtlDeleteFunctionTable(jit.runtime_fn_ptr) };
             }

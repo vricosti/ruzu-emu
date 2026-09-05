@@ -845,7 +845,7 @@ pub fn emit_a32_get_fpscr(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstR
             RegExp::from(R15) + A32JitState::offset_of_guest_mxcsr() as i32,
         ))
         .unwrap();
-    let fn_ptr = get_fpscr_impl as usize;
+    let fn_ptr = get_fpscr_impl as *const () as usize;
     ra.asm.mov(RAX, fn_ptr as i64).unwrap();
     ra.asm.call_reg(RAX).unwrap();
 }
@@ -868,7 +868,7 @@ pub fn emit_a32_set_fpscr(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: Inst
 
     ra.host_call(None, &mut [Some(&mut args[0])]);
     ra.asm.mov(abi::ABI_PARAMS[1].to_reg64(), R15).unwrap();
-    let fn_ptr = set_fpscr_impl as usize;
+    let fn_ptr = set_fpscr_impl as *const () as usize;
     ra.asm.mov(RAX, fn_ptr as i64).unwrap();
     ra.asm.call_reg(RAX).unwrap();
     ra.asm

@@ -195,7 +195,7 @@ pub fn thumb32_sbfx(ir: &mut A32IREmitter<'_>, inst: &DecodedThumb32) -> bool {
     }
 
     let (lsbit, width) = inst.bfx_lsb_width();
-    if lsbit + width - 1 >= 32 {
+    if lsbit + width > 32 {
         return super::unpredictable_instruction(ir);
     }
 
@@ -262,7 +262,7 @@ pub fn thumb32_ubfx(ir: &mut A32IREmitter<'_>, inst: &DecodedThumb32) -> bool {
     }
 
     let (lsbit, width) = inst.bfx_lsb_width();
-    if lsbit + width - 1 >= 32 {
+    if lsbit + width > 32 {
         return super::unpredictable_instruction(ir);
     }
 
@@ -312,11 +312,11 @@ mod tests {
     use crate::ir::value::Value;
 
     const PATTERNS: &[(u32, u32, Thumb32InstId)] = &[
-        (0xfbff_8000, 0xf20f_0000, Thumb32InstId::ADR_t3),
-        (0xfbf0_8000, 0xf200_0000, Thumb32InstId::ADD_imm_2),
-        (0xfbf0_8000, 0xf240_0000, Thumb32InstId::MOVW_imm),
-        (0xfbff_8000, 0xf2af_0000, Thumb32InstId::ADR_t2),
-        (0xfbf0_8000, 0xf2a0_0000, Thumb32InstId::SUB_imm_2),
+        (0xfbff_8000, 0xf20f_0000, Thumb32InstId::AdrT3),
+        (0xfbf0_8000, 0xf200_0000, Thumb32InstId::AddImm2),
+        (0xfbf0_8000, 0xf240_0000, Thumb32InstId::MovwImm),
+        (0xfbff_8000, 0xf2af_0000, Thumb32InstId::AdrT2),
+        (0xfbf0_8000, 0xf2a0_0000, Thumb32InstId::SubImm2),
         (0xfbf0_8000, 0xf2c0_0000, Thumb32InstId::MOVT),
         (0xff70_f0f0, 0xf320_0010, Thumb32InstId::UDF),
         (0xfff0_f0f0, 0xf320_0000, Thumb32InstId::SSAT16),

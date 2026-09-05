@@ -83,52 +83,52 @@ fn is_vfp_instruction(id: ArmInstId) -> bool {
         id,
         VPUSH
             | VPOP
-            | VLDR_fp
-            | VSTR_fp
+            | VldrFp
+            | VstrFp
             | VSTM
             | VLDM
-            | VMLA_fp
-            | VMLS_fp
-            | VNMLS_fp
-            | VNMLA_fp
-            | VMUL_fp
-            | VNMUL_fp
-            | VADD_fp
-            | VSUB_fp
-            | VDIV_fp
-            | VFNMS_fp
-            | VFNMA_fp
-            | VFMA_fp
-            | VFMS_fp
-            | VSEL_fp
-            | VMAXNM_fp
-            | VMINNM_fp
-            | VMOV_fp_reg
-            | VMOV_fp_imm
-            | VABS_fp
-            | VNEG_fp
-            | VSQRT_fp
-            | VCMP_fp
-            | VCMP_zero_fp
-            | VCVT_f_to_f
-            | VCVT_from_int
-            | VCVT_to_u32
-            | VCVT_to_s32
-            | VMOV_u32_f64
-            | VMOV_f64_u32
-            | VMOV_u32_f32
-            | VMOV_f32_u32
-            | VMOV_2u32_2f32
-            | VMOV_2f32_2u32
-            | VMOV_2u32_f64
-            | VMOV_f64_2u32
-            | VMOV_from_i32
-            | VMOV_to_i32
+            | VmlaFp
+            | VmlsFp
+            | VnmlsFp
+            | VnmlaFp
+            | VmulFp
+            | VnmulFp
+            | VaddFp
+            | VsubFp
+            | VdivFp
+            | VfnmsFp
+            | VfnmaFp
+            | VfmaFp
+            | VfmsFp
+            | VselFp
+            | VmaxnmFp
+            | VminnmFp
+            | VmovFpReg
+            | VmovFpImm
+            | VabsFp
+            | VnegFp
+            | VsqrtFp
+            | VcmpFp
+            | VcmpZeroFp
+            | VcvtFToF
+            | VcvtFromInt
+            | VcvtToU32
+            | VcvtToS32
+            | VmovU32F64
+            | VmovF64U32
+            | VmovU32F32
+            | VmovF32U32
+            | Vmov2u32_2f32
+            | Vmov2f32_2u32
+            | Vmov2u32F64
+            | VmovF64_2u32
+            | VmovFromI32
+            | VmovToI32
             | VMSR
             | VMRS
-            | VFP_VDUP
-            | VFP_VRINT_rm
-            | VFP_VCVT_rm
+            | VfpVdup
+            | VfpVrintRm
+            | VfpVcvtRm
     )
 }
 
@@ -233,18 +233,17 @@ pub(super) fn translate_thumb(
         }
     }
 
-    if matches!(
+    if (matches!(
         cond_state,
         ConditionalState::Translating | ConditionalState::Trailing
-    ) || single_step
+    ) || single_step)
+        && should_continue
     {
-        if should_continue {
-            let next = current.to_location();
-            if single_step {
-                block.set_terminal(Terminal::LinkBlock { next });
-            } else {
-                block.set_terminal(Terminal::LinkBlockFast { next });
-            }
+        let next = current.to_location();
+        if single_step {
+            block.set_terminal(Terminal::LinkBlock { next });
+        } else {
+            block.set_terminal(Terminal::LinkBlockFast { next });
         }
     }
 

@@ -121,7 +121,7 @@ mod tests {
             let mut block = Block::new(location.to_location());
             let decoded = DecodedArm {
                 raw,
-                id: ArmInstId::PLD_imm,
+                id: ArmInstId::PldImm,
             };
             assert!(!arm_pld(
                 &mut A32IREmitter::with_location(&mut block, location),

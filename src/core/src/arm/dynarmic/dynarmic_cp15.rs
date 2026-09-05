@@ -5,7 +5,9 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
-use std::sync::atomic::{fence, AtomicPtr, Ordering};
+#[cfg(not(all(target_env = "msvc", target_arch = "x86_64")))]
+use std::sync::atomic::fence;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 
 use rdynarmic::interface::a32::coprocessor::{

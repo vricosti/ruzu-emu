@@ -35,6 +35,7 @@ pub const NUM_REGS: usize = 0xE00;
 pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Deferred guest-memory write used by the Rust engine integration.
+#[allow(dead_code)]
 pub(crate) struct PendingWrite {
     pub gpu_va: u64,
     pub data: Vec<u8>,
@@ -1078,6 +1079,12 @@ pub enum FillViaTriangleMode {
     FillBoundingBox,
 }
 
+impl Default for FillViaTriangleMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 impl FillViaTriangleMode {
     pub fn from_raw(value: u32) -> Self {
         match value {
@@ -1092,12 +1099,6 @@ impl FillViaTriangleMode {
                 Self::Disabled
             }
         }
-    }
-}
-
-impl Default for FillViaTriangleMode {
-    fn default() -> Self {
-        Self::Disabled
     }
 }
 
@@ -2406,6 +2407,7 @@ impl Maxwell3D {
         self.regs[method as usize]
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn register_array_ptr(&self) -> *const u32 {
         self.regs.as_ptr()
     }

@@ -33,7 +33,7 @@ use crate::input_poller::{InputFactory, OutputFactory};
 use parking_lot::Mutex;
 
 /// Port of `Polling` namespace from main.h
-pub mod Polling {
+pub mod polling {
     /// Type of input desired for mapping purposes.
     /// Port of Polling::InputType enum from main.h
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,7 +645,7 @@ impl InputSubsystem {
 
     /// Start polling from all backends for a desired input type.
     /// Port of InputSubsystem::BeginMapping
-    pub fn begin_mapping(&mut self, input_type: Polling::InputType) {
+    pub fn begin_mapping(&mut self, input_type: polling::InputType) {
         self.imp.begin_configuration();
         if let Some(ref mapping_factory) = self.imp.mapping_factory {
             mapping_factory.lock().begin_mapping(input_type);
@@ -752,7 +752,7 @@ mod tests {
         imp.begin_configuration();
         mapping_factory
             .lock()
-            .begin_mapping(Polling::InputType::Button);
+            .begin_mapping(polling::InputType::Button);
 
         imp.pump_events();
         assert_eq!(

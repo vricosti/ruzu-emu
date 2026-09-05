@@ -2049,7 +2049,10 @@ fn emit_preserved_a64_block_entry_trace_hook(ra: &mut RegAlloc) {
 
     ra.asm.mov(RDI, R15).unwrap();
     ra.asm
-        .mov(RAX, crate::jit::a64_block_entry_trace_hook as usize as i64)
+        .mov(
+            RAX,
+            crate::jit::a64_block_entry_trace_hook as *const () as usize as i64,
+        )
         .unwrap();
     ra.asm.call_reg(RAX).unwrap();
 
@@ -2104,7 +2107,10 @@ fn emit_preserved_a32_pc_trace_hook(ra: &mut RegAlloc, tag: u64) {
         .mov(abi::ABI_PARAMS[2].to_reg64(), tag as i64)
         .unwrap();
     ra.asm
-        .mov(RAX, crate::jit::a32_pc_trace_hook as usize as i64)
+        .mov(
+            RAX,
+            crate::jit::a32_pc_trace_hook as *const () as usize as i64,
+        )
         .unwrap();
     ra.asm.call_reg(RAX).unwrap();
 

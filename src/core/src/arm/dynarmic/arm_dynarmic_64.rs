@@ -42,49 +42,11 @@ const _: () = assert!(
 /// layouts. Core diagnostics must inspect the state owned by the active host
 /// backend rather than importing the x64 layout unconditionally.
 trait A64JitStateHostAccess {
-    fn offset_of_pc() -> usize;
-    fn get_pstate(&self) -> u32;
-    fn get_fpcr(&self) -> u32;
-    fn get_fpsr(&self) -> u32;
     fn vector_lane(&self, index: usize) -> u64;
     fn vector_lane_or_zero(&self, index: usize) -> u64;
 }
 
 impl A64JitStateHostAccess for A64JitState {
-    fn offset_of_pc() -> usize {
-        core::mem::offset_of!(Self, pc)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn get_pstate(&self) -> u32 {
-        self.cpsr_nzcv
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn get_pstate(&self) -> u32 {
-        A64JitState::get_pstate(self)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn get_fpcr(&self) -> u32 {
-        self.fpcr
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn get_fpcr(&self) -> u32 {
-        A64JitState::get_fpcr(self)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn get_fpsr(&self) -> u32 {
-        self.fpsr
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn get_fpsr(&self) -> u32 {
-        A64JitState::get_fpsr(self)
-    }
-
     #[cfg(target_arch = "aarch64")]
     fn vector_lane(&self, index: usize) -> u64 {
         self.vec.0[index]
@@ -2843,8 +2805,8 @@ fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64, tpidr: u64) -
 mod tests {
     use super::{
         parse_optimization_mask_env, parse_watch_ranges, thread_context_from_jit_state,
-        translate_halt_reason, upstream_optimization_config, A64JitState, A64JitStateHostAccess,
-        DynarmicCallbacks64, PAGE_TABLE_LOG2_STRIDE,
+        translate_halt_reason, upstream_optimization_config, A64JitState, DynarmicCallbacks64,
+        PAGE_TABLE_LOG2_STRIDE,
     };
     use crate::arm::arm_interface::{
         ArmInterfaceBase, DebugWatchpoint, DebugWatchpointType, HaltReason,

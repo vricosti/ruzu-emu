@@ -191,9 +191,7 @@ impl MetalStagingBufferPool {
         size: usize,
         binding_span: usize,
     ) -> Result<StagingBufferRef, MetalStagingBufferError> {
-        if size <= MAX_STREAM_BUFFER_SIZE / NUM_SYNCS
-            && binding_span <= MAX_STREAM_BUFFER_SIZE
-        {
+        if size <= MAX_STREAM_BUFFER_SIZE / NUM_SYNCS && binding_span <= MAX_STREAM_BUFFER_SIZE {
             return self.get_stream_buffer_with_binding_span(
                 scheduler,
                 size,

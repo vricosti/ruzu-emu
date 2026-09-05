@@ -33,7 +33,7 @@ pub struct PrivateSettings {
     pub platform_region: i32,
 
     /// Reserved
-    pub _reserved_0xD4: [u8; 0x4],
+    pub _reserved_0x_d4: [u8; 0x4],
 }
 
 // offsetof checks (matching upstream static_asserts)

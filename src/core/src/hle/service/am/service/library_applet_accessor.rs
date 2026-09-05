@@ -203,7 +203,7 @@ impl ILibraryAppletAccessor {
             unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletAccessor) };
         log::debug!("ILibraryAppletAccessor::RequestExit called");
         {
-            let mut applet = service.applet.lock().unwrap();
+            let applet = service.applet.lock().unwrap();
             applet.lifecycle_manager.request_exit();
         }
         service.frontend_request_exit();

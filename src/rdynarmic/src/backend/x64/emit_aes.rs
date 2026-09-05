@@ -13,7 +13,12 @@ pub fn emit_aes_decrypt_single_round(
     inst: &Inst,
 ) {
     if !ctx.has_host_feature(HostFeature::AES) {
-        emit_one_arg_fallback(ra, inst_ref, inst, aes::decrypt_single_round as usize);
+        emit_one_arg_fallback(
+            ra,
+            inst_ref,
+            inst,
+            aes::decrypt_single_round as *const () as usize,
+        );
         return;
     }
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -32,7 +37,12 @@ pub fn emit_aes_encrypt_single_round(
     inst: &Inst,
 ) {
     if !ctx.has_host_feature(HostFeature::AES) {
-        emit_one_arg_fallback(ra, inst_ref, inst, aes::encrypt_single_round as usize);
+        emit_one_arg_fallback(
+            ra,
+            inst_ref,
+            inst,
+            aes::encrypt_single_round as *const () as usize,
+        );
         return;
     }
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -51,7 +61,12 @@ pub fn emit_aes_inverse_mix_columns(
     inst: &Inst,
 ) {
     if !ctx.has_host_feature(HostFeature::AES) {
-        emit_one_arg_fallback(ra, inst_ref, inst, aes::inverse_mix_columns as usize);
+        emit_one_arg_fallback(
+            ra,
+            inst_ref,
+            inst,
+            aes::inverse_mix_columns as *const () as usize,
+        );
         return;
     }
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -62,7 +77,7 @@ pub fn emit_aes_inverse_mix_columns(
 
 pub fn emit_aes_mix_columns(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     if !ctx.has_host_feature(HostFeature::AES) {
-        emit_one_arg_fallback(ra, inst_ref, inst, aes::mix_columns as usize);
+        emit_one_arg_fallback(ra, inst_ref, inst, aes::mix_columns as *const () as usize);
         return;
     }
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());

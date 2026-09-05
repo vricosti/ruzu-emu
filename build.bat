@@ -32,6 +32,8 @@ if not "%RUZU_SETUP_EXIT%"=="0" exit /b %RUZU_SETUP_EXIT%
 cd /d "%~dp0"
 set "RUZU_SETUP_EXIT="
 
+if /i "%RUZU_BUILD_ACTION%"=="package" goto build_package
+
 echo.
 set "RUZU_PLATFORM=x86_64-pc-windows-msvc"
 if /i "%RUZU_BUILD_PROFILE%"=="debug" (
@@ -91,8 +93,26 @@ echo.
 echo Ruzu was built successfully:
 echo   %RUZU_BINARY%
 set "RUZU_BUILD_PROFILE="
+set "RUZU_BUILD_ACTION="
 set "RUZU_BINARY="
 set "RUZU_CARGO_BINARY="
 set "RUZU_OUTPUT_DIR="
 set "RUZU_PLATFORM="
 set "RUZU_RUNTIME_BIN="
+exit /b 0
+
+:build_package
+if /i "%RUZU_BUILD_PROFILE%"=="debug" (
+    echo.
+    echo The NSIS package is only available for Release builds.
+    echo Run build.bat package without -Debug.
+    exit /b 1
+)
+
+echo.
+echo Building the self-contained Windows package and NSIS installer...
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release
+set "RUZU_PACKAGE_EXIT=%ERRORLEVEL%"
+set "RUZU_BUILD_ACTION="
+set "RUZU_BUILD_PROFILE="
+exit /b %RUZU_PACKAGE_EXIT%

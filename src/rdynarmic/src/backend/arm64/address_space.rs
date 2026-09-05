@@ -349,6 +349,7 @@ impl AddressSpace {
         &self.code
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_emitted_block(
         &mut self,
         location: LocationDescriptor,

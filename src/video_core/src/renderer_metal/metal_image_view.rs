@@ -161,12 +161,12 @@ impl MetalImageView {
             };
             unsafe {
                 source.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
-                        render_format,
-                        sampled_render_target.textureType(),
-                        levels,
-                        slices,
-                        identity_swizzle(),
-                    )
+                    render_format,
+                    sampled_render_target.textureType(),
+                    levels,
+                    slices,
+                    identity_swizzle(),
+                )
             }
             .ok_or(MetalImageViewError::CreationFailed {
                 texture_type: TextureType::Color2D,

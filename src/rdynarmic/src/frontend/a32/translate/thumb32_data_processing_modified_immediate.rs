@@ -343,22 +343,22 @@ mod tests {
     use crate::ir::opcode::Opcode;
 
     const PATTERNS: &[(u32, u32, Thumb32InstId)] = &[
-        (0xfbf0_8f00, 0xf010_0f00, Thumb32InstId::TST_imm),
-        (0xfbe0_8000, 0xf000_0000, Thumb32InstId::AND_imm),
-        (0xfbe0_8000, 0xf020_0000, Thumb32InstId::BIC_imm),
-        (0xfbef_8000, 0xf04f_0000, Thumb32InstId::MOV_imm),
-        (0xfbe0_8000, 0xf040_0000, Thumb32InstId::ORR_imm),
-        (0xfbef_8000, 0xf06f_0000, Thumb32InstId::MVN_imm),
-        (0xfbe0_8000, 0xf060_0000, Thumb32InstId::ORN_imm),
-        (0xfbf0_8f00, 0xf090_0f00, Thumb32InstId::TEQ_imm),
-        (0xfbe0_8000, 0xf080_0000, Thumb32InstId::EOR_imm),
-        (0xfbf0_8f00, 0xf110_0f00, Thumb32InstId::CMN_imm),
-        (0xfbe0_8000, 0xf100_0000, Thumb32InstId::ADD_imm_1),
-        (0xfbe0_8000, 0xf140_0000, Thumb32InstId::ADC_imm),
-        (0xfbe0_8000, 0xf160_0000, Thumb32InstId::SBC_imm),
-        (0xfbf0_8f00, 0xf1b0_0f00, Thumb32InstId::CMP_imm),
-        (0xfbe0_8000, 0xf1a0_0000, Thumb32InstId::SUB_imm_1),
-        (0xfbe0_8000, 0xf1c0_0000, Thumb32InstId::RSB_imm),
+        (0xfbf0_8f00, 0xf010_0f00, Thumb32InstId::TstImm),
+        (0xfbe0_8000, 0xf000_0000, Thumb32InstId::AndImm),
+        (0xfbe0_8000, 0xf020_0000, Thumb32InstId::BicImm),
+        (0xfbef_8000, 0xf04f_0000, Thumb32InstId::MovImm),
+        (0xfbe0_8000, 0xf040_0000, Thumb32InstId::OrrImm),
+        (0xfbef_8000, 0xf06f_0000, Thumb32InstId::MvnImm),
+        (0xfbe0_8000, 0xf060_0000, Thumb32InstId::OrnImm),
+        (0xfbf0_8f00, 0xf090_0f00, Thumb32InstId::TeqImm),
+        (0xfbe0_8000, 0xf080_0000, Thumb32InstId::EorImm),
+        (0xfbf0_8f00, 0xf110_0f00, Thumb32InstId::CmnImm),
+        (0xfbe0_8000, 0xf100_0000, Thumb32InstId::AddImm1),
+        (0xfbe0_8000, 0xf140_0000, Thumb32InstId::AdcImm),
+        (0xfbe0_8000, 0xf160_0000, Thumb32InstId::SbcImm),
+        (0xfbf0_8f00, 0xf1b0_0f00, Thumb32InstId::CmpImm),
+        (0xfbe0_8000, 0xf1a0_0000, Thumb32InstId::SubImm1),
+        (0xfbe0_8000, 0xf1c0_0000, Thumb32InstId::RsbImm),
     ];
 
     fn location() -> A32LocationDescriptor {

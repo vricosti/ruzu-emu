@@ -2926,7 +2926,7 @@ impl GMainWindow {
 
     fn on_capture_screenshot(self: &Rc<Self>) {
         use common::settings_enums::AspectRatio;
-        use ruzu_core::frontend::framebuffer_layout::{ScreenDocked, ScreenUndocked};
+        use ruzu_core::frontend::framebuffer_layout::{screen_docked, screen_undocked};
 
         let Some(program_id) = self
             .session
@@ -2940,9 +2940,9 @@ impl GMainWindow {
         let mut height = crate::uisettings::with(|ui| *ui.screenshot_height.get_value());
         if height == 0 {
             height = if common::settings::is_docked_mode(&values) {
-                ScreenDocked::HEIGHT
+                screen_docked::HEIGHT
             } else {
-                ScreenUndocked::HEIGHT
+                screen_undocked::HEIGHT
             };
             height = (height as f32 * values.resolution_info.up_factor) as u32;
         }
@@ -5342,6 +5342,7 @@ fn install_menu_css() {
 /// permanently. Applying a Pango underline to the label's existing mnemonic
 /// key changes presentation only; GTK remains the owner of `Alt+key`
 /// activation and translated mnemonic selection.
+#[cfg(not(target_os = "macos"))]
 fn force_menu_mnemonic_underlines(root: &gtk::Widget) {
     if let Some(label) = root.downcast_ref::<gtk::Label>() {
         if let Some(mnemonic) = label.mnemonic_keyval().to_unicode() {

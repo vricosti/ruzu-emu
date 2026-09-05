@@ -4,7 +4,7 @@
     unnecessary_transmutes
 )]
 
-use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, JmpType, Reg, RegExp, R15, RSP, XMM0};
+use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, JmpType, RegExp, R15, RSP, XMM0};
 
 use crate::backend::x64::abi;
 use crate::backend::x64::constants::{cmp, convert_rounding_mode_to_x64_immediate};
@@ -237,7 +237,13 @@ pub fn emit_fp_vector_muladd16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_four_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_muladd16 as usize);
+    emit_four_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_muladd16 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_muladd32(
     ctx: &EmitContext,
@@ -245,7 +251,14 @@ pub fn emit_fp_vector_muladd32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_muladd(ctx, ra, inst_ref, inst, 32, fallback_fp_muladd32 as usize);
+    emit_fp_vector_muladd(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        32,
+        fallback_fp_muladd32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_muladd64(
     ctx: &EmitContext,
@@ -253,7 +266,14 @@ pub fn emit_fp_vector_muladd64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_muladd(ctx, ra, inst_ref, inst, 64, fallback_fp_muladd64 as usize);
+    emit_fp_vector_muladd(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        64,
+        fallback_fp_muladd64 as *const () as usize,
+    );
 }
 
 fn emit_fp_vector_muladd(
@@ -370,10 +390,10 @@ fn emit_fp_vector_muladd(
         let fpcr_value = fpcr.value();
         let fpsr_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         let correction_function = match (fsize, inaccurate_nan) {
-            (32, false) => fallback_fp_muladd_correction32 as usize,
-            (32, true) => fallback_fp_muladd_correction32_inaccurate_nan as usize,
-            (64, false) => fallback_fp_muladd_correction64 as usize,
-            (64, true) => fallback_fp_muladd_correction64_inaccurate_nan as usize,
+            (32, false) => fallback_fp_muladd_correction32 as *const () as usize,
+            (32, true) => fallback_fp_muladd_correction32_inaccurate_nan as *const () as usize,
+            (64, false) => fallback_fp_muladd_correction64 as *const () as usize,
+            (64, true) => fallback_fp_muladd_correction64_inaccurate_nan as *const () as usize,
             _ => unreachable!(),
         };
         ctx.deferred_emits
@@ -583,7 +603,13 @@ pub fn emit_fp_vector_recip_estimate16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_recip_est16 as usize);
+    emit_two_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_recip_est16 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_recip_estimate32(
     ctx: &EmitContext,
@@ -591,7 +617,13 @@ pub fn emit_fp_vector_recip_estimate32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_recip_est32 as usize);
+    emit_two_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_recip_est32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_recip_estimate64(
     ctx: &EmitContext,
@@ -599,7 +631,13 @@ pub fn emit_fp_vector_recip_estimate64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_recip_est64 as usize);
+    emit_two_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_recip_est64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -791,7 +829,7 @@ pub fn emit_fp_vector_recip_step_fused16(
         inst_ref,
         inst,
         16,
-        fallback_fp_recip_step16 as usize,
+        fallback_fp_recip_step16 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_recip_step_fused32(
@@ -806,7 +844,7 @@ pub fn emit_fp_vector_recip_step_fused32(
         inst_ref,
         inst,
         32,
-        fallback_fp_recip_step32 as usize,
+        fallback_fp_recip_step32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_recip_step_fused64(
@@ -821,7 +859,7 @@ pub fn emit_fp_vector_recip_step_fused64(
         inst_ref,
         inst,
         64,
-        fallback_fp_recip_step64 as usize,
+        fallback_fp_recip_step64 as *const () as usize,
     );
 }
 
@@ -927,7 +965,13 @@ pub fn emit_fp_vector_rsqrt_estimate16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_rsqrt_est16 as usize);
+    emit_two_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_rsqrt_est16 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_rsqrt_estimate32(
     ctx: &EmitContext,
@@ -935,7 +979,13 @@ pub fn emit_fp_vector_rsqrt_estimate32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_rsqrt_est32 as usize);
+    emit_two_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_rsqrt_est32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_rsqrt_estimate64(
     ctx: &EmitContext,
@@ -943,7 +993,13 @@ pub fn emit_fp_vector_rsqrt_estimate64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_rsqrt_est64 as usize);
+    emit_two_op_fallback(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_rsqrt_est64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,7 +1215,7 @@ pub fn emit_fp_vector_rsqrt_step_fused16(
         inst_ref,
         inst,
         16,
-        fallback_fp_rsqrt_step16 as usize,
+        fallback_fp_rsqrt_step16 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_rsqrt_step_fused32(
@@ -1174,7 +1230,7 @@ pub fn emit_fp_vector_rsqrt_step_fused32(
         inst_ref,
         inst,
         32,
-        fallback_fp_rsqrt_step32 as usize,
+        fallback_fp_rsqrt_step32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_rsqrt_step_fused64(
@@ -1189,7 +1245,7 @@ pub fn emit_fp_vector_rsqrt_step_fused64(
         inst_ref,
         inst,
         64,
-        fallback_fp_rsqrt_step64 as usize,
+        fallback_fp_rsqrt_step64 as *const () as usize,
     );
 }
 
@@ -1267,7 +1323,7 @@ extern "C" fn fallback_fp_round_int64<const ROUNDING: u8, const EXACT: bool>(
 
 macro_rules! round_fallback {
     ($function:ident, $rounding:expr, $exact:expr) => {
-        $function::<$rounding, $exact> as usize
+        $function::<$rounding, $exact> as *const () as usize
     };
 }
 
@@ -1426,7 +1482,12 @@ pub fn emit_fp_vector_from_signed_fixed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_with_imm(ra, inst_ref, inst, fallback_fp_from_signed_fixed32 as usize);
+    emit_one_arg_fallback_with_imm(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_from_signed_fixed32 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_from_signed_fixed64(
     _ctx: &EmitContext,
@@ -1434,7 +1495,12 @@ pub fn emit_fp_vector_from_signed_fixed64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_with_imm(ra, inst_ref, inst, fallback_fp_from_signed_fixed64 as usize);
+    emit_one_arg_fallback_with_imm(
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_from_signed_fixed64 as *const () as usize,
+    );
 }
 pub fn emit_fp_vector_from_unsigned_fixed32(
     _ctx: &EmitContext,
@@ -1446,7 +1512,7 @@ pub fn emit_fp_vector_from_unsigned_fixed32(
         ra,
         inst_ref,
         inst,
-        fallback_fp_from_unsigned_fixed32 as usize,
+        fallback_fp_from_unsigned_fixed32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_from_unsigned_fixed64(
@@ -1459,7 +1525,7 @@ pub fn emit_fp_vector_from_unsigned_fixed64(
         ra,
         inst_ref,
         inst,
-        fallback_fp_from_unsigned_fixed64 as usize,
+        fallback_fp_from_unsigned_fixed64 as *const () as usize,
     );
 }
 
@@ -1706,7 +1772,7 @@ pub fn emit_fp_vector_to_signed_fixed16(
         ra,
         inst_ref,
         inst,
-        fallback_fp_to_signed_fixed16 as usize,
+        fallback_fp_to_signed_fixed16 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_to_signed_fixed32(
@@ -1723,7 +1789,7 @@ pub fn emit_fp_vector_to_signed_fixed32(
         ra,
         inst_ref,
         inst,
-        fallback_fp_to_signed_fixed32 as usize,
+        fallback_fp_to_signed_fixed32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_to_signed_fixed64(
@@ -1740,7 +1806,7 @@ pub fn emit_fp_vector_to_signed_fixed64(
         ra,
         inst_ref,
         inst,
-        fallback_fp_to_signed_fixed64 as usize,
+        fallback_fp_to_signed_fixed64 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_to_unsigned_fixed16(
@@ -1757,7 +1823,7 @@ pub fn emit_fp_vector_to_unsigned_fixed16(
         ra,
         inst_ref,
         inst,
-        fallback_fp_to_unsigned_fixed16 as usize,
+        fallback_fp_to_unsigned_fixed16 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_to_unsigned_fixed32(
@@ -1774,7 +1840,7 @@ pub fn emit_fp_vector_to_unsigned_fixed32(
         ra,
         inst_ref,
         inst,
-        fallback_fp_to_unsigned_fixed32 as usize,
+        fallback_fp_to_unsigned_fixed32 as *const () as usize,
     );
 }
 pub fn emit_fp_vector_to_unsigned_fixed64(
@@ -1791,7 +1857,7 @@ pub fn emit_fp_vector_to_unsigned_fixed64(
         ra,
         inst_ref,
         inst,
-        fallback_fp_to_unsigned_fixed64 as usize,
+        fallback_fp_to_unsigned_fixed64 as *const () as usize,
     );
 }
 
@@ -1877,16 +1943,16 @@ define_fp_vector_half_convert_fallback!(
 
 fn half_conversion_fallback(rounding: u8, to_half: bool) -> usize {
     match (rounding, to_half) {
-        (0, false) => fallback_fp_from_half32_nearest as usize,
-        (1, false) => fallback_fp_from_half32_plus as usize,
-        (2, false) => fallback_fp_from_half32_minus as usize,
-        (3, false) => fallback_fp_from_half32_zero as usize,
-        (4, false) => fallback_fp_from_half32_away as usize,
-        (0, true) => fallback_fp_to_half32_nearest as usize,
-        (1, true) => fallback_fp_to_half32_plus as usize,
-        (2, true) => fallback_fp_to_half32_minus as usize,
-        (3, true) => fallback_fp_to_half32_zero as usize,
-        (4, true) => fallback_fp_to_half32_away as usize,
+        (0, false) => fallback_fp_from_half32_nearest as *const () as usize,
+        (1, false) => fallback_fp_from_half32_plus as *const () as usize,
+        (2, false) => fallback_fp_from_half32_minus as *const () as usize,
+        (3, false) => fallback_fp_from_half32_zero as *const () as usize,
+        (4, false) => fallback_fp_from_half32_away as *const () as usize,
+        (0, true) => fallback_fp_to_half32_nearest as *const () as usize,
+        (1, true) => fallback_fp_to_half32_plus as *const () as usize,
+        (2, true) => fallback_fp_to_half32_minus as *const () as usize,
+        (3, true) => fallback_fp_to_half32_zero as *const () as usize,
+        (4, true) => fallback_fp_to_half32_away as *const () as usize,
         _ => unreachable!("invalid FP half conversion rounding mode {rounding}"),
     }
 }

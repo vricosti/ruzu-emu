@@ -289,7 +289,7 @@ pub fn emit_vector_polynomial_multiply8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_poly_mul8 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_poly_mul8 as *const () as usize);
 }
 pub fn emit_vector_polynomial_multiply_long8(
     _ctx: &EmitContext,
@@ -297,7 +297,12 @@ pub fn emit_vector_polynomial_multiply_long8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_poly_mul_long8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_poly_mul_long8 as *const () as usize,
+    );
 }
 pub fn emit_vector_polynomial_multiply_long64(
     _ctx: &EmitContext,
@@ -305,7 +310,12 @@ pub fn emit_vector_polynomial_multiply_long64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_poly_mul_long64 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_poly_mul_long64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +724,12 @@ pub fn emit_vector_paired_max_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_s8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_signed16(
     _ctx: &EmitContext,
@@ -722,7 +737,12 @@ pub fn emit_vector_paired_max_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_s16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_signed32(
     _ctx: &EmitContext,
@@ -730,7 +750,12 @@ pub fn emit_vector_paired_max_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_s32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_unsigned8(
     _ctx: &EmitContext,
@@ -739,7 +764,12 @@ pub fn emit_vector_paired_max_unsigned8(
     inst: &Inst,
 ) {
     if std::env::var_os("RUZU_FORCE_PAIRED_MAX_U8_FALLBACK").is_some() {
-        emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_u8 as usize);
+        emit_two_arg_fallback(
+            ra,
+            inst_ref,
+            inst,
+            fallback_paired_max_u8 as *const () as usize,
+        );
         return;
     }
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -767,7 +797,12 @@ pub fn emit_vector_paired_max_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_u16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_unsigned32(
     _ctx: &EmitContext,
@@ -775,7 +810,12 @@ pub fn emit_vector_paired_max_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_u32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_u32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_signed_lower8(
     _ctx: &EmitContext,
@@ -783,7 +823,12 @@ pub fn emit_vector_paired_max_signed_lower8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_lower_s8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_lower_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_signed_lower16(
     _ctx: &EmitContext,
@@ -791,7 +836,12 @@ pub fn emit_vector_paired_max_signed_lower16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_lower_s16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_lower_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_signed_lower32(
     _ctx: &EmitContext,
@@ -799,7 +849,12 @@ pub fn emit_vector_paired_max_signed_lower32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_lower_s32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_lower_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_unsigned_lower8(
     _ctx: &EmitContext,
@@ -807,7 +862,12 @@ pub fn emit_vector_paired_max_unsigned_lower8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_lower_u8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_lower_u8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_unsigned_lower16(
     _ctx: &EmitContext,
@@ -815,7 +875,12 @@ pub fn emit_vector_paired_max_unsigned_lower16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_lower_u16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_lower_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_max_unsigned_lower32(
     _ctx: &EmitContext,
@@ -823,7 +888,12 @@ pub fn emit_vector_paired_max_unsigned_lower32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_max_lower_u32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_max_lower_u32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_signed8(
     _ctx: &EmitContext,
@@ -831,7 +901,12 @@ pub fn emit_vector_paired_min_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_s8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_signed16(
     _ctx: &EmitContext,
@@ -839,7 +914,12 @@ pub fn emit_vector_paired_min_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_s16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_signed32(
     _ctx: &EmitContext,
@@ -847,7 +927,12 @@ pub fn emit_vector_paired_min_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_s32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_unsigned8(
     _ctx: &EmitContext,
@@ -855,7 +940,12 @@ pub fn emit_vector_paired_min_unsigned8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_u8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_u8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_unsigned16(
     _ctx: &EmitContext,
@@ -863,7 +953,12 @@ pub fn emit_vector_paired_min_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_u16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_unsigned32(
     _ctx: &EmitContext,
@@ -871,7 +966,12 @@ pub fn emit_vector_paired_min_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_u32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_u32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_signed_lower8(
     _ctx: &EmitContext,
@@ -879,7 +979,12 @@ pub fn emit_vector_paired_min_signed_lower8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_lower_s8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_lower_s8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_signed_lower16(
     _ctx: &EmitContext,
@@ -887,7 +992,12 @@ pub fn emit_vector_paired_min_signed_lower16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_lower_s16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_lower_s16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_signed_lower32(
     _ctx: &EmitContext,
@@ -895,7 +1005,12 @@ pub fn emit_vector_paired_min_signed_lower32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_lower_s32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_lower_s32 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_unsigned_lower8(
     _ctx: &EmitContext,
@@ -903,7 +1018,12 @@ pub fn emit_vector_paired_min_unsigned_lower8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_lower_u8 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_lower_u8 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_unsigned_lower16(
     _ctx: &EmitContext,
@@ -911,7 +1031,12 @@ pub fn emit_vector_paired_min_unsigned_lower16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_lower_u16 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_lower_u16 as *const () as usize,
+    );
 }
 pub fn emit_vector_paired_min_unsigned_lower32(
     _ctx: &EmitContext,
@@ -919,7 +1044,12 @@ pub fn emit_vector_paired_min_unsigned_lower32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_min_lower_u32 as usize);
+    emit_two_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_paired_min_lower_u32 as *const () as usize,
+    );
 }
 
 #[cfg(test)]

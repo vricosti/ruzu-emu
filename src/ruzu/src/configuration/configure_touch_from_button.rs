@@ -344,7 +344,7 @@ fn request_binding(
 
     input_subsystem
         .borrow_mut()
-        .begin_mapping(input_common::Polling::InputType::Button);
+        .begin_mapping(input_common::polling::InputType::Button);
     let finished = Rc::new(Cell::new(false));
     let callback = Rc::new(RefCell::new(Some(on_accept)));
     let deadline = Instant::now() + Duration::from_secs(5);

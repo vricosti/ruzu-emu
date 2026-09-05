@@ -215,6 +215,7 @@ impl A32Interface {
             .get_or_emit(location_descriptor)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn current_address_space(&self) -> &A32AddressSpace {
         &self.current_address_space
     }

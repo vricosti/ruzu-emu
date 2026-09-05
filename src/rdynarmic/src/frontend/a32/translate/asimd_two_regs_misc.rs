@@ -47,7 +47,7 @@ mod tests {
         let mut block = Block::new(loc.to_location());
         let decoded = DecodedArm {
             raw: 0xF3FA_2220,
-            id: ArmInstId::ASIMD_VMOVN,
+            id: ArmInstId::AsimdVmovn,
         };
         let ok = {
             let mut ir = A32IREmitter::with_location(&mut block, loc);

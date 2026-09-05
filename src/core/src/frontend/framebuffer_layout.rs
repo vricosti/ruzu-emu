@@ -7,7 +7,7 @@
 /// Minimum window size constants.
 ///
 /// Corresponds to upstream `Layout::MinimumSize`.
-pub mod MinimumSize {
+pub mod minimum_size {
     pub const WIDTH: u32 = 640;
     pub const HEIGHT: u32 = 360;
 }
@@ -15,7 +15,7 @@ pub mod MinimumSize {
 /// Undocked screen resolution constants.
 ///
 /// Corresponds to upstream `Layout::ScreenUndocked`.
-pub mod ScreenUndocked {
+pub mod screen_undocked {
     pub const WIDTH: u32 = 1280;
     pub const HEIGHT: u32 = 720;
 }
@@ -23,7 +23,7 @@ pub mod ScreenUndocked {
 /// Docked screen resolution constants.
 ///
 /// Corresponds to upstream `Layout::ScreenDocked`.
-pub mod ScreenDocked {
+pub mod screen_docked {
     pub const WIDTH: u32 = 1920;
     pub const HEIGHT: u32 = 1080;
 }
@@ -110,8 +110,8 @@ pub struct FramebufferLayout {
 impl Default for FramebufferLayout {
     fn default() -> Self {
         Self {
-            width: ScreenUndocked::WIDTH,
-            height: ScreenUndocked::HEIGHT,
+            width: screen_undocked::WIDTH,
+            height: screen_undocked::HEIGHT,
             screen: Rectangle::default(),
             is_srgb: false,
         }
@@ -170,14 +170,14 @@ pub fn default_frame_layout(width: u32, height: u32) -> FramebufferLayout {
 pub fn frame_layout_from_resolution_scale(res_scale: f32) -> FramebufferLayout {
     let is_docked = common::settings::is_docked_mode(&common::settings::values());
     let screen_width = if is_docked {
-        ScreenDocked::WIDTH
+        screen_docked::WIDTH
     } else {
-        ScreenUndocked::WIDTH
+        screen_undocked::WIDTH
     };
     let screen_height = if is_docked {
-        ScreenDocked::HEIGHT
+        screen_docked::HEIGHT
     } else {
-        ScreenUndocked::HEIGHT
+        screen_undocked::HEIGHT
     };
 
     let width = (screen_width as f32 * res_scale) as u32;
@@ -191,7 +191,7 @@ pub fn frame_layout_from_resolution_scale(res_scale: f32) -> FramebufferLayout {
 /// Corresponds to upstream `Layout::EmulationAspectRatio`.
 pub fn emulation_aspect_ratio(aspect: AspectRatio, window_aspect_ratio: f32) -> f32 {
     match aspect {
-        AspectRatio::Default => ScreenUndocked::HEIGHT as f32 / ScreenUndocked::WIDTH as f32,
+        AspectRatio::Default => screen_undocked::HEIGHT as f32 / screen_undocked::WIDTH as f32,
         AspectRatio::R4_3 => 3.0 / 4.0,
         AspectRatio::R21_9 => 9.0 / 21.0,
         AspectRatio::R16_10 => 10.0 / 16.0,

@@ -398,7 +398,7 @@ mod tests {
     fn dual_load_preserves_atomic_endian_and_writeback_order() {
         let loc = location(true, 0);
         let mut block = Block::new(loc.to_location());
-        let inst = decoded(0xE9F1_2304, Thumb32InstId::LDRD_imm_2);
+        let inst = decoded(0xE9F1_2304, Thumb32InstId::LdrdImm2);
         {
             let mut ir = A32IREmitter::with_location(&mut block, loc);
             assert!(thumb32_ldrd_imm_2(&mut ir, &inst));
@@ -435,10 +435,10 @@ mod tests {
         for (raw, id, translate) in [
             (
                 0xE87F_2304,
-                Thumb32InstId::LDRD_lit_1,
+                Thumb32InstId::LdrdLit1,
                 thumb32_ldrd_lit_1 as fn(&mut A32IREmitter<'_>, &DecodedThumb32) -> bool,
             ),
-            (0xE9E2_2304, Thumb32InstId::STRD_imm_2, thumb32_strd_imm_2),
+            (0xE9E2_2304, Thumb32InstId::StrdImm2, thumb32_strd_imm_2),
         ] {
             let loc = location(false, 0);
             let mut block = Block::new(loc.to_location());

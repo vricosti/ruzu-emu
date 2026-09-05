@@ -11,6 +11,10 @@ rust-version.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[lints.rust]
+# `objc` 0.2 expands this legacy feature probe in downstream crates.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [[bin]]
 name = "ruzu"
 path = "src/main.rs"

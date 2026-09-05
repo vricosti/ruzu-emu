@@ -166,6 +166,13 @@ if (-not $isWindowsPlatform) {
     throw "Ruzu's Windows package must be built on Windows with the MSVC toolchain."
 }
 
+$makeNsis = if (-not $StageOnly) {
+    Resolve-MakeNsis
+}
+else {
+    $null
+}
+
 $vcpkgRoot = Resolve-VcpkgRoot
 $vcpkgInstalled = Join-Path $vcpkgRoot "installed\$Triplet"
 if (-not $env:VCPKGRS_TRIPLET) {
@@ -273,7 +280,6 @@ if ($StageOnly) {
     return
 }
 
-$makeNsis = Resolve-MakeNsis
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 Push-Location $DistDirectory
 try {

@@ -1782,10 +1782,10 @@ mod tests {
 
     fn dummy_callbacks() -> EmitCallbacks {
         let mk_arg = || -> Box<dyn crate::backend::x64::callback::Callback> {
-            Box::new(ArgCallback::new(dummy_read as u64, 0))
+            Box::new(ArgCallback::new(dummy_read as *const () as u64, 0))
         };
         let mk_arg_w = || -> Box<dyn crate::backend::x64::callback::Callback> {
-            Box::new(ArgCallback::new(dummy_write as u64, 0))
+            Box::new(ArgCallback::new(dummy_write as *const () as u64, 0))
         };
         EmitCallbacks {
             memory_read_8: mk_arg(),
@@ -1822,14 +1822,20 @@ mod tests {
 
     fn dummy_raw_callbacks() -> RawExclusiveWriteCallbacks {
         let callback = || -> Box<dyn crate::backend::x64::callback::Callback> {
-            Box::new(ArgCallback::new(dummy_raw_write as usize as u64, 0))
+            Box::new(ArgCallback::new(
+                dummy_raw_write as *const () as usize as u64,
+                0,
+            ))
         };
         RawExclusiveWriteCallbacks {
             write_8: callback(),
             write_16: callback(),
             write_32: callback(),
             write_64: callback(),
-            write_128: Box::new(ArgCallback::new(dummy_raw_write_128 as usize as u64, 0)),
+            write_128: Box::new(ArgCallback::new(
+                dummy_raw_write_128 as *const () as usize as u64,
+                0,
+            )),
         }
     }
 

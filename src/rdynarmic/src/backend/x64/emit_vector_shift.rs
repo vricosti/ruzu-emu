@@ -324,7 +324,7 @@ pub fn emit_vector_logical_vshift8(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift8 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift8 as *const () as usize);
 }
 pub fn emit_vector_logical_vshift16(
     ctx: &EmitContext,
@@ -358,7 +358,7 @@ pub fn emit_vector_logical_vshift16(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift16 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift16 as *const () as usize);
 }
 // LogicalVShift32: AVX2 vpsllvd/vpsrlvd with sign-based split, fallback without AVX2
 pub fn emit_vector_logical_vshift32(
@@ -399,7 +399,7 @@ pub fn emit_vector_logical_vshift32(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift32 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift32 as *const () as usize);
 }
 // LogicalVShift64: AVX2 vpsllvq/vpsrlvq
 pub fn emit_vector_logical_vshift64(
@@ -434,7 +434,7 @@ pub fn emit_vector_logical_vshift64(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift64 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift64 as *const () as usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ pub fn emit_vector_arithmetic_vshift8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift8 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift8 as *const () as usize);
 }
 pub fn emit_vector_arithmetic_vshift16(
     ctx: &EmitContext,
@@ -519,7 +519,7 @@ pub fn emit_vector_arithmetic_vshift16(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift16 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift16 as *const () as usize);
 }
 // ArithmeticVShift32: AVX2 vpsllvd/vpsravd with sign split
 // Positive shift = left (logical), negative = right (arithmetic)
@@ -560,7 +560,7 @@ pub fn emit_vector_arithmetic_vshift32(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift32 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift32 as *const () as usize);
 }
 // ArithmeticVShift64: AVX512 vpsravq or fallback
 pub fn emit_vector_arithmetic_vshift64(
@@ -601,7 +601,7 @@ pub fn emit_vector_arithmetic_vshift64(
         ra.define_value(inst_ref, result);
         return;
     }
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift64 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift64 as *const () as usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +677,7 @@ pub fn emit_vector_rounding_shift_left_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s8 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s8 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_signed16(
     _ctx: &EmitContext,
@@ -685,7 +685,7 @@ pub fn emit_vector_rounding_shift_left_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s16 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s16 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_signed32(
     _ctx: &EmitContext,
@@ -693,7 +693,7 @@ pub fn emit_vector_rounding_shift_left_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s32 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s32 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_signed64(
     _ctx: &EmitContext,
@@ -701,7 +701,7 @@ pub fn emit_vector_rounding_shift_left_signed64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s64 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_s64 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_unsigned8(
     _ctx: &EmitContext,
@@ -709,7 +709,7 @@ pub fn emit_vector_rounding_shift_left_unsigned8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u8 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u8 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_unsigned16(
     _ctx: &EmitContext,
@@ -717,7 +717,7 @@ pub fn emit_vector_rounding_shift_left_unsigned16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u16 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u16 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_unsigned32(
     _ctx: &EmitContext,
@@ -725,7 +725,7 @@ pub fn emit_vector_rounding_shift_left_unsigned32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u32 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u32 as *const () as usize);
 }
 pub fn emit_vector_rounding_shift_left_unsigned64(
     _ctx: &EmitContext,
@@ -733,7 +733,7 @@ pub fn emit_vector_rounding_shift_left_unsigned64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u64 as usize);
+    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rsl_u64 as *const () as usize);
 }
 
 #[cfg(test)]

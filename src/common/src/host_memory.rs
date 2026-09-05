@@ -45,6 +45,9 @@ struct WindowsMapping {
 /// `#ifdef _WIN32`.
 #[cfg(target_os = "windows")]
 struct HostMemoryImpl {
+    // Kept for ownership parity with Eden's Windows `HostMemory::Impl`; the
+    // constructor consumes the value while reserving the backing section.
+    #[allow(dead_code)]
     backing_size: usize,
     virtual_size: usize,
     backing_base: *mut u8,
@@ -765,6 +768,7 @@ impl HostMemoryImpl {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn enable_direct_mapped_address(&mut self) {
         self.virtual_base = ptr::null_mut();
     }

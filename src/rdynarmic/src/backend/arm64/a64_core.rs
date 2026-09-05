@@ -64,7 +64,7 @@ mod tests {
         Exception as A64Exception, UserCallbacks as A64UserCallbacks, Vector as A64Vector,
     };
     use crate::interface::optimization_flags::OptimizationFlag;
-    use crate::ir::location::LocationDescriptor;
+
     use std::collections::HashMap;
 
     struct TestCallbacks {

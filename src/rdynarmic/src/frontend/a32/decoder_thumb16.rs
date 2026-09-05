@@ -11,61 +11,61 @@ pub struct DecodedThumb16 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Thumb16InstId {
     // Shift, Add, Subtract
-    LSL_imm,
-    LSR_imm,
-    ASR_imm,
-    ADD_reg_t1,
-    SUB_reg,
-    ADD_imm_t1,
-    SUB_imm_t1,
-    MOV_imm,
-    CMP_imm,
-    ADD_imm_t2,
-    SUB_imm_t2,
+    LslImm,
+    LsrImm,
+    AsrImm,
+    AddRegT1,
+    SubReg,
+    AddImmT1,
+    SubImmT1,
+    MovImm,
+    CmpImm,
+    AddImmT2,
+    SubImmT2,
     // Data processing
-    AND_reg,
-    EOR_reg,
-    LSL_reg,
-    LSR_reg,
-    ASR_reg,
-    ADC_reg,
-    SBC_reg,
-    ROR_reg,
-    TST_reg,
-    RSB_imm,
-    CMP_reg_t1,
-    CMN_reg,
-    ORR_reg,
-    MUL_reg,
-    BIC_reg,
-    MVN_reg,
+    AndReg,
+    EorReg,
+    LslReg,
+    LsrReg,
+    AsrReg,
+    AdcReg,
+    SbcReg,
+    RorReg,
+    TstReg,
+    RsbImm,
+    CmpRegT1,
+    CmnReg,
+    OrrReg,
+    MulReg,
+    BicReg,
+    MvnReg,
     // Special data
-    ADD_reg_t2,
-    CMP_reg_t2,
-    MOV_reg,
+    AddRegT2,
+    CmpRegT2,
+    MovReg,
     // Load/Store
-    LDR_literal,
-    STR_reg,
-    STRH_reg,
-    STRB_reg,
-    LDRSB_reg,
-    LDR_reg,
-    LDRH_reg,
-    LDRB_reg,
-    LDRSH_reg,
-    STR_imm_t1,
-    LDR_imm_t1,
-    STRB_imm,
-    LDRB_imm,
-    STRH_imm,
-    LDRH_imm,
-    STR_imm_t2,
-    LDR_imm_t2,
+    LdrLiteral,
+    StrReg,
+    StrhReg,
+    StrbReg,
+    LdrsbReg,
+    LdrReg,
+    LdrhReg,
+    LdrbReg,
+    LdrshReg,
+    StrImmT1,
+    LdrImmT1,
+    StrbImm,
+    LdrbImm,
+    StrhImm,
+    LdrhImm,
+    StrImmT2,
+    LdrImmT2,
     // Address generation
     ADR,
-    ADD_sp_t1,
-    ADD_sp_t2,
-    SUB_sp,
+    AddSpT1,
+    AddSpT2,
+    SubSp,
     // Extensions
     SXTH,
     SXTB,
@@ -87,15 +87,15 @@ pub enum Thumb16InstId {
     IT,
     SETEND,
     CPS,
-    CBZ_CBNZ,
+    CbzCbnz,
     // Load/Store multiple
     STMIA,
     LDMIA,
     // Branch
     BX,
-    BLX_reg,
-    B_t1,
-    B_t2,
+    BlxReg,
+    BT1,
+    BT2,
     SVC,
     UDF,
     // Unknown
@@ -155,7 +155,7 @@ impl DecodedThumb16 {
     }
     /// Extract register list (bits [7:0]).
     pub fn register_list(&self) -> u16 {
-        (self.raw & 0xFF) as u16
+        self.raw & 0xFF
     }
     /// Extract condition (bits [11:8]) for conditional branches.
     pub fn cond(&self) -> u8 {
@@ -179,7 +179,7 @@ pub fn decode_thumb16(instr: u16) -> DecodedThumb16 {
         // 010001: Special data / branch exchange
         0b0100 if (opcode & 3) == 1 => decode_thumb16_special(instr),
         // 01001x: LDR literal
-        0b0100 if (opcode & 2) == 2 => Thumb16InstId::LDR_literal,
+        0b0100 if (opcode & 2) == 2 => Thumb16InstId::LdrLiteral,
         // 0101xx, 011xxx, 100xxx: Load/Store
         0b0101..=0b1001 => decode_thumb16_load_store(instr),
         // 1010xx: Generate PC/SP-relative address
@@ -187,7 +187,7 @@ pub fn decode_thumb16(instr: u16) -> DecodedThumb16 {
             if opcode & 2 == 0 {
                 Thumb16InstId::ADR
             } else {
-                Thumb16InstId::ADD_sp_t1
+                Thumb16InstId::AddSpT1
             }
         }
         // 1011xx: Miscellaneous
@@ -203,7 +203,7 @@ pub fn decode_thumb16(instr: u16) -> DecodedThumb16 {
         // 1101xx: Conditional branch / SVC
         0b1101 => decode_thumb16_cond_branch(instr),
         // 11100x: Unconditional branch
-        0b1110 if opcode & 2 == 0 => Thumb16InstId::B_t2,
+        0b1110 if opcode & 2 == 0 => Thumb16InstId::BT2,
         _ => Thumb16InstId::Unknown,
     };
 
@@ -213,23 +213,23 @@ pub fn decode_thumb16(instr: u16) -> DecodedThumb16 {
 fn decode_thumb16_shift_add(instr: u16) -> Thumb16InstId {
     let op = (instr >> 11) & 0x1F;
     match op {
-        0b00000 => Thumb16InstId::LSL_imm,
-        0b00001 => Thumb16InstId::LSR_imm,
-        0b00010 => Thumb16InstId::ASR_imm,
+        0b00000 => Thumb16InstId::LslImm,
+        0b00001 => Thumb16InstId::LsrImm,
+        0b00010 => Thumb16InstId::AsrImm,
         0b00011 => {
             let op2 = (instr >> 9) & 3;
             match op2 {
-                0b00 => Thumb16InstId::ADD_reg_t1,
-                0b01 => Thumb16InstId::SUB_reg,
-                0b10 => Thumb16InstId::ADD_imm_t1,
-                0b11 => Thumb16InstId::SUB_imm_t1,
+                0b00 => Thumb16InstId::AddRegT1,
+                0b01 => Thumb16InstId::SubReg,
+                0b10 => Thumb16InstId::AddImmT1,
+                0b11 => Thumb16InstId::SubImmT1,
                 _ => unreachable!(),
             }
         }
-        0b00100 => Thumb16InstId::MOV_imm,
-        0b00101 => Thumb16InstId::CMP_imm,
-        0b00110 => Thumb16InstId::ADD_imm_t2,
-        0b00111 => Thumb16InstId::SUB_imm_t2,
+        0b00100 => Thumb16InstId::MovImm,
+        0b00101 => Thumb16InstId::CmpImm,
+        0b00110 => Thumb16InstId::AddImmT2,
+        0b00111 => Thumb16InstId::SubImmT2,
         _ => Thumb16InstId::Unknown,
     }
 }
@@ -237,22 +237,22 @@ fn decode_thumb16_shift_add(instr: u16) -> Thumb16InstId {
 fn decode_thumb16_dp(instr: u16) -> Thumb16InstId {
     let op = (instr >> 6) & 0xF;
     match op {
-        0b0000 => Thumb16InstId::AND_reg,
-        0b0001 => Thumb16InstId::EOR_reg,
-        0b0010 => Thumb16InstId::LSL_reg,
-        0b0011 => Thumb16InstId::LSR_reg,
-        0b0100 => Thumb16InstId::ASR_reg,
-        0b0101 => Thumb16InstId::ADC_reg,
-        0b0110 => Thumb16InstId::SBC_reg,
-        0b0111 => Thumb16InstId::ROR_reg,
-        0b1000 => Thumb16InstId::TST_reg,
-        0b1001 => Thumb16InstId::RSB_imm,
-        0b1010 => Thumb16InstId::CMP_reg_t1,
-        0b1011 => Thumb16InstId::CMN_reg,
-        0b1100 => Thumb16InstId::ORR_reg,
-        0b1101 => Thumb16InstId::MUL_reg,
-        0b1110 => Thumb16InstId::BIC_reg,
-        0b1111 => Thumb16InstId::MVN_reg,
+        0b0000 => Thumb16InstId::AndReg,
+        0b0001 => Thumb16InstId::EorReg,
+        0b0010 => Thumb16InstId::LslReg,
+        0b0011 => Thumb16InstId::LsrReg,
+        0b0100 => Thumb16InstId::AsrReg,
+        0b0101 => Thumb16InstId::AdcReg,
+        0b0110 => Thumb16InstId::SbcReg,
+        0b0111 => Thumb16InstId::RorReg,
+        0b1000 => Thumb16InstId::TstReg,
+        0b1001 => Thumb16InstId::RsbImm,
+        0b1010 => Thumb16InstId::CmpRegT1,
+        0b1011 => Thumb16InstId::CmnReg,
+        0b1100 => Thumb16InstId::OrrReg,
+        0b1101 => Thumb16InstId::MulReg,
+        0b1110 => Thumb16InstId::BicReg,
+        0b1111 => Thumb16InstId::MvnReg,
         _ => unreachable!(),
     }
 }
@@ -260,12 +260,12 @@ fn decode_thumb16_dp(instr: u16) -> Thumb16InstId {
 fn decode_thumb16_special(instr: u16) -> Thumb16InstId {
     let op = (instr >> 8) & 3;
     match op {
-        0b00 => Thumb16InstId::ADD_reg_t2,
-        0b01 => Thumb16InstId::CMP_reg_t2,
-        0b10 => Thumb16InstId::MOV_reg,
+        0b00 => Thumb16InstId::AddRegT2,
+        0b01 => Thumb16InstId::CmpRegT2,
+        0b10 => Thumb16InstId::MovReg,
         0b11 => {
             if instr & (1 << 7) != 0 {
-                Thumb16InstId::BLX_reg
+                Thumb16InstId::BlxReg
             } else {
                 Thumb16InstId::BX
             }
@@ -278,42 +278,42 @@ fn decode_thumb16_load_store(instr: u16) -> Thumb16InstId {
     let op = (instr >> 9) & 0x7F;
     match op >> 3 {
         0b0101 => match op & 7 {
-            0b000 => Thumb16InstId::STR_reg,
-            0b001 => Thumb16InstId::STRH_reg,
-            0b010 => Thumb16InstId::STRB_reg,
-            0b011 => Thumb16InstId::LDRSB_reg,
-            0b100 => Thumb16InstId::LDR_reg,
-            0b101 => Thumb16InstId::LDRH_reg,
-            0b110 => Thumb16InstId::LDRB_reg,
-            0b111 => Thumb16InstId::LDRSH_reg,
+            0b000 => Thumb16InstId::StrReg,
+            0b001 => Thumb16InstId::StrhReg,
+            0b010 => Thumb16InstId::StrbReg,
+            0b011 => Thumb16InstId::LdrsbReg,
+            0b100 => Thumb16InstId::LdrReg,
+            0b101 => Thumb16InstId::LdrhReg,
+            0b110 => Thumb16InstId::LdrbReg,
+            0b111 => Thumb16InstId::LdrshReg,
             _ => unreachable!(),
         },
         0b0110 => {
             if op & 4 == 0 {
-                Thumb16InstId::STR_imm_t1
+                Thumb16InstId::StrImmT1
             } else {
-                Thumb16InstId::LDR_imm_t1
+                Thumb16InstId::LdrImmT1
             }
         }
         0b0111 => {
             if op & 4 == 0 {
-                Thumb16InstId::STRB_imm
+                Thumb16InstId::StrbImm
             } else {
-                Thumb16InstId::LDRB_imm
+                Thumb16InstId::LdrbImm
             }
         }
         0b1000 => {
             if op & 4 == 0 {
-                Thumb16InstId::STRH_imm
+                Thumb16InstId::StrhImm
             } else {
-                Thumb16InstId::LDRH_imm
+                Thumb16InstId::LdrhImm
             }
         }
         0b1001 => {
             if op & 4 == 0 {
-                Thumb16InstId::STR_imm_t2
+                Thumb16InstId::StrImmT2
             } else {
-                Thumb16InstId::LDR_imm_t2
+                Thumb16InstId::LdrImmT2
             }
         }
         _ => Thumb16InstId::Unknown,
@@ -345,14 +345,14 @@ fn decode_thumb16_misc(instr: u16) -> Thumb16InstId {
         if bit11 == 0 || bit11 == 1 {
             // Check bit[11:10] = 00 or 10
             if (instr >> 10) & 1 == 0 {
-                return Thumb16InstId::CBZ_CBNZ;
+                return Thumb16InstId::CbzCbnz;
             }
         }
     }
 
     match op118 {
-        0b0000 => Thumb16InstId::ADD_sp_t2,
-        0b0001 => Thumb16InstId::SUB_sp,
+        0b0000 => Thumb16InstId::AddSpT2,
+        0b0001 => Thumb16InstId::SubSp,
         // Signed/unsigned extend: bits[11:6]
         _ => {
             let op116 = (instr >> 6) & 0x3F; // bits[11:6]
@@ -393,7 +393,7 @@ fn decode_thumb16_cond_branch(instr: u16) -> Thumb16InstId {
     match cond {
         0b1110 => Thumb16InstId::UDF,
         0b1111 => Thumb16InstId::SVC,
-        _ => Thumb16InstId::B_t1,
+        _ => Thumb16InstId::BT1,
     }
 }
 
@@ -406,7 +406,7 @@ mod tests {
         // MOV R0, #42
         let instr = 0x202A; // 00100 000 00101010
         let dec = decode_thumb16(instr);
-        assert_eq!(dec.id, Thumb16InstId::MOV_imm);
+        assert_eq!(dec.id, Thumb16InstId::MovImm);
         assert_eq!(dec.rt_hi(), Reg::R0);
         assert_eq!(dec.imm8(), 42);
     }
@@ -421,7 +421,7 @@ mod tests {
         // ADD R0, R1, R2
         let instr = 0x1888; // 0001100 010 001 000
         let dec = decode_thumb16(instr);
-        assert_eq!(dec.id, Thumb16InstId::ADD_reg_t1);
+        assert_eq!(dec.id, Thumb16InstId::AddRegT1);
     }
 
     #[test]
@@ -445,6 +445,6 @@ mod tests {
         // LDR R0, [PC, #0]
         let instr = 0x4800; // 01001 000 00000000
         let dec = decode_thumb16(instr);
-        assert_eq!(dec.id, Thumb16InstId::LDR_literal);
+        assert_eq!(dec.id, Thumb16InstId::LdrLiteral);
     }
 }

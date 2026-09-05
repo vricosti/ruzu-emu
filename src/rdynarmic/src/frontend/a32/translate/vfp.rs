@@ -721,7 +721,7 @@ pub fn arm_vmov_fp_imm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         let immediate = (sign << 63) | (exp << 52) | fract;
         ir.set_extended_register_64(d, Value::ImmU64(immediate));
     } else {
-        let sign = ((imm8 >> 7) & 1) as u32;
+        let sign = (imm8 >> 7) & 1;
         let exp = (if (imm8 >> 6) & 1 != 0 {
             0x7Cu32
         } else {
@@ -761,7 +761,7 @@ mod tests {
                 &mut ir,
                 &DecodedArm {
                     raw: 0xEEA0_4B90,
-                    id: ArmInstId::VFP_VDUP,
+                    id: ArmInstId::VfpVdup,
                 },
             )
         };
@@ -788,7 +788,7 @@ mod tests {
                 &mut ir,
                 &DecodedArm {
                     raw: 0xEEBC_0BC8,
-                    id: ArmInstId::VCVT_to_u32,
+                    id: ArmInstId::VcvtToU32,
                 },
             )
         };
@@ -850,8 +850,8 @@ mod tests {
         let cases: [(u32, ArmInstId, VfpMemoryTranslator); 6] = [
             (0x0000_0B02, ArmInstId::VPUSH, arm_vpush),
             (0x0000_0B02, ArmInstId::VPOP, arm_vpop),
-            (0x0080_0B00, ArmInstId::VLDR_fp, arm_vldr_fp),
-            (0x0080_0B00, ArmInstId::VSTR_fp, arm_vstr_fp),
+            (0x0080_0B00, ArmInstId::VldrFp, arm_vldr_fp),
+            (0x0080_0B00, ArmInstId::VstrFp, arm_vstr_fp),
             (0x0080_0B02, ArmInstId::VSTM, arm_vstm),
             (0x0080_0B02, ArmInstId::VLDM, arm_vldm),
         ];
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn big_endian_double_load_swaps_words_before_packing() {
-        let block = translate_vfp_memory(0x0080_0B00, ArmInstId::VLDR_fp, true, arm_vldr_fp);
+        let block = translate_vfp_memory(0x0080_0B00, ArmInstId::VldrFp, true, arm_vldr_fp);
         let reversals = block
             .instructions
             .iter()
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn big_endian_double_store_writes_high_word_first() {
-        let block = translate_vfp_memory(0x0080_0B00, ArmInstId::VSTR_fp, true, arm_vstr_fp);
+        let block = translate_vfp_memory(0x0080_0B00, ArmInstId::VstrFp, true, arm_vstr_fp);
         let least = block
             .instructions
             .iter()

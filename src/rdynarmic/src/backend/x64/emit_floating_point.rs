@@ -421,28 +421,76 @@ fn emit_fp_min_max(
 }
 
 pub fn emit_fp_max32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_max32 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_max32 as *const () as usize,
+    );
 }
 pub fn emit_fp_max64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_max64 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_max64 as *const () as usize,
+    );
 }
 pub fn emit_fp_min32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_min32 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_min32 as *const () as usize,
+    );
 }
 pub fn emit_fp_min64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_min64 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_min64 as *const () as usize,
+    );
 }
 pub fn emit_fp_max_numeric32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_max_numeric32 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_max_numeric32 as *const () as usize,
+    );
 }
 pub fn emit_fp_max_numeric64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_max_numeric64 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_max_numeric64 as *const () as usize,
+    );
 }
 pub fn emit_fp_min_numeric32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_min_numeric32 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_min_numeric32 as *const () as usize,
+    );
 }
 pub fn emit_fp_min_numeric64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(ctx, ra, inst_ref, inst, fallback_fp_min_numeric64 as usize);
+    emit_fp_min_max(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fallback_fp_min_numeric64 as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +653,7 @@ pub fn emit_fp_single_to_double(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_single_to_double as usize,
+        fp_helpers::fp_single_to_double as *const () as usize,
     );
 }
 
@@ -632,7 +680,7 @@ pub fn emit_fp_double_to_single(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_double_to_single as usize,
+        fp_helpers::fp_double_to_single as *const () as usize,
     );
 }
 
@@ -681,7 +729,7 @@ define_scalar_round_fallback!(fallback_fp_round_int64, u64);
 
 macro_rules! scalar_round_fallback {
     ($function:ident, $rounding:expr, $exact:expr) => {
-        $function::<$rounding, $exact> as usize
+        $function::<$rounding, $exact> as *const () as usize
     };
 }
 
@@ -889,10 +937,10 @@ fn emit_fp_mul_add(
         let fpcr_value = fpcr.value();
         let fpsr_offset = ctx.jit_state_info.offsetof_fpsr_exc as i32;
         let function = match (fsize, negate_product) {
-            (32, false) => fp_helpers::fp_mul_add32 as usize,
-            (32, true) => fp_helpers::fp_mul_sub32 as usize,
-            (64, false) => fp_helpers::fp_mul_add64 as usize,
-            (64, true) => fp_helpers::fp_mul_sub64 as usize,
+            (32, false) => fp_helpers::fp_mul_add32 as *const () as usize,
+            (32, true) => fp_helpers::fp_mul_sub32 as *const () as usize,
+            (64, false) => fp_helpers::fp_mul_add64 as *const () as usize,
+            (64, true) => fp_helpers::fp_mul_sub64 as *const () as usize,
             _ => unreachable!(),
         };
         ctx.deferred_emits
@@ -1031,10 +1079,10 @@ fn emit_fp_mul_add(
             )
             .unwrap();
         let function = match (fsize, negate_product) {
-            (32, false) => fp_helpers::fp_mul_add32 as usize,
-            (32, true) => fp_helpers::fp_mul_sub32 as usize,
-            (64, false) => fp_helpers::fp_mul_add64 as usize,
-            (64, true) => fp_helpers::fp_mul_sub64 as usize,
+            (32, false) => fp_helpers::fp_mul_add32 as *const () as usize,
+            (32, true) => fp_helpers::fp_mul_sub32 as *const () as usize,
+            (64, false) => fp_helpers::fp_mul_add64 as *const () as usize,
+            (64, true) => fp_helpers::fp_mul_sub64 as *const () as usize,
             _ => unreachable!(),
         };
         ra.asm.mov(rxbyak::RAX, function as i64).unwrap();
@@ -1236,7 +1284,7 @@ pub fn emit_fp_fixed_u64_to_single(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_fixed_u64_to_single as usize,
+        fp_helpers::fp_fixed_u64_to_single as *const () as usize,
     );
 }
 
@@ -1250,7 +1298,7 @@ pub fn emit_fp_fixed_u64_to_double(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_fixed_u64_to_double as usize,
+        fp_helpers::fp_fixed_u64_to_double as *const () as usize,
     );
 }
 
@@ -1268,9 +1316,9 @@ fn emit_fp_to_fixed_s32(
 
     if rounding == 4 || (rounding != 3 && !ctx.has_host_feature(HostFeature::SSE41)) {
         let helper = if is_double {
-            fp_helpers::fp_double_to_fixed_s32 as usize
+            fp_helpers::fp_double_to_fixed_s32 as *const () as usize
         } else {
-            fp_helpers::fp_single_to_fixed_s32 as usize
+            fp_helpers::fp_single_to_fixed_s32 as *const () as usize
         };
         ra.host_call(Some(inst_ref), &mut [Some(&mut args[0]), None, None, None]);
         let parameters = fbits as u64 | ((rounding as u64) << 8);
@@ -1377,9 +1425,9 @@ fn emit_fp_to_fixed_s64(
 
     if rounding == 4 || (rounding != 3 && !ctx.has_host_feature(HostFeature::SSE41)) {
         let helper = if is_double {
-            fp_helpers::fp_double_to_fixed_s64 as usize
+            fp_helpers::fp_double_to_fixed_s64 as *const () as usize
         } else {
-            fp_helpers::fp_single_to_fixed_s64 as usize
+            fp_helpers::fp_single_to_fixed_s64 as *const () as usize
         };
         ra.host_call(Some(inst_ref), &mut [Some(&mut args[0]), None, None, None]);
         let parameters = fbits as u64 | ((rounding as u64) << 8);
@@ -1637,7 +1685,7 @@ pub fn emit_fp_single_to_fixed_u32(
         inst,
         false,
         32,
-        fp_helpers::fp_single_to_fixed_u32 as usize,
+        fp_helpers::fp_single_to_fixed_u32 as *const () as usize,
     );
 }
 pub fn emit_fp_single_to_fixed_u64(
@@ -1653,7 +1701,7 @@ pub fn emit_fp_single_to_fixed_u64(
         inst,
         false,
         64,
-        fp_helpers::fp_single_to_fixed_u64 as usize,
+        fp_helpers::fp_single_to_fixed_u64 as *const () as usize,
     );
 }
 pub fn emit_fp_double_to_fixed_u32(
@@ -1669,7 +1717,7 @@ pub fn emit_fp_double_to_fixed_u32(
         inst,
         true,
         32,
-        fp_helpers::fp_double_to_fixed_u32 as usize,
+        fp_helpers::fp_double_to_fixed_u32 as *const () as usize,
     );
 }
 pub fn emit_fp_double_to_fixed_u64(
@@ -1685,16 +1733,26 @@ pub fn emit_fp_double_to_fixed_u64(
         inst,
         true,
         64,
-        fp_helpers::fp_double_to_fixed_u64 as usize,
+        fp_helpers::fp_double_to_fixed_u64 as *const () as usize,
     );
 }
 
 // Half-precision and 16-bit fixed-point — all host_call fallback
 pub fn emit_fp_abs16(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_host_call_1(ra, inst_ref, inst, fp_helpers::fp_abs16 as usize);
+    emit_host_call_1(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_abs16 as *const () as usize,
+    );
 }
 pub fn emit_fp_neg16(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_host_call_1(ra, inst_ref, inst, fp_helpers::fp_neg16 as usize);
+    emit_host_call_1(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_neg16 as *const () as usize,
+    );
 }
 pub fn emit_fp_round_int16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     emit_fp_round_int(ctx, ra, inst_ref, inst, 16);
@@ -1724,7 +1782,7 @@ pub fn emit_fp_half_to_single(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_half_to_single as usize,
+        fp_helpers::fp_half_to_single as *const () as usize,
     );
 }
 pub fn emit_fp_half_to_double(
@@ -1754,7 +1812,7 @@ pub fn emit_fp_half_to_double(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_half_to_double as usize,
+        fp_helpers::fp_half_to_double as *const () as usize,
     );
 }
 pub fn emit_fp_single_to_half(
@@ -1793,7 +1851,7 @@ pub fn emit_fp_single_to_half(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_single_to_half as usize,
+        fp_helpers::fp_single_to_half as *const () as usize,
     );
 }
 pub fn emit_fp_double_to_half(
@@ -1807,16 +1865,26 @@ pub fn emit_fp_double_to_half(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_double_to_half as usize,
+        fp_helpers::fp_double_to_half as *const () as usize,
     );
 }
 
 // FP multiply extended
 pub fn emit_fp_mul_x32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_host_call_2(ra, inst_ref, inst, fp_helpers::fp_mul_x32 as usize);
+    emit_host_call_2(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_mul_x32 as *const () as usize,
+    );
 }
 pub fn emit_fp_mul_x64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_host_call_2(ra, inst_ref, inst, fp_helpers::fp_mul_x64 as usize);
+    emit_host_call_2(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_mul_x64 as *const () as usize,
+    );
 }
 
 // Reciprocal/sqrt estimates
@@ -1831,7 +1899,7 @@ pub fn emit_fp_recip_estimate16(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_recip_estimate16 as usize,
+        fp_helpers::fp_recip_estimate16 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_estimate32(
@@ -1845,7 +1913,7 @@ pub fn emit_fp_recip_estimate32(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_recip_estimate32 as usize,
+        fp_helpers::fp_recip_estimate32 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_estimate64(
@@ -1859,7 +1927,7 @@ pub fn emit_fp_recip_estimate64(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_recip_estimate64 as usize,
+        fp_helpers::fp_recip_estimate64 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_exponent16(
@@ -1873,7 +1941,7 @@ pub fn emit_fp_recip_exponent16(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_recip_exponent16 as usize,
+        fp_helpers::fp_recip_exponent16 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_exponent32(
@@ -1887,7 +1955,7 @@ pub fn emit_fp_recip_exponent32(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_recip_exponent32 as usize,
+        fp_helpers::fp_recip_exponent32 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_exponent64(
@@ -1901,7 +1969,7 @@ pub fn emit_fp_recip_exponent64(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_recip_exponent64 as usize,
+        fp_helpers::fp_recip_exponent64 as *const () as usize,
     );
 }
 
@@ -2059,7 +2127,7 @@ pub fn emit_fp_recip_step_fused16(
         inst_ref,
         inst,
         16,
-        fp_helpers::fp_recip_step_fused16 as usize,
+        fp_helpers::fp_recip_step_fused16 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_step_fused32(
@@ -2074,7 +2142,7 @@ pub fn emit_fp_recip_step_fused32(
         inst_ref,
         inst,
         32,
-        fp_helpers::fp_recip_step_fused32 as usize,
+        fp_helpers::fp_recip_step_fused32 as *const () as usize,
     );
 }
 pub fn emit_fp_recip_step_fused64(
@@ -2089,7 +2157,7 @@ pub fn emit_fp_recip_step_fused64(
         inst_ref,
         inst,
         64,
-        fp_helpers::fp_recip_step_fused64 as usize,
+        fp_helpers::fp_recip_step_fused64 as *const () as usize,
     );
 }
 pub fn emit_fp_rsqrt_estimate16(
@@ -2103,7 +2171,7 @@ pub fn emit_fp_rsqrt_estimate16(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_rsqrt_estimate16 as usize,
+        fp_helpers::fp_rsqrt_estimate16 as *const () as usize,
     );
 }
 pub fn emit_fp_rsqrt_estimate32(
@@ -2117,7 +2185,7 @@ pub fn emit_fp_rsqrt_estimate32(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_rsqrt_estimate32 as usize,
+        fp_helpers::fp_rsqrt_estimate32 as *const () as usize,
     );
 }
 pub fn emit_fp_rsqrt_estimate64(
@@ -2131,7 +2199,7 @@ pub fn emit_fp_rsqrt_estimate64(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_rsqrt_estimate64 as usize,
+        fp_helpers::fp_rsqrt_estimate64 as *const () as usize,
     );
 }
 
@@ -2356,7 +2424,7 @@ pub fn emit_fp_rsqrt_step_fused16(
         inst_ref,
         inst,
         16,
-        fp_helpers::fp_rsqrt_step_fused16 as usize,
+        fp_helpers::fp_rsqrt_step_fused16 as *const () as usize,
     );
 }
 pub fn emit_fp_rsqrt_step_fused32(
@@ -2371,7 +2439,7 @@ pub fn emit_fp_rsqrt_step_fused32(
         inst_ref,
         inst,
         32,
-        fp_helpers::fp_rsqrt_step_fused32 as usize,
+        fp_helpers::fp_rsqrt_step_fused32 as *const () as usize,
     );
 }
 pub fn emit_fp_rsqrt_step_fused64(
@@ -2386,16 +2454,26 @@ pub fn emit_fp_rsqrt_step_fused64(
         inst_ref,
         inst,
         64,
-        fp_helpers::fp_rsqrt_step_fused64 as usize,
+        fp_helpers::fp_rsqrt_step_fused64 as *const () as usize,
     );
 }
 
 // FPMulAdd/Sub 16 — host_call fallback
 pub fn emit_fp_mul_add16(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_mul_add16 as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_mul_add16 as *const () as usize,
+    );
 }
 pub fn emit_fp_mul_sub16(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_mul_sub16 as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_mul_sub16 as *const () as usize,
+    );
 }
 
 // Half-precision fixed-point conversions — host_call fallback
@@ -2405,7 +2483,12 @@ pub fn emit_fp_half_to_fixed_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_s as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_s as *const () as usize,
+    );
 }
 pub fn emit_fp_half_to_fixed_s32(
     _ctx: &EmitContext,
@@ -2413,7 +2496,12 @@ pub fn emit_fp_half_to_fixed_s32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_s as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_s as *const () as usize,
+    );
 }
 pub fn emit_fp_half_to_fixed_s64(
     _ctx: &EmitContext,
@@ -2421,7 +2509,12 @@ pub fn emit_fp_half_to_fixed_s64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_s as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_s as *const () as usize,
+    );
 }
 pub fn emit_fp_half_to_fixed_u16(
     _ctx: &EmitContext,
@@ -2429,7 +2522,12 @@ pub fn emit_fp_half_to_fixed_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_u as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_u as *const () as usize,
+    );
 }
 pub fn emit_fp_half_to_fixed_u32(
     _ctx: &EmitContext,
@@ -2437,7 +2535,12 @@ pub fn emit_fp_half_to_fixed_u32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_u as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_u as *const () as usize,
+    );
 }
 pub fn emit_fp_half_to_fixed_u64(
     _ctx: &EmitContext,
@@ -2445,7 +2548,12 @@ pub fn emit_fp_half_to_fixed_u64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_u as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_u as *const () as usize,
+    );
 }
 
 pub fn emit_fp_double_to_fixed_u16(
@@ -2454,7 +2562,12 @@ pub fn emit_fp_double_to_fixed_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_to_fixed_u16 as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_to_fixed_u16 as *const () as usize,
+    );
 }
 pub fn emit_fp_single_to_fixed_u16(
     _ctx: &EmitContext,
@@ -2462,7 +2575,12 @@ pub fn emit_fp_single_to_fixed_u16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_to_fixed_u16 as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_to_fixed_u16 as *const () as usize,
+    );
 }
 pub fn emit_fp_single_to_fixed_s16(
     _ctx: &EmitContext,
@@ -2470,7 +2588,12 @@ pub fn emit_fp_single_to_fixed_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_s as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_s as *const () as usize,
+    );
 }
 pub fn emit_fp_double_to_fixed_s16(
     _ctx: &EmitContext,
@@ -2478,7 +2601,12 @@ pub fn emit_fp_double_to_fixed_s16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_3(ra, inst_ref, inst, fp_helpers::fp_half_to_fixed_s as usize);
+    emit_host_call_3(
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_half_to_fixed_s as *const () as usize,
+    );
 }
 
 // Fixed 16-bit to FP — host_call fallback
@@ -2492,7 +2620,7 @@ pub fn emit_fp_fixed_u16_to_single(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_fixed_u16_to_single as usize,
+        fp_helpers::fp_fixed_u16_to_single as *const () as usize,
     );
 }
 pub fn emit_fp_fixed_s16_to_single(
@@ -2505,7 +2633,7 @@ pub fn emit_fp_fixed_s16_to_single(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_fixed_s16_to_single as usize,
+        fp_helpers::fp_fixed_s16_to_single as *const () as usize,
     );
 }
 pub fn emit_fp_fixed_u16_to_double(
@@ -2518,7 +2646,7 @@ pub fn emit_fp_fixed_u16_to_double(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_fixed_u16_to_double as usize,
+        fp_helpers::fp_fixed_u16_to_double as *const () as usize,
     );
 }
 pub fn emit_fp_fixed_s16_to_double(
@@ -2531,7 +2659,7 @@ pub fn emit_fp_fixed_s16_to_double(
         ra,
         inst_ref,
         inst,
-        fp_helpers::fp_fixed_s16_to_double as usize,
+        fp_helpers::fp_fixed_s16_to_double as *const () as usize,
     );
 }
 

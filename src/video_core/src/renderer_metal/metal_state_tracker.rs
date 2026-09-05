@@ -79,18 +79,12 @@ mod tests {
         assert_eq!(tables[1][RT_BASE as usize], flags::RENDER_TARGETS);
         assert_eq!(tables[0][BLEND_BASE as usize], dirty::BLENDING);
         assert_eq!(tables[1][BLEND_BASE as usize], dirty::BLEND_EQUATIONS);
-        assert_eq!(
-            tables[0][BLEND_PER_TARGET_BASE as usize],
-            dirty::BLENDING
-        );
+        assert_eq!(tables[0][BLEND_PER_TARGET_BASE as usize], dirty::BLENDING);
         assert_eq!(
             tables[0][VERTEX_ATTRIB_BASE as usize],
             dirty::VERTEX_ATTRIBUTE_0
         );
-        assert_eq!(
-            tables[1][VERTEX_ATTRIB_BASE as usize],
-            dirty::VERTEX_INPUT
-        );
+        assert_eq!(tables[1][VERTEX_ATTRIB_BASE as usize], dirty::VERTEX_INPUT);
 
         tracker.change_channel(&channel);
         tracker.invalidate_state(&mut channel);

@@ -24,7 +24,6 @@
 
 use clap::{CommandFactory, Parser};
 use common::settings_enums::RendererBackend;
-use libc;
 use network::room::{StatusMessageTypes, DEFAULT_ROOM_PORT, NO_PREFERRED_IP};
 use network::room_member::{ChatEntry, RoomMemberError, RoomMemberState, StatusMessageEntry};
 use std::ffi::OsStr;
@@ -706,7 +705,7 @@ fn main() {
         #[cfg(unix)]
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = profile_signal as usize;
+            sa.sa_sigaction = profile_signal as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
         }
@@ -792,7 +791,7 @@ fn main() {
         #[cfg(unix)]
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = dump_counts as usize;
+            sa.sa_sigaction = dump_counts as *const () as usize;
             sa.sa_flags = 0;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());

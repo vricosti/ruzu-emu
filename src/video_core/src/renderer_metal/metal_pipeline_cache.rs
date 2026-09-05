@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 #[cfg(feature = "metal-spirv-validation")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use common::thread_worker::ThreadWorker;
 
@@ -49,7 +49,7 @@ use crate::renderer_vulkan::fixed_pipeline_state::FixedPipelineState;
 use crate::renderer_vulkan::graphics_pipeline::GraphicsPipelineKey;
 use crate::renderer_vulkan::pipeline_cache::{
     translate_graphics_stages_from_environments_with_features, RuntimeInfoDeviceFeatures,
-    TranslatedGraphicsShader, NUM_GRAPHICS_STAGES,
+    NUM_GRAPHICS_STAGES,
 };
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{

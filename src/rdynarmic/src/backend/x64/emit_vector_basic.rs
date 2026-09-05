@@ -236,7 +236,12 @@ pub fn emit_vector_clz8(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef,
         ra.release(tmp2);
         ra.define_value(inst_ref, data);
     } else {
-        emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_clz8 as usize);
+        emit_one_arg_fallback(
+            ra,
+            inst_ref,
+            inst,
+            fallback_vector_clz8 as *const () as usize,
+        );
     }
 }
 
@@ -346,7 +351,12 @@ pub fn emit_vector_clz16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef
         ra.release(tmp);
         ra.define_value(inst_ref, result);
     } else {
-        emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_clz16 as usize);
+        emit_one_arg_fallback(
+            ra,
+            inst_ref,
+            inst,
+            fallback_vector_clz16 as *const () as usize,
+        );
     }
 }
 
@@ -473,7 +483,12 @@ pub fn emit_vector_popcount(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Inst
         return;
     }
 
-    emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_popcount as usize);
+    emit_one_arg_fallback(
+        ra,
+        inst_ref,
+        inst,
+        fallback_vector_popcount as *const () as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------

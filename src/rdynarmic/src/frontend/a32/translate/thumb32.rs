@@ -16,10 +16,7 @@ use super::thumb32_multiply;
 use super::thumb32_parallel;
 use super::thumb32_store_single_data_item;
 use crate::frontend::a32::decoder_thumb32::{DecodedThumb32, Thumb32InstId};
-use crate::frontend::a32::types::Reg;
 use crate::ir::a32_emitter::A32IREmitter;
-use crate::ir::terminal::Terminal;
-use crate::ir::value::Value;
 
 use super::TranslationOptions;
 
@@ -32,114 +29,114 @@ pub fn translate_thumb32(
     use Thumb32InstId::*;
     match inst.id {
         // Data processing (modified immediate)
-        TST_imm => thumb32_data_processing_modified_immediate::thumb32_tst_imm(ir, inst),
-        AND_imm => thumb32_data_processing_modified_immediate::thumb32_and_imm(ir, inst),
-        BIC_imm => thumb32_data_processing_modified_immediate::thumb32_bic_imm(ir, inst),
-        MOV_imm => thumb32_data_processing_modified_immediate::thumb32_mov_imm(ir, inst),
-        ORR_imm => thumb32_data_processing_modified_immediate::thumb32_orr_imm(ir, inst),
-        MVN_imm => thumb32_data_processing_modified_immediate::thumb32_mvn_imm(ir, inst),
-        ORN_imm => thumb32_data_processing_modified_immediate::thumb32_orn_imm(ir, inst),
-        TEQ_imm => thumb32_data_processing_modified_immediate::thumb32_teq_imm(ir, inst),
-        EOR_imm => thumb32_data_processing_modified_immediate::thumb32_eor_imm(ir, inst),
-        CMN_imm => thumb32_data_processing_modified_immediate::thumb32_cmn_imm(ir, inst),
-        ADD_imm_1 => thumb32_data_processing_modified_immediate::thumb32_add_imm_1(ir, inst),
-        ADC_imm => thumb32_data_processing_modified_immediate::thumb32_adc_imm(ir, inst),
-        SBC_imm => thumb32_data_processing_modified_immediate::thumb32_sbc_imm(ir, inst),
-        CMP_imm => thumb32_data_processing_modified_immediate::thumb32_cmp_imm(ir, inst),
-        SUB_imm_1 => thumb32_data_processing_modified_immediate::thumb32_sub_imm_1(ir, inst),
-        RSB_imm => thumb32_data_processing_modified_immediate::thumb32_rsb_imm(ir, inst),
+        TstImm => thumb32_data_processing_modified_immediate::thumb32_tst_imm(ir, inst),
+        AndImm => thumb32_data_processing_modified_immediate::thumb32_and_imm(ir, inst),
+        BicImm => thumb32_data_processing_modified_immediate::thumb32_bic_imm(ir, inst),
+        MovImm => thumb32_data_processing_modified_immediate::thumb32_mov_imm(ir, inst),
+        OrrImm => thumb32_data_processing_modified_immediate::thumb32_orr_imm(ir, inst),
+        MvnImm => thumb32_data_processing_modified_immediate::thumb32_mvn_imm(ir, inst),
+        OrnImm => thumb32_data_processing_modified_immediate::thumb32_orn_imm(ir, inst),
+        TeqImm => thumb32_data_processing_modified_immediate::thumb32_teq_imm(ir, inst),
+        EorImm => thumb32_data_processing_modified_immediate::thumb32_eor_imm(ir, inst),
+        CmnImm => thumb32_data_processing_modified_immediate::thumb32_cmn_imm(ir, inst),
+        AddImm1 => thumb32_data_processing_modified_immediate::thumb32_add_imm_1(ir, inst),
+        AdcImm => thumb32_data_processing_modified_immediate::thumb32_adc_imm(ir, inst),
+        SbcImm => thumb32_data_processing_modified_immediate::thumb32_sbc_imm(ir, inst),
+        CmpImm => thumb32_data_processing_modified_immediate::thumb32_cmp_imm(ir, inst),
+        SubImm1 => thumb32_data_processing_modified_immediate::thumb32_sub_imm_1(ir, inst),
+        RsbImm => thumb32_data_processing_modified_immediate::thumb32_rsb_imm(ir, inst),
 
         // Data processing (shifted register)
-        TST_reg => thumb32_data_processing_shifted_register::thumb32_tst_reg(ir, inst),
-        AND_reg => thumb32_data_processing_shifted_register::thumb32_and_reg(ir, inst),
-        BIC_reg => thumb32_data_processing_shifted_register::thumb32_bic_reg(ir, inst),
-        MOV_reg => thumb32_data_processing_shifted_register::thumb32_mov_reg(ir, inst),
-        ORR_reg => thumb32_data_processing_shifted_register::thumb32_orr_reg(ir, inst),
-        MVN_reg => thumb32_data_processing_shifted_register::thumb32_mvn_reg(ir, inst),
-        ORN_reg => thumb32_data_processing_shifted_register::thumb32_orn_reg(ir, inst),
-        TEQ_reg => thumb32_data_processing_shifted_register::thumb32_teq_reg(ir, inst),
-        EOR_reg => thumb32_data_processing_shifted_register::thumb32_eor_reg(ir, inst),
+        TstReg => thumb32_data_processing_shifted_register::thumb32_tst_reg(ir, inst),
+        AndReg => thumb32_data_processing_shifted_register::thumb32_and_reg(ir, inst),
+        BicReg => thumb32_data_processing_shifted_register::thumb32_bic_reg(ir, inst),
+        MovReg => thumb32_data_processing_shifted_register::thumb32_mov_reg(ir, inst),
+        OrrReg => thumb32_data_processing_shifted_register::thumb32_orr_reg(ir, inst),
+        MvnReg => thumb32_data_processing_shifted_register::thumb32_mvn_reg(ir, inst),
+        OrnReg => thumb32_data_processing_shifted_register::thumb32_orn_reg(ir, inst),
+        TeqReg => thumb32_data_processing_shifted_register::thumb32_teq_reg(ir, inst),
+        EorReg => thumb32_data_processing_shifted_register::thumb32_eor_reg(ir, inst),
         PKH => thumb32_data_processing_shifted_register::thumb32_pkh(ir, inst),
-        CMN_reg => thumb32_data_processing_shifted_register::thumb32_cmn_reg(ir, inst),
-        ADD_reg => thumb32_data_processing_shifted_register::thumb32_add_reg(ir, inst),
-        ADC_reg => thumb32_data_processing_shifted_register::thumb32_adc_reg(ir, inst),
-        SBC_reg => thumb32_data_processing_shifted_register::thumb32_sbc_reg(ir, inst),
-        CMP_reg => thumb32_data_processing_shifted_register::thumb32_cmp_reg(ir, inst),
-        SUB_reg => thumb32_data_processing_shifted_register::thumb32_sub_reg(ir, inst),
-        RSB_reg => thumb32_data_processing_shifted_register::thumb32_rsb_reg(ir, inst),
+        CmnReg => thumb32_data_processing_shifted_register::thumb32_cmn_reg(ir, inst),
+        AddReg => thumb32_data_processing_shifted_register::thumb32_add_reg(ir, inst),
+        AdcReg => thumb32_data_processing_shifted_register::thumb32_adc_reg(ir, inst),
+        SbcReg => thumb32_data_processing_shifted_register::thumb32_sbc_reg(ir, inst),
+        CmpReg => thumb32_data_processing_shifted_register::thumb32_cmp_reg(ir, inst),
+        SubReg => thumb32_data_processing_shifted_register::thumb32_sub_reg(ir, inst),
+        RsbReg => thumb32_data_processing_shifted_register::thumb32_rsb_reg(ir, inst),
 
         // Data processing (plain binary immediate)
-        ADR_t2 => thumb32_data_processing_plain_binary_immediate::thumb32_adr_t2(ir, inst),
-        ADR_t3 => thumb32_data_processing_plain_binary_immediate::thumb32_adr_t3(ir, inst),
-        ADD_imm_2 => thumb32_data_processing_plain_binary_immediate::thumb32_add_imm_2(ir, inst),
+        AdrT2 => thumb32_data_processing_plain_binary_immediate::thumb32_adr_t2(ir, inst),
+        AdrT3 => thumb32_data_processing_plain_binary_immediate::thumb32_adr_t3(ir, inst),
+        AddImm2 => thumb32_data_processing_plain_binary_immediate::thumb32_add_imm_2(ir, inst),
         BFC => thumb32_data_processing_plain_binary_immediate::thumb32_bfc(ir, inst),
         BFI => thumb32_data_processing_plain_binary_immediate::thumb32_bfi(ir, inst),
         MOVT => thumb32_data_processing_plain_binary_immediate::thumb32_movt(ir, inst),
-        MOVW_imm => thumb32_data_processing_plain_binary_immediate::thumb32_movw_imm(ir, inst),
+        MovwImm => thumb32_data_processing_plain_binary_immediate::thumb32_movw_imm(ir, inst),
         SBFX => thumb32_data_processing_plain_binary_immediate::thumb32_sbfx(ir, inst),
         SSAT => thumb32_data_processing_plain_binary_immediate::thumb32_ssat(ir, inst),
         SSAT16 => thumb32_data_processing_plain_binary_immediate::thumb32_ssat16(ir, inst),
-        SUB_imm_2 => thumb32_data_processing_plain_binary_immediate::thumb32_sub_imm_2(ir, inst),
+        SubImm2 => thumb32_data_processing_plain_binary_immediate::thumb32_sub_imm_2(ir, inst),
         UBFX => thumb32_data_processing_plain_binary_immediate::thumb32_ubfx(ir, inst),
         USAT => thumb32_data_processing_plain_binary_immediate::thumb32_usat(ir, inst),
         USAT16 => thumb32_data_processing_plain_binary_immediate::thumb32_usat16(ir, inst),
 
         // Branch
         B => thumb32_branch::thumb32_b(ir, inst),
-        B_cond => thumb32_branch::thumb32_b_cond(ir, inst),
-        BL_imm => thumb32_branch::thumb32_bl_imm(ir, inst),
-        BLX_imm => thumb32_branch::thumb32_blx_imm(ir, inst),
+        BCond => thumb32_branch::thumb32_b_cond(ir, inst),
+        BlImm => thumb32_branch::thumb32_bl_imm(ir, inst),
+        BlxImm => thumb32_branch::thumb32_blx_imm(ir, inst),
 
         // Load/Store
-        LDR_lit => thumb32_load_word::thumb32_ldr_lit(ir, inst),
-        LDR_imm_t4 => thumb32_load_word::thumb32_ldr_imm8(ir, inst),
-        LDR_imm_t3 => thumb32_load_word::thumb32_ldr_imm12(ir, inst),
-        LDR_reg => thumb32_load_word::thumb32_ldr_reg(ir, inst),
+        LdrLit => thumb32_load_word::thumb32_ldr_lit(ir, inst),
+        LdrImmT4 => thumb32_load_word::thumb32_ldr_imm8(ir, inst),
+        LdrImmT3 => thumb32_load_word::thumb32_ldr_imm12(ir, inst),
+        LdrReg => thumb32_load_word::thumb32_ldr_reg(ir, inst),
         LDRT => thumb32_load_word::thumb32_ldrt(ir, inst),
-        STR_imm_1 => thumb32_store_single_data_item::thumb32_str_imm_1(ir, inst),
-        STR_imm_2 => thumb32_store_single_data_item::thumb32_str_imm_2(ir, inst),
-        STR_imm_3 => thumb32_store_single_data_item::thumb32_str_imm_3(ir, inst),
+        StrImm1 => thumb32_store_single_data_item::thumb32_str_imm_1(ir, inst),
+        StrImm2 => thumb32_store_single_data_item::thumb32_str_imm_2(ir, inst),
+        StrImm3 => thumb32_store_single_data_item::thumb32_str_imm_3(ir, inst),
         STRT => thumb32_store_single_data_item::thumb32_strt(ir, inst),
-        STR_reg => thumb32_store_single_data_item::thumb32_str_reg(ir, inst),
-        LDRB_lit => thumb32_load_byte::thumb32_ldrb_lit(ir, inst),
-        LDRB_imm_t3 => thumb32_load_byte::thumb32_ldrb_imm8(ir, inst),
-        LDRB_imm_t2 => thumb32_load_byte::thumb32_ldrb_imm12(ir, inst),
-        LDRB_reg => thumb32_load_byte::thumb32_ldrb_reg(ir, inst),
+        StrReg => thumb32_store_single_data_item::thumb32_str_reg(ir, inst),
+        LdrbLit => thumb32_load_byte::thumb32_ldrb_lit(ir, inst),
+        LdrbImmT3 => thumb32_load_byte::thumb32_ldrb_imm8(ir, inst),
+        LdrbImmT2 => thumb32_load_byte::thumb32_ldrb_imm12(ir, inst),
+        LdrbReg => thumb32_load_byte::thumb32_ldrb_reg(ir, inst),
         LDRBT => thumb32_load_byte::thumb32_ldrbt(ir, inst),
-        STRB_imm_1 => thumb32_store_single_data_item::thumb32_strb_imm_1(ir, inst),
-        STRB_imm_2 => thumb32_store_single_data_item::thumb32_strb_imm_2(ir, inst),
-        STRB_imm_3 => thumb32_store_single_data_item::thumb32_strb_imm_3(ir, inst),
+        StrbImm1 => thumb32_store_single_data_item::thumb32_strb_imm_1(ir, inst),
+        StrbImm2 => thumb32_store_single_data_item::thumb32_strb_imm_2(ir, inst),
+        StrbImm3 => thumb32_store_single_data_item::thumb32_strb_imm_3(ir, inst),
         STRBT => thumb32_store_single_data_item::thumb32_strbt(ir, inst),
-        STRB_reg => thumb32_store_single_data_item::thumb32_strb(ir, inst),
-        LDRH_lit => thumb32_load_halfword::thumb32_ldrh_lit(ir, inst),
-        LDRH_reg => thumb32_load_halfword::thumb32_ldrh_reg(ir, inst),
-        LDRH_imm_t3 => thumb32_load_halfword::thumb32_ldrh_imm8(ir, inst),
-        LDRH_imm_t2 => thumb32_load_halfword::thumb32_ldrh_imm12(ir, inst),
+        StrbReg => thumb32_store_single_data_item::thumb32_strb(ir, inst),
+        LdrhLit => thumb32_load_halfword::thumb32_ldrh_lit(ir, inst),
+        LdrhReg => thumb32_load_halfword::thumb32_ldrh_reg(ir, inst),
+        LdrhImmT3 => thumb32_load_halfword::thumb32_ldrh_imm8(ir, inst),
+        LdrhImmT2 => thumb32_load_halfword::thumb32_ldrh_imm12(ir, inst),
         LDRHT => thumb32_load_halfword::thumb32_ldrht(ir, inst),
-        STRH_imm_1 => thumb32_store_single_data_item::thumb32_strh_imm_1(ir, inst),
-        STRH_imm_2 => thumb32_store_single_data_item::thumb32_strh_imm_2(ir, inst),
-        STRH_imm_3 => thumb32_store_single_data_item::thumb32_strh_imm_3(ir, inst),
+        StrhImm1 => thumb32_store_single_data_item::thumb32_strh_imm_1(ir, inst),
+        StrhImm2 => thumb32_store_single_data_item::thumb32_strh_imm_2(ir, inst),
+        StrhImm3 => thumb32_store_single_data_item::thumb32_strh_imm_3(ir, inst),
         STRHT => thumb32_store_single_data_item::thumb32_strht(ir, inst),
-        STRH_reg => thumb32_store_single_data_item::thumb32_strh(ir, inst),
-        LDRSB_lit => thumb32_load_byte::thumb32_ldrsb_lit(ir, inst),
-        LDRSB_imm_t2 => thumb32_load_byte::thumb32_ldrsb_imm8(ir, inst),
-        LDRSB_imm_t1 => thumb32_load_byte::thumb32_ldrsb_imm12(ir, inst),
-        LDRSB_reg => thumb32_load_byte::thumb32_ldrsb_reg(ir, inst),
+        StrhReg => thumb32_store_single_data_item::thumb32_strh(ir, inst),
+        LdrsbLit => thumb32_load_byte::thumb32_ldrsb_lit(ir, inst),
+        LdrsbImmT2 => thumb32_load_byte::thumb32_ldrsb_imm8(ir, inst),
+        LdrsbImmT1 => thumb32_load_byte::thumb32_ldrsb_imm12(ir, inst),
+        LdrsbReg => thumb32_load_byte::thumb32_ldrsb_reg(ir, inst),
         LDRSBT => thumb32_load_byte::thumb32_ldrsbt(ir, inst),
-        LDRSH_lit => thumb32_load_halfword::thumb32_ldrsh_lit(ir, inst),
-        LDRSH_reg => thumb32_load_halfword::thumb32_ldrsh_reg(ir, inst),
-        LDRSH_imm_t2 => thumb32_load_halfword::thumb32_ldrsh_imm8(ir, inst),
-        LDRSH_imm_t1 => thumb32_load_halfword::thumb32_ldrsh_imm12(ir, inst),
+        LdrshLit => thumb32_load_halfword::thumb32_ldrsh_lit(ir, inst),
+        LdrshReg => thumb32_load_halfword::thumb32_ldrsh_reg(ir, inst),
+        LdrshImmT2 => thumb32_load_halfword::thumb32_ldrsh_imm8(ir, inst),
+        LdrshImmT1 => thumb32_load_halfword::thumb32_ldrsh_imm12(ir, inst),
         LDRSHT => thumb32_load_halfword::thumb32_ldrsht(ir, inst),
 
         // Load/Store dual, exclusive, and table branch
         LDA => thumb32_load_store_dual::thumb32_lda(ir, inst),
-        LDRD_imm_1 => thumb32_load_store_dual::thumb32_ldrd_imm_1(ir, inst),
-        LDRD_imm_2 => thumb32_load_store_dual::thumb32_ldrd_imm_2(ir, inst),
-        LDRD_lit_1 => thumb32_load_store_dual::thumb32_ldrd_lit_1(ir, inst),
-        LDRD_lit_2 => thumb32_load_store_dual::thumb32_ldrd_lit_2(ir, inst),
-        STRD_imm_1 => thumb32_load_store_dual::thumb32_strd_imm_1(ir, inst),
-        STRD_imm_2 => thumb32_load_store_dual::thumb32_strd_imm_2(ir, inst),
+        LdrdImm1 => thumb32_load_store_dual::thumb32_ldrd_imm_1(ir, inst),
+        LdrdImm2 => thumb32_load_store_dual::thumb32_ldrd_imm_2(ir, inst),
+        LdrdLit1 => thumb32_load_store_dual::thumb32_ldrd_lit_1(ir, inst),
+        LdrdLit2 => thumb32_load_store_dual::thumb32_ldrd_lit_2(ir, inst),
+        StrdImm1 => thumb32_load_store_dual::thumb32_strd_imm_1(ir, inst),
+        StrdImm2 => thumb32_load_store_dual::thumb32_strd_imm_2(ir, inst),
         LDREX => thumb32_load_store_dual::thumb32_ldrex(ir, inst),
         LDREXB => thumb32_load_store_dual::thumb32_ldrexb(ir, inst),
         LDREXH => thumb32_load_store_dual::thumb32_ldrexh(ir, inst),
@@ -250,10 +247,10 @@ pub fn translate_thumb32(
         REV16 => thumb32_misc::thumb32_rev16(ir, inst),
         REVSH => thumb32_misc::thumb32_revsh(ir, inst),
         SEL => thumb32_misc::thumb32_sel(ir, inst),
-        LSL_reg => thumb32_data_processing_register::thumb32_lsl_reg(ir, inst),
-        LSR_reg => thumb32_data_processing_register::thumb32_lsr_reg(ir, inst),
-        ASR_reg => thumb32_data_processing_register::thumb32_asr_reg(ir, inst),
-        ROR_reg => thumb32_data_processing_register::thumb32_ror_reg(ir, inst),
+        LslReg => thumb32_data_processing_register::thumb32_lsl_reg(ir, inst),
+        LsrReg => thumb32_data_processing_register::thumb32_lsr_reg(ir, inst),
+        AsrReg => thumb32_data_processing_register::thumb32_asr_reg(ir, inst),
+        RorReg => thumb32_data_processing_register::thumb32_ror_reg(ir, inst),
         SXTB => thumb32_data_processing_register::thumb32_sxtb(ir, inst),
         SXTB16 => thumb32_data_processing_register::thumb32_sxtb16(ir, inst),
         SXTAB => thumb32_data_processing_register::thumb32_sxtab(ir, inst),
@@ -273,8 +270,8 @@ pub fn translate_thumb32(
         ISB => thumb32_control::thumb32_isb(ir),
 
         // System
-        MRS_reg => thumb32_control::thumb32_mrs_reg(ir, inst),
-        MSR_reg => thumb32_control::thumb32_msr_reg(ir, inst),
+        MrsReg => thumb32_control::thumb32_mrs_reg(ir, inst),
+        MsrReg => thumb32_control::thumb32_msr_reg(ir, inst),
         UDF | BKPT => thumb32_control::thumb32_udf(ir),
         NOP => thumb32_control::thumb32_nop(),
         SEV => thumb32_control::thumb32_sev(ir, options),
@@ -283,14 +280,14 @@ pub fn translate_thumb32(
         WFI => thumb32_control::thumb32_wfi(ir, options),
         YIELD => thumb32_control::thumb32_yield(ir, options),
 
-        PLD_lit => thumb32_load_byte::thumb32_pld_lit(ir, inst, options),
-        PLD_imm8 => thumb32_load_byte::thumb32_pld_imm8(ir, inst, options),
-        PLD_imm12 => thumb32_load_byte::thumb32_pld_imm12(ir, inst, options),
-        PLD_reg => thumb32_load_byte::thumb32_pld_reg(ir, inst, options),
-        PLI_lit => thumb32_load_byte::thumb32_pli_lit(ir, inst, options),
-        PLI_imm8 => thumb32_load_byte::thumb32_pli_imm8(ir, inst, options),
-        PLI_imm12 => thumb32_load_byte::thumb32_pli_imm12(ir, inst, options),
-        PLI_reg => thumb32_load_byte::thumb32_pli_reg(ir, inst, options),
+        PldLit => thumb32_load_byte::thumb32_pld_lit(ir, inst, options),
+        PldImm8 => thumb32_load_byte::thumb32_pld_imm8(ir, inst, options),
+        PldImm12 => thumb32_load_byte::thumb32_pld_imm12(ir, inst, options),
+        PldReg => thumb32_load_byte::thumb32_pld_reg(ir, inst, options),
+        PliLit => thumb32_load_byte::thumb32_pli_lit(ir, inst, options),
+        PliImm8 => thumb32_load_byte::thumb32_pli_imm8(ir, inst, options),
+        PliImm12 => thumb32_load_byte::thumb32_pli_imm12(ir, inst, options),
+        PliReg => thumb32_load_byte::thumb32_pli_reg(ir, inst, options),
 
         // Unmatched Thumb32 encoding → UndefinedInstruction with the full
         // RaiseException lifecycle (PC+4 for a 4-byte Thumb32 instruction),
@@ -309,12 +306,10 @@ pub fn translate_thumb32(
 mod tests {
     use super::*;
     use crate::frontend::a32::decoder_thumb32::decode_thumb32;
-    use crate::frontend::a32::fpscr::FPSCR;
-    use crate::frontend::a32::psr::PSR;
-    use crate::frontend::a32::types::Reg;
     use crate::ir::block::Block;
     use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
     use crate::ir::opcode::Opcode;
+    use crate::ir::value::Value;
 
     fn translated_exception(raw: u32, options: TranslationOptions) -> Option<u64> {
         let loc = A32LocationDescriptor::at(0x1000).set_t_flag(true);
@@ -337,7 +332,6 @@ mod tests {
     #[test]
     fn thumb32_unknown_raises_undefined_with_full_lifecycle() {
         use crate::ir::terminal::Terminal;
-        use crate::ir::value::Value;
         let mut block = Block::new(LocationDescriptor::new(0));
         let loc = A32LocationDescriptor::at(0x1000).set_t_flag(true);
         let cont = {

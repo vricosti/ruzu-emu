@@ -994,9 +994,9 @@ mod tests {
 
     fn make_test_callbacks() -> RunCodeCallbacks {
         RunCodeCallbacks {
-            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
-            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
-            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as *const () as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as *const () as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as *const () as u64, 0)),
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,

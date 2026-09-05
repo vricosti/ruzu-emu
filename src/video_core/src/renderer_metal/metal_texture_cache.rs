@@ -301,15 +301,13 @@ impl MetalTextureCacheRuntime {
             let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
             attachment.setTexture(Some(source.handle()));
             attachment.setResolveTexture(Some(destination.handle()));
-            unsafe {
-                attachment.setSlice(copy.source_slice);
-                attachment.setResolveSlice(copy.destination_slice);
-                attachment.setResolveLevel(copy.destination_level);
-                descriptor.setRenderTargetWidth(copy.source_size.width);
-                descriptor.setRenderTargetHeight(copy.source_size.height);
-                descriptor.setRenderTargetArrayLength(1);
-                descriptor.setDefaultRasterSampleCount(source.samples() as usize);
-            }
+            attachment.setSlice(copy.source_slice);
+            attachment.setResolveSlice(copy.destination_slice);
+            attachment.setResolveLevel(copy.destination_level);
+            descriptor.setRenderTargetWidth(copy.source_size.width);
+            descriptor.setRenderTargetHeight(copy.source_size.height);
+            descriptor.setRenderTargetArrayLength(1);
+            descriptor.setDefaultRasterSampleCount(source.samples() as usize);
             attachment.setLoadAction(MTLLoadAction::Load);
             attachment.setStoreAction(MTLStoreAction::StoreAndMultisampleResolve);
             self.scheduler().begin_render_pass(&descriptor)?;
@@ -1603,11 +1601,9 @@ mod tests {
             blue: 0.0,
             alpha: 1.0,
         });
-        unsafe {
-            clear_pass.setRenderTargetWidth(4);
-            clear_pass.setRenderTargetHeight(4);
-            clear_pass.setDefaultRasterSampleCount(source_image.samples() as usize);
-        }
+        clear_pass.setRenderTargetWidth(4);
+        clear_pass.setRenderTargetHeight(4);
+        clear_pass.setDefaultRasterSampleCount(source_image.samples() as usize);
         runtime.scheduler().begin_render_pass(&clear_pass).unwrap();
         runtime.scheduler().end_render_pass();
         runtime

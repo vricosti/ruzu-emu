@@ -122,6 +122,37 @@ fn configure_windows_gsk_renderer() -> bool {
     true
 }
 
+#[cfg(target_os = "macos")]
+fn configure_macos_bundle_runtime() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let Some(contents) = executable.parent().and_then(std::path::Path::parent) else {
+        return;
+    };
+    if contents.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+        return;
+    }
+
+    let resources = contents.join("Resources");
+    let schema_dir = resources.join("share/glib-2.0/schemas");
+    if schema_dir.join("gschemas.compiled").is_file()
+        && std::env::var_os("GSETTINGS_SCHEMA_DIR").is_none()
+    {
+        std::env::set_var("GSETTINGS_SCHEMA_DIR", schema_dir);
+    }
+
+    let loader_cache = resources.join("gdk-pixbuf-2.0/loaders.cache");
+    if loader_cache.is_file() && std::env::var_os("GDK_PIXBUF_MODULE_FILE").is_none() {
+        std::env::set_var("GDK_PIXBUF_MODULE_FILE", loader_cache);
+    }
+
+    let gio_modules = contents.join("PlugIns/gio");
+    if gio_modules.is_dir() && std::env::var_os("GIO_EXTRA_MODULES").is_none() {
+        std::env::set_var("GIO_EXTRA_MODULES", gio_modules);
+    }
+}
+
 /// Apply the selected interface locale to the live launcher, matching
 /// upstream's `GMainWindow::OnLanguageChanged` retranslation step.
 pub(crate) fn retranslate_application() {
@@ -158,6 +189,11 @@ fn configure_linux_gdk_backend() -> bool {
 }
 
 fn main() -> glib::ExitCode {
+    // Homebrew's GTK runtime uses installation-prefix paths. A distributable
+    // app supplies equivalent resources inside Contents/Resources instead.
+    #[cfg(target_os = "macos")]
+    configure_macos_bundle_runtime();
+
     // This must happen before constructing any GTK object: GtkWindow reads
     // GTK_CSD while deciding how each native toplevel is decorated.
     #[cfg(target_os = "windows")]

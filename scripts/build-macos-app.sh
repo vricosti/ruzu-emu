@@ -102,8 +102,63 @@ if [[ -z "$moltenvk" || ! -f "$moltenvk" ]]; then
 fi
 install -m 755 "$moltenvk" "$frameworks/libMoltenVK.dylib"
 
+# GTK is not a macOS system framework. Bundle the runtime data that cannot be
+# discovered through Mach-O dependency traversal before collecting all dylibs.
+if command -v brew >/dev/null 2>&1; then
+    # Homebrew links libraries through opt/<formula>, but formula post-install
+    # hooks merge GTK's shared schemas and loader registry into the global
+    # prefix. Looking in the formula kegs silently produces an incomplete app.
+    schema_source="$brew_prefix/share/glib-2.0/schemas"
+    schema_dir="$resources/share/glib-2.0/schemas"
+    if [[ ! -f "$schema_source/gschemas.compiled" ]]; then
+        echo "Missing compiled GTK schemas: $schema_source/gschemas.compiled" >&2
+        exit 1
+    fi
+    mkdir -p "$schema_dir"
+    find -L "$schema_source" -maxdepth 1 -type f \
+        \( -name '*.xml' -o -name '*.override' \) -exec install -m 644 {} "$schema_dir" \;
+    if find "$schema_dir" -maxdepth 1 -name '*.xml' -type f | grep -q .; then
+        glib-compile-schemas "$schema_dir"
+    else
+        install -m 644 "$schema_source/gschemas.compiled" "$schema_dir"
+    fi
+
+    loader_cache="$(find -L "$brew_prefix/lib/gdk-pixbuf-2.0" -name loaders.cache -type f -print -quit)"
+    if [[ -z "$loader_cache" ]]; then
+        echo "Missing Homebrew GDK-Pixbuf loader cache." >&2
+        exit 1
+    fi
+    bundled_loader_cache="$resources/gdk-pixbuf-2.0/loaders.cache"
+    mkdir -p "$(dirname "$bundled_loader_cache")"
+    loader_modules=()
+
+    while IFS= read -r loader; do
+        [[ -f "$loader" ]] || {
+            echo "GDK-Pixbuf loader listed in the cache is missing: $loader" >&2
+            exit 1
+        }
+        loader_modules+=("$loader")
+    done < <(sed -n 's#^"\(/[^" ]*\)"$#\1#p' "$loader_cache")
+
+    if [[ ${#loader_modules[@]} -eq 0 ]]; then
+        echo "The GDK-Pixbuf loader cache contains no modules: $loader_cache" >&2
+        exit 1
+    fi
+
+    # dyld expands @rpath when GModule loads these paths, making the cache
+    # relocatable with the application bundle.
+    sed -E 's#^"[^"]*/([^/"]+)"$#"@rpath/\1"#' \
+        "$loader_cache" > "$bundled_loader_cache"
+fi
+
+"$repo_root/scripts/macos-bundle-dependencies.sh" "$staging" "${loader_modules[@]}"
+
 plutil -lint "$contents/Info.plist" >/dev/null
-codesign --force --deep --sign - "$staging" >/dev/null
+while IFS= read -r nested_code; do
+    codesign --force --sign - "$nested_code" >/dev/null
+done < <(find "$frameworks" -type f -print | sort)
+codesign --force --sign - "$macos/ruzu" >/dev/null
+codesign --force --sign - "$staging" >/dev/null
 
 if [[ -e "$app" ]]; then
     rm -rf "$app"

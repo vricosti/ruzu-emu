@@ -1,27 +1,23 @@
-# Current upstream parity debt
+# Upstream parity notes
 
-This file contains only active differences confirmed in the current source tree against
-`~/Dev/emulators/zuyu`. Implementation history, diagnostics, commands, runtime logs, and audit
-procedures are intentionally omitted.
+Keep actionable parity debt, intentional adaptations, significant corrections, and concrete
+binary-layout contracts, with their upstream file references. Historical entries are scoped to
+their audit date; they are not a certification of the current tree. Eden is the current reference;
+older entries may refer to zuyu or dynarmic.
+
+Omit empty audit categories, "nothing to fix" statements, generic unchanged-layout claims,
+successful build/test totals, launch commands, binary paths, and temporary logs. Keep unresolved
+test failures and validation limits. Do not append an entry for documentation-only cleanup.
 
 ## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
 
 ### Intentional differences
+
 - Rust represents upstream `Kernel::KThread*` backend/frontend arguments as stable numeric thread
   identifiers. Kernel thread ownership remains in the process registries, avoiding non-owning raw
   pointers across the debugger connection thread.
 - Rust traits replace the C++ virtual base classes. The eventual frontend/backend wiring passes the
   backend explicitly rather than constructing a self-referential Rust object.
-
-### Unintentional differences (to fix)
-- None.
-
-### Missing items
-- None in the action enum or declared backend/frontend operations.
-
-### Binary layout verification
-- N/A: these interfaces are not serialized. A focused test verifies the complete action set and its
-  upstream declaration order.
 
 ## Kernel
 
@@ -72,8 +68,6 @@ procedures are intentionally omitted.
 - The LDN service has helper methods for a small subset of commands, but its IPC table remains
   disconnected as listed above and it does not own upstream's event and network lifecycle.
 
-## Input and frontends
-
 ## 2026-08-09 — `ruzu/{src/game_list.rs,src/uisettings.rs,src/configuration/qt_config.rs,src/main.rs,i18n/catalogs.json}` vs `src/yuzu/{game_list.cpp,game_list_p.h,uisettings.h,configuration/qt_config.cpp}` and `dist/languages/*.ts` (`GameListFavorites`, `ToggleFavorite`, `AddFavorite`, `RemoveFavorite`, and `AddFavoritesPopup`)
 
 ### Intentional differences
@@ -94,10 +88,6 @@ procedures are intentionally omitted.
 The `favorites_expanded` setting is loaded, applied to the GTK tree row, updated on expansion changes,
 and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
-### Binary layout verification
-
-- Not applicable. The changed state is GTK frontend model data only.
-
 ## 2026-08-09 — `src/ruzu/src/game_list.rs` vs `src/yuzu/game_list.cpp` (`GameList::PopupContextMenu` and `AddGamePopup`)
 
 ### Intentional differences
@@ -107,10 +97,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   action group, so ruzu installs that group and parents/styles the empty `GtkPopoverMenu` before
   assigning its menu model. This preserves upstream's single layout pass and avoids initially
   rendering Favorite as a stateless row before rebuilding it as a checkbox.
-
-### Binary layout verification
-
-- Not applicable. This only changes GTK context-menu construction order.
 
 ## 2026-08-09 — `src/ruzu/src/main_window.rs` vs `src/yuzu/main.{h,cpp}` (`GMainWindow::OnRestartGame`)
 
@@ -123,11 +109,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - A pending restart is discarded when teardown reports a failure or the application window is
   closing, preventing a shutdown callback from launching a new session behind an error or close.
 
-### Binary layout verification
-
-- Not applicable. This changes frontend action wiring and lifecycle state only. A focused regression
-  test verifies that the retained restart path survives only a successful non-closing shutdown.
-
 ## 2026-08-09 — `src/ruzu/src/configuration/qt_config.rs`, `configure_dialog.rs`, and `main.rs` vs `src/frontend_common/config.cpp` and `src/yuzu/configuration/qt_config.cpp`
 
 ### Intentional differences
@@ -135,11 +116,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Rust keeps generic settings, Qt-compatible controls, and GTK UI values in separate writers over
   the same INI file. They execute in upstream order: generic `ReadValues`/`SaveValues` first, then
   frontend-owned controls and UI values.
-
-### Binary layout verification
-
-- Not applicable. A focused regression test verifies that the global `[Renderer]` category is read
-  and that `backend=0` selects OpenGL instead of retaining the Vulkan default.
 
 ### Missing items
 
@@ -153,8 +129,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The Android Oboe audio backend is represented by a no-op stub in
   `src/audio_core/src/sink/oboe_sink.rs`.
 
-## Video core
-
 ## 2026-08-09 — `src/ruzu/src/boot.rs`, `main_window.rs`, and `render_window_x11.rs` vs `src/video_core/video_core.cpp` and `src/yuzu/bootmanager.{h,cpp}`
 
 ### Intentional differences
@@ -163,6 +137,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   with a GLX-compatible visual and retains an `Arc`-owned root share group. Renderer and shader
   worker contexts share that root, matching upstream `OpenGLSharedContext` ownership and thread
   behavior without Qt objects.
+
 ### Missing items
 
 - The GTK frontend's shared OpenGL context bridge currently exists only for Linux/X11. The macOS
@@ -174,11 +149,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   Upstream propagates renderer creation failure through `CreateGPU`, allowing the frontend to show
   an error without terminating the process; Rust's current `System::subsystem_factory` callback
   cannot return a `Result` yet.
-
-### Binary layout verification
-
-- Not applicable. This slice changes frontend native-context ownership and renderer dispatch; no
-  guest-visible structure or raw payload layout changes.
 
 ## 2026-08-09 — `src/video_core/src/renderer_vulkan/turbo_mode.rs`, `renderer_vulkan/texture_cache.rs`, and `host_shaders/vulkan_turbo_mode.comp` vs `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}`, `vk_texture_cache.cpp`, and `host_shaders/vulkan_turbo_mode.comp`
 
@@ -192,11 +162,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   Vulkan `Device` wrapper. It uses the same predicate as upstream `Image::NeedsScaleHelper` and the
   same color or combined depth/stencil helper blits.
 
-### Binary layout verification
-
-- The turbo compute shader is byte-for-byte identical to upstream. This slice introduces no
-  guest-visible raw-memory structure.
-
 ## 2026-08-09 — `src/video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `src/video_core/host1x/codec_types.h`
 
 ### Intentional differences
@@ -205,12 +170,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `DecoderImpl` trait; upstream retains the register owner in the decoder base class.
 - Rust `Vec<u8>` values replace upstream `ScratchBuffer` and `Stream` owners without changing the
   emitted VP8/VP9 byte order or frame buffering lifecycle.
-
-### Binary layout verification
-
-- `Vp8PictureInfo` is `0xc0` bytes. `PictureInfo`, `EntropyProbs`, and `Vp9EntropyProbs` are
-  respectively `0x100`, `0xea0`, and `0x7b4` bytes; compile-time offset assertions cover the fields
-  read from NVDEC memory. Focused tests verify VP8 frame tags and VP9 range/bitstream encoder bytes.
 
 ## 2026-08-09 — `src/common/src/thread_worker.rs`, `src/video_core/src/rasterizer_interface.rs`, and renderer disk-cache loaders vs `src/common/thread_worker.h`, `src/video_core/rasterizer_interface.h`, and renderer shader caches
 
@@ -224,10 +183,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The command-line frontend supplies a never-signaled cancellation owner because it has no loading
   dialog. The GTK frontend forwards the same stop state that owns its launch lifecycle.
 
-### Binary layout verification
-
-- Not applicable: this slice changes synchronization and owner propagation only.
-
 ## 2026-08-09 — `src/video_core/src/renderer_opengl/gl_state_tracker.rs` and `gl_rasterizer.rs` vs `src/video_core/renderer_opengl/gl_state_tracker.{h,cpp}` and `gl_rasterizer.cpp`
 
 ### Intentional differences
@@ -238,11 +193,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The scoped lock over the buffer and texture caches uses the existing retrying dual-lock helper
   because `parking_lot::ReentrantMutex` has no direct `std::scoped_lock` equivalent.
 
-### Binary layout verification
-
-- Not applicable: this slice changes owner references and lifecycle ordering only; no guest-visible
-  structure is serialized or copied as raw bytes.
-
 ## 2026-08-09 — `src/video_core/src/texture_cache/texture_cache_base.rs` vs `src/video_core/texture_cache/texture_cache_base.h` and `control/channel_state_cache.inc`
 
 ### Intentional differences
@@ -250,10 +200,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - `channel_gpu_memory` is a Rust shared-owner mirror of upstream's live
   `channel_state->gpu_memory` reference. It is resynchronized after channel erasure so releasing an
   inactive channel preserves the active memory owner and releasing the active channel clears it.
-
-### Binary layout verification
-
-- Not applicable: this slice only updates channel ownership state.
 
 ## 2026-08-09 — `src/video_core/src/renderer_opengl/` vs `src/video_core/renderer_opengl/`
 
@@ -273,14 +219,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   operation boundary.
 - Backend `Image` state is stored separately from generic `ImageBase` state. Methods such as
   scaling therefore receive the paired base image explicitly instead of using C++ inheritance.
-
-### Binary layout verification
-
-- `ComputePipelineKey` is 24 bytes, `GraphicsPipelineKey` is 624 bytes, the GLASM bindless SSBO
-  payload is 16 bytes, and `ScreenRectVertex` is four contiguous `GLfloat` values. Focused tests
-  verify these raw-byte contracts.
-
-## Shader recompiler and JIT
 
 ## 2026-08-09 — `src/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64_vector_floating_point.rs`, and x64 exclusive-memory emitters vs Dynarmic `backend/arm64/emit_arm64_{floating_point,vector_floating_point}.cpp` and `backend/x64/emit_x64_memory.cpp.inc`
 
@@ -302,15 +240,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `EmitFastmemVAddr` requests one. Exclusive writes retain upstream's unconditional deferred fault
   stub and post-callback resume point.
 
-### Binary layout verification
-
-- No guest payload layout changes. Focused x64 tests cover 8/16/32/64/128-bit fallback generation,
-  successful `LDAXR`/`STLXR` and `LDXP` return paths, host exception-handler capability, and a
-  fault redirected to the raw exclusive callback.
-- The ARM64 scalar/vector FP routing and half/fixed-16 conversion tests compile for
-  `aarch64-unknown-linux-gnu` and pass under QEMU. This also verifies that the former cross-target
-  exception-handler build failure is no longer present.
-
 ### Unintentional differences (to fix)
 
 - rdynarmic's ARM64 backend still has a catch-all error for unported IR opcodes. Implemented
@@ -327,11 +256,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   wakes and joins the worker, accounts the final whole-second interval, then persists the database.
 - A mutex protects the database because GTK can read it while the timestamp worker updates it.
 
-### Binary layout verification
-
-- PASS: each entry is two consecutive little-endian `u64` values and occupies 16 bytes, matching
-  Eden's raw `PlayTimeElement` array in `playtime.bin`.
-
 ## 2026-08-09 — `src/ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/qt_common/game_list/{model,worker}.{h,cpp}`
 
 ### Intentional differences
@@ -347,10 +271,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The internal action identifier remains `properties`, while its visible label is Eden's
   `Configure Game`.
 
-### Binary layout verification
-
-- Not applicable to the GTK model; the shared play-time file layout is verified separately.
-
 ## 2026-08-09 — `src/ruzu/src/{boot,main_window}.rs` vs Eden `src/yuzu/main_window.{h,cpp}`
 
 ### Intentional differences
@@ -358,10 +278,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Eden starts play-time accounting directly in `OnStartGame`. Ruzu's boot thread emits a lossless
   `Started { program_id }` event so GTK performs the equivalent transition. Pause, resume, stop,
   restart, and guest-driven exit retain Eden's ordering.
-
-### Binary layout verification
-
-- Not applicable: this changes frontend lifecycle events only.
 
 ## 2026-08-09 — `src/ruzu/src/configuration/configure_per_game_addons.rs` vs Eden `src/yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`
 
@@ -371,10 +287,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   directory providers while Configure Game is open, then queries the same `PatchManager` data.
 - GTK uses a `gio::ListStore` rather than `QStandardItemModel`; patch name, version, enabled state,
   sorting, and disabled-addon persistence retain their upstream roles.
-
-### Binary layout verification
-
-- Not applicable: this is host frontend state.
 
 ## 2026-08-09 — `src/common/src/settings.rs` vs Eden `src/common/settings.h`
 
@@ -386,10 +298,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   instead of Eden's C++ linkage and Qt widget. The five enum values, persisted key, default, range,
   per-game switchability, and helper predicates match Eden.
 
-### Binary layout verification
-
-- Not applicable: this setting is not guest-visible.
-
 ## 2026-08-09 — `src/core/src/file_sys/registered_cache.rs` vs Eden `src/core/file_sys/registered_cache.{h,cpp}`
 
 ### Intentional differences
@@ -398,11 +306,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   handles. The raw `ContentRecordType` index and seven-entry contract are unchanged.
 - `open_container_as_nsp` probes NSP and then XCI directly, preserving Eden's final parser fallback
   without introducing a reverse dependency from `file_sys` to the loader dispatcher.
-
-### Binary layout verification
-
-- Not applicable: manual-provider entries are host-only. Focused tests cover highest-version
-  selection, descending update order, and clearing versioned entries.
 
 ## 2026-08-09 — `src/video_core/src/engines/maxwell_3d.rs` and `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.h` and `src/video_core/buffer_cache/buffer_cache.h`
 
@@ -420,11 +323,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The external recursive buffer-cache mutex is held in an `Arc`. This keeps the mutex owned by the
   cache while allowing Vulkan query operations to clone the lock before mutating the cache, instead
   of creating an aliased raw pointer to a field of the active mutable reference.
-
-### Binary layout verification
-
-- PASS: focused register tests verify that `0xffff_fff0` and `0xffff_ffe0` are exposed as `-16`
-  and `-32`; consumers cast back to unsigned values without clamping or normalization.
 
 ## 2026-08-09 — `src/video_core/src/renderer_vulkan/query_cache.rs`, `scheduler.rs`, `vk_rasterizer.rs`, `renderer_vulkan.rs`, and `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`, `vk_scheduler.{h,cpp}`, `vk_rasterizer.{h,cpp}`, `renderer_vulkan.{h,cpp}`, and `vk_device.{h,cpp}`
 
@@ -460,14 +358,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   active Vulkan setup in scheduler-shared state so render-pass transitions can pause it without a
   raw `QueryCacheRuntime*`.
 
-### Binary layout verification
-
-- PASS: the compute push-constant structs are `repr(C)` and verified as 4 bytes for conditional
-  rendering and 16 bytes for prefix scan. The three GLSL sources are byte-identical to Eden.
-  Focused tests cover slot ordering, cumulative ZPass reports, primitive topology conversion,
-  unsynchronized fence rejection, empty ZPass reports, scan size classes and producer barriers,
-  TFB stream mapping, query payload/timestamp writes, and draw preparation ordering.
-
 ## 2026-08-09 — `src/video_core/src/renderer_vulkan/compute_pass.rs`, `descriptor_pool.rs`, and `update_descriptor.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.{h,cpp}`, `vk_descriptor_pool.{h,cpp}`, and `vk_update_descriptor.{h,cpp}`
 
 ### Intentional differences
@@ -478,11 +368,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Raw descriptor payload pointers are wrapped in a `Send` newtype. The queue owns one fixed
   allocation for the renderer lifetime, and its frame ring waits for the worker before recycling a
   slice, matching Eden's recorded `const DescriptorUpdateEntry*` lifetime.
-
-### Binary layout verification
-
-- PASS: compute descriptor templates use `size_of::<DescriptorUpdateEntry>()` as Eden does. Unit
-  tests verify the union size/alignment and the two- and three-buffer template strides.
 
 ## 2026-08-09 — `src/core/src/core.rs` and `src/core/src/hle/kernel/kernel.rs` vs Eden `src/core/hle/kernel/kernel.cpp`
 
@@ -497,21 +382,12 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Separate application and system `KSystemResource` ownership remains to be ported before the two
   memory-block slab managers can be represented independently.
 
-### Binary layout verification
-
-- PASS: no guest-visible binary layout is changed; the regression test verifies both upstream
-  capacities and their combined runtime value.
-
 ## 2026-08-09 — `src/core/src/hle/kernel/k_shared_memory.rs` vs Eden `src/core/hle/kernel/k_shared_memory.{h,cpp}`
 
 ### Unintentional differences (fixed)
 
 - Allocation failure now returns `Kernel::ResultOutOfMemory` (`0xD001`) as Eden does; the previous
   raw `0xCE01` encoded `Kernel::ResultOutOfResource`.
-
-### Binary layout verification
-
-- PASS: no structure layout changed.
 
 ## 2026-08-18 — workspace SDL manifests vs Eden `src/audio_core/CMakeLists.txt`, `src/input_common/CMakeLists.txt`, and `src/yuzu_cmd/CMakeLists.txt`
 
@@ -526,20 +402,11 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `audio_core` and `ruzu_cmd` use the higher-level `sdl3` crate while still
   resolving the same `sdl3-sys` package and native SDL library.
 
-### Unintentional differences (to fix)
-
-- None found in the desktop SDL3 dependency ownership or generation.
-
 ### Missing items
 
 - Cross-target dependency resolution was verified for Windows MSVC, macOS
   aarch64, and FreeBSD. Native linking and runtime execution still require CI
   or hardware for each target.
-
-### Binary layout verification
-
-- N/A: this change affects native dependency selection only. `audio_core` and
-  `input_common` unit tests pass with the resolved SDL 3.4.14 build.
 
 ## 2026-08-18 — `src/ruzu/Info.plist` and `scripts/build-macos-app.sh` vs Eden `src/yuzu/Info.plist` and `src/yuzu/CMakeLists.txt`
 
@@ -553,20 +420,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The local developer bundle receives an ad-hoc signature after MoltenVK is copied. Distribution
   identity signing and notarization remain release-pipeline responsibilities.
 
-### Unintentional differences (to fix)
-
-- None found in the application bundle layout or MoltenVK lookup path.
-
 ### Missing items
 
 - Ruzu has no liquid-glass `Assets.car` equivalent to Eden's asset catalog.
-
-### Binary layout verification
-
-- PASS: the generated bundle contains an arm64 `Contents/MacOS/ruzu`, a valid `Info.plist`,
-  `Contents/Resources/ruzu.icns`, and an arm64
-  `Contents/Frameworks/libMoltenVK.dylib`. `codesign --verify --deep --strict` passes, and a
-  LaunchServices smoke test starts the bundled executable.
 
 ## 2026-08-18 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.cpp`
 
@@ -578,19 +434,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - `scripts/build-macos-app.sh` likewise copies Eden's bundled MoltenVK when available, after an
   explicit `MOLTENVK_LIBRARY` override and before the Homebrew fallback.
 
-### Unintentional differences (to fix)
-
-- None found in lookup priority. The previous development fallback selected a different emulator's
-  MoltenVK 1.4.2 while the current Eden build embeds MoltenVK 1.4.1.
-
 ### Missing items
 
 - Distribution builds still need a release-owned MoltenVK artifact rather than relying on a sibling
   development checkout.
-
-### Binary layout verification
-
-- N/A: the Vulkan loader ABI is unchanged; this only selects the dynamic library implementation.
 
 ## 2026-08-18 — `src/ruzu_cmd/src/emu_window/emu_window_sdl3_vk.rs` vs Eden `src/yuzu_cmd/emu_window/emu_window_sdl3_vk.cpp`
 
@@ -601,43 +448,14 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   its Vulkan surface path consumes it as a `CAMetalLayer`; the Rust split keeps the consumed native
   object explicit without changing the Cocoa ownership boundary.
 
-### Unintentional differences (to fix)
-
-- None. The SDL3 migration had left `WindowSystemInfo::type_` at `Headless` on macOS; it now assigns
-  `Cocoa` before publishing the Metal layer, matching Eden's constructor ordering.
-
-### Missing items
-
-- None for macOS window-system selection.
-
-### Binary layout verification
-
-- N/A: no serialized or guest-visible structure is changed.
-
 ## 2026-08-18 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
 
-### Intentional differences
-
-- None in the format-property probe list.
-
 ### Unintentional differences (to fix)
 
-- None. The ten ETC2/EAC formats at the end of Eden's `GetFormatProperties` format list are now
-  queried by ruzu as well. Previously they missed the cache and `is_format_supported` conservatively
-  returned true after logging `Unimplemented format query`, which also prevented device-aware
-  storage, blit, and texel-buffer capability checks from using the real driver properties.
 - Eden explicitly disables `robustBufferAccess2` and `robustImageAccess2` while retaining
   `nullDescriptor`. Ruzu now applies the same feature mutation before passing the queried feature
   chain to `vkCreateDevice`; previously all robustness2 features advertised by MoltenVK remained
   enabled.
-
-### Missing items
-
-- None for the format-property probe list or robustness2 feature selection.
-
-### Binary layout verification
-
-- N/A: the change only extends physical-device capability discovery.
 
 ## 2026-08-18 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
 
@@ -649,25 +467,13 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None in the host occlusion-query flush lifecycle. The Vulkan `SamplesStreamer` now participates
-  in `HasUnsyncedQueries`, `PushUnsyncedQueries`, `ShouldWaitAsyncFlushes`, and
-  `PopUnsyncedQueries`. Previously it bypassed that lifecycle and called
-  `vkGetQueryPoolResults` before the corresponding fence, producing `VK_NOT_READY` and thousands
-  of unsynchronized-query errors.
 - `pending_flush_sets` is protected across the GPU and GPU-fencing threads, matching Eden's
   `flush_guard`. The initial Rust adaptation omitted this synchronization.
 
 ### Missing items
 
-- None for host occlusion-query fence synchronization. The existing Rust lease-based bank owner
+- The existing Rust lease-based bank owner
   remains an intentional structural adaptation documented in the 2026-08-09 query-cache entry.
-
-### Binary layout verification
-
-- N/A: no guest-visible structure changed. All 17 focused Vulkan query-cache tests pass. A
-  90-second title run produced zero `Query report value not synchronized` and zero
-  `vkGetQueryPoolResults ... NOT_READY` messages; the previous implementation produced roughly
-  8,000 such messages in the same startup/title interval.
 
 ## 2026-08-18 — `src/core/src/gpu_core.rs` and `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
 
@@ -682,17 +488,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None. `RequestComposite` now records the pending sync-operation fence and returns after
+- `RequestComposite` now records the pending sync-operation fence and returns after
   `TickGPU`; it no longer waits synchronously. `WaitForComposite` consumes and waits that fence at
   the next HWC tick, including Eden's zero-fence and shutdown exits.
-
-### Missing items
-
-- None for the composite request/wait lifecycle.
-
-### Binary layout verification
-
-- N/A: no guest-visible or serialized structure changed.
 
 ## 2026-08-18 — `src/core/src/hle/service/nvdrv/devices/nvdisp_disp0.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvdisp_disp0.{h,cpp}`
 
@@ -700,18 +498,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - The Rust owner forwards through `GpuCoreInterface` because `core` cannot own the concrete
   `video_core::Gpu`; the call position and behavior match Eden's direct `system.GPU()` call.
-
-### Unintentional differences (to fix)
-
-- None. `wait_for_composite` now forwards Eden's HWC synchronization point to the GPU.
-
-### Missing items
-
-- None for composite waiting.
-
-### Binary layout verification
-
-- N/A: no ABI payload changed.
 
 ## 2026-08-18 — `src/core/src/hle/service/nvnflinger/display.rs` and `hardware_composer.rs` vs Eden `src/core/hle/service/nvnflinger/display.h` and `hardware_composer.{h,cpp}`
 
@@ -722,21 +508,12 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None. `Layer` now owns Eden's `z_index` and `is_overlay` fields with the same defaults.
 - `ComposeLocked` now waits for the previous composite, releases eligible buffers before
   acquisition, interval-gates non-overlay acquisition, excludes overlays from game cadence,
   stable-sorts real z indices, composites only after a new acquisition, advances exactly one HWC
   frame, and returns one.
 - Framebuffer release numbers are absolute (`frame_number + interval`), `last_acquire_frame` is
   tracked, and overlays release independently, matching Eden's lifecycle and ordering.
-
-### Missing items
-
-- None in the framebuffer cadence and release lifecycle covered by this slice.
-
-### Binary layout verification
-
-- N/A: these are host-side service structures. The Layer default regression test passes.
 
 ## 2026-08-18 — `src/core/src/hle/service/nvnflinger/surface_flinger.rs` vs Eden `src/core/hle/service/nvnflinger/surface_flinger.{h,cpp}`
 
@@ -746,17 +523,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None. `find_layer` is again a public SurfaceFlinger-owned operation, and the overlay setter
+- `find_layer` is again a public SurfaceFlinger-owned operation, and the overlay setter
   updates the matching layer where Eden owns that mutation. Z-index writes remain owned by
   `Container`, which uses this lookup exactly as Eden does.
-
-### Missing items
-
-- None for layer lookup, z-index, visibility, blending, and overlay state.
-
-### Binary layout verification
-
-- N/A: no guest-visible structure changed.
 
 ## 2026-08-18 — `src/core/src/hle/service/vi/container.rs`, `manager_display_service.rs`, and `system_display_service.rs` vs Eden `src/core/hle/service/vi/container.{h,cpp}`, `manager_display_service.{h,cpp}`, and `system_display_service.{h,cpp}`
 
@@ -767,20 +536,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None. Container now owns set/get z-index and overlay forwarding. ManagerDisplayService exposes
-  its upstream z-index forwarding method.
 - SystemDisplayService now wires `GetLayerZ`, parses `SetLayerZ` as `layer_id: u64` followed by
   `z_value: u64`, preserves the low signed 32-bit z pattern, and forwards visibility instead of
   returning success without changing the layer.
-
-### Missing items
-
-- None for the z-index and visibility methods covered by this slice.
-
-### Binary layout verification
-
-- PASS: SetLayerZ consumes two consecutive 64-bit request values in Eden's signature order;
-  GetLayerZ returns the signed 32-bit z index sign-extended and reinterpreted as `u64`.
 
 ## 2026-08-20 — `src/video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
 
@@ -789,19 +547,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - `BankPool::ReserveBank` returns `Result` so a fallible Rust resource constructor can replace a
   C++ builder that propagates allocation failures through exceptions.
 - The file was normalized from CRLF to LF while formatting the new implementation and tests.
-
-### Unintentional differences (to fix)
-
-- None. Reserve, close, reference counting, reset, dead-bank selection and queue rotation retain
-  Eden's ordering and conditions.
-
-### Missing items
-
-- None for `BankBase` and `BankPool`.
-
-### Binary layout verification
-
-- N/A: these are host-only bookkeeping types.
 
 ## 2026-08-20 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
 
@@ -817,11 +562,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Scheduler-facing accessors return the three independently locked state handles needed by the
   safe cross-owner adaptation.
 
-### Unintentional differences (to fix)
-
-- None in samples report ownership, async-flush gating, bank-wide host readback, or the scheduler
-  bridge covered by this correction.
-
 ### Missing items
 
 - Existing parity debt outside this correction remains in the full Eden samples accumulation
@@ -829,10 +569,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `PresyncWrites`/`SyncWrites` lifecycle).
 - A real Vulkan occlusion-query title run is still required; unit tests do not execute a device
   query pool.
-
-### Binary layout verification
-
-- N/A: no guest-visible raw-memory structure changed.
 
 ## 2026-08-20 — `src/video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
 
@@ -844,18 +580,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - `clear_query_cache_state` releases those handles before the rasterizer's Vulkan resources are
   destroyed; Eden relies on C++ member lifetime and its raw pointer is not dereferenced afterward.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed counter-reset, counter-close and conditional-rendering ordering.
-
-### Missing items
-
-- None for this scheduler/query-cache interaction slice.
-
-### Binary layout verification
-
-- N/A: scheduler state is host-only.
-
 ## 2026-08-20 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
 
 ### Intentional differences
@@ -866,18 +590,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The destructor explicitly clears those handles after `finish` and before destroying the query
   cache's Vulkan resource owners.
 
-### Unintentional differences (to fix)
-
-- None in construction registration, async query flush forwarding, or teardown ordering.
-
-### Missing items
-
-- None for the reviewed scheduler/query-cache ownership slice.
-
-### Binary layout verification
-
-- N/A: no guest ABI or serialized payload changed.
-
 ## 2026-08-20 — `src/core/src/hle/service/am/service/library_applet_creator.rs` vs Eden `src/core/hle/service/am/service/library_applet_creator.{h,cpp}`
 
 ### Intentional differences
@@ -885,21 +597,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Rust manually parses CMIF arguments and resolves the transfer-memory handle through the current
   process, replacing Eden's typed `InCopyHandle<KTransferMemory>` deserializer.
 - Rust returns service objects through `ResponseBuilder` rather than C++ `Out<SharedPointer<T>>`.
-
-### Unintentional differences (to fix)
-
-- None. `CreateTransferMemoryStorage` now naturally aligns the `s64` following the `bool`, and
-  both transfer-memory creation commands validate `size` before resolving the handle, matching
-  Eden's argument layout and validation order.
-
-### Missing items
-
-- None for the storage creation handlers reviewed in this slice.
-
-### Binary layout verification
-
-- PASS: `RequestParser::align_for::<i64>()` advances the raw CMIF cursor to the same 8-byte
-  boundary used by Eden's typed serialization.
 
 ## 2026-08-20 — `src/ruzu/src/applets/software_keyboard.rs` vs Eden `src/yuzu/applets/qt_software_keyboard.{h,cpp}`
 
@@ -914,27 +611,17 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed applet contract. Normal submissions now retain the active dialog through
+- Normal submissions now retain the active dialog through
   `Failure`/`Confirm` text checks, and only `ExitKeyboard` tears it down.
 - Controller callbacks no longer re-enter `active: RefCell` while it is borrowed, and the input
   edge which opened the keyboard is discarded instead of immediately activating X/Cancel.
 - Inline appear parameters, guest text/cursor updates, `ChangedString`, `MovedCursor`, key-disable
   flags, optional number-pad symbols, Shift/Caps Lock transitions and wrapped grid navigation now
   follow Eden's corresponding paths.
-- Fixed: the persistent GTK frontend is now exited on the same emulation-starting and
-  emulation-stopping boundaries as Eden's `MainWindow::SoftwareKeyboardExit` connections. A
-  stopped session can no longer leave the frontend initialized and suppress the next session's
-  inline keyboard initialization.
-
 ### Missing items
 
 - Eden's held-button autorepeat and rich multi-line `SwkbdTextDrawType::Box` presentation remain UI
   features of the excluded Qt frontend; they are not part of this GTK crash/lifecycle correction.
-
-### Binary layout verification
-
-- N/A: this is host UI state. Guest-visible string lengths and cursor positions are explicitly
-  converted to UTF-16 code-unit counts, with a focused regression test.
 
 ## 2026-08-20 — `src/ruzu/src/applets/mod.rs`, `src/ruzu/src/boot.rs`, and `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` software-keyboard ownership
 
@@ -946,7 +633,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The module and boot wiring have no direct file counterpart because Eden's Qt frontend directory
   is excluded and ruzu owns its GTK frontend under `src/ruzu/src/applets`.
 
-
 ## 2026-08-20 — `src/core/src/hle/service/am/frontend/applet_software_keyboard.rs` vs Eden `src/core/hle/service/am/frontend/applet_software_keyboard.{h,cpp}`
 
 ### Intentional differences
@@ -956,11 +642,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   callback, then resumes the owning frontend applet through its weak `Applet` reference.
 - `frontend_executing` distinguishes synchronous frontend callbacks from delayed GUI callbacks;
   queued work is drained before an active call returns, while delayed work reacquires the applet
-
-### Binary layout verification
-
-- PASS: the foreground result remains a zero-initialized `sizeof(SwkbdResult) +
-  STRING_BUFFER_SIZE` buffer, with the result followed by UTF-8 or UTF-16 text exactly as before.
 
 ## 2026-08-20 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` termination caller selection
 
@@ -984,19 +665,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   emulated controllers every 50 ms and preserves the same rising-edge A/B and horizontal-input
   behavior.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed shutdown and single-action regular-text configurations. The error action
-  owns the initial focus border, Return/Escape and controller A/B activate it, and dismissal occurs
-  before the applet completion callback resumes guest execution.
-
 ### Missing items
 
 - The two-action and rich-text overlay configurations remain outside this slice.
-
-### Binary layout verification
-
-- N/A: the overlay contains host UI state only.
 
 ## 2026-08-20 — `src/ruzu/src/game_list.rs` and `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/yuzu/main_window.{h,cpp}` shortcut dispatch
 
@@ -1006,19 +677,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `(program_id, game_path, target)` payload and `GMainWindow` ownership of argument construction.
 - GTK `gio::SimpleAction` objects replace the two `QAction` objects. Both remain hidden on macOS,
   matching Eden's compile-time guard.
-
-### Unintentional differences (to fix)
-
-- None. Both context-menu actions now reach `on_game_list_create_shortcut`; the former
-  unavailable-action placeholders were removed.
-
-### Missing items
-
-- None for per-game shortcut dispatch.
-
-### Binary layout verification
-
-- N/A: this is host frontend dispatch.
 
 ## 2026-08-20 — `src/ruzu/src/util/game.rs` vs Eden `src/qt_common/util/game.{h,cpp}` shortcut creation
 
@@ -1032,22 +690,12 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   bridge and standard user-profile paths rather than directly owning `IShellLinkW`; this avoids a
   second Windows COM binding while preserving target, arguments, description and icon fields.
 
-### Unintentional differences (to fix)
-
-- None in the Linux shortcut slice. Target validation, patched control metadata precedence,
-  loader fallbacks, illegal-character removal, icon creation, one-time AppImage warning,
-  fullscreen argument ordering and result messages follow Eden's order.
-
 ### Missing items
 
 - `CreateHomeMenuShortcut` and the unrelated content-removal helpers from `qt_common/util/game.cpp`
   are outside this per-game shortcut slice.
 - Eden's multi-resolution Windows ICO encoder is not yet ported; Windows currently stores the
   decoded icon as PNG before assigning it to the `.lnk`.
-
-### Binary layout verification
-
-- N/A on Linux. The `.desktop` field order and optional-field rules are covered by a focused test.
 
 ## 2026-08-20 — `src/ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.cpp` context-menu submenu presentation
 
@@ -1057,19 +705,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   Eden's `QMenu`; the toolkit-specific construction differs while retaining hover, click and
   keyboard access to each submenu.
 
-### Unintentional differences (to fix)
-
-- None. `Remove`, `Dump RomFS`, and `Create Shortcut` no longer use GTK's click-only sliding-page
-  presentation and now open as nested menus on pointer hover like Eden.
-
-### Missing items
-
-- None for game-list submenu presentation.
-
-### Binary layout verification
-
-- N/A: this is host UI behavior only.
-
 ## 2026-08-20 — `src/ruzu/src/overlay_dialog.rs` vs Eden `src/yuzu/util/overlay_dialog.cpp` and `src/yuzu/main_window.cpp` shutdown-dialog destruction
 
 ### Intentional differences
@@ -1077,19 +712,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - GTK exposes window-manager closure and programmatic `Window::close` through the same
   `close-request` signal. Ruzu retains the signal id so it can remove the user-close guard before
   performing Eden's `OnEmulationStopped`-owned destruction.
-
-### Unintentional differences (to fix)
-
-- None. The initial port incorrectly returned `Stop` for the programmatic close request too, which
-  left `Closing software...` visible after `StopComplete`; the guard is now disconnected first.
-
-### Missing items
-
-- None for shutdown-dialog destruction.
-
-### Binary layout verification
-
-- N/A: this is host UI lifecycle state only.
 
 ## 2026-08-20 — `src/ruzu/src/main_window.rs` and `src/ruzu/src/game_list.rs` vs Eden `src/yuzu/main_window.{h,cpp}` and `src/qt_common/game_list/model.{h,cpp}` refresh ownership
 
@@ -1105,21 +727,11 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   Rust worker; Eden can safely run two sequential `Repopulate()` calls because destroying its
   current worker waits for completion.
 
-### Unintentional differences (to fix)
-
-- None for the manual refresh behavior. The upper-toolbar button clears cached metadata before
-  scanning, refreshes the directory/provider data, and is disabled from boot until emulation
-  stops.
-
 ### Missing items
 
 - Eden's independent filesystem watchers for `Settings::values.external_content_dirs` are not
   present in Ruzu; configured game directories are refreshed explicitly by this button.
 - `SetFirmwareVersion()` has no Ruzu status-label counterpart to update after refresh.
-
-### Binary layout verification
-
-- N/A: this is host frontend state and worker dispatch.
 
 ## 2026-08-20 — `src/ruzu/src/util/game.rs` and `src/ruzu/src/uisettings.rs` vs Eden `src/qt_common/util/game.{h,cpp}` and `src/yuzu/uisettings.h` metadata reset
 
@@ -1132,16 +744,8 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None. `ResetMetadata` now removes the complete Ruzu `cache/game_list` directory, including the
+- `ResetMetadata` now removes the complete Ruzu `cache/game_list` directory, including the
   stale `<title-id>.pv.txt` Add-ons cache, and marks the game-list reload pending after success.
-
-### Missing items
-
-- None for metadata-cache removal and reload-pending signaling.
-
-### Binary layout verification
-
-- N/A: cache entries are host files; the focused test verifies complete directory removal.
 
 ## 2026-08-20 — `src/ruzu/src/configuration/configure_filesystem.rs` vs Eden `src/yuzu/configuration/configure_filesystem.{h,cpp}` metadata-reset action
 
@@ -1152,16 +756,8 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Unintentional differences (to fix)
 
-- None. The button now calls the shared metadata reset instead of logging an unavailable-action
+- The button now calls the shared metadata reset instead of logging an unavailable-action
   placeholder, and the main-window apply callback consumes the resulting reload-pending flag.
-
-### Missing items
-
-- None for `ConfigureFilesystem::ResetMetadata`.
-
-### Binary layout verification
-
-- N/A: this is host UI dispatch.
 
 ## 2026-08-20 — `src/hid_core/src/resources/ring_lifo.rs` vs Eden `src/hid_core/resources/ring_lifo.h`
 
@@ -1172,40 +768,12 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Rust bounds a corrupt `buffer_tail` to the backing array instead of reproducing C++ undefined
   behavior; the existing diagnostic remains available through `RUZU_TRACE_LIFO_CORRUPTION`.
 
-### Unintentional differences (to fix)
-
-- None. `write_next_entry` now publishes `new_state.sampling_number << 1` exactly like Eden. The
-  previous `previous_atomic_marker + 1` calculation could publish an odd marker, which newer
-  Nintendo SDK readers treat as an in-progress write and retry indefinitely.
-
-### Missing items
-
-- None for `AtomicStorage` and `Lifo` behavior.
-
-### Binary layout verification
-
-- PASS: `AtomicStorage` and `Lifo` remain `repr(C)` with unchanged fields; the full HID shared
-  memory layout test passes, and focused tests verify the even marker and source sample contract.
-
 ## 2026-08-20 — `src/hid_core/src/resources/shared_memory_format.rs` vs Eden `src/hid_core/resources/shared_memory_format.h`
 
 ### Intentional differences
 
 - The concrete shared-memory state types implement Rust's `LifoState` trait at their LIFO
   instantiation owner; Eden's C++ template accesses the same `sampling_number` members directly.
-
-### Unintentional differences (to fix)
-
-- None introduced by the atomic-publication correction.
-
-### Missing items
-
-- None for the LIFO state sampling accessors.
-
-### Binary layout verification
-
-- PASS: trait implementations add no fields or vtables to the state values, and
-  `shared_memory_layout_matches_upstream` passes.
 
 ## 2026-08-20 — `src/hid_core/src/resources/six_axis/seven_six_axis.rs` vs Eden `src/hid_core/resources/six_axis/seven_six_axis.{h,cpp}`
 
@@ -1214,17 +782,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - `SevenSixAxisState` converts its unsigned sampling number to `i64` for the common Rust
   `LifoState` interface; `as` preserves the underlying two's-complement bit pattern.
 
-### Unintentional differences (to fix)
-
-- None introduced by the LIFO marker correction.
-
 ### Missing items
 
 - The pre-existing incomplete `SevenSixAxis::on_update` integration remains outside this fix.
-
-### Binary layout verification
-
-- PASS: the state remains `repr(C)` and its existing `0x48` size assertion is unchanged.
 
 ## 2026-08-20 — `src/hid_core/src/resources/npad/npad.rs` vs Eden `src/hid_core/resources/npad/npad.{h,cpp}` prefill regression
 
@@ -1232,19 +792,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Rust regression tests observe the shared-memory result directly after activation; Eden has no
   matching C++ unit test in the ported source tree.
-
-### Unintentional differences (to fix)
-
-- None. The prefill expectation now reflects Eden's exact recurrence: each empty state derives
-  from the preceding atomic marker and the marker is twice the state sample.
-
-### Missing items
-
-- None for `NPad::WriteEmptyEntry` in this verification slice.
-
-### Binary layout verification
-
-- PASS: no Npad production struct changed; the full HID layout test and all Npad tests pass.
 
 ## 2026-08-20 — `src/core/src/hle/service/aoc/addon_content_manager.rs` vs Eden `src/core/hle/service/aoc/addon_content_manager.{h,cpp}`
 
@@ -1264,16 +811,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The pre-existing `GetAddOnContentBaseId` implementation always takes Eden's no-control-metadata
   fallback because the required `PatchManager` integration is not wired at the system level.
 
-### Missing items
-
-- None for command 3 dispatch: `ListAddOnContent` now parses `offset` and `count`, forwards the
-  client PID, writes the returned IDs to output buffer 0, and returns the output count.
-
-### Binary layout verification
-
-- PASS: add-on IDs are emitted as packed four-byte little-endian values, matching Eden's raw
-  `u32` buffer copy; no shared structs changed.
-
 ## 2026-08-20 — `src/shader_recompiler/src/frontend/control_flow.rs` vs Eden `src/shader_recompiler/frontend/maxwell/control_flow.{h,cpp}`
 
 ### Intentional differences
@@ -1287,21 +824,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   consumer's index-based `CfgBlock` representation. The older slice-based `build_cfg` entry point
   remains for callers that already own decoded instruction words.
 
-### Unintentional differences (to fix)
-
-- None in the corrected exception/lifecycle slice. `PRET`, constant-buffer branches, unsupported
-  indirect branches, invalid stack pops, invalid split addresses, and unsupported `EXIT` forms now
-  raise the same shader exception categories as Eden instead of killing the GPU worker with an
-  untyped panic or silently continuing.
-
 ### Missing items
 
 - `PRET` flow analysis itself remains unimplemented, matching Eden. The pipeline cache now rejects
   that shader without terminating the GPU thread.
-
-### Binary layout verification
-
-- N/A: CFG nodes are host-only analysis structures and are not copied to guest or GPU memory.
 
 ## 2026-08-20 — `src/common/src/scm_rev.rs` and `src/common/build.rs` vs Eden `src/common/scm_rev.{h,cpp.in}` and `CMakeModules/GenerateSCMRev.cmake`
 
@@ -1316,18 +842,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Ruzu currently exposes only the SCM/compiler constants consumed by its frontend. Eden's update
   feed, nightly-build, build-date, and custom title-format constants remain outside this slice.
 
-### Unintentional differences (to fix)
-
-- None in the development-build identity slice. The generated values on this host are
-  `08b3fb5169-main` and `GNU 13.3.0`; the compiler string is detected, not hard-coded.
-
 ### Missing items
 
 - Stable/nightly release tag formatting and auto-update endpoint constants are not used by Ruzu.
-
-### Binary layout verification
-
-- N/A: Rust string constants replace generated C++ character arrays and are not guest-visible.
 
 ## 2026-08-20 — `src/ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame`
 
@@ -1335,21 +852,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - The boot thread sends a typed `TitleChanged` event to GTK's main thread because GTK widgets may
   only be changed by their owning thread; Eden computes the same values on its Qt GUI thread.
-
-### Unintentional differences (to fix)
-
-- None in the running-title metadata slice. Ruzu reads the loader title, lets
-  `PatchManager::GetControlMetadata` replace it with the selected add-on NACP title/version,
-  applies Eden's filename fallback and translated 64/32-bit suffix, obtains the renderer vendor,
-  logs the boot identity, and publishes it before disk-cache construction.
-
-### Missing items
-
-- None for the default running-title fields.
-
-### Binary layout verification
-
-- N/A: title metadata is host UI text.
 
 ## 2026-08-20 — `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` `UpdateWindowTitle`
 
@@ -1360,18 +862,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The same handler exists in each platform-specific GTK launch loop because those loops own their
   native render surfaces; all three consume the identical `TitleChanged` event.
 
-### Unintentional differences (to fix)
-
-- None. Idle, versioned-running, versionless-running, and shutdown-reset title ordering matches
-  Eden: `Ruzu | build-version | compiler | game | optional-version | GPU vendor`.
-
 ### Missing items
 
 - User-defined idle title-bar format overrides are not ported.
-
-### Binary layout verification
-
-- N/A: window titles are host UI strings.
 
 ## 2026-08-20 — `src/ruzu/src/game_list.rs` vs Eden `src/qt_common/game_list/worker.cpp` and `src/core/file_sys/program_metadata.{h,cpp}`
 
@@ -1387,20 +880,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The frontend renders the architecture names as lowercase `aarch64`/`aarch32`; cached labels
   written by earlier Ruzu builds are normalized while loading, without changing the cache format.
 
-### Unintentional differences (to fix)
-
-- None in the `pv.txt` format: enabled/disabled names, version parentheses, packed-update file
-  type substitution, update filtering, UTF-8 encoding, and newline joining match Eden.
-
 ### Missing items
 
 - Eden has no architecture-column behavior to port. Files whose executable metadata cannot be
   recovered display `Unknown`.
-
-### Binary layout verification
-
-- PASS: `ProgramMetadata::is_64_bit_program` reads the existing NPDM bit; no guest or container
-  binary structure was changed.
 
 ## 2026-08-21 — `src/shader_recompiler/src/backend/spirv/emit_spirv_special.rs` vs Eden `src/shader_recompiler/backend/spirv/emit_spirv_special.cpp`
 
@@ -1417,19 +900,6 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   ownership prevents state leaking between concurrent shader compilations.
 - Unsupported geometry streams panic in Rust where Eden throws `NotImplementedException`.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed prologue/epilogue slice: dual-source fragment outputs, component-aware
-  generic varyings, unwritten clip distances, and the fragment alpha test follow Eden's ordering.
-
-### Missing items
-
-- None in the reviewed prologue/epilogue slice.
-
-### Binary layout verification
-
-- N/A: this change emits SPIR-V instructions and does not alter a serialized host structure.
-
 ## 2026-08-21 — `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/shader_recompiler/runtime_info.h`
 
 ### Intentional differences
@@ -1437,57 +907,17 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - At the time of this review, Rust stored active transform-feedback entries in a `Vec`; this was
   restored to Eden's fixed 256-entry array by the 2026-08-26 transform-feedback parity pass below.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed runtime-state slice: `TransformFeedbackVarying::stream` and
-  `RuntimeInfo::dual_source_blend` now have the same owners and defaults as Eden.
-
-### Missing items
-
-- None in the reviewed runtime-state slice.
-
-### Binary layout verification
-
-- N/A: `RuntimeInfo` is host-side compiler state and is not copied as a guest binary payload.
-
 ## 2026-08-21 — `src/video_core/src/transform_feedback.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`
 
 ### Intentional differences
 
 - Invalid attribute indices are ignored safely in Rust; Eden indexes its fixed array directly.
 
-### Unintentional differences (to fix)
-
-- None: generated varyings preserve `layout.stream`, and the complete Eden vector table through
-  `gl_TexCoord[7]` is present.
-
-### Missing items
-
-- None in `MakeTransformFeedbackVaryings`.
-
-### Binary layout verification
-
-- PASS: `TransformFeedbackLayout` remains `repr(C)` with Eden's `stream`, `varying_count`, and
-  `stride` field order; generated varying descriptors are host-side values.
-
 ## 2026-08-21 — `src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs` vs Eden `src/shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}`
 
 ### Intentional differences
 
 - SPIR-V construction uses `rspirv::dr::Builder` instead of Sirit.
-
-### Unintentional differences (to fix)
-
-- None in `DefineGenericOutput`: split component outputs and nonzero geometry transform-feedback
-  stream decorations now match Eden.
-
-### Missing items
-
-- None in the reviewed generic-output slice.
-
-### Binary layout verification
-
-- N/A: this slice emits SPIR-V declarations and decorations.
 
 ## 2026-08-21 — renderer runtime-info propagation
 
@@ -1500,37 +930,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - Rust maps the fixed pipeline key into owned `RuntimeInfo` values; Eden copies into fixed arrays.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed fields: Vulkan propagates `attachment0_dual_source_blend`, and both Vulkan
-  and OpenGL propagate transform-feedback `stream`.
-
-### Missing items
-
-- None in the reviewed runtime-info propagation slice.
-
-### Binary layout verification
-
-- N/A: these are host-side compiler inputs.
-
 ## 2026-08-21 — `src/shader_recompiler/src/pipeline_cache.rs` runtime identity vs Eden runtime shader state
 
 ### Intentional differences
 
 - Ruzu hashes runtime compiler inputs for its Rust pipeline cache; Eden keys the equivalent state
   through its fixed pipeline cache key.
-
-### Unintentional differences (to fix)
-
-- None: `dual_source_blend` and transform-feedback `stream` now participate in Ruzu's runtime hash.
-
-### Missing items
-
-- None in the reviewed runtime-hash slice.
-
-### Binary layout verification
-
-- N/A: the value is a host-side cache identity hash.
 
 ## 2026-08-21 — `src/shader_recompiler/src/frontend/translate/load_store_attribute.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/load_store_attribute.cpp`
 
@@ -1540,21 +945,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   as panics.
 - The Rust visitor stores the program header in an `Option`; generic `IPA` now requires it to be
   present, matching Eden's unconditional `env.SPH()` access.
-
-### Unintentional differences (to fix)
-
-- None in `IPA`: legacy interpolation, whole-vector effective `PixelImap` selection, the
-  perspective fallback for an unused vector, `Sc` handling, multiplier ordering, and the
-  saturated `FrontFace` rejection now match Eden.
-
-### Missing items
-
-- None in the reviewed `IPA` slice.
-
-### Binary layout verification
-
-- N/A: the instruction is decoded from the same bit positions, but no host struct is copied as a
-  guest payload.
 
 ## 2026-08-21 — `src/shader_recompiler/src/ir/value.rs` vs Eden `src/shader_recompiler/frontend/ir/attribute.h`
 
@@ -1570,14 +960,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   correction; `IsLegacyAttribute` was added to the active translation type so current users share
   one predicate.
 
-### Missing items
-
-- None in the reviewed generic/legacy classification slice.
-
-### Binary layout verification
-
-- N/A: attributes are host-side IR identifiers and are not raw-copied guest payloads.
-
 ## 2026-08-21 — `src/shader_recompiler/src/frontend/translate_program.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate_program.cpp`
 
 ### Intentional differences
@@ -1585,18 +967,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust invokes the active attribute newtype's `is_legacy` method; Eden imports
   `IR::IsLegacyAttribute` from `attribute.h`.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed legacy-varying classification call sites; the duplicate private predicate
-  was removed.
-
-### Missing items
-
-- None in the reviewed call-site slice.
-
-### Binary layout verification
-
-- N/A: this pass rewrites host-side IR instructions.
 ## 2026-08-20 — `src/core/src/hle/service/filesystem/filesystem.rs` vs Eden `src/core/hle/service/filesystem/filesystem.{h,cpp}`
 
 ### Intentional differences
@@ -1607,19 +977,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `set_sdmc_open_override` is a narrow Ruzu extension used only for standalone NRO launches. An
   overwriting `create_factories` call clears it together with the upstream factories so a view
   cannot leak into a later launch.
-
-### Unintentional differences (to fix)
-
-- None in this slice. With no override installed, `open_sdmc` retains Eden's factory/null-device
-  behavior.
-
-### Missing items
-
-- None for the per-launch SDMC override.
-
-### Binary layout verification
-
-- N/A: the added host-side `VirtualDir` does not alter a guest-visible or serialized structure.
 
 ## 2026-08-20 — `src/ruzu/src/homebrew_vfs.rs` vs Eden `src/core/file_sys/vfs/vfs_layered.{h,cpp}`
 
@@ -1637,19 +994,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   filename extension. No symbolic-link, junction-point, or platform-specific filesystem API is
   required.
 
-### Unintentional differences (to fix)
-
-- None. The writable semantics are deliberately frontend-specific because changing Eden's
-  read-only layered VFS would violate its contract.
-
-### Missing items
-
-- None for exposing sibling homebrew assets and writable nested paths.
-
-### Binary layout verification
-
-- N/A: the view contains host VFS handles and path components only.
-
 ## 2026-08-20 — `src/ruzu/src/boot.rs` and `src/ruzu/src/main.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame` and `src/yuzu/main.cpp`
 
 ### Intentional differences
@@ -1660,17 +1004,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The GTK entry point declares `homebrew_vfs` as a private frontend module; Eden's excluded Qt
   frontend has no corresponding source file.
 
-### Unintentional differences (to fix)
-
-- None. Non-NRO boot ordering and filesystem behavior are unchanged.
-
-### Missing items
-
-- None for this boot integration.
-
-### Binary layout verification
-
-- N/A: this changes host-side launch wiring only.
 ## 2026-08-21 — workspace source layout vs Eden repository source layout
 
 ### Intentional differences
@@ -1681,19 +1014,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   workspace.
 - The GTK frontend test for the quick-start action reaches the repository-level documentation
   through `../../../docs/quickstart.md`; Eden's excluded Qt frontend has different test ownership.
-
-### Unintentional differences (to fix)
-
-- None: all source crates now live under the top-level `src/` directory; scripts,
-  documentation, externals, tools, and agent configuration remain at the repository root.
-
-### Missing items
-
-- None for the workspace layout migration.
-
-### Binary layout verification
-
-- N/A: this is a path-only structural migration and changes no guest-visible layout.
 
 ## 2026-08-21 — `src/ruzu/src/homebrew_vfs.rs` vs Eden `src/core/file_sys/vfs/vfs_layered.{h,cpp}` and `src/core/hle/service/filesystem/filesystem.cpp`
 
@@ -1707,19 +1027,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - NROs in flat or per-application layouts retain the previous containing-directory root, and the
   configured SDMC remains the fallback layer in both cases.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed package-root selection slice.
-
-### Missing items
-
-- None for conventional `<package>/switch/application.nro` asset visibility.
-
-### Binary layout verification
-
-- N/A: the change selects a host `VirtualDir` root and does not alter serialized or guest ABI
-  structures.
-
 ## 2026-08-21 — `src/video_core/src/gpu.rs` and `src/video_core/src/gpu_thread.rs` vs Eden `src/video_core/gpu.{h,cpp}` and `src/video_core/gpu_thread.{h,cpp}`
 
 ### Intentional differences
@@ -1731,20 +1038,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   stored in-place and has a trivial destructor, so its storage remains within `GPU::Impl` while
   `gpu_thread` is destroyed.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed GPU-thread lifetime slice. Previously, Rust could destroy renderer-owned
-  state before requesting GPU-thread stop, causing a shutdown join hang, `SlotVector` panic, or
-  allocator corruption.
-
-### Missing items
-
-- None for GPU-thread shutdown ordering.
-
-### Binary layout verification
-
-- N/A: the change affects host-thread lifecycle only.
-
 ## 2026-08-21 — `src/core/src/core.rs` vs Eden `src/core/core.{h,cpp}` (`System::Impl::ShutdownMainProcess`)
 
 ### Intentional differences
@@ -1754,18 +1047,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   sessions can keep `IAudioRenderer` alive in the terminated-process table. Its finalizer waits
   for a signal from `AudioRenderSystemManager`; destroying `audio_core` at Eden's earlier point
   stops that worker first and deadlocks shutdown.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed shutdown slice.
-
-### Missing items
-
-- None for GPU shutdown and delayed Rust session finalization ordering.
-
-### Binary layout verification
-
-- N/A: the change affects host subsystem lifetime only.
 
 ## 2026-08-21 — `src/common/src/settings.rs` vs Eden `src/common/settings.h` (`dd12266c`)
 
@@ -1777,18 +1058,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   Rust declaration had incorrectly disabled persistence on every platform, while Eden persists it
   on Windows through the same settings linkage used by `disable_wgi_xinput`.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed WGI/XInput settings slice.
-
-### Missing items
-
-- None for the `disable_wgi_xinput` setting introduced by Eden commit `dd12266c`.
-
-### Binary layout verification
-
-- N/A: these are host configuration values and are not copied into a guest-visible binary payload.
-
 ## 2026-08-21 — `src/input_common/src/drivers/sdl_driver.rs` vs Eden `src/input_common/drivers/sdl_driver.cpp` (`dd12266c`)
 
 ### Intentional differences
@@ -1797,18 +1066,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   hint macros directly. Both set `SDL_JOYSTICK_RAWINPUT_CORRELATE_XINPUT` and `SDL_JOYSTICK_WGI`
   to `0` with `SDL_HINT_OVERRIDE`, only on Windows and only when the setting is enabled.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed WGI/XInput SDL hint slice.
-
-### Missing items
-
-- None for the SDL behavior introduced by Eden commit `dd12266c`.
-
-### Binary layout verification
-
-- N/A: SDL hints alter host input-backend selection and serialize no guest data.
-
 ## 2026-08-21 — `src/ruzu/src/configuration/configure_input_advanced.rs` vs Eden `src/yuzu/configuration/configure_input_advanced.{cpp,ui}` (`dd12266c`)
 
 ### Intentional differences
@@ -1816,34 +1073,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The excluded Qt frontend's `QCheckBox` is represented by Ruzu's GTK `CheckButton`; the label,
   tooltip, initial setting value, apply behavior, and Windows-only visibility match Eden.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed WGI/XInput configuration-widget slice.
-
-### Missing items
-
-- None for the advanced-input control introduced by Eden commit `dd12266c`.
-
-### Binary layout verification
-
-- N/A: this is host GUI state only.
-## 2026-08-21 — `src/core/src/hle/kernel/svc/svc_synchronization.rs` vs Eden `src/core/hle/kernel/svc/svc_synchronization.cpp` (`7731b5bc`)
-
-### Intentional differences
-
-- None in the `ResetSignal` logging-level slice.
-
-### Unintentional differences (to fix)
-
-- None. `ResetSignal` now logs routine calls at trace level, matching Eden's demotion from debug.
-
-### Missing items
-
-- None for this upstream commit.
-
-### Binary layout verification
-
-- N/A: the change affects host logging only.
 ## 2026-08-21 — `src/core/src/hle/service/acc/acc.rs` vs Eden `src/core/hle/service/acc/acc.cpp`
 
 ### Intentional differences
@@ -1857,20 +1086,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `Arc<Mutex<_>>`, `ResultCode`, and Rust enums replace C++ shared pointers, exceptions/results,
   and enum classes without changing service ownership or command behavior.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed `a41a98028a` ACC consolidation and new `acc:e`, `acc:e:u1`, `acc:e:u2`, and
-  `dauth:0` service-table slice.
-
 ### Missing items
 
-- None introduced by this port. Pre-existing unimplemented ACC commands remain registered as
+- Pre-existing unimplemented ACC commands remain registered as
   stubs exactly where the Rust service framework represents Eden's null handlers.
-
-### Binary layout verification
-
-- PASS: user IDs, pin-code lengths, IPC scalar widths, and existing raw profile payload types are
-  unchanged; this slice adds no new raw-copied structure.
 
 ## 2026-08-21 — `src/core/src/hle/service/{apm,audio,bpc,caps,es,friend,glue,grc,hid,lm,mnpp,ncm,ngc,nim,ns,nvdrv,olsc,pcie,pcv,psc,ptm,ro,tma,usb,wlan}` vs Eden commit `a41a98028a` service files
 
@@ -1901,22 +1120,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `services.rs` preserves Eden's service-thread ownership while adapting `unique_ptr` and thread
   launch to Rust's existing server-manager lifecycle.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed command-table and registration slice. Eden's changes to `mii.cpp` and
-  `glue/notif.cpp` are formatting-only, and its `spl.cpp` change only relocates explicit default
-  destructor definitions; Rust requires no corresponding behavioral change.
-
 ### Missing items
 
-- None introduced by this port. Commands represented by null handlers upstream remain named Rust
+- Commands represented by null handlers upstream remain named Rust
   stubs and deliberately return the service framework's unimplemented result.
-
-### Binary layout verification
-
-- PASS: the port adds service dispatch tables and scalar IPC replies only. Existing `repr(C)`
-  payload declarations are unchanged, and empty CAPS/PSC responses return Eden's error before any
-  payload serialization.
 
 ## 2026-08-21 — `src/core/src/hle/service/hle_ipc.rs` and `src/core/src/hle/service/sockets/{bsd,sfdnsres,sockets}.rs` vs Eden `src/core/hle/service/hle_ipc.h` and `src/core/hle/service/sockets/*.{h,cpp}`
 
@@ -1931,19 +1138,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   user/system split. Rust `Arc<Mutex<_>>` replaces C++ shared ownership for the shared network
   interface.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed `a41a98028a` handle-safety and socket-service slice.
-
-### Missing items
-
-- None introduced by this port; null upstream socket handlers remain explicit stubs.
-
-### Binary layout verification
-
-- PASS: BSD request/reply integer widths and handle values are unchanged; no socket ABI structure
-  was added or reordered.
-
 ## 2026-08-21 — `src/hid_core/src/resources/npad/{npad,npad_resource}.rs` vs Eden `src/hid_core/resources/npad/{npad,npad_resource}.cpp`
 
 ### Intentional differences
@@ -1956,10 +1150,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   index zero only for the temporary controller cleanup, then calls the guarded resource owner,
   matching Eden's fallback and lifecycle ordering.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed NPad ARUID guard slice.
-
 ### Missing items
 
 - Eden also adds a null `shared_memory_format` guard to
@@ -1967,11 +1157,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   not yet own or dereference an applet resource at all, so that crash path is already absent and
   this commit requires no executable Rust change there. Full abstract-battery integration remains
   pre-existing parity work, not a shortcut added by this port.
-
-### Binary layout verification
-
-- PASS: controller state and shared-memory payload declarations are unchanged. The added regression
-  test verifies that unregistering an unknown ARUID cannot clear the first registered resource.
 
 ## 2026-08-21 — corrective audit of Eden `a41a98028a` homebrew-service prerequisites
 
@@ -2001,30 +1186,15 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the re-reviewed NCM command/handler slice, registered-cache install/iteration/rights-ID
-  slice, SDMC parsing path, filesystem-controller wrappers, or game-file opening path.
 - This entry supersedes the broader “none” claim in the earlier `a41a98028a` service entry:
   subsequent line-by-line review found and fixed missing NCM prerequisites, NAX parsing,
   metadata filtering, registered installation and game-card setup.
 
 ### Missing items
 
-- None among the 31 reviewed `PlaceholderCache`/`RegisteredCache` methods: `GetRightsID`, all four
-  `InstallEntry` overloads and `IterateAllMetadata` are now present.
-- None among the eight reviewed NCM interfaces: the same 12 commands have concrete handlers in
-  Eden and Ruzu, and all remaining commands are registered stubs on both sides.
 - `FileSystemController::GetExternalContentProvider`, BIS partition access, the standalone
   save-data controller, image-directory access and placeholder wrappers are now present in their
   upstream-owned controller file.
-
-### Binary layout verification
-
-- PASS: `ContentMetaKey` remains `repr(C)` and 0x10 bytes; padding is ignored when matching keys,
-  as upstream does.
-- PASS: `CNMTHeader`, `OptionalHeader` and `ContentRecord` remain deterministically initialized
-  `repr(C)` payloads of 0x20, 0x10 and 0x38 bytes respectively. The new install path serializes the
-  same fields and hashes the same first 1 MiB as Eden.
-- N/A: filesystem controller accessors and `GetGameFileFromPath` add no guest-visible raw payload.
 
 ## 2026-08-21 — explicit service declarations vs Eden `a41a98028a` service owners
 
@@ -2034,21 +1204,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `impl_service_framework!` helper. It does not declare commands, own behavior or combine upstream
   files.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed stub-service ownership slice. The port-local `define_stub_service!` macro
-  has been removed from `audio`, `nvdrv`, `usb`, `psc`, `sockets`, `ptm`, `glue/ectx`, `wlan` and
-  `bpc`; each upstream service type and command table is now explicit in its corresponding Rust
-  owner.
-
 ### Missing items
 
-- None introduced by expanding these declarations. Null Eden handlers remain explicit Rust
+- Null Eden handlers remain explicit Rust
   unimplemented handlers with the same command IDs and labels.
 
-### Binary layout verification
-
-- N/A: this ownership correction changes declarations only and adds no raw-copied structure.
 ## 2026-08-21 — `src/core/src/hle/service/nim/nim.rs` vs Eden `src/core/hle/service/nim/nim.{h,cpp}` at `5c54abf353`
 
 ### Intentional differences
@@ -2070,21 +1230,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   their existing `nim.rs` owner so Eden's new async implementation is reachable through the same
   interface chain; unrelated `nim`, `nim:shp`, and `ntc` parity remains outside this commit.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed async-shop slice: command IDs, cancellation/join ordering, buffer locking,
-  offset clamping, error-code updates, dummy `{}` response, event clearing/signaling, and returned
-  copy/move objects match Eden.
-
 ### Missing items
 
 - `Request` remains deliberately stubbed to a two-byte JSON object, exactly as in Eden commit
   `5c54abf353`; no network download is performed.
-
-### Binary layout verification
-
-- PASS: IPC outputs retain Eden's `u64` size/read count and `u32` error code widths. Download data
-  is copied as bytes into the caller-provided output buffer; no host struct is raw-copied.
 
 ## 2026-08-21 — `src/core/src/hle/service/acc/{profile_manager.rs,acc.rs}` vs Eden `src/core/hle/service/acc/{profile_manager.cpp,acc.cpp}`
 
@@ -2093,20 +1242,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Eden creates the automatic first user and the `BeginUserRegistration` user with the branded
   name `Eden`; Ruzu uses the direct product-name adaptation `ruzu`. Existing saved profiles are
   parsed without renaming, so a user-selected or migrated name is never overwritten.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed default-profile creation paths: both paths generate a random non-null UUID,
-  construct a fixed-size zero-padded profile name, create the user, and preserve upstream ordering.
-
-### Missing items
-
-- None for default profile naming or `BeginUserRegistration` naming.
-
-### Binary layout verification
-
-- PASS: `ProfileUsername` remains 32 bytes. The four ASCII bytes `ruzu` are followed by 28
-  deterministic zero bytes, matching the upstream fixed-size payload contract.
 
 ## 2026-08-21 — `dist` Windows packaging vs Eden `dist/{installer.nsi,yuzu.manifest,eden.ico}`
 
@@ -2123,20 +1258,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Ruzu manifest fixes the malformed long-path namespace in the source manifest and embeds it,
   together with the Ruzu icon, through the Rust crate's Windows resource build step.
 
-### Unintentional differences (to fix)
-
-- None found by static validation of the adapted installer, manifest and resource definition.
-
 ### Missing items
 
 - The installer has not yet been executed on a native Windows host; MSVC resource compilation,
   vcpkg runtime staging, NSIS generation, install, launch and uninstall still require that test.
-
-### Binary layout verification
-
-- PASS: `dist/ruzu.ico` has a Windows ICO header and seven image sizes from 16 through 256 pixels.
-- PASS: the XML manifest parses successfully and uses resource ID 1/type 24, the standard
-  `CREATEPROCESS_MANIFEST_RESOURCE_ID` application-manifest slot.
 
 ## 2026-08-21 — `src/ruzu/src/{main.rs,main_window.rs,gui_settings.rs,uisettings.rs,configuration/qt_config.rs}` vs Eden `src/{yuzu/main.cpp,yuzu/main_window.cpp,qt_common/gui_settings.cpp,qt_common/config/uisettings.h}`
 
@@ -2153,18 +1278,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The restart text substitutes the Ruzu product name for Eden. The Wayland warning text, choices,
   default X11 action and “Don't show again” behavior otherwise match upstream.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed missing-key and Linux-backend startup slice.
-
-### Missing items
-
-- None for detection, warning suppression, X11 preference persistence or early backend selection.
-
-### Binary layout verification
-
-- N/A: these frontend settings are textual INI booleans and no raw structure is serialized.
-
 ## 2026-08-21 — `src/ruzu/src/user_data_migration.rs` vs Eden `src/yuzu/user_data_migration.{h,cpp}`
 
 ### Intentional differences
@@ -2175,17 +1288,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Completing `No migration` records the explicit one-time prompt marker and resumes the normal
   startup prerequisite chain, which presents Eden's missing-key question when appropriate.
 
-### Unintentional differences (to fix)
-
-- None in the requested first-page interaction.
-
 ### Missing items
 
 - Per-game migration remains hidden as documented by the existing implementation.
-
-### Binary layout verification
-
-- N/A: the changes affect GTK state and the existing text marker only.
 
 ## 2026-08-21 — external-content settings and `FileSystemController` vs Eden
 
@@ -2201,20 +1306,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   list. This is the GTK equivalent of Eden's `ExternalContentDirsChanged` signal followed by
   `OnGameListRefresh`.
 
-### Unintentional differences (to fix)
-
-- None in the implemented persistence, explicit refresh or engine registration path.
-
 ### Missing items
 
 - Eden installs a `QFileSystemWatcher` on external-content roots so later host filesystem changes
   trigger a metadata reset automatically. Ruzu currently detects those changes on the toolbar
   refresh or the next game-list rebuild; it has no directory watcher yet.
-
-### Binary layout verification
-
-- N/A: external paths use a textual QSettings-compatible array. The provider registration adds no
-  guest-visible raw structure.
 
 ## 2026-08-21 — `src/ruzu/src/util/content.rs` and firmware menu vs Eden `src/qt_common/util/content.{h,cpp}` / `src/yuzu/main_window.cpp`
 
@@ -2228,41 +1324,18 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   firmware display version, whose frontend lookup still depends on Ruzu's not-yet-faithful
   installed SystemVersion reader.
 
-### Unintentional differences (to fix)
-
-- None in source selection, direct-versus-recursive NCA discovery, extraction cleanup, copy order
-  or firmware-only integrity verification.
-
 ### Missing items
 
 - Displaying the installed firmware version requires replacing Ruzu's hardcoded
   `get_firmware_version_impl` with Eden's SystemVersion archive lookup; that prerequisite is
   outside this frontend menu slice.
 
-### Binary layout verification
-
-- N/A: ZIP extraction and firmware copying operate on files, not raw-copied payload structures.
-
 ## 2026-08-21 — `UISettings::enable_gamemode` ownership vs Eden `src/qt_common/config/uisettings.h`
-
-### Intentional differences
-
-- None. The obsolete standalone Rust `configure_linux_tab.rs` owner was removed because current
-  Eden exposes Gamemode and X11 as `UiGeneral` settings in `ConfigureGeneral`.
-
-### Unintentional differences (to fix)
-
-- None in ownership, platform default or row ordering: the MSVC default is false, other targets
-  default true, and Gamemode follows the profile prompt.
 
 ### Missing items
 
 - Ruzu does not yet have Eden's `qt_common/gamemode.cpp` DBus activation owner; this pre-existing
   runtime integration gap is separate from the corrected setting ownership and UI placement.
-
-### Binary layout verification
-
-- N/A: the value is a textual frontend boolean.
 
 ## 2026-08-21 — `src/core/src/file_sys/fssystem/compression_configuration.rs` vs Eden `src/core/file_sys/fssystem/fssystem_compression_configuration.{h,cpp}`
 
@@ -2272,20 +1345,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `Common::Compression::DecompressDataLZ4`; both require the decompressed byte count to equal the
   requested destination size.
 
-### Unintentional differences (to fix)
-
-- None. The invalid `cfg(feature = "lz4")` gate was removed: `lz4_flex` is an unconditional core
-  dependency and NCA LZ4 decompression is now active in every build, matching Eden.
-
-### Missing items
-
-- None for the NCA decompressor selection or destination-size validation path.
-
-### Binary layout verification
-
-- N/A: compressed bytes are decoded into caller-owned byte slices; no Rust structure is copied as
-  a guest payload.
-
 ## 2026-08-21 — `src/core/src/hle/service/ns/language.rs` and `src/core/src/hle/service/set/settings_types.rs` vs Eden `src/core/hle/service/ns/language.{h,cpp}` and `src/core/hle/service/set/settings_types.h`
 
 ### Intentional differences
@@ -2293,20 +1352,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Eden's partially initialized fixed-size Thai and Polish priority arrays zero-initialize their
   remaining enum slots. Rust arrays require every element explicitly, so Ruzu spells those zero
   values as trailing `ApplicationLanguage::AmericanEnglish` entries.
-
-### Unintentional differences (to fix)
-
-- None. Polish and Thai enum values, language codes, conversions, priority-list selection, and
-  Eden's exact aggregate-initialization result are now present.
-
-### Missing items
-
-- None in the reviewed language enum/conversion/priority-list slice.
-
-### Binary layout verification
-
-- PASS: `ApplicationLanguage` remains `repr(u8)` with Polish 16, Thai 17 and Count 18.
-- PASS: `LanguageCode` remains `repr(u64)` with Eden's exact little-endian `pl` and `th` values.
 
 ## 2026-08-21 — `src/common/src/logging/backend.rs` vs Eden `src/common/logging.{h,cpp}`
 
@@ -2319,7 +1364,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed state ownership. The abandoned Rust `LoggerImpl`, duplicate
+- The abandoned Rust `LoggerImpl`, duplicate
   `ColorConsoleBackend`, unused stacktrace hook, and redundant `LoggerState::color_console_enabled`
   were removed. The live file backend and `LoggerState` remain the only active owners.
 
@@ -2329,30 +1374,13 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Eden's `log_flush_line`, `extended_logging`, and username-censoring behavior is not part of this
   cleanup and still requires a dedicated parity pass.
 
-### Binary layout verification
-
-- N/A: logging state is host-only and is not serialized or exposed to guest memory.
-
 ## 2026-08-21 — removal of `src/web_service/src/telemetry_json.rs` vs current Eden `src/web_service/`
-
-### Intentional differences
-
-- None. This is a structural correction to the current Eden source tree rather than a Rust
-  adaptation.
 
 ### Unintentional differences (to fix)
 
-- None. Ruzu's `telemetry_json.rs` was an incomplete port from an older source tree: current Eden
+- Ruzu's `telemetry_json.rs` was an incomplete port from an older source tree: current Eden
   has no `telemetry_json.{h,cpp}`, Ruzu had no production caller, and both HTTP submission methods
   were explicit stubs. The module and its public export were removed.
-
-### Missing items
-
-- None relative to current Eden's `web_service` file list.
-
-### Binary layout verification
-
-- N/A: the removed component was host-only JSON state.
 
 ## 2026-08-21 — dead-code cleanup in `src/common/src/heap_tracker.rs` vs Eden `src/common/heap_tracker.{h,cpp}`
 
@@ -2362,21 +1390,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   intrusive red-black trees over each `SeparateHeapMap`. This is an existing structural and
   performance divergence and remains explicit parity debt.
 
-### Unintentional differences (to fix)
-
-- None introduced by this cleanup. The removed `SeparateHeapMap`, `AddrNode`, `TickNode`,
-  `HeapTrackerInner`, comparators, and partial `addr_tree` helpers formed a separate abandoned
-  implementation that was never constructed or referenced by the active `HeapTracker`.
-
 ### Missing items
 
 - A future parity slice must replace the active `BTreeMap` representation with the same dual-tree
   ownership model as Eden; retaining an unused partial tree beside it did not provide that parity.
-
-### Binary layout verification
-
-- N/A for the removed host-only structures. The active mapping records are not copied to guest
-  memory or serialized.
 
 ## 2026-08-21 — `src/dedicated_room/src/main.rs` announcement credentials vs Eden `src/dedicated_room/yuzu_room.cpp`
 
@@ -2385,21 +1402,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu retains the historical setting field names `yuzu_username` and `yuzu_token`; they are the
   existing Rust equivalents consumed by `AnnounceMultiplayerSession`.
 
-### Unintentional differences (to fix)
-
-- None in this slice. Before constructing the verification backend and announcement session, Ruzu
-  now writes `web_api_url`, username, and token to global settings in the same branches and order as
-  Eden. Display tokens publish the decoded token directly instead of assigning it to an otherwise
-  unread local variable.
-
-### Missing items
-
-- None for dedicated-room announcement credential propagation.
-
-### Binary layout verification
-
-- N/A: credentials are host strings and are not raw guest payloads.
-
 ## 2026-08-21 — current program ID in `src/common/src/settings.rs` / `src/core/src/core.rs` vs Eden `src/common/settings.{h,cpp}` / `src/core/core.cpp`
 
 ### Intentional differences
@@ -2407,20 +1409,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu stores the process-global ID in `AtomicU64` because Rust global mutable state must be
   synchronized. Eden uses a plain file-local `u64`; relaxed atomic operations preserve the same
   value semantics without adding ordering to unrelated emulator state.
-
-### Unintentional differences (to fix)
-
-- None. `set_current_program_id` and `get_current_program_id` now belong to `settings.rs`, and
-  `System::load` publishes the loaded process ID immediately after updating its runtime ID, at the
-  corresponding point in Eden's application-load flow.
-
-### Missing items
-
-- None for this settings prerequisite.
-
-### Binary layout verification
-
-- N/A: this is host-global scalar state and is not serialized or copied to guest memory.
 
 ## 2026-08-21 — macro dumping in `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}`
 
@@ -2432,40 +1420,17 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust uses `bytemuck::cast_slice` for the same native `u32` byte representation that Eden writes
   through `reinterpret_cast<const char*>`.
 
-### Unintentional differences (to fix)
-
-- None. Newly compiled macros now read `CacheInfo::hash` after execution and dump when
-  `dump_macros` is enabled, using Eden's exact program-ID/hash/variant filename and payload.
-
-### Missing items
-
-- None in the reviewed macro dump path.
-
-### Binary layout verification
-
-- PASS: the regression test verifies that the `.macro` payload is the contiguous native-byte view
-  of the original `u32` instruction span, matching Eden's `code.size_bytes()` write.
-
 ## 2026-08-21 — `src/shader_recompiler/src/pipeline_cache.rs` vs Eden Maxwell decode/translate ownership
 
-### Intentional differences
-
-- None for this cleanup.
-
 ### Unintentional differences (to fix)
 
-- None. The unused Ruzu-only `maxwell_opcode_is_unknown` wrapper was removed. Opcode decoding
+- The unused Ruzu-only `maxwell_opcode_is_unknown` wrapper was removed. Opcode decoding
   remains owned by the control-flow and translation modules that consume it, matching Eden's
   direct `Decode` use rather than making the unrelated pipeline cache an extra owner.
 
 ### Missing items
 
-- None introduced by this removal; the broader structured-control-flow parity work remains a
-  separate implementation slice.
-
-### Binary layout verification
-
-- N/A: no guest-visible or serialized data changed.
+- Broader structured-control-flow parity remains a separate implementation slice.
 
 ## 2026-08-21 — `src/input_common/src/main_common.rs` vs Eden `src/input_common/main.{h,cpp}` mapping callback ownership
 
@@ -2475,20 +1440,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   pointer. Consequently, the private `InputSubsystemImpl` methods receive that shared factory
   explicitly; their ownership and call chain still mirror Eden's `Impl` methods.
 
-### Unintentional differences (to fix)
-
-- None. `mapping_callback`, `register_engine`, and `register_input` now belong to
-  `InputSubsystemImpl`, and every engine callback routes through `register_input` as Eden's
-  `RegisterEngine` lambda does.
-
 ### Missing items
 
 - `GCAdapter` and Android registration remain the already documented platform-specific gaps in
   this subsystem; they are not introduced by this callback correction.
-
-### Binary layout verification
-
-- N/A: this changes host callback ownership only.
 
 ## 2026-08-21 — `src/hid_core/src/frontend/emulated_console.rs` vs Eden `src/hid_core/frontend/emulated_console.{h,cpp}` motion path
 
@@ -2506,10 +1461,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed file. Ruzu now owns both motion parameter slots and devices, restores the
-  first player's configured motion source, adds the virtual-gamepad source, updates raw and
-  emulated motion in callback order, resets rotations/quaternion on reload, and applies
-  `motion_sensitivity` to `is_at_rest` exactly where Eden does.
 - Callback keys now increment before insertion and therefore start at 1, matching Eden.
 - Deleting an unknown callback now asserts instead of only logging, matching Eden's
   `ASSERT_MSG` contract.
@@ -2519,11 +1470,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The downstream `ConsoleSixAxis` and `SevenSixAxis` resources do not yet consume this newly live
   console state in their update paths. That wiring belongs to those corresponding files and is a
   separate prerequisite-sensitive slice.
-
-### Binary layout verification
-
-- N/A: `ConsoleMotion` and `ConsoleMotionInfo` are synchronized host-side frontend state and are
-  not copied raw into guest memory.
 
 ## 2026-08-21 — console six-axis ownership in `src/hid_core/src/resources/six_axis/console_six_axis.rs` / `resource_manager.rs` vs Eden counterparts
 
@@ -2537,9 +1483,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None. `ConsoleSixAxis::on_update` now owns active-ARUID validation, activation validation,
-  `EmulatedConsole::get_motion`, and the shared-memory projection. `ResourceManager::update_motion`
-  only schedules the call, matching Eden's ownership boundary.
 - The obsolete Ruzu-only `ConsoleMotionStatus` duplicate and the default status constructed by the
   resource manager were removed.
 - Sampler initialization no longer assigns an applet resource to `SevenSixAxis`, matching Eden,
@@ -2551,12 +1494,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   owned by its Eden constructor. It remains a separate structural prerequisite and was not
   approximated in this slice.
 
-### Binary layout verification
-
-- PASS: the existing compile-time assertion still verifies
-  `ConsoleSixAxisSensorSharedMemoryFormat` is `0x20` bytes; the focused test verifies the exact
-  fields projected by Eden's update.
-
 ## 2026-08-21 — `src/core/src/file_sys/fs_path_utility.rs` vs Eden `src/core/file_sys/fs_path_utility.h` bounded backslash replacement
 
 ### Intentional differences
@@ -2567,42 +1504,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None. The Windows-path backslash replacement now computes `replaced_src_len` from the supplied
-  `path_len` minus the consumed source prefix, rather than ignoring `path_len` and sizing from
-  `strlen(src)`. This matches Eden when the caller's source-buffer bound truncates the visible
-  string.
 - The Rust-only outer `relative_len` temporary was removed; `rlen` still advances `cur_pos` at the
   exact point where Eden consumes `relative_len`.
-
-### Missing items
-
-- None in the reviewed `PathFormatter::Normalize` backslash-replacement branch.
-
-### Binary layout verification
-
-- N/A: the regression test verifies bounded byte-copy and normalized output behavior; no struct
-  layout changed.
-
-## 2026-08-21 — `src/hid_core/src/frontend/input_converter.rs` vs Eden `src/hid_core/frontend/input_converter.{h,cpp}` analog conversion
-
-### Intentional differences
-
-- None beyond Rust's direct return value and `log` facade.
-
-### Unintentional differences (to fix)
-
-- None. `transform_to_analog` now accepts only `InputType::Analog`, copies properties and raw
-  value, sanitizes without clamping, then applies Eden's second inversion step in the same order.
-
-### Missing items
-
-- None for `TransformToAnalog`; it unblocks the upstream-owned mouse-wheel path in
-  `EmulatedDevices`.
-
-### Binary layout verification
-
-- N/A: `AnalogStatus` is host-side callback state. Tests cover the non-clamped range, deadzone,
-  copied properties, and Eden's deliberately preserved inversion ordering.
 
 ## 2026-08-21 — `src/hid_core/src/frontend/emulated_devices.rs` vs Eden `src/hid_core/frontend/emulated_devices.{h,cpp}`
 
@@ -2618,20 +1521,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None. Reload/unload now owns all mouse buttons, position, wheel axes, keyboard keys, and keyboard
-  modifiers with Eden's exact parameter packages and callback order.
 - Button toggle/lock transitions, configuration-mode suppression, modifier bit mapping, mouse
   projection, raw-value getters, notifications, and callback-key lifecycle now match upstream.
-
-### Missing items
-
-- None in the reviewed `EmulatedDevices` file.
-
-### Binary layout verification
-
-- PASS: the existing compile-time assertions retain `KeyboardKey` at `0x20`,
-  `KeyboardModifier`/`MouseButton` at `0x4`, and `AnalogStickState` at `0x8`; focused tests verify
-  the corresponding bit and numeric projections.
 
 ## 2026-08-21 — `src/common/src/random.rs` vs Eden `src/common/random.{h,cpp}`
 
@@ -2643,20 +1534,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   are cross-platform, nondeterministic host random sources and the upstream seed parameters remain
   intentionally ignored.
 
-### Unintentional differences (to fix)
-
-- None. `random32`, `random64`, and `get_mt19937` retain Eden's ownership and behavior, including
-  the 32-bit `random_device::result_type` widened to `u64` by `random64`.
-
-### Missing items
-
-- None in the reviewed files.
-
-### Binary layout verification
-
-- N/A: no payload struct is serialized. A focused test verifies the MT19937 reference sequence and
-  another verifies that `random64` preserves Eden's zero upper 32 bits.
-
 ## 2026-08-21 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` ASLR load offset
 
 ### Intentional differences
@@ -2667,23 +1544,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   and assigning it in every switch arm. Flag mutation and address selection remain in the upstream
   order.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed address-selection path. Every address-space base now includes
-  `aslr_space_offset`, then adds `aslr_space_start` when constructing the process parameters.
-
 ### Missing items
 
 - `load_from_metadata` still uses pool-size constants because its Rust signature does not yet carry
   Eden's `KernelCore` reference.
 - Eden calls `InitializeInterfaces` before returning; Ruzu still creates the ARM interfaces later
   from `System::load`.
-
-### Binary layout verification
-
-- N/A: no serialized layout changed. The focused regression initializes the kernel slab allocator,
-  loads a synthetic homebrew process with a nonzero page-aligned offset, and verifies its exact
-  entrypoint.
 
 ## 2026-08-21 — `src/core/src/loader/deconstructed_rom_directory.rs` vs Eden `src/core/loader/deconstructed_rom_directory.{h,cpp}` ASLR load offset
 
@@ -2692,19 +1558,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The additional Ruzu `is_hbl` state is forwarded after Eden's five load parameters; it does not
   alter the upstream ASLR calculation.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed ASLR calculation. The selected seed is shifted by 12, masked with
-  `0xfff000`, and passed to `KProcess` after the fast-memory base exactly as in Eden.
-
 ### Missing items
 
 - Eden's NCE patch collection, patch-section size, and direct-mapped fast-memory base are not yet
   integrated, so the corresponding argument remains zero on Ruzu's current backends.
-
-### Binary layout verification
-
-- N/A: this slice passes scalar addresses only.
 
 ## 2026-08-21 — `src/core/src/loader/kip.rs` vs Eden `src/core/loader/kip.{h,cpp}` ASLR load offset
 
@@ -2714,39 +1571,16 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   file member; loader ownership is otherwise unchanged.
 - Ruzu's internal `is_hbl = false` argument follows Eden's load parameters.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed ASLR path. Seed selection, shift, mask, zero fast-memory base, and argument
-  ordering now match Eden.
-
-### Missing items
-
-- None in the reviewed ASLR path.
-
-### Binary layout verification
-
-- N/A: this slice passes scalar addresses only.
-
 ## 2026-08-21 — `src/core/src/loader/nro.rs` vs Eden `src/core/loader/nro.{h,cpp}` ASLR load offset
 
 ### Intentional differences
 
 - Ruzu's internal `is_hbl = false` argument follows Eden's load parameters.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed ASLR calculation. The offset is generated after determining `image_size`
-  and before process setup, with Eden's exact shift and mask.
-
 ### Missing items
 
 - Eden's NCE patching, patch relocation, and direct-mapped fast-memory base remain unintegrated; the
   fast-memory argument therefore remains zero.
-
-### Binary layout verification
-
-- PASS: the existing compile-time assertions still verify the affected NRO, MOD, and asset header
-  sizes; this scalar ASLR change does not alter them.
 
 ## 2026-08-21 — `src/common/src/intrusive_red_black_tree.rs` vs Eden `src/common/intrusive_red_black_tree.h` bidirectional iteration
 
@@ -2759,20 +1593,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   links; this linear lookup replaces the parent-pointer cast that Rust's arena representation
   cannot express safely.
 
-### Unintentional differences (to fix)
-
-- None. Immutable and mutable iterators now support reverse traversal, and base-node predecessor
-  and successor accessors now follow the tree links instead of always returning `NONE`.
-
-### Missing items
-
-- None in the reviewed bidirectional iterator and base-node neighbor methods.
-
-### Binary layout verification
-
-- N/A: Ruzu deliberately uses indices rather than serializing Eden's host pointers. Focused tests
-  cover forward, reverse, mixed, mutable, predecessor, and successor traversal without duplicates.
-
 ## 2026-08-21 — `src/audio_core/src/sink/cubeb_sink.rs` vs Eden `src/audio_core/sink/cubeb_sink.{h,cpp}` stream metadata ownership
 
 ### Intentional differences
@@ -2782,17 +1602,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed ownership slice. The duplicate `name` and `stream_type` fields were removed
+- The duplicate `name` and `stream_type` fields were removed
   from the Rust-only Cubeb wrapper; their canonical values remain on `SinkStream`, matching Eden's
   `CubebSinkStream` inheritance from `SinkStream`.
-
-### Missing items
-
-- None in the reviewed ownership slice.
-
-### Binary layout verification
-
-- N/A: the Rust wrapper is host-only state and is neither serialized nor copied to guest memory.
 
 ## 2026-08-21 — `src/core/src/hle/service/filesystem/filesystem.rs` vs Eden `src/core/hle/service/filesystem/filesystem.{h,cpp}` provider ownership
 
@@ -2802,21 +1614,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `Core::System::RegisterContentProvider`; both unions retain non-owning provider pointers.
 - Rust `Box<T>` replaces each upstream `std::unique_ptr<T>` and provides the same stable heap
   address while `FileSystemController` itself is moved.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed ownership slice. BIS, SDMC, external-content, game-card, registered-cache,
-  and placeholder-cache objects now have the stable allocation required by Eden's ownership model.
-  This prevents union slots from retaining dangling pointers after a controller move.
-
-### Missing items
-
-- None in the reviewed provider and game-card ownership slice.
-
-### Binary layout verification
-
-- N/A: these are host-side ownership objects. A focused regression moves a fully initialized
-  controller and verifies that all four union-provider addresses remain unchanged.
 
 ## 2026-08-21 — `src/ruzu/src/{main_window,gtk_compat}.rs` vs Eden `src/yuzu/main_window.{h,cpp}` stop confirmation lifecycle
 
@@ -2830,17 +1627,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed confirmation slice. Dismissing or destroying a GTK question now completes
+- Dismissing or destroying a GTK question now completes
   it as a rejection, so `stop_confirmation_pending` and `close_confirmation_pending` cannot remain
   latched after the dialog disappears.
-
-### Missing items
-
-- None in the reviewed `ConfirmShutdownGame` / `OnStopGame` confirmation lifecycle.
-
-### Binary layout verification
-
-- N/A: the change contains frontend-only callback and modal state.
 
 ## 2026-08-21 — `src/audio_core/src/adsp/apps/audio_renderer/audio_renderer.rs` vs Eden `src/audio_core/adsp/apps/audio_renderer/audio_renderer.{h,cpp}`
 
@@ -2866,20 +1655,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Fallible Rust initialization and optional stream handles reject an invalid session safely where
   Eden relies on initialized raw pointers.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed renderer lifecycle and render-loop slice. The 200 ms shutdown delay and the
-  `SetProcessTimeMax` → `WaitFreeSpace` → `Process` ordering now match Eden.
-
-### Missing items
-
-- None from the upstream `AudioRenderer` public/private method set or message constants.
-
-### Binary layout verification
-
-- N/A: `AudioRenderer` and `RendererShared` are host-side synchronization and ownership objects;
-  guest command-buffer layouts remain owned by `command_buffer.rs`.
-
 ## 2026-08-21 — `src/audio_core/src/adsp/apps/opus/opus_decoder.rs` vs Eden `src/audio_core/adsp/apps/opus/opus_decoder.{h,cpp}`
 
 ### Intentional differences
@@ -2887,19 +1662,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Focused Rust tests exercise the mailbox protocol and decoder lifecycle directly. Their success
   assertions now use the upstream Opus-domain constant `OPUS_OK`, rather than the numerically equal
   but unrelated HLE-service `ResultCode::SUCCESS`.
-
-### Unintentional differences (to fix)
-
-- None introduced by this warning-cleanup slice; runtime decoder behavior is unchanged.
-
-### Missing items
-
-- None discovered while tracing the unused `ResultCode` import through the upstream return-value
-  assignments.
-
-### Binary layout verification
-
-- N/A: this slice only changes test assertions and removes an unused production import.
 
 ## 2026-08-21 — `src/common/src/dynamic_library.rs` vs Eden `src/common/dynamic_library.{h,cpp}`
 
@@ -2914,19 +1676,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `get_symbol<T>` returns `Option<T>` instead of assigning through an output pointer and returning
   `bool`.
 
-### Unintentional differences (to fix)
-
-- None. `open` now matches Eden's ordering and replaces the stored handle without first calling
-  `close`; the previous pre-emptive cleanup was a Rust-only lifecycle change.
-
-### Missing items
-
-- None from the upstream `DynamicLibrary` interface.
-
-### Binary layout verification
-
-- N/A: the platform loader handle is host-only state and is never serialized.
-
 ## 2026-08-21 — `src/common/src/time_zone.rs` vs Eden `src/common/time_zone.{h,cpp}`
 
 ### Intentional differences
@@ -2939,19 +1688,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Targets that are neither Unix nor Windows retain a GMT fallback because Eden does not define a
   separate platform implementation for them.
 
-### Unintentional differences (to fix)
-
-- None. Windows now calculates the local/GMT offset and DST state like Eden instead of always
-  returning zero and selecting GMT.
-
-### Missing items
-
-- None from the upstream `Common::TimeZone` interface or offset table.
-
-### Binary layout verification
-
-- N/A: timezone values are host-side strings and scalar calculations, not serialized structures.
-
 ## 2026-08-21 — `src/common/src/tree.rs` vs Eden `src/common/tree.h`
 
 ### Intentional differences
@@ -2962,26 +1698,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `HasRBEntry` replaces Eden's `CheckRBEntry`, `IsRBEntry`, and `HasRBEntry` C++ concepts.
 - Rust naming follows snake_case, and a returned index replaces each returned pointer.
 
-### Unintentional differences (to fix)
-
-- None. `RB_REMOVE`'s `child` is assigned exactly once on each control-flow path as in Eden; its
-  unnecessary Rust `mut` qualifier was removed without changing the algorithm.
-
-### Missing items
-
-- None from the upstream red-black-tree type and function set.
-
-### Binary layout verification
-
-- N/A: the index-based `RBEntry` is an internal safe-Rust representation and is not copied to or
-  from Eden's packed, pointer-based host structure.
-
 ## 2026-08-21 — removed `src/common/src/x64/cpu_wait.rs` vs Eden `src/common/thread.{h,cpp}`
-
-### Intentional differences
-
-- None for the removed module: Eden has no `common/x64/cpu_wait.*` counterpart and Ruzu had no
-  production caller for its public `micro_sleep` function.
 
 ### Unintentional differences (to fix)
 
@@ -2995,11 +1712,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   does not yet port Eden's x86-64 Windows `MONITORX`/`WAITPKG` branches. This is a separate,
   platform-specific implementation slice rather than a prerequisite for removing the unreachable
   helper.
-
-### Binary layout verification
-
-- N/A: the removed cache-line-aligned tuple was host-only temporary storage passed to inline
-  assembly and was never serialized.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/exception_handler.rs` vs Eden `src/dynarmic/src/dynarmic/backend/exception_handler.{h,posix.cpp}`
 
@@ -3016,20 +1728,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Eden's POSIX source installs `SIGBUS` only when `__APPLE__` is defined. Ruzu's macOS path is the
   separately documented non-fastmem Mach stub, so Linux correctly installs only `SIGSEGV`.
 
-### Unintentional differences (to fix)
-
-- None identified for the Linux x86-64 handler lifecycle after the 2026-08-21 parity pass.
-
-### Missing items
-
-- None for the Linux x86-64 handler lifecycle. macOS fastmem remains disabled as documented at the
-  top of the Rust module and is outside this POSIX/Linux slice.
-
-### Binary layout verification
-
-- N/A: `SigHandlerState` is host-only Rust state. Platform context and SEH
-  layouts are verified by the existing platform-specific tests in this module.
-
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/a64_emit_x64.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{emit_x64,a64_emit_x64}.{h,cpp}`
 
 ### Intentional differences
@@ -3037,19 +1735,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust has no shared C++ `EmitX64` base object, so the A64 emitter directly owns its
   `ExceptionHandler`. It is declared before the owned code buffer and callback table so Rust's
   field drop order removes the registration first.
-
-### Unintentional differences (to fix)
-
-- None identified in exception-handler registration, support probing, callback publication, or
-  destruction ordering.
-
-### Missing items
-
-- None for this exception-handler ownership slice.
-
-### Binary layout verification
-
-- N/A: the new owner contains host pointers/ranges and is not copied to guest memory.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/a32_emit_x64.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{emit_x64,a32_emit_x64}.{h,cpp}`
 
@@ -3059,19 +1744,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `ExceptionHandler`. It is declared before the owned code buffer and callback table so cleanup
   follows Eden's emitter-before-code lifetime.
 
-### Unintentional differences (to fix)
-
-- None identified in exception-handler registration, support probing, callback publication, or
-  destruction ordering.
-
-### Missing items
-
-- None for this exception-handler ownership slice.
-
-### Binary layout verification
-
-- N/A: the new owner contains host pointers/ranges and is not copied to guest memory.
-
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/block_of_code.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
 
 ### Intentional differences
@@ -3080,19 +1752,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   Windows-only `Drop` remains a fallback for standalone code-buffer tests. Production cleanup is
   now first performed by the emitter-owned `ExceptionHandler`.
 
-### Unintentional differences (to fix)
-
-- None identified in Linux code-block cleanup: the non-upstream unconditional `BlockOfCode::drop`
-  registration removal has been deleted.
-
-### Missing items
-
-- None for this exception-handler ownership slice.
-
-### Binary layout verification
-
-- N/A on Linux. Existing Windows tests verify the in-buffer unwind layouts.
-
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/block_of_code.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
 
 ### Intentional differences
@@ -3100,21 +1759,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu emits x64 through `rxbyak::CodeAssembler` and stores byte offsets into its owned code buffer;
   Eden derives `BlockOfCode` from C++ Xbyak and stores native code pointers.
 - Rust uses `cfg(target_os = "windows")` for Eden's `_WIN32` callee-saved XMM6–XMM15 path.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed ABI import/save-restore slice. The `xmmword_ptr` operand and
-  `xmm_save_base` helper are now compiled only on Windows, matching the only path that consumes
-  them. The native constant-pool regression test now verifies both deduplicated operands.
-
-### Missing items
-
-- None introduced or discovered in the Windows callee-save operand slice.
-
-### Binary layout verification
-
-- PASS: the existing stack-frame and Windows unwind-code tests verify the offsets consumed by the
-  XMM save/restore instructions; no serialized guest structure is changed.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_memory.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{a64_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}`
 
@@ -3126,23 +1770,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   passes its `Vector` aggregate indirectly there. System V continues to use two integer lanes.
 - `rxbyak` memory-operand constructors replace C++ Xbyak's `ptr`/`xword` address frames.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed callback ABI slice. The indirect return buffer now applies to every Windows
-  toolchain, matching Eden's `_WIN32`, instead of only MSVC. Ordinary 128-bit writes likewise use
-  a Windows pointer payload, and 32/64-bit XMM-backed scalar writes select their third argument
-  through `ABI_PARAMS` rather than hard-coding System V's `RDX`.
-
 ### Missing items
 
 - The fastmem/page-table 128-bit paths are owned by
   `backend/x64/a64_emit_x64_memory.rs`; this file intentionally remains the callback-only owner
   selected by the current dispatcher for `A64ReadMemory128`/`A64WriteMemory128`.
-
-### Binary layout verification
-
-- PASS: Windows read/write buffers are exactly 16 bytes after ABI shadow space, and the
-  non-Windows path still transfers two 64-bit lanes through ABI-selected registers.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/a64_emit_x64_memory.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp`
 
@@ -3156,8 +1788,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed 128-bit read-fallback ABI slice. Both MSVC and MinGW now use the Windows
-  stack buffer, matching upstream `_WIN32`; System V no longer reserves the unused 16-byte local.
 - Removed one unused register binding from Ruzu-only fastmem diagnostic emission; emitted code is
   unchanged.
 
@@ -3166,11 +1796,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu's current dispatcher routes ordinary 128-bit accesses through callback-only
   `emit_memory.rs`; it does not yet select Eden's fastmem/page-table 128-bit read/write fallback
   path. This is pre-existing behavioral debt outside the ABI prerequisite fixed here.
-
-### Binary layout verification
-
-- PASS for the reviewed fallback payload: the Windows local is 16 bytes and is loaded with
-  `movups`; System V reconstructs the vector from the two 64-bit return registers.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_exclusive_memory.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc`
 
@@ -3181,21 +1806,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's Windows trampolines take explicit pointer payloads for 128-bit values instead of exposing
   the host compiler's aggregate ABI directly to generated code.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed callback-only 128-bit read/write slice. All Windows toolchains use the
-  stack-buffer read path, and exclusive writes use a pointer payload rather than System V lane
-  registers that overwrite Win64 arguments.
-
 ### Missing items
 
 - No new missing item found in the callback-only exclusive slice; inline fastmem ownership was not
   re-audited as part of this prerequisite.
-
-### Binary layout verification
-
-- PASS: each Windows exclusive payload occupies 16 bytes after the 32-byte shadow space; System V
-  continues to pass or return two 64-bit lanes.
 
 ## 2026-08-21 — `src/rdynarmic/src/jit.rs` vs Eden `src/dynarmic/src/dynarmic/interface/A64/config.h` and x64 memory callback call sites
 
@@ -3206,38 +1820,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - On Windows, Rust gives the read and write trampolines explicit `Pair128` pointers. Eden obtains
   the equivalent indirect aggregate transfer from its C++ ABI and generated accessor stubs.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed A64 128-bit trampoline slice. The ordinary and exclusive read/write
-  signatures now agree with the emitter on both Windows toolchains.
-
-### Missing items
-
-- None introduced in the A64 trampoline slice. A32 trampolines have separate emitter ownership and
-  were not changed or claimed by this comparison.
-
-### Binary layout verification
-
-- PASS: `Pair128` is `repr(C)`, compile-time asserted to size 16/alignment 8, and every field is
-  initialized before it crosses the trampoline boundary.
 ## 2026-08-21 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `src/dynarmic/src/dynarmic/ir/opcodes.inc`
 
 ### Intentional differences
 
 - Rust represents Eden's generated opcode table as an enum plus an explicit `OpcodeInfo` match.
-
-### Unintentional differences (to fix)
-
-- None in the scalar result-and-overflow saturation opcode slice: both `WithFlag32` operations
-  have the same U32 inputs/result, while signed and unsigned saturation keep their U8 width input.
-
-### Missing items
-
-- None for the four scalar saturation opcodes reviewed in this slice.
-
-### Binary layout verification
-
-- N/A: these are internal IR opcode/type declarations and are not serialized guest payloads.
 
 ## 2026-08-21 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `src/dynarmic/src/dynarmic/ir/ir_emitter.h`
 
@@ -3246,20 +1833,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's `ResultAndOverflow` stores the untyped `Value` enum instead of Eden's templated result
   type; opcode metadata enforces that every helper in this slice returns U32 plus U1.
 
-### Unintentional differences (to fix)
-
-- None in `signed_saturated_add_with_flag`, `signed_saturated_sub_with_flag`,
-  `signed_saturation`, or `unsigned_saturation`: validation, opcode arguments, and associated
-  overflow pseudo-operation ordering match Eden.
-
-### Missing items
-
-- None for the scalar saturation IR API reviewed in this slice.
-
-### Binary layout verification
-
-- N/A: `ResultAndOverflow` is an internal SSA builder result and is never copied to guest memory.
-
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_saturation.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/emit_x64_saturation.cpp`
 
 ### Intentional differences
@@ -3267,22 +1840,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust passes the presence of Eden's `has_overflow_inst` template parameter explicitly and uses
   `Option<InstRef>` for the associated pseudo-operation.
 - `rxbyak` register-width conversions replace C++ Xbyak's `changeBit` views.
-
-### Unintentional differences (to fix)
-
-- None in the signed saturated add/sub, signed scalar saturation, or unsigned scalar saturation
-  methods reviewed here. In particular, `WithFlag32` exposes overflow without touching FPSR.QC,
-  ordinary signed saturated add/sub ORs the generated overflow byte into QC, and the 8-bit CMOV
-  uses a 32-bit operand exactly as Eden does.
-
-### Missing items
-
-- None for the scalar saturation prerequisite methods reviewed in this slice; unrelated methods
-  in the same pre-existing file were not claimed as re-audited.
-
-### Binary layout verification
-
-- N/A: emitted host instructions operate on internal SSA values and JIT state fields.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_saturation.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_saturation.cpp`
 
@@ -3295,38 +1852,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   through Ruzu's common unsupported-opcode error if they survive required IR lowering; the four
   reachable scalar result-and-overflow operations remain owned by this matching file.
 
-### Unintentional differences (to fix)
-
-- None in `SignedSaturatedAddWithFlag32`, `SignedSaturatedSubWithFlag32`, `SignedSaturation`, or
-  `UnsignedSaturation`: register realization, flag spilling, clamp ordering, and overflow creation
-  match Eden.
-
-### Missing items
-
-- None for the four reachable scalar saturation operations reviewed in this slice.
-
-### Binary layout verification
-
-- N/A: the emitted AArch64 instruction stream does not serialize a guest-visible structure.
-
 ## 2026-08-21 — `src/rdynarmic/src/backend/arm64/inst.rs` vs Oaknut instructions used by Eden `emit_arm64_saturation.cpp`
 
 ### Intentional differences
 
 - Ruzu encodes AArch64 instructions directly as `u32` words rather than calling Oaknut.
-
-### Unintentional differences (to fix)
-
-- None for the newly required `CMP Wn, Wm` encoding; its known machine word is covered by the
-  AArch64 encoding regression test.
-
-### Missing items
-
-- None for the instruction-encoding prerequisite in this slice.
-
-### Binary layout verification
-
-- PASS: `cmp w16, w17` encodes as `0x6b11021f`, verified under the AArch64 test target.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/{x64/emit.rs,arm64/emit_arm64.rs,arm64/mod.rs}` vs Eden backend saturation emitter registration
 
@@ -3335,19 +1865,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust dispatches opcodes through explicit `match` arms and declares the ARM64 source module in
   `mod.rs`; Eden registers template specializations through its C++ emitter headers and build.
 
-### Unintentional differences (to fix)
-
-- None in this routing slice: all four scalar result-and-overflow saturation opcodes reach their
-  architecture-specific owner on x64 and ARM64.
-
-### Missing items
-
-- None introduced by the routing change.
-
-### Binary layout verification
-
-- N/A: routing declarations do not define a serialized layout.
-
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/helpers.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/common.h`
 
 ### Intentional differences
@@ -3355,22 +1872,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust returns the untyped internal `Value` enum where Eden's helper signatures distinguish U16
   and U32 at compile time; the emitted opcode metadata retains those types.
 
-### Unintentional differences (to fix)
-
-- None in `pack_2x16_to_1x32` or `most_significant_half`: masks, shift amounts, carry input, and
-  operation ordering match Eden exactly.
-- Fixed: `ITBlockCheck` was absent. `it_block_check` now rejects exactly an active, nonfinal Thumb
-  IT position, using the same `IsInITBlock() && !IsLastInITBlock()` predicate as Eden.
-
 ### Missing items
 
-- None for the three common helpers reviewed so far. Other
+- Other
   pre-existing helpers in `common.h` were not re-audited or claimed by this prerequisite.
-
-### Binary layout verification
-
-- N/A: these helpers construct internal SSA operations or inspect translation state and serialize
-  no guest-visible payload. Focused tests cover inactive, final, and nonfinal IT positions.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/saturated.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{saturated.cpp,a32_translate_impl.h}`
 
@@ -3382,21 +1887,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   therefore begin with Eden's pre-condition register validation and then emit the instruction
   body. Invalid PC operands still raise Unpredictable before any register read.
 
-### Unintentional differences (to fix)
-
-- None in `arm_ssat`, `arm_ssat16`, `arm_usat`, `arm_usat16`, `arm_qadd`, `arm_qsub`,
-  `arm_qdadd`, or `arm_qdsub`. Saturation widths, immediate-shift carry input, signed halfword
-  extension, result packing, and every sticky-Q update match Eden's order.
-
 ### Missing items
 
 - Eden's `arm_QASX`, `arm_QSAX`, `arm_UQASX`, and `arm_UQSAX` remain absent because Ruzu's ARM
   decoder does not yet expose those instruction IDs. They are pre-existing parallel-instruction
   debt outside this scalar warning slice.
-
-### Binary layout verification
-
-- N/A: these translators construct internal SSA and no raw guest payload.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/mod.rs` vs Eden ARM decoder/visitor dispatch for scalar saturation
 
@@ -3405,19 +1900,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust uses an explicit `ArmInstId` match after block-level condition setup; Eden invokes visitor
   methods through generated decoder callbacks.
 
-### Unintentional differences (to fix)
-
-- None in this routing slice: all eight decoded ARM scalar saturation instructions now call their
-  owner in `saturated.rs`; the former successful no-op stubs were removed.
-
 ### Missing items
 
 - The four parallel saturation IDs named in the `saturated.rs` audit remain absent from the Rust
   decoder and consequently from this dispatcher.
-
-### Binary layout verification
-
-- N/A: dispatcher routing defines no serialized layout.
 
 ## 2026-08-21 — `src/rdynarmic/src/jit.rs` scalar saturation regression vs Eden `frontend/A32/translate/impl/saturated.cpp`
 
@@ -3426,19 +1912,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Rust-native regression executes a compact ARM instruction stream through each available
   host backend; Eden's C++ source defines the expected semantics but does not own this Rust test.
 
-### Unintentional differences (to fix)
-
-- None in the covered behavior: signed/unsigned scalar and halfword clamps produce the expected
-  registers, saturated addition clamps to INT32_MAX, and CPSR.Q remains set.
-
 ### Missing items
 
 - This focused regression does not claim exhaustive immediate widths or every QDADD/QDSUB input;
   their IR ordering is covered by module tests.
-
-### Binary layout verification
-
-- N/A: the test executes guest instructions but changes no serialized guest structure.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/{data_processing.rs,mod.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{data_processing.cpp,a32_translate_impl.h}`
 
@@ -3465,11 +1942,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - No decoded ARM data-processing operation is missing from this file. Exact one-method-per-Eden-
   visitor structure remains the structural work identified above.
 
-### Binary layout verification
-
-- N/A: these translators construct internal SSA operations and serialize no guest-visible
-  payload.
-
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/{a32_emit_a32.rs,emit_a64.rs,emit_vector_multiply.rs}` warning-only cleanup vs Eden x64 emitter owners
 
 ### Intentional differences
@@ -3481,19 +1953,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   synthetic `Inst` and three unnecessary `unsafe` call sites changes neither the emitted code nor
   the paired-min/max fallback calculations rechecked against Eden's `emit_x64_vector.cpp`.
 
-### Unintentional differences (to fix)
-
-- None introduced or found in this warning-only slice. Production vector-emitter parity outside
-  the three existing lower-paired regressions was not re-audited here.
-
-### Missing items
-
-- None for this warning-only slice.
-
-### Binary layout verification
-
-- N/A: parameter naming and Rust test call-site cleanup define no serialized layout.
-
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/thumb16.rs` PUSH/POP vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{thumb16.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
@@ -3502,21 +1961,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   passes those fields as typed visitor arguments. Both construct the same 16-bit register mask.
 - Rust uses `Reg::R13` for Eden's `Reg::SP` spelling and `Value::ImmU1` carry operands for the
   equivalent `ir.Add`/`ir.Sub` operations.
-
-### Unintentional differences (to fix)
-
-- None in the re-audited PUSH/POP slice: empty lists are rejected before reading SP, stack
-  accesses are `Atomic`, registers are visited in ascending order, and POP writes the incremented
-  address to SP at Eden's exact point before `PopRSBHint`.
-
-### Missing items
-
-- None in `thumb16_PUSH` or `thumb16_POP`. Other methods in the shared Rust file were not claimed
-  by this warning-driven audit.
-
-### Binary layout verification
-
-- N/A: the methods emit guest memory operations but define no serialized structure.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a64/translate/mod.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A64/translate/{a64_translate.cpp,a64_translate.h}`
 
@@ -3542,10 +1986,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The public equivalent of Eden's `TranslateSingleInstruction` is absent. Module-local test
   helpers with a similar name do not implement that API.
 
-### Binary layout verification
-
-- N/A: block translation control flow defines no serialized guest structure.
-
 ## 2026-08-21 — `src/rdynarmic/src/ir/opt/a32_get_set_elimination.rs` pending-C forwarding vs Eden `src/dynarmic/src/dynarmic/ir/{opt_passes.cpp,opt_passes.h}`
 
 ### Intentional differences
@@ -3560,17 +2000,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the re-audited pending-C/`A32SetCpsrNZCV` path. The removed boolean assignment was
+- The removed boolean assignment was
   overwritten by the complete `FlagInfo::set_not_required()` state before any read.
 
-### Missing items
-
-- None in this warning-driven path. The rest of `FlagsPass` and `RegisterPass` was not newly
-  claimed by this focused audit.
-
-### Binary layout verification
-
-- N/A: this optimizer rewrites internal SSA and defines no serialized structure.
 ## 2026-08-21 — `src/core/src/file_sys/content_archive.rs` vs Eden `src/core/file_sys/{content_archive.h,content_archive.cpp}`
 
 ### Intentional differences
@@ -3592,16 +2024,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   to `Program`; Eden directly casts the byte to `NCAContentType`. Preserving an invalid discriminant
   safely requires changing the Rust public type instead of constructing an invalid enum value.
 
-### Missing items
-
-- None in the constructor paths audited here: reader initialization, key-area validation, title-key
-  setup, filesystem classification, update detection, and final status now follow Eden's ordering.
-
-### Binary layout verification
-
-- PASS: `NCA` itself is not serialized. The regression fixture writes the existing `repr(C)`
-  `NcaHeader`, whose compile-time size assertion remains `0x400`; it introduces no new payload type.
-
 ## 2026-08-21 — `src/core/src/file_sys/fssystem/aes_xts_storage.rs` vs Eden `src/core/file_sys/fssystem/{fssystem_aes_xts_storage.h,fssystem_aes_xts_storage.cpp}`
 
 ### Intentional differences
@@ -3615,21 +2037,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The `VfsFile` implementation supplies the Rust VFS naming, parent, readability, and write-reject
   methods around Eden's `IReadOnlyStorage` interface.
 
-### Unintentional differences (to fix)
-
-- None in `MakeAesXtsIv`, construction, `Read`, or `GetSize` after this audit. In particular, reads
-  now seed the counter from the supplied IV and preserve XTS block-tweak position for an offset in
-  the middle of a storage block.
-
-### Missing items
-
-- None for this storage layer.
-
-### Binary layout verification
-
-- N/A: `AesXtsStorage` is an in-memory polymorphic storage object and is not serialized. Key and IV
-  arrays retain Eden's exact `0x20` and `0x10` byte sizes.
-
 ## 2026-08-21 — `src/core/src/file_sys/fssystem/hierarchical_sha3_storage.rs` vs Eden `src/core/file_sys/fssystem/{fssystem_hierarchical_sha3_storage.h,fssystem_hierarchical_sha3_storage.cpp}`
 
 ### Intentional differences
@@ -3641,19 +2048,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   getters; Eden requires `Initialize` before `GetSize` or non-empty `Read`.
 - The unused mutex was removed. Eden declares and constructs `m_mutex` but never locks it in either
   `Initialize` or `Read`, so the Rust field provided no synchronization or lifecycle behavior.
-
-### Unintentional differences (to fix)
-
-- None in the initialization bounds, layer selection, hash-buffer fill, size query, or pass-through
-  read paths audited here.
-
-### Missing items
-
-- None for the behavior present in Eden's current hierarchical SHA3 storage.
-
-### Binary layout verification
-
-- N/A: this storage object and its owned work buffer are not serialized.
 
 ## 2026-08-21 — `src/core/src/file_sys/ips_layer.rs` vs Eden `src/core/file_sys/{ips_layer.h,ips_layer.cpp}`
 
@@ -3671,20 +2065,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `parse_integer_auto` expresses the valid signed decimal/octal/hexadecimal forms accepted by
   Eden's `std::strtoll(..., 0)` without calling a platform C runtime parser.
 
-### Unintentional differences (to fix)
-
-- None in the audited IPS/IPS32 record application and IPSwitch parsing paths. Inner patch comments
-  are now skipped, offset shifts accept C-style base prefixes, and signed shifts use wrapping
-  unsigned addition before the final `u32` narrowing, matching Eden's bit pattern.
-
-### Missing items
-
-- None for this file's public API.
-
-### Binary layout verification
-
-- N/A: patch records are parsed into owned containers and are not serialized as native structs.
-
 ## 2026-08-21 — `src/common/src/fs/path_util.rs` `sanitize_path` vs Eden `src/common/fs/{path_util.h,path_util.cpp}` `SanitizePath`
 
 ### Intentional differences
@@ -3697,15 +2077,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - Android content URIs are not bypassed before normalization. Android filesystem glue is an
   explicit project exception; this remains relevant only if that excluded frontend is introduced.
-
-### Missing items
-
-- None for desktop `SanitizePath`: repeated separators and trailing separators are removed, `.` is
-  discarded, and `..` removes the preceding retained component exactly as in Eden.
-
-### Binary layout verification
-
-- N/A: path normalization defines no serialized structure.
 
 ## 2026-08-21 — `src/core/src/file_sys/vfs/vfs_real.rs` vs Eden `src/core/file_sys/vfs/{vfs_real.h,vfs_real.cpp}`
 
@@ -3732,16 +2103,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Android content-URI filename handling is absent, consistently with the project's Android
   filesystem exception.
 
-### Missing items
-
-- None in file-reference lifecycle: cached opens create a closed reference, first access opens it,
-  every access promotes it to the LRU front, the least-recent open handle is evicted at the same
-  limit, and `Drop` removes and closes the reference.
-
-### Binary layout verification
-
-- N/A: VFS objects and host file-reference state are not serialized.
-
 ## 2026-08-21 — `src/core/src/loader/kip.rs` loader file ownership vs Eden `src/core/loader/{loader.h,kip.h,kip.cpp}`
 
 ### Intentional differences
@@ -3750,38 +2111,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   is a trait, so `AppLoaderKip` owns both fields directly. The retained file is named `_file` to
   express base-class ownership while avoiding a false dead-field warning.
 
-### Unintentional differences (to fix)
-
-- None in the file-lifetime slice. The complete KIP loading algorithm was not reimplemented here.
-
-### Missing items
-
-- None for `AppLoader` base-file ownership; a regression verifies the `VirtualFile` remains alive
-  until the loader is dropped.
-
-### Binary layout verification
-
-- N/A: loader ownership state is not serialized.
-
 ## 2026-08-21 — `src/core/src/loader/nax.rs` loader file ownership vs Eden `src/core/loader/{loader.h,nax.h,nax.cpp}`
 
 ### Intentional differences
 
 - As for KIP, Rust's trait cannot own Eden `AppLoader::file`; `AppLoaderNax::_file` retains that
   base-class ownership directly while `Nax` separately retains its own backing-file reference.
-
-### Unintentional differences (to fix)
-
-- None in this ownership-only slice; NAX parsing and delegated NCA loading were not changed.
-
-### Missing items
-
-- None for base-file lifetime. The regression distinguishes the loader's reference from `Nax`'s
-  own reference and verifies both disappear when the loader is dropped.
-
-### Binary layout verification
-
-- N/A: loader reference ownership is not serialized.
 
 ## 2026-08-21 — `tools/capture_harness/{src/main.rs,example.toml}` vs no Eden source counterpart
 
@@ -3790,19 +2125,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `capture_harness` is a Ruzu-specific developer tool and has no file under Eden's `src/` tree.
   Its embedded parser regression now uses the checked-in generic homebrew example timeline instead
   of referring to a missing, title-specific local fixture.
-
-### Unintentional differences (to fix)
-
-- None for this build-fixture correction.
-
-### Missing items
-
-- None: `cargo test --workspace --all-targets` can compile the harness test without an external
-  untracked configuration file.
-
-### Binary layout verification
-
-- N/A: the change only parses TOML developer-tool configuration.
 
 ## 2026-08-21 — `externals/rxbyak/src/{encode.rs,platform/unix.rs}` vs Eden x64 Xbyak consumers under `src/common/x64` and `src/dynarmic`
 
@@ -3815,19 +2137,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   instruction was generated, and Eden's current Dynarmic consumers do not emit APX; retaining the
   unreachable partial capability only produced dead code.
 
-### Unintentional differences (to fix)
-
-- None in this warning-only slice. General rxbyak/Xbyak instruction parity is outside this focused
-  allocation and unreachable-APX audit.
-
 ### Missing items
 
 - Full Intel APX instruction generation remains unsupported rather than being represented by one
   unreachable prefix helper.
-
-### Binary layout verification
-
-- N/A: executable mapping flags and instruction-emitter methods define no serialized structure.
 
 ## 2026-08-21 — `externals/rxbyak/tests/common/mod.rs` vs Eden test infrastructure
 
@@ -3837,80 +2150,42 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   the same shared operand tables and NASM helpers but deliberately uses only the subset relevant to
   its instruction family, so `dead_code` is allowed only inside that shared test module.
 
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None in this test-harness warning slice.
-
-### Binary layout verification
-
-- N/A: this changes only warning policy for test helpers.
 ## 2026-08-21 — `core/src/hle/kernel/k_session.rs` vs Eden `core/hle/kernel/k_session.{h,cpp}`
 
 ### Intentional differences
+
 - Rust stores the embedded client and server endpoints behind separate `Arc<Mutex<_>>` owners. `KSession::on_server_closed` does not lock the client endpoint solely to invoke `KClientSession::on_server_closed`, because that upstream method has an empty body; doing so introduced a Rust-only endpoint/session ABBA deadlock during concurrent close.
 
-### Unintentional differences (to fix)
-- None in the server-close notification corrected by this entry.
-
 ### Missing items
-- The wider `KAutoObject` reference-count lifecycle remains represented by Rust registries and endpoint-close flags rather than Eden's intrusive kernel-object ownership.
 
-### Binary layout verification
-- N/A: these kernel objects are not raw-copied or serialized.
+- The wider `KAutoObject` reference-count lifecycle remains represented by Rust registries and endpoint-close flags rather than Eden's intrusive kernel-object ownership.
 
 ## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_cryptography.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_cryptography.cpp`
 
 ### Intentional differences
+
 - Rust writes verified AArch64 instruction words through `BlockOfCode`; Eden expresses the same `SHA256H`, `SHA256H2`, `SHA256SU0`, and `SHA256SU1` instructions through Oaknut.
 
-### Unintentional differences (to fix)
-- None in the AES and SHA-256 instruction families currently owned by this file.
-
 ### Missing items
-- Eden's `SM4AccessSubstitutionBox` unreachable specialization remains outside this implementation slice.
 
-### Binary layout verification
-- PASS: focused instruction tests match words assembled by Apple's AArch64 assembler for registers `v16`, `v17`, and `v18`.
+- Eden's `SM4AccessSubstitutionBox` unreachable specialization remains outside this implementation slice.
 
 ## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_cryptography.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_cryptography.cpp` (CRC32 completion)
 
 ### Intentional differences
+
 - Rust selects the 32-bit or 64-bit data register with a boolean passed to the owner-local `emit_crc` helper; Eden expresses the same distinction through the `EmitCRC<bitsize>` template parameter.
 - Rust writes verified AArch64 instruction words through `BlockOfCode`; Eden invokes the corresponding Oaknut CRC32 instruction methods.
 
-### Unintentional differences (to fix)
-- None in the CRC32 ISO and Castagnoli 8/16/32/64-bit instruction families.
-
 ### Missing items
-- Eden's `SM4AccessSubstitutionBox` unreachable specialization remains the only cryptography opcode specialization not represented by this Rust owner.
 
-### Binary layout verification
-- PASS: all eight CRC32 instruction words match Apple's AArch64 assembler for `w16`, `w17`, and `w18`/`x18`. The existing end-to-end ISO CRC32 test now executes on Apple Silicon and matches the expected result.
+- Eden's `SM4AccessSubstitutionBox` unreachable specialization remains the only cryptography opcode specialization not represented by this Rust owner.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/jit_state.rs` vs `src/dynarmic/src/dynarmic/backend/x64/a32_jitstate.{h,cpp}`
 
 ### Intentional differences
 
 - Rust uses `debug_assert_eq!` for Eden's `DEBUG_ASSERT` on the stored FPSCR NZCV mask.
-
-### Unintentional differences (to fix)
-
-- None in the audited A32 FPSCR slice. Ruzu now stores `fpsr_nzcv` directly in ARM FPSCR bits
-  31:28, resets both MXCSR shadows to Eden's exact defaults before applying rounding/FZ, and
-  preserves only the lower location-descriptor half before installing FPSCR mode bits.
-
-### Missing items
-
-- None in `A32JitState::{get_fpscr,set_fpscr}`.
-
-### Binary layout verification
-
-- PASS: no fields were added, removed, or reordered; the existing `repr(C, align(16))` layout and
-  offset tests remain unchanged.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a64/translate/{simd_scalar_three_same.rs,simd_scalar_two_register_misc.rs,visitor.rs}` vs `src/dynarmic/src/dynarmic/frontend/A64/translate/impl/{simd_scalar_three_same.cpp,simd_scalar_two_register_misc.cpp,impl.h}`
 
@@ -3919,19 +2194,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's decoded instruction object supplies Eden's `sz`, `Vm`, `Vn`, and `Vd` parameters to the
   matching snake-case methods; the comparison helper boundaries remain file-local like upstream.
 
-### Unintentional differences (to fix)
-
-- None in the focused scalar equality slice. `FCMEQ_reg_2` and `FCMEQ_zero_2` now dispatch and emit
-  the same element-size-specific floating-point equality IR as Eden.
-
 ### Missing items
 
 - This audit covers only the two scalar FCMEQ methods discovered through warning analysis; the
   remaining A64 translator surface is not claimed complete here.
-
-### Binary layout verification
-
-- N/A: translator dispatch and IR construction serialize no raw payload.
 
 ## 2026-08-21 — `src/rdynarmic/src/{bin/a32_diff.rs,ir/opt/a64_get_set_elimination.rs,jit.rs}` warning audit vs Eden developer/test infrastructure
 
@@ -3942,18 +2208,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - AArch64-only mock callback builders are compiled only on AArch64, matching the architecture guard
   already applied to their sole tests.
 
-### Unintentional differences (to fix)
-
-- None in this developer/test-only slice.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: only local diagnostics and test builders changed.
-
 ## 2026-08-24 — `src/rdynarmic/src/bin/{a32_diff.rs,compile_bench.rs}` vs Eden `src/dynarmic/src/dynarmic/interface/A32/config.h` and `tests/A32/testenv.h`
 
 ### Intentional differences
@@ -3962,24 +2216,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   sparse differential address space and deterministic compilation workloads remain tool-local;
   callback ownership and configuration follow Eden's A32 interface.
 - Rust owns callbacks in `A32UserConfig` instead of storing Eden's non-owning `UserCallbacks*`.
-
-### Unintentional differences (to fix)
-
-- Fixed: both tools implemented the architecture-merged legacy callbacks, including A64-only
-  128-bit accesses and `u64` guest addresses. They now implement the A32 callback interface
-  directly with `u32` addresses, typed A32 exceptions, and A32-exclusive callback names.
-- Fixed: both tools built the merged legacy configuration and supplied irrelevant A64 register and
-  address-space options. They now construct `A32UserConfig` and override only cycle counting, code
-  cache size, and the optimization mask used by each workload.
-
-### Missing items
-
-- None in the callback/configuration ownership of these two developer tools.
-
-### Binary layout verification
-
-- N/A: the tools exchange no raw callback or configuration payload. Focused compile-time tests
-  require both environments to implement the architecture-owned A32 callback trait.
 
 ## 2026-08-24 — `src/rdynarmic/src/{tests_a32.rs,tests_a32_fuzz.rs}` callback/configuration ownership vs Eden `src/dynarmic/src/dynarmic/interface/A32/config.h` and `tests/A32/testenv.h`
 
@@ -3991,24 +2227,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Sparse test memory uses Rust maps and mutexes while preserving Eden's A32 `u32` guest-address
   domain and little-endian byte assembly.
 
-### Unintentional differences (to fix)
-
-- Fixed: the A32 test environments implemented the merged legacy interface, carried A64-only
-  128-bit/cache callbacks, and widened guest addresses to `u64`. They now implement the exact A32
-  callback inventory with typed exceptions and wrapping `u32` address arithmetic.
-- Fixed: test JIT builders now construct `A32UserConfig` directly and mutate only the code-cache,
-  optimization, cycle-counting, and coprocessor fields exercised by the corresponding test.
-
 ### Missing items
 
-- None in the callback/configuration ownership covered by this slice. Differential tests still
+- Differential tests still
   require their separately built Eden oracle executable at runtime.
-
-### Binary layout verification
-
-- N/A: callback/configuration objects are host-side state. Existing instruction tests cover the
-  memory and coprocessor paths; a focused local fuzz-environment regression constructs and runs an
-  A32 JIT without relying on the external oracle.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{a32_core.rs,a64_core.rs}` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/{a32_core.h,a64_core.h}` and architecture config headers
 
@@ -4018,23 +2240,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   on assertions/allocation invariants and returns its entry point directly.
 - The architecture-specific test callbacks are boxed by their Rust `UserConfig`; Eden stores a
   non-owning callback pointer.
-
-### Unintentional differences (to fix)
-
-- Fixed: both core test modules built the merged legacy configuration. Their callback inventories,
-  address widths, vector values, and exception types now come directly from their matching A32 or
-  A64 interface, and their builders return the architecture-owned configuration without adapters.
-- Fixed: the A64 page-table test now assigns the page table and its address-space width through the
-  A64-owned fields instead of mutating a shared memory carrier and converting it afterward.
-
-### Missing items
-
-- None in the `A32Core`/`A64Core` run and step surface or this test-configuration slice.
-
-### Binary layout verification
-
-- N/A: these core wrappers and test configurations serialize no guest payload. The complete
-  `rdynarmic` test target compiles for `aarch64-unknown-linux-gnu` with both callback traits checked.
 
 ## 2026-08-21 — `src/rdynarmic/src/frontend/a32/{decoder.rs,decoder_thumb32.rs,translate/thumb32.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/{decoder,translate/impl}`
 
@@ -4046,17 +2251,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Regression names describe the observed instruction sequence generically instead of referring to
   a commercial title; opcodes, fixtures, and assertions are unchanged.
 
-### Unintentional differences (to fix)
-
-- None in this dead-local warning slice.
-
 ### Missing items
 
 - The broader handwritten-decoder parity surface is outside this focused no-behavior-change audit.
-
-### Binary layout verification
-
-- N/A: decoder locals and helper parameters define no serialized structure.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_arrangement.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp` (narrow/sign-extend/zero-extend slice)
 
@@ -4065,20 +2262,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust releases scratch-register locks explicitly where Eden's register-allocation wrappers release
   them by scope; emitted instruction ordering is otherwise preserved.
 
-### Unintentional differences (to fix)
-
-- None in the focused slice. `VectorSignExtend64` now copies the low 64-bit lane to a GPR, performs
-  an arithmetic shift by 63, and installs that sign mask in the high lane like Eden instead of
-  incorrectly widening two 32-bit lanes. The 8/16/32-bit sign/zero extensions now also retain
-  Eden's SSE2 paths when SSE4.1 is unavailable.
-
 ### Missing items
 
 - Other vector-arrangement emitters remain under the separate warning/parity audit.
-
-### Binary layout verification
-
-- N/A: JIT instruction emission changes no shared state layout or serialized payload.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_arrangement.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64.h` and `emit_x64_vector.cpp` (broadcast/deinterleave slice)
 
@@ -4091,10 +2277,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. Broadcast emitters now select Eden's AVX2, SSSE3, and SSE2 paths;
-  lower broadcasts preserve Eden's upper-lane behavior. Full and lower even/odd deinterleave
-  emitters now use Eden's SSE4.1, SSSE3, and SSE2 instruction sequences instead of generic host
-  calls or unconditional `pshufb` implementations.
 - Removed the `RUZU_BCAST64_*` diagnostic machine-code injection. It had no Eden equivalent and
   could reserve or overwrite architectural host XMM registers outside the register allocator.
 
@@ -4103,10 +2285,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Other vector-arrangement emitters remain under separate parity slices; none of the broadcast or
   deinterleave methods audited here are missing.
 
-### Binary layout verification
-
-- N/A: these methods emit JIT instructions and define no shared or serialized structures.
-
 ## 2026-08-21 — `externals/rxbyak/src/assembler.rs` AVX packed immediate shifts
 
 ### Intentional differences
@@ -4114,19 +2292,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Rust API suffixes immediate packed-shift overloads with `_imm`, consistent with the existing
   legacy SSE methods, because Rust does not support C++-style method overloading.
 
-### Unintentional differences (to fix)
-
-- None in the focused encoder slice. `vpsllw`, `vpsrlw`, and `vpsrld` immediate forms encode the
-  opcode extension in ModRM.reg, the destination in VEX.vvvv, and the source in ModRM.r/m.
-
 ### Missing items
 
 - Other AVX packed immediate-shift element widths are not required by the interrupted Eden emitter
   slice and were not part of this focused prerequisite.
-
-### Binary layout verification
-
-- PASS: XMM, YMM, and extended-register encodings are asserted byte-for-byte against NASM output.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_basic.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64.h` and `emit_x64_vector.cpp` (CLZ/popcount/reverse-bits slice)
 
@@ -4140,20 +2309,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. The CLZ emitters now preserve Eden's GFNI, SSSE3, AVX, AVX2,
-  AVX-512 and fallback selections. Population count now preserves the AVX-512, SSSE3 and fallback
-  paths. Reverse-bits now preserves the GFNI, SSSE3 and baseline SSE2 instruction sequences.
 - Removed the unused 32-bit CLZ and reverse-bits host fallbacks: Eden has no corresponding
   fallbacks because every supported x86-64 host executes their baseline SSE implementations.
-
-### Missing items
-
-- None among `VectorCountLeadingZeros8/16/32`, `VectorPopulationCount`, and `VectorReverseBits`.
-  Other vector-basic methods were outside this warning-driven audit slice.
-
-### Binary layout verification
-
-- N/A: these methods emit JIT instructions and define no shared or serialized structures.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_misc.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp` (rounding-halving-add slice)
 
@@ -4166,21 +2323,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. Signed 8/16-bit RHADD now applies Eden's sign-bit bias around
-  `pavgb`/`pavgw`; signed 32-bit and unsigned 32-bit RHADD now use Eden's overflow-safe shift/add
-  sequences instead of host callbacks.
 - Removed all six scalar RHADD fallbacks. Eden emits native SSE2 for every supported width, so the
   unused unsigned 8/16-bit fallbacks were dead code and the remaining fallbacks represented parity
   debt.
 
 ### Missing items
 
-- None among the signed and unsigned 8/16/32-bit rounding-halving-add emitters. Other
+- Other
   `emit_vector_misc.rs` families remain outside this focused warning-driven audit.
-
-### Binary layout verification
-
-- N/A: these methods emit JIT instructions and define no shared or serialized structures.
 
 ## 2026-08-21 — `src/rdynarmic/src/ir/opt/polyfill.rs` and `backend/x64/emit_vector_multiply.rs` vs `src/dynarmic/src/dynarmic/ir/opt_passes.{h,cpp}` and `backend/x64/emit_x64_vector.cpp` (widening-multiply slice)
 
@@ -4193,20 +2343,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. The x64 A32 and A64 pipelines enable widening-multiply polyfill
-  unconditionally, and the strengthened regression verifies all six signed/unsigned 8/16/32-bit
-  source opcodes are eliminated.
 - Removed the six x64 callback/SSE implementations that had no Eden counterpart. The matching x64
   emitters now assert unreachable after legalization exactly like Eden.
-
-### Missing items
-
-- None for x64 widening-multiply legalization and emitter ownership. The ARM64 backend retains its
-  native widening emitters, matching Eden's separate ARM64 backend behavior.
-
-### Binary layout verification
-
-- N/A: the polyfill rewrites IR and the emitters define no shared or serialized structures.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_multiply.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp` (paired-add slice)
 
@@ -4219,20 +2357,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. The 8/16/32/64-bit full-width emitters and the 8/16/32-bit lower
-  emitters now preserve Eden's exact SSE instruction sequences and SSSE3 feature branches.
 - Removed the scalar callback implementations and the Ruzu-only
   `RUZU_FORCE_PAIRED_ADD8_FALLBACK` diagnostic branch. Eden emits these operations natively on
   every supported x86-64 host.
-
-### Missing items
-
-- None among `VectorPairedAddLower8/16/32` and `VectorPairedAdd8/16/32/64`. The adjacent signed
-  and unsigned widening paired-add family is intentionally handled as the next auditable slice.
-
-### Binary layout verification
-
-- N/A: these methods emit JIT instructions and define no shared or serialized structures.
 
 ## 2026-08-21 — `externals/rxbyak/src/assembler.rs` vs Xbyak 7.35.2 `xbyak_mnemonic.h` (packed immediate qword shifts)
 
@@ -4245,21 +2372,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. The qword logical-left and arithmetic-right immediate forms use the
-  same opcode extensions, opcodes, W bits, EVEX requirements, broadcast tuple flags, and memory
-  EVEX policy as Xbyak 7.35.2.
 - The pre-existing word and dword immediate forms now also retain Xbyak's EVEX flags, and the
   common validator accepts equal-width ZMM operands instead of rejecting a supported form.
-
-### Missing items
-
-- None for the immediate `vpsllw`, `vpsrlw`, `vpsrld`, `vpsllq`, and `vpsraq` register forms.
-  Other packed-shift overloads were outside this prerequisite slice.
-
-### Binary layout verification
-
-- PASS: XMM, YMM, ZMM, ordinary-register, and extended-register encodings match NASM
-  byte-for-byte; the complete rxbyak test suite passes.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_multiply.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64.h` and `emit_x64_vector.cpp` (widening paired-add slice)
 
@@ -4272,21 +2386,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Unintentional differences (to fix)
 
-- None in the focused slice. Signed and unsigned 8/16/32-bit widening paired adds now retain
-  Eden's exact native instruction sequences. Signed 32-bit widening selects the same
-  `AVX512_Ortho` path and preserves the same baseline SSE2 sign-extension construction.
 - Removed all six scalar callbacks plus the two alternative `pmaddwd`/`pmaddubsw` implementations.
   They had no Eden counterpart and bypassed its emitter structure.
-
-### Missing items
-
-- None among `VectorPairedAddSignedWiden8/16/32` and
-  `VectorPairedAddUnsignedWiden8/16/32`.
-
-### Binary layout verification
-
-- N/A: these methods emit JIT instructions and define no shared or serialized structures. The
-  AVX/EVEX prerequisite encodings are independently verified in the preceding rxbyak entry.
 
 ## 2026-08-21 — `src/frontend_common/src/config.rs` vs `src/frontend_common/config.h` and `config.cpp` (config-array ownership audit)
 
@@ -4296,40 +2397,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   is shared across frontend crates; its three fields and stack ownership match Eden's private
   `Config::ConfigArray`.
 
-### Unintentional differences (to fix)
-
-- None in the focused slice. Removed a second, unused `ConfigArray` declaration that duplicated
-  the live `ConfigArrayEntry` without owning Eden's `BeginArray`, `EndArray`, or `SetArrayIndex`
-  behavior.
-
-### Missing items
-
-- None in the config-array state representation and lifecycle.
-
-### Binary layout verification
-
-- N/A: config-array entries are in-memory parser state and are not serialized by raw layout.
-
 ## 2026-08-21 — `src/ruzu_cmd/src/sdl_config.rs` vs `src/yuzu_cmd/sdl_config.h` and `sdl_config.cpp` (configuration-path ownership audit)
 
 ### Intentional differences
 
 - Rust composes `BaseConfig` instead of inheriting C++ `Config`; the base object remains the owner
   of the resolved configuration location and INI state.
-
-### Unintentional differences (to fix)
-
-- None in the focused slice. Removed the unused duplicate `SdlConfig::config_path`; Eden's derived
-  `SdlConfig` does not retain a second path after `Config::Initialize` stores it in the base.
-
-### Missing items
-
-- None for configuration-path ownership. Other SDL configuration methods are outside this warning
-  slice.
-
-### Binary layout verification
-
-- N/A: neither configuration class is serialized by raw object layout.
 
 ## 2026-08-21 — `src/ruzu_cmd/src/main.rs` vs `src/yuzu_cmd/yuzu.cpp` (multiplayer CLI slice)
 
@@ -4366,38 +2439,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust computes the remaining duration before calling `Event::wait_for`; Eden passes the equivalent
   absolute `steady_clock` deadline to `WaitUntil`.
 
-### Unintentional differences (to fix)
-
-- None in this slice. Room validation, backend data ordering, verify-UID propagation, immediate
-  first update, 15-second cadence, error callbacks, 404 re-registration, stop/delete ordering,
-  running-state definition, and credential-update guard now match Eden.
-
-### Missing items
-
-- None in `AnnounceMultiplayerSession`'s declared API or worker lifecycle.
-
-### Binary layout verification
-
-- N/A: announcement state is host-only and is submitted through the typed backend interface.
-
 ## 2026-08-21 — `src/network/src/room_member.rs` vs `src/network/room_member.h` (default join-argument import audit)
 
 ### Intentional differences
 
 - Rust has no default function arguments, so callers pass `NO_PREFERRED_IP` explicitly to `join`
   and `send_join_request`; the constant remains owned by `room.rs`, matching Eden's `room.h`.
-
-### Unintentional differences (to fix)
-
-- None. The unused local import was dead code and did not provide Eden's declaration-level default.
-
-### Missing items
-
-- None in the preferred-address argument behavior.
-
-### Binary layout verification
-
-- N/A: this change only removes an unused import.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_cryptography.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_cryptography.cpp` (AES operations)
 
@@ -4407,11 +2454,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   Oaknut. Register allocation, realization, and instruction ordering remain identical.
 - The two single-round operations share a mechanical Rust helper, as do the two mix-column
   operations; each helper preserves the corresponding upstream method body and state ownership.
-
-### Unintentional differences (to fix)
-
-- None in `AESDecryptSingleRound`, `AESEncryptSingleRound`, `AESInverseMixColumns`, or
-  `AESMixColumns`.
 
 ### Missing items
 
@@ -4463,19 +2505,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu's raw-handle `create_image`, `create_buffer`, and `create_mapped_buffer` compatibility paths
   still use dedicated Vulkan allocations. Eden returns owning VMA-backed `vk::Image`/`vk::Buffer`
   wrappers; `create_owned_buffer` already uses VMA but the remaining callers have not all migrated.
+
 ## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_data_processing.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (masked shifts)
 
 ### Intentional differences
+
 - Rust casts the masked shift count to `u8` only after applying Eden's 32-bit or 64-bit mask, because the local instruction encoders accept the already-valid immediate as `u8`.
-
-### Unintentional differences (to fix)
-- None in the immediate and register forms of 32-bit and 64-bit masked logical-left, logical-right, arithmetic-right, and rotate-right shifts.
-
-### Missing items
-- None in this masked-shift helper slice.
-
-### Binary layout verification
-- N/A: this change only selects an AArch64 shift immediate. A focused regression emits all eight masked-shift opcodes with full-width constants whose upper bits are nonzero.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (scalar integer min/max)
 
@@ -4485,19 +2520,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   than Oaknut. Argument acquisition, W/X register allocation, realization, flag spilling, and
   instruction ordering are identical.
 
-### Unintentional differences (to fix)
-
-- None in `MaxSigned32/64`, `MaxUnsigned32/64`, `MinSigned32/64`, or `MinUnsigned32/64`.
-
-### Missing items
-
-- None in this scalar integer min/max slice.
-
-### Binary layout verification
-
-- N/A: these methods emit host instructions and do not serialize a shared structure. A focused
-  regression routes all eight IR opcodes through the ARM64 data-processing owner.
-
 ## 2026-08-21 — `src/video_core/src/control/channel_state_cache.rs` vs `src/video_core/control/channel_state_cache.h`, `.cpp`, and `.inc`
 
 ### Intentional differences
@@ -4506,7 +2528,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   it does not retain Eden's inner `config_mutex`; the cache owners must provide any cross-thread
   synchronization around the complete `ChannelSetupCaches` value.
 
-## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c}` and `src/video_core/build.rs` vs `src/video_core/host1x/ffmpeg.{h,cpp}`
 ## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/ffmpeg.rs` and `ffmpeg_shim.c` vs `src/video_core/host1x/ffmpeg.h` and `.cpp`
 
 ### Intentional differences
@@ -4522,22 +2543,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   backing `AVFrame` and all ownership/destruction remain identical.
 - `build.rs` probes libva on Linux and FreeBSD to define Eden's optional `LIBVA_FOUND` path; other
   targets compile the same non-libva branch selected by Eden's build configuration.
-
-### Unintentional differences (to fix)
-
-- None after restoring Eden's complete platform-specific preferred-device lists, GPU pixel-format
-  reselection, hardware initialization ownership, Android MediaCodec selection/deferred open/H.264
-  parameter-set extradata, Android low-delay flags, decoder-open reset behavior, allocated default
-  frames, hardware-frame detection, and optional VDPAU-over-VAAPI rejection.
-
-### Missing items
-
-- None in the FFmpeg packet/frame/decoder/hardware-context/decode-API slice.
-
-### Binary layout verification
-
-- N/A: all libav structures are allocated and accessed by the C shim compiled against the active
-  FFmpeg headers; Rust exchanges only opaque pointers, primitive values, and borrowed byte spans.
 
 ## 2026-08-21 — `src/video_core/src/renderer_metal/{metal_device,metal_buffer,metal_format,metal_image,metal_image_view,metal_layer,metal_scheduler,metal_presenter,metal_shader,metal_pipeline_cache,metal_staging_buffer_pool,metal_sampler}.rs` vs Eden renderer ownership
 
@@ -4732,9 +2737,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's `DebugUtilsMessenger` owns both the Vulkan handle and the `ash` extension loader needed
   to destroy it. This is the RAII counterpart of Eden's `vk::DebugUtilsMessenger`, whose instance
   dispatch table is retained by the wrapper internally.
-- None in the implemented native device, buffer/image/view allocation, format mapping, layer,
-  command-buffer, staging and drawable ownership slice after correcting the initial mistaken
-  assumption that `MTLTextureUsage::Unknown` represented all usages.
 
 ### Missing items
 
@@ -5843,6 +3845,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Removed the duplicate frontend `WebExitReason`. The frontend now consumes the HLE-owned type,
   including Eden's `WindowClosed = 4` value instead of the previous incorrect value 8, and uses
   reusable callback semantics matching `std::function`.
+
 ## 2026-08-22 — `src/common/src/settings.rs` vs Eden `src/common/settings.h` (`disable_web_applet`)
 
 ### Intentional differences
@@ -5850,14 +3853,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust registers the setting through `for_each_setting_in_category_mut` instead of Eden's
   `SettingsRegistry` linkage; both expose the same label, Debugging category and persisted value.
 
-### Unintentional differences (to fix)
-
-- None in this setting slice.
-
-### Missing items
-
-- None in this setting slice.
 ## 2026-08-22 — Web frontend applet ownership vs Eden
+
 `src/core/hle/service/am/frontend/applet_web_browser.{h,cpp}`,
 `src/core/hle/service/am/frontend/applets.{h,cpp}` and
 `src/core/frontend/applets/web_browser.{h,cpp}`
@@ -5898,6 +3895,7 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   the upstream date/settings bit encoding.
 
 ## 2026-08-22 — Cabinet frontend ownership vs Eden
+
 `core/hle/service/am/frontend/applet_cabinet.{h,cpp}`,
 `core/frontend/applets/cabinet.{h,cpp}` and `core/hle/service/am/frontend/applets.cpp`
 
@@ -6011,6 +4009,7 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
   full payload has no unread implicit padding at that boundary.
 
 ## 2026-08-22 — `system_settings_server.rs` state ownership vs Eden
+
 `system_settings_server.{h,cpp}`
 
 ### Intentional differences
@@ -6045,6 +4044,7 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
   automatic-application-download, USB 3.0, HTTP-auth-config, and account-user-settings commands.
 
 ## 2026-08-22 — `system_settings_server.rs` persistence vs Eden
+
 `system_settings_server.{h,cpp}`
 
 ### Intentional differences
@@ -6082,6 +4082,7 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
   that kept dead code alive was removed.
 
 ## 2026-08-22 — VI free-slot ownership in `display_list.rs` and `layer_list.rs`
+
 vs Eden `display_list.h` and `layer_list.h`
 
 ### Intentional differences
@@ -6099,6 +4100,7 @@ vs Eden `display_list.h` and `layer_list.h`
   IDs starting at one. Both previously unused-helper warnings are gone.
 
 ## 2026-08-22 — `sfdnsres.rs` NetDB mapping and blocked hosts vs Eden
+
 `sfdnsres.{h,cpp}`
 
 ### Intentional differences
@@ -6199,12 +4201,6 @@ vs Eden `display_list.h` and `layer_list.h`
   payload rejection. The unread LAN state fields and unused `init_node_state_change` warning are
   gone.
 
-### Binary layout verification
-
-- PASS: `NodeInfo` and `NetworkInfo` are still sent as their existing 0x40-byte and 0x480-byte
-  native payloads. The receive path validates every enum-bearing field before constructing the
-  raw-copied `NetworkInfo`; no field order or padding changed.
-
 ## 2026-08-22 — upstream-dead monitor state in `ldn/monitor_service.rs`
 
 ### Intentional differences
@@ -6250,6 +4246,7 @@ vs Eden `display_list.h` and `layer_list.h`
   status query.
 
 ## 2026-08-22 — application foreground request in `application_accessor.rs` vs Eden
+
 `application_accessor.{h,cpp}`
 
 ### Intentional differences
@@ -6305,11 +4302,6 @@ vs Eden `display_list.h` and `layer_list.h`
   calls only `build_application_launch_property`; migrating that lifecycle into this helper is a
   separate ownership change because it currently retains the frontend's loader and process.
 
-### Binary layout verification
-
-- PASS: failed control reads produce exactly `size_of::<RawNACP>() == 0x4000` zero bytes, and the
-  registered `ApplicationLaunchProperty` retains its existing verified 0x10-byte C layout.
-
 ## 2026-08-22 — `launch_timestamp_cache.rs` vs Eden `launch_timestamp_cache.{h,cpp}`
 
 ### Intentional differences
@@ -6333,6 +4325,7 @@ vs Eden `display_list.h` and `layer_list.h`
   serialization and the fixed fallback value.
 
 ## 2026-08-22 — `am/service/application_creator.rs` vs Eden
+
 `am/service/application_creator.{h,cpp}`
 
 ### Intentional differences
@@ -6375,6 +4368,7 @@ vs Eden `display_list.h` and `layer_list.h`
   transitions required by Eden's AM producer and consumer services.
 
 ## 2026-08-22 — `am/service/home_menu_functions.rs` vs Eden
+
 `am/service/home_menu_functions.{h,cpp}`
 
 ### Intentional differences
@@ -6395,6 +4389,7 @@ vs Eden `display_list.h` and `layer_list.h`
   misleading unread-field warning is gone and `core` decreases from 69 to 68 warnings.
 
 ## 2026-08-22 — general-channel producer in `am/service/common_state_getter.rs` vs Eden
+
 `am/service/common_state_getter.{h,cpp}`
 
 ### Intentional differences
@@ -6412,6 +4407,7 @@ vs Eden `display_list.h` and `layer_list.h`
 - A focused regression verifies command wiring and the complete producer-to-system pop path.
 
 ## 2026-08-22 — event ownership in `am/service/lock_accessor.rs` vs Eden
+
 `am/service/lock_accessor.{h,cpp}`
 
 ### Intentional differences
@@ -6433,6 +4429,7 @@ vs Eden `display_list.h` and `layer_list.h`
   owner. Both unread-field warnings are gone and `core` decreases from 68 to 67 warnings.
 
 ## 2026-08-22 — process ownership in `am/service/self_controller.rs` vs Eden
+
 `am/service/self_controller.{h,cpp}`
 
 ### Intentional differences
@@ -6454,6 +4451,7 @@ vs Eden `display_list.h` and `layer_list.h`
   decreases from 67 to 66 warnings.
 
 ## 2026-08-22 — `am/service/storage.rs` and `storage_accessor.rs` vs Eden
+
 `am/service/storage.{h,cpp}` and `storage_accessor.{h,cpp}`
 
 ### Intentional differences
@@ -6474,6 +4472,7 @@ vs Eden `display_list.h` and `layer_list.h`
   unread `IStorage::system` warning is gone and `core` decreases from 66 to 65 warnings.
 
 ## 2026-08-22 — `aoc/purchase_event_manager.rs` vs Eden
+
 `aoc/purchase_event_manager.{h,cpp}`
 
 ### Intentional differences
@@ -6494,6 +4493,7 @@ vs Eden `display_list.h` and `layer_list.h`
   from 65 to 64 warnings.
 
 ## 2026-08-22 — `apm/apm.rs` and `apm_interface.rs` vs Eden APM
+
 `apm/apm.{h,cpp}` and `apm/apm_interface.{h,cpp}`
 
 ### Intentional differences
@@ -6518,19 +4518,8 @@ vs Eden `display_list.h` and `layer_list.h`
   adding `ResultSuccess` and a third word. A focused regression verifies the raw IPC response
   size and payload placement.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed APM registration and ownership slice.
-
-### Missing items
-
-- None for the reviewed APM registration and ownership slice.
-
-### Binary layout verification
-
-- PASS: this cleanup changes only an unused Rust import and no IPC payload or serialized type.
-
 ## 2026-08-22 — audio service event ownership vs Eden audio interfaces
+
 `src/core/src/hle/service/audio/{audio_in,audio_out,audio_renderer}.rs` vs
 `src/core/hle/service/audio/{audio_in,audio_out,audio_renderer}.{h,cpp}` and their matching
 `src/audio_core/{in/audio_in,out/audio_out,renderer/audio_renderer}.{h,cpp}` owners
@@ -6549,19 +4538,6 @@ vs Eden `display_list.h` and `layer_list.h`
 - Eden balances `KProcess::Open/Close`; Ruzu's corresponding strong `Arc<ProcessLock>` is installed
   in the concrete audio system. Calling `free`/`finalize`, unregistering the event pair, and then
   dropping the concrete session releases that process owner in the same lifecycle order.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed event ownership and service-destruction slice.
-
-### Missing items
-
-- None for `IAudioIn`, `IAudioOut`, and `IAudioRenderer` event cleanup ordering.
-
-### Binary layout verification
-
-- PASS: no raw IPC payload was changed. Existing focused tests continue to verify the 0x28-byte
-  `AudioInBuffer` and `AudioOutBuffer` wire layouts.
 
 ### Fixed parity debt
 
@@ -6587,19 +4563,6 @@ vs Eden `display_list.h` and `layer_list.h`
   Removing the context owner first and the service field owner second preserves the same externally
   observable endpoint lifetime.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed command, event-identity, and destruction slice.
-
-### Missing items
-
-- None from Eden's `IBtmUserCore`; the remaining null command-table entries are also null upstream.
-
-### Binary layout verification
-
-- PASS: the implementation changes only host-side event ownership and does not alter an IPC
-  payload. Commands 0, 17, 26, and 33 retain their success result, valid flag, and copy handle.
-
 ### Fixed parity debt
 
 - Added explicit `scan`, `connection`, `service_discovery`, and `config` event closure in Eden's
@@ -6615,18 +4578,6 @@ vs Eden `display_list.h` and `layer_list.h`
   shared service object directly. Each Rust closure now captures one preconstructed `Arc` and
   clones that owner per session; `make_system_settings_factory` isolates this mechanical adapter
   for the typed `set:sys` dependency used by other services.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed service-registration ownership slice.
-
-### Missing items
-
-- None from Eden's `Set::LoopProcess` registration list.
-
-### Binary layout verification
-
-- PASS: no IPC payload or persisted settings structure changed.
 
 ### Fixed parity debt
 
@@ -6656,22 +4607,6 @@ vs Eden `display_list.h` and `layer_list.h`
   returned count is zero. Ruzu leaves those guest buffers untouched; the authoritative zero count
   and zero total still tell the caller that no element is valid.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed command table, settings dependency, IPC outputs, or event lifecycle.
-
-### Missing items
-
-- None from Eden's `IBtmSystemCore`; all methods with non-null upstream handlers are ported and all
-  upstream null entries remain unimplemented.
-
-### Binary layout verification
-
-- PASS: `bool` outputs occupy one CMIF word, device counts/totals remain signed 32-bit values, and
-  `ClientAppletResourceUserId` is sourced from the request PID as in Eden's serialization layer.
-  The `std::array<u8, 0xFF>` output elements are not materialized because every matching stub
-  reports zero valid elements.
-
 ### Fixed parity debt
 
 - Ported commands 0, 1, 4–7, 13, 14, 17, 20, 22, and 23 with their exact success, boolean, count,
@@ -6688,18 +4623,6 @@ vs Eden `display_list.h` and `layer_list.h`
 - Rust annotates the private `manager` field with `#[allow(dead_code)]`. Eden likewise retains the
   constructor-provided shared `AlbumManager` without dereferencing it; the field remains in its
   upstream owner to preserve lifetime and structure instead of being removed or renamed.
-
-### Unintentional differences (to fix)
-
-- None in the warning-producing ownership slice.
-
-### Missing items
-
-- None from `IAlbumControlService`; the command table and sole implemented command match Eden.
-
-### Binary layout verification
-
-- N/A: `IAlbumControlService` is not serialized or copied as a wire payload.
 
 ## 2026-08-22 — `src/core/src/hle/service/friend/{friend.rs,friend_interface.rs}` vs `src/core/hle/service/friend/{friend.cpp,friend_interface.cpp}`
 
@@ -6722,24 +4645,6 @@ vs Eden `display_list.h` and `layer_list.h`
 - Field-local `#[allow(dead_code)]` attributes cover only owners that Eden deliberately retains
   without later dereferencing: the flattened module owner, service `SystemRef`s, and notification
   UUID. Removing them would change upstream lifetime ownership.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed command tables, implemented handlers, payloads, system/module forwarding,
-  or event lifecycle.
-
-### Missing items
-
-- None from Eden's `IFriendService`, `INotificationService`, `Module::Interface`, concrete `Friend`,
-  or neighbor-detection service tables. All non-null upstream handlers are ported and every null
-  entry remains unimplemented.
-
-### Binary layout verification
-
-- PASS: compile-time assertions preserve `SizedFriendFilter` and `SizedNotificationInfo` at 0x10
-  bytes and `FriendsUserSetting` at 0x800 bytes. A byte-level regression verifies UUID placement,
-  permissions, reception flag, NUL-terminated default friend code, next-issuable time, and fully
-  zeroed reserved bytes.
 
 ### Fixed parity debt
 
@@ -6778,11 +4683,6 @@ vs Eden `display_list.h` and `layer_list.h`
   missing. The reviewed event methods for commands 50–60 and alarm methods for commands 200–202
   are present.
 
-### Binary layout verification
-
-- PASS: `AlarmInfo` continues to use its existing raw IPC layout. Invalid queries set only the
-  validity flag and preserve the caller-initialized info/time outputs, matching Eden.
-
 ### Fixed parity debt
 
 - Restored the three public service methods as the owners of commands 200–202; IPC handlers now
@@ -6817,16 +4717,6 @@ vs Eden `display_list.h` and `layer_list.h`
   self-reference between sibling fields of `TimeWorker`; the resource has no behavior in
   `AlarmWorker`, and CoreTiming is supplied directly instead.
 
-### Missing items
-
-- None inside `AlarmWorker`; constructor state, `Initialize`, both getters,
-  `OnPowerStateChanged`, `GetClosestAlarmInfo`, `AttachToClosestAlarmEvent`, and destructor ordering
-  are present.
-
-### Binary layout verification
-
-- N/A: this slice creates and schedules event objects but serializes no raw payload.
-
 ### Fixed parity debt
 
 - Replaced the unrelated synthetic closest-alarm event with the actual event owned by PSC
@@ -6857,11 +4747,6 @@ vs Eden `display_list.h` and `layer_list.h`
 - The PM-module registration described by Eden's own TODO remains absent in
   `pm_state_change_handler.rs`; this does not remove any implementation present in `worker.cpp`.
 
-### Binary layout verification
-
-- PASS: `SystemClockContext` and `SteadyClockTimePoint` remain respectively `0x20` and `0x18`
-  bytes. Full zero-initialized buffers are written to `set:sys`, preserving the raw C layouts.
-
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/file_timestamp_worker.rs` vs `src/core/hle/service/glue/time/file_timestamp_worker.{h,cpp}`
 
 ### Intentional differences
@@ -6877,10 +4762,6 @@ vs Eden `display_list.h` and `layer_list.h`
 - `IFileSystemProxy::SetCurrentPosixTime` remains absent exactly where Eden also leaves it as a
   TODO.
 
-### Binary layout verification
-
-- N/A: calendar values remain local typed objects and are not serialized by this worker.
-
 ### Fixed parity debt
 
 - Restored both upstream service owners and the complete implemented portion of
@@ -6888,48 +4769,51 @@ vs Eden `display_list.h` and `layer_list.h`
   either service.
 - A lifetime regression verifies that the exact clock and timezone allocations remain owned until
   the worker is destroyed.
+
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/manager.rs` vs `src/core/hle/service/glue/time/manager.{h,cpp}`
 
 ### Intentional differences
+
 - Rust stores the three manager-owned resources in `Arc<Mutex<_>>`: this preserves Eden's single
   allocation and reference-sharing contract without self-referential Rust structs.
 
 ### Unintentional differences (to fix)
+
 - `m_set_sys` and `m_time_m` are acquired as temporary manager references rather than retained as
   manager fields. The exact singleton owners are now forwarded to and retained by `TimeWorker`, so
   runtime lifetime and behavior match while the manager's field layout remains structurally
   different.
 
 ### Missing items
-- The final constructor-side filesystem timestamp update still stops at Eden's own filesystem TODO.
 
-### Binary layout verification
-- PASS: this ownership-only change does not serialize or raw-copy any payload.
+- The final constructor-side filesystem timestamp update still stops at Eden's own filesystem TODO.
 
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/static.rs` vs `src/core/hle/service/glue/time/static.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's borrowed manager-resource references are represented by clones of the same
   `Arc<Mutex<_>>` allocations so returned IPC services can safely outlive a temporary manager lock.
 
 ### Unintentional differences (to fix)
+
 - The Rust service does not yet retain Eden's `m_set_sys`, `m_time_m`, `m_time_sm`, and
   `m_time_zone` service owners as corresponding fields.
 
 ### Missing items
+
 - Several public clock methods still return simplified success values instead of forwarding to
   the wrapped PSC service; these pre-existing differences remain outside this ownership slice.
-
-### Binary layout verification
-- PASS: resource identity and lifetime changed, but no IPC payload layout changed.
 
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/time_zone.rs` vs `src/core/hle/service/glue/time/time_zone.{h,cpp}`
 
 ### Intentional differences
+
 - C++ borrowed references to `FileTimestampWorker` and `TimeZoneBinary` use shared
   `Arc<Mutex<_>>` owners in Rust, preserving identity and synchronized mutation.
 
 ### Unintentional differences (to fix)
+
 - `SetDeviceLocationName` now performs Eden's shared file-timestamp update, but it still does not
   persist the resulting name and update time through `set:sys` because that service owner is not
   retained yet.
@@ -6937,14 +4821,13 @@ vs Eden `display_list.h` and `layer_list.h`
   events and signals every registered reader after a location update.
 
 ### Missing items
-- The `m_set_sys` owner and its two setters are not yet ported into this glue service.
 
-### Binary layout verification
-- PASS: no raw payload type or IPC response layout changed in this ownership slice.
+- The `m_set_sys` owner and its two setters are not yet ported into this glue service.
 
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/worker.rs` vs `src/core/hle/service/glue/time/worker.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's two borrowed resource references are represented by clones of the manager's exact
   `Arc<Mutex<_>>` allocations, avoiding an unsafe self-reference while preserving ownership.
 - Rust's `JoinHandle` has no `std::jthread` stop token, so an `Arc<AtomicBool>` carries the same
@@ -6954,22 +4837,20 @@ vs Eden `display_list.h` and `layer_list.h`
   priority-dependent two-versus-nine event selection.
 
 ### Unintentional differences (to fix)
+
 - `PmStateChangeHandler` does not retain the otherwise unused `AlarmWorker` reference. Eden's only
   current constructor behavior is storing that reference beside a TODO for PM-module setup, so the
   active priority and dispatch behavior remain equal at zero.
 
 ### Missing items
+
 - PM-module registration remains absent from `pm_state_change_handler.rs`; Eden also marks that
   initialization as TODO.
-
-### Binary layout verification
-- PASS: `SystemClockContext` (`0x20`) and `SteadyClockTimePoint` (`0x18`) are copied into fully
-  zero-initialized fixed-size settings buffers. Focused dispatch coverage verifies the complete
-  local-clock payload written by the background worker.
 
 ## 2026-08-22 — `src/ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp`
 
 ### Intentional differences
+
 - Before constructing video subsystems, the GTK frontend rejects an OpenGL renderer selected on
   macOS AArch64 with a dedicated multiline diagnostic explaining that Apple Silicon supports only
   the Vulkan renderer in ruzu. Eden uses one generic `ErrorVideoCore` dialog because its supported
@@ -6978,31 +4859,13 @@ vs Eden `display_list.h` and `layer_list.h`
   applied. Vulkan, Null, macOS x86_64, and non-macOS hosts retain the existing load path and generic
   video-core error handling.
 
-### Unintentional differences (to fix)
-- None in this diagnostic slice.
-
-### Missing items
-- None.
-
-### Binary layout verification
-- N/A: this change only selects frontend error text before renderer construction.
-
 ## 2026-08-22 — `src/video_core/src/engines/fermi_2d.rs` vs `src/video_core/engines/fermi_2d.{h,cpp}`
 
 ### Intentional differences
+
 - Eden indexes the `Regs::reg_array` union member directly. Rust derives the same word pointer
   from the `#[repr(C)] RegsUnionRaw` address, avoiding an unsafe union-field projection required
   by Rust 1.89 while preserving the exact offset, size, and contiguous storage.
-
-### Unintentional differences (to fix)
-- None in this compiler-compatibility slice.
-
-### Missing items
-- None in this compiler-compatibility slice.
-
-### Binary layout verification
-- PASS: tests verify that `RegsRaw` and `RegsUnionRaw` are exactly
-  `Regs::NUM_REGS * sizeof(u32) == 0x960` bytes and that the word view spans exactly that union.
 
 ## 2026-08-26 — Fermi2D raw-register and blit parity
 
@@ -7021,6 +4884,7 @@ Eden files:
 - `src/video_core/renderer_vulkan/vk_texture_cache.cpp`
 
 ### Intentional differences
+
 - `Surface::format` and `Surface::linear` use raw `u32` storage, and `Operation` is a transparent
   `u32` newtype. C++ enums can retain arbitrary register bit patterns; constructing an invalid Rust
   enum discriminant would be undefined behavior. The raw Rust representations preserve every bit,
@@ -7028,43 +4892,18 @@ Eden files:
 - Rust checks the length of the slice passed to `call_multi_method`; Eden receives an unchecked
   pointer whose caller contract guarantees `amount` readable words.
 
-### Unintentional differences (to fix)
-- None after this correction. Unknown surface formats, memory layouts, and operations are no longer
-  normalized; all five `UNIMPLEMENTED_IF_MSG` checks now use Eden's fail-soft policy; the complete
-  blit calculation uses the same wraparound bit patterns and ordering; and the spurious deferred
-  `pending_blit` state has been removed. The register union is no longer extended with Maxwell's
-  `0xE00`-word register count, and `Blit` now requires the rasterizer binding that Eden dereferences
-  before selecting the software fallback.
-
-### Missing items
-- None in the Fermi2D register/blit slice.
-
-### Binary layout verification
-- PASS: `Operation` is 4 bytes, `Surface` is `0x28`, `Config` is `0x2c`, `ActiveRegsRaw` is `0x6e0`,
-  the upstream register union is exactly `0x960`, and tests verify every asserted register offset
-  plus the exact union word count.
-- PASS: Vulkan's `BlitImagePipelineKey` now owns the upstream Fermi2D `Operation` type rather than a
-  duplicate renderer-local enum; the representation remains one 32-bit word.
-
 ## 2026-08-22 — `src/video_core/build.rs` vs Eden root `CMakeLists.txt`
 
 ### Intentional differences
+
 - Eden selects C++20 globally. The Rust build script selects C++17 only for the BCN shim and its
   bundled decoder sources, which require a modern C++ mode but not Eden's complete C++20 build
   environment; this also prevents Apple Clang from falling back to C++98.
 
-### Unintentional differences (to fix)
-- None in this build-compatibility slice.
-
-### Missing items
-- None.
-
-### Binary layout verification
-- N/A: this changes only the language mode used to compile the existing C++ shim sources.
-
 ## 2026-08-22 — `src/core/src/hle/service/psc/time/tzif.rs` vs Eden `externals/tz/tz/tz.{h,cpp}`
 
 ### Intentional differences
+
 - Rust checks the input length and `TZif` magic before decoding the header. Eden's current
   `tzloadbody` copies the header without those guards; rejecting malformed input avoids an
   out-of-bounds read without changing valid Switch archive behavior.
@@ -7072,61 +4911,40 @@ Eden files:
   same offsets while making every guest-provided bit pattern valid to decode in Rust.
 
 ### Unintentional differences (to fix)
+
 - `parse_posix_tz` implements only the POSIX footer forms exercised by the embedded Switch
   archive. Eden retains the complete `tzparse` implementation, including its broader validation
   and transition-generation behavior.
 
 ### Missing items
+
 - The remaining `tzparse` branches and edge cases not represented by the current embedded archive
   still need a literal port before the external TZ library can be called complete.
-
-### Binary layout verification
-- PASS: `TtInfo` is 0x10 bytes and `TzRule` is 0x4000 bytes with Eden's field offsets, fixed array
-  capacities and explicit zeroed padding. Unaligned IPC decoding and full deterministic output are
-  covered by focused tests.
-- The parser now matches Eden's Switch-specific single 8-byte data block, counter ordering and
-  256-byte footer bound; a regression parses the archive's `Etc/GMT` rule.
-- `mktime_tzname` now preserves Eden's distinct success, overflow and not-found statuses and writes
-  the normalized `CalendarTimeInternal` back only after a successful conversion.
 
 ## 2026-08-22 — `src/core/src/hle/service/psc/time/time_zone.rs` vs Eden `src/core/hle/service/psc/time/time_zone.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's recursive member mutex is paired with borrowed references. Rust combines the existing
   member mutex with the enclosing `TimeManager` mutex used by shared service owners.
 - A zero-capacity Rust output slice returns zero results before writing. Eden writes the first
   element before checking `out_times_max_count`; valid CMIF requests provide output storage, while
   the Rust guard prevents malformed IPC from causing an out-of-bounds access.
 
-### Binary layout verification
-- PASS: parsing now updates `m_my_rule` only after success, failed output parsing preserves the
-  caller's rule, getters enforce Eden's initialization boundary, and `ValidateRule` checks the
-  fixed 0x4000-byte rule before conversion.
-- `GetTimeZoneTime`, `ToCalendarTimeImpl` and `ToPosixTimeImpl` now retain Eden's ownership and
-  locking boundaries. Reverse conversion preserves overflow/not-found mapping, normalized-calendar
-  validation, two-result ambiguity detection and ascending result order; focused regressions cover
-  the zero-result and two-result paths.
-
 ## 2026-08-22 — `src/core/src/hle/service/psc/time/time_zone_service.rs` and `static.rs` vs Eden PSC time services
 
 ### Intentional differences
+
 - `Arc<Mutex<TimeManager>>` retains the single owner behind Eden's
   `StandardSteadyClockCore&` and `TimeZone&` references. Isolated constructors create a private
   manager for unit-level service use; production `StaticService` forwards its shared manager.
 - Eden asserts that an `InLargeData` descriptor exists. Ruzu treats a missing descriptor as an
   empty buffer, retaining the same value-initialized rule without aborting the service process.
 
-### Binary layout verification
-- PASS: commands 8, 100 and 201 now exchange the fixed 0x4000-byte rule rather than serializing
-  Rust `Vec` metadata. Command 7 mutates the manager-owned timezone and captures the shared
-  standard steady-clock time point in Eden's order.
-- Commands 100 and 201 now reproduce CMIF `InLargeData` decoding by zero-initializing the rule and
-  copying the available prefix. Commands 201 and 202 allocate exactly the guest-advertised output
-  capacity rather than inventing two output elements.
-
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/time_zone.rs` vs Eden `src/core/hle/service/glue/time/time_zone.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's borrowed worker/binary references and shared service pointers use the corresponding
   `Arc<Mutex<_>>` or `Arc<_>` owners. Its one intrusive-list member operation event is represented
   by one stable optional `OperationEvent`; repeated handle requests reuse that event.
@@ -7135,34 +4953,26 @@ Eden files:
 - Eden asserts that an `InLargeData` descriptor exists. Ruzu treats a missing descriptor as an
   empty buffer, retaining the same value-initialized rule without aborting the service process.
 
-### Binary layout verification
-- PASS: location changes now follow Eden's validation, rule update, filesystem timestamp, wrapped
-  readback, settings-name persistence, settings-time persistence and event-signal order. Rule IPC
-  uses the complete deterministic 0x4000-byte payload, and output capacities come from the actual
-  IPC buffers.
-- Commands 100 and 201 preserve Eden's zero-initialize-then-copy-prefix `InLargeData` semantics;
-  focused coverage verifies that bytes beyond an undersized input remain zero.
-
 ## 2026-08-22 — `src/core/src/hle/service/set/system_settings_server.rs` timezone forwarding vs Eden settings server
 
 ### Intentional differences
+
 - Direct Rust forwarding methods return typed values or unit because the corresponding inner
   settings methods cannot fail; Eden expresses the same always-successful operations as `Result`.
 
 ### Unintentional differences (to fix)
+
 - The broader pre-existing partial service differences remain recorded in the earlier
   `system_settings_server.rs` audit entry.
 
 ### Missing items
-- No additional settings prerequisite is missing for timezone persistence.
 
-### Binary layout verification
-- PASS: `LocationName` remains 0x24 bytes and `SteadyClockTimePoint` remains 0x18 bytes. Focused
-  round-trip coverage includes a negative signed time point and a nonzero homebrew test UUID.
+- No additional settings prerequisite is missing for timezone persistence.
 
 ## 2026-08-22 — `src/core/src/hle/service/hid/hid_debug_server.rs` vs Eden `src/core/hle/service/hid/hid_debug_server.{h,cpp}`
 
 ### Intentional differences
+
 - Eden stores `shared_ptr` children inside `ResourceManager`. Ruzu retains the existing
   `Arc<Mutex<_>>` resource split and passes the shared `TouchResource`/`TouchScreenDriver` to the
   matching child operation; method ownership and operation order remain in `hid_debug_server.rs`.
@@ -7172,21 +4982,10 @@ Eden files:
   current Rust ownership adaptation. Eden returns `ResultSuccess` plus an output boolean; the
   service still evaluates both calls in Eden's order before combining their values.
 
-### Unintentional differences (to fix)
-- None remain in this file after the post-implementation comparison.
-
-### Missing items
-- None: all nine methods owned by Eden's `IHidDebugServer` are implemented, and all 158 command
-  IDs/names have matching implemented-versus-null registration state.
-
-### Binary layout verification
-- PASS: `TouchState` is 0x28 bytes, `AutoPilotState` is 0x288 bytes, and
-  `TouchScreenConfigurationForNx` is 0x10 bytes. Focused tests also cover the exact command IDs,
-  active-handler set, and touch/gesture restart-then-stop lifecycle.
-
 ## 2026-08-22 — `src/core/src/hle/service/psc/time/power_state_service.rs` vs Eden `src/core/hle/service/psc/time/power_state_service.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's `Core::System&` belongs to the `ServiceFramework` base, not to
   `IPowerStateRequestHandler` itself. Ruzu's framework obtains the process/kernel owner from the
   IPC context when the shared service `Event` lazily materializes its readable copy handle, so the
@@ -7197,20 +4996,14 @@ Eden files:
   Rust IPC adapter writes that zero explicitly.
 
 ### Unintentional differences (to fix)
+
 - Dynamic `time:p` registration remains part of the already-recorded missing `SetupSAndP` work in
   `service_manager.rs`; no additional behavior difference remains inside this service file.
-
-### Missing items
-- None in `IPowerStateRequestHandler`: both commands and their manager delegation are present.
-
-### Binary layout verification
-- N/A: the service exchanges scalar CMIF outputs and a copy handle, with no raw aggregate payload.
-  Focused tests cover the exact handler table and pending/available/clear state transition through
-  the shared manager.
 
 ## 2026-08-22 — `src/core/src/hle/service/olsc/remote_storage_controller.rs` and `olsc_service_for_system_service.rs` vs Eden OLSC counterparts
 
 ### Intentional differences
+
 - Eden passes `Core::System&` to every child because it belongs to the C++ `ServiceFramework`
   base. Ruzu's framework obtains system state from each IPC context, so the remote controller has
   no duplicate concrete-service `SystemRef`; its parent constructs the otherwise stateless child
@@ -7220,21 +5013,14 @@ Eden files:
   the template's alignment while keeping the upstream method itself as the behavior owner.
 
 ### Unintentional differences (to fix)
+
 - The broader pre-existing `IOlscServiceForSystemService` table and method parity were not part of
   this warning slice and still require a complete dedicated audit.
-
-### Missing items
-- None in `IRemoteStorageController`: all 30 registered IDs/names and all three upstream methods
-  are present; commands 18 and 27 deliberately share `GetDataInfo` as in Eden.
-
-### Binary layout verification
-- PASS: `GetSecondarySave` writes a deterministic 0x20-byte output with the `[u64; 3]` at offset
-  8; `GetDataInfo` writes exactly 0x38 zero bytes. Focused tests cover the layouts, exact handler
-  table, implemented/null states, and all upstream stub outputs.
 
 ## 2026-08-22 — `src/core/src/hle/service/ns/ecommerce_interface.rs` and `service_getter_interface.rs` vs Eden NS counterparts
 
 ### Intentional differences
+
 - Eden supplies `Core::System&` solely to the e-commerce interface's C++ `ServiceFramework` base.
   The Rust dispatcher obtains system state from the IPC context, so the concrete child stores no
   duplicate `SystemRef` and its getter constructs the stateless interface without one.
@@ -7242,21 +5028,19 @@ Eden files:
   thin IPC handler that installs the child as a moved interface object.
 
 ### Unintentional differences (to fix)
+
 - `IServiceGetterInterface` still has null handlers for the other getters except commands 7992
   and 7998. Several corresponding Rust modules are only command/data sketches rather than usable
   `ServiceFramework` owners, so completing them requires a separate structural NS slice.
 
 ### Missing items
-- None in `IECommerceInterface`: all seven upstream commands remain registered as null handlers.
-  Command 7992 now constructs and returns that exact child interface as Eden does.
 
-### Binary layout verification
-- N/A: this slice exchanges only a moved service interface and defines no raw payload.
-  Focused tests cover the seven-entry child table and command 7992 registration.
+- Command 7992 now constructs and returns that exact child interface as Eden does.
 
 ## 2026-08-22 — `src/core/src/hle/service/nvdrv/core/container.rs` vs Eden `src/core/hle/service/nvdrv/core/container.{h,cpp}`
 
 ### Intentional differences
+
 - `Container` is a cloneable Rust handle whose `Arc`-owned NvMap, syncpoint manager, device-file
   data, and session store remain shared. This models the borrowed `NvCore::Container&` retained by
   Eden's NVDEC/VIC base without a raw pointer or a second copy of the state.
@@ -7270,21 +5054,14 @@ Eden files:
   preallocated area, deactivate the session, unregister the ASID, then recycle the ID.
 
 ### Unintentional differences (to fix)
+
 - No remaining difference was found in the shared-handle and accumulated-syncpoint behavior
   changed by this slice.
-
-### Missing items
-- None in the `Container` interface used by NVDEC/VIC: session ownership, NvMap/syncpoint access,
-  and accumulated-syncpoint take/return behavior are available through Rust ownership adapters.
-
-### Binary layout verification
-- N/A: `Container` and `Session` are internal ownership objects and are never serialized as raw
-  guest payloads. A focused test verifies that a cloned handle resolves the exact same process
-  session.
 
 ## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_nvdec_common.rs`, `nvhost_nvdec.rs`, and `nvhost_vic.rs` vs Eden counterparts
 
 ### Intentional differences
+
 - Rust composition replaces C++ inheritance: both concrete devices forward `query_event` to the
   common owner, while each concrete file retains its own ioctl table exactly where Eden defines it.
 - The upstream-only `submit_timeout`, `nvmap_fd`, and `device_syncpoints` state and the unused
@@ -7298,25 +5075,15 @@ Eden files:
   because its Host1x interface accepts `Vec<u32>` rather than Eden's moved `CpuGuestMemory` view.
 
 ### Unintentional differences (to fix)
+
 - The eager command-list snapshot noted above cannot preserve Eden's lazy guest-memory view if the
   guest mutates that memory before Host1x consumes it. Correcting that requires a dedicated Host1x
   queue/interface ownership change and is not safe to fold into this warning-removal slice.
 
-### Missing items
-- None in the ioctl/query-event surface: NVDEC exposes commands 0x01, 0x02, 0x03, 0x07, 0x09,
-  0x0A, 0x23 and H/0x01; VIC exposes 0x01, 0x02, 0x03, 0x09, 0x0A and H/0x01. `GetClkRate`
-  writes 614400000/0, and unknown query events return no event.
-
-### Binary layout verification
-- PASS: every live fixed/variable ioctl payload has `repr(C)` and an exact size assertion:
-  `IoctlSetNvmapFD` 0x4, `IoctlSubmit` 0x10, `CommandBuffer` 0xC, `Reloc` 0x10,
-  `SyncptIncr` 0x14, syncpoint/waitbase/clock-rate and map entries 0x8, and map parameters 0xC.
-  Focused tests cover clock-rate serialization, concrete-device routing, `num_entries` bounds, and
-  syncpoint recycling.
-
 ## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvhost_as_gpu.{h,cpp}`
 
 ### Intentional differences
+
 - Eden retains a `Container&` after deriving `nvmap` from it but never reads that reference again.
   Ruzu removes the equivalent raw pointer and keeps only the live NvMap dependency.
 - Eden's `std::map`/`unordered_dense::set` owners map to `BTreeMap`/`HashSet`; `Arc<Mapping>` lets
@@ -7331,22 +5098,14 @@ Eden files:
   also serialized even though Eden omits its otherwise customary `scoped_lock`.
 
 ### Unintentional differences (to fix)
+
 - No remaining difference was found in the dead-container removal, `map_buffer_offsets` lifecycle,
   or `GetVARegionsImpl`/`GetVARegions1`/`GetVARegions3` ownership corrected by this slice.
-
-### Missing items
-- None: the ioctl1 commands A/1, A/2, A/3, A/5, A/6, A/8, A/9 and A/0x14, ioctl3 A/8,
-  empty open/close hooks, and unknown-event behavior all have counterparts.
-
-### Binary layout verification
-- PASS: all ioctl payloads have `repr(C)` and exact upstream sizes, including the newly asserted
-  0x4-byte `IoctlBindChannel`; `VaRegion` is 0x18 and `IoctlGetVaRegions` is 0x40. Focused tests
-  cover tracked/untracked unmap behavior, the inline-region copy bound, and existing allocation,
-  mapping, sparse, remap, free, and channel-binding behavior.
 
 ## 2026-08-22 — `src/core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs`, `nvdevice.rs`, `nvdrv.rs`, and `nvdrv_interface.rs` vs Eden counterparts
 
 ### Intentional differences
+
 - Rust exposes the persistent readable event as `Arc<Mutex<KReadableEvent>>` instead of returning
   Eden's owning `KEvent*`; copying that shared handle into the IPC object table preserves the same
   event identity and waiter state.
@@ -7356,21 +5115,15 @@ Eden files:
 - Optional event trace records add diagnostics without changing event status, handle, or IPC output.
 
 ### Unintentional differences (to fix)
+
 - The warning-triggering process/scheduler owner adapter was dead: neither weak field was read and
   the live host-action callback already signals `KReadableEvent` directly. It has been removed from
   all four layers, restoring Eden's direct `QueryEvent` path.
 
-### Missing items
-- None for queried-event ownership or signalling. The callback retains and signals the same
-  persistent readable event returned by `QueryEvent`.
-
-### Binary layout verification
-- PASS: `SyncpointEventValue` remains a 4-byte raw value and this cleanup does not alter any ioctl
-  payload. A focused test verifies allocated-event decoding and matching-syncpoint lookup.
-
 ## 2026-08-22 — `src/core/src/hle/service/nvdrv/nvdrv_interface.rs` vs Eden `src/core/hle/service/nvdrv/nvdrv_interface.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's `Common::ScratchBuffer<u8>` owners map to reusable `Vec<u8>` fields. Ruzu clears the
   requested range before every dispatch instead of leaving reused bytes unspecified, preserving
   deterministic reserved/output bytes as required by the Rust raw-payload contract.
@@ -7379,20 +5132,10 @@ Eden files:
 - Optional ioctl tracing/history observes the service-owned buffers after dispatch without changing
   the guest-visible write condition or response.
 
-### Unintentional differences (to fix)
-- None in the output-buffer ownership corrected by this slice.
-
-### Missing items
-- None for ioctl scratch storage: ioctl1/ioctl2 reuse `output_buffer`, while ioctl3 reuses both
-  `output_buffer` and `inline_output_buffer` before writing descriptors 0 and 1 respectively.
-
-### Binary layout verification
-- N/A: the reusable vectors are host-only storage. Their requested lengths still come directly from
-  the IPC write descriptors, and a focused test verifies resize and deterministic clearing.
-
 ## 2026-08-22 — `src/core/src/cpu_manager.rs` and `src/core/src/hle/kernel/k_scheduler.rs` vs Eden `cpu_manager.{h,cpp}` and `k_scheduler.{h,cpp}`
 
 ### Intentional differences
+
 - Ruzu's CPU loop passes a cached per-core JIT table into its `run_guest_thread_once` adaptation;
   the retained `_process_owner` `Arc` keeps those raw pointers valid without locking the process on
   every inner-loop iteration. Eden follows raw owner pointers from `KThread` in `PhysicalCore`.
@@ -7400,117 +5143,96 @@ Eden files:
   Eden's fiber switch loop waits through its scheduler/idle-thread lifecycle instead.
 
 ### Unintentional differences (to fix)
+
 - The process owner was redundantly passed into `run_guest_thread_once` after the cached-JIT change,
   although the callee never read it. Ownership now remains explicitly in each caller only.
 - The Rust-only runnable-thread polling helper accepted a current-thread ID that never influenced
   selection. The dead parameter and its forwarding were removed.
 
 ### Missing items
+
 - This slice does not change the already documented Rust scheduler/fiber adaptations; it only
   removes parameters with no control-flow, lifetime, or selection role.
-
-### Binary layout verification
-- N/A: these are host execution-loop signatures and do not define serialized guest data.
 
 ## 2026-08-22 — service bootstrap in `services.rs`, `am/am.rs`, `aoc/addon_content_manager.rs`, and `filesystem/filesystem.rs` vs Eden counterparts
 
 ### Intentional differences
+
 - Ruzu passes `SystemRef` and, for FileSystem, the shared Rust `FileSystemController` handle into
   each service process. Eden reaches the controller through `Core::System&`.
 - The Rust launcher still uses explicit closures/macros for host and guest service processes instead
   of Eden's tables of `void (*)(Core::System&)` function pointers.
 
 ### Unintentional differences (to fix)
+
 - `GenericStubService` has no Eden counterpart and guesses that command 0 returns a sub-interface.
   Removing its unused domain-header local and duplicate command read does not resolve that broader
   service-parity debt; concrete services must replace each remaining use.
 
 ### Missing items
+
 - AM, AOC, and FileSystem no longer accept an unused global `ServiceManager`: like Eden, their
   `loop_process` entry points create and own a local `ServerManager` from the system context.
 - The unused `ServiceManager` clone before PCTL launch was removed because PCTL already had the
   upstream-shaped system-only entry point.
 
-### Binary layout verification
-- N/A: this slice changes host service bootstrap signatures and local dispatch variables only.
-
 ## 2026-08-22 — `nvnflinger/window.rs` and `sockets/sockets.rs` vs Eden `window.h` and `sockets.h`
 
 ### Intentional differences
+
 - Eden uses `enum class` plus `DECLARE_ENUM_FLAG_OPERATORS`; Ruzu expresses the same flag types
   with `bitflags!`, so their rustdoc belongs inside the macro invocation.
 
 ### Unintentional differences (to fix)
+
 - The two type comments were attached to macro invocations rather than generated types and produced
   no Rust documentation. They now document `NativeWindowTransform` and `PollEvents` directly.
-
-### Missing items
-- None in this documentation-placement slice.
-
-### Binary layout verification
-- PASS: flag bases and values remain unchanged (`u32` for window transform, `u16` for poll events).
 
 ## 2026-08-22 — exhaustive value handling in `k_page_table_base.rs`, VI scaling, and `internal_network/sockets.rs` vs Eden counterparts
 
 ### Intentional differences
+
 - Eden's `OperationType` switch ends in `UNREACHABLE`; Rust's closed enum makes the equivalent
   single-address `operate` match exhaustive at compile time, so an unreachable wildcard is omitted.
 - POSIX platforms may define `EWOULDBLOCK` and `EAGAIN` to the same number. Ruzu uses one guarded
   match arm so both names map to `Errno::Again` without an unreachable-pattern diagnostic.
 
 ### Unintentional differences (to fix)
+
 - VI previously transmuted an arbitrary IPC `u32` into `NintendoScaleMode`, which is undefined
   behavior for values outside 0..=4 and made its fallback arm illusory. `from_raw` now rejects such
   values before enum construction and returns `ResultOperationFailed`, matching Eden's `default`.
 
-### Missing items
-- None for these value-domain checks.
-
-### Binary layout verification
-- PASS: `NintendoScaleMode` remains `repr(u32)` with values 0 through 4; the new conversion does not
-  alter its representation. `OperationType` discriminants and native errno values are unchanged.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_ipc.rs` vs Eden `src/core/hle/kernel/svc/svc_ipc.cpp`, `k_client_session.cpp`, and `k_server_session.{h,cpp}`
 
 ### Intentional differences
+
 - Ruzu retains an inline HLE dispatch fallback for ownerless test fixtures. Eden always queues the
   request through `KClientSession` and waits for the owning server thread.
 
 ### Unintentional differences (to fix)
+
 - The inline fallback converted enqueue and receive failures to `ResultInvalidHandle`. Both phases
   now preserve the original Kernel result, matching Eden's `R_RETURN` chain from
   `KServerSession::OnRequest` through `KClientSession::SendSyncRequest` and `SendSyncRequestImpl`.
 
-### Missing items
-- None for result propagation on the inline request path. A focused regression test verifies that
-  a closed session returns Kernel `ResultSessionClosed` rather than `ResultInvalidHandle`.
-
-### Binary layout verification
-- N/A: this change only preserves a 32-bit result code already produced by the session layer; no
-  IPC payload or raw-memory structure changes.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_server_session.rs` vs Eden `src/core/hle/kernel/k_server_session.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's pointer-descriptor constructors read through a const `MessageBuffer` view. Ruzu's
   `PointerDescriptor::from_raw` reads the same two words directly from the immutable source slice.
 
 ### Unintentional differences (to fix)
+
 - The receive and send pointer helpers cloned the complete source message into mutable vectors and
   constructed unused `MessageBuffer` views. Those dead allocations are removed; descriptor offsets,
   memory-copy direction, validation, and destination writes remain unchanged.
 
-### Missing items
-- None in the pointer-descriptor source parsing covered by this cleanup.
-
-### Binary layout verification
-- PASS: each pointer descriptor is still decoded from the same two `u32` words and encoded into the
-  same destination offsets. Existing focused tests cover send copying, receive linear-to-user
-  copying, receive heap-to-heap copying, and end-to-end request pointer payload transfer.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_condition_variable.rs` vs Eden `src/core/hle/kernel/k_condition_variable.{h,cpp}`
 
 ### Intentional differences
+
 - `signal_to_address` returns the next-owner handle together with the result when releasing Ruzu's
   process mutex; the scheduler guard remains live through `end_wait`, preserving Eden's ordering
   without nesting the process mutex around the Rust thread lock.
@@ -7518,76 +5240,56 @@ Eden files:
   Ruzu's split implementation calls `BeginWait`. Eden constructs its stack queue at `Wait` entry.
 
 ### Unintentional differences (to fix)
+
 - `signal_to_address` initialized `next_owner_thread` to `None` before unconditionally replacing it.
   The redundant initialization is removed by returning `(result, next_owner_thread)` from the
   process-locked section.
 - `wait_locked` constructed a second queue that was never configured or passed to `BeginWait`; the
   unused duplicate is removed.
 
-### Missing items
-- None for the owner-transfer or wait-queue lifetimes changed by this cleanup.
-
-### Binary layout verification
-- N/A: condition-variable ownership and queues are host kernel state; no raw payload layout changes.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_interrupt_manager.rs` vs Eden `src/core/hle/kernel/k_interrupt_manager.{h,cpp}`
 
 ### Intentional differences
+
 - Ruzu snapshots the current thread fields before acquiring scheduler and process locks to preserve
   its host-mutex order. Eden accesses the embedded kernel objects directly under its scheduler lock.
 
 ### Unintentional differences (to fix)
+
 - The snapshot included `KThread::current_core`, although both Eden and Ruzu use the interrupt's
   `core_id` for the pinned-thread lookup and pin operation. The unused field read is removed.
-
-### Missing items
-- None for interrupt-core selection: clear, pinned-thread lookup, pinning, and schedule request all
-  continue to use the `core_id` argument supplied by the physical core.
-
-### Binary layout verification
-- N/A: the removed tuple element was temporary host state and was never serialized.
 
 ## 2026-08-22 — `src/core/src/hle/kernel/message_buffer.rs` vs Eden `src/core/hle/kernel/message_buffer.h`
 
 ### Intentional differences
+
 - Rust names the header argument `_hdr` in `get_special_data_index` because, exactly as in Eden's
   formula, the special-data start depends only on the fixed message-header size and special-header
   size. Keeping the argument preserves the upstream helper signature without an unused warning.
 
 ### Unintentional differences (to fix)
+
 - Ruzu had removed the header parameter from `get_special_data_index` while retaining it in the
   downstream index helpers. The parameter and forwarding chain now match Eden again.
-
-### Missing items
-- None for the special-data, pointer, map-alias, raw-data, and receive-list index dependency chain.
-
-### Binary layout verification
-- PASS: the index formula remains `MessageHeader::DATA_SIZE / 4 + spc.header_size / 4`; only the
-  upstream-compatible header forwarding is restored. Existing message-buffer index and IPC copy
-  tests exercise the downstream offsets.
 
 ## 2026-08-22 — `src/core/src/file_sys/patch_manager.rs` vs Eden `src/core/file_sys/patch_manager.{h,cpp}`
 
 ### Intentional differences
+
 - Rust locks the shared filesystem controller and content-provider union while both temporary
   `PatchManager` values borrow them. Eden receives stable references directly from `Core::System`.
 - When no content provider is installed, Ruzu returns empty metadata; Eden's accessor contract
   assumes the provider has already been initialized.
 
 ### Unintentional differences (to fix)
+
 - Ruzu was missing `GetMetadataFromBaseOrUpdate`. The associated method now checks the application
   title first and, only when its NACP is absent, checks `GetUpdateTitleID(application_id)`.
-
-### Missing items
-- None for this base/update metadata lookup helper.
-
-### Binary layout verification
-- N/A: the method forwards existing `NACP` and virtual-file owners without changing their layout.
-  A focused provider test verifies the exact base-then-update request order.
 
 ## 2026-08-22 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}`
 
 ### Intentional differences
+
 - The Rust method returns a value-initialized `[u8; 16]` which the handler writes to CMIF as two
   `u64` values. Eden receives a value-initialized `Out<DisplayVersion>` from CMIF serialization.
 - The bounded copy and fallback are extracted into a file-local helper so their byte-level behavior
@@ -7595,38 +5297,26 @@ Eden files:
   application-functions file.
 
 ### Unintentional differences (to fix)
+
 - `GetDisplayVersion` previously ignored its service owner and always returned `"1.0.0"`. It now
   reads the applet program ID and uses `PatchManager::GetMetadataFromBaseOrUpdate`, matching Eden.
-
-### Missing items
-- None for display-version lookup, fallback, bounded copy, final NUL byte, or CMIF output size.
-
-### Binary layout verification
-- PASS: the response remains a deterministic 16-byte `DisplayVersion`; bytes beyond the copied
-  string are zero and byte 15 is always NUL. Focused tests verify the fallback and 16-byte truncation.
 
 ## 2026-08-22 — `src/core/src/hle/service/hid/hid_server.rs` vs Eden `src/core/hle/service/hid/hid_server.{h,cpp}`
 
 ### Intentional differences
+
 - Rust decodes `ClientAppletResourceUserId` directly as its single `u64` `pid` value and returns the
   IPC interface through `ResponseBuilder`; Eden expresses both through CMIF wrapper types.
 
 ### Unintentional differences (to fix)
+
 - `CreateAppletResource` previously discarded the resource manager result without reproducing
   Eden's diagnostic. It now logs the ARUID and raw result before constructing the interface.
-
-### Missing items
-- None for the `CreateAppletResource` call, diagnostic, interface construction, or unconditional
-  success behavior.
-
-### Binary layout verification
-- N/A: this correction only consumes the existing result for diagnostics and does not alter IPC
-  payload or HID shared-memory layout. A focused test verifies that a manager failure is logged-only
-  behavior and the handler still returns success plus an interface, as Eden does.
 
 ## 2026-08-22 — `src/core/src/hle/kernel/kernel.rs`, `src/core/src/core.rs` vs Eden `src/core/hle/kernel/kernel.{h,cpp}`
 
 ### Intentional differences
+
 - Ruzu initializes the persistent font and IRS objects from `System::initialize_kernel` after its
   physical memory manager has been initialized. Eden performs the same ordered allocation inside
   `KernelCore::Impl::InitializeHackSharedMemory`; this split follows Ruzu's existing staged kernel
@@ -7635,21 +5325,15 @@ Eden files:
   intrusive `KSharedMemory*`. Both expose one stable kernel-owned object for its full boot lifetime.
 
 ### Unintentional differences (to fix)
+
 - Ruzu previously lacked Eden's kernel-owned `font_shared_mem`. It now allocates it before IRS with
   owner permission `None`, user permission `Read`, size `0x1100000`, and clears it before IRS during
   shutdown.
 
-### Missing items
-- None for the font shared-memory field, initialization order, permissions, accessor, persistence,
-  or shutdown order required by the platform font services.
-
-### Binary layout verification
-- N/A: the object owns raw shared pages rather than a serialized structure. A focused test verifies
-  the exact allocation size and stable object identity across repeated initialization.
-
 ## 2026-08-22 — `src/core/src/hle/service/ns/platform_service_manager.rs` vs Eden `src/core/hle/service/ns/platform_service_manager.{h,cpp}`
 
 ### Intentional differences
+
 - Rust registers the kernel object's stable ID and `Arc<KSharedMemory>` with the caller process so
   its IPC layer can translate the deferred copy object into a process handle. Eden's intrusive
   kernel object and CMIF `OutCopyHandle` perform the equivalent registration during serialization.
@@ -7657,66 +5341,59 @@ Eden files:
   real `KSharedMemory` without constructing a complete emulator system.
 
 ### Unintentional differences (to fix)
+
 - `GetSharedMemoryNativeHandle` previously allocated and cached a separate shared memory in each
   `pl:*` service, used incorrect owner permission `Read`, and redundantly resolved the caller twice.
   It now copies the complete font blob into `KernelCore::GetFontSharedMem()` on every request and
   returns that single kernel-owned object, matching Eden.
 
-### Missing items
-- None for font-buffer copying, shared-object ownership, caller registration, or returned handle
-  identity in `GetSharedMemoryNativeHandle`.
-
-### Binary layout verification
-- PASS: the copied region remains exactly `0x1100000` bytes. A focused test pre-fills the complete
-  kernel buffer and verifies that the service copy overwrites it byte-for-byte with the font blob.
-
 ## 2026-08-22 — `src/core/src/hle/service/nvnflinger/buffer_queue_consumer.rs` vs Eden `src/core/hle/service/nvnflinger/buffer_queue_consumer.{h,cpp}`
 
 ### Intentional differences
+
 - The unused release-fence parameter is named `_release_fence` in Rust to make Eden's deliberate
   temporary non-use explicit while preserving the public method signature.
 
 ### Unintentional differences (to fix)
+
 - Ruzu previously retained a sampled `[BQC_RELEASE]` diagnostic counter absent from Eden. It has
   been removed, and Eden's explanatory TODO beside the intentionally disabled fence assignment is
   now preserved at the matching point.
 
 ### Missing items
+
 - Proper waiting on release fences remains an upstream TODO; Ruzu deliberately keeps the previous
   acquire fence exactly as Eden does rather than inventing behavior ahead of upstream.
-
-### Binary layout verification
-- N/A: no serialized or raw-memory payload changes. A focused state test verifies that release
-  frees the acquired slot without replacing its existing fence.
 
 ## 2026-08-22 — `src/core/src/hle/service/nvnflinger/buffer_queue_producer.rs` vs Eden `src/core/hle/service/nvnflinger/buffer_queue_producer.cpp`
 
 ### Intentional differences
+
 - Rust turns Eden's fatal `UNIMPLEMENTED_IF_MSG` and `ASSERT_MSG` paths into explicit panics because
   it does not use Eden's assertion macros.
 
 ### Unintentional differences (to fix)
+
 - The Connect-listener panic helper accepted but ignored the transaction code even though Eden's
   listener diagnostic does not include it; the dead parameter is removed.
 - The generic unsupported-transaction panic previously supplied `name` and `code` in reverse order.
   It now reports the numeric transaction first and its symbolic name second.
 
 ### Missing items
+
 - Producer-listener parcel decoding remains intentionally unimplemented exactly where Eden raises
   `UNIMPLEMENTED_IF_MSG`.
-
-### Binary layout verification
-- N/A: only fatal diagnostics changed. Focused tests verify the exact listener and unsupported
-  transaction messages.
 
 ## 2026-08-22 — `src/core/src/file_sys/fssystem/hierarchical_integrity_verification_storage.rs` vs Eden `src/core/file_sys/fssystem/fssystem_hierarchical_integrity_verification_storage.{h,cpp}`
 
 ### Intentional differences
+
 - Rust uses `Arc::get_mut` while a verification level is exclusively owned, and a scoped closure
   plus explicit error cleanup in place of Eden's `ON_RESULT_FAILURE` guards.
 - Rust slices make Eden's non-null read-buffer assertion implicit.
 
 ### Unintentional differences (to fix)
+
 - An allocated `top_verify` object was never used; the existing owned level zero was initialized
   instead. The dead allocation is removed.
 - Initialization previously recreated every verification owner and retained partial level state on
@@ -7728,21 +5405,15 @@ Eden files:
 - Ruzu previously relied only on member destruction; `Drop` now invokes `finalize` explicitly,
   matching Eden's destructor lifecycle.
 
-### Missing items
-- None for construction ownership, level initialization order, failure cleanup, finalization order,
-  read routing, size reporting, or the accessors defined in the matching upstream files.
-
-### Binary layout verification
-- PASS: the level-information structure is asserted to have Eden's size `0x18` and alignment `0x4`.
-  Focused tests verify failed-initialization cleanup/retry and the uninitialized `GetSize` bit pattern.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_base.rs` and `k_process_page_table.rs` vs Eden `src/core/hle/kernel/k_page_table_base.{h,cpp}` and `k_process_page_table.h`
 
 ### Intentional differences
+
 - Rust forwards through the composed `KProcessPageTable::base` member; Eden inherits
   `KProcessPageTable` from `KPageTableBase`.
 
 ### Unintentional differences (to fix)
+
 - `LockForCodeMemory` previously returned a physical address, accepted a caller-selected
   permission, and tested `FlagCanCodeAlias`. It now fills and opens the caller's page group,
   tests `FlagCanCodeMemory`, and installs `KernelReadWrite | NotMapped` exactly like Eden.
@@ -7752,16 +5423,10 @@ Eden files:
 - The process-page-table wrapper previously omitted both code-memory forwarding methods and the
   block-info-manager accessor needed to construct an owner-matched page group.
 
-### Missing items
-- None for the `LockForCodeMemory` and `UnlockForCodeMemory` dependency slice.
-
-### Binary layout verification
-- N/A: these methods operate on existing page groups and memory-block state; no serialized payload
-  changed.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_code_memory.rs` vs Eden `src/core/hle/kernel/k_code_memory.{h,cpp}`
 
 ### Intentional differences
+
 - `Arc<ProcessLock>` represents Eden's explicitly opened owner-process reference, and the outer
   `Mutex<KCodeMemory>` used by the typed object registry represents `m_lock`.
 - Methods receive an already locked mutable current/owner process where needed so Rust never
@@ -7770,6 +5435,7 @@ Eden files:
   `Finalize` before destruction under the same precondition.
 
 ### Unintentional differences (to fix)
+
 - The former implementation fabricated physical pages from the guest virtual address and never
   retained its owner. Initialization now obtains the owner page table's block-info manager, locks
   the real source mapping, clears every physical byte to `0xFF`, retains the owner, and records the
@@ -7780,16 +5446,10 @@ Eden files:
 - Finalization now conditionally unlocks the original source, closes and finalizes its page group,
   and releases its owner reference in upstream order.
 
-### Missing items
-- None for `KCodeMemory` initialization, mapping, accessors, and finalization behavior.
-
-### Binary layout verification
-- N/A: `KCodeMemory` is an internal ownership object rather than a raw guest payload. Focused tests
-  verify the page count, physical `0xFF` fill, memory states, permissions, and lock restoration.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` code-memory ownership
 
 ### Intentional differences
+
 - Ruzu's generic handle table stores opaque object IDs, so `KProcess` retains a typed
   `Arc<Mutex<KCodeMemory>>` registry beside its existing typed kernel-object registries. Eden's
   handle table and global auto-object container retain typed intrusive pointers directly.
@@ -7797,19 +5457,15 @@ Eden files:
   external `Arc` retains the object and its strong owner-process reference like Eden's `Open`.
 
 ### Unintentional differences (to fix)
+
 - Code-memory handles previously had no corresponding typed object and process teardown could not
   finalize their source mappings. Registration, lookup, last-handle removal, and process-finalize
   cleanup now preserve that lifecycle.
 
-### Missing items
-- None for process-owned lookup and release of code-memory handle objects.
-
-### Binary layout verification
-- N/A: the registry is host-only ownership state and does not alter `KProcess` guest ABI data.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_code_memory.rs` and `svc_dispatch.rs` vs Eden `src/core/hle/kernel/svc/svc_code_memory.cpp` and generated `svc.cpp`
 
 ### Intentional differences
+
 - Rust heap allocation and `Arc` ownership replace Eden's slab `Create/Register/Open/Close`
   mechanics; object IDs still come from `KernelCore` and handle-table insertion remains the
   publication point.
@@ -7818,6 +5474,7 @@ Eden files:
   and handle lookup, preserving Eden's error precedence.
 
 ### Unintentional differences (to fix)
+
 - `CreateCodeMemory` previously inserted only a synthetic opaque ID and never initialized an
   object. It now creates, initializes, registers, and publishes the typed `KCodeMemory`, with
   failure cleanup before returning.
@@ -7828,17 +5485,10 @@ Eden files:
   generic stub arm. Both dispatch tables now use Eden's generated register layouts, including the
   split 64-bit address and size in `ControlCodeMemory64From32`.
 
-### Missing items
-- None for code-memory SVC validation, object lookup, operation dispatch, or 32/64-bit argument
-  marshalling.
-
-### Binary layout verification
-- PASS: focused dispatch coverage verifies the generated AArch32 and AArch64 input/output register
-  positions; operation discriminants remain `0..=3` with unknown values rejected explicitly.
-
 ## 2026-08-22 — `src/core/src/hle/service/jit/jit_code_memory.rs` vs Eden `src/core/hle/service/jit/jit_code_memory.{h,cpp}`
 
 ### Intentional differences
+
 - `Arc<Mutex<KCodeMemory>>` represents Eden's raw pointer plus explicit `Open`/`Close` reference;
   the mapping helper accepts the Rust process owner and random generator as references rather than
   the C++ kernel argument.
@@ -7846,6 +5496,7 @@ Eden files:
   process-wide mutex is the Rust counterpart of the page-table and object locking used upstream.
 
 ### Unintentional differences (to fix)
+
 - The former file exposed only zero-valued size/address fields and documented the real behavior as
   blocked. `Initialize` now samples page-aligned addresses across the process alias-code region,
   retries indefinitely only for `ResultInvalidMemoryRegion`, maps with the requested permission,
@@ -7853,16 +5504,10 @@ Eden files:
 - `Finalize` now asserts the matching owner unmap, releases the retained code-memory reference, and
   clears its object member in Eden's order.
 
-### Missing items
-- None for `CodeMemory::Initialize`, `Finalize`, `GetSize`, or `GetAddress`.
-
-### Binary layout verification
-- N/A: this is a host-side ownership helper, not a raw guest payload. Focused coverage verifies the
-  sampled address, generated-code state, execute permission, getters, and final unmap.
-
 ## 2026-08-22 — `src/core/src/hle/service/jit/jit_context.rs` vs Eden `src/core/hle/service/jit/jit_context.{h,cpp}`
 
 ### Intentional differences
+
 - Rust shares the local-memory/range/helper state through `Arc<Mutex<_>>` because `rdynarmic`
   owns its boxed callback object; Eden stores callbacks and the JIT beside their parent and uses
   direct references.
@@ -7877,48 +5522,20 @@ Eden files:
   `Send + Sync`. Its backend pointers target stable owned allocations, and `IJitEnvironment`
   serializes every JIT call through one mutex.
 
-### Unintentional differences (to fix)
-- Fixed: the Rust service constructed the architecture-merged `JitConfig` and reached A64 through
-  `LegacyA64Callbacks`. It now implements the A64-owned callback trait with typed vectors and
-  exceptions and constructs `A64UserConfig` directly.
-- Fixed: the legacy literal disabled cycle counting and supplied its shared memory carrier's
-  64-bit address-space defaults. Eden only assigns `callbacks` on a default A64 configuration,
-  leaving cycle counting enabled and both unused address-space widths at 36; Rust now uses those
-  exact A64 defaults. The callback's no-op `AddTicks` and maximum tick budget preserve Eden's
-  effective unlimited plugin execution.
-
-### Missing items
-- None for the public `JITContext` interface or the private behavior in `JITContextImpl` and
-  `DynarmicCallbacks64`.
-
-### Binary layout verification
-- PASS: ELF dynamic/RELA/RELR entries use the shared `repr(C)` definitions; helper bytes are the
-  exact `svc #0; ret` sequence, stack/heap alignment is 16 bytes, and focused execution coverage
-  verifies the ninth integer argument at `[SP]`.
-
 ## 2026-08-22 — `src/rdynarmic/src/jit_config.rs` and A32/A64 backend callback wiring vs Eden `src/core/hle/service/jit/jit_context.cpp::DynarmicCallbacks64`
 
 ### Intentional differences
+
 - The Rust backend exposes `instruction_synchronization_barrier_raised` as a default no-op trait
   method and wires it for every JIT configuration. This avoids a JIT-service-only backend type while
   leaving existing callback implementations behaviorally unchanged.
 - The flag corresponding to Dynarmic's top-level `UserConfig::hook_isb` lives in the matching
   architecture-owned Rust `A64UserConfig`; its default remains false.
 
-### Unintentional differences (to fix)
-- None.
-
-### Missing items
-- None for the instruction-synchronization callback required by `JITContext`.
-
-### Binary layout verification
-- N/A: this adds a host callback slot only. A focused A64 execution test verifies one ISB produces
-  exactly one callback before the terminating SVC when `hook_isb` is enabled on the active host
-  backend; the default-disabled behavior matches Eden's `UserConfig`.
-
 ## 2026-08-22 — `src/core/src/hle/service/jit/jit.rs` vs Eden `src/core/hle/service/jit/jit.{h,cpp}`
 
 ### Intentional differences
+
 - Rust places the mutable environment members behind one `Mutex` because service callbacks receive
   `&self`; this preserves their upstream ownership and serializes the same per-object operations.
 - Typed copy handles are resolved through the caller process's Rust object registries, and
@@ -7935,20 +5552,10 @@ Eden files:
   uses narrow `allow(dead_code)` annotations rather than deleting ABI-visible symbol ownership or
   inventing calls absent upstream.
 
-### Unintentional differences (to fix)
-- None.
-
-### Missing items
-- None for `JITU`, `IJitEnvironment`, their command tables, callbacks, configuration, or lifecycle.
-
-### Binary layout verification
-- PASS: focused tests verify `CodeRange` is 16 bytes/aligned to 8, `Struct32` is 32 bytes, and
-  `JITConfiguration` is 80 bytes. Callback execution tests cover `GenerateCode`'s 13-argument ABI,
-  `Control`, cleared output-range sizes, and preserved output-buffer contents.
-
 ## 2026-08-22 — `src/video_core/src/shader_environment.rs` vs Eden `src/video_core/shader_environment.{h,cpp}`
 
 ### Intentional differences
+
 - Rust validates serialized environment counts and their complete byte size against the remaining
   cache file before allocating. It also uses fallible reservations, rejects empty pipeline entries,
   and requires exactly one environment for compute pipelines. Eden relies on trusted cache contents
@@ -7957,73 +5564,49 @@ Eden files:
 - Pipeline-loader callbacks return `std::io::Result<()>` so key-read failures reach the same outer
   invalid-cache cleanup that Eden obtains from `ifstream` exceptions.
 
-### Unintentional differences (to fix)
-- None in the reviewed serialization and disk-cache loading slice.
-
-### Missing items
-- None in the reviewed serialization and disk-cache loading slice.
-
-### Binary layout verification
-- PASS: the magic, cache version, field order, field widths, stage-specific payloads, and pipeline
-  key placement remain unchanged. Round-trip and malformed-cache tests cover valid compute entries,
-  truncated data, invalid discriminants, empty entries, oversized environment counts, and oversized
-  shader payloads.
-
 ## 2026-08-22 — `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`
 
 ### Intentional differences
+
 - Rust key readers return `std::io::Result` instead of relying on `ifstream::failbit` exceptions.
   Dynamic-feature incompatibility remains a skipped valid entry and does not invalidate the cache.
 
 ### Unintentional differences (to fix)
+
 - Cached compute and graphics key read failures were previously logged and swallowed, allowing a
   desynchronized reader to continue. They now propagate through `load_pipelines`, matching Eden's
   whole-file deletion on a failed key read.
 
-### Missing items
-- None in the reviewed disk-resource key-loading slice.
-
-### Binary layout verification
-- PASS: `ComputePipelineCacheKey` and `GraphicsPipelineKey` serialization is unchanged; only failure
-  propagation after reading those existing layouts changed.
-
 ## 2026-08-22 — `src/video_core/src/renderer_opengl/gl_shader_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_cache.{h,cpp}`
 
 ### Intentional differences
+
 - Rust key readers report `std::io::Result` explicitly instead of using throwing `ifstream` reads.
 
 ### Unintentional differences (to fix)
+
 - Cached compute and graphics key read failures were previously logged and swallowed. They now
   reach `load_pipelines` and delete the invalid cache as Eden's stream exception path does.
-
-### Missing items
-- None in the reviewed disk-resource key-loading slice.
-
-### Binary layout verification
-- PASS: OpenGL pipeline key bytes and their placement after serialized environments are unchanged.
 
 ## 2026-08-22 — `src/core/src/debugger/debugger_interface.rs` vs Eden `src/core/debugger/debugger_interface.h`
 
 ### Intentional differences
+
 - Rust passes retained `Arc<KThreadLock>` values instead of Eden's non-owning `KThread*`; this keeps
   the thread alive across the channel from a CPU thread to the debugger connection thread.
 - The backend reference is an explicit argument to frontend callbacks because Rust traits cannot
   retain the same self-referential backend reference as Eden's `DebuggerFrontend` constructor.
 
 ### Unintentional differences (to fix)
+
 - The former interface represented threads as opaque integers and watchpoints as split primitive
   fields. It now carries the matching kernel thread and `DebugWatchpoint` owners required by Eden's
   frontend contract.
 
-### Missing items
-- None in the debugger frontend/backend action and callback interface.
-
-### Binary layout verification
-- N/A: these are host-only Rust traits and retained kernel-object references, not guest payloads.
-
 ## 2026-08-22 — `src/core/src/debugger/debugger.rs` vs Eden `src/core/debugger/debugger.{h,cpp}`
 
 ### Intentional differences
+
 - Rust's standard `TcpListener`, `TcpStream`, channel and owned thread replace Boost.Asio's acceptor,
   socket and asynchronous signal pipe. They retain the same single server thread, 4096-byte reads,
   replacement of an existing connection, and synchronous frontend callbacks.
@@ -8037,79 +5620,69 @@ Eden files:
   `threads.front()` precondition. A connected debugger still pauses every thread that exists.
 
 ### Unintentional differences (to fix)
+
 - The previous file contained no server, connection state, process/thread ownership, signal path,
   pause/resume behavior, or debugger thread lifecycle. Those responsibilities now live in their
   matching module and execute in Eden's connection/action order.
 
 ### Missing items
+
 - CPU-side step completion, breakpoint notification and watchpoint generation are prerequisites in
   their own upstream-owned modules; they are recorded in `PORTING_STATE.md` before the GDB command
   dispatcher is resumed.
 
-### Binary layout verification
-- N/A: the connection and synchronization state is host-only. Socket regression tests verify bind
-  failure, deterministic thread shutdown and real packet routing.
-
 ## 2026-08-22 — `src/core/src/core.rs` debugger ownership vs Eden `src/core/core.{h,cpp}`
 
 ### Intentional differences
+
 - Ruzu exposes notification forwarding methods on `System` because its CPU owners cannot borrow the
   debugger field directly while retaining a kernel thread `Arc`; Eden exposes `GetDebugger()`.
 - The debugger-triggered exit flag is reset explicitly at initialization and after debugger
   destruction because it replaces Eden's detached `System::Exit()` call.
 
 ### Unintentional differences (to fix)
+
 - `System` previously had no debugger owner. It now initializes the configured server, forwards
   thread notifications, sends shutdown before teardown, and destroys the debugger immediately after
   CPU-manager shutdown and before kernel shutdown, matching Eden's lifecycle ordering.
 
-### Missing items
-- None in `System`'s debugger ownership and initialization/detachment lifecycle.
-
-### Binary layout verification
-- N/A: the new members are host runtime state and do not alter any raw guest structure.
-
 ## 2026-08-22 — `src/ruzu/src/boot.rs` debugger lifecycle vs Eden `src/qt_common/render/emu_thread.cpp`
 
 ### Intentional differences
+
 - Ruzu's non-Qt boot controller polls the atomic debugger shutdown request in its existing command
   loop; Eden's GDB backend invokes `System::Exit()` from a detached thread.
 
 ### Unintentional differences (to fix)
+
 - The frontend previously ignored `use_gdbstub`. It now initializes the debugger after GPU/CPU
   readiness, observes debugger-requested exit, and detaches it before pausing and shutting down the
   application process in the same lifecycle positions as Eden.
 
-### Missing items
-- None in the frontend-owned debugger initialization and detachment slice.
-
-### Binary layout verification
-- N/A: this is frontend control flow only.
-
 ## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` connection callback slice vs Eden `src/core/debugger/gdbstub.{h,cpp}`
 
 ### Intentional differences
+
 - Rust returns explicit packet-completeness booleans from `process_data` so split TCP frames remain
   buffered without the recursive asynchronous-read structure used by Boost.Asio.
 
 ### Unintentional differences (to fix)
+
 - Stop and watchpoint callbacks previously fabricated a default register context and only logged
   the reply. They now read the retained active thread and send the matching remote status packet.
 - Packet acknowledgement, checksum rejection, escaping, replies and the initial supported-feature
   negotiation now use the live backend instead of remaining inert helpers.
 
 ### Missing items
+
 - The complete register, memory, thread, query, breakpoint/watchpoint and `vCont` dispatcher remains
   interrupted behind the CPU stop/step and Dynarmic watchpoint prerequisites recorded in
   `PORTING_STATE.md`.
 
-### Binary layout verification
-- N/A for this framing slice; register byte order and architecture-specific XML remain owned by
-  `gdbstub_arch.rs` and will be verified with the resumed command dispatcher.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs Eden `src/core/hle/kernel/physical_core.{h,cpp}` debugger halt slice
 
 ### Intentional differences
+
 - Ruzu's host-fiber dispatcher retains the `Arc<KThreadLock>` and JIT pointer in `cpu_manager.rs`,
   so that coordinator calls narrow `PhysicalCore` methods for the upstream-owned execution and halt
   decisions rather than holding the Rust thread mutex across guest execution.
@@ -8120,6 +5693,7 @@ Eden files:
   relies on the invariant that only a matched debugger watchpoint emits `DataAbort`.
 
 ### Unintentional differences (to fix)
+
 - Runtime execution previously ignored `StepPending` and always called `RunThread`; a successful
   step could also be misclassified as an SVC. It now calls `StepThread`, records `StepPerformed`,
   gives the step priority over simultaneous halt bits, and reports/suspends it when rescheduled.
@@ -8128,162 +5702,128 @@ Eden files:
   rewind, context save, notification and suspension ordering.
 
 ### Missing items
+
 - A32/A64 Dynarmic callbacks still need to produce and retain matched watchpoints; that prerequisite
   is recorded in `PORTING_STATE.md` and is required before the data-abort path is complete.
-
-### Binary layout verification
-- N/A: this slice changes host execution ordering and retained thread state only.
 
 ## 2026-08-22 — `src/core/src/cpu_manager.rs` delegation vs Eden `src/core/hle/kernel/physical_core.cpp`
 
 ### Intentional differences
+
 - Ruzu's CPU manager owns the fiber boundary and cached per-core JIT pointers. It therefore invokes
   the corresponding `PhysicalCore` decisions before/after the JIT call; the behavioral logic and
   ordering remain in `physical_core.rs`, matching upstream ownership as closely as the fiber model
   permits.
 
 ### Unintentional differences (to fix)
+
 - The coordinator formerly classified breakpoint/data/prefetch halts itself and omitted the step
   state and debugger notifications. It now delegates those decisions and reschedules only after
   `PhysicalCore` has requested the upstream debug suspension.
 
-### Missing items
-- None in the CPU-manager delegation for the reviewed debugger halt slice.
-
-### Binary layout verification
-- N/A: no serialized or guest-visible layout changes.
-
 ## 2026-08-22 — `src/core/src/memory/memory.rs` vs Eden `src/core/memory.{h,cpp}` debugger-page marking
 
 ### Intentional differences
+
 - Rust receives the process address as its underlying `u64`; the page-table bridge already uses raw
   virtual addresses throughout, while preserving Eden's address-space validation and page walk.
 
 ### Unintentional differences (to fix)
+
 - `Memory::MarkRegionDebug` was absent. Watchpoint pages now lose fastmem access, transition from
   `Memory` to `DebugMemory`, and recover their biased host pointer when the last debug reference is
   removed, in Eden's protection-before-page-transition order.
 
-### Missing items
-- None for `MarkRegionDebug`.
-
-### Binary layout verification
-- N/A: this changes page-table entry state but introduces no serialized structure.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` watchpoint ownership
 
 ### Intentional differences
+
 - Rust's optional `Arc<Mutex<Memory>>` replaces Eden's directly owned `Memory`; initialized runtime
   processes always have it, while isolated `KProcess::new()` tests can still exercise table and
   reference-count behavior without a system memory owner.
 
 ### Unintentional differences (to fix)
+
 - `DebugWatchpoint` stored its type as an untyped byte and insert/remove changed only the table.
   The field now uses the owning bitflag type, and both operations apply Eden's per-page reference
   counting and `MarkRegionDebug` calls for overlapping watchpoints.
 
-### Missing items
-- None for the reviewed watchpoint table and page-reference slice.
-
-### Binary layout verification
-- PASS: replacing the raw `u8` with a `u8`-backed bitflag preserves the field's size and alignment;
-  focused assertions verify the 24-byte size and 8-byte alignment of the host structure.
-
 ## 2026-08-22 — `src/core/src/arm/arm_interface.rs` vs Eden `src/core/arm/arm_interface.{h,cpp}` watchpoints
 
 ### Intentional differences
+
 - Rust JIT callbacks are moved owners rather than C++ objects retaining a parent reference. The
   process-array pointer therefore lives in a shared atomic slot, and a match is copied out instead
   of returning a reference whose lifetime cannot cross the callback mutex boundary.
 
 ### Unintentional differences (to fix)
+
 - The interface previously duplicated the kernel watchpoint type with primitive addresses and did
   not expose `SetWatchpointArray` through every backend. It now consumes the `k_process.rs` owner and
   applies Eden's half-open range and access-bit matching literally.
 
-### Missing items
-- None for the reviewed watchpoint-array and matching slice.
-
-### Binary layout verification
-- N/A: the shared atomic pointer is host callback state; the process-owned watchpoint layout is
-  verified in `k_process.rs`.
-
 ## 2026-08-22 — `src/core/src/arm/dynarmic/arm_dynarmic_32.rs` vs Eden `src/core/arm/dynarmic/arm_dynarmic_32.{h,cpp}` watchpoint callbacks
 
 ### Intentional differences
+
 - The callback shares halted-watchpoint state with its Rust JIT owner through `Arc<Mutex<_>>` and
   invokes the existing Rust JIT halt bridge. Rust-only exclusive-read/128-bit callback extensions
   perform the same access check before their underlying memory operation.
 
 ### Unintentional differences (to fix)
+
 - `CheckMemoryAccess` previously returned unconditionally and the halt translation discarded
   Dynarmic's memory-abort bit. Address validation, read/write matching, retained watchpoint state,
   prefetch/data-abort halts and exclusive-access ordering now match Eden.
 
-### Missing items
-- None for the reviewed A32 memory-access/watchpoint slice.
-
-### Binary layout verification
-- N/A: callback and halt state are host-only.
-
 ## 2026-08-22 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs` vs Eden `src/core/arm/dynarmic/arm_dynarmic_64.{h,cpp}` watchpoint callbacks
 
 ### Intentional differences
+
 - The moved Rust callback uses a shared watchpoint-array pointer and mutex-protected copied match in
   place of Eden's parent reference and raw matched pointer; ownership and halt timing are preserved.
 
 ### Unintentional differences (to fix)
+
 - `CheckMemoryAccess` previously returned unconditionally. It now derives Eden's exact enable state,
   validates addresses, distinguishes read/write watchpoints, retains the match and prevents writes
   after requesting the corresponding prefetch/data-abort halt.
 
-### Missing items
-- None for the reviewed A64 memory-access/watchpoint slice.
-
-### Binary layout verification
-- N/A: callback and halt state are host-only.
-
 ## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs Eden `src/core/hle/kernel/physical_core.cpp` watchpoint loading
 
 ### Intentional differences
+
 - Rust passes the address of the stable process-owned array while holding the process lock; Eden
   obtains the same array through `GetWatchpoints()`.
 
 ### Unintentional differences (to fix)
+
 - `LoadContext` previously omitted `SetWatchpointArray`, and the data-abort path converted from a
   duplicate ARM watchpoint representation. It now wires the process owner after context/TLS setup
   and forwards that exact typed watchpoint to the debugger.
 
-### Missing items
-- None for the reviewed load-context/data-abort watchpoint slice.
-
-### Binary layout verification
-- N/A: this is host lifecycle wiring.
-
 ## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` vs Eden `src/core/debugger/gdbstub.cpp` typed watchpoint reply
 
-### Intentional differences
-- None in the reviewed watchpoint classification.
-
 ### Unintentional differences (to fix)
+
 - The reply path previously reconstructed a watchpoint type from an untyped byte. It now matches the
   owning kernel bitflag directly when selecting `rwatch`, `watch`, or `awatch`.
 
 ### Missing items
-- The command dispatcher remains the next warning-driven slice recorded in `PORTING_STATE.md`.
 
-### Binary layout verification
-- N/A: this formats a remote-protocol reply and introduces no payload structure.
+- The command dispatcher remains the next warning-driven slice recorded in `PORTING_STATE.md`.
 
 ## 2026-08-22 — `src/core/src/arm/debug.rs` vs Eden `src/core/arm/debug.{h,cpp}` module discovery
 
 ### Intentional differences
+
 - Rust page-table queries return `Option` and are asserted with `expect` where Eden uses `R_ASSERT`.
   Isolated tests can read the process-memory fallback when the runtime `Memory` bridge is absent.
 - Module path bytes are converted lossily to Rust UTF-8 strings; valid UTF-8 and ASCII paths retain
   Eden's exact basename and declared-length behavior.
 
 ### Unintentional differences (to fix)
+
 - `FindModules`, `GetModuleEnd` and the no-module entrypoint fallback previously returned empty or
   placeholder values. They now reproduce Eden's complete region walk, state/permission checks,
   module-path record parsing, three-segment end calculation and code-region fallback.
@@ -8291,16 +5831,14 @@ Eden files:
   symbolication. It now uses the owning kernel types and the single upstream-equivalent function.
 
 ### Missing items
+
 - Existing backtrace symbol names are still not resolved/demangled because Ruzu has no counterpart
   for Eden `common/demangle.{h,cpp}`; this is independent of the GDB module-enumeration prerequisite.
-
-### Binary layout verification
-- PASS: the module path record is decoded as upstream's `u32`, `s32`, and 0x200-byte path in its
-  exact 0x208-byte little-endian layout; focused coverage reads a real record from process memory.
 
 ## 2026-08-22 — `src/core/src/debugger/gdbstub.rs` vs Eden `src/core/debugger/gdbstub.{h,cpp}` command dispatcher
 
 ### Intentional differences
+
 - Eden retains its backend, `System` and process as raw references. Rust receives the backend per
   callback, retains the process as `Arc<ProcessLock>`, and uses `Arc<KThreadLock>` for selected and
   resumed threads; pointer identity preserves Eden's `vCont` matching semantics.
@@ -8315,54 +5853,43 @@ Eden files:
   valid packet.
 
 ### Unintentional differences (to fix)
+
 - The stub previously implemented only stop status, `qSupported`, kill, continue and step. It now
   ports Eden's complete register/memory dispatch, instruction restoration, software breakpoint and
   watchpoint lifecycle, query transfers, `vCont`, monitor output, pagination and escaping.
 - Breakpoint removal now writes the saved instruction, invalidates the instruction cache, and only
   then erases the saved entry, matching Eden's lifecycle order.
 
-### Missing items
-- None in the reviewed GDB stub command and query surface.
-
-### Binary layout verification
-- N/A: the GDB remote protocol serializes explicit text and hexadecimal byte streams rather than
-  raw host structures.
-
 ## 2026-08-23 — `src/shader_recompiler/src/frontend/mod.rs` tests vs Eden `src/shader_recompiler/frontend/maxwell/{decode.cpp,maxwell.inc}`
 
 ### Intentional differences
+
 - Ruzu keeps native Rust decoder smoke tests in the module root; Eden's C++ test tree is excluded
   from the port, while the tested instruction words come directly from Eden's Maxwell table.
 
 ### Unintentional differences (to fix)
+
 - The NOP and register-IADD instruction builders were unused, and the NOP test only checked that
   decoding did not panic. Both encodings now assert Eden's exact decoded opcode.
-
-### Missing items
-- None for the two reviewed decoder encodings.
-
-### Binary layout verification
-- N/A: the tests pass explicit 64-bit Maxwell instruction words to the decoder.
 
 ## 2026-08-23 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `src/dynarmic/src/dynarmic/ir/{opcodes.inc,opcodes.h}`
 
 ### Intentional differences
+
 - Rust retains 26 internal or decomposed opcodes that are not present in Eden's opcode enum. Their
   ownership and necessity remain active audit items; they are not treated as upstream parity.
 
 ### Unintentional differences (to fix)
+
 - Seventy-three existing opcodes used semantic Rust renames such as `RotateRight32`,
   `VectorMaxSigned8`, and `PackedAbsDiffSumS8`. Their enum variants, metadata, emit dispatch,
   frontend calls, optimization matches, and tests now use Eden's exact opcode names.
 
 ### Missing items
+
 - Fifteen Eden opcodes remain absent: seven `VectorBroadcastElement*`, four `VectorReduceAdd*`, and
   four `Vector{Signed,Unsigned}Multiply*` forms. Their existing composite or differently-owned Rust
   behavior must be replaced in prerequisite-backed slices.
-
-### Binary layout verification
-- PASS for this naming-only slice: enum cardinality and discriminants are unchanged; no serialized
-  or ABI-visible structure changed.
 
 ## 2026-08-23 — rdynarmic vector broadcast-element IR/backends vs Eden Dynarmic
 
@@ -8375,6 +5902,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`.
 
 ### Intentional differences
+
 - Rust dispatches enum variants through explicit `match` arms and passes `InstRef` into its register
   allocators; Eden uses generated x64 member dispatch and arm64 `EmitIR` template specializations.
   The opcode ownership, argument order, validation, emitted host instructions and value-definition
@@ -8383,36 +5911,33 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
   Eden's templated `EmitBroadcastElement<size>` helper and emits the same `DUP` encoding.
 
 ### Unintentional differences (to fix)
+
 - The newly ported x64 methods now have the correct upstream owner, but older methods from Eden's
   `emit_x64_vector.cpp` are still distributed across several legacy `emit_vector_*.rs` files. That
   broader ownership migration remains part of the directory audit.
 
 ### Missing items
+
 - Eight Eden IR opcodes remain absent after this slice: `VectorReduceAdd8/16/32/64` and
   `VectorSignedMultiply16/32` / `VectorUnsignedMultiply16/32`.
-
-### Binary layout verification
-- PASS: all seven opcodes use Eden's exact `U128(U128, U8)` metadata. No raw-memory payload or ABI
-  structure is introduced; x64 instruction bytes and arm64 `DUP` encodings have focused coverage.
 
 ## 2026-08-23 — `src/rdynarmic/src/backend/arm64/inst.rs` vs Oaknut instructions used by Eden vector reductions
 
 ### Intentional differences
+
 - Ruzu encodes AArch64 instructions directly as `u32` words rather than invoking Oaknut's
   overloaded `ADDV` and `ADDP` methods.
 
 ### Unintentional differences (to fix)
+
 - The direct encoder previously lacked the scalar across-lane `ADDV` and pairwise `ADDP Dd,
   Vn.2D` forms required by Eden's `VectorReduceAdd*` backend. Both encodings are now present in the
   arm64 instruction owner.
 
 ### Missing items
+
 - The four `VectorReduceAdd*` IR and backend paths remain paused until this prerequisite is
   independently committed.
-
-### Binary layout verification
-- PASS: GNU AArch64 binutils independently assembled the covered instructions as `0x4e31b820`,
-  `0x4e71b862`, `0x4eb1b8a4`, and `0x5ef1b8e6`; focused Rust assertions require the same words.
 
 ## 2026-08-23 — rdynarmic vector reduce-add IR/frontend/backends vs Eden Dynarmic
 
@@ -8427,6 +5952,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`.
 
 ### Intentional differences
+
 - Rust uses explicit opcode matches and direct host-instruction APIs. Eden uses generated x64
   member dispatch and arm64 template specializations; operand realization and value-definition
   ordering remain the same.
@@ -8434,18 +5960,15 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
   to Eden's `EmitReduce<size>` template and selects the same scalar instruction for every size.
 
 ### Unintentional differences (to fix)
+
 - ADDV previously expanded every lane into scalar IR additions and truncations. It now emits Eden's
   single dedicated reduction opcode after the same reserved-value check and operand read, removing
   both the behavioral and ownership divergence.
 
 ### Missing items
+
 - Four Eden IR opcodes remain absent: `VectorSignedMultiply16/32` and
   `VectorUnsignedMultiply16/32`.
-
-### Binary layout verification
-- PASS: all four opcodes use Eden's exact `U128(U128)` metadata. The x64 instruction sequences are
-  covered for SSSE3 and SSE2, and arm64 encodings were independently verified in the prerequisite
-  slice; no raw guest-visible payload is introduced.
 
 ## 2026-08-23 — rdynarmic upper/lower multi-result pseudo-operations vs Eden Dynarmic
 
@@ -8458,6 +5981,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/ir_emitter.h`,
 `src/dynarmic/src/dynarmic/backend/arm64/{emit_arm64,reg_alloc}.{h,cpp}`.
 
 ### Intentional differences
+
 - Rust's arena-backed emitter exposes named `get_upper_from_op` and `get_lower_from_op` methods
   around the common pseudo-operation linker; Eden constructs the same two typed `Inst<U128>`
   values directly inside its multi-result emitter.
@@ -8466,6 +5990,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/ir_emitter.h`,
   argument accounting before the check.
 
 ### Unintentional differences (to fix)
+
 - The x64 handlers previously extracted one 64-bit half from an ordinary `U128` and incorrectly
   defined the nominally 128-bit result in a GPR. They now only register the complete `U128` value
   already defined by the multi-result producer, exactly as Eden does.
@@ -8473,14 +5998,11 @@ Eden files: `src/dynarmic/src/dynarmic/ir/ir_emitter.h`,
   `backend/x64/emit_x64.rs` owner corresponding to Eden's `emit_x64.cpp`.
 
 ### Missing items
+
 - The interrupted `VectorSignedMultiply16/32` and `VectorUnsignedMultiply16/32` producer slice
   remains to be ported now that this prerequisite is available.
 - Other generic x64 methods from Eden `emit_x64.cpp` are still distributed across older Ruzu
   modules and remain part of the structural ownership audit.
-
-### Binary layout verification
-- N/A: the change restores SSA pseudo-result ownership and register-allocation bookkeeping; it
-  introduces no serialized payload or ABI-visible data structure.
 
 ## 2026-08-23 — rdynarmic vector multi-result multiply IR/backends vs Eden Dynarmic
 
@@ -8493,6 +6015,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
 `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`.
 
 ### Intentional differences
+
 - Rust represents Eden's nullable associated pseudo-operation pointers as `Option<InstRef>` and
   dispatches the same per-opcode emitters through explicit `match` arms. Producer ownership,
   result-sensitive branches, host instruction ordering, and value-definition ordering are retained.
@@ -8501,6 +6024,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
   multiplication even though both signed and unsigned producer backends are present.
 
 ### Unintentional differences (to fix)
+
 - Four dead `Vector{Signed,Unsigned}MultiplyLong{16,32}` operations had no Eden counterpart and
   returned one widened vector instead of Eden's upper/lower multi-result contract. They and their
   fallback implementations are removed; the exact four Eden producer operations replace them.
@@ -8510,41 +6034,37 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
   a separate audit slice.
 
 ### Missing items
-- None for the four reviewed multiply producers. The opcode inventory has no missing Eden names,
-  while 22 Ruzu-only operations still require ownership and behavior review.
 
-### Binary layout verification
-- PASS: all four producer opcodes use Eden's exact `Void(U128, U128)` signature and both pseudo
-  results remain full `U128` values. No raw-memory payload or guest ABI structure is introduced.
+- The opcode inventory has no missing Eden names,
+  while 22 Ruzu-only operations still require ownership and behavior review.
 
 ## 2026-08-23 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `ir/opcodes.inc`
 
 ### Intentional differences
+
 - Rust stores opcode metadata in an explicit `match`, whereas Eden generates it from
   `opcodes.inc`. The audit tool now expands every Rust grouped arm and compares all 725 shared
   return/argument signatures to retain line-item traceability.
 
 ### Unintentional differences (to fix)
+
 - The audit found 126 shared signature mismatches. This slice fixes all 119 vector mismatches and
   all four CRC mismatches. `A32CoprocLoadWords`, `A32CoprocStoreWords`, and
   `A64DataCacheOperationRaised` remain intentionally stopped on their recorded behavioral
   prerequisites rather than receiving metadata-only changes.
 
 ### Missing items
+
 - A32 coprocessor load/store construction and backend dispatch must be ported before removing their
   extra `U1` metadata argument.
 - A64 data-cache callbacks and non-hooked lowering must be ported before adding the missing location
   descriptor argument.
 - The 22 Ruzu-only opcode variants still require individual ownership and behavior review.
 
-### Binary layout verification
-- PASS for the reviewed metadata: vector operands retain full `U128` values and CRC8/16 retain the
-  upstream `U32` bit pattern until the backend selects the instruction width. No serialized payload
-  or ABI-visible structure changed.
-
 ## 2026-08-23 — rdynarmic `interface/a32/coprocessor*.rs` vs Eden `interface/A32/coprocessor*.h`
 
 ### Intentional differences
+
 - Rust expresses Eden's abstract class as a `Send + Sync` trait behind `Arc`, and its
   `std::variant` actions as enums. `Option<Callback>` and explicit `CoprocessorException` variants
   preserve the same compile-time decisions.
@@ -8552,23 +6072,21 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
   Rust FFI counterpart of Eden's native function pointer and `std::optional<void*>`.
 
 ### Unintentional differences (to fix)
+
 - The existing x64 and arm64 backend emitters still implement a hard-coded CP15 subset. They must
   consume these interface actions through the configured 16-entry registry before the old paths
   are removed.
 
 ### Missing items
+
 - `interface/A32/config.h::UserConfig::coprocessors` is not yet wired into `JitConfig` and both
   backend emit configurations.
 - Eden's seven compile-time coprocessor action dispatchers are the next prerequisite slice.
 
-### Binary layout verification
-- PASS: `CoprocReg` is `repr(u8)`, contiguous from C0 through C15, and focused tests verify its
-  size, alignment, discriminants, and conversion. Callback/action enums are host-only interfaces
-  and are never raw-copied into guest-visible storage.
-
 ## 2026-08-23 — rdynarmic A32 coprocessor registry vs Eden `interface/A32/config.h`
 
 ### Intentional differences
+
 - Ruzu's pre-existing combined `JitConfig` serves both A32 and A64, so the A32 registry is stored
   there and ignored by A64. Its type and owner are defined in the matching
   `interface/a32/config.rs` module.
@@ -8576,16 +6094,14 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}`,
   direct ownership counterpart of Eden's zero-initialized `std::array<std::shared_ptr<...>, 16>`.
 
 ### Unintentional differences (to fix)
+
 - The registry is now present at the public configuration boundary, but has not yet been forwarded
   to x64/arm64 emit configuration or consulted by the seven coprocessor emitters.
 
 ### Missing items
+
 - Backend action dispatch and the core CP15 implementation must populate and consume slot 15 before
   replacing the current hard-coded CP15 subset.
-
-### Binary layout verification
-- N/A: the registry contains host-owned `Arc` trait objects and is never serialized or exposed to
-  guest memory. Focused tests verify exactly 16 empty default slots.
 
 ## 2026-08-23 — rdynarmic A32 coprocessor frontend/IR vs Eden Dynarmic
 
@@ -8599,6 +6115,7 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/decoder/{arm,thumb32,vfp}.in
 `src/dynarmic/src/dynarmic/ir/{a32_ir_emitter.h,a32_ir_emitter.cpp,opcodes.inc}`.
 
 ### Intentional differences
+
 - Rust represents Eden's generated decoder tables with explicit masked matches. The same VFP,
   ASIMD, unconditional ARM, and generic coprocessor priority is preserved; focused overlap tests
   cover the VFP-before-generic and VFP-before-Thumb32 boundaries.
@@ -8609,6 +6126,7 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/decoder/{arm,thumb32,vfp}.in
   Rust translation helpers, which emit the same exception kind through Rust's IR API.
 
 ### Unintentional differences (to fix)
+
 - Coprocessor metadata was previously packed in the decoder, placed `opc2` in the wrong byte, and
   could not represent CDP's `CRd`. Construction now belongs to `A32IREmitter`, with the seven exact
   upstream argument lists and byte layouts.
@@ -8621,13 +6139,6 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/decoder/{arm,thumb32,vfp}.in
 - `A32CoprocLoadWords` and `A32CoprocStoreWords` previously carried a separate `U1` argument.
   Their complete transfer metadata now lives in the packed `U64`, leaving Eden's exact
   `Void(U64, U32)` signature.
-
-### Missing items
-- None in the reviewed ARM/Thumb coprocessor frontend and A32 IR-emitter slice.
-
-### Binary layout verification
-- PASS: focused tests assert every byte of Eden's seven eight-byte coprocessor metadata layouts,
-  including CDP `CRd`, one-word `opc2`, load/store option fields, and zeroed reserved bytes.
 
 ## 2026-08-23 — rdynarmic A32 coprocessor backends vs Eden Dynarmic
 
@@ -8642,6 +6153,7 @@ Eden files: `src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp`,
 `src/dynarmic/src/dynarmic/interface/A32/a32.{h,cpp}`.
 
 ### Intentional differences
+
 - Rust stores Eden's shared coprocessor objects as `Arc<dyn Coprocessor>` and forwards a cloned
   16-entry array into backend configuration. This preserves shared lifetime and the exact slot
   lookup while replacing C++ `shared_ptr` ownership.
@@ -8652,6 +6164,7 @@ Eden files: `src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp`,
   corresponding to Eden's currently unreachable `EmitCoprocessorException` implementation.
 
 ### Unintentional differences (to fix)
+
 - Both backends previously hard-coded a small CP15 subset and silently ignored several generic
   actions. They now query the configured coprocessor and implement all seven upstream action
   families: callback, direct one-word access, direct two-word access, and exception paths.
@@ -8662,21 +6175,13 @@ Eden files: `src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp`,
   `A32Jit` accessors. Those non-upstream fields and accessors are removed; storage now belongs to
   the configured core CP15 object, as it does in Eden.
 
-### Missing items
-- None in the reviewed x64/arm64 A32 coprocessor emission slice.
-
-### Binary layout verification
-- PASS for the reviewed state change: the two non-upstream CP15 words are removed from backend JIT
-  state, and every generated state access continues to use `offset_of!` rather than a persisted
-  numeric offset. Coprocessor pointers and callbacks are host-only and are not raw-copied into a
-  guest-visible structure.
-
 ## 2026-08-23 — `core/arm/dynarmic/dynarmic_cp15.rs` vs Eden `dynarmic_cp15.{h,cpp}`
 
 Related Rust owner: `src/core/src/arm/dynarmic/arm_dynarmic_32.rs`; related Eden owner:
 `src/core/arm/dynarmic/arm_dynarmic_32.{h,cpp}`.
 
 ### Intentional differences
+
 - Rust uses `UnsafeCell<u32>` for UPRW/URO and the ignored-write target so a coprocessor shared by
   `Arc` can expose stable direct-access pointers through `&self`. Eden exposes pointers to mutable
   members through a `shared_ptr`; both rely on the same single guest-execution-thread lifetime.
@@ -8690,6 +6195,7 @@ Related Rust owner: `src/core/src/arm/dynarmic/arm_dynarmic_32.rs`; related Eden
   The MSVC x64 DSB/DMB instruction distinction is preserved explicitly.
 
 ### Unintentional differences (to fix)
+
 - CP15 previously returned local result enums that the JIT interpreted through hard-coded paths.
   It now implements the upstream `Coprocessor` interface directly, including exact accepted
   encodings, direct UPRW/URO accesses, barrier callbacks, CNTPCT callback, and rejection behavior.
@@ -8697,25 +6203,19 @@ Related Rust owner: `src/core/src/arm/dynarmic/arm_dynarmic_32.rs`; related Eden
   JIT state. It now owns one shared CP15 object, installs it in registry slot 15 before JIT
   creation, and reads/writes thread context through that object in Eden's lifecycle order.
 
-### Missing items
-- None in the reviewed CP15 and `ArmDynarmic32` integration slice.
-
-### Binary layout verification
-- N/A: CP15 is a host-side polymorphic service object and is never serialized or raw-copied to
-  guest memory. Focused tests verify that the two thread-register actions expose distinct stable
-  words and that every accepted/rejected compile action matches Eden.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/acc_type.rs` vs Eden `ir/acc_type.h`
 
 Related Rust users: `src/rdynarmic/src/backend/{x64/emit_x64_memory,arm64/emit_arm64_memory}.rs`.
 
 ### Intentional differences
+
 - Rust spells Eden's uppercase enumerators with Rust `UpperCamelCase` (`ORDEREDRW` becomes
   `OrderedRw`, `DCZVA` becomes `Dczva`) and uses `repr(u8)`. The value is a typed IR immediate and
   is never passed through the host ABI or raw-copied; the explicit representation makes the exact
   contiguous discriminants reviewable.
 
 ### Unintentional differences (to fix)
+
 - The former Rust enum had 15 values from a different access-type vocabulary and lacked Eden's
   `PTW`, `DC`, `IC`, `DCZVA`, `AT`, and `SWAP` entries. It now has Eden's exact 16-value inventory
   and declaration order.
@@ -8723,14 +6223,6 @@ Related Rust users: `src/rdynarmic/src/backend/{x64/emit_x64_memory,arm64/emit_a
   `OrderedRw` and `Ifetch` values in both backend ordering checks and focused tests.
 - The unused fallback conversion silently mapped every invalid byte to `Normal`, behavior with no
   upstream counterpart. It is removed; IR construction uses typed `AccType` values throughout.
-
-### Missing items
-- None for the `AccType` inventory or the reviewed backend ordering predicate.
-
-### Binary layout verification
-- PASS for the Rust IR representation: focused tests require size/alignment one byte and exact
-  discriminants 0 through 15 in Eden declaration order. No guest or persisted binary structure
-  contains this enum.
 
 ## 2026-08-23 — rdynarmic A64 cache-maintenance frontend vs Eden Dynarmic
 
@@ -8744,6 +6236,7 @@ Eden files: `src/dynarmic/src/dynarmic/interface/A64/config.h`,
 `src/dynarmic/src/dynarmic/ir/opcodes.inc`.
 
 ### Intentional differences
+
 - Rust gives both cache-operation enums an explicit `repr(u8)` and Rust-style `Va` spelling. They
   remain typed until `A64IREmitter` converts them to Eden's contiguous `U64` IR immediate.
 - Eden generates instruction dispatch from decoder tables; Rust's generated decoder feeds methods
@@ -8751,6 +6244,7 @@ Eden files: `src/dynarmic/src/dynarmic/interface/A64/config.h`,
   same.
 
 ### Unintentional differences (to fix)
+
 - All non-ZVA cache operations were previously NOPs in the unrelated `simd.rs` owner, while ZVA
   emitted eight hard-coded 64-bit normal stores. The nine DC visitors now emit Eden's exact typed
   cache operation and register value; the callback-config pass owns any later ZVA lowering.
@@ -8758,15 +6252,6 @@ Eden files: `src/dynarmic/src/dynarmic/interface/A64/config.h`,
   and value, write the next PC, and terminate with `CheckHalt(ReturnToDispatch)` in Eden's order.
 - `A64DataCacheOperationRaised` previously omitted the current location descriptor. Its emitter
   and opcode metadata now have Eden's exact `Void(U64, U64, U64)` contract.
-
-### Missing items
-- None in the reviewed cache-operation enums, frontend visitors, or A64 IR-emitter contract. The
-  callback-config optimization and host backends are the recorded next prerequisite.
-
-### Binary layout verification
-- PASS: focused tests require the exact operation discriminants and all three data-cache IR
-  arguments, including the location descriptor. These enums and IR immediates are host-internal;
-  no guest-visible raw payload changes.
 
 ## 2026-08-23 — rdynarmic A64 cache callback/config/backends vs Eden Dynarmic
 
@@ -8783,6 +6268,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/opt_passes.cpp`,
 `src/core/arm/dynarmic/arm_dynarmic_64.cpp`.
 
 ### Intentional differences
+
 - Rust's index-backed IR arena renumbers later `InstRef` values after each insertion and recomputes
   use counts after the pass. Eden's list-backed iterator keeps instruction addresses stable; the
   emitted instruction order and operands are otherwise identical.
@@ -8791,6 +6277,7 @@ Eden files: `src/dynarmic/src/dynarmic/ir/opt_passes.cpp`,
   and value therefore occupy the same two effective callback parameters as Eden.
 
 ### Unintentional differences (to fix)
+
 - Ruzu still exposes one combined `JitConfig` for A32 and A64 instead of the two upstream
   `interface/{A32,A64}/config.h::UserConfig` owners. The newly reviewed `ctr_el0`, `dczid_el0`, and
   `hook_data_cache_operations` state is at least kept at that public configuration level rather
@@ -8798,15 +6285,6 @@ Eden files: `src/dynarmic/src/dynarmic/ir/opt_passes.cpp`,
 - The pre-existing `hook_isb` field lived in `MemoryEmitConfig`. It now sits beside the other
   callback-policy state in the public combined `JitConfig` and is forwarded explicitly to both
   backends; splitting that combined owner remains part of the broader structural debt above.
-
-### Missing items
-- None in the reviewed A64 cache callback, unhooked lowering, x64 emission, arm64 emission, or
-  configurable CTR/DCZID behavior.
-
-### Binary layout verification
-- PASS: the new configuration fields are host-only Rust values and are not serialized or copied to
-  guest memory. Cache-operation IR keeps Eden's exact `Void(U64, U64, U64)` / `Void(U64, U64)`
-  signatures, and focused native plus AArch64-QEMU tests verify callback argument bit patterns.
 
 ## 2026-08-23 — rdynarmic dead IR opcodes vs Eden Dynarmic IR/backend owners
 
@@ -8816,25 +6294,14 @@ Rust files: `src/rdynarmic/src/ir/opcode.rs` and
 Eden files: `src/dynarmic/src/dynarmic/ir/{opcodes.inc,ir_emitter.h}` and
 `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`.
 
-### Intentional differences
-- None in this slice. Rust retains its index-based insertion-point state, but that state is not an
-  IR opcode, matching Eden's separation between `IREmitter` state and the opcode inventory.
-
 ### Unintentional differences (to fix)
+
 - The Rust opcode enum formerly exposed `SetInsertionPoint` and `GetInsertionPoint` as void IR
   instructions. Neither had a producer or backend consumer; Eden exposes insertion-point changes
   solely as `IREmitter` methods. The two dead opcodes and their metadata are removed.
 - Rust formerly exposed three immediate shuffle opcodes and x64 emitters with no frontend producer.
   Eden has no such IR opcodes and uses host shuffles locally inside the emitters that require them.
   The dead opcodes, dispatch arms, emitter functions, helper, and signature-only test are removed.
-
-### Missing items
-- None for the reviewed insertion-point state or the three dead shuffle operations.
-
-### Binary layout verification
-- PASS: the removed values were host-internal IR enum variants with no producer, persisted format,
-  raw-memory payload, or guest-visible representation. The exact opcode audit now reports 725 Eden
-  opcodes, 742 Rust opcodes, zero missing/shared-signature mismatches, and 17 remaining Rust extras.
 
 ## 2026-08-23 — rdynarmic signed vector comparison IR vs Eden `ir_emitter.h`
 
@@ -8847,11 +6314,13 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{ir_emitter.h,opcodes.inc}` and
 `src/dynarmic/src/dynarmic/backend/{x64/emit_x64_vector.cpp,arm64/emit_arm64_vector.cpp}`.
 
 ### Intentional differences
+
 - Rust uses locals for intermediate `Value`s because nested mutable method calls cannot borrow the
   emitter repeatedly in one expression. The generated instruction order and dependencies are the
   same as Eden's nested expressions.
 
 ### Unintentional differences (to fix)
+
 - `vector_greater_equal_signed` formerly emitted one of four Rust-only opcodes. It now emits
   `VectorGreaterS*`, then `VectorEqual*`, then `VectorOr`, matching Eden exactly.
 - `vector_less_equal_signed` formerly emitted one of four Rust-only opcodes. It now emits
@@ -8867,16 +6336,6 @@ Eden files: `src/dynarmic/src/dynarmic/ir/{ir_emitter.h,opcodes.inc}` and
   their exact upstream owners. A64 scalar signed `LE`/`LT` now likewise call the matching signed
   helpers instead of swapping operands into `GE`/`GT`.
 
-### Missing items
-- None for the seven reviewed signed/unsigned comparison helper compositions or their primitive
-  backend operations.
-
-### Binary layout verification
-- PASS: focused emitter and A32/A64 frontend tests verify all four element sizes, instruction order,
-  IR dependencies, and owner selection. The removed enum variants were host-internal and never
-  serialized or raw-copied. The exact audit now reports 725 Eden opcodes, 726 Rust opcodes, no
-  missing/shared-signature mismatches, and one remaining Rust-only diagnostic opcode.
-
 ## 2026-08-23 — rdynarmic A32 translation/IR diagnostic hook vs Eden Dynarmic
 
 Rust files: `src/rdynarmic/src/frontend/a32/translate/mod.rs`,
@@ -8889,11 +6348,13 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/translate/{translate_arm,tra
 `src/dynarmic/src/dynarmic/ir/opcodes.inc`, and the A32 x64/arm64 emitter owners.
 
 ### Intentional differences
+
 - Ruzu's separate environment-gated block-entry `RUZU_A32_PC_TRACE` diagnostic remains outside the
   IR surface. Removing the per-instruction opcode restores normal translation parity without
   changing that disabled-by-default diagnostic facility.
 
 ### Unintentional differences (to fix)
+
 - `RUZU_A32_PC_EXEC` formerly parsed a list of ARM guest PCs and appended a Rust-only host-call IR
   instruction after matching ARM instructions. Eden has no such opcode or translation step, and
   the Rust path did not cover Thumb instructions. Its environment parser, translator injection,
@@ -8901,14 +6362,10 @@ Eden files: `src/dynarmic/src/dynarmic/frontend/A32/translate/{translate_arm,tra
   emitters, and JIT guard exception are removed.
 
 ### Missing items
+
 - Resolved by the later A32 translation callbacks/options slice: the loop now owns
   `PreCodeReadHook`, `PreCodeTranslationHook`, and per-instruction `GetTicksForCode` in matching
   callback and ARM/Thumb modules.
-
-### Binary layout verification
-- PASS: the removed opcode and its five operands were host-internal IR only and were not serialized,
-  raw-copied, or guest-visible. The exact audit now reports 725 opcodes on both sides, zero missing
-  or extra operations, zero shared-signature mismatches, and complete one-to-one metadata coverage.
 
 ## 2026-08-23 — `src/rdynarmic/src/interface/a32/arch_version.rs`, `frontend/a32/translate/a32_translate.rs`, and `ir/a32_emitter.rs` vs Eden A32 architecture/translation options
 
@@ -8917,6 +6374,7 @@ Eden files: `src/dynarmic/src/dynarmic/interface/A32/{arch_version.h,config.h}`,
 `frontend/A32/a32_ir_emitter.{h,cpp}`.
 
 ### Intentional differences
+
 - Rust's `ArchVersion` has `repr(u8)` and a `Default` of `V8`; the representation mirrors the C++
   underlying type, while the default mirrors `A32::UserConfig`. `TranslationOptions::default()`
   explicitly selects `V3`, preserving C++ value-initialization of `TranslationOptions{}`.
@@ -8926,17 +6384,15 @@ Eden files: `src/dynarmic/src/dynarmic/interface/A32/{arch_version.h,config.h}`,
   Production A32 translation uses `with_location_and_arch` with the configured version.
 
 ### Unintentional differences (to fix)
+
 - Ruzu still combines A32 and A64 public state in `JitConfig`, whereas Eden owns separate
   `interface/A32/config.h::UserConfig` and `interface/A64/config.h::UserConfig` types. The new A32
   fields are behaviorally forwarded, but this pre-existing structural split remains to be ported.
 
 ### Missing items
+
 - The reviewed `ArchVersion`, `TranslationOptions`, `ALUWritePC`, and `LoadWritePC` contracts are
   present. The remaining item is the broader A32/A64 public configuration ownership split above.
-
-### Binary layout verification
-- PASS: `ArchVersion` is an eight-value `repr(u8)` enum in Eden declaration order. Translation and
-  JIT options are host-only and are not raw-copied or serialized into guest-visible memory.
 
 ## 2026-08-23 — A32 translation callbacks and loops vs Eden `translate_callbacks.h`, `translate_arm.cpp`, and `translate_thumb.cpp`
 
@@ -8945,6 +6401,7 @@ Rust files: `src/rdynarmic/src/frontend/a32/translate/{translate_callbacks,trans
 `src/rdynarmic/src/backend/arm64/a32_address_space.rs`, and `src/rdynarmic/src/jit.rs`.
 
 ### Intentional differences
+
 - `UserCallbacksAdapter` models C++ `UserCallbacks : TranslateCallbacks` by delegation because Rust
   traits do not inherit stored trait objects. The frontend depends only on the translation-time
   contract, while both host backends adapt the public callbacks at their compile boundary.
@@ -8956,18 +6413,16 @@ Rust files: `src/rdynarmic/src/frontend/a32/translate/{translate_callbacks,trans
   three distinct matcher invocations.
 
 ### Unintentional differences (to fix)
+
 - The per-instruction visitors are still coordinated by the broad Rust `translate/mod.rs`
   dispatcher, while Eden retains one method per matching `translate/impl/*.cpp` owner. Splitting
   those pre-existing ownership aggregates remains part of the structural audit.
 
 ### Missing items
+
 - No callback or loop-order item remains in this slice: pre-read early termination, aligned code
   reads, pre-translation hooks, custom ticks, NoExecuteFault advancement, conditional-state exit,
   single-step terminals, and end-location updates are all wired and covered by focused tests.
-
-### Binary layout verification
-- N/A for guest layout: callbacks, options, and translation loop state are host-only. The adapter
-  passes A32 PCs/instructions as exact `u32` values and tick counts as `u64`, matching Eden widths.
 
 ## 2026-08-23 — A32 hint/preload decoding and translation vs Eden decoder tables and hint owners
 
@@ -8978,113 +6433,75 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 `frontend/A32/translate/impl/{hint,thumb16,thumb32_control,thumb32_load_byte}.cpp`.
 
 ### Intentional differences
+
 - Rust expresses generated decoder-table rows as explicit mask/value checks. The masks and values
   are derived directly from Eden's bitstrings and are placed before the same broader decode groups.
 
 ### Unintentional differences (to fix)
+
 - Thumb32 preload behavior currently shares the existing broad `thumb32.rs` and
   `thumb32_control.rs` owners. Eden owns these methods in `thumb32_load_byte.cpp`; moving the whole
   related Thumb32 load-byte family, rather than only the new methods, remains a structural slice.
 
 ### Missing items
+
 - The reviewed hint family now includes ARM/Thumb16/Thumb32 `SEVL`, all four Thumb32 `PLD` forms,
   all four Thumb32 `PLI` forms, the W-bit PLD/PLDW distinction, hook-disabled NOP behavior, and the
   register-PC UnpredictableInstruction checks.
 
-### Binary layout verification
-- N/A: decoder identifiers and exception IR are host-internal. Focused tests verify the exact
-  16/32-bit encodings and exception discriminants rather than a raw guest payload.
-
 ## 2026-08-23 — `src/rdynarmic/src/backend/x64/emit_data_processing.rs` vs Eden `backend/x64/emit_x64_data_processing.cpp` (`ExtractRegister`)
 
 ### Intentional differences
+
 - Rust's `change_bit` and assembler methods return `Result`; the emitter unwraps them at the same
   points where Eden relies on Xbyak assertions/errors. Register allocation and emission ownership
   remain in the matching x64 data-processing module.
 
-### Unintentional differences (to fix)
-- Fixed: Ruzu previously branched on whether `lsb` was immediate and advertised dynamic
-  `ExtractRegister32`/`ExtractRegister64` paths that only panicked. Eden has one shared helper,
-  obtains `lsb` through `GetImmediateU8`, and unconditionally emits `SHRD`; Ruzu now does the same,
-  including Eden's scratch/source allocation and immediate-extraction order.
-
-### Missing items
-- None in the reviewed x64 `ExtractRegister32`/`ExtractRegister64` emitter slice. Dynamic `lsb` is
-  not an upstream feature: both opcode signatures accept `U8`, while both host backends require an
-  immediate at emission time.
-
-### Binary layout verification
-- N/A: this slice emits host x86-64 instructions and changes no raw-copied or serialized guest
-  structure. The focused regression covers both 32-bit and 64-bit widths with an immediate `lsb`.
-
 ## 2026-08-23 — `src/rdynarmic/src/backend/arm64/inst.rs` prerequisites for Eden `backend/arm64/emit_arm64_packed.cpp`
 
 ### Intentional differences
+
 - Eden delegates AArch64 encoding to Oaknut. Ruzu owns its equivalent bit encoders in `inst.rs`;
   the new helpers keep that existing platform-adaptation boundary and expose the exact instruction
   forms used by the upstream packed emitter.
 
 ### Unintentional differences (to fix)
+
 - Fixed prerequisite: Ruzu lacked the 64-bit-vector forms of `MOVI`, `AND`, `EOR`, and `BSL`, the
   compare-against-zero forms of `CMGE`/`CMEQ`, and encoders for `UADDLV` and `SHRN`. The former
   `movi_v16b_imm` also accepted only two hard-coded immediates; its shared encoder now accepts the
   full `imm8` field while preserving its existing encodings.
 
 ### Missing items
+
 - The encoders required by the complete `emit_arm64_packed.cpp` port are present. The packed
   emitter itself remains the next slice and is not claimed complete by this prerequisite commit.
-
-### Binary layout verification
-- PASS: focused encoder tests compare every new form against exact 32-bit words independently
-  assembled with GNU AArch64 binutils, including both MOVI masks, all element widths used by
-  `SHRN`/`UADDLV`, and the 64-bit vector logical/compare forms.
 
 ## 2026-08-23 — `src/rdynarmic/src/backend/arm64/a32_address_space.rs` vs Eden `backend/arm64/a32_address_space.cpp` (`GenerateIR` constant reads)
 
 ### Intentional differences
+
 - Eden's central `Optimization::Optimize` obtains `MemoryReadCode` and `IsReadOnlyMemory` through
   `A32::UserCallbacks`. Ruzu invokes the already-separated Rust passes explicitly and supplies two
   closures over the same callback owner.
 
-### Unintentional differences (to fix)
-- Fixed: the ARM64 address space called `a32_constant_memory_reads` with an undefined `read_code`
-  identifier. Native x86-64 builds did not compile this target-specific owner, but AArch64 builds
-  failed. The closure now delegates `u32` A32 addresses to `UserCallbacks::memory_read_code` with
-  the same widening used by the translation callback adapter.
-
 ### Missing items
+
 - No constant-memory callback is missing in the reviewed `GenerateIR` path. Broader optimization
   pass order and ownership remain tracked separately from this compile-blocking correction.
-
-### Binary layout verification
-- N/A: this change only restores a host callback passed to an IR optimization; it changes no
-  raw-copied or serialized guest structure and preserves the guest address as an unsigned 32-bit
-  value before widening it to the public callback's `u64` parameter.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder.rs` vs Eden `frontend/A32/decoder/arm.inc` (literal loads)
 
 ### Intentional differences
+
 - Eden generates its ARM decoder from per-instruction bit-pattern declarations in `arm.inc`.
   Ruzu's existing decoder is a handwritten decision tree, so the six literal patterns are routed
   explicitly inside the matching load/store decode families.
 
-### Unintentional differences (to fix)
-- Fixed: the extra-load/store decoder never produced `LDRD_lit`, `LDRH_lit`, `LDRSB_lit`, or
-  `LDRSH_lit`, even though their identifiers existed. It now matches Eden's Rn=PC pattern priority
-  and preserves Eden's fixed P=1/W=0 constraints for the doubleword and signed literal forms.
-
-### Missing items
-- None among Eden's six reviewed ARM literal-load patterns: `LDR`, `LDRB`, `LDRD`, `LDRH`,
-  `LDRSB`, and `LDRSH` all have reachable Rust decoder identifiers.
-
-### Binary layout verification
-- N/A: the decoder classifies fixed 32-bit instruction words and defines no raw-copied payload.
-  Focused tests cover all six Eden patterns plus non-literal PC encodings that must remain routed
-  to immediate visitors and raise UnpredictableInstruction there.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/{load_store.rs,mod.rs}` vs Eden `frontend/A32/translate/impl/{load_store.cpp,a32_translate_impl.h}` (load visitors)
 
 ### Intentional differences
+
 - Rust extracts typed fields from `DecodedArm` inside each matching snake-case visitor; Eden's
   generated decoder passes them as typed parameters. ARM condition-state bookkeeping remains in
   Ruzu's block translator rather than being repeated in every visitor.
@@ -9092,30 +6509,16 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   and `Reg::from_u32` replaces Eden's register `operator+` after the same validity checks.
 
 ### Unintentional differences (to fix)
-- Fixed: all six literal-load identifiers shared immediate visitors. Dedicated Rust visitors now
-  own Eden's exact immediate PC-relative address calculation, access width/type, extension,
-  destination handling, terminal choice, and LDRD endian-sensitive split order.
-- Fixed: immediate and register-offset load visitors omitted Eden's register/writeback validation;
-  LDR register-to-PC also omitted Eden's PopRSBHint branch. The reviewed `LDR`, `LDRB`, `LDRD`,
-  `LDRH`, `LDRSB`, and `LDRSH` load methods now preserve those checks before reading operands.
+
 - Frontend-wide pre-existing difference: Ruzu performs condition-state setup before dispatch,
   whereas Eden performs each visitor's encoding validation before `ArmConditionPassed`. Correcting
   that ordering requires restoring visitor-owned condition state across the A32 frontend, not a
   load/store-local helper, and remains a separate structural slice.
 
-### Missing items
-- None among the reviewed literal, immediate, and register variants of `LDR`, `LDRB`, `LDRD`,
-  `LDRH`, `LDRSB`, and `LDRSH`. Store visitors and the unprivileged `*T` methods were not claimed
-  by this prerequisite slice.
-
-### Binary layout verification
-- N/A: these visitors construct internal SSA and serialize no guest payload. Focused tests verify
-  immediate address operands, absence of synthetic Add32/Sub32 operations, exception terminals,
-  LDR-to-PC dispatch, LDRD access atomicity, and endian-dependent opcode ordering.
-
 ## 2026-08-23 — `src/rdynarmic/src/backend/arm64/emit_arm64_packed.rs` vs Eden `backend/arm64/emit_arm64_packed.cpp`
 
 ### Intentional differences
+
 - Eden emits through Oaknut register wrappers. Ruzu propagates encoder/allocation failures with
   `Result` and passes realized vector-register indexes to its existing `inst.rs` encoder boundary;
   the upstream helper ownership and instruction ordering remain local to the matching packed file.
@@ -9123,53 +6526,18 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   routes the same opcode set to `emit_packed_instruction`, while each implementation remains owned
   by the new file corresponding to `emit_arm64_packed.cpp`.
 
-### Unintentional differences (to fix)
-- Fixed: the ARM64 dispatcher rejected all 34 packed opcodes. The matching Rust owner now emits
-  Eden's eight add/sub operations and optional GE results, eight mixed add/sub operations, twelve
-  halving operations, eight saturating operations, absolute-difference sum, and packed selection.
-- Fixed: the mixed add/sub family now preserves Eden's V0/V1/V2 scratch sequence, lane rotation,
-  signed/unsigned widening and halving, GE mask construction, and final narrowing order.
-- Fixed: saturating operations spill the deferred FPSR state before modifying host QC, matching
-  Eden's lifecycle order rather than allowing a later FPSR restore to overwrite the result.
-
-### Missing items
-- None among the 34 explicit `EmitIR` specializations in the reviewed Eden file.
-
-### Binary layout verification
-- N/A: this file defines no raw-copied payload. AArch64 tests run under QEMU route all 34 opcodes
-  and compare parity-sensitive GE, scratch-register, saturation, absolute-difference, and select
-  sequences against exact 32-bit instruction words from the independently verified encoders.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (unprivileged loads)
 
 ### Intentional differences
+
 - Eden builds an ordered matcher from `thumb32.inc`; Ruzu retains its existing handwritten
   decision tree. The Rust branch now makes the same `1110` low-control-nibble priority explicit
   before the broader `1PUW` immediate forms.
 
-### Unintentional differences (to fix)
-- Fixed: `LDRT`, `LDRBT`, `LDRHT`, `LDRSBT`, and `LDRSHT` decoded as their generic imm8 families.
-  They now have distinct identifiers and win over `LDR/B/H/SB/SH_imm8` for the exact five Eden
-  patterns.
-- Fixed: negative-offset word/halfword/signed-byte literals with `Rn=PC` lost to the broader
-  register/imm8 groups, and Eden's four reserved signed-halfword `Rt=PC` patterns did not decode as
-  `NOP`. The handwritten decision tree now preserves those earlier table entries.
-- Fixed: translation preserves the existing effective-address behavior for the newly distinct
-  identifiers and applies Eden's PC-destination rejection before performing the load. Their final
-  method ownership now lives in the matching load-byte, load-halfword, and load-word files.
-
-### Missing items
-- None among the five reviewed unprivileged word/byte/halfword load patterns. Store families were
-  not part of this decoder prerequisite.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words and defines no raw-copied payload. Focused
-  tests cover all five exact `...1110...` encodings, adjacent `...1100...` imm8 encodings, the four
-  negative literal forms, and the four reserved signed-halfword `NOP` patterns.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_byte.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_byte.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes decoded fields as typed visitor parameters. Ruzu's matching
   snake-case methods read those fields from `DecodedThumb32`; each method and helper remains in the
   corresponding byte-load owner, while `thumb32.rs` only dispatches.
@@ -9177,364 +6545,125 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `ExtensionFunctionU8` member pointer and explicit `wrapping_add`/`wrapping_sub` for the same
   unsigned `u32` literal-address arithmetic.
 
-### Unintentional differences (to fix)
-- Fixed: byte-load and preload behavior was split between broad `thumb32.rs` and unrelated
-  `thumb32_control.rs` owners. All 18 visitors plus `PLDHandler`, `PLIHandler`, `LoadByteLiteral`,
-  `LoadByteRegister`, and `LoadByteImmediate` now live in `thumb32_load_byte.rs`.
-- Fixed: generic byte loads omitted Eden's imm8 validation (`Rt=PC && W`, writeback aliasing, and
-  `!P && !W`) and the register form's `Rm=PC` rejection. Validation now precedes all register reads,
-  memory operations, and writeback.
-- Fixed: the former shared address helper performed writeback before the memory read and before
-  writing `Rt`. The immediate helper now preserves Eden's `read -> extend -> SetRegister(t) ->
-  optional SetRegister(n)` order.
-- Fixed: register byte loads skipped `LogicalShiftLeft` when `imm2` was zero. The helper now emits
-  Eden's operation unconditionally, preserving IR shape as well as the result.
-- Fixed: the distinct `LDRBT`/`LDRSBT` paths now apply their PC validation and then reuse the normal
-  positive, pre-indexed, non-writeback imm8 visitor exactly like Eden.
-
-### Missing items
-- None among the 18 declarations and implementations in the reviewed byte-load/memory-hint owner.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify literal
-  U-bit addressing, signed/unsigned extension selection, validation-before-side-effects, exact
-  destination/writeback order, register/preload PC checks, unprivileged access type, and absence of
-  unprivileged writeback.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_halfword.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_halfword.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes decoded fields to visitor methods. Ruzu's matching methods read
   the fields from `DecodedThumb32`, use a higher-ranked Rust function pointer for
   `ExtensionFunctionU16`, and state unsigned literal-address wraparound explicitly.
 
-### Unintentional differences (to fix)
-- Fixed: all halfword visitors and helpers lived in the broad `thumb32.rs`; the ten reviewed
-  methods plus `LoadHalfLiteral`, `LoadHalfRegister`, and `LoadHalfImmediate` now live in the
-  matching `thumb32_load_halfword.rs` owner.
-- Fixed: the generic implementation omitted Eden's imm8 validation and register `Rm=PC` rejection.
-  The exact `!P && !W` -> `Rt=PC && W` -> writeback-alias validation order now runs before any IR
-  side effect.
-- Fixed: register loads read `Rn` before `Rm` and elided a zero-bit shift. They now preserve Eden's
-  `GetRegister(m) -> GetRegister(n) -> LogicalShiftLeft` IR ordering.
-- Fixed: the shared address helper wrote the destination before the base for writeback forms. The
-  halfword helper now preserves Eden's distinct `read -> extend -> optional SetRegister(n) ->
-  SetRegister(t)` order.
-- Fixed: `LDRHT` and `LDRSHT` now apply their PC validation and reuse the normal positive,
-  pre-indexed, non-writeback imm8 visitors.
-
-### Missing items
-- None among the ten declarations and implementations in the reviewed halfword-load owner.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify
-  positive/negative literal addressing, signed/unsigned extension, register-read and zero-shift IR
-  order, validation-before-side-effects, halfword-specific writeback order, and unprivileged
-  no-writeback behavior.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_word.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_word.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed decoded fields to its visitor. The five snake-case Rust
   visitors read the same fields from `DecodedThumb32`; the dispatcher remains routing-only.
 - Rust spells unsigned literal-address wraparound explicitly and represents Eden's terminal
   variants with the existing `Terminal` enum.
 
-### Unintentional differences (to fix)
-- Fixed: the five word-load visitors lived in broad `thumb32.rs`; they now live in the matching
-  `thumb32_load_word.rs` owner, and the shared address helper no longer owns their behavior.
-- Fixed: word loads omitted Eden's undefined/writeback-alias, `Rm=PC`, and nonfinal-IT validation.
-  The exact validation order now runs before any register read or memory operation.
-- Fixed: register loads read `Rn` before `Rm` and elided `LogicalShiftLeft` for a zero shift. They
-  now preserve Eden's `GetRegister(m) -> GetRegister(n) -> LogicalShiftLeft` IR order.
-- Fixed: indexed loads previously performed writeback inside the shared address helper before the
-  memory read. The word visitor now preserves Eden's read-before-writeback order, followed by the
-  PC update and `PopRSBHint` only for post-indexed `SP` loads.
-- Fixed: the distinct `LDRT` visitor now rejects `Rt=PC` and reuses the positive, pre-indexed,
-  non-writeback imm8 path exactly like Eden.
-
-### Missing items
-- None among the five declarations and implementations in the reviewed word-load owner.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify
-  literal U-bit addressing, PC and IT behavior, validation-before-side-effects, register and
-  zero-shift order, writeback-before-PC order, pop terminal selection, and unprivileged behavior.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (store single data item)
 
 ### Intentional differences
+
 - Eden builds a priority-ordered matcher from `thumb32.inc`; Ruzu retains its handwritten
   decision tree while spelling the same control-nibble and register-form masks explicitly.
-
-### Unintentional differences (to fix)
-- Fixed: the fifteen Eden store-single entries were collapsed into nine ARM-manual-style IDs.
-  Ruzu now exposes the exact `_imm_1`, `_imm_2`, `_imm_3`, `*T`, and register identities used by
-  the upstream visitor boundary for word, byte, and halfword stores.
-- Fixed: every store with bit 11 clear was accepted as a register form, and every store with bit
-  11 set was accepted as an indexed immediate. The decoder now requires the exact register mask,
-  gives `1100` and `1110` their `_imm_2`/`*T` priority, accepts only `1PU1` as `_imm_1`, and rejects
-  reserved controls as `Unknown`.
-
-### Missing items
-- None among the fifteen store-single decoder entries reviewed from `thumb32.inc`.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words and defines no raw-copied payload. Focused
-  tests cover all fifteen identities plus reserved register/control patterns.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_store_single_data_item.rs` vs Eden `frontend/A32/translate/impl/{thumb32_store_single_data_item.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden passes typed matcher fields to the fifteen visitors; the snake-case Rust visitors read the
   same fields from `DecodedThumb32`, while the dispatcher only routes exact decoded identities.
 - Rust function pointers stand in for Eden's immediate-store callbacks and register-store lambdas.
   Separate byte, halfword, and word callbacks retain the same truncation and memory-operation
   ownership inside the matching file.
 
-### Unintentional differences (to fix)
-- Fixed: all store-single behavior lived in broad `thumb32.rs` behind six combined methods and a
-  shared address helper. The fifteen visitors, `StoreRegister`, `StoreImmediate`, and width-specific
-  callbacks now live in the matching store-single owner.
-- Fixed: register stores omitted Eden's `Rn=PC` undefined path and `Rt/Rm=PC` unpredictable path,
-  read operands as `Rn -> Rm -> Rt`, and skipped a zero-bit shift. They now validate first and emit
-  `GetRegister(m) -> GetRegister(n) -> GetRegister(t) -> LogicalShiftLeft` exactly.
-- Fixed: immediate stores omitted per-encoding PC/alias validation and performed indexed writeback
-  while calculating the address, before reading `Rt` and before the store. They now preserve Eden's
-  `GetRegister(n) -> GetRegister(t) -> address -> store -> optional SetRegister(n)` order.
-- Fixed: `_imm_2`, `_imm_3`, and `*T` visitors now enforce their fixed subtract/add and no-writeback
-  modes instead of deriving all behavior from one broad decoded form.
-
-### Missing items
-- None among the fifteen declarations and implementations in the reviewed store-single owner.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify exact
-  register/shift ordering, byte/halfword truncation, validation-before-side-effects, store-before-
-  writeback ordering, fixed immediate modes, and unprivileged no-writeback behavior.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/a32_emitter.rs` vs Eden `frontend/A32/{a32_ir_emitter.h,a32_ir_emitter.cpp}` (memory access boundary)
 
 ### Intentional differences
+
 - Rust's shared `Value` wrapper requires explicit byte/halfword coercion where Eden's C++ method
   signatures carry `U8`/`U16` statically. The emitted operand types and operation order match.
 - `ExclusiveReadMemory64` returns a Rust tuple instead of `std::pair`; both expose separate low and
   high words, and `ExclusiveWriteMemory64` accepts those words separately in the same order.
 
-### Unintentional differences (to fix)
-- Fixed: normal and exclusive 16/32-bit reads, normal 64-bit reads, and the corresponding writes
-  omitted Eden's `EFlag` byte reversal at the A32 emitter boundary.
-- Fixed: the 64-bit exclusive API returned/accepted one packed value. It now extracts low then high,
-  reverses each word without swapping in big-endian mode, and reverses then packs both write words
-  exactly like Eden. Existing ARM synchronization callers were updated to preserve that boundary.
-
-### Missing items
-- None among the reviewed normal/exclusive 8/16/32/64-bit memory methods.
-
-### Binary layout verification
-- N/A: these methods emit typed SSA operations rather than raw-copied structures. Focused tests
-  verify the exact reversal counts and the reverse-low -> reverse-high -> pack -> exclusive-write
-  sequence for the parity-sensitive 64-bit path.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (dual/exclusive/table branch)
 
 ### Intentional differences
+
 - Eden generates its first-match decoder from pattern strings; Ruzu retains the handwritten
   decoder and represents this family as an ordered mask table derived from the same strings.
-
-### Unintentional differences (to fix)
-- Fixed: six LDRD/STRD encodings were collapsed into three broad identities, which erased Eden's
-  fixed `P`/`W` visitor boundary and admitted reserved forms.
-- Fixed: `LDA`, `STL`, `TBB`, and `TBH` were absent. The decoder now exposes all eighteen exact
-  identities in upstream priority order, including the previously stubbed exclusive variants.
-
-### Missing items
-- None among the eighteen reviewed decoder entries from the dual/exclusive/table-branch group.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string parser
-  verifies all eighteen Rust mask/value pairs against `thumb32.inc`, and focused tests exercise
-  every identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_store_dual.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_store_dual.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed fields into visitor methods. The eighteen snake-case Rust
   visitors read the same fields from `DecodedThumb32`; dispatch remains in `thumb32.rs` and all
   behavior and helpers live in the matching owner.
 - Rust represents Eden's `U32`/`U64` SSA wrappers with `Value` and its terminal variants with the
   existing `Terminal` enum.
 
-### Unintentional differences (to fix)
-- Fixed: dual-load/store and word-exclusive behavior lived in broad `thumb32.rs`, byte/half/dual
-  exclusives were stubs, and ordered access was incorrectly used for `LDREX`/`STREX`. The complete
-  family now lives in the upstream-owned file and uses exact atomic/ordered/normal access types.
-- Fixed: dual operations omitted Eden's validation and side-effect ordering. The helpers now
-  preserve validation-before-operands, endian word selection, atomic 64-bit access, and writeback.
-- Fixed: table branches and load-acquire/store-release were missing. Their IT checks, address and
-  branch IR order, location update, fast-dispatch terminal, and ordered accesses now match Eden.
-
-### Missing items
-- None among the four helpers and eighteen visitor declarations/implementations in the reviewed
-  owner.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify all
-  decoder identities, validation-before-side-effects, endian extraction and writeback order,
-  access types, exclusive widths, and table-branch read width/terminal behavior.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (load/store multiple)
 
 ### Intentional differences
+
 - Eden generates its ordered decoder from pattern strings; Ruzu retains a handwritten decoder and
   uses an ordered mask table derived from those same six strings.
-
-### Unintentional differences (to fix)
-- Fixed: `STMIA` and `LDMIA` were exposed as generic `STM` and `LDM` identities, obscuring the
-  exact upstream visitor boundary.
-- Fixed: the former decision tree did not enforce bit 15 as zero for `STMIA`, `STMDB`, and `PUSH`,
-  so reserved store-multiple encodings could reach translation. Exact upstream masks and priority
-  now reject those words and preserve the specialized `POP`/`PUSH` entries.
-
-### Missing items
-- None among the six reviewed load/store-multiple decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string comparison
-  verifies all six mask/value pairs, and focused tests cover every identity and reserved bit-15
-  store forms.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_load_store_multiple.rs` vs Eden `frontend/A32/translate/impl/{thumb32_load_store_multiple.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's matcher supplies typed `Imm<15>`/`Imm<16>` fields. Rust reads the same instruction fields
   from `DecodedThumb32` and explicitly masks the store lists to retain the `Imm<15>` boundary.
 - Rust represents Eden's `IR::U32` wrappers with `Value` and uses `count_ones` for `std::popcount`.
 
-### Unintentional differences (to fix)
-- Fixed: the six visitors and both helpers lived in broad `thumb32.rs`; they now live in the
-  matching owner and the dispatcher only routes exact identities.
-- Fixed: loads omitted all Eden validation, while invalid stores returned `false` silently instead
-  of raising an unpredictable-instruction exception. PC/base/list/IT validation now runs in the
-  exact upstream order before any operand or memory access.
-- Fixed: generic decrement/increment implementations reconstructed addresses and writeback instead
-  of preserving Eden's shared start/writeback values. The helpers now retain exact atomic access,
-  register iteration, writeback, upper-location update, PC-load, and terminal ordering.
-
-### Missing items
-- None among `LDMHelper`, `STMHelper`, and the six reviewed visitor implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify
-  validation-before-side-effects, atomic access metadata, register/writeback order, shared
-  decrement-before start/writeback state, and POP's update-before-PC-read terminal path.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`PackedAbsDiffSumU8`)
 
 ### Intentional differences
+
 - Rust uses snake case and the shared `Value` wrapper in place of Eden's typed `U32` wrapper.
-
-### Unintentional differences (to fix)
-- Fixed: the `PackedAbsDiffSumU8` opcode and both host backends existed, but the owning base-IR
-  emitter method was absent, preventing the Thumb32 `USAD8`/`USADA8` visitors from matching Eden's
-  call boundary.
-
-### Missing items
-- None for the reviewed `PackedAbsDiffSumU8` wrapper.
-
-### Binary layout verification
-- N/A: this is a typed SSA operation. A focused test verifies the exact opcode and `a, b` operand
-  order.
 
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`MostSignificantWord`)
 
 ### Intentional differences
+
 - Rust uses a concrete `ResultAndCarry` structure containing `Value` fields where Eden uses the
   templated `ResultAndCarry<U32>` type.
-
-### Unintentional differences (to fix)
-- Fixed: `most_significant_word` returned only the primary value and callers created a carry
-  pseudo-operation only on rounding paths. It now eagerly creates and links `GetCarryFromOp` and
-  returns both values exactly at the base-IR ownership boundary; all A32 and A64 callers consume
-  `.result`, and rounding multiply callers consume the returned `.carry`.
-
-### Missing items
-- None for the reviewed `MostSignificantWord` result/carry contract and its existing Rust callers.
-
-### Binary layout verification
-- N/A: this is SSA metadata rather than a raw-copied structure. A focused test verifies producer,
-  pseudo-opcode, and associated-pseudo-operation linkage.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (multiply)
 
 ### Intentional differences
+
 - Eden generates one global first-match table from pattern strings; Ruzu preserves its handwritten
   outer decoder and uses an ordered mask table derived from the sixteen multiply strings.
 
-### Unintentional differences (to fix)
-- Fixed: ten multiply identities were absent and the existing manual decoder recognized only six
-  coarse forms. All sixteen exact identities now retain accumulator/non-accumulator and selector
-  field boundaries in upstream priority order.
-- Fixed: the `FB0…FB7` multiply range fell through to load-byte/halfword decoding, while unrelated
-  later prefixes were routed to the multiply helpers. Explicit `FB0…FB7` and `FB8…FBF` family
-  boundaries now route multiply and long-multiply words before the broad handwritten groups.
-
 ### Missing items
-- None among the sixteen reviewed Thumb32 multiply decoder entries. The long-multiply visitor owner
-  remains a separate audit slice.
 
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. Independent comparison against
-  `thumb32.inc` verifies all sixteen mask/value pairs; focused tests cover every identity and the
-  multiply/long-multiply/coprocessor prefix boundaries.
+- The long-multiply visitor owner
+  remains a separate audit slice.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_multiply.rs` vs Eden `frontend/A32/translate/impl/{thumb32_multiply.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed registers and selector bits. The snake-case Rust visitors
   read those exact fields from `DecodedThumb32`, and Rust variable swaps replace `std::swap`.
 - Rust uses `Value` for Eden's typed SSA wrappers and explicit `ImmU1(false/true)` carry inputs.
 
-### Unintentional differences (to fix)
-- Fixed: only six of sixteen visitors existed, aggregated in `thumb32.rs`; the complete owner now
-  implements MLA/MLS/MUL, all signed halfword/word multiply families, and USAD8/USADA8.
-- Fixed: the six former visitors omitted some or all PC validation and emitted register reads in a
-  different order. Every visitor now validates before side effects and preserves Eden's operand,
-  extension, product, accumulation, destination, and Q-flag order.
-- Fixed: packed absolute difference, halfword exchange/selection, overflow accumulation, and the
-  exact eager most-significant-word carry boundary were absent. They now use the matching IR
-  operations and upstream-owned base-emitter prerequisites.
-
-### Missing items
-- None among the sixteen declarations and implementations in the reviewed multiply owner.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests exercise all
-  sixteen decoded visitors, validation-before-register-read, accumulator operand order, both Q
-  updates around SMLAD accumulation, rounding carry use, and dedicated packed absolute difference.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (long multiply)
 
 ### Intentional differences
+
 - Eden generates one global first-match table from pattern strings; Ruzu retains its handwritten
   outer decoder and uses an ordered mask table derived from the same ten long-multiply strings.
-
-### Unintentional differences (to fix)
-- Fixed: four identities (`SMLALD`, `SMLALXY`, `SMLSLD`, and `UMAAL`) were absent, and the former
-  six-way decision accepted reserved selector bits for several existing families. The decoder now
-  uses all ten exact upstream masks in upstream priority order.
-
-### Missing items
-- None among the ten reviewed long-multiply, long-multiply-accumulate, and divide decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string parser
-  verifies all ten mask/value pairs against `thumb32.inc`, and focused tests exercise every
-  identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_long_multiply.rs` vs Eden `frontend/A32/translate/impl/{thumb32_long_multiply.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed registers and selector bits. The snake-case Rust visitors
   read the same fields from `DecodedThumb32`, and Rust's `Value` represents Eden's typed SSA
   wrappers.
@@ -9542,531 +6671,215 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   pointer type, so two mechanical signed/unsigned wrappers feed the matching `DivideOperation`
   helper boundary.
 
-### Unintentional differences (to fix)
-- Fixed: six partial implementations lived in broad `thumb32.rs`, omitted all PC/equal-destination
-  validation, and read accumulator registers in a different order. All ten visitors now live in
-  the matching owner and preserve validation-before-side-effects and exact operand order.
-- Fixed: `SMLALD`, `SMLALXY`, `SMLSLD`, and `UMAAL` were missing. Their halfword selection/swap,
-  signed extension, add/subtract nesting, accumulation, and low/high destination emission now
-  follow Eden literally, including the family-specific high-word extraction order.
-
-### Missing items
-- None among `DivideOperation` and the ten reviewed declarations/implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify all ten
-  visitors, validation before register reads, `SMLAL`/`UMAAL` operand order, and the direct
-  low-write-before-high-extraction ordering used by the dual-halfword accumulate families.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (branch)
 
 ### Intentional differences
+
 - Eden generates one global first-match table from pattern strings; Ruzu retains its handwritten
   outer family routing and uses the same ordered mask/value entries within the branch family.
-
-### Unintentional differences (to fix)
-- Fixed: generic `B_t3`, `B_t4`, and `BL` identities obscured the exact `B_cond`, `B`, and `BL_imm`
-  visitor boundaries. The four branch identities and masks now match `thumb32.inc` exactly.
-- Fixed: the former decision tree treated the reserved `F7E…` conditional-branch space as a
-  fabricated Thumb32 `SVC`; Eden has no such visitor and decodes it as `UDF`. All three upstream
-  Thumb32 `UDF` patterns now retain their priority around the branch entries.
-
-### Missing items
-- None among the four reviewed branch decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern-string parser
-  verifies the four branch masks, and focused tests cover all identities plus `UDF` priority.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_branch.rs` vs Eden `frontend/A32/translate/impl/{thumb32_branch.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed immediate fields. The snake-case Rust visitors consume the
   same fields through `DecodedThumb32` offset helpers, and Rust terminal variants represent Eden's
   `IR::Term` values.
 
-### Unintentional differences (to fix)
-- Fixed: all four implementations lived in broad `thumb32.rs` and omitted Eden's IT-block
-  validation. They now live in the matching owner and reject non-final IT positions, while
-  conditional branches reject every IT position before branch side effects.
-- Fixed: `BLX_imm` accepted an odd low immediate bit. It now validates `lo[0]` before pushing the
-  RSB or writing LR, then preserves Eden's aligned-PC, ARM-state, and IT-advance ordering.
-
-### Missing items
-- None among the four reviewed branch declarations/implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and terminals rather than raw-copied payloads. Focused tests
-  verify all four visitors, IT and low-bit validation before link side effects, RSB/LR order,
-  aligned BLX targeting, and conditional then/else locations.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/mod.rs` vs Eden `frontend/A32/translate/impl/a32_translate_impl.h` (`ThumbExpandImm_C`)
 
 ### Intentional differences
+
 - Eden receives separate typed `i`, `imm3`, and `imm8` fields; Rust receives their already
   concatenated twelve-bit value from `DecodedThumb32`.
 - Rust represents Eden's `IR::U1` carry with the shared `Value` SSA wrapper.
 
-### Unintentional differences (to fix)
-- Fixed: Thumb modified-immediate expansion lived in the decoder and accepted a host `bool` carry,
-  so non-rotated forms could not preserve Eden's runtime `GetCFlag` SSA value. The helper now lives
-  at the translator-implementation boundary, returns `ImmAndCarry`, and forwards dynamic carry
-  unchanged for all replication forms.
-- Fixed: the caller hard-coded carry-in to false. It now reads C before expansion; rotated forms
-  replace it with the immediate result's bit 31 exactly as Eden does.
-
-### Missing items
-- None for the reviewed `ThumbExpandImm_C` and `ThumbExpandImm` helper pair. The neighboring ARM
-  expansion helpers were not part of this prerequisite slice.
-
-### Binary layout verification
-- N/A: these helpers build immediate SSA values. Exhaustive tests verify all 4096 immediate values,
-  dynamic-carry identity for the 1024 replication forms, and immediate bit-31 carry for every
-  rotated form.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (modified immediate)
 
 ### Intentional differences
+
 - Eden generates one global first-match decoder from pattern strings; Ruzu retains its handwritten
   family routing and an ordered mask table derived from the same sixteen strings.
-
-### Unintentional differences (to fix)
-- Fixed: `ADD_imm` and `SUB_imm` hid the upstream `_1` visitor identities, and the former field
-  decision tree did not make every fixed/variable bit directly auditable. All sixteen identities,
-  masks, and priority positions now match `thumb32.inc` exactly.
-
-### Missing items
-- None among the sixteen reviewed modified-immediate decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
-  sixteen mask/value pairs, and focused decoder tests exercise every identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_modified_immediate.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_modified_immediate.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed immediate fields and registers; the snake-case Rust
   visitors read those same fields from `DecodedThumb32` and use `Value` for typed SSA values.
 - Eden's soft `ASSERT` records an impossible decoder-contract violation and may continue; Rust
   `assert!` stops on the same impossible direct-dispatch state. Valid decoded instructions cannot
   reach those assertions.
 
-### Unintentional differences (to fix)
-- Fixed: all sixteen visitors were collapsed into a generic dispatcher in broad `thumb32.rs`,
-  omitted the per-visitor PC/decode validation, and read registers that MOV/MVN do not own. Each
-  visitor now lives in the matching file and validates before emitting carry or operand reads.
-- Fixed: the generic path emitted flag extraction/writes before the destination register. Logical
-  and arithmetic instructions now preserve Eden's result → destination → flag-extraction → flag
-  write order, while TST/TEQ/CMN/CMP never write a destination.
-- Fixed: BIC used `Not32` plus `And32`, and MVN/ORN emitted runtime `Not32`; the port now uses
-  `AndNot32` and compile-time complemented immediates exactly like Eden. Runtime C carry is also
-  retained through the verified translator-owned expansion helper.
-
-### Missing items
-- None among the sixteen reviewed declarations/implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
-  sixteen visitors, validation-before-inputs, dynamic carry/register order, exact logical opcodes,
-  destination-before-flags ordering, and the no-destination test forms.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (plain binary immediate)
 
 ### Intentional differences
+
 - Eden generates one global first-match decoder from pattern strings; Ruzu retains its handwritten
   family routing and an ordered mask table derived from the same fifteen entries.
-
-### Unintentional differences (to fix)
-- Fixed: the former field decision tree omitted both `SSAT16` and `USAT16`, hid five upstream
-  visitor identities behind `*_wide`/`ADR_add`/`ADR_sub` names, and made the reserved UDF priority
-  difficult to audit. The exact fifteen identities, masks, and source order now match
-  `thumb32.inc`.
-
-### Missing items
-- None among the fifteen reviewed decoder entries, including the reserved UDF encoding.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
-  fifteen mask/value pairs, and focused tests decode every identity and exercise every non-UDF
-  visitor.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_plain_binary_immediate.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_plain_binary_immediate.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden passes typed matcher fields to each visitor; the snake-case Rust visitors extract the same
   fields from `DecodedThumb32`. A small Rust enum represents Eden's member-function pointer used by
   the two saturation helpers.
 - Eden's two-argument shift IR methods do not expose a carry input; the shared Rust IR methods take
   one, so shifts whose carry result is unused receive an immediate false value.
 
-### Unintentional differences (to fix)
-- Fixed: nine partial visitors lived in broad `thumb32.rs`, omitted PC and bit-range validation,
-  optimized away zero shifts, and used a different BFI mask/operation sequence. They now live in
-  the matching owner and preserve validation, register-read, shift, mask, and destination-write
-  ordering.
-- Fixed: `SSAT`, `SSAT16`, `USAT`, and `USAT16` were successful no-op stubs. Both upstream helper
-  boundaries and all four visitors are now ported, including the single source-register read for
-  halfword saturation and destination-before-Q-flag ordering.
-
-### Missing items
-- None among the fourteen reviewed declarations/implementations or their two private saturation
-  helpers.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
-  decoder entries and visitors, validation before register reads, exact BFI read/shift behavior,
-  both halfword saturation results and Q writes, bitfield shifts, and aligned architectural PC.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (shifted register)
 
 ### Intentional differences
+
 - Eden generates one global first-match decoder from pattern strings; Ruzu retains its handwritten
   family routing and an ordered mask table derived from the same seventeen entries.
-
-### Unintentional differences (to fix)
-- Fixed: a field-based decision tree obscured the exact fixed bits and specialized-entry priority.
-  The seventeen identities, masks, and source-order positions now match `thumb32.inc` directly.
-
-### Missing items
-- None among the seventeen reviewed shifted-register decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
-  seventeen mask/value pairs, and focused tests decode and translate every identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_shifted_register.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_shifted_register.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed fields; the snake-case Rust visitors extract the same
   fields from `DecodedThumb32`. The private `shifted_register` helper is a mechanical expression of
   Eden's repeated `EmitImmShift(GetRegister(m), ..., GetCFlag())` call.
 
-### Unintentional differences (to fix)
-- Fixed: all seventeen visitors were collapsed into a generic dispatcher in broad `thumb32.rs`.
-  That path skipped per-visitor decode/PC validation, read Rn for MOV/MVN, and wrote flags before
-  destination registers. The split visitors now preserve Eden's ownership, validation, operand,
-  destination, and flags ordering.
-- Fixed: BIC expanded NOT+AND rather than using `AndNot`, while PKH always selected the same half
-  ownership and register-read order. Both now emit Eden's exact operations for each `tb` form;
-  ADC/SBC also perform the second runtime carry read used by the arithmetic operation.
-
-### Missing items
-- None among the seventeen reviewed declarations/implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
-  visitors, validation before shift inputs, MOV input ownership, destination-before-flags order,
-  BIC opcode choice, ADC/SBC carry reads, and both PKH source-order branches.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`PackedAddU16`)
 
 ### Intentional differences
+
 - Rust represents Eden's templated `ResultAndGE<U32>` with a concrete `ResultAndGE` containing two
   shared SSA `Value` handles.
 
-### Unintentional differences (to fix)
-- Fixed: the `PackedAddU16` opcode and both backend emitters existed, but the Rust IR builder had no
-  corresponding producer method or `ResultAndGE` type. The method now emits the packed operation
-  followed by its associated `GetGEFromOp` pseudo-result exactly like Eden.
-
 ### Missing items
-- None for the reviewed `PackedAddU16` builder prerequisite. The neighboring packed-operation
-  builders remain outside this prerequisite slice and will be audited with their owners.
 
-### Binary layout verification
-- N/A: this is an SSA builder API. A focused test verifies operand order, result opcode, GE opcode,
-  and the pseudo-operation link to its producer.
+- The neighboring packed-operation
+  builders remain outside this prerequisite slice and will be audited with their owners.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/helpers.rs` vs Eden `frontend/A32/translate/impl/common.h` (`Rotate`)
 
 ### Intentional differences
+
 - Rust receives the two-bit `SignExtendRotation` field as its numeric decoded value and represents
   Eden's typed IR values with the shared `Value` wrapper.
-
-### Unintentional differences (to fix)
-- Fixed: `Rotate` had no counterpart in the Rust `common.h` owner. Its former inline substitute in
-  broad `thumb32.rs` skipped the rotate instruction when the encoded rotation was zero; the owned
-  helper now always emits Eden's register read followed by ROR using `rotate * 8` and false carry.
-
-### Missing items
-- None for the reviewed `Rotate` prerequisite.
-
-### Binary layout verification
-- N/A: this helper constructs SSA. A focused test verifies the source-register read and exact
-  ROR-by-zero arguments that distinguish it from the previous substitute.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (register)
 
 ### Intentional differences
+
 - Eden generates one global first-match decoder from pattern strings; Ruzu routes the `0xFA`
   family to an ordered mask table derived from the same sixteen register entries.
-
-### Unintentional differences (to fix)
-- Fixed: none of the four register-shift entries or eight `*16`/accumulate variants had a decoded
-  Rust identity, and the other eight extension identities were unreachable through the Thumb32
-  family router. All sixteen identities, masks, and specialized-before-accumulate priorities now
-  match `thumb32.inc`.
-
-### Missing items
-- None among the sixteen reviewed data-processing-register decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
-  sixteen mask/value pairs, and focused tests decode and translate every identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_data_processing_register.rs` vs Eden `frontend/A32/translate/impl/{thumb32_data_processing_register.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden represents the four shift member-function pointers with a C++ function-pointer type; Rust
   passes the matching `ShiftType` to one `shift_instruction` helper. Typed matcher fields are read
   from `DecodedThumb32`.
 
-### Unintentional differences (to fix)
-- Fixed: eight extension visitors lived in broad `thumb32.rs`, omitted validation, optimized away
-  rotate-by-zero, and used masks in place of Eden's byte/halfword extension operations. They now
-  live in the matching owner and preserve exact validation, rotate, extraction, extension,
-  accumulation, and destination ordering.
-- Fixed: the four register shifts and four byte-pair extensions/accumulates were absent. The shift
-  helper preserves Eden's `s` read → low-byte → C read → `m` read → shift → optional flags →
-  destination order; `SXTAB16` and `UXTAB16` use the verified packed-add/GE prerequisite with the
-  correct asymmetric operand order.
-
-### Missing items
-- None among the sixteen reviewed declarations/implementations or the private `ShiftInstruction`
-  helper.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all
-  visitors, validation before input reads, shift/flags/destination ordering, rotate-by-zero, and
-  both packed-accumulate operand orders plus GE pseudo-results.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`PackedSelect`)
 
 ### Intentional differences
+
 - Rust represents Eden's typed `U32` operands and result through the shared SSA `Value` wrapper.
-
-### Unintentional differences (to fix)
-- Fixed: the `PackedSelect` opcode and backend emitters existed but the Rust IR builder exposed no
-  producer method. It now forwards GE, first data operand, and second data operand in Eden's order.
-
-### Missing items
-- None for the reviewed `PackedSelect` builder prerequisite.
-
-### Binary layout verification
-- N/A: this is an SSA builder API. A focused test verifies the exact opcode and three-operand
-  ordering.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (miscellaneous)
 
 ### Intentional differences
+
 - Eden generates one global matcher; Ruzu checks the register table first within the `0xFA` family
   and then an ordered table derived from the same ten miscellaneous patterns.
-
-### Unintentional differences (to fix)
-- Fixed: the ten miscellaneous identities had no Thumb32 decode path, and five were absent from the
-  Rust identity enum entirely. Every identity and exact mask now matches `thumb32.inc`.
-
-### Missing items
-- None among the ten reviewed miscellaneous decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
-  ten mask/value pairs, and focused tests decode and translate every identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_misc.rs` vs Eden `frontend/A32/translate/impl/{thumb32_misc.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden's generated matcher passes typed registers; the snake-case Rust visitors extract the same
   registers from `DecodedThumb32` and use the shared SSA `Value` representation.
-
-### Unintentional differences (to fix)
-- Fixed: five partial visitors lived in broad `thumb32.rs` without validation; RBIT only reversed
-  bytes, and REV16/REVSH used different expanded sequences. All ten visitors now live in the
-  matching owner and preserve exact validation and IR operation ordering.
-- Fixed: the four saturating scalar operations and SEL were absent. Their runtime register order,
-  intermediate/final Q writes, destination ordering, GE read, and verified `PackedSelect` call now
-  match Eden.
-
-### Missing items
-- None among the ten reviewed declarations/implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all ten
-  visitors, duplicated-register validation before reads, QDADD lifecycle order, full RBIT shape,
-  and SEL register/GE/select ordering.
 
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (packed parallel builders)
 
 ### Intentional differences
+
 - Rust uses concrete `Value` and `ResultAndGE` types where Eden's declarations use typed IR
   templates. Each method remains explicit to retain one-to-one auditability.
-
-### Unintentional differences (to fix)
-- Fixed: 31 of the 32 packed builders required by `thumb32_parallel.cpp` were absent even though
-  their opcodes and backend emitters existed. The full add/sub/add-sub/sub-add, signed/unsigned,
-  8/16-bit, saturating, and halving surface is now exposed with Eden's exact opcode and operand
-  order; all twelve GE-producing operations emit and link `GetGEFromOp`.
-
-### Missing items
-- None among the 32 packed builders used by the reviewed Thumb32 parallel owner.
-
-### Binary layout verification
-- N/A: these methods construct SSA. A comprehensive focused test invokes every builder, checks all
-  opcodes and operand order, and verifies every GE pseudo-result link.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (parallel)
 
 ### Intentional differences
+
 - Eden generates one global matcher; Ruzu routes the `0xFA` family through register, parallel, then
   miscellaneous ordered mask tables matching those source sections.
-
-### Unintentional differences (to fix)
-- Fixed: all 36 parallel identities and decode paths were absent. The exact pattern-derived masks,
-  identities, and source ordering are now present between the register and miscellaneous families.
-
-### Missing items
-- None among the 36 reviewed parallel decoder entries.
-
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. An independent pattern parser verifies all
-  36 mask/value pairs, and focused tests decode and translate every identity.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_parallel.rs` vs Eden `frontend/A32/translate/impl/{thumb32_parallel.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Eden passes typed matcher registers; every explicit snake-case Rust visitor extracts the same
   fields from `DecodedThumb32` and uses the shared SSA `Value` representation.
-
-### Unintentional differences (to fix)
-- Fixed: all 36 visitors were absent. Each now preserves Eden's validation, `m`-then-`n` reads,
-  packed opcode/operand order, destination write, and GE write where applicable.
-- Fixed: QASX/QSAX/UQASX/UQSAX now preserve the explicit half extraction and signed/unsigned
-  extension order, add/sub orientation, saturation pseudo-results, low/high packing, and final
-  destination write without hiding the four visitors behind a generic dispatcher.
-
-### Missing items
-- None among the 36 reviewed declarations/implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests cover all 36
-  visitors, validation before reads, GE lifecycle ordering, and crossed-half saturation expansion.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb16.rs` vs Eden `frontend/A32/translate/impl/thumb16.cpp` (`thumb16_BX`)
 
 ### Intentional differences
+
 - Rust exposes the snake-case visitor within the translation module so `thumb32_BXJ` can preserve
   Eden's direct delegation without duplicating the branch lifecycle.
-
-### Unintentional differences (to fix)
-- Fixed: the Rust visitor previously extracted its register from a complete Thumb16 decode and
-  omitted Eden's non-final-IT-block rejection. It now owns the decoded `Reg` operand, validates IT
-  state before reading that register, then preserves descriptor update, `BXWritePC`, and terminal
-  selection order.
-
-### Missing items
-- None for the reviewed `thumb16_BX` prerequisite.
-
-### Binary layout verification
-- N/A: this visitor constructs SSA. A focused test verifies rejection before the source-register
-  read in a non-final IT instruction.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/decoder_thumb32.rs` vs Eden `frontend/A32/decoder/{thumb32.h,thumb32.inc}` (control)
 
 ### Intentional differences
+
 - Eden generates one global first-match decoder from pattern strings; Rust keeps the same ordered
   control entries as explicit mask/value tuples in its branch-and-control decoder.
 
-### Unintentional differences (to fix)
-- Fixed: `BXJ` was absent, `CLREX` was unreachable, and a broad classifier accepted reserved
-  encodings as hints, barriers, `MSR`, or `MRS`. All thirteen control identities now use Eden's
-  exact ordered masks, and the `MRS_reg` identity retains its upstream name.
-
 ### Missing items
-- None among the thirteen reviewed miscellaneous-control decoder entries; UDF and branch entries
-  remain in their following upstream order.
 
-### Binary layout verification
-- N/A: the decoder classifies 32-bit instruction words. Focused tests cover every exact pattern,
-  variable field, and reserved near-match rejection.
+- UDF and branch entries
+  remain in their following upstream order.
 
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/thumb32_control.rs` vs Eden `frontend/A32/translate/impl/{thumb32_control.cpp,a32_translate_impl.h}`
 
 ### Intentional differences
+
 - Typed matcher fields are extracted from `DecodedThumb32`; Rust represents terminal and SSA
   values with its existing enums while preserving Eden's operation sequence.
-
-### Unintentional differences (to fix)
-- Fixed: `thumb32_BXJ` was missing. It now rejects `PC` before any register read and delegates to
-  the verified `thumb16_BX` owner exactly as Eden does.
-
-### Missing items
-- None among the fourteen reviewed control declarations and implementations.
-
-### Binary layout verification
-- N/A: this frontend constructs SSA and defines no raw-copied payload. Focused tests verify both
-  the `PC` rejection and the delegated R14 `PopRSBHint` lifecycle.
 
 ## 2026-08-23 — `src/rdynarmic/src/interface/optimization_flags.rs` vs Eden `interface/optimization_flags.h`
 
 ### Intentional differences
+
 - Rust uses a transparent `u32` newtype with standard bitwise traits instead of a scoped C++ enum
   plus free operator overloads. `contains` and `bits` expose the checks needed by existing Rust
   consumers. `jit_config` temporarily re-exports the type while its shared configuration is split.
 
-### Unintentional differences (to fix)
-- Fixed: `OptimizationFlag` lived in the unrelated shared `jit_config.rs` owner and omitted Eden's
-  `CodeSpeed` and `DisableVerification` values. The complete flag inventory and constants now live
-  in the matching interface module with exact `u32` values.
-
-### Missing items
-- None for the reviewed flag values, constants, and bitwise operations.
-
-### Binary layout verification
-- PASS: `#[repr(transparent)]` preserves Eden's `std::uint32_t` underlying representation; focused
-  tests verify every value plus four-byte size and alignment.
-
 ## 2026-08-23 — `src/rdynarmic/src/interface/a32/config.rs` vs Eden `interface/A32/config.h` (`Exception`)
 
 ### Intentional differences
+
 - Rust exposes `as_u32` for the existing SSA immediate boundary. `frontend/a32/types.rs` retains a
   compatibility re-export so translation owners can migrate independently of this ownership move.
 
-### Unintentional differences (to fix)
-- Fixed: `A32::Exception` lived in `frontend/a32/types.rs` despite Eden owning it in the public
-  configuration interface. The complete thirteen-value enum now lives beside the A32 configuration.
-
 ### Missing items
-- None for the reviewed A32 exception inventory. `UserCallbacks` was restored in the later
-  2026-08-24 configuration-owner slice; `UserConfig` remains outstanding.
 
-### Binary layout verification
-- PASS: `repr(i32)` matches the default C++ scoped-enum underlying representation used by Eden;
-  focused tests verify every discriminant plus four-byte size and alignment.
+- `UserCallbacks` was restored in the later
+  2026-08-24 configuration-owner slice; `UserConfig` remains outstanding.
 
 ## 2026-08-23 — `src/rdynarmic/src/interface/a64/config.rs` vs Eden `interface/A64/config.h` (public enums)
 
 ### Intentional differences
+
 - Rust applies normal PascalCase spelling to Eden's `VA` acronym in variant names.
   `frontend/a64/types.rs` temporarily re-exports `Exception` for existing translation consumers.
 
-### Unintentional differences (to fix)
-- Fixed: `A64::Exception` lived in `frontend/a64/types.rs` and used an eight-byte representation.
-  It now lives in the public configuration owner with Eden's ten values and default four-byte
-  scoped-enum representation.
-- Fixed: the already-owned data- and instruction-cache enums used `repr(u8)` even though Eden uses
-  the default C++ scoped-enum representation. Both now use `repr(i32)`.
-
 ### Missing items
-- None for the three reviewed A64 public enums. `UserCallbacks` was restored in the later
-  2026-08-24 configuration-owner slice; `UserConfig` remains outstanding.
 
-### Binary layout verification
-- PASS: focused tests verify all discriminants and four-byte size/alignment for `Exception`,
-  `DataCacheOperation`, and `InstructionCacheOperation`.
+- `UserCallbacks` was restored in the later
+  2026-08-24 configuration-owner slice; `UserConfig` remains outstanding.
 
 ## 2026-08-23 — `src/rdynarmic/src/jit_config.rs` vs Eden `interface/{A32,A64}/config.h` (`UserCallbacks` exclusive surface)
 
 ### Intentional differences
+
 - Rust still exposes one temporary shared callback trait while the interrupted configuration split
   is completed; the exact prerequisite and resume point are recorded in the project-local state
   file, which is excluded from commits.
@@ -10075,87 +6888,44 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   guest-visible callback events.
 
 ### Unintentional differences (to fix)
-- Fixed: the shared trait invented `exclusive_read_8/16/32/64/128` and `exclusive_clear` host
-  callbacks. Neither Eden callback interface declares them: exclusive loads use `MemoryRead*`, and
-  `Jit::ClearExclusiveState` only resets the backend-owned reservation state.
+
 - The remaining shared A32/A64 callback trait still exposes each architecture's members to the
   other architecture. The active prerequisite slice will replace it with the two upstream-owned
   traits before the `UserConfig` split resumes.
 
 ### Missing items
+
 - The architecture-owned traits were added in the later 2026-08-24 configuration-owner slice.
   Runtime consumers still use this shared trait through explicit compatibility implementations.
-
-### Binary layout verification
-- N/A: Rust trait objects are not copied into guest or JIT binary payloads; this review verifies
-  method inventory and call ownership.
 
 ## 2026-08-23 — `src/rdynarmic/src/{jit.rs,backend/common/a32_callbacks.rs}` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,a64_emit_x64_memory.cpp,a32_interface.cpp,a64_interface.cpp}`
 
 ### Intentional differences
+
 - Rust trampolines make the callback target explicit and share mechanical reservation bookkeeping
   with the in-progress arm64 backend. The generated-code callback table retains internal fields
   named `exclusive_read_*`; those fields target the normal `memory_read_*` host methods just as
   Eden's emitters instantiate exclusive-read helpers with `UserCallbacks::MemoryRead*`.
 
-### Unintentional differences (to fix)
-- Fixed: x64 exclusive-read trampolines previously dispatched through non-upstream exclusive-read
-  host methods, and clear dispatched an extra host event. They now read through `memory_read_*` and
-  clear only `jit_state.exclusive_state`, preserving Eden's exact callback and lifecycle behavior.
-
-### Missing items
-- None for the reviewed x64 exclusive-read and clear callback behavior.
-
-### Binary layout verification
-- PASS: no layout changed. Focused tests verify that reads record the expected value and that clear
-  resets only the reservation-state flag without modifying its stored values.
-
 ## 2026-08-23 — `src/rdynarmic/src/backend/arm64/{a32_address_space.rs,a64_address_space.rs}` vs Eden `backend/arm64/{a32_address_space.cpp,a64_address_space.cpp}`
 
 ### Intentional differences
+
 - Rust uses explicit callback-context trampolines instead of Eden's generated devirtualized call
   trampolines; the target callback and monitor ordering remain the same.
-
-### Unintentional differences (to fix)
-- Fixed: arm64 exclusive-read trampolines called invented `exclusive_read_*` host methods. Both
-  architectures now route the monitor closure and local fallback through the ordinary
-  `memory_read_*` callbacks selected by Eden's `EmitExclusiveReadCallTrampoline` instantiations.
-
-### Missing items
-- None for the reviewed arm64 exclusive-read callback selection.
-
-### Binary layout verification
-- PASS: callback-context and JIT-state layouts are unchanged; this slice changes only the selected
-  trait method.
 
 ## 2026-08-23 — `src/rdynarmic/src/{ir/a32_emitter.rs,frontend/a32/translate/{thumb16.rs,multiply.rs,thumb32_data_processing_modified_immediate.rs,thumb32_data_processing_shifted_register.rs,thumb32_data_processing_register.rs}}` vs Eden `frontend/A32/{a32_ir_emitter.{h,cpp},translate/impl/{thumb16.cpp,multiply.cpp,thumb32_data_processing_modified_immediate.cpp,thumb32_data_processing_shifted_register.cpp,thumb32_data_processing_register.cpp,a32_translate_impl.h}}`
 
 ### Intentional differences
+
 - Rust exposes `nzcv_from` beside the A32 `nz_from` adapter because it cannot inherit Eden's
   generic `IR::IREmitter::NZCVFrom`; both methods emit the exact upstream opcode and keep the
   inherited C++ call surface visible to translation owners.
 
-### Unintentional differences (to fix)
-- Fixed: `A32IREmitter::nz_from` emitted `GetNZCVFromOp` instead of Eden's `GetNZFromOp`. Logical
-  Thumb32 instructions could therefore consume stale host flags because their result operations do
-  not own a `GetNZCVFromOp` pseudo-operation. Logical and shift visitors now use `GetNZFromOp`,
-  while all arithmetic `SetCpsrNZCV` sites explicitly use `GetNZCVFromOp`.
-- Fixed: the same pre-existing extractor mismatch affected Thumb16 logical/shift visitors and the
-  six flag-setting ARM multiply visitors. Their `SetCpsrNZ`/`SetCpsrNZC` paths now match Eden's
-  `NZFrom` calls.
-
-### Missing items
-- None for the reviewed A32 N/Z versus N/Z/C/V extraction surface and its affected visitors.
-
-### Binary layout verification
-- N/A: this slice changes SSA opcode selection only. Focused tests verify both helper opcodes,
-  logical-versus-arithmetic Thumb16 selection, flag-setting multiply selection, and the Thumb32
-  logical/arithmetic instruction streams. An x64 JIT regression executes Thumb32 `TST.W` followed
-  by `BEQ` and verifies that the branch observes N/Z from the logical result.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a32/translate/vfp.rs` vs Eden `frontend/A32/translate/impl/{vfp.cpp,a32_translate_impl.h}` (VFP memory transfers)
 
 ### Intentional differences
+
 - Eden's decoder exposes separate A1/A2 VSTM and VLDM visitors. Rust currently decodes each family
   to one identity and selects the single- or double-register path from `sz` in the same `vfp.rs`
   owner; the source comment records this structural adaptation, while validation, ordering, and IR
@@ -10163,119 +6933,48 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - ARM condition handling remains in Rust's block-level conditional translator instead of being
   repeated inside every VFP visitor; the memory-transfer bodies execute only after that guard.
 
-### Unintentional differences (to fix)
-- Fixed: VPUSH, VPOP, VLDR, VSTR, VSTM, and VLDM used `AccType::Normal`; every 32-bit transfer now
-  uses Eden's `AccType::ATOMIC`.
-- Fixed: double-register transfers omitted Eden's E-flag word swap. BE-8 loads now exchange the two
-  individually byte-reversed words before packing, and stores exchange low/high words before the
-  emitter performs each word's endian conversion.
-- Fixed: VPOP updated SP after its loads, and VSTM/VLDM updated Rn after their transfers. All three
-  now perform writeback before memory accesses in Eden's exact order.
-- Fixed: empty/out-of-range register lists returned success, VSTM/VLDM omitted addressing and PC
-  validation, and VSTR did not use the aligned architectural PC base. These checks and the aligned
-  base now match the corresponding Eden visitors.
-
-### Missing items
-- None for the reviewed VPUSH, VPOP, VLDR, VSTR, VSTM A1/A2, and VLDM A1/A2 behavior.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify atomic
-  access tags, BE-8 double-word dependency order, pre-access writeback, and unpredictable empty
-  lists across all six memory-transfer families.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_crypto_four_register.rs` vs Eden `frontend/A64/translate/impl/{simd_crypto_four_register.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust extracts `Vm`, `Va`, `Vn`, and `Vd` from `DecodedInst` inside each visitor because its
   decoder dispatch passes a decoded instruction rather than Eden's typed visitor arguments. The
   register read order, IR operation nesting, and destination write remain identical.
 - Rust's `add_32` and `rotate_right_32` builders take an explicit false carry input; this is the IR
   builder representation of Eden's non-flag-setting `Add` and `RotateRight` calls.
 
-### Unintentional differences (to fix)
-- Fixed: EOR3, BCAX, and SM3SS1 decoded successfully but fell through to the non-upstream
-  `interpret_this_instruction` terminal. Their implementations and dispatch now live in the
-  corresponding four-register crypto owner and emit Eden's exact IR sequence.
-
-### Missing items
-- None for the three visitors owned by Eden's `simd_crypto_four_register.cpp`.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify decoder
-  identity, distinct source-register ownership, exact EOR3/BCAX opcode order, and SM3SS1 lane,
-  rotation, addition, and destination-write shape.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_crypto_three_register.rs` vs Eden `frontend/A64/translate/impl/{simd_crypto_three_register.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust's file-local `Sm3TtVariant`, `sm3tt1`, and `sm3tt2` mirror Eden's anonymous-namespace enum
   and helpers. Each public visitor extracts the typed register and two-bit immediate operands from
   `DecodedInst` before forwarding them to the matching helper.
 - Rust's arithmetic and rotation builders take an explicit false carry input; operation order and
   data dependencies match Eden's non-flag-setting nested IR expressions.
 
-### Unintentional differences (to fix)
-- Fixed: SM3TT1A, SM3TT1B, SM3TT2A, and SM3TT2B decoded successfully but fell through to the
-  non-upstream `interpret_this_instruction` terminal. Their helpers, visitor ownership, and
-  dispatch now match Eden.
-
-### Missing items
-- None for the four visitors owned by Eden's `simd_crypto_three_register.cpp`.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify all
-  four decoder identities, D/M/N register order, non-zero two-bit lane extraction, four result-lane
-  writes, and the final destination write.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (generic extension and signed-to-unsigned saturated-shift builders)
 
 ### Intentional differences
+
 - Rust resolves an instruction-backed `Value` through `Block::inst_real_return_type` because its
   SSA references do not carry Eden's `UAny::GetType()` information inline. Immediate and
   instruction inputs nevertheless select the same extension opcode.
 - Unsupported input types panic instead of reaching Eden's `UNREACHABLE`; both represent an
   internal IR construction error rather than guest-visible validation.
 
-### Unintentional differences (to fix)
-- Fixed: `zero_extend_to_quad` directly emitted `ZeroExtendLongToQuad` for every input, omitting
-  Eden's preceding byte, half, or word extension. The generic sign/zero extension-to-word/long
-  helpers and indeterminate aliases now mirror the complete reviewed upstream helper family.
-- Fixed: `vector_signed_saturated_shift_left_unsigned` converted its U8 shift amount to a broadcast
-  U128 operand. It now passes the exact U8 immediate required by Eden's builder and opcode
-  signature.
-
-### Missing items
-- None for the reviewed generic extension helpers and
-  `VectorSignedSaturatedShiftLeftUnsigned` builder.
-
-### Binary layout verification
-- N/A: this slice changes SSA builder selection and operand typing only. Focused tests verify all
-  narrow-to-long opcode choices, identity behavior for already-wide values, the two-stage
-  narrow-to-quad chain, and the saturated-shift U8 operand without an extra broadcast.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/visitor.rs` vs Eden `frontend/A64/translate/impl/impl.cpp` (`V_scalar` write adapter)
 
 ### Intentional differences
+
 - Rust retains a runtime U128 assertion for the 128-bit path because its `Value` type does not
   encode Eden's compile-time `UAnyU128` constraint. Valid translated instructions observe the same
   direct `SetQ` behavior.
 
-### Unintentional differences (to fix)
-- Fixed: scalar writes manually selected byte/half/word extensions from the requested data size
-  before calling the formerly U64-only quad helper. They now call the corrected generic
-  `zero_extend_to_quad(value)` exactly once, matching Eden's `V_scalar` implementation and the
-  value's actual IR type.
-
-### Missing items
-- None for the reviewed `V_scalar(bitsize, vec, value)` write behavior.
-
-### Binary layout verification
-- N/A: this adapter constructs SSA and defines no raw-copied payload. The generic extension tests
-  cover the resulting U8/U16/U32/U64-to-U128 chains.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_shift_by_immediate.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_shift_by_immediate.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract `immh`, `immb`, `Vn`, and `Vd` from `DecodedInst` before forwarding them
   to file-local helpers; Eden's decoder passes those typed operands directly.
 - Rust uses `Fpcr::rmode()` and passes the resulting enum discriminant to its IR builders, which
@@ -10286,48 +6985,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust arithmetic builders take an explicit false carry input for Eden's non-flag-setting `Add`
   operations.
 
-### Unintentional differences (to fix)
-- Fixed: SSRA, SRSHR, SRSRA, SQSHL-immediate, SQSHRN, USRA, URSHR, URSRA, SRI, SLI, SQSHLU,
-  UQSHL-immediate, SQSHRUN, and UQSHRN decoded but fell through to the non-upstream interpreter
-  terminal. All 14 now dispatch to their matching owner.
-- Fixed: the existing SSHR, USHR, SHL, FCVTZS, FCVTZU, SCVTF, and UCVTF visitors bypassed Eden's
-  file-local helper boundaries. The integer and FP paths now share the exact upstream helpers,
-  validation, operation ordering, and accumulation behavior.
-- Fixed: those existing integer and FP visitors applied `VectorGetElement` a second time to the
-  scalar returned by `v_scalar_read`. They now consume `V_scalar` directly as Eden does.
-
-### Missing items
-- None for the 21 visitors and six file-local helpers implemented by the reviewed Eden source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all 21
-  decoder identities, the six saturation opcodes, rounding/accumulation operation counts, single
-  scalar source extraction, and reserved-value handling without interpreter fallback.
-
 ## 2026-08-23 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (scalar saturated-arithmetic builders)
 
 ### Intentional differences
+
 - Rust resolves instruction-backed operand types through the block arena because `Value::Inst`
   does not carry Eden's `UAny::GetType()` inline. It asserts equal operand types before selecting
   the same width-specific opcode.
 - Unsupported widths panic instead of returning Eden's empty `UAny` or reaching `UNREACHABLE`;
   both are internal builder misuse and cannot be produced by a valid frontend visitor.
 
-### Unintentional differences (to fix)
-- Fixed: scalar signed/unsigned saturated add and subtract opcodes, plus signed saturating doubling
-  multiply-high, existed in the IR and backends without their upstream builder methods. All five
-  type-dispatching builders now live beside Eden's other saturated-arithmetic helpers.
-
-### Missing items
-- None for the reviewed scalar saturated-arithmetic builder family.
-
-### Binary layout verification
-- N/A: these builders construct SSA and define no raw-copied payload. A focused test verifies all
-  18 valid width/operation opcode selections in upstream order.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_three_same.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_three_same.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract typed operands from `DecodedInst`; the three file-local helper boundaries,
   enums, validations, and visitor responsibilities otherwise mirror Eden.
 - Rust passes `fpcr_controlled=true` explicitly to FP vector comparison builders and false/true
@@ -10337,30 +7008,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   have neither decoder identities nor C++ definitions, so Rust does not invent unreachable visitor
   methods for them.
 
-### Unintentional differences (to fix)
-- Fixed: SQADD, SQSUB, SQDMULH, SQRDMULH, UQADD, UQSUB, SQSHL-register, SRSHL,
-  UQSHL-register, URSHL, FMULX, FACGE, and FACGT decoded but fell through to the non-upstream
-  interpreter terminal. All 13 now dispatch to their matching owner.
-- Fixed: ADD and SUB applied `VectorGetElement` twice to values already returned by `V_scalar`.
-  They now perform one scalar extraction per source as Eden does.
-- Fixed: scalar integer comparisons, CMTST, SSHL, USHL, and scalar FP comparisons used
-  `V_scalar` inputs where Eden uses vector `V(32/64)`. Their GetS/GetD/GetQ selection, vector
-  operation shape, scalar result extraction, and SetD/SetQ ordering now match upstream.
-- Fixed: the file used invented argument-decoding helpers and stored a register inside the
-  comparison-variant enum. The enums and three file-local helpers now have Eden's ownership and
-  responsibilities.
-
-### Missing items
-- None for the 37 visitors and three file-local helpers defined by the reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all 13
-  restored identities, scalar saturated opcode selection, corrected scalar/vector operand shapes,
-  and reserved rounding-shift sizes without interpreter fallback.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_two_register_misc.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_two_register_misc.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract typed operands from `DecodedInst`; the two helper enums and three
   file-local helper responsibilities otherwise mirror Eden.
 - Rust passes `fpcr_controlled=true` explicitly to FP vector comparisons and an explicit true
@@ -10370,32 +7021,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   generic callable because a C++ member-function pointer cannot be represented directly across
   Rust emitter lifetimes. The selected IR methods and call ordering are unchanged.
 
-### Unintentional differences (to fix)
-- Fixed: FCMLE, FCMLT, FCVTXN, SQABS, SQNEG, SUQADD, and USQADD decoded but fell through to the
-  temporary interpreter terminal. All seven now dispatch to their matching file owner.
-- Fixed: scalar FP zero comparisons read `V_scalar` rather than Eden's `V(datasize)`, and the LE/LT
-  comparison variants were absent. Reads, operand inversion, comparison opcodes, and scalar result
-  extraction now match Eden.
-- Fixed: ABS and NEG applied `VectorGetElement64` twice to values already returned by `V_scalar`.
-  Each now performs exactly one scalar source extraction.
-- Fixed: the conversion family encoded rounding modes as local integer constants and used invented
-  helper ownership. It now uses `FP::RoundingMode`'s Rust counterpart, `FPCR::RMode`, and Eden's
-  `ScalarFPConvertWithRound` boundary.
-- Fixed: the saturated narrowing family used an invented enum dispatcher and a 128-bit scalar read.
-  It now passes the matching IR operation to `SaturatedNarrow` and reads `V_scalar(2 * esize)`.
-
-### Missing items
-- None for the 34 visitors, two file-local enums, and three file-local helpers defined by the
-  reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all seven
-  restored decoder identities, comparison operand ordering, ToOdd conversion metadata, reserved
-  FCVTXN handling, scalar extraction counts, saturating accumulator reads, and narrowing opcodes.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_scalar_x_indexed_element.rs` vs Eden `frontend/A64/translate/impl/{simd_scalar_x_indexed_element.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`.
   `CombineScalar`, `ExtraBehavior`, `MultiplyByElement`, and `MultiplyByElementHalfPrecision`
   otherwise remain file-local with the same responsibilities and branch ordering.
@@ -10405,46 +7034,18 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `SQRDMLAH_elt_1`, `SQRDMLSH_elt_1`, and `FMULX_elt_1`) have no decoder identities or C++
   definitions in the reviewed snapshot. Rust does not invent unreachable implementations.
 
-### Unintentional differences (to fix)
-- Fixed: SQDMULL, SQDMULH, and SQRDMULH scalar-by-element identities decoded but fell through to
-  the temporary interpreter terminal. All three now preserve Eden's size validation, combined
-  index/register selection, scalar/vector operand shapes, saturation opcodes, and destination form.
-- Fixed: the existing floating-point helpers used `V_scalar(idxdsize, Vm)` for the indexed source,
-  then passed that scalar through `VectorGetElement`. They now read `V(idxdsize, Vm)` as Eden does.
-- Fixed: the three upstream helpers lived as methods on `TranslatorVisitor`, obscuring their
-  anonymous-namespace ownership, and `CombineScalar` was open-coded only in the floating-point
-  path. All three helpers now have their matching file-local ownership.
-
-### Missing items
-- None for the nine visitors and three file-local helpers defined by the reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both
-  `CombineScalar` layouts, all three restored identities at 16/32 bits, reserved 8/64-bit sizes,
-  indexed vector-read shape, and the existing floating-point family.
-
 ## 2026-08-23 — `src/rdynarmic/{build.rs,src/frontend/a64/decoder.rs}` vs Eden `frontend/A64/decoder/{a64.h,a64.inc}` (trailing instruction comments)
 
 ### Intentional differences
+
 - Eden consumes `a64.inc` through C++ macros, while Rust's build script parses the same pattern
   table and generates its enum and two-tier lookup table. The parser therefore locates the closing
   `INST(...)` parenthesis explicitly before processing its three fields.
 
-### Unintentional differences (to fix)
-- Fixed: Rust required an active `INST(...)` line to end exactly at `)`. The trailing ARM-version
-  comments on CFINV, RMIF, XAFlag, and AXFlag caused all four patterns to be silently omitted from
-  the generated decoder, unlike Eden's preprocessor inclusion.
-
-### Missing items
-- None for active A64 instruction patterns with trailing comments in the reviewed table.
-
-### Binary layout verification
-- N/A: decoder patterns are generated metadata, not raw-copied payloads. A focused test verifies
-  the four affected encodings decode to their exact upstream instruction identities.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/system_flag_{manipulation,format}.rs` vs Eden `frontend/A64/translate/impl/system_flag_{manipulation,format}.cpp` and `impl.h`
 
 ### Intentional differences
+
 - Rust visitors accept an unused `DecodedInst` for Eden's operand-free CFINV, XAFlag, and AXFlag
   because all dispatch methods share the generated decoder interface.
 - Rust passes an explicit false carry input to 32-bit logical shifts. Eden's generic IR builder
@@ -10453,22 +7054,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   commented out and the reviewed snapshot provides no C++ definitions, so Rust does not invent
   unreachable implementations.
 
-### Unintentional differences (to fix)
-- Fixed: CFINV, RMIF, XAFlag, and AXFlag had active decoder entries but no matching Rust owner files
-  or visitor methods. All four now dispatch and preserve Eden's exact raw-NZCV masks, rotations,
-  conditional fast paths, boolean compositions, and final write ordering.
-
-### Missing items
-- None for the four visitors defined by the two reviewed C++ sources.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests verify CFINV's
-  carry mask, RMIF's zero/full/partial mask paths, both flag-format operation shapes, raw-NZCV
-  writes, and absence of interpreter fallback.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_sha512.rs` vs Eden `frontend/A64/translate/impl/{simd_sha512.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract typed decoder operands from `DecodedInst`; all ten methods remain in the
   matching file owner.
 - Rust's 32-bit rotate and 64-bit add builders require explicit carry inputs, so two mechanical
@@ -10477,49 +7066,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   simultaneous closures borrowing the mutable emitter cannot coexist. They retain the same
   captured hash-part and upper/lower-Y inputs and are called at the same points.
 
-### Unintentional differences (to fix)
-- Fixed: SHA512SU0, SHA512SU1, SHA512H, SHA512H2, RAX1, XAR, SM3PARTW1, SM3PARTW2, SM4E, and
-  SM4EKEY decoded but fell through to the temporary interpreter terminal. All ten now preserve
-  Eden's exact register-read order, rotations, boolean functions, nested additions, lane updates,
-  four-round SM4 loop, substitution-box calls, and destination writes.
-
-### Missing items
-- None for the ten visitors, two helper enums, and five principal file-local helpers defined by the
-  reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all ten
-  decoder identities, SHA-512 choice-versus-majority IR shapes, and the four SM4 rounds with four
-  S-box substitutions per round.
-
 ## 2026-08-23 — `src/rdynarmic/src/frontend/a64/translate/simd_shift_by_immediate.rs` vs Eden `frontend/A64/translate/impl/{simd_shift_by_immediate.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`;
   the six anonymous-namespace helpers remain file-local with the same responsibilities.
 - Rust passes `fpcr_controlled=true` explicitly to the four fixed-point vector conversion IR
   builders. Eden's builder API supplies the same value as its default argument.
 - Rust computes Eden's `mcl::bit::ones<u64>(esize)` masks with an equivalent bounded `u64` shift.
 
-### Unintentional differences (to fix)
-- Fixed: SQSHL, SQSHLU, and UQSHL immediate, SRI, SLI, SCVTF, UCVTF, FCVTZS, and FCVTZU decoded but
-  fell through to the temporary interpreter terminal. All nine now preserve Eden's validation,
-  element-size and immediate calculations, source/destination reads, IR ordering, and writes.
-- Fixed: the four existing shift helpers were methods on `TranslatorVisitor`, obscuring their
-  anonymous-namespace ownership. They now have file-local ownership alongside the two restored
-  saturating-shift and floating-conversion helpers.
-
-### Missing items
-- None for the 28 visitors and six file-local helpers defined by the reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all nine
-  restored identities, all three saturation modes, both shift-insert directions, fixed-point
-  signedness/direction/fraction bits/rounding metadata, and absence of interpreter fallback.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_three_same.rs` vs Eden `frontend/A64/translate/impl/{simd_three_same.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`.
   Three tuple helpers mechanically share identical operand extraction among visitors; they do not
   own IR behavior or merge differing validation rules.
@@ -10532,29 +7092,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `impl.h`; their decoder entries are commented out and the reviewed source has no definitions, so
   Rust does not invent unreachable visitors.
 
-### Unintentional differences (to fix)
-- Fixed: FP16 FMLA/FMLS, PMUL, SQDMULH/SQRDMULH, SQSHL/SRSHL, and UQSHL/URSHL decoded but fell
-  through to the temporary interpreter terminal. All nine now preserve Eden's validation,
-  vector reads, IR operation selection, FP negation/multiply-add order, and destination writes.
-- Fixed: the 12 anonymous-namespace helpers were implemented as visitor methods or replaced with
-  broader invented dispatchers. Their ownership and responsibilities now mirror Eden; unsigned
-  UABA/UABD behavior is once again owned directly by those visitors.
-- Fixed: SMAX, SMIN, UMAX, and UMIN accepted `size=0b11` when Q was set because they shared the
-  looser validation used by ADD and comparisons. Eden reserves size 3 for all four min/max visitors.
-- Fixed: CMEQ, CMGE, CMHS, BIC, and ORN omitted the explicit `VectorZeroUpper` emitted by their
-  visitor before Eden's common 64-bit destination write performs its own upper-zero operation.
-
-### Missing items
-- None for the 84 visitors and 12 file-local helpers defined by the reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover all nine
-  restored identities, reserved size combinations, all restored helper operation families, the
-  corrected min/max validation, and explicit lower-vector zeroing order.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_three_different.rs` vs Eden `frontend/A64/translate/impl/{simd_three_different.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`;
   all four anonymous-namespace helpers remain file-local with matching responsibilities.
 - Eden's `LongOperation` lambda for signed/unsigned extension is written as two explicit Rust
@@ -10564,24 +7105,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   entries are commented out and the reviewed source has no definitions, so Rust does not invent
   unreachable visitors.
 
-### Unintentional differences (to fix)
-- Fixed: PMULL and SQDMULL decoded but fell through to the temporary interpreter terminal. Both now
-  preserve Eden's exact reserved size sets, Q-selected source halves, polynomial/saturating IR
-  operations, and 128-bit destination writes.
-- Fixed: the four anonymous-namespace helpers lived as visitor methods. Their ownership now matches
-  Eden without changing the existing long, wide, multiply-long, or absolute-difference behavior.
-
-### Missing items
-- None for the 20 visitors and four file-local helpers defined by the reviewed C++ source.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both
-  restored identities at every encoded size, reserved combinations, selected lower/upper halves,
-  and absence of interpreter fallback.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_three_same_extra.rs` vs Eden `frontend/A64/translate/impl/{simd_three_same_extra.cpp,impl.h}`
 
 ### Intentional differences
+
 - Rust visitors extract Eden's typed immediate and vector-register operands from `DecodedInst`;
   the `DotProduct` helper and its extension-function parameter remain file-local.
 - Rust gives the extension-function pointer an explicit emitter lifetime because a C++ member
@@ -10591,23 +7118,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   declaration-then-assignment form. Each branch emits the same element reads and negations before
   the same multiply-add or add operations.
 
-### Unintentional differences (to fix)
-- Fixed: SDOT, UDOT, FCMLA, and FCADD decoded but fell through to the temporary interpreter
-  terminal. All four now preserve Eden's size validation, vector widths, lane iteration,
-  signed/unsigned extension, accumulation, complex rotations, FP operation ordering, and writes.
-
-### Missing items
-- None for the four visitors and the file-local dot-product helper defined by the reviewed C++
-  source and header.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload. Focused tests cover both dot
-  product signedness modes, rejected sizes, all FCMLA/FCADD rotations, 32/64-bit FP operation
-  selection, and absence of interpreter fallback.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/a64_translate.rs` vs Eden `frontend/A64/translate/a64_translate.{h,cpp}` and backend translation call sites
 
 ### Intentional differences
+
 - Rust's block-level `translate` allocates and returns its `Block`; Eden receives a reset block by
   mutable reference from each backend. Instruction loop ordering, terminal assertion, cycle count,
   single-step link, and end-location update remain the same.
@@ -10616,27 +7130,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The implementation lives in its own `a64_translate.rs`; `translate/mod.rs` only declares and
   re-exports the owner, matching Rust module mechanics without retaining behavior in the dispatcher.
 
-### Unintentional differences (to fix)
-- Fixed: `TranslationOptions` lived in `visitor.rs`, omitted `define_unpredictable_behaviour`, and
-  derived a false `hook_hint_instructions` default instead of Eden's true default.
-- Fixed: both runtime backends discarded the configured define-unpredictable value; x64 also
-  discarded `wall_clock_cntpct`. Both now construct the same option values as Eden.
-- Fixed: block translation routed decoder misses to the extra interpreter terminal instead of
-  raising `UnallocatedEncoding`, and Rust lacked Eden's `TranslateSingleInstruction` counterpart.
-- Fixed: dispatch used a catch-all interpreter arm even though every active generated decoder
-  identity now has an explicit visitor arm. The match is exhaustive.
-
-### Missing items
-- None for the options, memory-code callback type, block translation, and single-instruction
-  translation declared and defined by the reviewed upstream pair.
-
-### Binary layout verification
-- N/A: translation options are passed as Rust values and no raw-memory ABI is exposed. Focused
-  tests verify all defaults plus decoded and undecodable single-instruction bookkeeping.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/system.rs` vs Eden `frontend/A64/translate/impl/{system.cpp,impl.h}` (interpreter-producer audit)
 
 ### Intentional differences
+
 - Rust packs the decoded system-register fields into a `repr(u16)` enum while Eden uses its generic
   immediate concatenation into a `u32` enum. Every constant bit pattern is identical and the enum
   is not raw-copied or exposed through an ABI.
@@ -10646,160 +7143,75 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   commented out and this snapshot has no C++ definitions. Rust no longer invents dead fallback
   implementations for them.
 
-### Unintentional differences (to fix)
-- Fixed: unsupported decoded MRS/MSR register values produced the extra interpreter terminal;
-  Eden reaches `UNREACHABLE()` after its switch. Rust now does the same and has focused panic tests.
-- Fixed: CNTPCT block splitting used saturating subtraction for the cycle count. The nonempty-block
-  guard makes Eden's literal decrement valid, so Rust now preserves it exactly.
-
-### Missing items
-- None among the active decoder identities defined by `system.cpp`.
-
-### Binary layout verification
-- N/A: system-register encodings are compile-time discriminants, not serialized payloads. Their
-  values are preserved bit-for-bit.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_exclusive.rs` vs Eden `frontend/A64/translate/impl/{load_store_exclusive.cpp,impl.h}` (interpreter-producer audit)
 
 ### Intentional differences
+
 - Rust visitors extract operands from `DecodedInst`; pair visitors reconstruct Eden's
   `concatenate(Imm<1>{1}, sz)` from the encoded size bits before invoking the same shared helper.
 - Rust represents Eden's optional registers with `Option<Reg>` and names the overloaded
   `ExclusiveMem` helpers `exclusive_mem_read` and `exclusive_mem_write`.
 
-### Unintentional differences (to fix)
-- Fixed: separate single/pair load/store implementations duplicated and reordered Eden's shared
-  decode. The owner now has direct counterparts for `ExclusiveSharedDecodeAndOperation` and
-  `OrderedSharedDecodeAndOperation`, including the exact alias-validation `else if` order.
-- Fixed: STXR/STLXR omitted the `Rs == Rt` and `Rs == Rn` constrained-unpredictable checks, while
-  STXP/STLXP unconditionally rejected `Rs == Rt` or `Rs == Rt2`. Both single and pair stores now
-  honor `define_unpredictable_behaviour` and execute Eden's `Constraint_NONE` case when enabled.
-- Fixed: the four impossible direct-width fallbacks produced an extra interpreter terminal. All
-  width selection now goes through the shared `ExclusiveMem` helpers with unreachable defaults.
-
-### Missing items
-- None among the two file-local helpers and twelve visitor definitions in the reviewed upstream
-  source and header.
-
-### Binary layout verification
-- N/A: these methods construct SSA and define no raw-copied payload. Focused tests cover all twelve
-  decoded visitors, exclusive and ordered access tags, pair widths, alias failures, option-controlled
-  `Constraint_NONE`, and the validation-order interaction when `Rs`, `Rn`, and `Rt` alias.
-
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/simd_vector_x_indexed_element.rs` vs Eden `frontend/A64/translate/impl/{simd_vector_x_indexed_element.cpp,impl.h}` (FCMLA fallback audit)
 
 ### Intentional differences
+
 - Rust extracts operands from `DecodedInst` and initializes FCMLA's rotation-selected elements as
   tuples because Rust forbids Eden's declaration-then-assignment form.
 
 ### Unintentional differences (to fix)
-- Fixed: FCMLA by element used the extra interpreter terminal for the unsupported half-precision
-  form. Eden asserts that `esize != 16`; Rust now asserts at the identical point and has a focused
-  regression test.
+
 - The six anonymous-namespace helpers are currently visitor methods or duplicated field-extraction
   logic, including an extra `fp_multiply_by_element_fields` dispatcher. Their ownership must be
   restored in a later full owner slice; all 21 upstream visitor definitions are present.
 
 ### Missing items
+
 - No visitor definition is missing; the remaining gap is the ownership/boundary mismatch for the
   six file-local helpers.
-
-### Binary layout verification
-- N/A: these visitors construct SSA and define no raw-copied payload.
 
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/visitor.rs` vs Eden `frontend/A64/translate/impl/{impl.cpp,impl.h}` (`ExclusiveMem`, `SignExtend`, and `ZeroExtend` helpers)
 
 ### Intentional differences
+
 - Rust names Eden's overloaded `ExclusiveMem` methods `exclusive_mem_read` and
   `exclusive_mem_write` because Rust has no function overloading. The write helper keeps Eden's
   address, byte-size, access-type, value order.
 - Invalid sizes use Rust `unreachable!` diagnostics where Eden uses `UNREACHABLE()` after its
   switches.
 
-### Unintentional differences (to fix)
-- Fixed: the generic exclusive-memory overloads were absent, forcing instruction owners to repeat
-  width dispatch and making exact helper-boundary parity impossible.
-- Fixed: the visitor-level destination-directed `SignExtend` and `ZeroExtend` helpers were absent;
-  the existing broader signedness helper did not preserve Eden's method ownership.
-
-### Missing items
-- None for the four reviewed visitor-helper methods.
-
-### Binary layout verification
-- N/A: these helpers construct SSA and define no raw-copied payload. Focused tests verify all ten
-  exclusive read/write width selections and all four byte-to-word/long extension selections.
-
 ## 2026-08-24 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `ir/ir_emitter.h` (`MemOp` ownership)
 
 ### Intentional differences
+
 - Rust applies PascalCase variant spelling and derives comparison/debug traits; the enum remains a
   control-flow type and is not encoded into SSA or exposed through the JIT ABI.
-
-### Unintentional differences (to fix)
-- Fixed: `MemOp` was absent from the generic IR emitter owner, forcing A64 translation files to
-  duplicate partial local enums. The shared owner now exposes Eden's Load, Store, and Prefetch
-  inventory in the same conceptual location.
-
-### Missing items
-- None for the reviewed `MemOp` declaration.
-
-### Binary layout verification
-- N/A: neither implementation serializes or raw-copies this control-flow enum. A focused inventory
-  test constructs all three upstream variants.
 
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_multiple_structures.rs` vs Eden `frontend/A64/translate/impl/load_store_multiple_structures.cpp` (`MemOp` ownership)
 
 ### Intentional differences
+
 - Rust uses an explicit unreachable match arm for Prefetch; this upstream helper is called only by
   load and store decoder identities.
-
-### Unintentional differences (to fix)
-- Fixed: the file owned a duplicate two-variant `MemOp`. Its shared decode helper now consumes the
-  generic IR-owner enum used by Eden.
-
-### Missing items
-- None for this ownership correction.
-
-### Binary layout verification
-- N/A: the enum only selects translation control flow. Existing focused multiple-structure tests
-  pass unchanged after the owner migration.
 
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_single_structure.rs` vs Eden `frontend/A64/translate/impl/load_store_single_structure.cpp` (`MemOp` ownership)
 
 ### Intentional differences
+
 - Rust uses an explicit unreachable match arm for Prefetch; no single-structure decoder identity
   supplies that operation.
-
-### Unintentional differences (to fix)
-- Fixed: the file owned a duplicate two-variant `MemOp`. Its shared decode helper now consumes the
-  generic IR-owner enum used by Eden.
-
-### Missing items
-- None for this ownership correction.
-
-### Binary layout verification
-- N/A: the enum only selects translation control flow. Existing focused single-structure tests
-  pass unchanged after the owner migration.
 
 ## 2026-08-24 — `src/rdynarmic/src/frontend/a64/translate/load_store_register_immediate.rs` vs Eden `frontend/A64/translate/impl/load_store_register_immediate.cpp` (`LoadStoreSIMD` `MemOp` ownership)
 
 ### Intentional differences
+
 - Rust uses an explicit unreachable Prefetch arm in `load_store_simd`, matching Eden's default
   unreachable path because only SIMD load and store visitors call that helper.
-
-### Unintentional differences (to fix)
-- Fixed: `LoadStoreSIMD` accepted a file-local `SimdMemOp` instead of Eden's generic `IR::MemOp`.
-  It now consumes the enum from the IR emitter owner.
-
-### Missing items
-- None for the reviewed SIMD-helper ownership correction.
-
-### Binary layout verification
-- N/A: the enum only selects translation control flow; no SSA or guest payload layout changes.
 
 ## 2026-08-24 — `src/rdynarmic/src/{ir/terminal.rs,ir/opt,frontend/a64/translate/visitor.rs,backend/{x64,arm64}}` vs Eden `ir/terminal.h`, `frontend/A64/translate/impl/impl.cpp`, and host terminal emitters (terminal inventory)
 
 ### Intentional differences
+
 - Rust represents the C++ variant surface as an enum and uses `Box` for recursive storage. Backend
   emitters remain split according to Rust's existing host modules rather than C++ class overloads.
 - Translation tests retain their positive opcode/exception/terminal assertions; 118 negative
@@ -10807,24 +7219,19 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   tautological rather than behavioral checks.
 
 ### Unintentional differences (to fix)
-- Fixed: Rust invented `Terminal::Interpret`, an A64 `interpret_this_instruction` producer, x64 and
-  arm64 emitter cases, and a no-op `a64_merge_interpret_blocks` optimization. Eden has none of
-  these; the variant, producer, optimizer, calls, and emitter paths are removed.
+
 - Rust still permits conditional terminals to contain another recursive `Terminal`, whereas Eden
   restricts `If`, `CheckBit`, and `CheckHalt` children to `LeafTerminal`. Aligning this type-level
   invariant is a broader terminal-ownership refactor and remains outstanding.
 
 ### Missing items
-- A distinct Rust `LeafTerminal` owner enforcing Eden's non-recursive conditional children.
 
-### Binary layout verification
-- N/A: terminals are compiler-owned control-flow values and are not raw-copied across an ABI. The
-  bounded crate suite passes with 1075 tests and four ignored after removing the two extra
-  Interpret-specific tests.
+- A distinct Rust `LeafTerminal` owner enforcing Eden's non-recursive conditional children.
 
 ## 2026-08-24 — `src/rdynarmic/src/{jit_config.rs,jit.rs,backend/{common/a32_callbacks.rs,x64,arm64}}` vs Eden `interface/{A32,A64}/config.h` and host callback plumbing (interpreter-callback inventory)
 
 ### Intentional differences
+
 - Rust still exposes a temporary shared `UserCallbacks` trait and constructs boxed x64 callback
   adapters, while Eden owns separate A32/A64 interfaces and devirtualizes their methods directly.
   That broader configuration-owner split remains the next parity slice.
@@ -10832,25 +7239,15 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   trampolines; Eden's templated C++ emitters derive them directly from the architecture callback
   type. The surviving callback inventory and relocation targets now match.
 
-### Unintentional differences (to fix)
-- Fixed: Rust retained a non-upstream `interpreter_fallback` trait method after removing the only
-  terminal that could invoke it. Its A32 forwarding helper, A32/A64 JIT trampolines, x64 callback
-  slots, arm64 callback address/trampoline, relocation target, and prelude field are removed.
-- Fixed: AES and SHA regression-test names still described the removed fallback architecture; they
-  now state the positive upstream-IR contract that the tests actually verify.
-
 ### Missing items
+
 - Separate A32 and A64 callback traits in their matching configuration owners remain missing; the
   shared callback interface is retained only until that structural prerequisite is implemented.
-
-### Binary layout verification
-- N/A: callback adapters, function pointers, and relocation discriminants are internal JIT
-  plumbing and are not raw-copied guest payloads. Backend construction tests compile against the
-  reduced callback inventory, and the bounded crate suite validates both host-independent paths.
 
 ## 2026-08-24 — `src/rdynarmic/src/interface/{a32,a64}/config.rs` vs Eden `interface/{A32,A64}/config.h` (`UserCallbacks` owners)
 
 ### Intentional differences
+
 - Rust uses one architecture-owned trait per C++ callback struct. A32's four translation methods
   are repeated on that trait and forwarded by `UserCallbacksAdapter`, because Rust cannot override
   inherited trait defaults in the C++ manner while retaining the standalone `TranslateCallbacks`
@@ -10862,27 +7259,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   migrated in the immediately following slices.
 
 ### Unintentional differences (to fix)
-- Fixed: the matching A32 and A64 configuration owners lacked their `UserCallbacks` interfaces.
-  They now expose Eden's exact architecture-specific method inventories, `u32` versus `u64`
-  addresses, A64 vector shape, typed exceptions/cache operations, timing methods, and defaults.
-- Fixed: the A32 frontend adapter depended directly on the unrelated shared callback trait. It is
-  now generic over the A32-owned callback interface and forwards all four translation methods.
+
 - The legacy shared trait and its raw integer event surface remain in use by runtime/backend
   consumers. They must be removed after those consumers migrate to the new typed owners.
 
 ### Missing items
+
 - `UserConfig` was restored in the following 2026-08-24 configuration-owner slice.
 - Direct A32 and A64 runtime/backend consumption of the new traits remains the next prerequisite
   before the legacy shared callback trait can be deleted.
 
-### Binary layout verification
-- PASS: A32/A64 exception and cache-event enums retain their verified four-byte layouts; A64
-  `Vector = [u64; 2]` is verified as 16 bytes with eight-byte alignment. Trait objects themselves
-  are host-side interfaces and are not raw-copied guest payloads.
-
 ## 2026-08-24 — `src/rdynarmic/src/interface/{a32,a64}/config.rs` vs Eden `interface/{A32,A64}/config.h` (`UserConfig` owners)
 
 ### Intentional differences
+
 - Rust owns callbacks with `Box<dyn UserCallbacks>` and represents nullable pointers with `Option`;
   Eden accepts non-owning raw callback pointers and uses null/default optionals. The JIT lifetime
   remains responsible for keeping every callback and pointee alive.
@@ -10892,26 +7282,19 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   default cannot manufacture Eden's required callback pointer.
 
 ### Unintentional differences (to fix)
-- Fixed: both architecture configuration owners lacked their complete `UserConfig` structures.
-  All fields now live beside their upstream counterparts with exact architecture-specific integer
-  widths, pointer shapes, constants, and initial values.
-- Fixed: the only optimization predicate lived on the merged legacy `JitConfig`. Both owned
-  configurations now apply Eden's unsafe-flag mask before testing the requested flag.
+
 - Runtime JITs and host backends still consume the merged legacy `JitConfig`; migration to these
   new owners remains required before the old structure can be removed.
 
 ### Missing items
+
 - Direct A32/A64 JIT and backend construction from their respective `UserConfig` types.
 - Removal of the legacy shared `jit_config::JitConfig` after all callers have migrated.
-
-### Binary layout verification
-- N/A: these host configuration structures are not raw-copied across the guest ABI. Focused tests
-  verify both upstream constants and every nonzero/true default, including A32 page-table geometry,
-  A64 timer/cache registers, mirror/recompile switches, cycle counting, and optimization masking.
 
 ## 2026-08-24 — `src/rdynarmic/src/{jit.rs,jit_config.rs,backend/{common/a32_callbacks.rs,arm64/a32_{address_space,core,interface}.rs,arm64/emit_arm64.rs}}` vs Eden `interface/A32/config.h` and `backend/{x64,arm64}/a32_{interface,address_space}.*`
 
 ### Intentional differences
+
 - Rust owns the A32 callback object in `A32::UserConfig` and uses lifecycle pointer setters after
   the boxed JIT state reaches a stable address. Eden's emulator callback object instead already
   owns a pointer to the public JIT wrapper; callback values and invocation ordering are unchanged.
@@ -10922,30 +7305,21 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   where Eden devirtualizes C++ member-function pointers while emitting its prelude.
 
 ### Unintentional differences (to fix)
-- Fixed: A32 runtime/backend consumers used the merged 64-bit-address callback surface. They now
-  use `A32::UserCallbacks`, preserve 32-bit guest addresses, and forward typed A32 exceptions.
-- Fixed: A32 callback tables exposed A64-only 128-bit reads/writes, cache-operation callbacks, and
-  `GetCNTPCT`. Actual A32 paths are removed, and the arm64 A32 prelude leaves its shared
-  `get_cntpct` relocation slot empty like Eden.
-- Fixed: the arm64 A32 emitter hard-coded little-endian behavior. It now forwards
-  `UserConfig::always_little_endian`, preserving Eden's CPSR.E policy.
+
 - The x64 `EmitCallbacks` and `RawExclusiveWriteCallbacks` structures are still shared between
   A32 and A64, so A32 construction must populate unreachable placeholders for their A64-only
   128-bit/cache/counter slots. Splitting these backend callback owners remains required.
 
 ### Missing items
+
 - Direct A64 runtime/backend migration to `interface/a64/config.rs::UserConfig` and removal of the
   legacy shared configuration/callback compatibility layer.
 - Architecture-specific x64 callback-table types matching Eden's separate A32/A64 emitters.
 
-### Binary layout verification
-- N/A: the changed configuration objects and callback tables are host-side Rust structures and
-  are not raw-copied guest payloads. A32 exception values retain their verified four-byte layout;
-  focused callback/configuration tests and all four cross-target test builds pass.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/{common/emit_context.rs,x64/emit_x64_memory.rs,arm64/{emit_arm64.rs,emit_arm64_memory.rs}}` vs Eden `backend/{x64/emit_x64_memory.h,arm64/{emit_arm64.h,emit_arm64_memory.cpp}}` (`page_table_log2_stride`)
 
 ### Intentional differences
+
 - Rust's existing `MemoryEmitConfig` is shared by the two host emitters, whereas Eden stores the
   field in each architecture `UserConfig` and copies it into the arm64 `EmitConfig`. Both A32 and
   A64 construction paths now forward the architecture-owned value into that mechanical backend
@@ -10953,55 +7327,25 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The temporary public `JitConfig` compatibility bridge exposes the stride through its nested
   memory configuration until remaining callers migrate to architecture-owned configurations.
 
-### Unintentional differences (to fix)
-- Fixed: both x64 page-table lookups multiplied every index by eight. They now shift the index by
-  the configured log2 stride before the unscaled pointer load, exactly like Eden, so both supported
-  eight- and sixteen-byte entries address the correct pointer field.
-- Fixed: arm64 used the scaled `LDR` form and therefore also hard-coded eight-byte entries. It now
-  emits Eden's explicit `LSL` followed by an unscaled indexed `LDR`.
-- Fixed: the A32 and A64 configuration adapters discarded the supplied stride and always selected
-  three; they now preserve the value end-to-end.
-- Fixed: A32 emitter construction conditioned `fastmem_exclusive_access` on two unrelated pointer
-  presences. Eden forwards the configuration flag literally; both host construction paths now do
-  the same.
-
 ### Missing items
+
 - Removing the temporary merged `JitConfig` remains part of the architecture-configuration
   migration; no page-table stride behavior remains missing in the reviewed x64 or arm64 lookup.
-
-### Binary layout verification
-- N/A: the configuration is host-side. A native x64 execution test uses sixteen-byte entries with
-  a poisoned second word and verifies that the JIT loads the first-word pointer; arm64 emission
-  tests verify the configured `LSL #4` and unscaled indexed `LDR` sequence.
 
 ## 2026-08-24 — `src/core/src/arm/dynarmic/arm_dynarmic_{32,64}.rs` vs Eden `core/arm/dynarmic/arm_dynarmic_{32,64}.{h,cpp}` (`page_table_log2_stride`)
 
 ### Intentional differences
+
 - Eden indexes its interleaved 32-byte `Common::PageTable::PageEntryData` records and therefore
   uses a log2 stride of five. Ruzu exposes its separate contiguous `PageInfo` pointer buffer to
   rdynarmic, so both JIT owners derive the stride from `size_of::<PageInfo>()` (eight bytes and a
   log2 stride of three on the supported 64-bit hosts). A compile-time assertion preserves the
   required power-of-two layout contract.
 
-### Unintentional differences (to fix)
-- Fixed: after rdynarmic gained the upstream `page_table_log2_stride` option, the two explicit
-  core `MemoryEmitConfig` initializers did not forward their concrete page-table entry stride and
-  no longer compiled.
-- Fixed: `DynarmicCallbacks64` still implemented the removed, non-upstream
-  `interpreter_fallback` compatibility callback after the A64 interface migration. The unreachable
-  callback and its private trace helper are removed; unsupported instructions continue through
-  the translator/JIT exception path owned by rdynarmic, matching Eden.
-
-### Missing items
-- None for this configuration field.
-
-### Binary layout verification
-- PASS: each core owner derives the emitted index stride from the exact `PageInfo` element type
-  backing the pointer passed to rdynarmic and statically rejects a non-power-of-two entry size.
-
 ## 2026-08-24 — `src/rdynarmic/src/{interface/a64/config.rs,jit.rs,jit_config.rs,backend/arm64/a64_{address_space,core,interface}.rs,backend/arm64/emit_arm64.rs}` vs Eden `interface/A64/config.h` and `backend/{x64,arm64}/a64_{interface,address_space}.*`
 
 ### Intentional differences
+
 - Rust owns the callback object with `Box<dyn UserCallbacks>` and installs stable JIT-state
   pointers through two lifecycle hooks. Eden receives a non-owning callback pointer whose owner
   already knows the public JIT object; callback arguments and installation order are preserved.
@@ -11011,32 +7355,18 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The Rust arm64 backend stores an explicit callback context and function-address table where Eden
   devirtualizes C++ member functions into generated trampolines.
 
-### Unintentional differences (to fix)
-- Fixed: A64 runtime and arm64 backend owners consumed the merged configuration and raw-integer
-  callback surface. They now consume `interface/a64/config.rs::{UserConfig,UserCallbacks}` and
-  preserve A64 vector values, typed exceptions, cache operations, address widths, system-register
-  values, memory policy, processor ID, and optimization masking.
-- Fixed: the A64 x64 and arm64 callback trampolines exposed legacy method names and tuple-shaped
-  128-bit values. Their calls now match the A64-owned interface, including exclusive writes and
-  SVC/cache-event ownership.
-- Fixed: both A64 host constructors treated an explicit zero code-cache size as a request for the
-  default. Eden forwards the configured value literally; Rust now preserves it as well.
-
 ### Missing items
+
 - The legacy shared `jit_config::{JitConfig,UserCallbacks}` remains as a caller compatibility
   boundary and still narrows its old read-only-memory query to 32 bits. It must be removed after
   all external construction sites use the separate A32/A64 owners.
 - The x64 `EmitCallbacks` and `RawExclusiveWriteCallbacks` containers are still shared between
   A32 and A64; splitting those backend tables remains a separate ownership slice.
 
-### Binary layout verification
-- PASS: A64 exception and cache-operation enums remain four-byte values with upstream ordinal
-  order, and `Vector = [u64; 2]` remains 16 bytes. Round-trip enum tests and typed callback tests
-  cover the values crossing generated-code trampolines.
-
 ## 2026-08-24 — `src/core/src/arm/dynarmic/arm_dynarmic_{32,64}.rs` vs Eden `core/arm/dynarmic/arm_dynarmic_{32,64}.{h,cpp}` (architecture configuration ownership)
 
 ### Intentional differences
+
 - Ruzu owns the callback object in `A64UserConfig` and installs stable halt/PC pointers after JIT
   allocation; Eden passes a non-owning `DynarmicCallbacks64*` whose parent already owns the JIT.
 - A32 installs its parent pointer only after the Rust owner reaches a stable address; this is the
@@ -11047,431 +7377,216 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ruzu reads instruction words directly and therefore does not need Eden's cached-code-page reset
   in `InstructionSynchronizationBarrierRaised`.
 
-### Unintentional differences (to fix)
-- Fixed: the production A64 core owner constructed the legacy architecture-merged `JitConfig`,
-  which converted its callbacks and configuration through `LegacyA64Callbacks`. It now implements
-  `interface/a64/config.rs::UserCallbacks` and constructs that owner's `UserConfig` directly,
-  preserving typed vectors, exceptions, cache operations, widths, processor ID, system registers,
-  memory policy, optimization mask, and timing fields.
-- Fixed: `DynarmicCallbacks64` retained an unread copy of the exclusive-monitor pointer even though
-  Eden's callback does not own that state. The pointer now exists only in the A64 JIT configuration,
-  matching its actual consumer and removing the dead field.
-- Fixed: the production A32 core owner also constructed the merged `JitConfig`. It now implements
-  the A32-owned callback surface with 32-bit guest addresses, removes the unreachable A64-only
-  128-bit/cache-counter callbacks, and constructs `A32UserConfig` directly with its coprocessor,
-  page-table, optimization, endianness, processor, timing, and memory-policy fields.
-- Fixed: A32 enabled fastmem exclusives only when both fastmem and the global-monitor pointer were
-  present. Eden derives this option solely from `fastmem_pointer`; Ruzu now does the same while the
-  monitor remains an independently optional configuration field.
-- Fixed: A32 overrode Eden's conservative default `IsReadOnlyMemory` callback with a page-permission
-  query. Removing the override restores the upstream optimization contract instead of folding
-  reads under a Ruzu-specific policy.
-- Fixed: `ArmDynarmic32` retained an unread exclusive-monitor field after construction. The pointer
-  now lives only in the A32 configuration that consumes it.
-
 ### Missing items
+
 - `InstructionCacheOperationRaised` still logs operations instead of invoking the owning JIT's
   range/all-cache invalidation methods and requesting `CacheInvalidation` like Eden. Restoring this
   requires a shared invalidation request owned across the Rust callback/JIT lifetime boundary.
 - Other remaining production and test callers still use the temporary shared `JitConfig`; this
   slice removes the compatibility boundary from both production CPU owners.
 
-### Binary layout verification
-- N/A: the changed configuration and callback ownership are host-side. The architecture-owned
-  exception, vector, and cache-operation layouts are verified in the two interface configuration
-  modules; core compile-time regression tests require each callback owner to implement its exact
-  architecture trait.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{a32,a64}_interface.rs` vs Eden `backend/arm64/{a32,a64}_interface.cpp` and `interface/{A32,A64}/config.h` (test configuration ownership)
 
 ### Intentional differences
+
 - Rust test callbacks retain optional shared pointer-observation state so lifecycle tests can
   assert that generated-code callback pointers target the final boxed interface state. Eden's
   production interfaces do not contain these Rust regression fixtures.
 
-### Unintentional differences (to fix)
-- Fixed: both ARM64 interface test modules built the obsolete architecture-merged `JitConfig` and
-  reached the backend through its conversion adapter. They now construct the interface-owned A32
-  and A64 configurations directly and override only the three test-specific settings.
-- Fixed: the A32 fixture exposed 64-bit addresses and A64-only 128-bit callbacks. It now implements
-  the A32 callback contract with 32-bit addresses, typed exceptions, and the upstream default
-  exclusive-write behavior.
-- Fixed: the A64 fixture used tuple-shaped 128-bit values, raw exception integers, and the legacy
-  supervisor-call name. It now uses the upstream-shaped vector, typed exception, `call_svc`, and
-  required physical-counter callback.
-
 ### Missing items
+
 - The remaining legacy test-configuration users in other ARM64 backend files are outside this
   interface-owned slice and still need conversion before the merged compatibility layer can be
   removed.
 
-### Binary layout verification
-- PASS: compile-time trait checking on AArch64 now enforces A32 `u32` guest addresses and A64
-  `[u64; 2]` vectors at these test/backend boundaries; this slice serializes no guest payload.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{emit_context,emit_arm64_a64}.rs` vs Eden `backend/arm64/{emit_context.h,emit_arm64_a64.cpp}` and `interface/A64/config.h` (A64 emitter test ownership)
 
 ### Intentional differences
+
 - Rust emission helpers return `Result` because instruction-buffer writes are fallible; the test
   fixtures exercise the same emitted instruction and relocation sequences as Eden through this
   error-aware API.
 
-### Unintentional differences (to fix)
-- Fixed: A64 emission-context and terminal-emitter tests constructed the obsolete merged
-  configuration and converted it before building `EmitConfig`. Both now consume A64 `UserConfig`
-  directly, including its direct `check_halt_on_memory_access` owner.
-- Fixed: their callback fixtures exposed the legacy tuple/raw-integer API. They now implement the
-  A64 callback contract with typed vectors, exceptions, SVC naming, physical counter, and upstream
-  default exclusive-write behavior.
-- Fixed: `emit_arm64_a64.rs` imported the optimization flags through the compatibility module even
-  in production code. It now imports their upstream-equivalent interface owner directly.
-
 ### Missing items
+
 - Other ARM64 A64 address-space and shared-memory emitter test fixtures still depend on the merged
   compatibility layer and remain separate ownership slices.
-
-### Binary layout verification
-- PASS: the AArch64 test build checks the `[u64; 2]` callback vector boundary; this test-only
-  configuration migration does not alter emitted instruction encodings or guest data layouts.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a64_address_space.rs` vs Eden `backend/arm64/a64_address_space.{h,cpp}` and `interface/A64/config.h` (test configuration ownership)
 
 ### Intentional differences
+
 - Rust callback-thunk tests retain observable fields for memory and system events; Eden implements
   the corresponding production trampolines through devirtualized C++ member-function pointers.
 
-### Unintentional differences (to fix)
-- Fixed: the address-space fixture implemented both the merged callback API and A64 callback API,
-  forwarding every method through an adapter. It now implements only A64 `UserCallbacks`, with the
-  upstream vector, typed system-event, exclusive-write, SVC, and counter signatures.
-- Fixed: its configuration was constructed as merged `JitConfig` and converted afterward. It now
-  starts from A64 `UserConfig` and changes only cache size, cycle counting, and optimizations.
-- Fixed: the thunk regression invoked exception and cache-operation callbacks with out-of-range raw
-  integers that the typed A64 boundary correctly rejects. It now uses valid upstream enum ordinals.
-
 ### Missing items
+
 - Shared ARM64 memory-emitter tests still construct the merged configuration and are handled in a
   later file-owned slice.
-
-### Binary layout verification
-- PASS: the AArch64 test build enforces the 16-byte `[u64; 2]` vector callback boundary; existing
-  `Pair128` thunk assertions continue to verify low/high word ordering.
 
 ## 2026-08-24 — `src/core/src/cpu_manager.rs` vs Eden `core/cpu_manager.{h,cpp}` and `core/hle/kernel/physical_core.cpp` (ordinary JIT halt path)
 
 ### Intentional differences
+
 - Explicit `RUZU_SPIN_TRACE` requests may still capture a halt context, and the Rust-only null-PC
   `BreakLoop` workaround captures one context to classify that known bridge failure. Neither path
   runs for an ordinary zero-reason cycle-budget expiration.
 
-### Unintentional differences (to fix)
-- Fixed: every Rust `Halted` event, including `Halted(0)` at each budget expiration, called
-  `get_context()` and published PC/LR/SP plus 29 registers through release atomics. Eden simply
-  continues after an ordinary halt and performs no equivalent diagnostic work.
-- Fixed: thread 17 performed another unconditional context copy for its first 500 halts even when
-  trace logging was disabled. The obsolete investigation probe and counter were removed.
-
 ### Missing items
+
 - The larger Rust cooperative run-loop structure still differs from Eden's direct
   `PhysicalCore::RunThread`; this change is limited to removing non-upstream work from its hot
   ordinary-halt path.
 
-### Binary layout verification
-- N/A: this change affects host-side scheduling and diagnostic snapshots only.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/emit_arm64_memory.rs` vs Eden `backend/arm64/emit_arm64_memory.cpp` and `interface/A64/config.h` (memory-emitter test ownership)
 
 ### Intentional differences
+
 - Rust memory-emission tests construct an `EmitConfig` explicitly around the fallible instruction
   writer; their expected ARM64 words and relocation records remain the behavioral oracle for the
   same helpers owned by Eden's file.
 
-### Unintentional differences (to fix)
-- Fixed: the shared memory-emitter fixture built the architecture-merged `JitConfig`, mutated its
-  nested memory policy, then converted it to A64. It now constructs A64 `UserConfig` directly and
-  sets `check_halt_on_memory_access` on its upstream-equivalent owner.
-- Fixed: its callbacks used legacy raw exception values and tuple-shaped 128-bit memory values.
-  They now implement the typed A64 callback boundary, including `get_cntpct` and upstream default
-  exclusive-write behavior.
-
 ### Missing items
+
 - The A32-specific ARM64 memory and coprocessor emitter fixtures remain on the compatibility layer
   and require their own A32-owned conversion.
-
-### Binary layout verification
-- PASS: the AArch64 test build enforces the A64 `[u64; 2]` callback vector layout; the existing
-  memory-emission tests continue to assert instruction words for 8/16/32/64/128-bit paths.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/emit_arm64_a32_{memory,coprocessor}.rs` vs Eden `backend/arm64/emit_arm64_a32_{memory,coprocessor}.cpp` and `interface/A32/config.h` (A32 emitter test ownership)
 
 ### Intentional differences
+
 - Rust keeps native unit-test harnesses next to these file-owned emitters and constructs the
   fallible instruction writer explicitly; the production emission sequences remain unchanged.
 
-### Unintentional differences (to fix)
-- Fixed: both A32 emitter fixtures built the architecture-merged `JitConfig` and callback adapter.
-  They now construct A32 `UserConfig` directly and implement only A32 `UserCallbacks`.
-- Fixed: the fixtures exposed A64-only 128-bit callbacks, `u64` guest addresses, and raw exception
-  values. Their boundary now uses A32 `u32` addresses, typed exceptions and SVC naming, while
-  retaining upstream's default exclusive-write behavior.
-- Fixed: the memory fixture now sets `check_halt_on_memory_access` directly on its A32 owner, and
-  the coprocessor fixture installs CP15 directly in the A32 coprocessor table.
-
 ### Missing items
+
 - The shared ARM64 dispatcher and A32 dispatcher test fixtures in `emit_arm64.rs` and
   `emit_arm64_a32.rs` still use the merged compatibility layer and require separate owner-aligned
   conversion.
 
-### Binary layout verification
-- PASS: the AArch64 test build enforces the A32 `u32` callback-address boundary; the existing
-  emitter tests continue to verify generated instruction words and this slice serializes no guest
-  payload.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/{emit_arm64,emit_arm64_a32}.rs` vs Eden `backend/arm64/emit_arm64.{h,cpp}`, `backend/arm64/emit_arm64_a32.cpp`, and `interface/{A32,A64}/config.h` (dispatcher test ownership)
 
 ### Intentional differences
+
 - Rust retains native instruction-word and relocation tests beside the corresponding shared and
   A32 dispatcher implementations; their fallible code-buffer API does not change the upstream
   emission ordering under test.
 
-### Unintentional differences (to fix)
-- Fixed: the shared dispatcher tests used one merged callback/configuration type for both guest
-  architectures. They now use separate A32 and A64 fixtures with their respective address widths,
-  vector representation, exception type, system callbacks, and configuration defaults.
-- Fixed: the A32 dispatcher tests converted a merged configuration at every context boundary.
-  Their helpers now own A32 `UserConfig` directly, including optimization, cycle-counting, and
-  memory-abort fields.
-- Fixed: `emit_arm64_a32.rs` imported `OptimizationFlag` through the compatibility module, and the
-  shared dispatcher retained an unused `XFASTMEM` import. The flag now comes from its interface
-  owner and the stale import is removed.
-
 ### Missing items
+
 - The mixed-architecture test environment in `jit.rs` remains the final legacy merged-configuration
   consumer before the compatibility layer can be removed.
-
-### Binary layout verification
-- PASS: the AArch64 test build enforces A32 `u32` addresses and A64 `[u64; 2]` vectors at the
-  dispatcher fixtures; existing tests continue to assert generated instruction words, JIT-state
-  offsets, relocation ordering, and A32's fixed 32-bit memory spaces.
 
 ## 2026-08-24 — `src/rdynarmic/src/jit.rs` vs Eden `interface/A32/{a32,config}.h` and `backend/{x64,arm64}/a32_interface.cpp` (A32 test configuration ownership)
 
 ### Intentional differences
+
 - Rust keeps its cross-backend native regression tests in the public JIT wrapper while Eden's
   backend interfaces are separate translation units. The fixtures now expose the A32-owned
   configuration and callback boundary directly despite that existing harness placement.
 - The Rust JIT constructors remain fallible because executable-memory allocation and code
   generation report errors instead of relying on C++ assertions.
 
-### Unintentional differences (to fix)
-- Fixed: 42 A32 JIT fixtures constructed the obsolete architecture-merged `JitConfig`, including
-  A64-only timer, cache-register, cache-hook, TLS, and 128-bit callback fields. They now construct
-  A32 `UserConfig` directly with `u32` guest addresses and the A32-owned memory-policy fields.
-- Fixed: the page-table fixtures reached A32 through a typeless compatibility pointer. They now
-  expose the upstream 1,048,576-entry A32 page-table pointer type and preserve the configured
-  entry stride, pointer mask, misalignment, absolute-offset, fastmem fallback, and halt policies.
-
 ### Missing items
+
 - The A64 fixtures in the same Rust-native test module still construct the merged compatibility
   configuration. The common mock behavior still delegates through its legacy callback
   implementation until those A64 fixtures are migrated and both architecture traits can call
   architecture-neutral test-memory helpers directly.
 
-### Binary layout verification
-- PASS: native and AArch64 test builds enforce the A32 `u32` callback boundary and upstream-sized
-  page-table pointer type. Existing focused fastmem, sixteen-byte page-table stride, and Thumb
-  logical-flags regressions pass; this test-only migration serializes no guest payload.
-
 ## 2026-08-24 — `src/rdynarmic/src/{jit.rs,lib.rs}` and removed `jit_config.rs` vs Eden `interface/{A32,A64}/{a32,a64,config}.h` and `backend/{x64,arm64}/{a32,a64}_interface.cpp`
 
 ### Intentional differences
+
 - Rust exposes fallible JIT constructors and boxes callback traits to represent C++ virtual
   callback ownership. The constructors now otherwise take the matching architecture `UserConfig`
   by value, as Eden does.
 - Rust-native A32 and A64 integration regressions share memory-storage helper methods inside the
   test module; the two public callback implementations retain their distinct upstream signatures.
 
-### Unintentional differences (to fix)
-- Fixed: all 58 remaining A64 fixtures constructed an architecture-merged configuration containing
-  A32 coprocessor/version fields. They now construct A64 `UserConfig` directly and use Eden's
-  36-bit address-space defaults unless a test explicitly selects another width.
-- Fixed: the shared test callback implementation and conversion adapters erased A32/A64 address,
-  vector, exception, cache-operation, and default-exclusive-write differences. The fixtures now
-  implement the two architecture callback traits directly over test-only storage helpers.
-- Fixed: the non-upstream public `jit_config.rs` compatibility owner and its generic constructor
-  conversions remained after every consumer had migrated. The module, re-export, adapters, and
-  stale backend imports have been removed; optimization flags are imported from their interface
-  owner.
-
 ### Missing items
+
 - `jit.rs` remains a combined Rust wrapper for both guest architectures rather than mirroring
   Eden's backend-specific A32/A64 interface translation units. Splitting that established wrapper
   is a separate structural ownership slice because it also owns host callback trampolines and
   cache lifecycle.
 
-### Binary layout verification
-- PASS: native and AArch64 test builds enforce A64 `[u64; 2]` vectors, typed four-byte exceptions
-  and cache operations, direct TLS/page-table pointer types, and A32 `u32` callback addresses.
-  Focused A64 fastmem-fault, physical-counter, and exclusive-fallback execution tests pass; no
-  serialized guest payload changed.
-
 ## 2026-08-24 — `src/rdynarmic/src/common/spin_lock.rs` vs Eden `common/spin_lock.h` and `common/spin_lock_{x64,arm64}.cpp`
 
 ### Intentional differences
+
 - Rust uses a four-byte `AtomicU32` rather than lazily generating host routines for ordinary
   `SpinLock::lock` and `unlock`; acquire/release behavior and the x64 `xchg`/`mfence` strength are
   retained without allocating an executable helper page.
 
-### Unintentional differences (to fix)
-- Fixed: `SpinLock` lived inside the root exclusive-monitor module instead of its upstream
-  `common/spin_lock` owner.
-- Fixed: the x64 ordinary unlock used only a release store; it now performs the upstream-equivalent
-  sequentially consistent exchange and fence.
-
 ### Missing items
+
 - The AArch64 JIT-emitted `EmitSpinLockLock` and `EmitSpinLockUnlock` helpers remain part of the
   broader arm64 exclusive-fastmem backend parity work.
-
-### Binary layout verification
-- PASS: a focused test verifies that `SpinLock` has the four-byte size and alignment required by
-  both upstream host emitters and Ruzu's generated x64 accesses.
 
 ## 2026-08-24 — `src/rdynarmic/src/common/spin_lock_x64.rs` vs Eden `common/spin_lock_x64.{h,cpp}`
 
 ### Intentional differences
+
 - Rust emits through `rxbyak::CodeAssembler` and uses its native `umonitor` encoder instead of
   Eden's hand-written workaround for the historical Xbyak encoding bug.
-
-### Unintentional differences (to fix)
-- Fixed: the file lived under `backend/x64` even though upstream owns both declarations and
-  implementation under `common`.
-- Fixed: the acquire helper ignored WAITPKG and added a redundant explicit `lock` prefix to the
-  implicitly locked memory `xchg`; both paths now follow Eden's emitted sequence.
-
-### Missing items
-- None for the two reviewed x64 emission helpers.
-
-### Binary layout verification
-- N/A: this owner emits host instructions rather than a raw-copied payload. Focused byte-level
-  tests verify the PAUSE path, implicit-lock encoding, and UMONITOR/UMWAIT path.
 
 ## 2026-08-24 — `src/rdynarmic/src/interface/code_page.rs` vs Eden `interface/code_page.h`
 
 ### Intentional differences
+
 - Rust expresses the public instruction array length with a constant expression over its native
   `u32` size.
-
-### Unintentional differences (to fix)
-- Fixed: Ruzu had no counterpart for Eden's public `CodePage` declaration and constant.
-
-### Missing items
-- None for this declaration.
-
-### Binary layout verification
-- PASS: `CodePage` is `repr(C)` and tests verify a 4096-byte size with `u32` alignment.
 
 ## 2026-08-24 — `src/rdynarmic/src/interface/halt_reason.rs` vs Eden `interface/halt_reason.h`
 
 ### Intentional differences
+
 - Rust uses `bitflags` for Eden's operators and retains named aliases mapping Ruzu core events onto
   the corresponding upstream `UserDefined` bits.
-
-### Unintentional differences (to fix)
-- Fixed: the declaration lived at the crate root instead of its upstream `interface` owner; all
-  internal and external consumers now use the owned type or its top-level public re-export.
-
-### Missing items
-- None for the upstream flag inventory and bitwise operations.
-
-### Binary layout verification
-- PASS: focused tests verify the four-byte representation and upstream bit values.
 
 ## 2026-08-24 — `src/rdynarmic/src/interface/exclusive_monitor.rs` vs Eden `interface/exclusive_monitor.h` and host `exclusive_monitor.cpp` implementations
 
 ### Intentional differences
+
 - Rust stores the fixed-at-construction address/value sequences in non-resizing `Vec`s rather than
   Boost `static_vector`; the four-entry capacity is enforced and the host pointers remain stable.
 - `Copy` is Rust's bound for the trivially-copyable template payload, and `MaybeUninit` represents
   Eden's uninitialized local before the exact-size `memcpy`.
 
-### Unintentional differences (to fix)
-- Fixed: the monitor lived at the crate root and also owned the unrelated `SpinLock` implementation.
-- Fixed: construction accepted more than Eden's four-core static capacity, and `read_and_mark`
-  cleared all sixteen reserved-value bytes before copying a smaller payload. It now enforces the
-  upstream capacity and copies only `size_of::<T>()` bytes.
-
-### Missing items
-- None for the reviewed public methods, constants, state, and host-independent lifecycle.
-
-### Binary layout verification
-- N/A: Eden's monitor is a host-only C++ class containing Boost storage and is not raw-copied.
-  Focused tests cover all supported widths, invalidation, clearing, and the capacity invariant.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/exclusive_monitor_friend.rs` vs Eden `backend/x64/exclusive_monitor_friend.h`
 
 ### Intentional differences
+
 - Rust exposes the four friend operations as `unsafe` crate-local functions because raw-pointer
   validity, index bounds, and stable monitor ownership are caller contracts.
-
-### Unintentional differences (to fix)
-- Fixed: the four friend operations were extra public methods on `ExclusiveMonitor`, obscuring the
-  upstream x64 owner. The emitter now calls the matching file-owned functions.
-
-### Missing items
-- None for the four friend accessors.
-
-### Binary layout verification
-- PASS: focused tests verify that the accessors address the monitor's four-byte lock storage,
-  processor count, reservation-address slots, and 128-bit value slots.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{emit_context.rs,emit_vector_helpers.rs,emit_vector_saturated.rs}` vs Eden `backend/x64/{emit_x64_vector.cpp,jitstate_info.h}` (SQSHLU/VQSHLU immediate fallback)
 
 ### Intentional differences
+
 - Rust passes `ArchConfig` through `EmitContext` to select the A32/A64 `fpsr_qc` offset; Eden
   obtains the same architecture-specific offset from `BlockOfCode::GetJitStateInfo()`.
 - Rust implements the element loop with fixed-size arrays instead of Eden's `VectorArray<T>`
   template. The signed input, unsigned result, saturation result and sticky QC behavior match.
 
-### Unintentional differences (to fix)
-- Fixed: the x64 fallback previously materialized Eden's scalar `Imm8` shift as an XMM value and
-  read a different byte for every lane. Its ABI now takes one scalar `u8`, matching
-  `EmitTwoArgumentFallbackWithSaturationAndImmediate`, and applies it to every lane.
-- Fixed: the shared saturated fallbacks previously hard-coded `A64JitState::fpsr_qc`; A32 SIMD
-  saturation could therefore write QC at the wrong state offset. All three shared helpers now use
-  the active architecture's offset and Eden's byte-sized sticky OR.
-
 ### Missing items
+
 - Eden's AVX2-specialized 32-bit SQSHLU emitter is not ported; Rust uses the behaviorally
   equivalent corrected scalar fallback for 8-, 16-, 32- and 64-bit lanes.
-
-### Binary layout verification
-- PASS: the fallback ABI is `(result pointer, input pointer, u8 immediate) -> u32`, with two
-  16-byte stack slots plus the platform shadow space, matching Eden on System V and Windows x64.
-  A focused full-JIT four-lane test verifies positive results, unsigned saturation,
-  negative-to-zero and QC.
 
 ## 2026-08-24 — `src/rdynarmic/{build.rs,a64_decoder_parser.rs}` vs Eden `frontend/A64/decoder/{a64.h,a64.inc}` (closing `INST` delimiter)
 
 ### Intentional differences
+
 - Eden expands `a64.inc` with the C++ preprocessor. Rust's build script must parse the same three
   macro fields to generate its decoder, so the parser is isolated in a build-support module that
   can also be compiled by the regression test.
 
-### Unintentional differences (to fix)
-- Fixed: `rfind(')')` could select a parenthesis from a trailing comment and silently omit an active
-  decoder entry. The parser now selects the first closing parenthesis outside quoted fields, so
-  parentheses in display names remain valid and trailing comments cannot pollute the bit string.
-
-### Missing items
-- None in the reviewed active-entry parsing path.
-
-### Binary layout verification
-- N/A: this code generates decoder metadata and does not serialize or raw-copy a payload. The
-  regression fixture covers parentheses in both the quoted display name and trailing comment.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/block_range_information.rs` vs Eden `backend/block_range_information.{h,cpp}`
 
 ### Intentional differences
+
 - Rust stores one closed range and descriptor per registration in a `Vec`, while Eden's Boost
   interval map splits/coalesces overlapping intervals and stores descriptor sets. Iterating every
   registered interval produces the same union of descriptors for invalidation without adding a
@@ -11479,137 +7594,61 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust accepts a slice of closed ranges in place of Boost's `interval_set`; callers construct the
   same closed invalidation intervals at their architecture boundary.
 
-### Unintentional differences (to fix)
-- Fixed: the shared owner was absent and its range lookup was duplicated partially in the ARM64
-  address spaces or replaced by entry-PC filtering in the x64 emitters.
-- Fixed: the ARM64 duplicates erased matched registrations, unlike Eden's current implementation,
-  which deliberately retains them and carries an efficiency TODO.
-
-### Missing items
-- None for `AddRange`, `ClearCache`, `InvalidateRanges`, and the `u32`/`u64` instantiations.
-
-### Binary layout verification
-- N/A: this is host-only cache metadata and is never serialized or copied as a binary payload.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a32_address_space.rs` vs Eden `backend/arm64/a32_address_space.{h,cpp}` (block ranges)
 
 ### Intentional differences
+
 - Rust forwards a `HashSet<LocationDescriptor>` to its address-space invalidator rather than
   Eden's `ankerl::unordered_dense::set`; both represent the same unique descriptor set.
-
-### Unintentional differences (to fix)
-- Fixed: A32 owned a local `BlockRange32` vector and overlap loop instead of consuming the shared
-  backend owner. Registration and invalidation now preserve Eden's exact start-PC through
-  `EndLocation().PC() - 1` closed interval and descriptor lookup ordering.
-
-### Missing items
-- None in the reviewed `RegisterNewBasicBlock` and `InvalidateCacheRanges` paths.
-
-### Binary layout verification
-- N/A: block-range information is host-only cache metadata.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a64_address_space.rs` vs Eden `backend/arm64/a64_address_space.{h,cpp}` (block ranges)
 
 ### Intentional differences
+
 - Rust forwards a `HashSet<LocationDescriptor>` to its address-space invalidator rather than
   Eden's `ankerl::unordered_dense::set`; both represent the same unique descriptor set.
-
-### Unintentional differences (to fix)
-- Fixed: A64 owned a local `BlockRange64` vector and overlap loop instead of consuming the shared
-  backend owner. Registration and invalidation now preserve Eden's exact start-PC through
-  `EndLocation().PC() - 1` closed interval and descriptor lookup ordering.
-
-### Missing items
-- None in the reviewed `RegisterNewBasicBlock` and `InvalidateCacheRanges` paths.
-
-### Binary layout verification
-- N/A: block-range information is host-only cache metadata.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_x64.rs` vs Eden `backend/x64/a32_emit_x64.{h,cpp}` (block ranges)
 
 ### Intentional differences
+
 - The Rust public wrapper still supplies one start/length pair, which this owner converts to the
   same closed `u32` interval that Eden's interface queues in its Boost interval set.
-
-### Unintentional differences (to fix)
-- Fixed: range invalidation filtered cached descriptors only by their entry PC. A write touching a
-  later instruction in a compiled block could therefore leave stale host code active. Every
-  emitted block now registers its complete guest-PC interval before cache insertion and
-  invalidation removes all overlapping descriptors through `BlockRangeInformation`.
-- Fixed: the x64-only `BlockCache::invalidate_range` entry-PC filter and its associated test were
-  removed; exact-descriptor removal remains owned by the cache.
-- Fixed: clearing the emitter cache did not clear its range metadata. It now follows Eden's
-  `EmitX64::ClearCache` then `block_ranges.ClearCache` lifecycle.
-
-### Missing items
-- None in the reviewed range registration, clear, and invalidation paths.
-
-### Binary layout verification
-- N/A: this change affects host code-cache metadata only. A full-JIT regression test mutates the
-  middle instruction of an A32 block and proves that invalidating four bytes recompiles it.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_emit_x64.rs` vs Eden `backend/x64/a64_emit_x64.{h,cpp}` (block ranges)
 
 ### Intentional differences
+
 - The Rust public wrapper still supplies one start/length pair, which this owner converts to the
   same closed `u64` interval that Eden's interface queues in its Boost interval set.
-
-### Unintentional differences (to fix)
-- Fixed: range invalidation filtered cached descriptors only by their entry PC. Every emitted A64
-  block now registers the complete closed guest-PC interval before cache insertion and removes all
-  descriptors overlapping the requested range.
-- Fixed: clearing the emitter cache did not clear its range metadata, and invalidating the last
-  cached block reset the whole code buffer even though Eden only unpatches and erases selected
-  descriptors. Both lifecycle paths now match Eden.
-
-### Missing items
-- None in the reviewed range registration, clear, and invalidation paths.
-
-### Binary layout verification
-- N/A: this change affects host code-cache metadata only. A full-JIT regression test mutates the
-  middle instruction of an A64 block and proves that invalidating four bytes recompiles it.
 
 ## 2026-08-24 — `src/rdynarmic/src/common/mod.rs` vs Eden `common/spin_lock_x64.{h,cpp}`
 
 ### Intentional differences
+
 - Eden only builds its x64 backend on x64 hosts. Rust currently compiles the x64 code-generator
   modules on ARM64 as well, so the architecture-independent `rxbyak` emission helper must remain
   visible there even though the generated instructions are x64 instructions.
 
-### Unintentional differences (to fix)
-- Fixed: `spin_lock_x64` was hidden behind a host-architecture `cfg`, while the unconditionally
-  compiled x64 exclusive-memory emitter imported it. Clean Apple Silicon builds consequently
-  failed with an unresolved import.
-
-### Missing items
-- None in the module-ownership fix.
-
-### Binary layout verification
-- N/A: this only changes Rust module visibility for a host-code emission helper.
 ## 2026-08-24 — `src/rdynarmic/src/common/llvm_disassemble.rs` vs Eden `common/llvm_disassemble.{h,cpp}`
 
 ### Intentional differences
+
 - Eden conditionally uses LLVM when `DYNARMIC_USE_LLVM` is enabled. That option defaults to OFF,
   and rdynarmic currently has no LLVM integration, so Rust ports the exact non-LLVM branch for all
   three helpers rather than adding a differently formatted disassembler dependency.
 - Rust accepts typed instruction pointers instead of Eden's `void*`; the fallback only formats
   their numeric addresses and never dereferences them.
 
-### Unintentional differences (to fix)
-- Fixed: the entire common owner was absent, preventing the x64 public interfaces from exposing
-  Eden's `Disassemble()` result without an incorrect empty-string stub.
-
 ### Missing items
+
 - LLVM-enabled x64, AArch32, and AArch64 instruction decoding is not available until rdynarmic
   gains an explicit equivalent of Eden's optional `DYNARMIC_USE_LLVM` build mode.
-
-### Binary layout verification
-- N/A: the fallback formats pointers and fixed diagnostic strings; it does not serialize or copy
-  an architectural payload.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a32_interface.rs` vs Eden `backend/arm64/a32_interface.cpp` and `interface/A32/a32.h`
 
 ### Intentional differences
+
 - Rust uses a boxed inner value for stable callback/state pointers and `Result` for fallible code
   allocation/emission. If such an operation fails, Rust restores `is_executing` before returning
   the error; Eden's corresponding operations do not expose a recoverable error path.
@@ -11619,31 +7658,13 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   every range to the shared invalidator preserves the same union of affected guest blocks.
 
 ### Unintentional differences (to fix)
-- Fixed: Run/Step reset `is_executing` before deferred invalidation; successful execution now keeps
-  it set until invalidation completes, matching Eden's lifecycle order.
-- Fixed: deferred invalidation released its mutex before clearing or invalidating the address
-  space. The mutex is now held through the full operation and the halt bit is cleared under it.
-- Fixed: range construction used `saturating_sub(1)`, so a zero length produced `start..=start`
-  instead of Eden's unsigned `start + length - 1` result.
-- Fixed: the backend returned no `Disassemble` surface and the FPSCR setter contained non-upstream
-  environment-driven logging. ARM64 disassembly now returns Eden's empty string and the setter
-  only updates architectural state.
+
 - The diagnostic block-map/state-pointer and compile-only extensions still live in this upstream
   owner. They must move behind an explicit Ruzu extension boundary in a dedicated follow-up.
-- Fixed: A32 `is_executing` lived in the backend inner value instead of the public interface owner.
-  Both host backends now update the `interface/a32/a32.rs::Jit` field through an explicit mutable
-  reference while retaining Eden's invalidation/execution ordering.
-
-### Missing items
-- None in the reviewed public A32 method inventory or deferred-invalidation behavior.
-
-### Binary layout verification
-- PASS: this slice does not alter `A32JitState`; register and extension-register access continues
-  through the existing layout-verified state arrays.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/arm64/a64_interface.rs` vs Eden `backend/arm64/a64_interface.cpp` and `interface/A64/a64.h`
 
 ### Intentional differences
+
 - Rust uses a boxed inner value for stable callback/state pointers and returns `Result` from
   fallible ARM64 code allocation/emission. Error paths restore `is_executing`; Eden has no
   equivalent recoverable error path.
@@ -11655,47 +7676,29 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   queued range preserves the same union of affected guest blocks.
 
 ### Unintentional differences (to fix)
-- Fixed: Run/Step reset `is_executing` before deferred invalidation, and deferred invalidation
-  released its mutex before operating on the address space. Both lifecycle orders now match Eden.
-- Fixed: zero-length range arithmetic used saturation instead of Eden's unsigned wrapping
-  `start + length - 1` expression.
-- Fixed: `GetRegisters`, `SetRegisters`, `GetVector`, `SetVector`, `GetVectors`, `SetVectors`, and
-  the empty ARM64 `Disassemble` result were absent from this owner.
+
 - Fixed in the x64 JIT-state ownership slice: TPIDR accessors that only mirrored Core-owned
   backing storage were removed from this upstream owner.
-
-### Missing items
-- None in the reviewed public A64 method inventory or deferred-invalidation behavior.
-
-### Binary layout verification
-- PASS: `Vector` is two contiguous `u64` lanes (16 bytes), and the focused aggregate-accessor test
-  verifies all 32 vectors preserve low/high lane order. `A64JitState` itself is unchanged.
 
 ## 2026-08-24 — `src/rdynarmic/src/interface/a32/a32.rs` vs Eden `interface/A32/a32.h`
 
 ### Intentional differences
+
 - Rust selects the x64 or ARM64 implementation with target `cfg` blocks instead of a link-selected
   C++ `Impl`, but the public `Jit` remains the owner of the backend object and `is_executing`.
 - `read_halt_reason`, raw state-pointer access, individual register helpers,
   compile-only, and block-map dumping are Ruzu diagnostic/tool extensions beyond Eden's public
   interface. They delegate to host backends and do not replace an upstream method.
 
-### Unintentional differences (to fix)
-- Fixed: the public owner previously delegated `is_executing` to duplicated backend fields. It now
-  owns one boolean on both hosts, and backend Run/Step receive that exact state so callbacks observe
-  Eden's `false -> true -> false` lifecycle.
-
 ### Missing items
+
 - The diagnostic/tool methods still need a separate explicit extension trait or module before the
   upstream public owner is structurally exact.
-
-### Binary layout verification
-- N/A: `Jit` is a host-only opaque owner in both implementations; no field is copied or serialized
-  as an architectural payload.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_interface.rs` vs Eden `backend/x64/a32_interface.cpp`
 
 ### Intentional differences
+
 - Rust's fixed-size executable allocation is committed when `BlockOfCode` is created, so there is
   no separate `EnsureMemoryCommitted` operation after the one-megabyte capacity check.
 - The emitter retains the same one-megabyte check as a defensive guard for direct emitter tests
@@ -11704,25 +7707,15 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - W^X transitions surround slow-path compilation explicitly; Eden performs them through its code
   emission machinery. Callback trampolines and diagnostic hooks are Rust ABI/adaptation code.
 
-### Unintentional differences (to fix)
-- Fixed: low code space was handled inside `A32EmitX64`, clearing emitter metadata without resetting
-  the interface RSB. The cache-miss owner now applies Eden's strict `< 1 MiB` condition, requests a
-  whole-cache invalidation, clears its halt request under the mutex, resets the RSB, and recompiles.
-- Fixed: Run and Step stored execution state in the x64 backend. They now update the A32 public
-  interface owner's field at Eden's exact lifecycle points.
-
 ### Missing items
+
 - Diagnostic state-pointer, compile-only, trace, and block-map facilities remain mixed into
   this upstream-owned backend file pending an explicit Ruzu extension boundary.
-
-### Binary layout verification
-- PASS: no JIT-state field or callback ABI layout changed. Focused full-JIT tests prove that exactly
-  one mebibyte remaining preserves existing blocks, while less than one mebibyte clears blocks and
-  stale RSB descriptor/code-pointer entries.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_interface.rs` vs Eden `backend/x64/a64_interface.cpp`
 
 ### Intentional differences
+
 - Rust uses a fully committed fixed-size code allocation, so Eden's `EnsureMemoryCommitted` call has
   no separate counterpart; its preceding one-megabyte capacity policy is preserved literally.
 - Rust executes the emitter-provided entrypoint directly. Eden rounds `GetCurrentBlock()` upward to
@@ -11732,150 +7725,83 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   cache misses now take the upstream-owned check. W^X transitions, callback trampolines, and Ruzu
   diagnostic hooks are host-language/runtime adaptations.
 
-### Unintentional differences (to fix)
-- Fixed: the emitter alone evacuated a nearly full code cache, leaving interface RSB entries that
-  could point into reused code. Every A64 interface cache miss now applies Eden's strict `< 1 MiB`
-  check through whole-cache invalidation before translation/emission.
-- Fixed: range invalidation and whole-cache invalidation now share the same locked lifecycle, reset
-  the RSB first, and process every queued closed range before Run/Step report non-execution.
-
 ### Missing items
+
 - Fixed in the x64 JIT-state ownership slice: TPIDR values are no longer mirrored through backend
   accessors or raw-state fields. Diagnostic raw-pointer/trace facilities remain mixed into this
   upstream-owned backend file pending an explicit Ruzu extension boundary.
 
-### Binary layout verification
-- PASS: no A64 JIT-state or callback payload layout changed. The focused capacity test covers the
-  exact threshold and verifies stale RSB descriptor/code-pointer removal below it.
-
 ## 2026-08-24 — `src/rdynarmic/src/interface/a64/a64.rs` vs Eden `interface/A64/a64.h`
 
 ### Intentional differences
+
 - Target-specific Rust `Jit` definitions replace the C++ pImpl selected by the build, while retaining
   the same public method owner and complete register/vector surface.
 - Raw state/halt pointers, halt inspection, and tuple vector compatibility are Ruzu
   integration extensions delegated to the selected backend.
 
 ### Unintentional differences (to fix)
+
 - Fixed in the associated host owners: both x64 and ARM64 implementations now provide the complete
   aggregate register/vector accessors, disassembly surface, invalidation ordering, and execution
   state queried by this public interface.
 
 ### Missing items
+
 - The Ruzu-only integration methods need an explicit extension boundary before this owner can be
   structurally identical to the upstream header.
-
-### Binary layout verification
-- PASS: public `Vector` remains `[u64; 2]`; aggregate access tests verify 31 GPRs and 32 vectors,
-  including low/high lane order.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_jitstate.rs` vs Eden `backend/x64/a32_jitstate.{h,cpp}`
 
 ### Intentional differences
+
 - Rust spells the fields and methods with Rust naming conventions and uses explicit zeroed padding
   before `ext_reg`; the padding reproduces Eden's implicit `alignas(16)` gap and makes reserved
   bytes deterministic.
 - Compile-time `offset_of!` helpers expose the same offsets to the Rust x64 emitter that C++ obtains
   with `offsetof`.
 
-### Unintentional differences (to fix)
-- Fixed: A32 state was combined with A64 in `jit_state.rs`; it now has the matching upstream owner.
-- Fixed: the raw state had appended `exclusive_value` and `cntpct` fields absent from Eden. The safe
-  no-global-monitor fallback value now belongs to `A32JitInner`; the unused A32 CNTPCT extension was
-  removed.
-- Fixed: `TransferJitState` was missing. The port copies Eden's exact architectural/MXCSR/FPSR
-  fields, preserves `halt_reason`, clears `exclusive_state`, and conditionally copies or resets RSB.
-
-### Missing items
-- None in the state fields, constants, or method inventory of the reviewed header/source pair.
-
-### Binary layout verification
-- PASS: a program compiled against Eden's header and the Rust layout test both report alignment 16,
-  size 528, and identical offsets for every field from `reg` at 0 through `fpsr_nzcv` at 512.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a64_jitstate.rs` vs Eden `backend/x64/a64_jitstate.{h,cpp}`
 
 ### Intentional differences
+
 - Rust uses explicit zeroed padding after `exclusive_state` to reproduce the C++ compiler's padding
   before `rsb_ptr`, and compile-time offset helpers stand in for C++ `offsetof` calls.
-
-### Unintentional differences (to fix)
-- Fixed: A64 state was combined with A32 in `jit_state.rs`; it now has the matching upstream owner.
-- Fixed: `exclusive_value`, `tpidr_el0`, and `tpidrro_el0` incorrectly extended the generated-code
-  state. The fallback exclusive value now belongs to `JitInner`, while TPIDR uses the configured
-  stable pointers exactly like Eden.
-
-### Missing items
-- None in the state fields, constants, or method inventory of the reviewed header/source pair.
-
-### Binary layout verification
-- PASS: a program compiled against Eden's header and the Rust layout test both report alignment 16,
-  size 960, and identical offsets for every field from `reg` at 0 through `fpcr` at 944.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/emit_a64.rs` vs Eden `backend/x64/a64_emit_x64.cpp` (TPIDR)
 
 ### Intentional differences
+
 - Rust represents nullable TPIDR pointers as `Option<*mut u64>`/`Option<*const u64>` and materializes
   their addresses through rxbyak's Rust API; the emitted load/store sequence is otherwise the same.
-
-### Unintentional differences (to fix)
-- Fixed: TPIDR instructions read and wrote private fields appended to `A64JitState`. `MRS/MSR
-  TPIDR_EL0` and `MRS TPIDRRO_EL0` now load/store through the pointers embedded from `UserConfig`;
-  null reads return zero and null writes do nothing.
-
-### Missing items
-- None in the three reviewed TPIDR emitter methods.
-
-### Binary layout verification
-- N/A: TPIDR backing storage is host-owned and outside raw JIT state. An executing five-instruction
-  regression verifies both configured reads and the configured write.
 
 ## 2026-08-24 — `src/rdynarmic/src/interface/{a32/a32,a64/a64}.rs` and host interfaces vs Eden `interface/{A32/a32,A64/a64}.h` and `backend/{x64,arm64}/*_interface.cpp`
 
 ### Intentional differences
+
 - When no global monitor is configured, Ruzu's safe callback fallback retains expected exclusive
   values in the host interface owner. These values are not visible to generated code and are reset
   with the architectural state.
 
-### Unintentional differences (to fix)
-- Fixed: public A32 CNTPCT accessors stored an inert value that no A32 instruction consumed.
-- Fixed: public A64 TPIDR accessors duplicated Core's configured backing storage; the read-only
-  setter also cast Eden's `const` TPIDRRO pointer to mutable. Core now reads/writes its stable
-  backing allocations directly, as Eden's `ArmDynarmic64` does.
-
 ### Missing items
+
 - Ruzu diagnostic state pointers, halt inspection, compile-only, trace, and block-map helpers still
   require a separate extension boundary to make the public/upstream interface owners exact.
-
-### Binary layout verification
-- PASS: removing the extra values from raw state is covered by the exact A32/A64 layout assertions;
-  the host interface fallback storage has no generated-code or serialized ABI.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/jitstate_info.rs` vs Eden `backend/x64/jitstate_info.h`
 
 ### Intentional differences
+
 - Rust uses explicit `from_a32` and `from_a64` constant constructors because it cannot express
   Eden's templated constructor over arbitrary standard-layout JIT-state types.
 - `EmitContext` carries a value copy supplied by `BlockOfCode` because Rust emission temporarily
   borrows the assembler separately from its owner. The copied ten-field inventory is immutable for
   the block and is the counterpart of calling Eden's `BlockOfCode::GetJitStateInfo()`.
 
-### Unintentional differences (to fix)
-- Fixed: the upstream file owner was missing and `block_of_code.rs` held only three offsets, while
-  RSB, CPSR, and FPSR consumers independently selected A32 or A64 layouts.
-- Fixed: the shared saturation emitter hard-coded `A64JitState::fpsr_qc`; A32 saturation now writes
-  its own QC field through the `JitStateInfo` supplied by its `BlockOfCode`.
-
-### Missing items
-- None in the reviewed ten-field `JitStateInfo` inventory.
-
-### Binary layout verification
-- N/A: `JitStateInfo` describes host-side byte offsets and is neither copied to guest memory nor
-  serialized. Focused tests verify all ten values against both exact JIT-state layouts.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/emit_saturation.rs` vs Eden `backend/x64/emit_x64_saturation.cpp`
 
 ### Intentional differences
+
 - Runtime `SaturationOp` and bit-width matches replace Eden's template instantiations while keeping
   the same shared signed/unsigned helper boundaries and emitted operation ordering.
 - The mechanical `emit_or_qc` helper centralizes Eden's repeated byte-sized QC update without
@@ -11884,42 +7810,17 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   context holds an immutable IR block; Eden replaces uses with an immediate false during emission.
   Both paths expose the same value to generated code.
 
-### Unintentional differences (to fix)
-- Fixed: every QC update used the A64 offset, including A32 instructions.
-- Fixed: unsigned saturated add/sub used branchful saturation and QC paths; they now preserve
-  Eden's scratch-operand ownership, boundary move, `cmovae`, `setb`, and byte-sized sticky-QC OR.
-- Fixed: signed doubling multiply used a compare/branch special case; both widths now reproduce
-  Eden's doubled-product, sign test, conditional move, and sticky-QC sequence.
-
-### Missing items
-- None in the reviewed saturation opcode/helper inventory.
-
-### Binary layout verification
-- PASS: the focused A32 regression inspects emitted addressing and verifies that the QC write uses
-  offset 508 rather than A64 offset 940; both offsets are covered by the exact JIT-state layouts.
-  The executing scalar-saturation regression also verifies results and the architectural Q flag.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_a32.rs` vs Eden `backend/x64/a32_emit_x64.cpp` (`EmitA32OrQFlag`)
 
 ### Intentional differences
+
 - Rust uses `ArgumentInfo` and rxbyak's Rust register conversions, preserving Eden's immediate and
   register branches without changing method ownership.
-
-### Unintentional differences (to fix)
-- Fixed: the register path ORed a full dirty 32-bit temporary into the one-bit `cpsr_q` field.
-  It now ORs only `value.cvt8()`, while immediate one stores a dword one and immediate zero emits
-  nothing, exactly as Eden does.
-
-### Missing items
-- None in the reviewed `EmitA32OrQFlag` method.
-
-### Binary layout verification
-- PASS: no state layout changed; the executing A32 scalar-saturation regression confirms `cpsr_q`
-  remains exactly zero or one after SSAT/USAT/QADD-family flag updates.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/a32_emit_x64_memory.rs` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}` and `a32_emit_x64.h`
 
 ### Intentional differences
+
 - Rust expresses Eden's member methods as architecture-owned free functions. The A32 fallback-table
   loop, scalar stub primitives, and three fallback maps all live in this file; only the mechanical
   intra-buffer relative-call encoder is shared with A64.
@@ -11929,69 +7830,24 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   enabled; normal fastmem execution jumps over it. This is the Rust exception-handler counterpart
   of Eden's deferred fallback handler calling `EmitCheckMemoryAbort` before joining `end`.
 
-### Unintentional differences (to fix)
-- Fixed: all A32 memory emitters and the per-instruction fallback stub were owned by
-  `a32_emit_a32.rs`/`a32_emit_x64.rs`; they now live in the counterpart memory module.
-- Fixed: `EmitCheckMemoryAbort` was absent. Callback, page-table fallback, direct-fastmem fallback,
-  and exclusive paths now test `MemoryAbort`, restore the exact A32 PC/upper descriptor, and force
-  a dispatcher return in Eden's ordering.
-- Fixed: exclusive inline selection ignored `fastmem_exclusive_access`; disabled configurations
-  now use the callback path as upstream requires.
-- Fixed: inline exclusive reads used an unordered MOV and unordered fallback. They now use Eden's
-  always-ordered `lock xadd` sequence and ordered callback stub for every scalar width.
-- Fixed: a `do_not_fastmem` marker selected the entire non-inline exclusive path. The inline owner
-  now retains Eden's monitor lock/address/value lifecycle and calls the pre-generated fallback
-  under that lock when only the individual fastmem instruction has been disabled.
-- Fixed: A32 reused the A64 fallback generator and emitted unused 128-bit tables. Its owner now
-  generates exactly the upstream 8/16/32/64 inventory and registers Eden's exact per-width perf
-  symbol names.
-- Fixed: exclusive fastmem faults generated a second per-instruction callback stub, and exclusive
-  writes resumed directly after `cmpxchg`, where callback-modified host flags could produce a
-  wrong status. All A32 accesses now use the architecture-owned pre-generated tables; exclusive
-  write faults resume in Eden's explicit `AL`-to-status continuation before unlocking.
-- Fixed: generated accesses to `exclusive_state` used dword operations. Clear/set/test operations
-  now use the byte-sized field semantics emitted by Eden.
-
-### Missing items
-
-### Binary layout verification
-- PASS: no `A32JitState` field or offset changed. Memory-abort tests verify the embedded A32 resume
-  PC, upper descriptor, halt-reason offset, and disabled no-op path; the fallback inventory test
-  verifies exactly `2 * 14 * 14 * 4` entries per scalar table and rejects 128-bit A32 entries.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{a32_emit_x64_memory,a32_interface}.rs` vs Eden `backend/x64/{a32_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}`
 
 ### Intentional differences
+
 - Rust host trampolines recover `A32JitInner` in `a32_interface.rs`; the exclusive-monitor
   operations corresponding to Eden's generated lambdas live beside the generated-code owner in
   `a32_emit_x64_memory.rs`.
 - The shared callback container retains an unused clear-exclusive slot for the existing Rust FFI
   boundary, while A32 generated code clears `A32JitState::exclusive_state` directly like Eden.
 
-### Unintentional differences (to fix)
-- Fixed: non-inline exclusive callbacks previously owned the generated-code reservation lifecycle
-  and maintained a private `exclusive_value`. The emitter now sets, tests, atomically consumes, and
-  clears `exclusive_state` in Eden's exact order, while the global monitor alone owns the expected
-  value.
-- Fixed: non-inline exclusive operations could run without a global monitor. Their emitters now
-  enforce Eden's `ASSERT(conf.global_monitor != nullptr)` precondition.
-- Fixed: scalar exclusive reads did not explicitly zero-extend the callback result after the host
-  call. They now apply Eden's per-width zero extension before the memory-abort check.
-- Fixed: the A32 differential-test harness could generate LDREX/STREX without configuring Eden's
-  required global monitor. Its one-CPU test configuration now owns a monitor for the complete JIT
-  lifetime.
-
 ### Missing items
-- No missing item remains in the reviewed A32 scalar non-inline exclusive path.
 
-### Binary layout verification
-- PASS: the host-only private `exclusive_value` was removed from `A32JitInner`; the generated-code
-  `A32JitState` layout is unchanged. An executing LDREX/STREX/STREX regression verifies the global
-  monitor value, first-store success, reservation consumption, and second-store failure.
+- No missing item remains in the reviewed A32 scalar non-inline exclusive path.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/constants.rs` vs Eden `backend/x64/constants.h`
 
 ### Intentional differences
+
 - Eden's `Cmp`, `CmpInt`, `Tern`, and `FpClass` namespaces are Rust modules, with constant and enum
   spellings changed only to Rust naming conventions.
 - Rust has no default function arguments, so `fixup_lut` requires all eight `FpFixup` operands;
@@ -11999,22 +7855,15 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `convert_rounding_mode_to_x64_immediate` retains Eden's `Option<i32>` result. Consumers cast the
   proven two-bit value to `u8` only at rxbyak's more strongly typed instruction boundary.
 
-### Unintentional differences (to fix)
-- Fixed: the complete constants owner was absent and consumers embedded raw compare predicates and
-  duplicated rounding-mode maps. The full predicate, ternary, floating-point class, fixup, range,
-  and rounding inventories now live in the matching module.
-
 ### Missing items
+
 - No item is missing from the reviewed constants owner; AVX-512 consumers that use some currently
   unreferenced constants remain part of their respective emitter-file audits.
-
-### Binary layout verification
-- PASS: `FpFixup`, `FpRangeSelect`, and `FpRangeSign` use `repr(u8)` and exhaustive tests verify all
-  discriminants, bitmasks, LUT bit placement, aliases, and rounding immediates.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/oparg.rs` vs Eden `backend/x64/oparg.h`
 
 ### Intentional differences
+
 - Rust stores the register-or-address alternatives in `RegMem` rather than a manually tagged C++
   union. The default/uninitialized C++ `Operand` state is represented by `None` and rejected when
   consumed; every upstream `UseOpArg` consumer initializes the wrapper before use.
@@ -12025,57 +7874,24 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Rust rxbyak surface does not expose Xbyak's three-operand immediate overload. The resulting
   lower 32-bit value is identical; only the emitted instruction sequence differs.
 
-### Unintentional differences (to fix)
-- Fixed: the matching owner and `RegAlloc::UseOpArg` boundary were absent. Add/sub, multiply,
-  multiply-high, AND/OR/EOR, and AND-NOT consumers now use the wrapper at all 15 upstream sites
-  instead of duplicating register-width conversion locally.
-- Fixed: both AND-NOT emitters materialized immediate operands through the generic register path.
-  They now preserve Eden's immediate `MOV`/`AND` branches and their exact signed-32-bit selection
-  rule for the 64-bit operation.
-
-### Missing items
-- None in the reviewed `OpArg` owner or its current `emit_x64_data_processing.cpp` consumers.
-
-### Binary layout verification
-- N/A: `OpArg` is an emission-time tagged operand and is never serialized or copied into guest/JIT
-  state. Focused tests cover the default state, all four upstream GPR widths, address-size changes
-  without altering the address expression, and executing immediate AND-NOT paths.
-
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.rs` vs Eden `backend/x64/{block_of_code,a32_emit_x64,a64_emit_x64}.{h,cpp}` (prelude lifecycle)
 
 ### Intentional differences
+
 - Rust's `gen_run_code` returns byte-offset dispatcher labels to the owning emitter, whereas Eden's
   `BlockOfCode` stores native function pointers. Both now leave the prelude open until the
   architecture emitter explicitly completes it.
 - `rxbyak` reserves the complete executable buffer up front, so there is no Linux operation
   corresponding to Eden's Windows-only incremental `EnsureMemoryCommitted` implementation.
 
-### Unintentional differences (to fix)
-- Fixed: `gen_run_code` completed the prelude before architecture fallback tables and terminal
-  handlers were emitted. Cache clearing therefore rewound into permanent code and could overwrite
-  it. A32 now emits fallbacks, terminal handlers, then completes the prelude exactly in Eden's
-  constructor order; A64 does the same for its currently ported permanent stubs.
-- Fixed: A64 generated terminal handlers before fallback tables and regenerated both after every
-  cache clear. Permanent stubs now remain below `code_begin` and `clear_cache` only rewinds dynamic
-  blocks, as Eden's `EmitX64::ClearCache` does.
-- Fixed: both architecture emitters performed their own low-space cache clear in addition to the
-  interface-owned capacity check. Capacity invalidation remains solely in the matching A32/A64
-  interface owner.
-- Fixed: x64 execution tests configured 4 MiB caches despite Eden documenting an approximately
-  8 MiB minimum. The complete A32 prelude left less than the mandatory 1 MiB compilation reserve,
-  causing perpetual clear/recompile dispatch. Test configurations now use 16 MiB.
-
 ### Missing items
-- Resolved by the 2026-08-24 A64 memory-prelude follow-up below.
 
-### Binary layout verification
-- N/A: this changes generated-code lifecycle and test cache capacity, not either architecture's
-  JIT-state layout. The executing x64 back-edge regression verifies bounded linked and unlinked
-  dispatch after the corrected prelude boundary.
+- Resolved by the 2026-08-24 A64 memory-prelude follow-up below.
 
 ## 2026-08-24 — `src/rdynarmic/src/backend/x64/{a64_emit_x64_memory,a64_emit_x64,a64_interface,emit_context,emit_x64_memory}.rs` vs Eden `backend/x64/{a64_emit_x64_memory.cpp,a64_emit_x64.{h,cpp},emit_x64_memory.{h,cpp.inc},callback.cpp}`
 
 ### Intentional differences
+
 - Rust stores generated-code byte offsets in `Memory128Accessors` and resolves them relative to the
   owning code buffer; Eden stores native function pointers. The accessors remain below
   `code_begin` and survive cache clears under the same lifetime.
@@ -12085,30 +7901,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Existing opt-in `RUZU_*` diagnostic traps remain in the A64 memory owner. They emit no guest path
   changes unless explicitly enabled through the environment.
 
-### Unintentional differences (to fix)
-- Fixed: A64 omitted `GenMemory128Accessors`, generated no ordinary 128-bit write fallbacks, and
-  routed ordinary `ReadMemory128`/`WriteMemory128` through a separate callback-only owner. The
-  generated accessors, all 6,048 fallback entries, dispatcher ownership, and permanent-prelude
-  ordering now match Eden.
-- Fixed: ordered 128-bit packing and extraction unconditionally emitted SSE4.1 instructions. The
-  SSE2 `movq`/`punpck*qdq` alternatives now follow `emit_x64_memory.h`.
-- Fixed: direct callback and deferred fastmem/page-table fallbacks skipped Eden's post-access
-  `EmitCheckMemoryAbort`; all scalar and 128-bit paths now restore the exact A64 resume PC and force
-  a dispatcher return when `MemoryAbort` is set.
-- Fixed: the raw 128-bit exclusive-write trampoline used pointer payloads on System V. The generated
-  accessor now fills `ABI_PARAM3` through `ABI_PARAM6` and calls a scalar-lane trampoline there,
-  while Windows retains Eden's two pointer payloads and compiler-specific hidden-return ordering.
-
-### Missing items
-
-### Binary layout verification
-- PASS: Windows generated accessors use exact 16-byte value/expected payloads after the 32-byte
-  shadow space; System V transfers two 64-bit lanes per value. Linux execution covers direct and
-  faulting fastmem `LDR/STR Q`, while Windows and AArch64 cross-target test builds pass.
-
 ## 2026-08-24 — `src/rdynarmic/src/tests_a32_fuzz.rs` and `tools/a32_oracle.cpp` vs Eden A32 JIT differential-test behavior
 
 ### Intentional differences
+
 - Test-only runners retain one Rust JIT and one Eden oracle process per test thread. Between cases
   they reset CPU state, clear the complete code cache, replace code memory, clear data memory,
   restore the 200-tick budget, and use the same optimization configuration as the former
@@ -12117,29 +7913,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   only; the one-shot and existing `INIT` protocols remain compatible.
 
 ### Unintentional differences (to fix)
-- Fixed: the differential harness rebuilt both JITs and spawned an Eden process for every case,
-  making the full-coverage fuzz tests appear blocked for minutes. Persistent runners now preserve
-  case isolation while removing initialization overhead.
+
 - Fixed during verification: calling `ClearCache` before `Reset` lost Eden's pending
   `CacheInvalidation` halt bit because `Reset` zeroes the JIT state. Both runners now perform
   `Reset` before `ClearCache`, so the following `Run` consumes the invalidation exactly as Eden's
   A32 interface requires.
-- Fixed: the Eden oracle left `UserConfig::global_monitor` null even though the generated Thumb32
-  corpus includes exclusive loads and stores. Those cases terminated the oracle with SIGSEGV and
-  were silently skipped; all oracle modes now own a one-core `ExclusiveMonitor`, matching the Rust
-  runner and restoring the missing comparisons.
-
 ### Missing items
-- None for the reviewed differential-test lifecycle. An older externally configured oracle falls
-  back to the original one-shot protocol, and a failed batch session also falls back safely.
 
-### Binary layout verification
-- PASS: the text protocol still transfers exactly 15 input GPRs, an instruction count, the code
-  words, 16 output GPRs, and CPSR. No production or guest-visible binary structure changed.
+- An older externally configured oracle falls
+  back to the original one-shot protocol, and a failed batch session also falls back safely.
 
 ## 2026-08-24 — `src/core/src/hle/service/bcat/{bcat,service_creator}.rs` vs Eden `src/core/hle/service/bcat/{bcat,service_creator}.{h,cpp}`
 
 ### Intentional differences
+
 - Rust uses explicit `ServiceFramework` callbacks and `CmifResponse` in place of Eden's compile-time
   `D<&IServiceCreator::...>` CMIF wrappers. Commands 0 and 1 read the same out-of-band client process
   ID, while command 2 reads the same raw application ID; all return one IPC interface.
@@ -12149,204 +7936,111 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   controller and runtime program ID remain owned by `System`, and their lookup ordering matches
   Eden.
 
-### Unintentional differences (to fix)
-- None in commands 0, 1, or 2.
-
 ### Missing items
-- None in the three commands implemented by Eden. Commands 3 and 4 remain null entries on both
-  sides.
 
-### Binary layout verification
-- N/A: `ClientProcessId` is supplied by the HIPC handle descriptor rather than serialized in the
-  raw CMIF payload. Command 2 carries one aligned `u64`; every response contains only a result code
-  plus one IPC interface.
+- Commands 3 and 4 remain null entries on both
+  sides.
 
 ## 2026-08-24 — `src/core/src/hle/service/bcat/delivery_cache_storage_service.rs` vs Eden `src/core/hle/service/bcat/delivery_cache_storage_service.{h,cpp}` (`EnumerateDeliveryCacheDirectory`)
 
 ### Intentional differences
+
 - Rust protects `entries` and `next_read_index` with mutexes because service callbacks receive a
   shared reference. Both values remain owned together by `IDeliveryCacheStorageService`, and the
   lock scope preserves Eden's count, copy, then index-advance ordering.
 
-### Unintentional differences (to fix)
-- None in the three storage-service commands implemented by Eden.
-
-### Missing items
-- None. Commands 0 and 1 return their corresponding child interfaces; command 10 uses Eden's HIPC
-  map-alias output buffer and signed 32-bit count.
-
-### Binary layout verification
-- PASS: `DirectoryName` retains its fixed upstream payload layout; the handler copies complete
-  entries and serializes the count as `s32`.
-
 ## 2026-08-24 — `src/video_core/src/texture_cache/image_view_info.rs` vs Eden `src/video_core/texture_cache/image_view_info.{h,cpp}`
 
 ### Intentional differences
+
 - Rust expresses Eden's mutable local `TextureType` switch as an enum match. The promotion rules and
   subsequent view-type switch remain in the same file and order.
-
-### Unintentional differences (to fix)
-- Fixed: Ruzu previously skipped Eden's promotion of 1D, 2D, and cube TIC types to their array forms
-  when `Depth() > 1` or `base_layer != 0`. A layered 2D TIC consequently reached the scalar 2D
-  assertion and aborted the GPU thread.
-
-### Missing items
-- None in the TIC view-type selection path.
-
-### Binary layout verification
-- PASS: `ImageViewInfo` fields and `repr(C)` layout are unchanged; this correction only restores the
-  constructor's type-selection control flow. Focused tests cover depth-driven and base-layer-driven
-  2D-array promotion.
 
 ## 2026-08-24 — `src/core/src/hle/service/ns/{service_getter_interface,application_manager_interface}.rs` vs Eden `src/core/hle/service/ns/{service_getter_interface,application_manager_interface}.{h,cpp}`
 
 ### Intentional differences
+
 - Rust returns the child service with an explicit `ResponseBuilder` IPC interface instead of Eden's
   `Out<SharedPointer<IApplicationManagerInterface>>` serialization wrapper. `SystemRef` preserves
   the same non-owning system lifetime.
 
 ### Unintentional differences (to fix)
+
 - The application-manager child now exists and owns its command table, but most Eden-implemented
   application-manager callbacks and its service-context events are not yet ported.
 - Several other `IServiceGetterInterface` child getters remain disconnected despite being wired in
   Eden; the application-manager getter required by the observed launch path is now connected.
 
 ### Missing items
+
 - Full `IApplicationManagerInterface` method/event parity and the remaining service-getter child
   callbacks.
-
-### Binary layout verification
-- N/A: this slice creates and transfers IPC service objects; it does not introduce a raw-memory
-  payload. The focused test verifies that command 7996 returns the application-manager owner with
-  its current command table.
 
 ## 2026-08-24 — `src/shader_recompiler/src/frontend/translate/load_store_local_shared.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/load_store_local_shared.cpp`
 
 ### Intentional differences
+
 - Rust uses the existing `IR::Reg` counterpart and converts its index only at the legacy
   `TranslatorVisitor::x`/`set_x` boundary. Register ownership, alignment checks, and arithmetic stay
   in the translating module as in Eden.
 
-### Unintentional differences (to fix)
-- Fixed: the local/shared translator previously treated register fields as raw integers. This made
-  `RZ` fail wide-register alignment (`255 % 2 != 0`) and made `RZ + n` wrap through the legacy `u8`
-  conversion instead of remaining `RZ`, unlike Eden's `IR::IsAligned` and `Reg::operator+`.
-
-### Missing items
-- None in the register decoding, alignment, or consecutive-register behavior of LDL, LDS, STL, and
-  STS.
-
-### Binary layout verification
-- N/A: the change only affects shader IR construction and does not alter a serialized structure.
-
 ## 2026-08-24 — `src/shader_recompiler/src/frontend/{decode.rs,translate/mod.rs}` vs Eden `src/shader_recompiler/frontend/maxwell/{decode.cpp,translate/translate.cpp}`
 
 ### Intentional differences
+
 - Rust keeps the generated mask-table lookup returning `Option`, while the upstream-owned
   `decode.rs::decode` wrapper converts an unmatched word to `NOP`. This preserves Eden's public
   `Decode` contract without rebuilding the generated table API.
 - Eden's failed soft assertion is represented by an error log because Ruzu has no process-wide
   `AssertFailSoftImpl` setting in this crate.
 
-### Unintentional differences (to fix)
-- Fixed: `TranslatorVisitor::translate_instruction` previously used the optional table helper
-  directly and issued an ordinary Rust panic for an unmatched word. Eden reports the soft assert,
-  returns `Opcode::NOP`, and continues translation when debug assertions are disabled.
-
 ### Missing items
+
 - Other CFG/branch-tracking callers still consume the optional low-level decoder directly. Their
   current unmatched-word behavior is equivalent to NOP for control-flow analysis, but they do not
   emit Eden's soft diagnostic.
 
-### Binary layout verification
-- N/A: decoder return behavior changes only shader control flow; instruction words and IR layouts
-  are unchanged.
-
 ## 2026-08-24 — `src/shader_recompiler/src/frontend/{location.rs,control_flow.rs}` vs Eden `src/shader_recompiler/frontend/maxwell/{location.h,control_flow.cpp}`
 
 ### Intentional differences
+
 - Rust spells Eden's implicit `u32`-to-`Location` construction as explicit `Location::new` calls
   for absolute, relative, and indirect branch targets.
-
-### Unintentional differences (to fix)
-- Fixed: Ruzu stored a shader-relative scheduling-grid phase in every `Location`. Eden always
-  classifies scheduling words with the absolute byte offset modulo 32. At the `0x50` end of a
-  Maxwell program header, the relative grid skipped the first instruction and later decoded an
-  absolute scheduling word as an instruction, corrupting shader control flow.
-
-### Missing items
-- None in `Location` construction, alignment, stepping, backing, virtual locations, or the CFG's
-  construction of branch targets.
-
-### Binary layout verification
-- N/A: `Location` is internal shader-frontend state and is not serialized. Focused tests verify
-  Eden's absolute scheduling grid at the `0x50` program-header boundary and at an aligned
-  scheduling word.
 
 ## 2026-08-24 — `src/shader_recompiler/src/pipeline_cache.rs` translation driver vs Eden `src/shader_recompiler/frontend/maxwell/{translate/translate.cpp,translate_program.cpp}`
 
 ### Intentional differences
+
 - Rust materializes structured actions from a cached instruction slice and flat word indices.
   Eden iterates absolute `Location` values and reads each instruction through `Environment`.
   The Rust slice driver therefore converts each word index back to its absolute byte offset before
   applying Eden's scheduling-word rule.
 
-### Unintentional differences (to fix)
-- Fixed: the slice driver previously classified every `code[4n]` as a scheduling word regardless
-  of the slice's absolute base address. A graphics shader body beginning at the `0x50` end of its
-  program header consequently skipped `code[0]` and translated `code[2]` at absolute `0x60`, the
-  opposite of Eden's `Location` iteration.
-
 ### Missing items
+
 - The compatibility driver still represents instruction ranges as slice-local word indices rather
   than retaining Eden's absolute `Location` values through structured translation.
-
-### Binary layout verification
-- N/A: this correction changes instruction selection only. The focused regression test verifies
-  scheduling-word classification for a slice beginning at absolute byte offset `0x50`.
 
 ## 2026-08-24 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/buffer_cache/buffer_cache.h`
 
 ### Intentional differences
+
 - Rust collects tracker callbacks before mutating `gpu_modified_ranges` to satisfy exclusive
   borrowing, then performs Eden's range construction and clearing in the same order.
 - Device memory is optional during Ruzu's cache setup lifecycle, so the final writes are guarded
   until the memory manager has been attached.
 
-### Unintentional differences (to fix)
-- Fixed: a Ruzu-only `DISABLE_DOWNLOADS = true` debug constant returned after clearing the dirty
-  ranges but before either download path. GPU-written buffers therefore remained stale in guest
-  memory; in particular, CPU shader recompilation could read zeroed dynamically generated shaders.
-
-### Missing items
-- None in the verified synchronous `DownloadBufferMemory` staging and immediate-download paths.
-
-### Binary layout verification
-- N/A: the correction transfers existing buffer bytes and changes no raw-memory payload layout.
-  The focused regression test verifies a GPU-modified cache range is copied back byte-for-byte.
-
 ## 2026-08-24 — `src/video_core/src/engines/maxwell_3d.rs::hle_bind_shader` vs Eden `src/video_core/macro.cpp::HLE_BindShader::Execute`
 
 ### Intentional differences
+
 - Rust addresses the flattened Maxwell register array through the corresponding register constants;
   Eden accesses the typed `Regs` members directly.
-
-### Unintentional differences (to fix)
-- Fixed: Ruzu reset `const_buffer.offset` to zero while binding a shader. Eden updates only the
-  constant-buffer size and address and deliberately preserves the current offset before
-  `ProcessCBBind`.
-
-### Missing items
-- None in the verified pipeline-offset, shader-dirty, scratch-register, constant-buffer, and bind
-  group updates performed by `HLE_BindShader`.
-
-### Binary layout verification
-- N/A: the change preserves one existing register value and does not alter register layout. The
-  focused regression test initializes a nonzero offset and verifies it survives the bind.
 
 ## 2026-08-24 — `src/shader_recompiler/src/frontend/translate/{mod.rs,load_store_local_shared.rs}` and `src/shader_recompiler/src/pipeline_cache.rs` vs Eden `src/shader_recompiler/frontend/maxwell/{translate/impl/impl.h,translate/impl/load_store_local_shared.cpp,translate/translate.cpp,translate_program.cpp}`
 
 ### Intentional differences
+
 - Runtime translation now retains a shared Rust reference to `Environment`, corresponding to
   Eden's `TranslatorVisitor::env`. Reduced instruction-level fixtures may still construct a
   visitor without an environment and use their explicit program-header/program metadata.
@@ -12354,46 +8048,24 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   each instruction through `Environment`. The active environment is nevertheless passed to every
   runtime `TranslatorVisitor`, preserving the state ownership required by instruction handlers.
 
-### Unintentional differences (to fix)
-- Fixed: local-memory bounds checks previously used the cloned graphics program header whenever
-  one was present. Compute environments have their allocation in `Environment::LocalMemorySize`,
-  so a zero-valued header caused every immediate `STL` to be discarded. Both `LDL` bounds checks
-  and `STL` rejection now query the active environment exactly like Eden.
-
-### Missing items
-- None in the verified local-memory size lookup, immediate `STL` bounds decision, or runtime
-  visitor/environment ownership path.
-
-### Binary layout verification
-- N/A: this changes IR instruction retention and no serialized or raw-memory structure. The
-  focused compute regression uses a zero-sized SPH plus a nonzero environment allocation and
-  verifies that an in-bounds `STL.B32` produces `WriteLocal`.
-
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/present_manager.rs` vs Eden `src/video_core/renderer_vulkan/vk_present_manager.{h,cpp}`
 
 ### Intentional differences
+
 - Rust exposes Eden's function-local two-element wait-stage constant through a private helper so
   the production synchronization contract can be covered by a focused unit test.
 - Rust owns Vulkan images and memory explicitly rather than through Eden's memory-allocator
   wrappers; this does not change the verified barrier or semaphore ordering.
 
-### Unintentional differences (to fix)
-- Fixed: Ruzu waited for swapchain acquisition at `COLOR_ATTACHMENT_OUTPUT`, after the first
-  transfer command was already allowed to run. Eden waits for both the acquisition semaphore and
-  `render_ready` at `TRANSFER`, before the final copy or blit touches either image.
-- Fixed: the pre-copy image barrier used `ALL_COMMANDS`; it now uses Eden's
-  `PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER` mask before transitioning to `TRANSFER`.
-
 ### Missing items
+
 - Eden's optional storage-image presentation path and frame-generation integration are not ported;
   they are independent of the verified ordinary composite-to-swapchain synchronization path.
 
-### Binary layout verification
-- N/A: the change affects Vulkan stage masks only. The focused regression test verifies the exact
-  two-element transfer-stage wait array used by the production submit.
 ## 2026-08-25 — `src/shader_recompiler/src/frontend/{location,control_flow,maxwell_opcodes}.rs` and `pipeline_cache.rs` vs Eden Maxwell frontend
 
 ### Intentional differences
+
 - Rust materializes Eden's `maxwell.inc` macro table once through `OnceLock`. The 280 names,
   encodings, source order, and first-match decode rule are identical to upstream.
 - Rust converts absolute Maxwell `Location` ranges to indices into a cached instruction slice.
@@ -12401,36 +8073,26 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   are skipped on Eden's absolute 32-byte grid.
 
 ### Unintentional differences (to fix)
+
 - The code-slice-only OpenGL helpers still build their CFG with the older relative-word builder;
   the environment-owned Vulkan path now uses the upstream absolute `Location` path.
 
 ### Missing items
+
 - Direct ownership parity for upstream `Translate(Environment&, IR::Block*, location_begin,
   location_end)` remains part of the wider shader translation refactor.
-
-### Binary layout verification
-- N/A: these files decode and translate instructions without defining a serialized payload.
-  Regression tests cover non-zero scheduling-grid phases and the upstream opcode collisions.
 
 ## 2026-08-25 — `src/video_core/src/{shader_environment,shader_cache}.rs` vs Eden `shader_environment.{h,cpp}` and `shader_cache.{h,cpp}`
 
 ### Intentional differences
+
 - `GenericEnvironmentOwner` represents C++ base-subobject access without erasing the concrete
   graphics or compute environment required by virtual resource callbacks.
-
-### Unintentional differences (to fix)
-- None in the reviewed shader-size and slow cache-analysis paths.
-
-### Missing items
-- None in `TryFindSize` termination or `ShaderCache::MakeShaderInfo` CFG ownership.
-
-### Binary layout verification
-- PASS: the existing serialized environment layout is unchanged. Tests verify the non-proprietary
-  EXIT terminator and the proprietary-driver self-branch behavior separately.
 
 ## 2026-08-25 — Vulkan shader/rasterizer invalidation and compute-cache parity
 
 ### Intentional differences
+
 - Ruzu mirrors Maxwell dirty flags for a draw while Eden's state tracker points directly at live
   flags. When pipeline configuration rotates the command buffer, Ruzu reapplies Eden's
   invalidation mask to that draw-scoped mirror.
@@ -12438,6 +8100,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   cache entry without moving successful pipelines when the Rust hash map grows.
 
 ### Unintentional differences (to fix)
+
 - Graphics-pipeline translation and runtime-info construction remain owned by
   `graphics_pipeline.rs` instead of the upstream `vk_pipeline_cache.cpp` counterpart.
 - Runtime graphics pipeline construction remains conditional on the asynchronous-shader setting,
@@ -12445,16 +8108,14 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   waits.
 
 ### Missing items
+
 - The graphics-pipeline ownership and runtime-info parity slice, including MoltenVK-only fragment
   color types, geometry passthrough/layer emulation, geometry point size, and the device XFB guard.
-
-### Binary layout verification
-- PASS: pipeline key serialization is unchanged. Focused tests cover negative compute-cache state,
-  draw-scoped invalidation, image capability collection, and zero-register vector accesses.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/{pipeline_cache,graphics_pipeline}.rs` vs Eden `vk_pipeline_cache.{h,cpp}` and `vk_graphics_pipeline.{h,cpp}`
 
 ### Intentional differences
+
 - `GraphicsPipelineBuilder` is a Rust lifetime adapter for the state captured by Eden's pipeline
   worker jobs. Shader translation, `MakeRuntimeInfo`, SPIR-V emission, module creation, and layer
   emulation remain owned by `pipeline_cache.rs`; Vulkan graphics-pipeline construction remains
@@ -12469,19 +8130,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Android's configurable pipeline-worker count is not applicable to the currently supported
   desktop targets; non-Android worker-count selection matches Eden.
 
-### Unintentional differences (to fix)
-- None in the reviewed runtime-info, graphics/compute translation, pipeline build scheduling, or
-  negative-cache paths.
-
-### Missing items
-- None in the ownership, behavior, or GPU shader-logging slice covered by the two parity reports.
-
-### Binary layout verification
-- PASS: compute and graphics pipeline cache keys and their serialized byte encodings are unchanged.
-  The ownership move only relocates implementation logic. Focused tests cover MoltenVK-only color
-  types, geometry point size, transform-feedback capability guards, geometry passthrough state,
-  negative compute entries, and fixed-state serialization.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`
 
 ### Intentional differences
@@ -12490,43 +8138,16 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   two file-local helpers so the exact payload contract is directly testable. Both hooks remain in
   the matching pipeline-cache owner.
 
-### Unintentional differences (to fix)
-
-- None after passing every successfully emitted graphics SPIR-V module to `Device::save_shader`,
-  then logging and optionally dumping graphics and compute SPIR-V only after successful Vulkan
-  shader-module creation, with independent `is_active` and `gpu_log_shader_dumps` guards, and
-  restoring Eden's graphics shader-module debug names after those hooks.
-
-### Missing items
-
-- None in the shader save/log/dump lifecycle owned by `PipelineCache`.
-
-### Binary layout verification
-
-- PASS: pipeline cache keys and their serialized encodings are unchanged; the added operations
-  consume emitted SPIR-V words without modifying them.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
 
 ### Intentional differences
+
 - Rust splits construction from synchronous or worker-backed Vulkan pipeline completion so the
   worker owns an immutable snapshot instead of capturing a movable `this`. The shader build
   notification still begins at graphics-pipeline construction and completes from the selected
   build path.
 - Scheduler pipeline identity uses the stable Rust `GraphicsPipeline` address through a raw
   identity handle; this is the direct counterpart of Eden tracking `GraphicsPipeline*`.
-
-### Unintentional differences (to fix)
-- None in the reviewed construction, vertex-input, runtime-info, geometry-passthrough, pipeline
-  configuration, bind-order, or GPU-logging paths. `MarkShaderBuilding` is now owned by the Rust
-  graphics pipeline constructor counterpart instead of `pipeline_cache.rs`.
-
-### Missing items
-- None in `GraphicsPipeline`.
-
-### Binary layout verification
-- PASS: no serialized or raw-copied layout changed. The correction only moves notification
-  ownership across the existing constructor boundary.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}`
 
@@ -12536,46 +8157,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   their exact payloads can be covered without constructing Vulkan objects. The helpers remain in
   the matching pipeline owner file; logger access uses the process-wide singleton functions.
 
-### Unintentional differences (to fix)
-
-- None after logging a graphics bind only when the scheduler changes pipeline and Eden's Vulkan
-  call logging guard is enabled, and logging successful graphics-pipeline creation with the exact
-  shader-stage and color-attachment counts after publishing the created handle and before
-  collecting pipeline statistics, in Eden's lifecycle order.
-
-### Missing items
-
-- None in the GPU-logging hooks owned by `GraphicsPipeline`.
-
-### Binary layout verification
-
-- N/A: the change adds host-side logging calls without modifying pipeline keys, Vulkan create
-  structures, descriptor payloads, or serialized data.
-
 ## 2026-08-26 — `src/video_core/src/host1x/{host1x,nvdec}.rs` vs Eden `src/video_core/host1x/host1x.{h,cpp}` and `nvdec.cpp`
 
 ### Intentional differences
+
 - Rust stores active Host1x devices in a `HashMap` of `CDmaPusher` owners instead of Eden's fixed
   array of `Nvdec`/`Vic` variants. Each pusher owns the same concrete processor and dropping an
   entry performs the corresponding device destructor lifecycle.
 - `Arc<Frame>` and a mutex-protected Rust `HashMap`/`VecDeque` replace `shared_ptr<Frame>` and the
   mutex-protected C++ containers while preserving the per-FD `FrameDevice` boundary.
 
-### Unintentional differences (to fix)
-- None in the reviewed Host1x aggregation and frame-queue paths. Presentation and decode queues
-  are now capped at Eden's 100 and 200 entries, presentation retrieval is constant-time, NVDEC
-  destruction closes its frame device, and unsupported channel dispatch is handled only by the
-  upstream default branch.
-
-### Missing items
-- None in this Host1x aggregation slice.
-
-### Binary layout verification
-- N/A: these containers and device owners are host-only and are not raw-copied or serialized.
-
 ## 2026-08-26 — `src/video_core/src/host1x/codecs/h264.rs` vs Eden `src/video_core/host1x/codecs/h264.{h,cpp}` and `codec_types.h`
 
 ### Intentional differences
+
 - The Rust decoder trait returns an owned `Vec<u8>` from `compose_frame`; Eden returns a span into
   `frame_scratch`. This avoids retaining a borrow into the decoder while the shared decode path
   queries offsets and mutably drives `DecodeApi`; the generated byte sequence is identical.
@@ -12585,121 +8180,63 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden's unused `scan_scratch` member is omitted; both implementations use the same immutable
   4x4 and 8x8 zig-zag orders directly.
 
-### Unintentional differences (to fix)
-- None in the reviewed context layout, bitfield extraction, SPS/PPS construction, scaling-list
-  order, Exp-Golomb encoding, frame-header insertion, or output-offset calculations.
-
-### Missing items
-- None in this H.264 decoder slice.
-
-### Binary layout verification
-- PASS: `Offset`, `H264ParameterSet`, `DpbEntry`, `DisplayParam`, and
-  `H264DecoderContext` retain Eden's sizes and field offsets. Focused tests also verify signed and
-  unsigned bitfield extraction from the raw 64-bit parameter word.
-
 ## 2026-08-25 — `src/video_core/src/query_cache/query_stream.rs` vs Eden `src/video_core/query_cache/query_stream.h`
 
 ### Intentional differences
+
 - Rust represents Eden's virtual base class as `StreamerInterfaceBase` plus the
   `StreamerInterface` trait; both dependency masks remain owned by that base state.
-
-### Unintentional differences (to fix)
-- None. Fixed the inherited yuzu behavior where `get_dependent_mask` returned
-  `dependence_mask`; it now returns Eden's distinct `dependent_mask`.
-
-### Missing items
-- None in the reviewed streamer base and simple-streamer owner.
-
-### Binary layout verification
-- N/A: the streamer state is internal and is not serialized or copied as a raw payload.
-  The focused regression test verifies both directions of the dependency relationship.
 
 ## 2026-08-25 — `src/video_core/src/engines/puller.rs` vs Eden `src/video_core/engines/puller.{h,cpp}`
 
 ### Intentional differences
+
 - Rust passes `true` to `RasterizerInterface::release_fences` because the Rust interface exposes
   the force argument explicitly; Eden's puller calls its argument-less wrapper.
 - Raw engine identifiers are represented by the transparent `EngineID` newtype so unsupported
   values retain Eden's `static_cast<EngineID>` bit pattern.
 
-### Unintentional differences (to fix)
-- None in the corrected semaphore-trigger path. An unsatisfied `AcquireEqual`, `AcquireGequal`, or
-  `AcquireMask` now releases fences once and returns, matching Eden's single-pass
-  `do { ... } while (false)` control flow instead of busy-waiting in the puller thread.
-
-### Missing items
-- None in the reviewed bind, dispatch, fence, and semaphore paths. `NV01_TIMER` now binds and
-  dispatches through its matching engine counterpart.
-
-### Binary layout verification
-- PASS: `PullerRegs` remains a 0x800-word register array and all typed accessors retain Eden's
-  asserted word offsets. The focused regression test verifies the one-pass acquire state changes.
-
 ## 2026-08-25 — `src/video_core/src/engines/engine_interface.rs` vs Eden `src/video_core/engines/engine_interface.h`
 
 ### Intentional differences
+
 - Rust extracts the inherited fields into `EngineInterfaceState` and exposes
   `has_pending_methods` to preserve Eden's guarded `ConsumeSink` behavior across trait objects.
 - `EngineHandle` retains Eden's non-owning engine-pointer semantics for Rust fat pointers.
 
-### Unintentional differences (to fix)
-- None. Restored `Nv01Timer = 0` and the exact discriminants of all following `EngineTypes`.
-- None. `consume_sink` now calls `consume_sink_impl` only when the method sink is non-empty, as
-  Eden does.
-
-### Missing items
-- None in the reviewed interface and shared state.
-
-### Binary layout verification
-- N/A: this interface state is not serialized or copied as a raw payload. A focused test verifies
-  every `EngineTypes` discriminant.
-
 ## 2026-08-25 — `src/video_core/src/engines/nv01_timer.rs` vs Eden `src/video_core/engines/nv01_timer.h`
 
 ### Intentional differences
+
 - The ignored `MemoryManager&` constructor argument is accepted as an `Arc<Mutex<MemoryManager>>`
   to match the existing Rust engine construction boundary; neither implementation stores it.
 - Inherited `EngineInterface` fields live in `EngineInterfaceState` because Rust has no field
   inheritance.
 
 ### Unintentional differences (to fix)
-- None. Single and multi-method calls only log their arguments, and `consume_sink_impl` remains an
+
+- Single and multi-method calls only log their arguments, and `consume_sink_impl` remains an
   intentional no-op exactly like Eden.
-
-### Missing items
-- None.
-
-### Binary layout verification
-- PASS: `Regs` is exactly 0x48 bytes and is deterministically zero-initialized. A focused layout
-  test verifies its size.
 
 ## 2026-08-25 — `src/video_core/src/control/channel_state.rs` vs Eden `src/video_core/control/channel_state.{h,cpp}`
 
 ### Intentional differences
+
 - Eden's optional `Payload` is represented by individually boxed optional engines and a boxed DMA
   pusher so their addresses remain stable for non-owning engine handles.
 - Maxwell3D guest-memory and tick callbacks are Rust adapters required by the flattened owner.
 
-### Unintentional differences (to fix)
-- None. `init` now creates the NV01 timer and calls the file-owned NVK default-subchannel helper,
-  binding 3D/compute/2D/copy to subchannels 0/1/3/4 in Eden's order.
-
-### Missing items
-- None in the reviewed payload construction, default binding, and rasterizer-binding lifecycle.
-
-### Binary layout verification
-- N/A: `ChannelState` is an internal owner and is not serialized or copied as an upstream C++
-  payload. A focused test verifies every NVK default binding and the deliberately empty M2MF slot.
-
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/state_tracker.rs` vs Eden `src/video_core/renderer_vulkan/vk_state_tracker.{h,cpp}`
 
 ### Intentional differences
+
 - Rust stores the bound channel's live dirty-flag array through `NonNull` and keeps an owned
   fallback array, preserving Eden's non-owning `Flags*` lifecycle.
 - `apply_command_buffer_invalidation` applies Eden's mask to the draw-scoped Rust flag mirror when
   pipeline configuration rotates the command buffer.
 
 ### Unintentional differences (to fix)
+
 - Fixed `SetupDirtyViewports`: both `surface_clip` words in table 1 now map to `Viewports`.
 - Fixed `MakeInvalidationFlags`: command-buffer invalidation now contains exactly Eden's 37 named
   flags plus all 32 vertex-buffer, vertex-attribute, and vertex-binding flags; render targets,
@@ -12708,13 +8245,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   of starting with every known flag dirty.
 - Restored the header-owned `invalidate_state_enable_flag` operation for scheduler pipeline-state
   transitions.
-
-### Missing items
-- None in the reviewed table setup, invalidation mask, channel binding, and touch/check methods.
-
-### Binary layout verification
-- N/A: dirty flags are internal boolean lookup arrays rather than serialized payloads. Focused
-  tests verify the 133-bit invalidation mask and both surface-clip table entries.
 
 ## 2026-08-25 — `src/common/src/thread.rs` vs Eden `src/common/thread.{h,cpp}` (`SetCurrentThreadPriority` prerequisite)
 
@@ -12725,10 +8255,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Unsupported non-Unix/non-Windows targets retain a no-op fallback. Eden has a dedicated Haiku
   priority mapping which is not a supported Ruzu build target.
 
-### Unintentional differences (to fix)
-
-- None in the Linux, Windows, or generic POSIX priority mapping covered by this prerequisite.
-
 ### Missing items
 
 - Android's topology-policy registration (`RememberCurrentThreadNice`) and the related
@@ -12736,10 +8262,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   priority prerequisite and depend on Eden's Android-only topology/ADPF infrastructure.
 - Pre-existing thread-name, Event, Barrier, and topology-policy differences are outside this
   focused prerequisite review.
-
-### Binary layout verification
-
-- N/A: thread-priority selection has no serialized or guest-visible structure.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
 
@@ -12767,24 +8289,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `Scheduler::new` propagates `MasterSemaphore` and initial command-pool construction failures as
   `vk::Result`; Eden propagates the equivalent Vulkan wrapper exceptions from its constructor.
 
-### Unintentional differences (to fix)
-
-- None in scheduler state ownership, render-pass state lifetime, deferred clears, pipeline-state
-  transitions, worker submission, signal/wait semaphore forwarding, flush/finish ordering, or
-  frame pacing after this correction.
-
 ### Missing items
 
 - Resolved by the 2026-08-26 GPU-logging scheduler entry below: render-pass begin/end and successful
   queue submissions now reach the ported logger.
 - Android performance-core placement remains part of the unported topology/ADPF prerequisite
   recorded in the `common/thread.rs` entry above. It is a no-op in Eden on Linux, Windows and macOS.
-
-### Binary layout verification
-
-- N/A: scheduler state and command chunks are host-only and are never serialized or exposed to the
-  guest. Focused tests verify the 0x8000-byte arena limit, command alignment/order/destruction,
-  semaphore payloads, exact `Scheduler::State` defaults, and extended-dynamic-state transitions.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` (`UsesExtendedDynamicState` prerequisite)
 
@@ -12794,19 +8304,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   build cell after its build wait. Eden captures `this` and reads its `vk::Pipeline` member at the
   same execution point.
 
-### Unintentional differences (to fix)
-
-- None in `UsesExtendedDynamicState` or the `ConfigureDraw` scheduler identity update: Rust now
-  passes the stable `GraphicsPipeline` object even while its Vulkan handle is still being built.
-
 ### Missing items
 
 - Broader `graphics_pipeline.rs` parity findings are handled by its dedicated
   `bugs/eden-parity/graphics_pipeline.md` review rather than this scheduler prerequisite.
-
-### Binary layout verification
-
-- N/A: no serialized pipeline-key or guest-visible structure changed in this prerequisite.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/master_semaphore.rs` vs Eden `src/video_core/renderer_vulkan/vk_master_semaphore.{h,cpp}`
 
@@ -12822,20 +8323,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust gives its two helper threads diagnostic names; Eden leaves these particular thread names to
   the operating system.
 
-### Unintentional differences (to fix)
-
-- None after restoring fixed-size synchronization2 submit arrays, fatal handling for non-timeout
-  debug/fence wait failures, and destruction of a checked-out fence when queue submission fails.
-
 ### Missing items
 
 - The focused unit test verifies file-owned constants. Timeline and fence submissions require a
   real Vulkan device and remain covered only by renderer integration/runtime validation.
-
-### Binary layout verification
-
-- N/A: `MasterSemaphore` owns host Vulkan synchronization objects and exposes no serialized or
-  guest-visible raw-memory payload.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/resource_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_resource_pool.{h,cpp}`
 
@@ -12846,22 +8337,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `try_commit_resource` is the `Result` counterpart of Eden's exception-propagating
   `CommitResource`; its fallible grow path preserves Eden's resize-before-`Allocate` ordering.
 
-### Unintentional differences (to fix)
-
-- None after removing the external-tick variants and restoring Eden's failed-search sequence:
-  query `KnownGpuTick`, call `Refresh`, query `KnownGpuTick` again, and only then grow the pool.
-- None in search order, committed-tick assignment, overflow growth, or hint advancement.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: the pool stores host-only resource indices and timeline ticks. A focused test verifies that
-  the fallible Rust grow path publishes the resized tick range before invoking allocation, as
-  Eden's `Grow` does.
-
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` and descriptor-commit call sites vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.{h,cpp}` (`ResourcePool` prerequisite)
 
 ### Intentional differences
@@ -12871,19 +8346,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   that same semaphore into the newly returned allocator.
 - Vulkan allocation failures use `Result<_, vk::Result>` instead of C++ exceptions.
 
-### Unintentional differences (to fix)
-
-- None in descriptor resource retirement after this prerequisite: `DescriptorAllocator::commit`
-  now delegates tick acquisition and refresh to `ResourcePool`, matching Eden instead of using a
-  stale pair of ticks captured by individual draw-recording call sites.
-
 ### Missing items
 
 - Broader descriptor-pool findings remain owned by its dedicated `bugs/eden-parity` report.
-
-### Binary layout verification
-
-- N/A: this prerequisite changes host ownership and resource-retirement timing only.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/command_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_command_pool.{h,cpp}`
 
@@ -12901,15 +8366,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   buffer allocation fails.
 - Fixed error propagation: pool creation and command-buffer allocation no longer panic through
   `expect`; they return the original `vk::Result` like Eden's wrapper exception.
-
-### Missing items
-
-- None in construction, allocation, commit indexing, or destruction.
-
-### Binary layout verification
-
-- N/A: command-pool entries are host Vulkan resources, not raw-copied or serialized payloads. The
-  focused test verifies the empty entry state that precedes Vulkan allocation.
 
 ## 2026-08-25 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.{h,cpp}`
 
@@ -12938,17 +8394,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Restored move-only allocator ownership and `Box`-stable banks instead of sharing both through
   `Arc` clones.
 
-### Missing items
-
-- None in the bank-info helpers, allocator overloads, pool allocation/retry, bank selection, or
-  descriptor resource commit path.
-
-### Binary layout verification
-
-- N/A: bank metadata is consumed field-wise and Vulkan descriptor structures are built through ash,
-  not serialized by raw memory copy. Focused tests cover all-field superset comparison,
-  multi-shader accumulation, and unsigned wrapping.
-
 ## 2026-08-25 — `src/video_core/src/delayed_destruction_ring.rs` vs Eden `src/video_core/delayed_destruction_ring.h`
 
 ### Intentional differences
@@ -12963,15 +8408,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   matching Eden's `std::array<std::vector<T>, TICKS_TO_DESTROY>` storage and allocation behavior.
 - Restored conditional copy support with `Clone`, corresponding to the implicitly copyable C++
   template whenever `T` itself is copyable.
-
-### Missing items
-
-- None in construction, tick advancement, slot clearing, move-push, or copy behavior.
-
-### Binary layout verification
-
-- N/A: this host-only generic container is not raw-copied or serialized. Focused tests verify the
-  const-generic outer size and destruction after exactly one complete ring traversal.
 
 ## 2026-08-25 — `src/video_core/src/fence_manager.rs` vs Eden `src/video_core/fence_manager.h`
 
@@ -13000,11 +8436,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Linux target, while its Android behavior depends on the still-unported topology/ADPF subsystem
   already recorded in the `common/thread.rs` audit entry.
 
-### Binary layout verification
-
-- N/A: fence-manager queues and callbacks are host-only and are neither raw-copied nor serialized.
-  Focused tests verify the async guard interval and synchronous queue lifetime.
-
 ## 2026-08-26 — `src/video_core/src/surface.rs` vs Eden `src/video_core/surface.{h,cpp}`
 
 ### Intentional differences
@@ -13023,44 +8454,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden's owning `compatible_formats.cpp`; call sites address that owner directly because Rust
   modules do not separately reproduce Eden's enclosing `VideoCore::Surface` namespace.
 
-### Unintentional differences (to fix)
-
-- None after restoring `PixelFormat::Invalid = 255`, 32-bit `SurfaceType`/`SurfaceTarget`
-  representation, `SurfaceTargetFromTextureType`, `HasAlpha`, fail-soft conversion and
-  `GetFormatType` handling, and ASTC recompression-aware transcoded sizes.
-- None after removing the misplaced compatibility wrappers from `surface.rs` and routing their
-  callers to the file-owning `compatible_formats.rs` module.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: focused tests verify 32-bit enum sizes, sentinel discriminants 112 and 255, and all three
-  112-entry property table lengths. The exhaustive source comparison verifies every table value
-  and enum position against Eden's `PIXEL_FORMAT_LIST`.
-
 ## 2026-08-26 — `src/video_core/src/host_shaders/blit_{color,depth,depth_stencil}_msaa.frag` vs Eden `src/video_core/host_shaders/blit_{color,depth,depth_stencil}_msaa.frag`
 
 ### Intentional differences
 
 - Rust's `build.rs` generates the SPIR-V word slices consumed by `ash`; Eden's CMake rules generate
   C++ headers. Both invoke `glslangValidator` for the same GLSL source files and SPIR-V 1.3 target.
-
-### Unintentional differences (to fix)
-
-- None after restoring all three missing MSAA blit shader sources and registering their generated
-  modules with the Vulkan shader build and validation test.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: each Rust GLSL source is byte-for-byte identical to Eden's source, and the focused test
-  verifies that all three generated modules begin with the SPIR-V magic word.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/blit_image.rs` vs Eden `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
 
@@ -13075,30 +8474,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden's fail-soft assertions optionally trap a debugger. Rust logs the same condition and panics
   when `use_debug_asserts` is enabled.
 
-### Unintentional differences (to fix)
-
-- None after restoring `BlitColorMSAA`, `ResolveDepthStencil`, both matching pipeline builders,
-  their keys/caches/shader modules, and the exact source-image shader-read barrier.
-- None after restoring MoltenVK primitive-restart state, stencil-export-dependent module creation,
-  depth/stencil pipeline state, empty color attachment state for depth targets, and the original
-  conversion-pipeline method ownership.
-- None after moving descriptor allocation/update into the recorded command, using
-  `SHADER_READ_ONLY_OPTIMAL` for the explicit-image transition, and retaining `CurrentTick` for
-  deferred MSAA resources.
-- None after fixing MSAA resource destruction to release the framebuffer before its attachment
-  views, matching reverse C++ field destruction and Vulkan lifetime requirements.
-
-### Missing items
-
-- None in the class interface, file-owned helpers, pipeline keys, shader modules, pipeline caches,
-  conversion paths, clear paths, or MSAA copy/resolve paths.
-
-### Binary layout verification
-
-- PASS: focused tests verify `PushConstants` is 16 bytes with fields at offsets 0 and 8, and
-  `MSAACopyPushConstants` is 24 bytes with fields at offsets 0, 8, and 16. Pipeline keys are
-  host-only field-wise cache keys and are not raw-copied or serialized.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` blit integration vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
 
 ### Intentional differences
@@ -13110,27 +8485,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   references, preserving the same handles, formats, ranges, extents, sample count, and stencil
   capability across deferred recording.
 
-### Unintentional differences (to fix)
-
-- None after wiring the restored color-MSAA and depth/stencil-resolve branches in Eden's order and
-  applying the same `SamplesLog2` adjustment to scale-helper regions and framebuffer extents.
-- None after restoring `ImageView::{depth_view,stencil_view,color_view}` as the owners of lazy
-  auxiliary-view creation; helper blits no longer receive null depth/stencil handles.
-- None after restoring Eden's fail-soft validation flow and exact
-  graphics/compute/transfer pipeline-stage masks in `TextureCacheRuntime::BlitImage`.
-- None after making every multisampled color image use the scale helper and clearing `Rescaled`
-  when no supported depth/stencil helper path exists.
-
-### Missing items
-
-- None in the `BlitImage`, `BlitScaleHelper`, `NeedsScaleHelper`, or lazy auxiliary-view slice
-  exercised by `BlitImageHelper`.
-
-### Binary layout verification
-
-- N/A: the integration passes host Vulkan handles and field-wise snapshots; no payload in this
-  slice is raw-copied or serialized.
-
 ## 2026-08-26 — `src/video_core/src/texture_cache/accelerated_swizzle.rs` vs Eden `src/video_core/texture_cache/accelerated_swizzle.{h,cpp}`
 
 ### Intentional differences
@@ -13140,45 +8494,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `Common::AlignUpLog2` accepts the tile width through its Rust `u64` API and converts the result
   back to the upstream `u32` payload type.
 
-### Unintentional differences (to fix)
-
-- Fixed: the module duplicated `GOB_SIZE_*` constants owned by `textures/decoders`; it now imports
-  the matching constants just as Eden imports them from `textures/decoders.h`.
-- Fixed: local copies of `AlignUpLog2`, `DivCeilLog2`, and `BytesPerBlock` wrappers have been
-  removed in favor of the same owning modules used by Eden.
-
-### Missing items
-
-- None: both parameter payloads and both 2D/3D parameter constructors are present.
-
-### Binary layout verification
-
-- PASS: focused tests verify every field offset, alignment, and total size (64 bytes/alignment 16
-  for the 2D payload; 56 bytes/alignment 4 for the 3D payload), plus representative 2D and 3D
-  formulas against Eden's expected values.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/anti_alias_pass.rs` vs Eden `src/video_core/renderer_vulkan/present/anti_alias_pass.h`
 
 ### Intentional differences
 
 - Rust uses a trait for Eden's abstract base class; the single virtual `Draw` contract and mutable
   image/view outputs remain identical.
-
-### Unintentional differences (to fix)
-
-- Fixed: `draw` now receives `&Device` before `&mut Scheduler`, matching Eden's full virtual
-  signature instead of relying on a device retained by each implementation.
-- Fixed: the invented `NoAa` implementation was removed; Eden represents a disabled pass as
-  `std::monostate`, now mirrored by the `AntiAlias::None` variant in `layer.rs`.
-
-### Missing items
-
-- None: the virtual destructor role is provided by Rust concrete-value destruction and the
-  complete `Draw` interface is present.
-
-### Binary layout verification
-
-- N/A: this is a virtual interface and does not define a copied or serialized payload.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/{fxaa,smaa}.rs` Draw integration vs Eden `src/video_core/renderer_vulkan/present/{fxaa,smaa}.{h,cpp}`
 
@@ -13187,41 +8508,11 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The passes retain a cloned raw `ash::Device` for explicit destruction of Vulkan handles; Eden's
   wrapper members carry that destruction context through RAII.
 
-### Unintentional differences (to fix)
-
-- Fixed: `Draw`, `UpdateDescriptorSets`, and `UploadImages` now consume the high-level `Device&`
-  passed by the caller, in the same ownership and call order as Eden.
-
-### Missing items
-
-- None in the anti-alias interface integration slice.
-
-### Binary layout verification
-
-- N/A: this slice changes host references and Vulkan calls, not a raw-copied payload.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/layer.rs` and `renderer_vulkan/blit_screen.rs` anti-alias wiring vs Eden `src/video_core/renderer_vulkan/present/layer.{h,cpp}` and `renderer_vulkan/vk_blit_screen.cpp`
 
 ### Intentional differences
 
 - Vulkan wrapper handles are still represented by raw ash handles with explicit Rust destruction.
-
-### Unintentional differences (to fix)
-
-- Fixed: `Layer` now receives and forwards Eden's high-level `Device&` from `BlitScreen` through
-  `ConfigureDraw`, `SetAntiAliasPass`, and the selected pass's `Draw` call.
-- Fixed: anti-alias storage now mirrors `std::variant<std::monostate, FXAA, SMAA>` with a concrete
-  Rust enum instead of heap-allocating a trait object and inventing a no-op pass.
-- Fixed: the unchanged-setting fast path now also requires a non-empty pass, matching Eden's
-  `!holds_alternative<std::monostate>` condition.
-
-### Missing items
-
-- None in the anti-alias selection and dispatch slice.
-
-### Binary layout verification
-
-- N/A: the variants are host-only owners and are neither raw-copied nor serialized.
 
 ## 2026-08-26 — `src/video_core/src/textures/astc.rs` vs Eden `src/video_core/textures/astc.{h,cpp}`
 
@@ -13241,24 +8532,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust skips undersized compressed input blocks and out-of-range output rows rather than allowing
   `span::subspan`/`memcpy` to access invalid memory. Valid texture buffers take the identical path.
 
-### Unintentional differences (to fix)
-
-- None after restoring all six HDR endpoint modes, HDR interpolation and half-float conversion,
-  the 64-weight and 24..96 packed-bit validations, first-byte start-offset semantics, the missing
-  `Pixel` methods and depth-reduction branch, common `divide_up` ownership, and inline integer
-  sequence storage.
-
-### Missing items
-
-- None in `astc.h`/`astc.cpp`: every class, structure, table, helper, endpoint mode, validation,
-  block decoder path, and public decompression entry point has a Rust counterpart.
-
-### Binary layout verification
-
-- N/A: ASTC helper structures are internal algorithm state and are not raw-copied or serialized.
-  Eden-oracle corpus tests instead verify the HDR mode 7/mode 11 arithmetic and all finite
-  nonnegative half-float conversions bit-for-bit.
-
 ## 2026-08-26 — `src/video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
 
 ### Intentional differences
@@ -13267,21 +8540,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   returns `Result`, the Rust equivalent of an exception escaping Eden's `ReserveBank`.
 - C++ default arguments for reference counts remain explicit arguments at Rust call sites.
 
-### Unintentional differences (to fix)
-
-- None after removing the invented `can_recycle_front` preflight and unused immutable accessor.
-  The fallible builder now runs inside the exact non-recycling branch before the index is queued.
-- None after matching the implicit sequentially-consistent atomic store/load used by Eden's
-  `references = 0` and `references == 0`; explicit add/close operations remain relaxed.
-
-### Missing items
-
-- None for `BankBase` or `BankPool`.
-
-### Binary layout verification
-
-- N/A: the banks and pool are host-only types and are neither raw-copied nor serialized.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/query_cache.rs` bank reservation integration vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
 
 ### Intentional differences
@@ -13289,19 +8547,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Vulkan construction failures propagate as `vk::Result`; Eden propagates wrapper exceptions.
   Samples banks remain `Arc`-owned as documented by the broader query-cache audit.
 
-### Unintentional differences (to fix)
-
-- None after constructing a new samples bank directly from `BankPool::reserve_bank`'s builder,
-  matching Eden's branch and eliminating the separate preflight/panic invariant.
-
 ### Missing items
 
-- None in the bank-reservation integration changed by this slice. Broader samples-streamer debt
+- Broader samples-streamer debt
   remains tracked in its existing query-cache audit entry.
-
-### Binary layout verification
-
-- N/A: this slice changes host ownership and error propagation only.
 
 ## 2026-08-26 — `src/video_core/src/textures/bcn.rs` vs Eden `src/video_core/textures/bcn.{h,cpp}`
 
@@ -13315,20 +8564,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   access outside the spans.
 - The C `stb_dxt` shim fixes the mode to `STB_DXT_NORMAL`, preserving the two direct Eden calls
   without exposing the C++ implementation through Rust FFI.
-
-### Unintentional differences (to fix)
-
-- None after restoring one queued task per compressed row, `WaitForRequests` after each depth
-  slice, the stack-owned 64-byte texel block, and `Common::DivideUp` ownership.
-
-### Missing items
-
-- None: the generic BC compressor and both public BC1/BC3 entry points are present.
-
-### Binary layout verification
-
-- N/A: compression state is local algorithm data. Focused tests verify multi-row/multi-plane
-  output placement and Eden's BC1 alpha-threshold boundary.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present_manager.rs` vs Eden `src/video_core/renderer_vulkan/vk_present_manager.{h,cpp}`
 
@@ -13367,12 +8602,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Optional `HAS_LSFG` frame-generation scheduling is not enabled in Ruzu; all non-LSFG
   `PresentManager` behavior is present.
 
-### Binary layout verification
-
-- N/A: `Frame` is a host Vulkan-resource owner, not a raw-copied or serialized payload. Focused
-  tests verify its upstream defaults, the seven-frame cap, copy/blit extents, and snapshot handle
-  identity without moving image ownership.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/blit_screen.rs` vs Eden `src/video_core/renderer_vulkan/vk_blit_screen.{h,cpp}`
 
 ### Intentional differences
@@ -13395,16 +8624,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Moved pipeline selection, push-constant/descriptor allocation, layer configuration, and draw
   recording back to `present/window_adapt_pass.rs`, their upstream owner.
 
-### Missing items
-
-- None in `vk_blit_screen.h`/`.cpp`; `PrepareFrame` is present even though the optional LSFG caller
-  is not built.
-
-### Binary layout verification
-
-- N/A: `FramebufferTextureInfo` is field-wise host state and presentation objects are not
-  serialized. A focused test verifies every constructor default used by the first resource update.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/window_adapt_pass.rs` and `present/filters.rs` vs Eden `src/video_core/renderer_vulkan/present/window_adapt_pass.{h,cpp}`
 
 ### Intentional differences
@@ -13422,15 +8641,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   helper boundaries instead of flattening them into `new`.
 - Removed the invented public sampler accessor; Eden exposes only descriptor-set layout and render
   pass accessors.
-
-### Missing items
-
-- None in the constructor, creation helpers, draw path, accessors, or resource destruction.
-
-### Binary layout verification
-
-- N/A: the pass owns host Vulkan handles. Existing tests verify the complete background-color
-  normalization used by its clear command.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and `renderer_vulkan.rs` frame ownership integration vs Eden `src/video_core/renderer_vulkan/present/util.{h,cpp}` and `renderer_vulkan.cpp`
 
@@ -13451,15 +8661,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Updated all `BlitScreen` construction, framebuffer, draw, and present-manager construction calls
   to the restored ownership and lifecycle interfaces.
 
-### Missing items
-
-- None in the frame-creation and presentation integration changed by this slice.
-
-### Binary layout verification
-
-- N/A: this integration changes Vulkan ownership and call ordering, not guest-visible or serialized
-  data.
-
 ## 2026-08-26 — `src/common/src/thread.rs` vs Eden `src/common/thread.{h,cpp}` (`SetCurrentThreadToPerformanceCores` integration)
 
 ### Intentional differences
@@ -13476,10 +8677,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Missing items
 
 - Android's ADPF session and core-group implementation is not built.
-
-### Binary layout verification
-
-- N/A: thread placement has no raw-copied or serialized payload.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/buffer_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}`
 
@@ -13498,22 +8695,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ash exposes raw Vulkan handles rather than Eden's owning `vk::Buffer`; the allocation itself is
   retained by `AllocatedBuffer`, and its views are explicitly destroyed before that allocation.
 
-### Unintentional differences (to fix)
-
-- None after restoring the host-visible direct-write/flush path, null transform-feedback fallback,
-  both single-buffer binding methods, `Quad LUT` debug name, native-endian LUT writes, upstream
-  allocation/replacement order, and the no-op behavior for non-quad topologies.
-
-### Missing items
-
-- None in `Buffer`, the quad-index hierarchy, `BufferCacheRuntime`, or `BufferCacheParams`.
-
-### Binary layout verification
-
-- N/A: this file owns host Vulkan resources and command parameters rather than raw-copied or
-  serialized structs. Focused tests verify LUT byte generation, index-type thresholds, null-binding
-  ranges, usage flags, and the restored single-binding API signatures.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden `src/video_core/vulkan_common/vulkan_wrapper.{h,cpp}` (`AllocatedBuffer` integration)
 
 ### Intentional differences
@@ -13524,20 +8705,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - VMA calls are serialized through the allocator mutex because Ruzu creates VMA for external
   synchronization; Eden stores and calls its opaque allocator handle directly.
 
-### Unintentional differences (to fix)
-
-- None in the added `IsHostVisible`, mutable `Mapped`, and `Flush` equivalents: visibility follows
-  `pMappedData`, the span covers the requested buffer size, and non-coherent memory is flushed from
-  offset zero through `VK_WHOLE_SIZE` while preserving Eden's ignored VMA return value.
-
 ### Missing items
 
-- None required by the buffer-cache host-visible LUT path. Other wrapper/allocator coverage remains
+- Other wrapper/allocator coverage remains
   tracked by the dedicated Vulkan wrapper and memory-allocator audits.
-
-### Binary layout verification
-
-- N/A: `AllocatedBuffer` is an owning host wrapper and is never copied or serialized as raw bytes.
 
 ## 2026-08-26 — `src/video_core/src/buffer_cache/buffer_base.rs` vs Eden `src/video_core/buffer_cache/buffer_base.h`
 
@@ -13550,20 +8721,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden's class-static page constants are module constants in the corresponding Rust file. The
   owner, values, and visibility remain local to `buffer_base.rs`.
 
-### Unintentional differences (to fix)
-
-- None after restoring public `cpu_addr_cached`, initializing it in both constructors, consuming it
-  in `SynchronizeBuffer`, and using wrapping unsigned additions in `is_in_bounds`.
-
-### Missing items
-
-- None in `BufferFlagBits`, `NullBufferParams`, `BufferBase` state, constructors, or methods.
-
-### Binary layout verification
-
-- N/A: `BufferBase` is neither raw-copied nor serialized. Its state order follows Eden
-  conceptually, and focused tests verify all flag bit patterns, constructor defaults, cached
-  address state, boundary arithmetic, LRU state, stream score, preemptive flag, and write tick.
 ## 2026-08-26 — buffer-cache base contract and backend adapters vs Eden buffer-cache headers/runtimes
 
 ### Intentional differences
@@ -13584,21 +8741,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `buffer_cache.rs`. A sibling-module struct would require widening every private field merely so
   Rust could implement the upstream methods; shared types and runtime interfaces remain owned by
   `buffer_cache_base.rs`.
-
-### Unintentional differences (to fix)
-
-- None after restoring Eden's single-vertex-buffer runtime contract and the inline overlap-ID
-  storage.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS (not ABI-shared): these host-only cache structures are not serialized or copied as raw
-  bytes. Focused tests verify enum values, default sentinels, inline capacities, and the restored
-  runtime method signature.
 
 ## 2026-08-26 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
@@ -13625,24 +8767,11 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The non-Android Rust frontend always uses Eden's optimized vertex-buffer batching path. Eden's
   alternate unoptimized path is selected only by an Android-specific setting.
 
-### Unintentional differences (to fix)
-
-- None after restoring the reusable inline upload-copy collection, fixed page-table shape, scratch
-  resize semantics, granular null-pointer upload behavior, picked-overlap lifetime, wrapping
-  unsigned address arithmetic, synchronous download behavior, streamed-uniform rebinding, and
-  index/vertex usage tracking.
-
 ### Missing items
 
-- None for the supported desktop buffer-cache path. Eden's three unread members
+- Eden's three unread members
   (`last_index_count`, `current_buffer`, and `immediate_buffer_capacity`) remain intentionally
   omitted as recorded above.
-
-### Binary layout verification
-
-- N/A: `BufferCache` is host-only state and is never raw-copied or serialized. Focused tests verify
-  the fixed page-table length, inline `SmallVec` capacities, enum/runtime contracts, range
-  arithmetic, upload/download behavior, binding usage, and overlap/tick lifecycle ordering.
 
 ## 2026-08-26 — `src/video_core/src/buffer_cache/memory_tracker_base.rs` vs Eden `src/video_core/buffer_cache/memory_tracker_base.h`
 
@@ -13660,21 +8789,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   diagnostic, and stop. Eden indexes its fixed array out of bounds in that invalid state, which is
   undefined behavior; valid device-address ranges follow the same iteration path.
 
-### Unintentional differences (to fix)
-
-- None after restoring fixed-size top-tier/pool storage, explicit FIFO free-manager ordering, and
-  wrapping unsigned address composition.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: the tracker is host-only state and is not raw-copied or serialized. Focused tests verify the
-  4096-entry top tier, 32-manager pool batches, FIFO slot order, normal queries, and out-of-range
-  handling.
-
 ## 2026-08-26 — `src/video_core/src/buffer_cache/usage_tracker.rs` vs Eden `src/video_core/buffer_cache/usage_tracker.h`
 
 ### Intentional differences
@@ -13683,20 +8797,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   GCC 13.3 on the supported x86-64 host lowers the variable shift to the hardware modulo-64
   operation, yielding an all-ones mask. Rust spells out that conservative over-marking explicitly
   so sub-64-byte and zero-length ranges do not panic or silently become no-ops.
-
-### Unintentional differences (to fix)
-
-- None after restoring Eden's effective conservative mask for sub-granule ranges and preserving
-  unsigned wrapping before page calculation.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: `UsageTracker` is host-only state. Focused tests cover empty, single-page, cross-page,
-  reset, sub-64-byte, and zero-length range behavior.
 
 ## 2026-08-26 — `src/video_core/src/buffer_cache/word_manager.rs` vs Eden `src/video_core/buffer_cache/word_manager.h`
 
@@ -13716,22 +8816,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   dereference its null default tracker in this invalid lifecycle state; valid managers behave
   identically.
 
-### Unintentional differences (to fix)
-
-- None after restoring `size_bytes` as a const generic, the fixed inline five-channel storage,
-  `Type::Max`, associated `NUM_WORDS`, upstream field order, and unsigned wrapping arithmetic.
-
-### Missing items
-
-- None on active paths; only the dead `NotifyRasterizer` helper is intentionally omitted above.
-
-### Binary layout verification
-
-- PASS for the host-only manager layout: `#[repr(C)]` fixes Eden's `heap`, tracker pointer, and
-  CPU-address field order; nested fixed arrays are contiguous without padding between channels,
-  and focused tests verify the enum representation, channel order, inline size, word count, and
-  constructor tail mask. The structure is not serialized or raw-copied across an ABI boundary.
-
 ## 2026-08-26 — `src/video_core/src/capture.rs` vs Eden `src/video_core/capture.h`
 
 ### Intentional differences
@@ -13739,23 +8823,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ruzu's shared `align_up_log2` accepts and returns `u64`, so the `u32` framebuffer height is
   widened for the constant evaluation and narrowed after alignment. The result and unsigned bit
   pattern match Eden's templated `Common::AlignUpLog2` call.
-
-### Unintentional differences (to fix)
-
-- None after restoring `TILED_HEIGHT` and `TILED_SIZE` as compile-time constants owned by
-  `capture.rs`, using the common alignment helper, and making all three renderer consumers use the
-  shared tiled-size constant. This also fixes the null renderer's former unaligned
-  `1280 * 720 * 4` allocation; Eden allocates `1280 * 768 * 4` bytes.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: this file owns constants and a normal `FramebufferLayout` value; it defines no raw-copied
-  or serialized payload. Focused tests verify the aligned height, tiled size, pixel format, and
-  complete framebuffer layout.
 
 ## 2026-08-26 — `src/video_core/src/cdma_pusher.rs` vs Eden `src/video_core/cdma_pusher.h` and `.cpp`
 
@@ -13775,24 +8842,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   array out of bounds for such an invalid command, which is undefined behavior; valid methods use
   the identical register write and dispatch sequence.
 
-### Unintentional differences (to fix)
-
-- None after replacing lossy enum conversions with transparent raw-value-preserving
-  `ChClassId`/Control-method wrappers. Unknown class IDs now remain in parser state, and unknown
-  Control methods reach the same unimplemented/default path instead of being mapped to `NoClass`
-  or silently discarded.
-
-### Missing items
-
-- None in the CDMA parser, worker lifecycle, Control dispatch, THI register actions, or virtual
-  device dispatch used by NvDec and Vic.
-
-### Binary layout verification
-
-- PASS: focused tests verify the 4-byte command header, every header bit field and submission-mode
-  value, the 4-byte class identifier including unknown raw values, all THI method offsets, and the
-  0x80-byte THI register array.
-
 ## 2026-08-26 — `src/video_core/src/host1x/control.rs` vs Eden `src/video_core/host1x/control.h` and `.cpp`
 
 ### Intentional differences
@@ -13802,20 +8851,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   wait operation.
 - `Method` is a transparent `u32` newtype rather than a Rust enum so Eden's default switch arm can
   safely receive arbitrary values produced by `Control::Method(raw)`.
-
-### Unintentional differences (to fix)
-
-- None after forwarding unknown raw methods to the unimplemented diagnostic path instead of
-  dropping them in `CDmaPusher::execute_command`.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: `Method` remains four bytes, and focused tests verify all three constants plus preservation
-  of an unknown raw method value.
 
 ## 2026-08-26 — `src/video_core/src/control/channel_state_cache.rs` vs Eden `src/video_core/control/channel_state_cache.h`, `.cpp`, and `.inc`
 
@@ -13835,64 +8870,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   construction in the occupied deque slot; Rust cannot safely begin a second object lifetime
   without ending the first one.
 
-### Unintentional differences (to fix)
-
-- None after restoring the actual GPU-memory owner in `AddressSpaceRef`, `GetFromID`, and the bound
-  cache state. The previous port retained and returned only `MemoryManager::get_id()`, despite Eden
-  storing and returning `MemoryManager*`.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: the cache is host-only state and is neither raw-copied nor serialized. Focused tests verify
-  stable payload addresses, FIFO slot reuse bookkeeping, once-per-address-space registration, and
-  pointer identity of the retained GPU-memory owner.
-
 ## 2026-08-26 — removed `src/video_core/src/command_processor.rs` and `gpu_context.rs` vs Eden `src/video_core/dma_pusher.{h,cpp}` and `gpu_thread.{h,cpp}`
 
-### Intentional differences
-
-- None. These two Rust-only files had no upstream owner and no production caller.
-
-### Unintentional differences (to fix)
-
-- None after removing the second GPFIFO parser and its sole `GpuContext` owner. The live Ruzu path
-  now has one owner chain, matching Eden: the GPU thread schedules a channel command list and that
-  channel's `DmaPusher` parses and dispatches it through `Puller` and bound engine interfaces.
-
 ### Missing items
 
-- None introduced by the removal. `dma_pusher.rs`, `gpu_thread.rs`, and `control/scheduler.rs`
+- `dma_pusher.rs`, `gpu_thread.rs`, and `control/scheduler.rs`
   remain the active counterparts of Eden's submission path.
-
-### Binary layout verification
-
-- N/A: the removed types were private host-side duplicate state. The live `CommandListHeader` and
-  `CommandHeader` layouts remain owned and tested in `dma_pusher.rs`.
-
-## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (obsolete GPFIFO batch path)
-
-### Intentional differences
-
-- None in this removal slice.
-
-### Unintentional differences (to fix)
-
-- None after removing the unused fixed-size color/depth framebuffer, mapped readback buffer,
-  private render pass, resize/readback helpers, and `render_draw_calls` batch entry point. Eden's
-  rasterizer renders directly into texture-cache-owned guest render targets and owns none of those
-  resources. Ruzu's live `RasterizerInterface` path does the same.
-
-### Missing items
-
-- None introduced by this removal.
-
-### Binary layout verification
-
-- N/A: only dead host-side Vulkan resources and methods were removed.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pass.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.h` and `.cpp`
 
@@ -13909,25 +8892,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Rust. Image initialization exchange, compute-unswizzle-buffer allocation, and storage-view lookup
   remain performed by the texture-cache owner immediately before these calls.
 
-### Unintentional differences (to fix)
-
-- None after restoring Eden's local conditional-rendering extension guard, `Device` ownership,
-  optional required-subgroup-size `pNext`, shader-save notification, ASTC descriptor-template
-  update path, exact ASTC pipeline stage masks and buffer ranges, and assertion behavior for invalid
-  ASTC/3D-unswizzle inputs.
-- None after leaving `descriptor_allocator` empty when `templates` is empty and restoring
-  constructor-failure cleanup plus reverse member-destruction order for Vulkan resources.
-
-### Missing items
-
-- None in the six compute passes defined by the matching upstream files.
-
-### Binary layout verification
-
-- PASS: focused tests verify the 28-byte ASTC constants, 16-byte query constants, and 76-byte
-  block-linear 3D constants including `destination` at offset 60; the subgroup-size chaining truth
-  table is also covered.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.h` and `.cpp`
 
 ### Intentional differences
@@ -13942,23 +8906,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   push-descriptor dispatch table instead of borrowing the engine, memory manager, and wrapper
   device simultaneously. Descriptor collection and command ordering remain the same.
 
-### Unintentional differences (to fix)
-
-- None after restoring Eden's compute-pipeline creation and bind GPU-logging hooks, removing the
-  non-upstream descriptor payload early return, using the backend
-  `ImageView::buffer_size` value instead of recomputing it, restoring the retained pipeline-cache
-  member and `is_bound`, matching the relaxed build-state publication, and destroying the
-  descriptor update template before its pipeline/set layouts in Eden's RAII order.
-
 ### Missing items
 
-- None in `ComputePipeline`. Compute dispatch logging remains owned by the Vulkan rasterizer, as in
+- Compute dispatch logging remains owned by the Vulkan rasterizer, as in
   Eden, and is covered by its separate parity entry.
-
-### Binary layout verification
-
-- N/A: `ComputePipeline` is host-only ownership/synchronization state and is never copied or
-  serialized as raw bytes. Descriptor binding order remains covered by the focused test.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.h` and `.cpp`
 
@@ -13966,21 +8917,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Rust calls the same process-wide GPU logger through free functions returning the singleton;
   Eden spells the access as `GPU::Logging::GPULogger::GetInstance()`.
-
-### Unintentional differences (to fix)
-
-- None after logging successful compute-pipeline creation immediately before statistics
-  collection and logging compute-pipeline binding after the asynchronous build wait and before
-  descriptor data preparation, with Eden's exact activation and Vulkan-call setting guards.
-
-### Missing items
-
-- None in the GPU-logging hooks owned by `ComputePipeline`.
-
-### Binary layout verification
-
-- N/A: the change only adds calls around existing Vulkan pipeline lifecycle points and does not
-  alter any raw-copied or serialized structure.
 
 ## 2026-08-26 — `src/video_core/src/host_shaders/compute_shaders.rs` and compute `.comp` files vs Eden `src/video_core/host_shaders/*.comp`
 
@@ -13992,22 +8928,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `block_linear_unswizzle_3d_bcn.comp` has a final newline in the Rust tree while Eden's file ends
   immediately after the closing brace. Its GLSL token stream and behavior are identical.
 
-### Unintentional differences (to fix)
-
-- None after replacing duplicated embedded strings with the source files, restoring the missing
-  query-prefix assignment, restoring both conditional-render comparison modes, and replacing the
-  Vulkan-only 3D BCN rewrite with Eden's complete Vulkan/OpenGL source.
-
-### Missing items
-
-- None among the sixteen compute shaders audited for this module. The six OpenGL runtime sources
-  that previously existed only as duplicated Rust strings now have their matching `.comp` files.
-
-### Binary layout verification
-
-- N/A: these are text shader sources. A normalized byte comparison verifies every source against
-  Eden, and focused tests cover the three previously drifted semantic expressions.
-
 ## 2026-08-26 — `src/video_core/src/engines/const_buffer_info.rs` vs Eden `src/video_core/engines/const_buffer_info.h`
 
 ### Intentional differences
@@ -14016,23 +8936,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   C++ aggregate layout and value-initializes the containing Maxwell state.
 - `Maxwell3D::process_cb_bind` rejects a shader-slot value outside the 18-entry array. Eden uses
   unchecked `std::array::operator[]`; preserving that undefined behavior would be unsound in Rust.
-
-### Unintentional differences (to fix)
-
-- None after removing the differently ordered `ConstBufferBinding` duplicate from `maxwell_3d.rs`
-  and using the upstream-owned `ConstBufferInfo` throughout Maxwell state, draw snapshots, shader
-  environments, and both renderer pipelines.
-- None after making a disabled bind retain the current address and size before disabling the slot,
-  matching Eden's `ProcessCBBind` update order instead of replacing the whole entry with defaults.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: `ConstBufferInfo` is 16 bytes with alignment 8; `address`, `size`, and `enabled` are at
-  offsets 0, 8, and 12 respectively. Focused tests also verify value-initialized defaults.
 
 ## 2026-08-26 — `src/video_core/src/control/scheduler.rs` vs Eden `src/video_core/control/scheduler.h` and `.cpp`
 
@@ -14045,19 +8948,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   before DMA push and dispatch, preserving Eden's global-lock scope.
 - Missing channels and uninitialized DMA pushers panic through `expect`; these correspond to Eden's
   assertion and required initialized `payload` invariant.
-
-### Unintentional differences (to fix)
-
-- None after replacing `HashMap::insert` with entry insertion. Declaring a duplicate channel now
-  preserves the first entry like Eden's `unordered_dense::map::emplace` instead of replacing it.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: scheduler state is host-only synchronization and ownership state.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/decode_bc.rs` vs Eden `src/video_core/texture_cache/decode_bc.h` and `.cpp`
 
@@ -14073,21 +8963,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   arithmetic outside a span or dividing by a zero block width. Valid `BufferImageCopy` inputs take
   the same path as Eden.
 
-### Unintentional differences (to fix)
-
-- None after removing the custom BC1 through BC5 implementations and routing every BC format to
-  the same `bc_decoder` revision vendored by Eden. Unsigned offset arithmetic now also preserves
-  Eden's `u32` wraparound behavior.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: the API transforms compressed byte spans into decoded byte spans and does not serialize a
-  host struct. The C ABI uses pointer, `size_t`, and `bool` arguments matching `bc_decoder.h`.
-
 ## 2026-08-26 — `src/common/src/alignment.rs` and `div_ceil.rs` vs Eden `src/common/alignment.h` and `div_ceil.h`
 
 ### Intentional differences
@@ -14100,22 +8975,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden's unused `AlignmentAllocator` C++ container adapter has no standalone Rust type. Rust
   allocation sites that need stronger alignment request it through `std::alloc::Layout`; Eden has
   no source-tree consumer of this adapter to map here.
-
-### Unintentional differences (to fix)
-
-- None after spelling every unsigned intermediate that can overflow with wrapping arithmetic.
-  Debug builds now retain C++ unsigned behavior instead of panicking before the caller observes the
-  wrapped result.
-- None after removing the invented `is_4kb_aligned` convenience function. Its only consumer now
-  calls the upstream-owned `is_aligned` operation with the shared guest page-size constant.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: these files contain integer functions and no raw-memory data structures.
 
 ## 2026-08-26 — `src/video_core/src/textures/decoders.rs` vs Eden `src/video_core/textures/decoders.h` and `.cpp`
 
@@ -14132,11 +8991,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None after removing the dead `SwizzleTable`/`make_swizzle_table` API that has no counterpart in
-  Eden, restoring const-generic `TO_LINEAR`, `BYTES_PER_PIXEL`, mask, and increment parameters, and
-  using the upstream-owned `common` alignment/division helpers.
-- None after preserving the wrapping behavior of every upstream `u32` offset, size, and coordinate
-  calculation in debug builds.
 - Corrected: the full-image loop previously performed `checked_add`, two bounds comparisons, slice
   construction, and conditional skipping for every pixel. Eden performs a direct fixed-size
   `memcpy`; Ruzu now validates the spans once and gives the hot loop the same shape.
@@ -14145,17 +8999,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   touched by a compressed image. The guard now derives the monotonic final visited tiled offset;
   the BC tile-count regression again passes without restoring per-pixel checks.
 
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: the module copies byte spans and owns no serialized structure. Focused tests exercise every
-  BPP dispatch arm through full swizzle/unswizzle round trips, GOB offsets, overflow behavior, and
-  Eden's non-power-of-two subrectangle overlap semantics. Texture-cache coverage additionally
-  verifies a compressed image whose input omits untouched GOB tail padding.
-
 ## 2026-08-26 — `src/audio_core/src/renderer/memory/pool_mapper.rs` vs Eden `src/audio_core/renderer/memory/pool_mapper.cpp`
 
 ### Intentional differences
@@ -14163,19 +9006,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ruzu obtains the 4 KiB guest-page value from `common::PAGE_SIZE_U64`; Eden names the same value
   `Core::Memory::YUZU_PAGESIZE`. This avoids introducing a dependency on a C++ memory-header
   boundary while retaining the shared constant rather than a literal.
-
-### Unintentional differences (to fix)
-
-- None after `PoolMapper::update` began calling the upstream-owned generic `is_aligned` helper for
-  both the address and size instead of an invented 4 KiB-specific wrapper.
-
-### Missing items
-
-- None for this alignment validation path.
-
-### Binary layout verification
-
-- N/A: this change only selects the validation helper and does not alter `MemoryPoolInfo` payloads.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/descriptor_buffer.rs` vs Eden `src/video_core/renderer_vulkan/vk_descriptor_buffer.h` and `.cpp`
 
@@ -14187,24 +9017,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Vulkan allocation failures use `Result<VulkanError>` instead of constructor exceptions.
 - The raw mapped pointers make the ring non-`Send` by inference. The explicit `Send` implementation
   records Eden's GPU-thread ownership contract; mutation still requires exclusive access.
-
-### Unintentional differences (to fix)
-
-- None after failure of the host-visible or host-coherent checks clears only `chunks`, exactly as
-  Eden does. Address/host vectors and capacity metadata are no longer reset by an invented
-  `disable` helper.
-- None after replacing the file-local alignment functions with the upstream-owned `common`
-  operations and preserving unsigned wrapping in address, cursor, index, and generation updates.
-- None after removing the public `device()` accessor, which has no upstream counterpart.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- N/A: `Allocation` is returned within Rust and is not copied to a Vulkan or guest-memory payload;
-  its pointer, offset, chunk, and generation values correspond field-for-field to Eden.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/descriptor_pool.rs` and descriptor-allocation call sites vs Eden `src/video_core/renderer_vulkan/vk_descriptor_pool.h` and `.cpp`
 
@@ -14218,27 +9030,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   of Eden's scheduler lambdas capturing `this`.
 - Allocator methods accept a shared scheduler borrow because they only call the logically const
   `get_master_semaphore`; Eden spells the parameter as a non-const reference.
-
-### Unintentional differences (to fix)
-
-- None after restoring slice-based `make_bank_info`, explicit device/scheduler arguments on every
-  allocator overload, and the absence of a master-semaphore member on `DescriptorPool`.
-- None after making `DescriptorAllocator` uniquely owned and move-only again, storing banks in
-  address-stable boxes, and replacing owning allocator clones with non-owning deferred-command
-  references.
-- None after `ComputePass` stopped creating an allocator for an empty descriptor-template list and
-  began cleaning partially created Vulkan resources in Eden's reverse member order.
-
-### Missing items
-
-- None in descriptor counting, pool construction/retry, bank selection/publication, resource
-  commit, or the audited allocator call sites.
-
-### Binary layout verification
-
-- N/A: descriptor metadata is consumed field-wise and Vulkan structures are built through ash.
-  Focused tests cover all-field superset matching, multi-shader accumulation, unsigned wrapping,
-  and bank address stability across outer-vector growth.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/descriptor_table.rs` and Maxwell3D TIC/TSC accessors vs Eden `src/video_core/texture_cache/descriptor_table.h` and `src/video_core/engines/maxwell_3d.{h,cpp}`
 
@@ -14254,27 +9045,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   memory reader. Eden default-constructs the `std::pair<T, bool>` storage before
   `ReadBlockUnsafe`; the supported POD descriptor types accept every overwritten bit pattern.
 
-### Unintentional differences (to fix)
-
-- None after deleting the duplicate root-level descriptor table, keeping the implementation in
-  Eden's `texture_cache` owner, restoring Eden's public field order, removing invented cached/limit
-  accessors, and using the common `DivCeil` counterpart.
-- None after removing Maxwell3D's invented cached TIC/TSC tables and synchronization method.
-  `get_tic_entry` and `get_tsc_entry` now directly read a 32-byte `TicEntry`/`TscEntry` from the
-  register-selected pool, matching Eden's method ownership, return type, address calculation, and
-  lack of change-detection state.
-
-### Missing items
-
-- None in `DescriptorTable<T>::Synchronize`, `Invalidate`, `Read`, or `Refresh`, or in the audited
-  Maxwell3D TIC/TSC accessors.
-
-### Binary layout verification
-
-- PASS: `TicEntry` and `TscEntry` are `#[repr(C)]` wrappers over `[u64; 4]` with compile-time
-  0x20-byte size assertions, matching Eden's two descriptor payloads. `DescriptorTable<T>` itself
-  is host-only cache state and is not serialized or copied as raw bytes.
-
 ## 2026-08-26 — `src/video_core/src/dirty_flags.rs` vs Eden `src/video_core/dirty_flags.h` and `.cpp`
 
 ### Intentional differences
@@ -14284,29 +9054,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust names the register-structure word counts explicitly because it cannot apply C++ `sizeof`
   to the separately modeled Maxwell register fields. Each count was checked against Eden's field
   type and static size assertions.
-
-### Unintentional differences (to fix)
-
-- None after `SetupDirtyVertexBuffers` began passing the 64-word size of the complete
-  `vertex_stream_limits` array on every iteration. This deliberately preserves Eden's overlapping
-  fills and their 62-word table-1 spill past the array instead of substituting the more plausible
-  two-word element size.
-- None after marking only `zeta_size.width` and `zeta_size.height`; the depth/dimension-control word
-  is no longer dirtied by this common setup.
-- None after porting the previously missing constexpr `GetDirtyFlagsForMethod` with Eden's literal
-  constants, branch order, boundary rules, and overlapping ranges.
-- None after restoring fixed-size `Regs::NUM_REGS` tables and removing `fill_block`'s silent
-  out-of-range truncation, which had no counterpart in Eden's fixed `std::array` implementation.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: `DirtyTable` is a fixed `[u8; ENGINE_REG_COUNT]` of exactly 0xE00 bytes and `DirtyTables`
-  contains exactly two such arrays, matching Eden's `DirtyState::Table` and `Tables`. This is
-  host-only lookup state and is not serialized.
 
 ## 2026-08-26 — `src/video_core/src/dma_pusher.rs` vs Eden `src/video_core/dma_pusher.h` and `.cpp`
 
@@ -14319,26 +9066,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   that both pointers identify the same upstream-owned channel state.
 - The synchronization predicate and condition variable live in an `Arc<DmaSyncState>` so Eden's
   asynchronous fence callback can outlive the stack frame without capturing a raw `this` pointer.
-
-### Unintentional differences (to fix)
-
-- None after restoring the 24-bit `CommandHeader::method_count_` view and the explicit
-  `ChannelState` relationship on `DmaPusher`.
-- None after narrowing `index * sizeof(u32)` to `u32` before assigning `dma_word_offset`, matching
-  Eden's explicit cast, and using wrapping signed negation for the inline command's zero-address
-  offset so the two's-complement bit pattern is preserved even for `i64::MIN` in debug builds.
-
-### Missing items
-
-- None in the audited command-header, queue, dispatch, step, command-processing, state-update, or
-  subchannel-binding paths.
-
-### Binary layout verification
-
-- PASS: `CommandListHeader` is one `u64`; `CommandHeader` is one `u32`, including Eden's
-  overlapping 13-bit method, 24-bit legacy method-count, 3-bit subchannel, 13-bit argument-count,
-  and 3-bit submission-mode views. Focused tests decode the raw bit patterns and verify the 512
-  inline entries of each command-list small vector.
 
 ## 2026-08-26 — Draw-manager and topology consumers vs Eden `src/video_core/engines/draw_manager.cpp`, `maxwell_3d.h/.cpp`, and renderer counterparts
 
@@ -14358,33 +9085,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `u32` values. OpenGL/Vulkan conversion, pipeline runtime info, query counting, and depth-bias
   consumers retain Eden's respective invalid/default handling for those values.
 
-### Unintentional differences (to fix)
-
-- None after porting the bulk `SetInlineIndexBuffer` overload and
-  `Maxwell3D::ProcessInlineIndexMultiData`, including the one-time last-word Shadow RAM/dirty update
-  and the per-word fallback when Shadow RAM is in Replay mode.
-- None after restoring all declared `PrimitiveTopologyOverride` values in their `maxwell_3d.rs`
-  owner and making `UpdateTopology` execute Eden's default raw-topology conversion. Overrides such
-  as triangles, adjacency topologies, patches, and legacy values are no longer silently converted
-  to `None` or `Triangles`.
-- None after using wrapping `u32` arithmetic for instance accumulation, deferred-draw count, and
-  base-instance subtraction, matching C++ unsigned arithmetic in debug and release builds.
-
-### Missing items
-
-- None in the audited DrawManager state, method dispatch, direct/indirect draw, inline-index,
-  topology-override, clear, or draw-texture paths.
-
-### Binary layout verification
-
-- N/A: draw-manager state is host-only and is consumed field-wise. The topology-control,
-  topology-override, and representation-preserving primitive-topology enums are `#[repr(u32)]`;
-  focused tests cover every modern and legacy override bit pattern plus each packed bulk
-  inline-index representation.
-
 ## 2026-08-26 — `src/video_core/src/engines/engine_upload.rs` vs Eden `src/video_core/engines/engine_upload.{h,cpp}`
 
 ### Intentional differences
+
 - Eden stores a `Registers&` inside `Upload::State`. Rust passes the owning engine's register view
   to each entry point to avoid a movable self-referential engine; every owner constructs that view
   immediately before the same Eden call boundary.
@@ -14398,6 +9102,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   out-of-bounds behavior. Valid command streams use the same line slices.
 
 ### Unintentional differences (to fix)
+
 - Resolved: `ProcessExec`, word accumulation, and linear destination calculations now use wrapping
   unsigned arithmetic matching Eden's `u32`/`GPUVAddr` operations in debug and release builds.
 - Resolved: single-word accumulation now uses native byte order, matching Eden's `memcpy` from the
@@ -14405,23 +9110,17 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: the linear path no longer depends on the unrelated memory-manager owner, silently skips
   short lines, or falls back to a direct memory write when the required rasterizer is absent.
 
-### Missing items
-- None in the reviewed register helpers, transfer state machine, linear upload, or block-linear
-  swizzle path.
-
-### Binary layout verification
-- PASS: `Registers` and `DestRegisters` are `repr(C)` and focused tests verify their complete Eden
-  sizes, alignments, and field offsets (`0x30` and `0x28` bytes respectively).
-
 ## 2026-08-26 — `src/video_core/src/engines/mod.rs` vs Eden `src/video_core/engines/`
 
 ### Intentional differences
+
 - Rust requires `mod.rs` to declare the source modules; Eden expresses the same source membership
   through its C++ build files and includes.
 - The legacy standalone `inline_to_memory` fixture remains visible only under `cfg(test)` until its
   dedicated parity report is reviewed; production uses Eden's `KeplerMemory` plus `Upload::State`.
 
 ### Unintentional differences (to fix)
+
 - Resolved: removed the duplicate `ClassId` enum. The canonical class identifiers remain in
   `puller.rs`, matching Eden's `EngineID` ownership in `puller.h`.
 - Resolved: removed the invented `SubChannel` enum. In particular, Rust no longer labels subchannel
@@ -14433,13 +9132,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `engines/mod.rs` no longer owns the shared `ENGINE_REG_COUNT` or `PendingWrite`
   compatibility payload. Maxwell3D and MaxwellDMA now own their distinct upstream register counts
   and their local deferred-write integration payloads.
-
-### Missing items
-- None among Eden's engine source-module declarations.
-
-### Binary layout verification
-- N/A: `mod.rs` now owns no class-id or subchannel representation. The canonical transparent
-  `EngineID` representation and engine register layouts are verified in their owning modules.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/filters.rs` and `present/util.rs` vs Eden `src/video_core/renderer_vulkan/present/filters.{h,cpp}` and `present/util.{h,cpp}`
 
@@ -14459,15 +9151,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Restored `CreateCubicSampler`'s high-level `Device` input and its linear-filter fallback when
   `VK_EXT_filter_cubic` is unavailable.
 
-### Missing items
-
-- None in the filter factories or cubic-sampler selection and construction paths.
-
-### Binary layout verification
-
-- PASS: focused tests verify all four Vulkan enum values, structure type `1000519000`, and the
-  native-pointer-width C layout of the locally declared sampler pNext payload.
-
 ## 2026-08-26 — `src/video_core/src/texture_cache/format_lookup_table.rs` and `texture_cache/util.rs` vs Eden `src/video_core/texture_cache/format_lookup_table.{h,cpp}` and `texture_cache/util.cpp`
 
 ### Intentional differences
@@ -14486,16 +9169,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Restored `SNORM_FORCE_FP16` and `UNORM_FORCE_FP16` flow through `PixelFormatFromTIC`: unsupported
   tuples now reach Eden's logged `A8B8G8R8_UNORM` fallback instead of returning `Invalid` early.
 
-### Missing items
-
-- None: an automated source-table comparison found the same 111 hash-to-pixel-format entries on
-  both sides.
-
-### Binary layout verification
-
-- PASS: the canonical component and texture enums are `repr(u32)` with upstream discriminants, and
-  a focused non-uniform hash test verifies every component shift plus the sRGB bit.
-
 ## 2026-08-26 — `src/video_core/src/texture_cache/formatter.rs` vs Eden `src/video_core/texture_cache/formatter.{h,cpp}`
 
 ### Intentional differences
@@ -14510,15 +9183,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `Invalid`.
 - Resolved: image-view addresses now use lower-case hexadecimal digits, matching Eden's `{:#x}`
   formatting used by the already-correct image formatter.
-
-### Missing items
-
-- None in the reviewed pixel-format, image-type, extent, image, image-view, or render-target
-  formatters.
-
-### Binary layout verification
-
-- N/A: this file only creates text and does not define or serialize binary payloads.
 
 ## 2026-08-26 — `src/video_core/src/host_shaders/fragment_shaders.rs` and `host_shaders/*.frag` vs Eden `src/video_core/host_shaders/CMakeLists.txt` and `host_shaders/*.frag`
 
@@ -14542,15 +9206,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   seven fragment-source constants omitted from the old module. All 44 Eden fragment shader files
   now have one matching file and one embedded Rust constant.
 
-### Missing items
-
-- None among Eden's 44 fragment-shader source files.
-
-### Binary layout verification
-
-- N/A: GLSL is embedded as text; the existing build step validates and compiles every applicable
-  source to SPIR-V.
-
 ## 2026-08-26 — `src/video_core/src/framebuffer_config.rs` and framebuffer bridge consumers vs Eden `src/video_core/framebuffer_config.{h,cpp}`
 
 ### Intentional differences
@@ -14571,16 +9226,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `PixelFormatFromGPUPixelFormat` now accepts the canonical Android `PixelFormat` instead
   of an untyped `u32`; downstream conversions no longer unwrap and reconstruct its raw value.
 
-### Missing items
-
-- None in `FramebufferConfig` or `NormalizeCrop`.
-
-### Binary layout verification
-
-- N/A: `FramebufferConfig` is passed as a typed in-process descriptor rather than serialized by a
-  raw memory copy. Its canonical pixel-format enum remains `repr(u32)` and rectangle field order is
-  owned by `common::math_util::Rectangle`.
-
 ## 2026-08-26 — `src/video_core/src/fsr.rs` vs Eden `src/video_core/fsr.{h,cpp}`
 
 ### Intentional differences
@@ -14593,16 +9238,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: RCAS sharpening now uses `(-sharpness).exp2()`, the direct equivalent of Eden's
   `std::exp2f(-sharpness)`, instead of routing the same mathematical expression through `powf`.
-
-### Missing items
-
-- None: both 512-entry half-conversion tables and all EASU/RCAS constant-generation operations
-  match Eden.
-
-### Binary layout verification
-
-- PASS: focused tests compare all sixteen EASU output words and representative RCAS/packed-half
-  words bit-for-bit against values produced by the Eden C++ expressions.
 
 ## 2026-08-26 — Vulkan `present/{fxaa,fsr,smaa}.rs` vs Eden `renderer_vulkan/present/{fxaa,fsr,smaa}.{h,cpp}`
 
@@ -14617,16 +9252,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: FXAA, FSR, and all three SMAA render passes now start in `GENERAL` with attachment
   `LOAD`, matching Eden. They no longer opt into `UNDEFINED`/`DONT_CARE`, which Eden reserves here
   for the explicitly different window-adaptation pass.
-
-### Missing items
-
-- None in the reviewed FXAA pass; the same local render-pass mismatch identified by the report was
-  also corrected in its FSR and SMAA peers.
-
-### Binary layout verification
-
-- N/A: the correction changes Vulkan attachment state and does not define or serialize a binary
-  payload.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_blit_screen.rs` vs Eden `src/video_core/renderer_opengl/gl_blit_screen.{h,cpp}`
 
@@ -14644,16 +9269,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: when an existing window-adaptation pass no longer matches the configured scaling
   filter, Rust now performs Eden's second callback read before selecting the replacement pass. It
   no longer reuses the value read for the early-return comparison.
-
-### Missing items
-
-- None in `FramebufferTextureInfo`, `BlitScreen::DrawScreen`, or
-  `BlitScreen::CreateWindowAdapt`.
-
-### Binary layout verification
-
-- N/A: the framebuffer texture metadata is an in-process typed descriptor and is not serialized by
-  raw memory copy in this path.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_buffer_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_buffer_cache.{h,cpp}`
 
@@ -14677,16 +9292,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: unified index-buffer size alignment is truncated back to Eden's `u32` result before it
   is converted to `GLsizeiptr`.
 
-### Missing items
-
-- None in `Buffer`, `BufferCacheRuntime`, `BindlessSSBO`, or `BufferCacheParams`; every public and
-  private upstream runtime operation has a corresponding Rust owner in this file.
-
-### Binary layout verification
-
-- PASS: `BindlessSSBO` remains a 16-byte `repr(C)` payload (`u64`, `i32`, `i32`), matching Eden's
-  four-`GLuint` static assertion. Focused tests also cover the unsigned-width alignment edge.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_compute_pipeline.rs` vs Eden `src/video_core/renderer_opengl/gl_compute_pipeline.{h,cpp}`
 
 ### Intentional differences
@@ -14709,15 +9314,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: compute descriptor views and samplers can no longer grow beyond Eden's 80- and
   64-element `static_vector` capacities.
 
-### Missing items
-
-- None in `ComputePipelineKey`, `ComputePipeline`, `Configure`, or `WaitForBuild`.
-
-### Binary layout verification
-
-- PASS: `ComputePipelineKey` is `repr(C)`, 24 bytes, with offsets 0/8/12 and no padding; hashing
-  and cache serialization cover the same complete byte representation as Eden.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_device.rs` vs Eden `src/video_core/renderer_opengl/gl_device.{h,cpp}`
 
 ### Intentional differences
@@ -14734,16 +9330,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: NVIDIA's GLSL-workaround version parser now preserves `std::atoi` prefix semantics,
   including leading whitespace/signs and suffixes after the numeric major version. It no longer
   silently returns zero merely because the major-version substring has a non-numeric suffix.
-
-### Missing items
-
-- None: all device limits, vendor predicates, extension flags, driver quirks, shader probes,
-  public capability queries, and dedicated-memory reporting are present.
-
-### Binary layout verification
-
-- N/A: `Device` is a private in-process capability object and is never serialized or copied as a
-  raw upstream payload.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_graphics_pipeline.rs` vs Eden `src/video_core/renderer_opengl/gl_graphics_pipeline.{h,cpp}`
 
@@ -14777,16 +9363,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: per-stage view traversal now advances by the wrapped `Shader::NumDescriptors` result,
   rather than independently summing descriptor counts in host `usize` arithmetic.
 
-### Missing items
-
-- None in `GraphicsPipelineKey`, constructor metadata, `ConfigureImpl`, transform feedback,
-  asynchronous program construction, `WaitForBuild`, or `IsBuilt`.
-
-### Binary layout verification
-
-- PASS: `GraphicsPipelineKey` is `repr(C)`, 624 bytes, with the same 52-byte no-XFB hash prefix;
-  `TransformFeedbackState` is 560 bytes and raw cache round trips cover the complete XFB key.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_rasterizer.rs` vs Eden `src/video_core/renderer_opengl/gl_rasterizer.{h,cpp}`
 
 ### Intentional differences
@@ -14815,17 +9391,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   change suppression, and eight OpenGL clip-distance enables. Eden's unimplemented
   `SyncClipCoef` placeholder also retains a same-owner diagnostic counterpart.
 
-### Missing items
-
-- None among the public rasterizer operations, OpenGL state synchronization methods, transform
-  feedback lifecycle, channel lifecycle, or DMA acceleration methods.
-
-### Binary layout verification
-
-- PASS: Eden's unused header-level `BindlessSSBO` duplicate is not materialized here. The active
-  payload owned by `gl_buffer_cache.cpp` maps to the 16-byte `gl_buffer_cache.rs::BindlessSSBO`
-  with a size regression test; no `RasterizerOpenGL` state is raw-serialized.
-
 ## 2026-08-26 — `src/video_core/src/engines/{draw_manager,maxwell_3d}.rs` support for Eden `src/video_core/renderer_opengl/gl_rasterizer.cpp`
 
 ### Intentional differences
@@ -14837,14 +9402,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: draw views now carry the raw user-clip enable mask required by the restored
   `RasterizerOpenGL::SyncClipEnabled` owner.
-
-### Missing items
-
-- None for the user-clip register access required by this rasterizer parity slice.
-
-### Binary layout verification
-
-- N/A: `Maxwell3DDrawRegisters` is a typed in-process snapshot and is never raw-serialized.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_resource_manager.rs` vs Eden `src/video_core/renderer_opengl/gl_resource_manager.{h,cpp}`
 
@@ -14865,15 +9422,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `OGLSync::is_signaled` now reproduces Eden's always-on fail-soft assertion for
   `GL_WAIT_FAILED`, including fatal behavior when `use_debug_asserts` is enabled, before applying
   the same `status != GL_TIMEOUT_EXPIRED` completion test.
-
-### Missing items
-
-- None; all thirteen Eden OpenGL resource owners and their distinct create/release operations are
-  present.
-
-### Binary layout verification
-
-- N/A: these wrappers own process-local OpenGL handles and are never raw-serialized.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_shader_cache.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_cache.{h,cpp}`
 
@@ -14908,16 +9456,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `use_asynchronous_shaders` is true. Unlike Vulkan's cache, Eden's OpenGL cache does not always
   build runtime pipelines on the pool.
 
-### Missing items
-
-- None among cache-key construction, negative caching, runtime pipeline selection, disk loading,
-  shader translation/emission, progress reporting, or worker lifecycle.
-
-### Binary layout verification
-
-- PASS: compute and graphics keys are read, hashed, and serialized through their complete `repr(C)`
-  byte layouts; their dedicated pipeline modules retain size/layout regression tests.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_shader_context.rs` vs Eden `src/video_core/renderer_opengl/gl_shader_context.h`
 
 ### Intentional differences
@@ -14933,15 +9471,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `ShaderPools::Drop` now releases live flow blocks, IR blocks, and instructions in Eden's
   reverse-member destruction order. Automatic Rust field destruction previously visited the three
   pools in declaration order.
-
-### Missing items
-
-- None; `ShaderPools`, `Context`, their capacities, release ordering, and shared-context lifecycle
-  are present.
-
-### Binary layout verification
-
-- N/A: contexts and object pools are process-local allocation owners and are never raw-serialized.
 
 ## 2026-08-26 — `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
 
@@ -14963,10 +9492,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - `ReleaseChannel` remains deliberately unimplemented exactly as in Eden.
 
-### Binary layout verification
-
-- N/A: `Gpu` is a process-local orchestrator and is never raw-serialized.
-
 ## 2026-08-26 — `src/core/src/{cpu_manager.rs,gpu_core.rs}` vs Eden `src/core/cpu_manager.cpp` and `src/video_core/gpu.h`
 
 ### Intentional differences
@@ -14981,14 +9506,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: the synchronous single-core CPU thread now calls `obtain_context` after the GPU barrier,
   at the same point and under the same `!is_async_gpu && !is_multicore` condition as Eden.
 
-### Missing items
-
-- None for the `CpuManager::RunThread` graphics-context handoff.
-
-### Binary layout verification
-
-- N/A: these interfaces and thread owners are not raw-serialized.
-
 ## 2026-08-26 — `src/video_core/src/{renderer_base.rs,renderer_opengl/renderer_opengl.rs}` vs Eden `src/video_core/renderer_base.h` and `src/video_core/renderer_opengl/renderer_opengl.{h,cpp}`
 
 ### Intentional differences
@@ -15002,14 +9519,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: OpenGL shared-context creation is now non-optional at renderer construction and remains
   available to `GPU::ObtainContext`, rather than being consumed solely by shader workers.
-
-### Missing items
-
-- None for shared-context creation used by the GPU CPU thread.
-
-### Binary layout verification
-
-- N/A: renderer traits, contexts, and factories are process-local owners.
 
 ## 2026-08-26 — `src/common/src/address_space.rs` vs Eden `src/common/address_space.{h,inc}` (`FlatAllocator` prerequisite)
 
@@ -15027,15 +9536,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   mapping.
 - Resolved: all guest-VA additions and subtractions in the bool-backed map/allocator now use
   explicit wrapping operations, preserving the unsigned C++ bit patterns in debug builds.
-
-### Missing items
-
-- None for the bool-backed `FlatAllocator` operations used by the Maxwell device memory manager.
-
-### Binary layout verification
-
-- PASS: allocator blocks are process-local and not raw-serialized; their ordered `(virt, mapped)`
-  state and mutation order match the corresponding upstream specialization.
 
 ## 2026-08-26 — `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs Eden `src/core/device_memory_manager.{h,inc}` and `src/video_core/host1x/gpu_device_memory_manager.{h,cpp}`
 
@@ -15063,16 +9563,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   unsigned wrapping arithmetic.
 - Resolved: the module no longer describes the dense physical/device table implementation as an
   unfinished SMMU subset.
-
-### Missing items
-
-- None for the instantiated Maxwell manager API and allocator helpers.
-
-### Binary layout verification
-
-- PASS: the device table stores one `u32` compressed physical value and the cached-page table one
-  atomic `u8` per device page, matching Eden's element widths and zero/one initialization. These
-  process-local tables are not raw-serialized.
 
 ## 2026-08-26 — `src/video_core/src/gpu_thread.rs` and `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu_thread.{h,cpp}` and `src/video_core/gpu.cpp`
 
@@ -15102,15 +9592,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   submit timing, trace emissions, CLI environment switch, and dump hooks were removed from the hot
   path.
 
-### Missing items
-
-- None for the command variants, public operations, worker dispatch, fence synchronization, or
-  stop/join lifecycle.
-
-### Binary layout verification
-
-- N/A: command enums and synchronization owners are process-local and are not raw-serialized.
-
 ## 2026-08-26 — `src/video_core/src/host1x/codecs/vp9.rs` vs Eden `src/video_core/host1x/codecs/vp9.{h,cpp}`
 
 ### Intentional differences
@@ -15128,16 +9609,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: unsigned range arithmetic and bit extraction preserve Eden's `u32` wrapping and shift
   semantics explicitly, including in debug builds.
 
-### Missing items
-
-- None for VP9 header composition, probability/context updates, segmentation, frame buffering, or
-  range/bitstream encoding.
-
-### Binary layout verification
-
-- N/A: this file consumes the raw NVDEC layouts owned and verified in `vp9_types.rs`; its encoder
-  state and output vectors are process-local.
-
 ## 2026-08-26 — `src/video_core/src/host1x/sync_manager.rs` vs Eden `src/video_core/host1x/sync_manager.{h,cpp}`
 
 ### Intentional differences
@@ -15152,15 +9623,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: the previously missing `SyncptIncr` and `SyncptIncrManager` owners now live in the
   corresponding `host1x/sync_manager.rs` module. Handle allocation, ordered completion, guest/host
   increment order, and prefix erasure follow Eden literally.
-
-### Missing items
-
-- None for `SyncptIncr` or `SyncptIncrManager`.
-
-### Binary layout verification
-
-- PASS: `SyncptIncr` is `repr(C)`, size 16, alignment 4, with its four fields at offsets 0, 4, 8,
-  and 12. It is process-local and is not raw-serialized.
 
 ## 2026-08-26 — `src/video_core/src/host_shaders/mod.rs` and source exports vs Eden `src/video_core/host_shaders/`
 
@@ -15179,15 +9641,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `opengl_present.vert` now exists beside the other shader sources instead of living only
   inside `vertex_shaders.rs`.
 
-### Missing items
-
-- None from Eden's runtime `.comp`, `.frag`, `.vert`, or `.glsl` source inventory.
-
-### Binary layout verification
-
-- N/A: GLSL sources are text; Vulkan modules are validated separately by the generated-SPIR-V
-  tests.
-
 ## 2026-08-26 — `src/video_core/src/texture_cache/image_base.rs` vs Eden `src/video_core/texture_cache/image_base.{h,cpp}`
 
 ### Intentional differences
@@ -15203,16 +9656,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `s32`/`u32` division and remainder. Offsets with bit 31 set no longer take the signed Rust path.
 - Resolved: the missing `has_scaled` accessor is present, address/range calculations preserve
   unsigned wrapping, and alias block rounding uses the upstream-owned common `div_ceil` helper.
-
-### Missing items
-
-- None for flags, constructors, subresource lookup, view tracking, overlap state, or alias-copy
-  generation.
-
-### Binary layout verification
-
-- N/A: `ImageBase`, `ImageMapView`, and alias vectors are process-local cache owners and are not
-  copied to guest memory or serialized as raw bytes.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/image_info.rs` vs Eden `src/video_core/texture_cache/image_info.{h,cpp}`
 
@@ -15231,15 +9674,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   default. Invalid inputs continue through the same constructor branches as Eden.
 - Resolved: multisample width and height expansion now preserves unsigned C++ wrapping, and the
   obsolete placeholder description for the already-ported `PixelFormat` owner was removed.
-
-### Missing items
-
-- None for the default, TIC, render-target, zeta, Fermi2D, or DMA constructors.
-
-### Binary layout verification
-
-- N/A: `ImageInfo` is a process-local descriptor and is not raw-serialized. Its Rust enum replacing
-  the anonymous union intentionally has a different host layout.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/image_view_base.rs` vs Eden `src/video_core/texture_cache/image_view_base.{h,cpp}`
 
@@ -15264,15 +9698,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: depth/stencil component swizzles now replace unsupported integer/float `ONE` sources
   with `ZERO`, guarded by the same maintenance5 property as Eden.
 
-### Missing items
-
-- None for constructors, flags, buffer detection, or anisotropy support.
-
-### Binary layout verification
-
-- N/A: `ImageViewBase` and the Rust slot wrapper are process-local cache objects and are not copied
-  to guest memory or serialized as raw bytes.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` maintenance5 prerequisite vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
 
 ### Intentional differences
@@ -15288,17 +9713,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: maintenance5 is queried, suitability-filtered, enabled on the logical device, and
   exposed through the upstream `IsKhrMaintenance5Supported`, `SupportsPolygonModePointSize`,
   `SupportsDepthStencilSwizzleOne`, and `SupportsEarlyFragmentTests` counterparts.
-
-### Missing items
-
-- None for the maintenance5 feature, queried properties, extension state, or accessors required by
-  the texture-cache view constructor.
-
-### Binary layout verification
-
-- PASS: the local feature payload is 24 bytes on 64-bit hosts (12 on 32-bit), and the property
-  payload is 40 bytes on 64-bit hosts (32 on 32-bit), with `depthStencilSwizzleOneSupport` at the
-  Vulkan ABI offset. Focused tests verify these sizes and offsets.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/image_view_info.rs` vs Eden `src/video_core/texture_cache/image_view_info.{h,cpp}`
 
@@ -15320,15 +9734,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: mip-count subtraction and cube-array layer multiplication preserve C++ unsigned
   wrapping instead of overflowing under Rust debug arithmetic.
 
-### Missing items
-
-- None for constructors, swizzle access, render-target detection, or TIC type promotion.
-
-### Binary layout verification
-
-- PASS: `ImageViewInfo` is 28 bytes with alignment 4; focused tests verify field offsets 0, 4, 8,
-  24, and 27, preserving the unique object representation consumed by cache keys.
-
 ## 2026-08-26 — `src/video_core/src/textures/texture.rs` swizzle prerequisite vs Eden `src/video_core/textures/texture.h`
 
 ### Intentional differences
@@ -15342,14 +9747,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `SwizzleSource::from_raw` no longer rejects the representable raw value 1 before the
   texture-cache and backend validation paths can reproduce Eden's behavior.
 
-### Missing items
-
-- None for `SwizzleSource` discriminants or raw decoding.
-
-### Binary layout verification
-
-- PASS: `SwizzleSource` remains `repr(u32)` and all upstream named discriminants remain unchanged.
-
 ## 2026-08-26 — backend invalid-swizzle handling vs Eden `renderer_{opengl,vulkan}/{gl_texture_cache,maxwell_to_vk}.cpp`
 
 ### Intentional differences
@@ -15362,19 +9759,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: invalid OpenGL swizzles now report and return `GL_NONE`; invalid Vulkan swizzles report
   and return the zero-initialized `VkComponentSwizzle`, matching Eden's fallback results.
 
-### Missing items
-
-- None for the invalid component-swizzle fallback paths touched by this prerequisite.
-
-### Binary layout verification
-
-- N/A: these functions translate an enum into backend API constants and serialize no payload.
-
 ## 2026-08-26 — removed `src/video_core/src/engines/inline_to_memory.rs` vs Eden engine ownership
-
-### Intentional differences
-
-- None. Eden has no `engines/inline_to_memory.{h,cpp}` owner.
 
 ### Unintentional differences (to fix)
 
@@ -15384,15 +9769,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Verified: runtime A140 single- and multi-method dispatch already targets `KeplerMemory`, whose
   matching `engine_upload::State` owner performs Eden's linear rasterizer upload or block-linear
   `swizzle_subrect` path.
-
-### Missing items
-
-- None introduced by the removal; the upstream-owned implementation remains in
-  `engines/{kepler_memory,engine_upload}.rs`.
-
-### Binary layout verification
-
-- N/A: the removed type was test-only and was neither guest-visible nor serialized.
 
 ## 2026-08-26 — `src/video_core/src/invalidation_accumulator.rs` vs Eden `src/video_core/invalidation_accumulator.h`
 
@@ -15412,14 +9788,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   arithmetic rather than panicking on Rust debug overflow.
 - Resolved: `MemoryManager::flush_caching` consumes the unified API instead of relying on the
   non-upstream `any_accumulated`/`callback`/`clear` protocol.
-
-### Missing items
-
-- None for range accumulation, adjacency merging, callback ordering, reset, or return state.
-
-### Binary layout verification
-
-- N/A: the accumulator is a process-local owner and is not copied to guest memory or serialized.
 
 ## 2026-08-26 — `src/video_core/src/engines/kepler_compute.rs` vs Eden `src/video_core/engines/kepler_compute.{h,cpp}`
 
@@ -15441,17 +9809,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `get_tic_entry` and `get_tsc_entry` are compiled as runtime-private methods instead of
   existing only in test builds. Their pool offset arithmetic now preserves unsigned wrapping.
 
-### Missing items
-
-- None for register ownership, QMD fields, upload tracking, indirect-compute detection, launch,
-  sink consumption, or TIC/TSC reads.
-
-### Binary layout verification
-
-- PASS: the register array contains exactly 0xCF8 words; `LaunchParamsLayout` is 0x100 bytes and
-  compile-time assertions verify the upstream program, grid, shared-memory, block, constant-buffer
-  mask, and constant-buffer table offsets.
-
 ## 2026-08-26 — `src/video_core/src/engines/kepler_memory.rs` vs Eden `src/video_core/engines/kepler_memory.{h,cpp}`
 
 ### Intentional differences
@@ -15470,16 +9827,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   and sink consumption no longer silently drops out-of-range methods.
 - Resolved: the default multi-method path uses wrapping `u32` subtraction for
   `methods_pending - i`, matching C++ instead of saturating at zero.
-
-### Missing items
-
-- None for register layout, rasterizer binding, upload execution/data handling, multi-method
-  dispatch, or deferred sink consumption.
-
-### Binary layout verification
-
-- PASS: `Regs` is 0x1FC bytes with alignment 4, and focused tests verify the upload, exec, and data
-  word positions 0x60, 0x6C, and 0x6D.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/layer.rs` vs Eden `src/video_core/renderer_vulkan/present/layer.{h,cpp}`
 
@@ -15510,15 +9857,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: a scope guard updates the resource tick on every exit from `configure_draw`, including
   panic unwinding, matching Eden's `SCOPE_EXIT` lifecycle.
 
-### Missing items
-
-- None in Layer construction, draw configuration, resource refresh/release, staging upload,
-  anti-alias selection, push constants, descriptor updates, or tick ordering.
-
-### Binary layout verification
-
-- N/A: Layer owns host-side Vulkan resources and does not serialize its Rust representation.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs Eden `src/video_core/renderer_vulkan/present/fsr.{h,cpp}`
 
 ### Intentional differences
@@ -15536,14 +9874,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: EASU and RCAS images are owning VMA allocations, so their lifetime follows the FSR
   object instead of the global allocator.
 - Resolved: the stage enum, count, and per-image resources are private like Eden's nested members.
-
-### Missing items
-
-- None in the two-pass FSR construction, upload, descriptor, push-constant, or draw path.
-
-### Binary layout verification
-
-- N/A: push constants remain the fixed `[u32; 16]` payload; the remaining state is host-only.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/sgsr.rs` vs Eden `src/video_core/renderer_vulkan/present/sgsr.{h,cpp}`
 
@@ -15567,10 +9897,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Eden declares but does not define or call `Initialize`; there is no executable method to port.
 
-### Binary layout verification
-
-- N/A: the seven-word push-constant array is unchanged and host object layout is not serialized.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/fxaa.rs` vs Eden `src/video_core/renderer_vulkan/present/fxaa.{h,cpp}`
 
 ### Intentional differences
@@ -15587,14 +9913,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: every per-frame FXAA image owns its VMA allocation and is released when the pass is
   replaced by Layer.
 
-### Missing items
-
-- None in FXAA creation, upload, descriptor update, draw, or resource ownership.
-
-### Binary layout verification
-
-- N/A: FXAA owns host Vulkan handles and has no serialized payload.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/smaa.rs` vs Eden `src/video_core/renderer_vulkan/present/smaa.{h,cpp}`
 
 ### Intentional differences
@@ -15610,14 +9928,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: both static lookup images and all three dynamic images per frame own VMA allocations;
   replacing the SMAA pass now releases them with the pass.
 - Resolved: SMAA's nested enums, counts, and `Images` structure are private like upstream.
-
-### Missing items
-
-- None in SMAA image creation/upload, its three render passes, descriptor wiring, or draw order.
-
-### Binary layout verification
-
-- N/A: SMAA owns host Vulkan handles and does not serialize its Rust object representation.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden presentation utilities and `vulkan_memory_allocator.{h,cpp}`
 
@@ -15645,10 +9955,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - GPU allocation/deallocation logging remains unavailable because Ruzu has not ported Eden's GPU
   logging subsystem; this does not alter allocation policy or resource lifetime.
-
-### Binary layout verification
-
-- N/A: the wrappers own host Vulkan/VMA handles and are not copied to guest memory or disk.
 
 ## 2026-08-26 — `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}`
 
@@ -15684,17 +9990,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: interpreter assertions use Eden's fail-soft policy for validly recoverable cases, and
   the x86-64 emitter follows Eden's optimizer, delay-slot, method-send, and parameter-fetch paths.
 
-### Missing items
-
-- None in the macro instruction representation, HLE table and implementations, interpreter,
-  x86-64 JIT, cache dispatch, rebased upload lookup, or macro dumping.
-
-### Binary layout verification
-
-- PASS: focused tests verify every opcode/method-address field and the native `u32` dump payload.
-  `JitState` remains 56 bytes on x86-64 with the two pointer slots, eight registers, and carry flag
-  at the same offsets as Eden; only the meaning of the second pointer is the documented adaptation.
-
 ## 2026-08-26 — `src/video_core/src/engines/maxwell_dma.rs` vs Eden `src/video_core/engines/maxwell_dma.{h,cpp}`
 
 ### Intentional differences
@@ -15710,17 +10005,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the wrapping unsigned `methods_pending - i <= 1` expression used by Eden.
 - Resolved: launching DMA now rejects non-`NONE` interrupt types before selecting or executing a
   copy path, matching the assertion at the head of Eden's `Launch`.
-
-### Missing items
-
-- None in the launch dispatch, pitch/block-linear copy algorithms, accelerated paths, semaphore
-  release, method sink handling, or register decoding exercised by this engine.
-
-### Binary layout verification
-
-- PASS: the register storage is exactly 0x800 `u32` words; every typed register base used by the
-  implementation is derived from the byte offset asserted in Eden's `Regs` definition. Rust does
-  not serialize a host `MaxwellDMA` object or expose its object layout to guest memory.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/maxwell_to_gl.rs` vs Eden `src/video_core/renderer_opengl/maxwell_to_gl.h`
 
@@ -15738,15 +10022,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `cull_face` now accepts Eden's `0x404`/`0x405`/`0x408` Maxwell encodings.
 - Resolved: floating-point `Size_R16_G16_B16` vertex attributes (`0x05`) now map to
   `GL_HALF_FLOAT` together with the other three 16-bit floating formats.
-
-### Missing items
-
-- None: all 102 `SURFACE_FORMAT_LIST` entries and every conversion function in the upstream header
-  were compared against the Rust counterpart.
-
-### Binary layout verification
-
-- N/A: this file maps guest register values to host OpenGL enums and exposes no raw-memory payload.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/maxwell_to_vk.rs` vs Eden `src/video_core/renderer_vulkan/maxwell_to_vk.{h,cpp}`
 
@@ -15767,15 +10042,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   input creation now both pass their live device owner.
 - Resolved: the obsolete Nvidia and scaled-format snapshots were removed from the texture-cache
   and rasterizer constructors once those decisions returned to the upstream-owned `Device` paths.
-
-### Missing items
-
-- None in the 112-entry surface-format mapping, transcoding policy, sampler conversions, vertex
-  format table, or remaining Maxwell-to-Vulkan enum conversions.
-
-### Binary layout verification
-
-- N/A: the module returns Vulkan handles/enums and does not copy its Rust structures as raw data.
 
 ## 2026-08-26 — `src/video_core/src/memory_manager.rs` vs Eden `src/video_core/memory_manager.{h,cpp}`
 
@@ -15809,11 +10075,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   scalar and block access, range queries, cache invalidation, copy, page-kind/layout queries, and
   span access.
 
-### Binary layout verification
-
-- N/A: the page tables and range maps are internal host data structures and are not serialized or
-  copied across an ABI boundary.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/nsight_aftermath_tracker.rs` vs Eden `src/video_core/vulkan_common/nsight_aftermath_tracker.{h,cpp}`
 
 ### Intentional differences
@@ -15833,10 +10094,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - The proprietary `HAS_NSIGHT_AFTERMATH` implementation is unavailable; the no-SDK constructor,
   destructor, and `SaveShader` behavior are present.
-
-### Binary layout verification
-
-- N/A: the stub is not passed through a C ABI and stores no state.
 
 ## 2026-08-26 — removed `src/video_core/src/renderer_null/null_backend.rs`; factory comparison with Eden `src/video_core/video_core.{h,cpp}`
 
@@ -15859,10 +10116,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The null selection arm itself is present in the frontend renderer factory and constructs
   `renderer_null::RendererNull`; no separate null-backend object exists upstream.
 
-### Binary layout verification
-
-- N/A: the removed marker type and trait carried no ABI payload.
-
 ## 2026-08-26 — `src/video_core/src/renderer_null/null_rasterizer.rs` vs Eden `src/video_core/renderer_null/null_rasterizer.{h,cpp}`
 
 ### Intentional differences
@@ -15883,14 +10136,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: flush-area alignment uses wrapping unsigned arithmetic like C++, stale source-tree
   references were corrected, and duplicate parameterless DMA image helpers were removed.
 
-### Missing items
-
-- None among the `AccelerateDMA` and `RasterizerNull` overrides declared by Eden.
-
-### Binary layout verification
-
-- N/A: these renderer objects and callbacks are host-only and are not raw-copied or serialized.
-
 ## 2026-08-26 — `src/video_core/src/host1x/nvdec_common.rs` vs Eden `src/video_core/host1x/nvdec_common.h`
 
 ### Intentional differences
@@ -15909,15 +10154,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `ControlParams` owns all five upstream bitfields, and constants/accessors now cover
   every named NVDEC register, including the H.264, VP8, HVEC, and VP9 scratch-buffer fields that
   were previously absent from the Rust surface.
-
-### Missing items
-
-- None from `VideoCodec`, `Offset`, `control_params`, or the named `NvdecRegisters` fields.
-
-### Binary layout verification
-
-- PASS: `VideoCodec`, `ControlParams`, and `Offset` are each 8 bytes; `NvdecRegisters` is 0xBC0
-  bytes with 8-byte alignment, and tests verify every named register index from 0x80 through 0x177.
 
 ## 2026-08-26 — `src/video_core/src/host1x/nvdec.rs` vs Eden `src/video_core/host1x/nvdec.{h,cpp}`
 
@@ -15939,15 +10175,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: per-frame trace instrumentation absent from Eden was removed, and raw unknown codec
   values are preserved by the corrected `nvdec_common` representation.
 
-### Missing items
-
-- None among construction/destruction, `ProcessMethod`, `CreateDecoder`, `Execute`, and
-  `GetSyncpoint`.
-
-### Binary layout verification
-
-- N/A: `Nvdec` is a host-side polymorphic engine object and is not copied through a guest or C ABI.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/pipeline_helper.rs` vs Eden `src/video_core/renderer_vulkan/pipeline_helper.h`
 
 ### Intentional differences
@@ -15967,16 +10194,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   range sizing, image/sampler fallback selection, modification tracking, and rescaling bit packing
   retain the upstream order and conditions.
 
-### Missing items
-
-- None among the inline helpers, descriptor layout builder, rescaling/render-area state, or image
-  descriptor push path.
-
-### Binary layout verification
-
-- PASS: tests verify the upstream-owned `RescalingLayout` size/alignment (32/16 bytes),
-  `RenderAreaLayout` size (16 bytes), and offsets 0/24/0 used by Vulkan push constants.
-
 ## 2026-08-26 — `src/video_core/src/pte_kind.rs` vs Eden `src/video_core/pte_kind.h`
 
 ### Intentional differences
@@ -15988,15 +10205,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: removed thirteen named kinds absent from Eden and restored Eden's exact names for
   `C32_MS2_2CRA`, `C64_MS2_2CRA`, and `SMASKED_MESSAGE`.
-
-### Missing items
-
-- None: all 233 Eden enumerators and `IsPitchKind` are present.
-
-### Binary layout verification
-
-- PASS: `PteKind` is `repr(transparent)` over `u8`; focused tests cover the sparse corrected values
-  and pitch-kind predicate.
 
 ## 2026-08-26 — `src/video_core/src/query_cache/query_cache_base.rs` vs Eden `src/video_core/query_cache/query_cache_base.h` and `query_cache.h`
 
@@ -16016,11 +10224,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - The generic lifecycle hooks are present. The Vulkan samples streamer still needs to be wired
   through the complete `PresyncWrites`/`SyncWrites` lifecycle in its owning backend file.
-
-### Binary layout verification
-
-- PASS: `QueryLocation` remains a 32-bit packed value with a 27-bit query id and 5-bit stream id;
-  the new regression test verifies wrapping accumulation at the `u64` boundary.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/query_cache.rs`, `vk_rasterizer.rs`, and `query_cache/query_cache_base.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}` and `query_cache/query_cache.h`
 
@@ -16052,11 +10255,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - A live Vulkan query-pool validation remains necessary because unit tests cannot execute recorded
   device commands.
 
-### Binary layout verification
-
-- N/A: the corrected query bookkeeping and synchronization payloads are host-only Rust structures;
-  no raw guest or cache serialization layout changed.
-
 ## 2026-08-26 — `src/video_core/src/rasterizer_interface.rs` vs Eden `src/video_core/rasterizer_interface.h` and `rasterizer_download_area.h`
 
 ### Intentional differences
@@ -16074,15 +10272,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `Maxwell3D::process_counter_reset` now maps all four clear-report values to Eden's exact
   query types instead of sending unrelated numeric counter identifiers.
 
-### Missing items
-
-- None in the rasterizer virtual surface or counter-reset mapping.
-
-### Binary layout verification
-
-- PASS: every rasterizer backend now returns the same `RasterizerDownloadArea` owner with Eden's
-  `u64`, `u64`, `bool` field order; the structure is not copied as a raw guest payload.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/render_pass_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_render_pass_cache.{h,cpp}`
 
 ### Intentional differences
@@ -16099,16 +10288,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   cached null handle, so later lookups return null without retrying, matching Eden's
   `try_emplace`-before-`CreateRenderPass` lifecycle.
 
-### Missing items
-
-- None in render-pass keying, attachment/reference construction, resolve handling, self-dependency,
-  or cache lifecycle.
-
-### Binary layout verification
-
-- N/A: `RenderPassKey` and cached Vulkan handles are host-only and are not serialized or copied to
-  guest memory.
-
 ## 2026-08-26 — `src/video_core/src/renderer_null/renderer_null.rs` vs Eden `src/video_core/renderer_null/renderer_null.{h,cpp}` and `renderer_base.{h,cpp}`
 
 ### Intentional differences
@@ -16124,15 +10303,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: Null construction and `refresh_base_settings` recalculate the live framebuffer layout,
   and screenshot requests use the inherited base lifecycle instead of immediately reporting
   failure.
-
-### Missing items
-
-- None in `RendererNull` construction, composite, capture-buffer, vendor, rasterizer access, or
-  inherited renderer-base behavior.
-
-### Binary layout verification
-
-- N/A: renderer state and frontend callback owners are host-only and are not raw guest payloads.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/renderer_opengl.rs` vs Eden `src/video_core/renderer_opengl/renderer_opengl.{h,cpp}` and `renderer_base.cpp`
 
@@ -16154,16 +10324,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: an empty composite now returns before reading frontend layout state or making the GL
   context current, matching Eden's first operation in `Composite`.
 
-### Missing items
-
-- None in construction, composition, telemetry, screenshot rendering, applet capture, debug
-  handling, or inherited base-renderer behavior.
-
-### Binary layout verification
-
-- N/A: the renderer owners, GL handles, and frontend callbacks are host-only and are not serialized
-  or copied as guest payloads.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/present/layer.rs` vs Eden `src/video_core/renderer_opengl/present/layer.{h,cpp}`
 
 ### Intentional differences
@@ -16178,16 +10338,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: the fallback display path now computes `framebuffer.address + framebuffer.offset` with
   unsigned wraparound. It no longer panics in debug builds where Eden's `DAddr` arithmetic wraps.
-
-### Missing items
-
-- None in render-target preparation, accelerated-display fallback, framebuffer unswizzling/upload,
-  anti-alias selection, FSR application, or presentation vertex construction.
-
-### Binary layout verification
-
-- N/A: `Layer` and `TextureInfo` are host-side GL owners. `ScreenRectVertex`, the buffer payload
-  emitted by this file, is verified separately against Eden's four-`GLfloat` layout.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/renderer_vulkan.rs` vs Eden `src/video_core/renderer_vulkan/renderer_vulkan.{h,cpp}`
 
@@ -16216,11 +10366,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Eden's optional `HAS_LSFG` frame-generation path is not built or exposed by Ruzu.
 
-### Binary layout verification
-
-- N/A: this file owns host Vulkan objects and frontend callbacks; capture pixel buffers use the
-  separately verified capture constants and texture swizzle implementation.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/fence_manager.rs`, `scheduler.rs`, and `vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_fence_manager.{h,cpp}`
 
 ### Intentional differences
@@ -16238,15 +10383,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: the Rust-only public `wait_tick` and `is_stubbed` accessors were removed after their
   rasterizer-side callers were eliminated.
 
-### Missing items
-
-- None in Vulkan fence creation, queuing, completion checks, or waiting.
-
-### Binary layout verification
-
-- N/A: Vulkan fences and scheduler synchronization handles are host-only owners and are not raw
-  guest payloads.
-
 ## 2026-08-26 — `src/video_core/src/texture_cache/samples_helper.rs` and `image_info.rs` vs Eden `src/video_core/texture_cache/samples_helper.h` and `image_info.cpp`
 
 ### Intentional differences
@@ -16259,15 +10395,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `samples_helper.rs` no longer owns a duplicate `MsaaMode` enum left from the early
   texture-port scaffold. It consumes `textures::texture::MsaaMode`, matching Eden's include and
   type ownership, and `image_info.rs` decodes directly to that canonical type.
-
-### Missing items
-
-- None in sample-count or sample-dimension conversion.
-
-### Binary layout verification
-
-- PASS: the canonical `MsaaMode` remains `repr(u32)` with every Eden discriminant unchanged;
-  focused tests exercise all eleven valid modes through all three sample helpers.
 
 ## 2026-08-26 — `src/video_core/src/lib.rs` module tree vs Eden `src/video_core`
 
@@ -16290,14 +10417,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: removed the unused root `syncpoint.rs` prototype. Eden owns this functionality only in
   `host1x/syncpoint_manager.{h,cpp}`, and every live Ruzu caller already uses the corresponding
   `host1x/syncpoint_manager.rs` implementation.
-
-### Missing items
-
-- None introduced by removing the unreachable scaffold.
-
-### Binary layout verification
-
-- N/A: the removed types were unused host-only placeholder state.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs Eden `src/video_core/vulkan_common/vulkan_memory_allocator.{h,cpp}` (remaining buffer paths)
 
@@ -16337,10 +10456,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved by the later 2026-08-26 GPU-memory logging entry.
 
-### Binary layout verification
-
-- N/A: these are host Vulkan/VMA ownership wrappers and are not serialized or guest-visible.
-
 ## 2026-08-26 — Vulkan buffer owners vs Eden renderer Vulkan buffer ownership
 
 ### Intentional differences
@@ -16367,10 +10482,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - GPU allocation/deallocation logging remains unavailable with the unported GPU logger.
 
-### Binary layout verification
-
-- N/A: these are host-only Vulkan handles and VMA allocations, not raw-copied guest payloads.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (channel cache locking)
 
 ### Intentional differences
@@ -16393,10 +10504,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved by the later 2026-08-26 rasterizer GPU-logging entry.
 
-### Binary layout verification
-
-- N/A: this changes host-side locking and address alignment only.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.{h,cpp}`
 
 ### Intentional differences
@@ -16416,10 +10523,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Android frontend-owned driver-library injection remains unported.
 
-### Binary layout verification
-
-- N/A: this change selects a host dynamic library and does not define a shared binary payload.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`
 
 ### Intentional differences
@@ -16436,10 +10539,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Missing items
 
 - Resolved by the later 2026-08-26 callback entry after the GPU logger was ported.
-
-### Binary layout verification
-
-- N/A: the callback consumes Vulkan-owned ABI structures without copying or serializing them.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` vs Eden `src/video_core/vulkan_common/vulkan_instance.cpp`
 
@@ -16461,15 +10560,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: extension discovery and validation precede the available-version check in the same
   lifecycle order as Eden.
 
-### Missing items
-
-- None in extension selection, validation-layer filtering, version validation, or platform
-  instance flags.
-
-### Binary layout verification
-
-- N/A: Vulkan ABI payloads are constructed by ash and are not serialized by Ruzu.
-
 ## 2026-08-26 — `src/video_core/src/textures/workers.rs` vs Eden `src/video_core/textures/workers.{h,cpp}` and `src/common/thread_worker.h`
 
 ### Intentional differences
@@ -16485,14 +10575,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden does. This closes the interval in which the queue was empty but a removed request had not
   yet incremented Ruzu's former active counter.
 
-### Missing items
-
-- None for the texture worker singleton, worker count, queueing, completion waits, or teardown.
-
-### Binary layout verification
-
-- N/A: work queues and closures are host-only state.
-
 ## 2026-08-26 — `src/video_core/src/host1x/syncpoint_manager.rs` vs Eden `src/video_core/host1x/syncpoint_manager.{h,cpp}`
 
 ### Intentional differences
@@ -16507,15 +10589,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: removed environment-controlled syncpoint logging, stderr output, and trace events from
   registration, increment, action dispatch, and waits. Eden performs only the synchronization and
   callback operations in this owner.
-
-### Missing items
-
-- None in guest/host value access, action registration and deregistration, increments, readiness,
-  or blocking waits.
-
-### Binary layout verification
-
-- N/A: this is host-only synchronization state and is never copied or serialized as raw bytes.
 
 ## 2026-08-26 — `src/video_core/src/shader_cache.rs` and `shader_environment.rs` vs Eden `src/video_core/shader_cache.{h,cpp}` and `shader_environment.{h,cpp}`
 
@@ -16534,15 +10607,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   of silently accepting an internally inconsistent shader cache.
 - Resolved: removed the Rust-only shader-stage stall counters and shader-word/analyzer environment
   tracing from cache refresh, registration, CFG sizing, sentinel lookup, and constant-buffer reads.
-
-### Missing items
-
-- None in the methods changed by this parity pass.
-
-### Binary layout verification
-
-- N/A: these cache entries and environments are host-owned; on-disk environment serialization was
-  not changed by this pass.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/swapchain.rs` vs Eden `src/video_core/renderer_vulkan/vk_swapchain.{h,cpp}`
 
@@ -16563,11 +10627,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Frame-generation-specific presentation policy remains absent with its unported subsystem.
 
-### Binary layout verification
-
-- N/A: Vulkan create-info structures are built through `ash`; the view-format order and count now
-  match Eden on each target.
-
 ## 2026-08-26 — `src/video_core/src/engines/sw_blitter/converter.rs` vs Eden `src/video_core/engines/sw_blitter/converter.{h,cpp}`
 
 ### Intentional differences
@@ -16576,37 +10635,13 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   sign mask `0x8000` a second time, which discards all ten mantissa bits; reproducing that apparent
   copy/paste error would corrupt ordinary non-integral FP16 values.
 
-### Unintentional differences (to fix)
-
-- None identified in this focused decision.
-
-### Missing items
-
-- None introduced by retaining the correct FP16 conversion.
-
-### Binary layout verification
-
-- N/A: conversion operates on explicitly decoded scalar words rather than raw host struct copies.
-
 ## 2026-08-26 — Vulkan scheduler tick consumers vs Eden `vk_scheduler.h`, `vk_texture_cache.cpp`, and `vk_query_cache.cpp`
-
-### Intentional differences
-
-- None for retrieval of the scheduler's current command-buffer tick.
 
 ### Unintentional differences (to fix)
 
 - Resolved: removed the Rust-only `Scheduler::pending_tick` synonym. Texture lifetime tracking and
   transform-feedback query-bank reservation now call `Scheduler::current_tick` directly, matching
   Eden's `Scheduler::CurrentTick()` call sites and ownership.
-
-### Missing items
-
-- None for these tick consumers.
-
-### Binary layout verification
-
-- N/A: the change removes an API synonym and preserves the same `u64` timeline value.
 
 ## 2026-08-26 — `src/video_core/src/engines/{mod,maxwell_3d,maxwell_dma}.rs`, `dirty_flags.rs`, and `macro.rs` vs Eden engine register ownership
 
@@ -16623,15 +10658,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   with the values declared by Eden.
 - Resolved: dirty-state tables and macro register reads now refer explicitly to Maxwell3D's
   register count instead of an engine-global constant.
-
-### Missing items
-
-- None in the reviewed register-count ownership slice.
-
-### Binary layout verification
-
-- PASS: focused tests verify that the Maxwell3D and MaxwellDMA register arrays contain 0xE00 and
-  0x800 `u32` entries respectively, matching Eden's `Regs` unions.
 
 ## 2026-08-26 — `src/video_core/src/gpu_logging/*.rs` and GPU-log settings vs Eden `src/video_core/gpu_logging/*.{h,cpp}` and `common/settings{,_enums}.h`
 
@@ -16652,22 +10678,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Android environment setup uses Rust's process-environment API; Qualcomm remains the same
   explicit future-integration stub as Eden.
 
-### Unintentional differences (to fix)
-
-- None after porting logger initialization/shutdown, ring-buffer ordering, memory accounting,
-  shader dumps, pipeline/extension/render-pass logging, state snapshots, crash dumps, driver
-  stubs, and all six GPU-log settings with Eden's defaults and enum discriminants.
-
 ### Missing items
 
 - Runtime Vulkan call sites are wired in their corresponding file-level audit slices; this entry
   covers the logger subsystem and its settings prerequisite only.
-
-### Binary layout verification
-
-- N/A: logger entries and snapshots are host-only diagnostic data copied field-by-field. Focused
-  tests verify enum discriminants, shader-stage names, unit formatting, snapshot section ordering,
-  and the exact settings defaults.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` GPU logging lifecycle vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
 
@@ -16681,21 +10695,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust `Drop` calls `shutdown_gpu_logging` before automatic field destruction. This preserves
   Eden's destructor order: logger shutdown precedes VMA allocator and logical-device destruction.
 
-### Unintentional differences (to fix)
-
-- None after restoring `initialize_gpu_logging`/`shutdown_gpu_logging`, driver classification,
-  logger feature configuration, driver/version/device metadata, extension reporting, and their
-  constructor/destructor call order.
-
-### Missing items
-
-- None in the audited `Device` GPU-logging lifecycle.
-
-### Binary layout verification
-
-- N/A: this lifecycle only reads Vulkan-owned property structures field-by-field and writes
-  host-side diagnostics.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` GPU logger routing vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}`
 
 ### Intentional differences
@@ -16705,20 +10704,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `VulkanDebug` generic name; valid Vulkan strings are forwarded unchanged.
 - Rust's ash callback flag types use `contains` in place of Eden's bitwise flag tests, preserving
   Eden's Validation-before-Performance message-type priority and severity priority.
-
-### Unintentional differences (to fix)
-
-- None after restoring Vulkan validation forwarding, message-type prefixes, message-ID call names,
-  the `-1` error / `-2` warning / `0` other result mapping, and both runtime enablement guards.
-
-### Missing items
-
-- None in the audited debug-callback GPU-logging path.
-
-### Binary layout verification
-
-- PASS: the callback consumes ash's Vulkan ABI structure in place. No Vulkan payload is copied or
-  serialized, and the callback continues returning `VK_FALSE` on every path.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` GPU memory tracking vs Eden `src/video_core/vulkan_common/vulkan_memory_allocator.{h,cpp}`
 
@@ -16730,22 +10715,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   metadata and before entering the independent GPU logger. Eden's VMA calls do not require this
   Rust mutex, while the allocation/logging order is unchanged.
 
-### Unintentional differences (to fix)
-
-- None after restoring `MemoryCommit` allocation/deallocation tracking and VMA image/buffer
-  allocation tracking with Eden's exact enablement guards, sizes, memory handles, and flag values.
-
-### Missing items
-
-- None in the audited allocator GPU-memory logging path. As in Eden, explicit deallocation logging
-  belongs only to `MemoryCommit::Release`; the VMA-owning image and buffer wrappers do not add
-  extra logger calls during destruction.
-
-### Binary layout verification
-
-- PASS: `VkDeviceMemory` handle bits and `VkMemoryPropertyFlags` raw bits are forwarded without
-  reinterpretation. A focused regression verifies the opaque handle conversion.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/scheduler.rs` GPU logging hooks vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
 
 ### Intentional differences
@@ -16756,20 +10725,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   closure; the successful-submit logger call remains under the same submission mutex and follows
   the same master-semaphore call.
 
-### Unintentional differences (to fix)
-
-- None after restoring render-pass begin/end logging and successful `vkQueueSubmit` logging with
-  Eden's exact runtime guards, payloads, result code, and lifecycle ordering.
-
 ### Missing items
 
-- None in the audited scheduler GPU-logging path. The separate Android worker-topology dependency
+- The separate Android worker-topology dependency
   remains recorded in the earlier full scheduler audit.
-
-### Binary layout verification
-
-- N/A: scheduler diagnostics consume host-side Vulkan state and do not alter command or guest
-  payload layouts. A focused test verifies the exact render-pass log string.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` GPU logging hooks vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
 
@@ -16781,21 +10740,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Vulkan success is forwarded through ash's `vk::Result::SUCCESS.as_raw()` rather than Eden's
   `VK_SUCCESS`; both pass the same signed integer zero to the logger.
 
-### Unintentional differences (to fix)
-
-- None after restoring direct draw, plain indirect draw, direct compute-dispatch, and transform-
-  feedback extension logging with Eden's exact branch placement and runtime guards.
-
-### Missing items
-
-- None in the audited rasterizer GPU-logging path. Matching Eden, byte-count draws, count-buffer
-  draws, and indirect compute dispatches return before the corresponding direct-path log hooks.
-
-### Binary layout verification
-
-- N/A: the hooks only format already-decoded host draw state. Focused tests verify indexed draw,
-  indirect draw, and dispatch payloads byte-for-byte against Eden's format strings.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` border-color-swizzle prerequisite vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
 
 ### Intentional differences
@@ -16805,22 +10749,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   payload remains in the logical-device `pNext` chain until `vkCreateDevice` returns.
 - The suitability predicate is mechanically extracted into a file-local function so all four
   upstream requirements can be covered by a focused regression test without a Vulkan device.
-
-### Unintentional differences (to fix)
-
-- None after restoring extension discovery, feature querying, the dependency on usable custom
-  border colors and both swizzle feature bits, Qualcomm/Turnip filtering, logical-device
-  enablement, and the two upstream accessors.
-
-### Missing items
-
-- None for `VK_EXT_border_color_swizzle` capability discovery and publication.
-
-### Binary layout verification
-
-- PASS: ash owns the Vulkan ABI definition of `VkPhysicalDeviceBorderColorSwizzleFeaturesEXT`;
-  Ruzu uses that structure directly in both the physical-device query and logical-device feature
-  chains, without copying or serializing its bytes.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` sampler extension logging vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
 
@@ -16832,22 +10760,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ruzu's validated `custom_border_color_supported` boolean combines Eden's extension,
   `customBorderColors`, and `customBorderColorWithoutFormat` checks during device discovery.
 
-### Unintentional differences (to fix)
-
-- None after restoring `VK_EXT_custom_border_color` and `VK_EXT_border_color_swizzle` usage logs
-  in the sampler constructor, before reduction-mode conversion and exactly once per cached sampler
-  rather than once per derived Vulkan sampler handle.
-
 ### Missing items
 
-- None in the audited `Sampler::Sampler` extension-usage path. The report's broader image,
+- The report's broader image,
   transfer, blit, and layout-transition review remains part of the continuing texture-cache audit.
-
-### Binary layout verification
-
-- N/A: these hooks inspect host capability booleans and emit diagnostic strings; sampler create
-  structures and guest texture descriptors are unchanged. A focused test covers both guards and
-  their upstream order.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/texture_cache.rs` blit ownership vs Eden `src/video_core/texture_cache/texture_cache.{h,cpp}`
 
@@ -16863,26 +10779,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `get_framebuffer_id` is fallible for Vulkan, so common `blit_image` returns `false` if framebuffer
   construction fails. Eden propagates the equivalent Vulkan construction failure by exception.
 
-### Unintentional differences (to fix)
-
-- None after moving `GetBlitImages`, `BlitImage`, and `RenderTargetFromImage` back into the common
-  texture-cache owner, removing the duplicated backend control flow, and making both rasterizers
-  delegate without injecting GPU-memory callbacks.
-- None after matching Eden's unmapped-address behavior: `FindImage` does not see fake CPU ranges,
-  and each failed translation followed by `InsertImage` consumes a new aligned segment of
-  `virtual_invalid_space`.
-
 ### Missing items
 
-- None in the audited `GetBlitImages`, `BlitImage`, `RenderTargetFromImage`, `FindImage`, and
-  `InsertImage` slice. The rest of the large common texture-cache report remains under sequential
-  audit and is not declared complete by this entry.
-
-### Binary layout verification
-
-- N/A: the change moves host-side ownership and control flow. `Region2D`, `RenderTargets`, image
-  IDs, image-view IDs, and framebuffer IDs retain their existing layouts; no guest payload or
-  serialized cache structure changed.
+- The common texture-cache audit beyond `GetBlitImages`, `BlitImage`,
+  `RenderTargetFromImage`, `FindImage`, and `InsertImage` is not complete in this entry.
 
 ## 2026-08-26 — `src/common/src/thread.rs` and `thread_worker.rs` vs Eden `src/common/thread.{h,cpp}` and `thread_worker.h`
 
@@ -16894,20 +10794,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The Android ADPF/core-affinity bodies remain no-ops because the Android JNI integration is an
   explicit port exception. Desktop hosts follow Eden's no-op affinity branches, while every
   non-default placement still lowers the worker priority first.
-
-### Unintentional differences (to fix)
-
-- None after restoring `ThreadPlacement::{Default,Background,Efficiency}`, the placement-aware
-  worker constructor, Eden's low-priority ordering, and the per-placement routing.
-
-### Missing items
-
-- None in the audited `StatefulThreadWorker` placement contract on supported desktop hosts.
-
-### Binary layout verification
-
-- PASS: `ThreadPlacement` is `repr(u32)` with Eden's exact discriminants 0, 1, and 2. It is
-  host-only state and is not serialized.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/texture_cache_base.rs`, `texture_cache.rs`, and `util.rs` storage ownership vs Eden `src/video_core/texture_cache/texture_cache_base.h`, `texture_cache.{h,cpp}`, and `util.{h,cpp}`
 
@@ -16927,24 +10813,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   tick destruction rings match that Eden configuration. Eden's current CMake labels
   `YUZU_LEGACY` Android-only, and the Android frontend is an explicit port exception.
 
-### Unintentional differences (to fix)
-
-- None after restoring `ScratchBuffer<u8>` for decoded, swizzle, and unswizzle storage;
-  `SmallVec` inline capacities 16 and 4 for sparse/decode and join state; and the dedicated
-  `Common::ThreadWorker` with `ThreadPlacement::Efficiency` for texture decoding.
-
-### Missing items
-
-- None in the audited constants, associated backend types, per-channel descriptor state, slot
-  storage, page tables, download queues, LRU/destruction state, unswizzle state, or join-cache
-  fields of `TextureCache<P>`.
-
-### Binary layout verification
-
-- N/A: these are host-side containers rather than raw guest or disk payloads. Focused tests pin
-  the upstream inline capacities, initial scratch sizes, common worker owner, and existing cache
-  lifecycle behavior.
-
 ## 2026-08-26 — `src/video_core/src/texture_cache/types.rs` vs Eden `src/video_core/texture_cache/types.h`
 
 ### Intentional differences
@@ -16953,23 +10821,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `bitflags` type. Its four bit positions and combined mask remain identical.
 - C++ comparison operators are represented by the corresponding Rust equality, ordering, and
   hashing derives where the structures expose those operations.
-
-### Unintentional differences (to fix)
-
-- None after restoring `MAX_MIP_LEVELS` from 14 to Eden's 16. This also restores the length of
-  `LevelArray` and `ImageBase::mip_level_offsets`, so levels 14 and 15 are no longer rejected or
-  omitted by the common texture-cache storage.
-
-### Missing items
-
-- None. All constants, slot-ID aliases, enumerations, flags, geometry structures, subresource
-  structures, and copy/swizzle descriptors from the upstream header are present in this owner.
-
-### Binary layout verification
-
-- PASS: focused tests pin every fixed structure's size and the field offsets of `ImageCopy`.
-  Pointer-width-specific tests pin the 64-bit layouts and field offsets of `BufferImageCopy`,
-  `BufferCopy`, and `SwizzleParameters`, plus their expected 32-bit sizes.
 
 ## 2026-08-26 — `src/video_core/src/texture_cache/util.rs`, `image_base.rs`, and `texture_cache_base.rs` vs Eden `src/video_core/texture_cache/util.{h,cpp}`, `image_base.{h,cpp}`, and `texture_cache.h`
 
@@ -16992,31 +10843,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden's `FixSmallVectorADL` works around a Boost/GCC 12 ADL defect. Rust has no Boost range
   niebloids, so no equivalent compatibility copy is required.
 
-### Unintentional differences (to fix)
-
-- None after restoring `NumBlocks`, `AdjustSize`, `CalculateLevelOffset`,
-  `SwizzlePitchLinearImage`, and `SwizzleBlockLinearImage` as their upstream-owned helpers and
-  routing their callers through them.
-- None after restoring Eden's layer-size/stride calculation, 16-level bounds and error behavior,
-  linear mip-size behavior, generic alignment arithmetic, fail-soft invariants, value-initialized
-  image-view fallback, and unsigned integer bit patterns.
-- None after restoring 3D mip-depth reduction and slice bounds in overlap/subresource checks,
-  block-linear swizzle's default stride alignment of one, reusable ASTC decode scratch storage,
-  exact pitch-linear offsets, and full-span processing instead of silent truncation.
-- None after replacing heap-first `Vec` results and `ImageBase` slice storage with the upstream
-  16-element inline `SmallVec` containers.
-
-### Missing items
-
-- None in the audited `util.h`/`util.cpp` API, private helper set, image-layout calculations,
-  copy generation, conversion, swizzle/unswizzle, overlap resolution, or map-size selection.
-
-### Binary layout verification
-
-- N/A: the changed arrays and small vectors are host-side containers and are not raw-copied or
-  serialized. The copy descriptor layouts remain covered by the `types.rs` layout tests; focused
-  tests additionally pin Eden's compile-time layout-size oracles and the 16-entry inline capacity.
-
 ## 2026-08-26 — `src/video_core/src/transform_feedback.rs`, `engines/maxwell_3d.rs`, and `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`, `engines/maxwell_3d.h`, and `src/shader_recompiler/runtime_info.h`
 
 ### Intentional differences
@@ -17028,27 +10854,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   out-of-bounds array access. Valid indices preserve Eden's assignment and maximum-count ordering.
 - Eden's `UNIMPLEMENTED_IF` diagnostics are represented by the project's fail-soft Rust helper:
   violations are logged and become fatal only when debug assertions are enabled.
-
-### Unintentional differences (to fix)
-
-- None after moving `StreamOutLayout` and `NUM_TRANSFORM_FEEDBACK_BUFFERS` to the Maxwell 3D owner,
-  matching `Maxwell3D::Regs::StreamOutLayout` and `NumTransformFeedbackBuffers`.
-- None after removing the duplicate video-core varying type: `make_transform_feedback_varyings`
-  now returns the canonical shader-recompiler `TransformFeedbackVarying` array directly, as Eden
-  does, and the OpenGL/Vulkan consumers no longer perform field-by-field conversions.
-- None after restoring `RuntimeInfo::xfb_varyings` from a growable vector to Eden's fixed,
-  value-initialized 256-entry array and preserving unsigned wraparound in the generator arithmetic.
-
-### Missing items
-
-- None in the audited transform-feedback state, varying generator, Maxwell register owner, or
-  runtime transform-feedback fields.
-
-### Binary layout verification
-
-- PASS: focused tests pin the 4-byte `StreamOutLayout` register representation and its four byte
-  fields, the 12-byte `TransformFeedbackLayout` field order, the 560-byte
-  `TransformFeedbackState`, and the fixed 256-entry runtime varying extent.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/turbo_mode.rs` and `renderer_vulkan.rs` vs Eden `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}` and `renderer_vulkan.cpp`
 
@@ -17064,27 +10869,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Android calls the same external `adrenotools_set_turbo` C ABI through a conditional Rust link
   declaration instead of including the C header.
 
-### Unintentional differences (to fix)
-
-- None after restoring Eden's constructor boundary: the dedicated device and allocator are made
-  before spawning, while the buffer, descriptors, shader, pipeline, fence, command pool, and
-  command buffer are initialized inside the worker's `run` method.
-- None after using the shared `create_device` owner and its configured physical-device selection,
-  removing the extra explicit command-buffer reset and device-idle wait, and restoring the reverse
-  declaration destruction order for the descriptor layout and pool.
-- None after porting the Android/AArch64 enable-on-work and disable-on-exit calls; Android on other
-  architectures retains Eden's wait loop without creating the desktop Vulkan workload.
-
-### Missing items
-
-- None in the audited constructor, queue notification, worker workload, idle predicate, Android
-  switch, stop request, or resource lifecycle.
-
-### Binary layout verification
-
-- N/A: this slice owns host synchronization state and Vulkan handles; it defines no guest-visible
-  or raw-serialized payload.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/update_descriptor.rs` and `graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_update_descriptor.{h,cpp}` and `vk_graphics_pipeline.cpp`
 
 ### Intentional differences
@@ -17099,26 +10883,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The private `acquire_with_wait` callback is a mechanical test seam for Eden's `WaitWorker` call;
   the public `acquire` method still sets descriptor-buffer mode first and supplies the scheduler's
   exact wait operation.
-
-### Unintentional differences (to fix)
-
-- None after restoring the null `update_data` result before the first acquire and the one-byte
-  empty union member matching `std::monostate`.
-- None after replacing the always-fatal reservation assertion with Eden's fail-soft assertion
-  policy and preserving unsigned wraparound for capacity and descriptor-address arithmetic.
-- None after removing the Rust-only `pending_count` method and graphics-pipeline assertion; Eden
-  reserves the known descriptor count but does not add this runtime instrumentation.
-
-### Missing items
-
-- None in the audited constants, union members, constructor, frame advance, acquisition/recycling,
-  descriptor-buffer selection, payload access, or image/buffer/texel append operations.
-
-### Binary layout verification
-
-- PASS: focused tests pin the empty member at 1 byte, `DescriptorAddress` at 24 bytes with offsets
-  0/8/16, and `DescriptorUpdateEntry` to the maximum member size and alignment used as Vulkan
-  update-template stride.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/util.rs` and presentation callers vs Eden `src/video_core/renderer_vulkan/present/util.{h,cpp}`
 
@@ -17136,29 +10900,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Small create-info builders are same-file mechanical test seams for Eden's local vectors and
   input-assembly structure; they do not move behavior out of the `present/util.rs` owner.
 
-### Unintentional differences (to fix)
-
-- None after porting the previously absent `CreateWrappedComputePipeline` implementation.
-- None after replacing `ALL_COMMANDS` in `download_color_image` with Eden's precise
-  graphics/compute/transfer source and graphics/compute destination stage masks.
-- None after restoring MoltenVK-only primitive restart for the presentation triangle-strip
-  pipelines.
-- None after forwarding descriptor-layout stage flags, preserving explicit empty descriptor-pool
-  type lists and Eden's `size_t`-to-`u32` casts, and restoring the fail-soft capacity assertion
-  that protects descriptor-image pointers from vector reallocation.
-- None after restoring the high-level `Device` boundary for resource, sampler, descriptor, and
-  pipeline creation helpers and updating their presentation callers accordingly.
-
-### Missing items
-
-- None in the audited `present/util.h`/`.cpp` public API or file-static pipeline helper.
-
-### Binary layout verification
-
-- N/A for the Vulkan handles and create-info values changed here. Existing focused tests continue
-  to verify the locally declared QCOM sampler pNext ABI; new tests pin descriptor construction,
-  unsigned descriptor-count conversion, pointer stability, and MoltenVK input assembly state.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/util_shaders.rs` vs Eden `src/video_core/renderer_opengl/util_shaders.{h,cpp}`
 
 ### Intentional differences
@@ -17175,44 +10916,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden's fail-soft assertion handler is represented by an error log and a panic only when
   `use_debug_asserts` is enabled; normal execution continues after the same failed invariants.
 
-### Unintentional differences (to fix)
-
-- None after restoring Eden's fail-soft assertion policy for ASTC parameters, image-copy layer
-  invariants, non-power-of-two pitch uploads, and the invalid `StoreFormat` fallback. Ruzu had
-  logged some of these conditions without honoring `use_debug_asserts`.
-
-### Missing items
-
-- None in the audited constructor, utility operations, or `StoreFormat`. All eight compute-shader
-  source files consumed by this owner are byte-identical to Eden's current sources.
-
-### Binary layout verification
-
-- N/A: this owner passes ordinary scalar values and OpenGL handles and defines no guest-visible or
-  raw-serialized payload. Focused tests cover every `StoreFormat` mapping and its fail-soft
-  fallback.
-
 ## 2026-08-26 — `src/video_core/src/host_shaders/vertex_shaders.rs` vs Eden `src/video_core/host_shaders/CMakeLists.txt` and vertex shader sources
 
 ### Intentional differences
 
 - Eden generates one C++ header per GLSL source, while Rust exposes the same source text through
   `include_str!` constants and separately compiles the Vulkan subset to SPIR-V in `build.rs`.
-
-### Unintentional differences (to fix)
-
-- None after exporting `sgsr1_shader.vert`; it was compiled by the Rust SPIR-V build path but was
-  the only one of Eden's ten vertex sources absent from the source registry.
-
-### Missing items
-
-- None: the ten vertex files listed by Eden's host-shader build are present and byte-identical,
-  and each now has a corresponding Rust source constant.
-
-### Binary layout verification
-
-- N/A: this module embeds text sources and defines no binary payload. The generated SPIR-V owner
-  has its own magic-word coverage; a focused test pins the complete ten-source registry here.
 
 ## 2026-08-26 — `src/video_core/src/host1x/vic.rs` vs Eden `src/video_core/host1x/vic.{h,cpp}`
 
@@ -17234,33 +10943,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The unused C++ surface-offset spans are omitted from the private read-method signatures; Eden
   does not read them in any progressive or interlaced path.
 
-### Unintentional differences (to fix)
-
-- None after replacing the five `Vec` workspaces with Eden's `ScratchBuffer` owner and exact
-  `resize` versus `resize_destructive` choices.
-- None after removing the non-upstream per-frame timing trace and the Rust-only
-  `write_single_plane`/`write_plane_pair` helper boundaries.
-- None after restoring fail-soft behavior for unsupported formats, fatal behavior for impossible
-  block kinds, the original output-format argument, and Eden's interlaced chroma-height bound.
-- None after restoring `Vic::Method` to Eden's byte-offset values, performing the same word-index
-  multiplication at dispatch, and naming every register range exposed by `VicRegisters`.
-- None after restoring the final odd-width YUV iteration and passing one-byte elements—not
-  two-byte chroma texels—to the block-linear chroma swizzle, exactly as Eden does.
-- None after restoring Eden's scoped safe-write guest-memory paths, including direct-span writes
-  and preservation of untouched pitch padding; YUV pitch retains the explicit luma-then-chroma
-  overwrite order used for overlapping guest mappings.
-
-### Missing items
-
-- None in the audited VIC registers/configuration structures, execution flow, progressive and
-  interlaced reads, blend/color conversion, pitch output, or block-linear output.
-
-### Binary layout verification
-
-- PASS: compile-time checks cover every raw VIC structure size; focused tests additionally pin
-  `Pixel`, all `ConfigStruct` member offsets, and the byte offsets of the used VIC registers. A
-  block-linear YUV regression test verifies Eden's one-byte chroma swizzle element contract.
-
 ## 2026-08-26 — `src/video_core/src/video_core.rs` vs Eden `src/video_core/video_core.{h,cpp}`
 
 ### Intentional differences
@@ -17273,22 +10955,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `RUZU_DISABLE_ASYNC_GPU` remains a diagnostic override layered onto Eden's asynchronous-GPU
   setting. Both frontends now receive that decision from the single `create_gpu` owner.
 
-### Unintentional differences (to fix)
-
-- None after removing the unused duplicate renderer/NVDEC enums and routing both GTK and SDL
-  subsystem factories through `video_core::create_gpu`.
-- None after restoring Eden's order: update rescaling state, read NVDEC/async settings, allocate
-  the GPU, select and construct the renderer, then bind it.
-
-### Missing items
-
-- None in the shared `CreateGPU` lifecycle. Concrete window/context construction is supplied by
-  the frontends as described above.
-
-### Binary layout verification
-
-- N/A: this owner contains lifecycle functions and no raw or serialized payloads.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vk_enum_string_helper.rs` vs Eden `src/video_core/vulkan_common/vk_enum_string_helper.h` and Vulkan Utility Libraries `vk_enum_string_helper.h`
 
 ### Intentional differences
@@ -17299,24 +10965,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The Rust wrappers return owned `String` values instead of generated `const char*` values. This
   preserves the exact observable text while allowing the registry-known portion to be assembled
   from Ash's `Debug` names.
-
-### Unintentional differences (to fix)
-
-- None after restoring the `VK_*` prefixes, generated `Unhandled Vk*` fallbacks, lowercase ASTC
-  dimension separators, Vulkan 1.4 values, and the canonical names selected by Eden's generated
-  header.
-- None after routing Eden's production `string_VkResult` equivalents through this module in
-  `VulkanError`, `available_version`, image acquisition, and presentation diagnostics.
-
-### Missing items
-
-- None among the ten Rust wrappers or Eden's production call sites. Other enum helpers exposed by
-  the external generated C header have no callers in Eden's source tree and are not duplicated.
-
-### Binary layout verification
-
-- N/A: these functions convert transparent Vulkan integer enums to diagnostic strings and define
-  no serialized or guest-visible payload.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}` (clear command ordering)
 
@@ -17329,23 +10977,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Command-buffer invalidation and per-channel release are forwarded explicitly to Ruzu's separate
   `StateTracker`; Eden's tracker observes the same lifecycle through scheduler and live Maxwell
   state ownership.
-
-### Unintentional differences (to fix)
-
-- None after recording full-channel color and depth/stencil attachment clears separately and in
-  Eden's order. This also restores color-before-blit ordering when a color clear is followed by a
-  partial stencil clear.
-- None among the report's cache-invalidation, channel-locking, device-page alignment, and GPU-
-  logging findings; those corrections were already present when this report was re-audited.
-
-### Missing items
-
-- None in the report's audited rasterizer slice. The obsolete offscreen framebuffer/readback path
-  named by the report is no longer present in the current rasterizer owner.
-
-### Binary layout verification
-
-- N/A: this change only restores Vulkan command recording order and adds no binary payload.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vma.rs` vs Eden `src/video_core/vulkan_common/vma.h`
 
@@ -17362,22 +10993,11 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden selects the one translation unit defining `VMA_IMPLEMENTATION` in each frontend. The
   `vk-mem` build script compiles its own `wrapper.cpp` translation unit with that definition.
 
-### Unintentional differences (to fix)
-
-- None after correcting the binding documentation and removing four unused type aliases that had
-  no counterpart in Eden's VMA configuration header.
-
 ### Missing items
 
-- None in this binding/configuration owner. Allocator creation flags and block-size policy remain
+- Allocator creation flags and block-size policy remain
   in `vulkan_device.rs`, matching Eden's `vulkan_device.cpp`; allocation policy remains in
   `vulkan_memory_allocator.rs`.
-
-### Binary layout verification
-
-- N/A: this module selects the external VMA binding and Rust ownership wrapper; it defines no
-  copied or serialized payload. A focused type-level test pins the shareable, externally locked
-  allocator ownership contract.
 
 ## 2026-08-26 — `src/video_core/src/host1x/codecs/vp9_types.rs` vs Eden `src/video_core/host1x/codec_types.h` (VP9 section) and `src/video_core/host1x/codecs/vp9.cpp`
 
@@ -17391,24 +11011,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   arrays for upstream padding macros. Their sizes, discriminants, offsets, and raw bytes match the
   C++ representations.
 
-### Unintentional differences (to fix)
-
-- None found in the VP9 structures, conversions, or default probabilities. The report's reference
-  to a nonexistent `vp9_types.h` was corrected to `host1x/codec_types.h`.
-
-### Missing items
-
-- None in the audited VP9 portion. The 22 default-probability fields contain the same 1,972 bytes
-  as Eden, and both `PictureInfo::Convert` and `EntropyProbs::Convert` preserve Eden's field and
-  loop ordering.
-
-### Binary layout verification
-
-- PASS: compile-time and focused runtime checks cover enum/flag widths, all upstream size and
-  offset assertions for `Vp9FrameDimensions`, `Segmentation`, `LoopFilter`, `Vp9EntropyProbs`,
-  `PictureInfo`, and `EntropyProbs`. Regression tests cover zero-extension and flag conversion,
-  every skipped fourth coefficient, Y-mode reshaping, and the complete default-table hash.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/{mod.rs,vulkan.rs}` vs Eden `src/video_core/vulkan_common/vulkan.h`
 
 ### Intentional differences
@@ -17419,21 +11021,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust's `mod.rs` declares the same subsystem files instead of serving as a C++ include
   aggregator. The actual constants owned by Eden's header live in the matching `vulkan.rs` module.
 
-### Unintentional differences (to fix)
-
-- None after adding the missing `VK_KHR_maintenance7` and `VK_KHR_maintenance8` extension-name
-  fallbacks to their upstream-equivalent owner and correcting the stale `zuyu` provenance.
-
-### Missing items
-
-- None in the header's source-owned declarations. Consumption of the provisional extension names
-  belongs to the separate `vulkan_device` parity slice.
-
-### Binary layout verification
-
-- N/A: Ash owns the Vulkan ABI declarations. The two retained values are UTF-8 extension-name
-  constants, covered by a focused exact-string regression test.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs Eden `src/video_core/vulkan_common/vulkan_debug_callback.{h,cpp}` (report re-audit)
 
 ### Intentional differences
@@ -17443,22 +11030,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   so valid calls retain Eden's exact message, ID-name, type-prefix, and priority behavior.
 - Rust's `error!` level is the closest available counterpart to Eden's `LOG_CRITICAL`; warning,
   info, and verbose/debug levels map directly.
-
-### Unintentional differences (to fix)
-
-- None. The report's missing GPU-logger route had already been ported before this re-audit; both
-  runtime guards and the `-1` error / `-2` warning / `0` other result mapping match Eden.
-- None for the Android `0x01257b492` literal: its leading zero does not overflow or change the
-  value, and Rust's `0x1257b492` is exactly equivalent.
-
-### Missing items
-
-- None in the debug callback, false-positive filters, messenger creation flags, or RAII lifetime.
-
-### Binary layout verification
-
-- N/A: Ash owns the callback ABI and Rust reads the callback data in place. A focused regression
-  now pins every platform-selected ignored message ID, in addition to message-type priority.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
 
@@ -17494,11 +11065,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   This requires the Android-only debug setting, API-level query, and AdrenoTools BCn ABI rather
   than a safe local edit to the host-independent device path.
 
-### Binary layout verification
-
-- PASS: focused tests verify the locally declared maintenance5/6 payload sizes, alignments,
-  feature offsets, and Vulkan structure-type values on both 32-bit and 64-bit pointer layouts.
-
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
 
 ### Intentional differences
@@ -17518,11 +11084,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The audited ASTC decode-mode image-view path is complete; broader texture-cache parity remains
   tracked by its dedicated reports.
 
-### Binary layout verification
-
-- PASS: `ash` owns both Vulkan `pNext` payload layouts; the focused test verifies the exact LDR
-  ASTC range boundary and rejects HDR ASTC formats.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` Haiku prerequisite vs Eden `src/video_core/vulkan_common/vulkan_instance.{h,cpp}`
 
 ### Intentional differences
@@ -17534,14 +11095,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: `WindowSystemType::Xcb` and `VK_KHR_xcb_surface` are now present on Haiku, completing
   the platform dispatch consumed by `vulkan_surface.rs`.
-
-### Missing items
-
-- None in the Haiku/XCB instance-extension prerequisite.
-
-### Binary layout verification
-
-- N/A: this change selects a Vulkan extension name and does not define an ABI payload.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_surface.rs` vs Eden `src/video_core/vulkan_common/vulkan_surface.{h,cpp}`
 
@@ -17560,14 +11113,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: every platform creation failure now logs Eden's platform-specific message and becomes
   `VK_ERROR_INITIALIZATION_FAILED`; successful calls returning a null surface are rejected by the
   same final guard as upstream.
-
-### Missing items
-
-- None in the platform surface dispatch.
-
-### Binary layout verification
-
-- PASS: `ash` owns `VkXcbSurfaceCreateInfoKHR`; no locally declared or serialized payload is used.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_wrapper.rs` vs Eden `src/video_core/vulkan_common/vulkan_wrapper.{h,cpp}`
 
@@ -17595,17 +11140,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `get_driver_name` is again owned by the wrapper, includes HoneyKrisp and KosmicKrisp,
   returns Eden's exact `Nvidia` and `llvmpipe` spellings, and falls back to `driver_name`.
 
-### Missing items
-
-- None among the non-Ash helpers used by Ruzu. The upstream per-object wrapper surface is replaced
-  by Ash handles plus the renderer's typed owners rather than duplicated in this file.
-
-### Binary layout verification
-
-- PASS: Ash owns `VkApplicationInfo`, `VkInstanceCreateInfo`,
-  `VkDebugUtilsObjectNameInfoEXT`, and `VkPhysicalDeviceDriverProperties`; no replacement ABI
-  payload is declared locally.
-
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_instance.rs` ownership call site vs Eden `src/video_core/vulkan_common/vulkan_instance.cpp`
 
 ### Intentional differences
@@ -17616,14 +11150,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Resolved: the frontend instance factory no longer owns `VkApplicationInfo` or the Apple create
   flag; it passes Eden's `available` version argument to the matching wrapper method.
-
-### Missing items
-
-- None in the `vk::Instance::Create` call boundary.
-
-### Binary layout verification
-
-- N/A: the call site only passes borrowed name-pointer arrays and a scalar version.
 
 ## 2026-08-26 — `src/video_core/src/vulkan_common/vulkan_device.rs` driver-name delegation vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
 
@@ -17640,14 +11166,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   matching Eden's `Device::GetDriverName` ownership boundary.
 - Resolved: shader-module and buffer naming reuse the wrapper-owned optional dispatch helper, so a
   missing debug-utils symbol no longer reaches Ash's panic fallback.
-
-### Missing items
-
-- None in the audited driver-name or object-name delegation paths.
-
-### Binary layout verification
-
-- N/A: these methods forward existing Ash handles and property payloads without serialization.
 
 ## 2026-08-26 — `src/video_core/src/renderer_vulkan/present/window_adapt_pass.rs` vs Eden `src/video_core/renderer_vulkan/present/window_adapt_pass.{h,cpp}`
 
@@ -17668,16 +11186,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   while creating the second or third pipeline cannot leak an earlier one.
 - The report's claimed caller-side layer preconfiguration is obsolete: `draw` already owns
   `configure_draw`, pipeline selection, command recording, and draw ordering exactly as Eden does.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: `PresentPushConstants` is `repr(C)` and exactly 128 bytes (a 64-byte matrix followed by
-  four 16-byte vectors); the complete payload is passed to Vulkan with the same vertex-stage range
-  as Eden. All Vulkan create-info layouts remain owned by Ash.
 
 ## 2026-08-26 — `src/video_core/src/textures/workers.rs` vs Eden `src/video_core/textures/workers.{h,cpp}`
 
@@ -17703,14 +11211,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The report's BCN usage warning is obsolete: both ASTC decompression and BCN compression queue
   one job per row/stride on this shared pool and wait after each depth plane, matching Eden.
 
-### Missing items
-
-- None in the texture worker singleton or its ASTC/BCN call sites.
-
-### Binary layout verification
-
-- N/A: the singleton contains host-only synchronization objects and boxed closures.
-
 ## 2026-08-26 — `src/video_core/src/query_cache_top.rs` and `src/video_core/src/renderer_opengl/gl_query_cache.rs` vs Eden `src/video_core/query_cache.h` and `src/video_core/renderer_opengl/gl_query_cache.{h,cpp}`
 
 ### Intentional differences
@@ -17734,16 +11234,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `PopAsyncFlushes` no longer removes a non-null batch before collecting its queries; it
   keeps that batch at the front and pops it only after processing, matching Eden's lifecycle order.
 
-### Missing items
-
-- None in the audited legacy query-cache or OpenGL query-cache paths.
-
-### Binary layout verification
-
-- N/A: these caches contain host-only Rust/C++ ownership and synchronization objects; guest
-  writebacks explicitly serialize the same 32-bit/64-bit values and optional timestamp bytes as
-  Eden.
-
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_staging_buffer_pool.rs` vs Eden `src/video_core/renderer_opengl/gl_staging_buffer_pool.{h,cpp}`
 
 ### Intentional differences
@@ -17761,16 +11251,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: `STREAM_BUFFER_SIZE`, `NUM_SYNCS`, `REGION_SIZE`, and `MAX_ALIGNMENT` are private
   `StreamBuffer` associated constants again, rather than module-level constants, matching their
   upstream class ownership.
-
-### Missing items
-
-- None in `StagingBufferMap`, `StagingBuffers`, `StreamBuffer`, or `StagingBufferPool`.
-
-### Binary layout verification
-
-- N/A: these types own host OpenGL objects and mapped host pointers and are not serialized or
-  copied as raw guest payloads. Compile-time assertions retain Eden's stream-size divisibility
-  invariants.
 
 ## 2026-08-26 — OpenGL texture cache and common `CopyImage` ownership vs Eden `gl_texture_cache.{h,cpp}`, `texture_cache.{h,cpp}`, and `vk_texture_cache.{h,cpp}`
 
@@ -17800,15 +11280,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden's file-local accelerated-format table, materializes `StorageViews` before probing it, and
   uses unsigned wrapping arithmetic for the device-memory budget.
 
-### Missing items
-
-- None in the audited common image-copy policy or the OpenGL/Vulkan runtime operations it calls.
-
-### Binary layout verification
-
-- N/A: this slice moves host-side control flow and constant ownership; it does not serialize or
-  raw-copy any guest-visible payload.
-
 ## 2026-08-26 — `src/video_core/src/shader_notify.rs` vs Eden `src/video_core/shader_notify.{h,cpp}`
 
 ### Intentional differences
@@ -17817,20 +11288,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   progress concurrently. The two counters remain independent atomics and retain Eden's ordering.
 - `Option<Instant>` represents Eden's default-constructed `steady_clock::time_point`; the value is
   only read after the same `completed` transition has stored a completion time.
-
-### Unintentional differences (to fix)
-
-- None after retaining `relaxed` only for Eden's two explicit initial snapshots, using fresh
-  sequentially-consistent `num_complete` loads inside both completion-state branches, and restoring
-  the default sequentially-consistent ordering of both C++ atomic pre-increments.
-
-### Missing items
-
-- None in the notification counters, completion timeout, or reporting-state lifecycle.
-
-### Binary layout verification
-
-- N/A: `ShaderNotify` is process-local synchronized state and is neither raw-copied nor serialized.
 
 ## 2026-08-26 — `src/video_core/src/renderer_opengl/gl_fence_manager.rs` vs Eden `src/video_core/renderer_opengl/gl_fence_manager.{h,cpp}`
 
@@ -17841,20 +11298,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   callback-owned fence handles can be shared safely.
 - The test-only forced-stub switch allows the common fence lifecycle to be exercised without an
   OpenGL context and is absent from production builds.
-
-### Unintentional differences (to fix)
-
-- None after all three `GLInnerFence` state assertions use Eden's fail-soft assertion policy and
-  become fatal when `use_debug_asserts` is enabled, instead of merely logging in every mode.
-
-### Missing items
-
-- None in fence creation, queueing, signal polling, waiting, or generic-manager delegation.
-
-### Binary layout verification
-
-- N/A: the fence manager owns process-local OpenGL sync handles and callback state; no payload is
-  raw-copied or serialized.
 
 ## 2026-08-26 — `src/video_core/src/host1x/codec_types.rs` vs Eden `src/video_core/host1x/codec_types.h`
 
@@ -17871,15 +11314,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: the H264, VP9, and VP8 codec payload declarations, their inline conversions, and their
   layout assertions now share the `host1x/codec_types.rs` owner matching Eden. They are no longer
   split across `codecs/h264.rs`, `codecs/vp8.rs`, and the removed `codecs/vp9_types.rs` module.
-
-### Missing items
-
-- None in the declarations, inline conversions, or layout contracts owned by `codec_types.h`.
-
-### Binary layout verification
-
-- PASS: compile-time assertions and `raw_nvdec_layout_matches_codec_types_header` verify every
-  upstream size assertion and all upstream offset assertions for H264, VP9, and VP8 payloads.
 
 ## 2026-08-27 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
 
@@ -17901,11 +11335,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Live query-pool validation remains necessary for recorded Vulkan commands; the startup
   regression was additionally exercised through five consecutive release launches.
 
-### Binary layout verification
-
-- N/A: this correction changes host-side ownership and borrowing only; no guest payload or disk
-  cache layout changes.
-
 ## 2026-08-27 — `src/shader_recompiler/src/frontend/translate/{mod.rs,load_store_local_shared.rs}` and `src/shader_recompiler/src/pipeline_cache.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/{impl/impl.h,impl/load_store_local_shared.cpp,translate.cpp}`
 
 ### Intentional differences
@@ -17921,15 +11350,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `Environment::local_memory_size`; a zero-valued header therefore discarded valid immediate
   `STL` writes and left their consumer buffers uninitialized.
 
-### Missing items
-
-- None in the verified runtime environment ownership, `LDL` bounds lookup, or immediate `STL`
-  bounds decision.
-
-### Binary layout verification
-
-- N/A: this correction retains shader IR writes and changes no serialized or raw-memory payload.
-
 ## 2026-08-27 — `src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs` vs Eden `src/shader_recompiler/backend/spirv/spirv_emit_context.cpp`
 
 ### Intentional differences
@@ -17944,14 +11364,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   previously used ordinary Rust assertions and could terminate the GPU thread. They now raise the
   same typed `NotImplementedException` as Eden, allowing pipeline creation to log, cache the
   failure, and continue.
-
-### Missing items
-
-- None in the four verified fragment-output rejection paths.
-
-### Binary layout verification
-
-- N/A: this changes host exception propagation only; no guest or serialized layout is involved.
 
 ## 2026-08-29 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h`
 
@@ -17973,16 +11385,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   non-owning pointer while the texture cache is already serialized. Ruzu now uses the matching
   stable handle, removing two atomic mutex operations per descriptor from every draw.
 
-### Missing items
-
-- None in the verified `DownloadMemory`, `VisitImageView`, and `GetSamplerId` memory-access paths.
-
-### Binary layout verification
-
-- N/A: the corrections change address translation and lifecycle access only. A focused regression
-  holds the owning channel mutex while `GetSamplerId` reads through the stable non-owning handle,
-  proving that the hot path neither recursively locks nor changes descriptor contents.
-
 ## 2026-08-29 — `src/core/src/hle/service/am/library_applet_storage.rs` vs Eden `src/core/hle/service/am/library_applet_storage.{h,cpp}`
 
 ### Intentional differences
@@ -17995,14 +11397,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: ordinary `TransferMemoryLibraryAppletStorage` exposed its transfer-memory handle,
   causing `IStorage::Open` to reject it. It now matches Eden's null `GetHandle()` result; only
   `HandleLibraryAppletStorage` exposes the handle.
-
-### Missing items
-
-- None in the verified storage-type/handle distinction.
-
-### Binary layout verification
-
-- N/A: these are host-side polymorphic storage objects, not raw guest payloads.
 
 ## 2026-08-29 — `src/core/src/hle/kernel/k_scheduler.rs` vs Eden `src/core/hle/kernel/k_scheduler.{h,cpp}`
 
@@ -18019,14 +11413,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   forever trying to reacquire the actual current thread's context guard. Current-thread selection
   now follows Eden's per-core scheduler pointer before the bootstrap fallback.
 
-### Missing items
-
-- None in the verified `ScheduleImpl` current-thread selection and same-thread fast path.
-
-### Binary layout verification
-
-- N/A: the change affects host scheduler ownership and control flow only.
-
 ## 2026-08-29 — `src/ruzu/src/configuration/configure_dialog.rs` vs Eden `src/yuzu/configuration/configure_dialog.{h,cpp}` and `configure_input_player.{h,cpp}`
 
 ### Intentional differences
@@ -18035,19 +11421,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   stops input mapping and disables the eight player controllers plus the handheld controller
   before page destruction. Eden obtains the same final state synchronously from the
   `ConfigureInputPlayer` destructors when its stack-owned modal dialog returns.
-
-### Unintentional differences (to fix)
-
-- None after closing Configure now ends the temporary input-configuration lifetime before gameplay
-  resumes.
-
-### Missing items
-
-- None in this close/lifetime slice.
-
-### Binary layout verification
-
-- N/A: this changes frontend and input lifecycle state only.
 
 ## 2026-08-29 — `src/ruzu/src/{main_window.rs,main.rs,i18n.rs}` vs Eden `src/yuzu/{bootmanager.{h,cpp},main.cpp,main_window.cpp}`
 
@@ -18062,19 +11435,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Qt resolves the system locale internally. Ruzu queries the Windows user locale when POSIX locale
   variables are absent, then resolves it through the available frontend catalogs.
 
-### Unintentional differences (to fix)
-
-- None after restore/DPI changes invalidate native render geometry, the menubar fills its allocated
-  row, Windows dialogs use native frames, and `<System>` follows the OS locale with English fallback.
-
-### Missing items
-
-- None in these render-window geometry, decoration, and locale slices.
-
-### Binary layout verification
-
-- N/A: these changes affect frontend geometry and process startup configuration only.
-
 ## 2026-08-29 — `src/ruzu/src/{user_data_migration.rs,migration_worker.rs,gtk_compat.rs}` vs no Eden frontend counterpart
 
 ### Intentional differences
@@ -18083,18 +11443,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   legacy sources read-only, validates Windows junctions without treating ordinary directories as
   reparse points, repairs imported absolute storage paths, dismisses failed flows exactly once,
   and formats estimates as localized MB or GB at the requested threshold.
-
-### Unintentional differences (to fix)
-
-- None in the verified migration failure, destination-safety, junction, and size-formatting paths.
-
-### Missing items
-
-- None in this migration correction slice.
-
-### Binary layout verification
-
-- N/A: migration plans and GTK callbacks are host-side state and are not raw-copied or serialized.
 
 ## 2026-08-29 — `build.bat`, `scripts/build.ps1`, and `README.md` vs no Eden source-file counterpart
 
@@ -18109,19 +11457,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   the Git `main`-branch checks. The default package path remains strict, and dependency, staging,
   runtime-file, and NSIS validation are never bypassed.
 
-### Unintentional differences (to fix)
-
-- None after the verified Windows Release build used `D:\Dev\vcpkg` and produced the standalone
-  runtime directory.
-
-### Missing items
-
-- None in the requested Windows build workflow.
-
-### Binary layout verification
-
-- N/A: build orchestration does not define a guest or serialized binary payload.
-
 ## 2026-08-29 — `src/common/{build.rs,src/scm_rev.rs}` vs Eden `CMakeModules/GenerateSCMRev.cmake` and `src/common/scm_rev.{h,cpp.in}`
 
 ### Intentional differences
@@ -18129,20 +11464,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Eden obtains `CMAKE_CXX_COMPILER_ID` and `CMAKE_CXX_COMPILER_VERSION` from CMake. Ruzu's Cargo
   build script queries the selected native compiler directly and exports the equivalent
   `COMPILER_ID` compile-time value.
-
-### Unintentional differences (to fix)
-
-- None after MSVC `/Bv` output is retained despite `cl.exe` returning D8003 when invoked without a
-  source file. Windows builds now expose CMake's complete `MSVC 19.44.35222.0` identity instead of
-  `Unknown compiler`.
-
-### Missing items
-
-- None in the compiler identity slice.
-
-### Binary layout verification
-
-- N/A: the compiler identity is build metadata embedded as a Rust string constant.
 
 ## 2026-08-30 — `src/core/src/file_sys/vfs/vfs_real.rs` vs Eden `src/core/file_sys/vfs/vfs_real.{h,cpp}`
 
@@ -18154,20 +11475,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None after relative file and directory paths use the platform separator consistently. The prior
+- The prior
   Windows-only mismatch compared a backslash-normalized root with a slash-normalized child, so
   every valid relative lookup failed and `RegisteredCache` indexed zero firmware entries.
-
-### Missing items
-
-- None in the relative path lookup and containment slice.
-
-### Binary layout verification
-
-- N/A: this change affects host VFS path resolution only. The regression test verifies that an
-  in-root child opens while a `..` escape remains rejected. Runtime verification now also confirms
-  that MK8D opens the real `0100000000000802` NCA/RomFS twice, completes its animated attract race,
-  and renders `Create a Mii` plus six default Mii faces instead of an empty selection grid.
 
 ## 2026-08-30 — `src/rdynarmic/src/backend/x64/emit_a64.rs` and `src/rdynarmic/src/jit.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/emit_x64.{h,cpp}`
 
@@ -18177,23 +11487,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `Value::Inst` stores only an arena reference, so the fallback resolves the same type through the
   owning block's `inst_real_return_type` before selecting the 8/16/32/64-bit x64 register view.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed pseudo-operation slice. `GetCarryFromOp` and `GetOverflowFromOp` now only
-  register their producer-owned pseudo-operations. `GetNZCVFromOp` now consumes its input and emits
-  Eden's exact fallback order (`test`, `lahf`, clear `AL`) when the producer did not define NZCV
-  inline; the former path read stale host flags and left the input live at block end.
-
-### Missing items
-
-- None in the three reviewed pseudo-operation handlers.
-
-### Binary layout verification
-
-- N/A: this changes generated instruction selection and register lifetime only. The focused A64
-  `ANDS W0, W0, W1` regression verifies the result and architectural N/Z/C/V value; the existing
-  mixed `TST`/shift/conditional-select regression also passes.
-
 ## 2026-08-30 — `src/rdynarmic/src/backend/x64/{a64_interface.rs,a64_emit_x64_memory.rs,callback.rs}` vs Eden `src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp` and `a64_emit_x64.h`
 
 ### Intentional differences
@@ -18202,21 +11495,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   after the callback object. Rust uses an explicit `Pair128*` trampoline argument, while the
   generated accessor preserves the same register contract: context in `RCX`, return pointer in
   `RDX`, and guest address moved to `R8`.
-
-### Unintentional differences (to fix)
-
-- None after the Windows trampoline accepts its explicit parameters in generated-register order.
-  It previously interpreted `RDX` as the guest address and `R8` as the return pointer, causing two
-  unmapped reads followed by an access violation when LM3 executed `LDR Q`.
-
-### Missing items
-
-- None in the reviewed Windows 128-bit read-return adapter.
-
-### Binary layout verification
-
-- PASS: `Pair128` remains `repr(C)`, size 16 and alignment 8. The executing Windows
-  `test_a64_ldr_q_uses_host_128_bit_return_abi` regression returns both expected 64-bit lanes.
 
 ## 2026-08-30 — `externals/rxbyak/src/{code_array.rs,platform/{mod.rs,windows.rs,unix.rs}}` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
 
@@ -18229,24 +11507,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Unix keeps one lazy `mmap` for the complete range and treats explicit commitment as a no-op,
   matching the effective upstream behavior outside Windows.
 
-### Unintentional differences (to fix)
-
-- None after Windows reserves the full cache with `MEM_RESERVE`, commits the initial 16 MiB prelude,
-  and commits additional 16 MiB chunks using the buffer's current protection. The previous
-  `MEM_RESERVE | MEM_COMMIT` charged all 512 MiB for every core immediately and left cores 2 and 3
-  without a JIT on the tested system.
-
-### Missing items
-
-- None in the reviewed Windows reserve/commit/free/protection lifecycle.
-
-### Binary layout verification
-
-- N/A: this changes host virtual-memory state, not guest or serialized layout. The Windows
-  `VirtualQuery` regression proves that a 512 MiB buffer starts with 16 MiB committed, retains the
-  following range as reserved, and commits the next chunk on the first crossing write. The full
-  Rxbyak test suite passes.
-
 ## 2026-08-30 — `src/rdynarmic/src/backend/x64/{hostloc.rs,reg_alloc.rs,a64_emit_x64.rs,emit_data_processing.rs}` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{hostloc.h,reg_alloc.h,reg_alloc.cpp,a64_emit_x64.cpp}`
 
 ### Intentional differences
@@ -18258,23 +11518,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   increment to two bits, preserving the effective wrap while avoiding implementation-defined Rust
   layout.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed candidate-selection slice. `any_gpr` again owns Eden's complete candidate
-  set (including `RBP`, `R13`, and `R14`), while `RegAlloc::select_a_register` owns the exclusions,
-  numeric-order empty preference, non-REX-before-REX resolution, and quasi-LRU counter update.
-
-### Missing items
-
-- None in the reviewed register candidate and selection behavior.
-
-### Binary layout verification
-
-- N/A: `HostLocInfo` is private host bookkeeping and is never copied as a binary payload. Focused
-  tests cover reserved candidates, numeric ordering, quasi-LRU updates, A64 memory-base candidate
-  removal, and unsigned division under full selectable-GPR pressure. The full `rdynarmic` suite
-  passes: 1129 passed, 4 ignored, with all auxiliary test targets passing.
-
 ## 2026-08-30 — `src/core/src/file_sys/patch_manager.rs` vs Eden `src/core/file_sys/patch_manager.{h,cpp}`
 
 ### Intentional differences
@@ -18283,23 +11526,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden's concrete `ContentProviderUnion` casts. The versioned and per-origin probes therefore use
   trait methods, while the final unversioned fallback retains Eden's union-wide `GetEntryRaw`
   behavior.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed ExeFS/RomFS update-selection fallback. Ruzu previously suppressed
-  `GetEntryRaw` whenever `supports_origin_tracking()` was true; Eden performs that fallback for its
-  `ContentProviderUnion`, including frontend-manual content. Both Rust paths now do the same when
-  no versioned update was selected and the legacy update keys are enabled.
-
-### Missing items
-
-- None in the reviewed unversioned update fallback slice.
-
-### Binary layout verification
-
-- N/A: selection changes only which existing `VirtualFile` is queried. The focused
-  `romfs_uses_raw_fallback_with_an_origin_tracking_provider` regression passes, and the LM3 runtime
-  check still applies the same `v0.5.0` ExeFS and RomFS update.
 
 ## 2026-08-30 — `src/ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp` (`BootGame` title metadata)
 
@@ -18313,17 +11539,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed running-title slice. LM3 now reports `1.4.0` instead of the base NACP's
+- LM3 now reports `1.4.0` instead of the base NACP's
   `1.0.0`, matching Eden, while the technical CNMT revision remains `v0.5.0` in patch logs.
 
-### Missing items
-
-- None in the reviewed title-name/version selection slice.
-
-### Binary layout verification
-
-- N/A: frontend strings only. The two focused `running_title_*` regressions pass, and a real
-  Windows Release launch logged and displayed `Luigi's Mansion 3 (64-bit) | 1.4.0`.
 ## 2026-08-30 — `src/audio_core/src/sink/sink_stream.rs` vs Eden `src/audio_core/sink/sink_stream.{h,cpp}`
 
 ### Intentional differences
@@ -18339,24 +11557,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust guards zero-frame and out-of-range channel copies that Eden assumes are prevented by its
   callers.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed sink timing and AudioIn accounting slice. Ruzu now timestamps callbacks
-  with `CoreTiming::GetGlobalTimeNs`, uses Eden's 25 ms (`TargetSampleCount * 5`) reporting margin,
-  updates AudioIn sample counts, and leaves AudioIn append buffers unqueued like Eden. It
-  previously used the host wall clock, a 15 ms margin, and skipped the no-queue AudioIn count
-  update.
-
-### Missing items
-
-- None in the reviewed sink timing, six-to-two downmix, and AudioIn accounting paths.
-
-### Binary layout verification
-
-- N/A: `SinkBuffer` and the FIFO state are host-only and are not copied into guest or serialized
-  memory. The focused sink-stream tests pass, including exact 25 ms reporting and the six-channel
-  center-channel downmix; the complete `audio_core` library suite passes serially (202 tests).
-
 ## 2026-08-30 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.{h,cpp}`
 
 ### Intentional differences
@@ -18366,23 +11566,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   allocator creation receives at most Vulkan 1.3. Ruzu therefore clamps only the VMA allocator's
   advertised API version to 1.3; the physical-device version retained and reported by `Device`
   remains unchanged. This also matches Ruzu's Vulkan 1.3 instance creation.
-
-### Unintentional differences (to fix)
-
-- None in the reviewed allocator-creation slice. Moving to Eden's direct `ApiVersion()` behavior
-  requires the separate, workspace-wide `ash` 0.38 and `vk-mem` 0.5 API migration.
-
-### Missing items
-
-- None in the reviewed allocator-creation slice.
-
-### Binary layout verification
-
-- N/A: the helper selects a Vulkan API version integer passed to VMA and does not alter guest or
-  serialized layout. The focused regression covers Vulkan 1.1, 1.3, and 1.4 inputs. A real AMD
-  Vulkan 1.4.315 device now creates the allocator and runs Luigi's Mansion 3 in Release without
-  the former VMA assertion. The complete `video_core` library suite passes serially (1507 passed,
-  1 ignored).
 
 ## 2026-08-30 — `src/shader_recompiler/src/frontend/translate/internal_stage_buffer_entry_read.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/internal_stage_buffer_entry_read.cpp`
 
@@ -18395,23 +11578,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   rely on those modes carrying immediate indices. Rust checks that invariant before constructing
   the corresponding strongly typed IR value; the valid instruction behavior is unchanged.
 
-### Unintentional differences (to fix)
-
-- None. Ruzu previously rejected skew, global, non-default mode, and shifted ISBERD forms, then
-  emitted a fallback register copy. It now owns Eden's complete scale-index, lane-skew, global
-  U8/U16/U32/F32 load, Patch/Prim/Attr, default-skew, and fallback-copy ordering.
-
-### Missing items
-
-- None in `TranslatorVisitor::ISBERD`.
-
-### Binary layout verification
-
-- N/A: instruction fields are decoded from a `u64` and emitted as typed IR; no host struct is
-  copied as a guest payload. Four focused regressions cover the fallback, global U16 skew,
-  indexed Attr/B32, and default-skew paths. The complete `shader_recompiler` suite passes (468
-  tests).
-
 ## 2026-08-30 — `src/shader_recompiler/src/ir/emitter.rs` (`uconvert_u64_from_u32`) vs Eden `src/shader_recompiler/frontend/ir/ir_emitter.{h,cpp}` (`UConvert`)
 
 ### Intentional differences
@@ -18420,19 +11586,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   exact U32-to-U64 specialization required by ISBERD, following the existing typed emitter API;
   both emit `Opcode::ConvertU64U32`.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed U32-to-U64 conversion branch.
-
 ### Missing items
 
 - The other Eden `UConvert` width combinations remain outside this focused prerequisite slice.
-
-### Binary layout verification
-
-- N/A: this emits an IR opcode and does not serialize a host structure. The ISBERD global-load
-  regression verifies that `ConvertU64U32` is emitted before `LoadGlobalU16`; the complete
-  `shader_recompiler` suite passes (468 tests).
 
 ## 2026-08-30 — `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/shader_recompiler/runtime_info.h` (`InputTopologyVertices`)
 
@@ -18442,42 +11598,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden's stateless `InputTopologyVertices` helper struct. The helper remains in the corresponding
   `runtime_info.rs` owner and returns the same value for every topology.
 
-### Unintentional differences (to fix)
-
-- None. The former SPIR-V context-local topology switch has been moved to its upstream owner and
-  all five point/line/adjacency/triangle mappings match Eden.
-
-### Missing items
-
-- None in `InputTopologyVertices::vertices`.
-
-### Binary layout verification
-
-- N/A: the helper maps an enum to a compile-time vertex count and is not serialized. A focused
-  regression covers all five topology values.
-
 ## 2026-08-30 — `src/shader_recompiler/src/backend/spirv/emit_spirv_context_get_set.rs` vs Eden `src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp` (`EmitInvocationInfo`)
 
 ### Intentional differences
 
 - Rspirv builder calls replace Eden's typed `EmitContext::OpShiftLeftLogical`/`Const` wrappers;
   both construct the same unsigned 32-bit left shift by 16.
-
-### Unintentional differences (to fix)
-
-- None. Ruzu previously sent geometry shaders through the default stub and returned
-  `0x00ff0000`. It now returns `InputTopologyVertices::vertices(input_topology) << 16`, while the
-  tessellation and unsupported-stage branches retain Eden's existing behavior.
-
-### Missing items
-
-- None in `EmitInvocationInfo`.
-
-### Binary layout verification
-
-- N/A: this emits SPIR-V SSA instructions and defines no raw-memory payload. The topology helper
-  regression covers every geometry input value; the complete shader-recompiler suite passes (468
-  tests).
 
 ## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` image-allocation diagnostics vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.cpp` (`MakeImage`/`Image::Image`)
 
@@ -18487,20 +11613,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   VMA image allocation fails. With `RUZU_TRACE_VULKAN_IMAGE_ALLOC` set, it also logs allocations
   made after heap usage reaches 4 GiB. These diagnostics do not alter image creation or ownership.
 
-### Unintentional differences (to fix)
-
-- None introduced by the diagnostic path; the same VMA allocation is attempted once and its
-  original `VkResult` is returned unchanged.
-
 ### Missing items
 
 - The underlying LM3 memory-pressure cause remains under investigation; this entry covers only
   the non-invasive allocation diagnostics.
-
-### Binary layout verification
-
-- N/A: existing Rust and Ash debug formatting observes host-side values and does not change any
-  Vulkan or guest payload.
 
 ## 2026-08-30 — `src/audio_core/src/renderer/command/data_source/decode.rs` vs Eden `src/audio_core/renderer/command/data_source/decode.{h,cpp}` (`DecodeAdpcm`)
 
@@ -18509,24 +11625,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust retains bounds-checked coefficient lookup and opt-in diagnostics around Eden's direct
   array indexing. With the upstream three-bit predictor mask, every possible header maps to one
   of the eight valid coefficient pairs, so valid decoding behavior is identical.
-
-### Unintentional differences (to fix)
-
-- None. Ruzu previously used all four high header bits (`& 0xF`) as the ADPCM predictor index;
-  Eden uses only bits 4 through 6 (`& 0x7`). Headers with bit 7 set were therefore decoded with
-  zeroed coefficients in Ruzu. Both initial-context and per-frame header paths now use Eden's
-  three-bit predictor index.
-
-### Missing items
-
-- None in the reviewed ADPCM predictor-index extraction.
-
-### Binary layout verification
-
-- N/A: the change only selects an existing coefficient pair and does not alter a serialized
-  structure. A focused regression verifies that header `0xF0` selects coefficients 14 and 15,
-  matching Eden's `(header >> 4) & 0x7` behavior. The complete `audio_core` suite passes (202
-  tests).
 
 ## 2026-08-30 — `src/audio_core/src/adsp/apps/opus/opus_multistream_decode_object.rs` vs `src/audio_core/adsp/apps/opus/opus_multistream_decode_object.{h,cpp}`
 
@@ -18538,23 +11636,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust represents Eden's `self` pointer comparison with the emulated work-buffer identifier and
   returns `OPUS_INVALID_STATE` before calling libopus with absent decoder storage.
 
-### Unintentional differences (to fix)
-
-- Fixed: `IsValidStreamCounts` previously restricted `total_stream_count` to `1` or `2`, reusing
-  the single-stream channel constraint. Eden accepts every positive stream count through 255.
-  Ruzu now uses the upstream-owned `OpusStreamCountMax = 255` condition and still rejects zero,
-  counts above 255, and stereo counts greater than the total count.
-
-### Missing items
-
-- None in the reviewed stream-count validation and libopus multistream initialization path.
-
-### Binary layout verification
-
-- N/A: the Rust object is host-side state and is not serialized as the C++ wrapper. A focused
-  regression verifies all validation boundaries and initializes a real six-stream libopus decoder.
-  The complete `audio_core` suite passes sequentially (203 tests).
-
 ## 2026-08-30 — `src/core/src/file_sys/control_metadata.rs` vs Eden `src/core/file_sys/control_metadata.{h,cpp}` (`Language` / `LANGUAGE_NAMES`)
 
 ### Intentional differences
@@ -18562,26 +11643,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust declares the array length as `Language::Count as usize` instead of C++
   `size_t(Language::Count)`; both bind the table length to the owning NACP language enum.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed NACP language enum/table slice. Ruzu previously stopped at
-  `BrazilianPortuguese` and exposed only 16 names, so Eden's French priority list produced an
-  invalid index for `Polish=16`. Ruzu now owns Eden's `Polish=16`, `Thai=17`, `Count=18` values
-  and both corresponding names in the same order.
-
 ### Missing items
 
 - The existing Rust file still lacks Eden's compressed 18+-entry `LanguageEntryData` handling and
   several named late `RawNACP` fields. Those pre-existing, larger structural differences are
   outside this focused table correction; uncompressed raw NACP bytes remain preserved by the
   current fixed-size representation.
-
-### Binary layout verification
-
-- PASS for the reviewed enum/table slice: `Language` remains `repr(u8)`, the new discriminants
-  match Eden exactly, and the table has `Language::Count` entries. The focused regression passes.
-  The existing `RawNACP` size assertion remains `0x4000`; compressed language-entry parity is
-  still missing as noted above.
 
 ## 2026-08-30 — `src/ruzu/src/migration_worker.rs` vs Eden `src/yuzu/migration_worker.{h,cpp}` (copy activation of firmware)
 
@@ -18594,24 +11661,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   tree. This preserves Eden's whole-installation invariant for firmware without broadening the
   deletion boundary to the rest of Ruzu's NAND.
 
-### Unintentional differences (to fix)
-
-- None in the corrected firmware-copy slice. Ruzu previously seeded every copy payload with the
-  current destination. For firmware this retained obsolete destination-only NCAs and produced a
-  hybrid installation. The observed Ruzu store contained all 229 files from Eden firmware 16.0.3
-  plus 212 stale files, causing player-select program `0100000000001007` to resolve to unsupported
-  key generation 11 instead of Eden's loadable version.
-
 ### Missing items
 
 - Ruzu intentionally does not expose Eden's destructive whole-tree `Move` strategy. Its `Copy`
   and `Link` strategies remain the supported non-destructive subset documented in this file.
-
-### Binary layout verification
-
-- N/A: this changes transactional filesystem ownership only. The focused migration-worker suite
-  passes (18 tests), including regressions that remove stale firmware entries while retaining
-  destination-only NAND user content when NAND and firmware are selected together.
 
 ## 2026-08-30 — `src/core/src/hle/service/ns/application_manager_interface.rs` vs Eden `src/core/hle/service/ns/application_manager_interface.{h,cpp}` (`IsQualificationTransitionSupportedByProcessId`)
 
@@ -18621,22 +11674,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `D<>` serializer. The command remains owned by the matching application-manager module and has
   the same input, result, and output ordering.
 
-### Unintentional differences (to fix)
-
-- None in the reviewed command. Ruzu previously listed command 2520 but registered no handler;
-  the player-select system applet therefore received an invalid IPC response. It now consumes the
-  `u64` process id, returns success, and writes `true`, exactly like Eden.
-
 ### Missing items
 
 - The remainder of this pre-existing partial interface still has implemented Eden commands that
   are only represented in Ruzu's command inventory. They require separate ownership/parity passes.
-
-### Binary layout verification
-
-- PASS for command 2520: request payload is one `u64`; response payload is `ResultSuccess` followed
-  by one CMIF `bool`. A focused regression verifies that the command is registered and returns the
-  upstream constant result.
 
 ## 2026-08-30 — `src/core/src/hle/service/acc/acc.rs` vs Eden `src/core/hle/service/acc/acc.{h,cpp}` (`IManagerForSystemService` / `GetBaasAccountManagerForSystemService`)
 
@@ -18650,9 +11691,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed slice. Commands 102 on `acc:su` and `acc:u1` now parse the UUID and return
-  the system-service manager object. Its command table, UUID hash result, successful availability
-  and token-cache stubs, and zeroed extended licence-cache response match Eden.
 - `LoadSaveDataThumbnail` remains unimplemented intentionally because Eden also registers command
   112 with a null handler; it was not the fatal player-select divergence.
 
@@ -18660,12 +11698,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Other null ACC commands outside `IManagerForSystemService` remain separate pre-existing parity
   work.
-
-### Binary layout verification
-
-- PASS for the reviewed IPC payloads: command 102 consumes the 16-byte UUID and returns one move
-  object; `GetAccountId` returns Eden's 64-bit UUID hash; the licence response preserves the
-  `u32` then `s64` order. Focused registration/hash tests pass.
 
 ## 2026-08-30 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}` (`EnsureSaveData`)
 
@@ -18679,21 +11711,15 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None in the reviewed slice. Command 20 no longer reports unconditional stub success: it consumes
+- Command 20 no longer reports unconditional stub success: it consumes
   the 16-byte UUID, constructs a zero-initialized account `SaveDataAttribute` using the applet's
   program ID, creates it in `SaveDataSpaceId::User`, propagates creation failure, then returns size
   zero on success, matching Eden's ordering.
 
 ### Missing items
 
-- None for `EnsureSaveData`. Other pre-existing missing handlers in this partial interface remain
+- Other pre-existing missing handlers in this partial interface remain
   separate parity slices.
-
-### Binary layout verification
-
-- PASS: `SaveDataAttribute::make_default` deterministically zeroes the system-save ID, primary
-  rank, index, and all 0x1C reserved bytes; the UUID's little-endian `AsU128` bit pattern is
-  preserved as two `u64` words. The response is `Result` followed by one `u64` size.
 
 ## 2026-08-30 — `src/audio_core/src/device/audio_buffers.rs` vs Eden `src/audio_core/device/audio_buffers.h`
 
@@ -18702,24 +11728,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Rust uses a `parking_lot::Mutex` and a lock-held `release_buffer_locked` helper instead of
   Eden's recursive mutex and nested call to `ReleaseBuffer`. The ring ownership and mutation
   ordering remain unchanged.
-
-### Unintentional differences (to fix)
-
-- None in the corrected release slice. Ruzu previously replaced a released `AudioBuffer` with
-  `AudioBuffer::default()`, erasing `start_timestamp` and `end_timestamp`. Eden clears only
-  `played_timestamp`, `samples`, `tag`, and `size`; Ruzu now does the same. This preserves the
-  last appended slot's `end_timestamp` for `GetNextTimestamp` and prevents freshly recycled
-  buffers from being classified as already played and queued without bound.
-
-### Missing items
-
-- None for the corrected `GetReleasedBuffers` lifecycle slice.
-
-### Binary layout verification
-
-- N/A: `AudioBuffer` is an in-memory host queue descriptor, not a raw serialized payload. A
-  focused regression verifies that both timestamps survive tag retrieval while exactly the four
-  fields cleared by Eden are reset.
 
 ## 2026-08-30 — `src/core/src/hle/kernel/k_event.rs` vs Eden `src/core/hle/kernel/k_event.{h,cpp}` (`Signal` / `Clear`)
 
@@ -18734,23 +11742,11 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `signal_arc` and `clear_arc` remain Rust ownership adapters for callers that hold shared event
   and process objects; Eden accesses the embedded readable end directly.
 
-### Unintentional differences (to fix)
-
-- None in the corrected slice. Previously all four Ruzu paths acquired the scheduler lock before
-  waiting for `Mutex<KReadableEvent>`, while direct readable-event callers held that mutex before
-  acquiring the scheduler lock. The observed runtime cycle left guest thread 84 holding the
-  global scheduler lock while guest thread 83 held the readable-event mutex.
-
 ### Missing items
 
 - `KEvent` still represents upstream object ownership and post-destroy resource accounting through
   process object IDs rather than the complete `KAutoObject` lifecycle; that pre-existing structural
   gap is outside this deadlock correction.
-
-### Binary layout verification
-
-- N/A: this slice changes host-side lock lifetime only. The two existing focused round-trip tests
-  cover direct and shared `Signal` / `Clear` paths and pass.
 
 ## 2026-08-30 — `src/core/src/hle/kernel/k_server_session.rs` vs Eden `src/core/hle/kernel/k_server_session.{h,cpp}` (`OnRequest` / `NotifyAvailable`)
 
@@ -18760,24 +11756,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `MultiWait`. `KServerSession::notify_available` therefore also wakes that host-only condition;
   it does not alter or re-signal kernel event state.
 
-### Unintentional differences (to fix)
-
-- None in the corrected slice. Ruzu previously called the manager wakeup event's full `signal()`
-  while `KServerSession::OnRequest` held the scheduler lock. Eden only calls
-  `KSynchronizationObject::NotifyAvailable` there; its manager wakeup `KEvent` is signaled by
-  `ServerManager::LinkToDeferredList`. The extra Ruzu signal inverted the scheduler lock with the
-  bridged `KReadableEvent` mutex and froze synchronous IPC during startup. The kernel session
-  waiter is now notified exactly once, while the Rust fallback receives only a host Condvar wake.
-
 ### Missing items
 
 - The pre-existing `Arc<Mutex<KSessionRequest>>` and shared-owner server adapters remain structural
   differences from Eden's intrusive request objects; they require a separate ownership pass.
-
-### Binary layout verification
-
-- N/A: this changes only host/kernel wakeup ownership. A focused regression verifies that a new
-  request wakes the manager's host fallback without signaling its bridged kernel readable event.
 
 ## 2026-08-30 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` (`ConfigureDraw`)
 
@@ -18789,20 +11771,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   updates the scheduler cache, but records the binding immediately before every corresponding
   `SetDescriptorBufferOffsetsEXT`, making each recorded command stream self-contained.
 
-### Unintentional differences (to fix)
-
-- None in the corrected descriptor-buffer binding slice. The former suppression produced
-  VUID-vkCmdSetDescriptorBufferOffsetsEXT-None-08065 during the Luigi's Mansion 3 workload.
-
 ### Missing items
 
-- None in this reviewed `ConfigureDraw` descriptor-buffer slice. Other pre-existing graphics
+- Other pre-existing graphics
   pipeline parity work remains separate.
-
-### Binary layout verification
-
-- PASS for the reviewed command payload: the same descriptor chunk address, usage flags, buffer
-  index zero, layout, set zero, and allocation offset are recorded in Eden's order.
 
 ## 2026-08-30 — `src/video_core/src/renderer_vulkan/compute_pipeline.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pipeline.{h,cpp}` (`Configure`)
 
@@ -18812,19 +11784,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   command instead of allowing the recording-side scheduler cache to omit it across a worker-owned
   command-buffer lifetime. The scheduler chunk cache is still updated for state bookkeeping.
 
-### Unintentional differences (to fix)
-
-- None in the corrected descriptor-buffer binding slice.
-
 ### Missing items
 
-- None in this reviewed `Configure` descriptor-buffer slice. Other pre-existing compute pipeline
+- Other pre-existing compute pipeline
   parity work remains separate.
-
-### Binary layout verification
-
-- PASS for the reviewed command payload: binding address/usage and compute descriptor offset
-  arguments remain identical to Eden.
 
 ## 2026-08-30 — `src/video_core/src/engines/draw_manager.rs`, `renderer_vulkan/state_tracker.rs`, `renderer_vulkan/vk_rasterizer.rs`, and `renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.{h,cpp}`, `renderer_vulkan/vk_state_tracker.{h,cpp}`, `renderer_vulkan/vk_rasterizer.{h,cpp}`, and `texture_cache/texture_cache.h` (live dirty flags / `PrepareDraw`)
 
@@ -18854,14 +11817,8 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Missing items
 
-- None in the reviewed `PrepareDraw` rollover path. Other pre-existing rasterizer parity work
+- Other pre-existing rasterizer parity work
   remains separate.
-
-### Binary layout verification
-
-- N/A: no serialized structure changes. Focused regressions verify that draw and clear views mutate
-  the channel-owned array, snapshot views remain isolated, the render-target adapter has one owner,
-  and command-buffer invalidation marks the complete per-slot vertex-buffer dirty range.
 
 ## 2026-08-30 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` and `renderer_vulkan/vk_texture_cache.{h,cpp}` (`DownloadMemory`)
 
@@ -18878,14 +11835,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `runtime.Finish()`. Ruzu now preserves that order and avoids the extra allocation and full-image
   host copy.
 
-### Missing items
-
-- None in the reviewed synchronous Vulkan download-to-swizzle handoff.
-
-### Binary layout verification
-
-- N/A: the staging bytes are consumed in place and are not a serialized host payload.
-
 ## 2026-08-30 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` (`RunGarbageCollector`)
 
 ### Intentional differences
@@ -18896,7 +11845,7 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Unintentional differences (to fix)
 
-- None in the corrected aggressive-GC transition. Ruzu previously stopped the complete LRU scan
+- Ruzu previously stopped the complete LRU scan
   when one aggressive deletion brought memory below `critical_memory`. Eden only quarters the
   remaining iteration quota, disables aggressive mode, and continues scanning. Ruzu now preserves
   that ordering and continuation behavior.
@@ -18909,21 +11858,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Missing items
 
-- None in the reviewed aggressive-to-high-priority transition. Other pre-existing texture-cache
+- Other pre-existing texture-cache
   parity work remains separate.
 
-### Binary layout verification
-
-- N/A: no serialized layout changes. A focused regression covers a 21-image LRU sequence where
-  the non-aggressive pass exhausts its quota and the aggressive pass must continue after crossing
-  the critical threshold.
-
 ## 2026-08-30 — video-core runtime hot paths vs the corresponding Eden paths (diagnostic cleanup)
-
-### Intentional differences
-
-- None in the restored runtime paths; ordinary `log::trace!` calls that already correspond to the
-  project's logging policy remain outside this investigation-only telemetry.
 
 ### Unintentional differences (to fix)
 
@@ -18931,14 +11869,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   garbage-collector probes remained in production hot paths. Even while disabled, their live
   environment lookups accounted for about 9.6% of sampled GPU-thread CPU cycles. The probes and
   behavior-changing diagnostic bypasses are now removed rather than merely cached.
-
-### Missing items
-
-- None in the reviewed diagnostic cleanup.
-
-### Binary layout verification
-
-- N/A: logging only; no Vulkan or guest-visible structure layout changes.
 
 ## 2026-08-30 — `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` and `vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp}` and `vk_rasterizer.{h,cpp}` (channel memory ownership / `PrepareDraw`)
 
@@ -18964,15 +11894,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   channel memory pointer and buffer-cache adapter are now rebound after `EraseChannel`, matching
   `ChannelSetupCaches::EraseChannel` ownership.
 
-### Missing items
-
-- None in the reviewed Vulkan channel-memory and draw-scope callback access paths.
-
-### Binary layout verification
-
-- N/A: these are host ownership adapters. Focused regressions keep the owning non-reentrant mutex
-  locked while graphics-pipeline and buffer-cache reads use the stable pointer, and verify that the
-  tick scope-exit does not increase the callback `Arc` strong count.
 ## 2026-08-31 — `src/ruzu/src/gtk_compat.rs` vs Eden `src/yuzu/main_window.cpp` (`MainWindow::question`)
 
 ### Intentional differences
@@ -18986,14 +11907,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Unintentional differences (to fix)
 
 - Corrected: Linux question dialogs displayed the emulator name twice in adjacent headings.
-
-### Missing items
-
-- None for the reviewed dialog-title presentation.
-
-### Binary layout verification
-
-- N/A: frontend presentation only.
 
 ## 2026-08-31 — `src/video_core/src/renderer_{vulkan,opengl}/*_rasterizer.rs` vs Eden `src/video_core/renderer_{vulkan,opengl}/*_rasterizer.cpp` (`OnCPUWrite`)
 
@@ -19011,13 +11924,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Resolved: partial CPU writes could replace recent GPU render-target contents with stale guest
   backing when the image was refreshed.
 
-### Missing items
-
-- None in the reviewed CPU-write texture-coherency path.
-
-### Binary layout verification
-
-- PASS: no guest or host structure layout changed; the fix only changes synchronization ordering.
 ## 2026-08-31 — `src/audio_core/src/sink/{sink_stream,sink,null_sink,cubeb_sink,sdl3_sink}.rs` vs Eden `src/audio_core/sink/{sink_stream.h,sink_stream.cpp,sink.h,null_sink.h,cubeb_sink.cpp,sdl3_sink.cpp}`
 
 ### Intentional differences
@@ -19064,11 +11970,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   ownership, but remains a performance/structure difference.
 - The Android Oboe backend remains a base-only stub as documented in `oboe_sink.rs`.
 
-### Binary layout verification
-
-- N/A: sink stream classes and synchronization state are host-only. Guest-visible command and
-  buffer payload layouts are unchanged.
-
 ## 2026-08-31 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs`, `src/core/src/{cpu_manager.rs,hle/kernel/kernel.rs}`, and `src/rdynarmic/src/backend/arm64/jit_state.rs` vs host-backend ownership
 
 ### Intentional differences
@@ -19083,15 +11984,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Corrected: unconditional imports and calls into `rdynarmic::backend::x64` made `origin/main`
   fail to compile on Apple Silicon before `audio_core` could be validated.
 
-### Missing items
-
-- None in the reviewed target-selection/buildability slice.
-
-### Binary layout verification
-
-- PASS: the ARM64 state layout is unchanged; only accessors and `Deref` views were added. Existing
-  ARM64 layout assertions still cover offsets and total size.
-- N/A: this changes host-side synchronization only and does not alter guest-visible audio payloads.
 ## 2026-08-27 — `src/core/src/arm/dynarmic/arm_dynarmic_64.rs` vs Eden/Dynarmic A64 host backends
 
 ### Intentional differences
@@ -19101,20 +11993,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   x64 state type at compile time; it does not merge or reinterpret their distinct layouts.
 - The x64 alternate signal-stack registration remains confined to x64 hosts. Dynarmic's Arm64
   backend does not own the x64 exception-handler module.
-
-### Unintentional differences (to fix)
-
-- None. The previous unconditional dependency on the x64 backend has been removed from the
-  Apple-Silicon build.
-
-### Missing items
-
-- None in the host-specific A64 context snapshot and signal-stack integration exercised here.
-
-### Binary layout verification
-
-- PASS: the core now consumes each backend's native `A64JitState`; the context snapshot regression
-  test passes against the active Arm64 layout without casting through the x64 state type.
 
 ## 2026-08-27 — `src/video_core/src/renderer_metal` vs Eden video-core cache contracts
 
@@ -19126,35 +12004,17 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Metal stores a pending vertex binding for later encoder application rather than recording a
   Vulkan command or issuing an immediate OpenGL bind.
 
-### Unintentional differences (to fix)
-
-- None in this build-integration slice. Image-view creation now receives the common
-  `ImageViewInfo`, vertex binding implements the current common runtime interface, and all legacy
-  primitive topologies map to the matching Metal topology class.
-
 ### Missing items
 
 - The broader direct-MSL backend parity work remains tracked by its owning implementation slices;
   this entry only covers adaptation to the current Eden-derived video-core interfaces.
 
-### Binary layout verification
-
-- N/A: these changes alter host-side API ownership and Metal state only; no guest payload or disk
-  cache representation changes.
 ## 2026-09-01 — `src/core/src/hle/service/am/{lifecycle_manager.rs,window_system.rs}` vs Eden `src/core/hle/service/am/{lifecycle_manager,window_system}.{h,cpp}`
 
 ### Intentional differences
+
 - Eden protects lifecycle exit state with `Applet::lock`. Ruzu executes HLE handlers on guest fibers, and releasing the scheduler lock may suspend such a fiber while it still owns the Rust `Mutex<Applet>`. `LifecycleManager` therefore owns an `Arc<LifecycleExitRequest>` containing the requested/acknowledged/event-cache state, and `WindowSystem` keeps a matching handle for each tracked applet. `OnExitRequested` retains Eden's window-system lock and iteration order but delivers the same `Exit` transition without acquiring the rest of the applet state.
 - `LifecycleExitRequest` disables guest dispatch while its small state lock spans `Event::signal` or `Event::clear`. The event keeps its existing Rust lock order before acquiring the recursive scheduler lock; the lifecycle state is released before dispatch is enabled and a fiber switch becomes possible.
-
-### Unintentional differences (to fix)
-- None in this shutdown slice.
-
-### Missing items
-- None in this shutdown slice.
-
-### Binary layout verification
-- N/A: lifecycle state is host-only and no shared binary payload or disk format changed.
 
 ## 2026-09-01 — `src/core/src/hle/service/server_manager.rs`, `src/core/src/hle/kernel/{svc/svc_ipc.rs,k_server_session.rs}` vs Eden `src/core/hle/{service/server_manager.cpp,kernel/svc/svc_ipc.cpp,kernel/k_server_session.cpp}`
 
@@ -19182,14 +12042,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   and reply inline instead of returning `ResultInvalidHandle` as an invalid routing state.
 - Corrected: the test `sm:` setup published the ServiceManager after managed-port registration, so
   sessions created through that port lacked their ServerManager queue, wakeup, and owner links.
-
-### Missing items
-
-- None in the reviewed HLE dispatch-ownership slice.
-
-### Binary layout verification
-
-- N/A: the change affects host-side ownership, locking, and event-loop routing only.
 
 ## 2026-09-01 — `src/core/src/hle/kernel/k_scheduler.rs`, `src/core/src/hle/service/server_manager.rs` vs Eden `src/core/hle/kernel/k_scheduler.{h,cpp}`, `src/core/hle/service/server_manager.{h,cpp}`
 
@@ -19229,11 +12081,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   non-runnable current thread at `RescheduleCurrentCore`, remain immediate handoff points; they are
   not converted into IPC preemption deferrals by this slice.
 
-### Binary layout verification
-
-- N/A: the context contains host thread-local depth/pending state only and changes no guest-visible
-  structure, IPC payload, or cache format.
-
 ## 2026-09-01 — `src/core/src/hle/service/sm/sm.rs`, `src/core/src/hle/service/glue/time/manager.rs` vs Eden `src/core/hle/service/sm/sm.{h,cpp}`, `src/core/hle/service/glue/time/manager.{h,cpp}`
 
 ### Intentional differences
@@ -19250,14 +12097,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   service destruction between emulation sessions, leaving `TimeWorker` threads and NFC callbacks
   alive; a later controller reload could then deadlock in the stale NFC callback.
 
-### Missing items
-
-- None for this ownership correction.
-
-### Binary layout verification
-
-- N/A: these are host-only Rust ownership handles and contain no guest-visible or serialized data.
-
 ## 2026-09-01 — `src/hid_core/src/{hid_core.rs,frontend/emulated_controller.rs}` vs Eden `src/hid_core/{hid_core.cpp,frontend/emulated_controller.cpp}`
 
 ### Intentional differences
@@ -19273,14 +12112,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Corrected: Ruzu dispatched the NFC disconnected callback while
   `HIDCore::reload_input_devices` still owned the controller mutex. `NfcDevice::Finalize` then
   re-entered the same controller and permanently blocked the boot thread.
-
-### Missing items
-
-- None in the `HIDCore::ReloadInputDevices` callback-ordering slice.
-
-### Binary layout verification
-
-- N/A: deferred callback owners and trigger values are host-only synchronization state.
 
 ## 2026-09-01 — NIFM applet reply and POSIX socket error parity
 
@@ -19313,12 +12144,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   requests use the safety failure above.
 - The native Windows socket backend remains outside this POSIX correction slice.
 
-### Binary layout verification
-
-- PASS: service `Errno::ISCONN` is `repr(u32)` value 106 as upstream, and the NIFM reply now
-  reserves the six words required for `ResultSuccess` plus three `u32` values. No serialized DNS
-  payload structure was reordered.
-
 ## 2026-09-01 — `src/core/src/hle/service/ns/application_manager_interface.rs` vs Eden `src/core/hle/service/ns/application_manager_interface.{h,cpp}`
 
 ### Intentional differences
@@ -19336,11 +12161,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Other command-table entries marked implemented but still lacking handlers remain outside this
   runtime-failure slice.
 
-### Binary layout verification
-
-- PASS: `StorageId` remains `repr(u8)` and the response contains `ResultSuccess`, `s64` total size,
-  then `s64` free size in six normal parameter words.
-
 ## 2026-09-01 — `src/core/src/hle/service/am/frontend/applet_error.rs` vs Eden `src/core/hle/service/am/frontend/applet_error.{h,cpp}`
 
 ### Intentional differences
@@ -19354,34 +12174,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Corrected synchronous error frontends marking completion without ever executing `Exit`; the
   owner applet is now completed and its state-change event is signalled as in Eden.
 
-### Missing items
-
-- None in this callback-completion slice.
-
-### Binary layout verification
-
-- PASS: no guest-visible error argument or output layout changed; completion still emits Eden's
-  zero-initialized 0x1000-byte output storage.
-
 ## 2026-09-01 — `src/core/src/hle/service/am/service/application_functions.rs` vs Eden `src/core/hle/service/am/service/application_functions.{h,cpp}`
-
-### Intentional differences
-
-- None in this logging-level correction.
 
 ### Unintentional differences (to fix)
 
 - Corrected `GetDisplayVersion` logging from info to debug. Eden uses `LOG_DEBUG`; the former info
   level flooded ordinary diagnostic runs when software repeatedly queried the version.
-
-### Missing items
-
-- None in this handler slice.
-
-### Binary layout verification
-
-- PASS: `DisplayVersion` remains a zero-initialized 0x10-byte response with its last byte forced to
-  NUL; only host logging changed.
 
 ## 2026-09-01 — `src/core/src/hle/service/am/{applet.rs,display_layer_manager.rs,window_system.rs}` vs Eden `src/core/hle/service/am/{applet,display_layer_manager,window_system}.{h,cpp}`
 
@@ -19411,11 +12209,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   ported; `overlay_in_foreground` therefore retains its default false state unless another owner
   changes it.
 
-### Binary layout verification
-
-- PASS: `Applet` is host-owned and is neither raw-copied nor serialized. The added boolean has no
-  guest ABI or cache-format representation.
-
 ## 2026-09-01 — `src/core/src/hle/service/hle_ipc.rs` vs Eden `src/core/hle/service/hle_ipc.{h,cpp}`
 
 ### Intentional differences
@@ -19430,14 +12223,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `service_name()` while holding the session-manager mutex. With a shared mutex-backed service,
   two concurrent domain requests could otherwise invert the manager/service lock order and stop
   the service permanently before either IPC response was written.
-
-### Missing items
-
-- None in the domain-handler selection and insertion lock-order slice.
-
-### Binary layout verification
-
-- PASS: no command, domain header, response, or serialized payload layout changed.
 
 ## 2026-09-01 — `src/ruzu/src/applets/error.rs` and frontend wiring vs Eden `src/yuzu/applets/qt_error.{h,cpp}`
 
@@ -19463,11 +12248,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Locale-aware date and time formatting equivalent to `QDateTime::fromSecsSinceEpoch` remains to
   be added to the GTK-only timestamp presentation path.
 
-### Binary layout verification
-
-- PASS: the GTK frontend consumes `ResultCode` and host strings only. Guest error arguments and
-  the 0x1000-byte applet output storage remain owned by `applet_error.rs` and are unchanged.
-
 ## 2026-09-01 — `src/core/src/frontend/applets/error.rs` vs Eden `src/core/frontend/applets/error.{h,cpp}`
 
 ### Intentional differences
@@ -19476,19 +12256,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   Eden's default frontend ignores it, which leaves an HLE Error applet permanently incomplete.
   This keeps the HLE default usable by frontends such as `ruzu-cmd` that do not install a graphical
   error display.
-
-### Unintentional differences (to fix)
-
-- None in this fallback-completion slice.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: the frontend receives host-owned values and callbacks only; no guest-visible structure or
-  serialized payload changed.
 
 ## 2026-09-01 — `src/common/src/settings.rs` vs Eden `src/common/settings.h`
 
@@ -19499,24 +12266,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   HLE default uses the frontend callback contract and returns control to the caller; users can
   still select the real applet explicitly for LLE parity testing.
 
-### Unintentional differences (to fix)
-
-- None in this setting-default slice.
-
 ### Missing items
 
 - The underlying LLE Error applet exit incompatibility remains; changing the explicit per-title or
   global preference to `Real applet` can still reproduce it.
 
-### Binary layout verification
-
-- PASS: `AppletMode` remains `repr(u32)` and no serialized or cache structure changed.
-
 ## 2026-09-01 — `src/core/src/hle/service/am/service/library_applet_accessor.rs` vs Eden `src/core/hle/service/am/service/library_applet_accessor.{h,cpp}`
-
-### Intentional differences
-
-- None in the process-state tracking correction.
 
 ### Unintentional differences (to fix)
 
@@ -19524,15 +12279,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   directly. Eden delegates process-state observation to `EventObserver`; in particular, a frontend
   applet has no guest process and must never be marked as running. The former assignment could
   leave its caller obscured and non-interactive after the frontend dialog completed.
-
-### Missing items
-
-- None in this lifecycle slice.
-
-### Binary layout verification
-
-- PASS: no IPC response or guest-visible structure changed; only host-side process-state ownership
-  was restored to the event observer.
 
 ## 2026-09-01 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h`
 
@@ -19548,15 +12294,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   channel memory handle, matching Eden's direct `gpu_memory->WriteBlockUnsafe` call. Locking the
   owning `Arc<Mutex<MemoryManager>>` while the fencing thread already owned the rasterizer inverted
   the safe-read `MemoryManager -> Rasterizer` order and could deadlock both GPU threads.
-
-### Missing items
-
-- None in the DMA buffer writeback slice.
-
-### Binary layout verification
-
-- PASS: staging bytes and GPU virtual-address translation are unchanged; the correction only
-  removes an extra Rust ownership lock from Eden's unsafe cache-managed writeback path.
 
 ## 2026-09-02 — `src/video_core/src/renderer_vulkan/texture_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`
 
@@ -19578,11 +12315,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Devices without `VK_EXT_shader_stencil_export` retain the pre-existing limitation for restoring
   per-fragment stencil values through a shader; the conversion reports failure instead of issuing
   an invalid Vulkan copy.
-
-### Binary layout verification
-
-- PASS: the conversion preserves the first 32-bit word as raw depth bits and the low byte of the
-  second 32-bit word as stencil. No serialized cache, guest structure, or IPC layout changed.
 
 ## 2026-09-02 — `src/video_core/src/renderer_vulkan/blit_image.rs` vs Eden `src/video_core/renderer_vulkan/blit_image.{h,cpp}`
 
@@ -19606,11 +12338,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - A non-extension fallback capable of scattering the second word's low byte into the stencil plane
   would be required for devices without fragment-shader stencil export.
 
-### Binary layout verification
-
-- PASS: transient host resource records are not serialized; shader conversion preserves all depth
-  bits and the guest-visible stencil byte exactly.
-
 ## 2026-09-03 — `src/ruzu/src/configuration/configure_hotkeys.rs` vs Eden `src/yuzu/configuration/configure_hotkeys.{h,cpp}`
 
 ### Intentional differences
@@ -19621,17 +12348,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - GTK list cells are recycled, so each binding tracks weak label references while visible. This
   keeps Clear All and Restore Defaults model-driven without retaining GTK widgets past unbind.
 
-### Unintentional differences (to fix)
-
-- None in keyboard hotkey editing, conflict detection, apply, Clear All, or Restore Defaults.
-
 ### Missing items
 
 - Controller-hotkey polling and the per-row Restore/Clear context menu remain unported.
-
-### Binary layout verification
-
-- PASS: shortcuts are frontend-owned strings and do not cross a guest ABI boundary.
 
 ## 2026-09-03 — `src/ruzu/src/util/sequence_dialog.rs` vs Eden `src/yuzu/util/sequence_dialog/sequence_dialog.{h,cpp}`
 
@@ -19640,18 +12359,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The GTK dialog returns its single captured chord through a completion callback rather than a
   nested blocking event loop. Modifier-only presses and focus traversal are consumed so Tab and
   other keys can be assigned, matching Eden's `focusNextPrevChild(false)` behavior.
-
-### Unintentional differences (to fix)
-
-- None in the single-chord keyboard capture slice.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: no binary payload or serialized structure is involved.
 
 ## 2026-09-03 — `src/ruzu/src/uisettings.rs`, `src/ruzu/src/configuration/qt_config.rs` vs Eden `src/qt_common/config/uisettings.{h,cpp}`, `src/qt_common/config/qt_config.cpp`
 
@@ -19664,18 +12371,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   INI adapter rather than Qt's `BeginGroup`/`Write*Setting` API.
 - The product-specific default action is named `Exit ruzu`; all other action names, values,
   contexts, repeat flags, and ordering match Eden.
-
-### Unintentional differences (to fix)
-
-- None in shortcut defaulting, loading, or saving.
-
-### Missing items
-
-- None in the shortcut persistence slice.
-
-### Binary layout verification
-
-- PASS: shortcut persistence is key/value INI data; no raw structure layout is serialized.
 
 ## 2026-09-03 — `src/ruzu/src/hotkeys.rs` vs Eden `src/yuzu/hotkeys.{h,cpp}`
 
@@ -19690,18 +12385,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ruzu currently registers accelerators only for frontend actions that have functional GTK action
   counterparts; reapplying a changed binding replaces or clears the former accelerator.
 
-### Unintentional differences (to fix)
-
-- None in the connected keyboard-hotkey slice.
-
 ### Missing items
 
 - Controller-shortcut parsing, HID callbacks, repeat dispatch, and GTK action counterparts for the
   remaining default actions are not yet ported.
-
-### Binary layout verification
-
-- PASS: the registry contains frontend strings and flags only; it does not cross a guest ABI.
 
 ## 2026-09-03 — `src/frontend_common/src/content_manager.rs` vs Eden `src/frontend_common/content_manager.h`
 
@@ -19716,18 +12403,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Installation callbacks require `Send + Sync` because the GTK frontend performs disk work on its
   install worker rather than capturing GUI objects in the copy callback.
 
-### Unintentional differences (to fix)
-
-- None in `install_nsp` or `install_nca`.
-
 ### Missing items
 
 - The pre-existing `remove_dlc`, `remove_all_dlc`, `remove_update`, `remove_base_content`,
   `remove_mod`, and `verify_game_contents` stubs remain outside this installation slice.
-
-### Binary layout verification
-
-- PASS: installation copies opaque VFS bytes; the implementation introduces no serialized struct.
 
 ## 2026-09-03 — `src/ruzu/src/install_dialog.rs` vs Eden `src/yuzu/install_dialog.{h,cpp}`
 
@@ -19738,18 +12417,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   returned.
 - A scrolling `GtkListBox` with a fixed initial dialog size replaces Qt's list-column size hint and
   `GetMinimumWidth`; this is toolkit layout mechanics only.
-
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: this dialog owns only host paths and widgets.
 
 ## 2026-09-03 — `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` (`OnMenuInstallToNAND`, `InstallNCA`)
 
@@ -19764,19 +12431,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Progress uses exact per-file byte fractions instead of Eden's integer count of 1 MiB callback
   steps. Cancellation is still observed at the same copy-block boundaries.
 
-### Unintentional differences (to fix)
-
-- None in the wired install action.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: the frontend passes paths, enum values, progress counters, and result classifications; no
-  guest ABI payload is involved.
-
 ## 2026-09-03 — `src/ruzu/src/{uisettings.rs,configuration/qt_config.rs}` vs Eden `src/qt_common/config/{uisettings.h,qt_config.cpp}` (`roms_path`)
 
 ### Intentional differences
@@ -19784,18 +12438,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The plain `roms_path` value is loaded and saved by focused Rust functions rather than as part of
   Qt's monolithic `ReadPathValues` / `SavePathValues` pass. Its `Paths\\romsPath` key, default
   marker, and update-after-confirmation ordering match upstream.
-
-### Unintentional differences (to fix)
-
-- None in `roms_path` persistence.
-
-### Missing items
-
-- None in this setting slice.
-
-### Binary layout verification
-
-- PASS: `roms_path` is an INI string and does not cross a binary ABI.
 
 ## 2026-09-03 — `src/ruzu/src/gtk_compat.rs` vs Eden `src/yuzu/main_window.cpp` (`QFileDialog::getOpenFileNames`)
 
@@ -19805,18 +12447,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   reports its `GFile` list asynchronously. Filters, initial folder, modality, acceptance, and
   cancellation semantics are preserved.
 
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: the adapter returns host filesystem handles only.
-
 ## 2026-09-04 — `src/common/src/host_memory.rs` vs Eden `src/common/host_memory.{h,cpp}`
 
 ### Intentional differences
@@ -19825,18 +12455,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   constructor argument performs the allocations directly while the parity-owned `backing_size`
   field is retained but not read later. A local `dead_code` allowance documents that ownership
   difference without removing upstream state.
-
-### Unintentional differences (to fix)
-
-- None introduced by this warning cleanup.
-
-### Missing items
-
-- None in this warning-only slice.
-
-### Binary layout verification
-
-- PASS: `HostMemoryImpl` is host-only state and is not serialized or exposed through a guest ABI.
 
 ## 2026-09-04 — `src/common/{build.rs,src/scm_rev.rs}` vs Eden `CMakeModules/GenerateSCMRev.cmake` and `src/common/scm_rev.cpp.in`
 
@@ -19848,20 +12466,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   parsing `cl /Bv`. This reports the compiler that Cargo's native dependencies select instead of a
   hard-coded Visual Studio release.
 
-### Unintentional differences (to fix)
-
-- None. A normal PowerShell Cargo build no longer falls back to `Unknown compiler` when Visual
-  Studio is installed but `cl.exe` is not globally discoverable.
-
-### Missing items
-
-- None in compiler identity generation.
-
-### Binary layout verification
-
-- PASS: compiler identity is build-time UTF-8 metadata only. The `common` compiler-identity
-  regression test now passes with the installed MSVC toolset.
-
 ## 2026-09-04 — `src/core/src/arm/dynarmic/dynarmic_cp15.rs` vs Eden `src/core/arm/dynarmic/dynarmic_cp15.{h,cpp}`
 
 ### Intentional differences
@@ -19869,18 +12473,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The unused Rust `fence` import is now selected only for the platforms that use it. The MSVC x64
   path continues to use its dedicated barrier, matching Eden's MSVC-intrinsic versus
   `__sync_synchronize` platform split.
-
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None in this warning-only slice.
-
-### Binary layout verification
-
-- PASS: no CP15 storage or payload layout changed.
 
 ## 2026-09-04 — `src/core/src/file_sys/vfs/vfs_real.rs` vs Eden `src/core/file_sys/vfs/vfs_real.{h,cpp}` (`RealVfsDirectory::GetFileTimeStamp`)
 
@@ -19890,19 +12482,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   `std::os::windows::fs::MetadataExt` instead of Eden's `_wstat64`. `FILETIME` values are converted
   from 100 ns ticks since 1601 to signed Unix seconds before preserving Eden's signed-to-unsigned
   bit pattern.
-
-### Unintentional differences (to fix)
-
-- None. The former Windows default-value result has been replaced with the upstream behavior.
-
-### Missing items
-
-- None in this method.
-
-### Binary layout verification
-
-- PASS: all four `FileTimeStampRaw` fields are initialized, including zeroed padding; a Windows
-  regression test covers the epoch, a positive offset, and the pre-epoch unsigned wrap.
 
 ## 2026-09-04 — `src/core/src/internal_network/sockets.rs` vs Eden `src/core/internal_network/{sockets.h,network.cpp}`
 
@@ -19923,10 +12502,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Native Windows initialization, non-blocking mode, polling, and the other WinSock-backed socket
   operations remain to be ported.
 
-### Binary layout verification
-
-- PASS: socket state is host-only and no serialized layout changed.
-
 ## 2026-09-04 — `src/core/src/hle/service/sockets/bsd.rs` vs Eden `src/core/hle/service/sockets/bsd.cpp` (`DuplicateSocketImpl`)
 
 ### Intentional differences
@@ -19944,10 +12519,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - Windows duplication and exact shared-socket ownership parity.
 
-### Binary layout verification
-
-- PASS: no IPC request or response structure changed.
-
 ## 2026-09-04 — `src/rdynarmic/src/backend/x64/{a32_emit_a32.rs,a32_emit_x64_memory.rs,a32_interface.rs,a64_emit_x64.rs,a64_emit_x64_memory.rs,a64_interface.rs,abi.rs,block_of_code.rs,emit.rs,emit_aes.rs,emit_crc32.rs,emit_floating_point.rs,emit_fp_vector.rs,emit_fp_vector_convert.rs,emit_packed.rs,emit_vector_basic.rs,emit_vector_misc.rs,emit_vector_multiply.rs,emit_vector_saturated.rs,emit_vector_shift.rs,exception_handler.rs}`
 
 ### Intentional differences
@@ -19962,19 +12533,10 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   removed. Per-code-buffer registration is still paired with `unregister_code_block` from
   `BlockOfCode::drop`, so registration lifecycle and ordering are unchanged.
 
-### Unintentional differences (to fix)
-
-- None introduced by this warning cleanup.
-
 ### Missing items
 
 - No upstream-owned method or constant was removed; the Rust Windows SEH integration has no Eden
   source-file counterpart to compare line-for-line.
-
-### Binary layout verification
-
-- PASS: function addresses retain the same machine-width bit pattern, unwind record bytes are
-  unchanged, and all 1,133 `rdynarmic` library tests execute successfully (1,129 passed, 4 ignored).
 
 ## 2026-09-04 — `src/video_core/src/macro.rs` vs Eden `src/video_core/macro.{h,cpp}` (`MacroJIT_SendThunk`, `MacroJIT_ErrorThunk`)
 
@@ -19983,18 +12545,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The two thunk function items now pass explicitly through `*const ()` before becoming the host
   integer address consumed by the far-call emitter. The address and call sequence are unchanged.
 
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None in these thunk call sites.
-
-### Binary layout verification
-
-- PASS: generated call targets retain identical pointer bits; no macro state layout changed.
-
 ## 2026-09-04 — `src/ruzu/src/boot.rs` vs platform renderer context ownership
 
 ### Intentional differences
@@ -20002,18 +12552,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - `opengl_context_source` is now allowed to be unused on every non-Linux target, matching the
   existing Linux-only GLX consumption. This GTK frontend is outside the excluded Qt `yuzu`
   source-tree parity contract.
-
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None in this warning-only slice.
-
-### Binary layout verification
-
-- PASS: frontend renderer handles are host-only and no serialized layout changed.
 
 ## 2026-09-05 — `src/core/src/internal_network/network_interface.rs` vs Eden `src/core/internal_network/network_interface.{h,cpp}` (`GetAvailableNetworkInterfaces`, Windows)
 
@@ -20028,22 +12566,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The required IP Helper declarations are enabled as target-specific `winapi` features in
   `src/core/Cargo.toml`; this replaces Eden's Windows SDK includes without changing ownership.
 
-### Unintentional differences (to fix)
-
-- None in the Windows enumeration path. The former unconditional empty result has been replaced by
-  Eden's two-call `GetAdaptersAddresses` flow, flags, filters, first-unicast selection, prefix-mask
-  conversion, gateway lookup, friendly name, enumeration order, and Wi-Fi classification.
-
-### Missing items
-
-- None in Eden's Windows `GetAvailableNetworkInterfaces` implementation.
-
-### Binary layout verification
-
-- PASS: the FFI structures come directly from `winapi`; IPv4 addresses and masks preserve the four
-  network-order bytes. The Windows regression test confirms that active adapters are returned with
-  non-empty names and nonzero IPv4 addresses.
-
 ## 2026-09-05 — `src/core/src/internal_network/network_interface.rs` vs Eden `src/core/internal_network/network_interface.cpp` (`GetSelectedNetworkInterface`, `SelectFirstNetworkInterface`)
 
 ### Intentional differences
@@ -20057,18 +12579,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - If only excluded adapters exist, Ruzu leaves the automatic selection empty instead of falling
   back to Eden's first entry.
 
-### Unintentional differences (to fix)
-
-- None in the requested default-selection policy.
-
-### Missing items
-
-- None.
-
-### Binary layout verification
-
-- PASS: selection examines host-side strings and `Ipv4Addr` values only; no layout changed.
-
 ## 2026-09-05 — `src/ruzu/src/configuration/configure_network.rs` vs Eden `src/yuzu/configuration/configure_network.{h,cpp}` (`SetConfiguration`)
 
 ### Intentional differences
@@ -20077,18 +12587,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   interface instead of GTK's implicit first row. If core intentionally finds no automatic
   candidate, the dropdown is explicitly left unselected; selecting any listed virtual/VPN adapter
   manually is still supported and saved normally.
-
-### Unintentional differences (to fix)
-
-- None in network-interface selection.
-
-### Missing items
-
-- None in this selection slice.
-
-### Binary layout verification
-
-- PASS: the frontend stores only the selected host interface name.
 
 ## 2026-09-05 — `src/ruzu/src/util/game.rs` vs Eden `src/qt_common/util/game.{h,cpp}` (`OpenRootDataFolder`)
 
@@ -20100,18 +12598,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The Windows command is built through a small mechanical helper so the exact executable and the
   single native path argument can be regression-tested without opening an Explorer window.
 
-### Unintentional differences (to fix)
-
-- None in `OpenRootDataFolder`; the former Windows GIO-only path has been replaced.
-
 ### Missing items
 
 - The other Eden standard-folder helpers remain outside this focused root-data-folder slice.
-
-### Binary layout verification
-
-- PASS: this change only launches a host process and does not alter serialized or guest-visible
-  data.
 
 ## 2026-09-05 — `src/ruzu/src/file_menu.rs` vs Eden `src/yuzu/main_window.{h,cpp}` (`OnOpenRootDataFolder`)
 
@@ -20119,18 +12608,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - GTK registers an application-scoped `gio::SimpleAction`; its activation now delegates to the
   matching `util/game.rs` owner just as Eden's main-window slot delegates to `QtCommon::Game`.
-
-### Unintentional differences (to fix)
-
-- None.
-
-### Missing items
-
-- None in this menu-action wrapper.
-
-### Binary layout verification
-
-- PASS: menu callbacks are host-side frontend state only.
 
 ## 2026-09-05 — `src/ruzu/src/about_dialog.rs` vs Eden `src/yuzu/about_dialog.{h,cpp}` and `src/yuzu/aboutdialog.ui`
 
@@ -20144,19 +12621,11 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   repository; Eden's Discord, Stoat, and Twitter links are deliberately omitted.
 - The packaged Ruzu logo is always used instead of first looking up Eden's Qt theme icon.
 
-### Unintentional differences (to fix)
-
-- None in the requested About-dialog layout and link behavior.
-
 ### Missing items
 
 - Eden appends its UTC build date and supports a custom idle-title format. Ruzu's generated
   `common::scm_rev` metadata does not currently expose either value, so this dialog shows the same
   build name, version, and compiler triplet used in Ruzu's main-window title.
-
-### Binary layout verification
-
-- PASS: this frontend-only widget change does not alter serialized or guest-visible data.
 
 ## 2026-09-05 — `src/ruzu/src/{main_window.rs,gtk_compat.rs,i18n.rs}` vs Eden `src/yuzu/main_window.{h,cpp}` (`OpenURL`, `OnOpenQuickstartGuide`)
 
@@ -20170,37 +12639,12 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Ruzu's context-free translation layer still changes visible yuzu branding to ruzu, but now skips
   URI spans so the upstream `yuzu-mirror.github.io` host remains byte-for-byte intact.
 
-### Unintentional differences (to fix)
-
-- None in URL-launch success/failure handling: both implementations open the platform browser and
-  display an error dialog when the platform rejects the URL.
-
-### Missing items
-
-- None in this URL-launching slice.
-
-### Binary layout verification
-
-- PASS: URL launching is host-side frontend behavior only.
-
 ## 2026-09-05 — `src/ruzu/src/{game_list.rs,util/game.rs}` vs Eden `src/yuzu/game/game_list.{h,cpp}`, `src/yuzu/main_window.{h,cpp}` (`AddPermDirPopup`, `OnGameListOpenDirectory`)
 
 ### Intentional differences
 
 - Eden routes the game-list signal through `QDesktopServices::openUrl`. Ruzu keeps the action in `game_list.rs` and reuses the platform folder adapter in `util/game.rs`: `explorer.exe` receives one native path argument on Windows, while GIO remains the launcher on non-Windows hosts. This is required because the packaged Windows GIO runtime does not reliably register a `file://` URI handler.
 - Ruzu uses a fixed translated error-dialog title; Eden includes the rejected path in its title. The path is still written to the log together with the platform error.
-
-### Unintentional differences (to fix)
-
-- None in the directory existence check or platform file-manager launch.
-
-### Missing items
-
-- None for opening configured game-directory, save-data, mod-data, and pipeline-cache locations.
-
-### Binary layout verification
-
-- PASS: this is host-side frontend behavior and introduces no serialized or guest-visible structure.
 
 ## 2026-09-05 — `src/common/{build.rs,src/scm_rev.rs}` vs Eden `CMakeModules/GenerateSCMRev.cmake` and `src/common/scm_rev.cpp.in`
 
@@ -20214,17 +12658,9 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The workspace version is `0.0.1`; Windows staging and NSIS already consume that single Cargo
   version source, producing `Ruzu-Windows-0.0.1-x64-msvc` and the matching installer name.
 
-### Unintentional differences (to fix)
-
-- None in release-versus-development build-version selection.
-
 ### Missing items
 
 - Eden's stable/nightly update-feed metadata remains outside Ruzu's current frontend scope.
-
-### Binary layout verification
-
-- N/A: version and compiler identities are build-time UTF-8 metadata and are not guest-visible.
 
 ## 2026-09-05 - src/rdynarmic/src/backend/arm64/a64_address_space.rs vs dynarmic/backend/arm64/a64_address_space.{h,cpp}
 
@@ -20236,25 +12672,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   restores the same invariant after callback expansion and optimization, before
   verification and emission.
 
-### Unintentional differences (to fix)
-
-- None remaining in this repair: expanding `DC ZVA` inserts instructions and
-  clears links; without the final rebuild, `GetNZCVFromOp` was no longer visible
-  to the arithmetic producer. `SUBS` became `SUB` followed by `TST`, losing C/V
-  and causing a following `B.HI` to take the wrong path.
-
-### Missing items
-
-- No new prerequisite missing in this slice. This audit does not claim full
-  A64 address-space parity.
-
-### Binary layout verification
-
-- N/A: no guest state, ABI, or instruction representation layout changes.
-- Regression: `DC ZVA; SUBS; B.HI` must retain the subtraction-to-NZCV link with
-  optimizations disabled and enabled. The test failed before and passes after
-  the repair.
-
 ## 2026-09-05 - src/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs vs dynarmic/backend/arm64/emit_arm64_data_processing.cpp
 
 ### Intentional differences
@@ -20263,32 +12680,198 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   passing an immediate/register variant through upstream's `MaybeAddSubImm`
   lambda. The instruction selection and operand bits follow `EmitAddSub`.
 
-### Unintentional differences (to fix)
-
-- None remaining in the immediate add/sub fallback: the already complemented
-  operand is no longer complemented a second time by the raw-register helper.
-  Carry-in selects ADD/ADDS or SUB/SUBS exactly as upstream does, in both widths.
-
-### Missing items
-
-- No new prerequisite missing in this slice; other emitters are outside this audit.
-
-### Binary layout verification
-
-- PASS: native execution tests verify 32/64-bit results and NZCV, both carry-in
-  values, addition/subtraction, encodable/materialized constants, and signed
-  boundary operands. No ABI or serialized layout changes.
-
 ### Validation
 
-- Release GUI bundle rebuilt. Two Freebrick launches reached the rendered menu
-  at approximately 60 FPS, with window-specific screenshots, and remained alive
-  until the deliberate 90-second and 45-second test limits. Temporary JIT
-  tracing was removed before rebuilding. Gameplay beyond the menu is not validated.
-- 125 focused tests passed: A64 address space (5), ARM64 emitter (29), IR (90),
-  and native immediate arithmetic (1).
-- Full `cargo test -p rdynarmic --release -- --test-threads=1` did not pass:
+- Gameplay beyond the menu is not validated.
+- The full rdynarmic suite did not pass:
   `normal_callback_trampolines_populate_prelude_and_extend_cache_base` failed
   with 768 versus 800, followed by SIGABRT in the A32
   `run_existing_block_calls_arm64_prelude` test. These failures are outside the
   repaired A64 callback-expansion path; the full crate is not certified green.
+
+## 2026-09-05 - src/ruzu_cmd/src/main.rs vs eden/src/yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+
+- Rust exposes a general renderer override; Eden's force-null override is the
+  lifecycle reference. Both update the shared setting before System/window
+  creation. Rust keeps the configured OpenGL shader variant when not overridden.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_blit_helper.rs vs eden/src/video_core/renderer_vulkan/blit_image.h/.cpp
+
+### Intentional differences
+
+- Native Metal uses depth/stencil aspect blits plus integer compute packing,
+  not Vulkan fragment passes, for D32S8/RG32 reinterpretation. Helper owns the
+  native pipelines; the runtime creates this helper lazily. No SPIR-V involved.
+- Metal command-buffer retention and ordered, tracked encoder transitions
+  replace Vulkan resource barriers and scheduler-recorded API commands.
+
+### Missing items
+
+- General Fermi2D runtime blits were connected by the later BlitImage slice below.
+  Remaining conversion coverage is documented in that slice.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_image.rs vs eden/src/video_core/renderer_vulkan/vk_texture_cache.h/.cpp (Image)
+
+### Intentional differences
+
+- Image owns region/subresource translation for packed D32S8 upload/download;
+  the runtime supplies its conversion helper. Generic Metal texture/buffer
+  transfers reject combined D32S8 instead of issuing an invalid aspect copy.
+- Existing native/compatibility-storage authority is synchronized before a
+  download and updated after upload; no extra CPU wait is added.
+
+### Missing items
+
+- MSAA D32S8 transfers are explicitly rejected, not silently approximated.
+  Full Image rescaling/download-policy parity is not claimed by this change.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_texture_cache.rs vs eden/src/video_core/renderer_vulkan/vk_texture_cache.h/.cpp (TextureCacheRuntime)
+
+### Intentional differences
+
+- The D32S8/RG32 pair uses GPU-only packing through a private intermediate
+  buffer. All source regions are captured before writing destination regions,
+  preserving ReinterpretImage ordering. No finish/readback between stages.
+- Copy layouts retain Metal's row-alignment requirements, not Vulkan's layout.
+- The packed D32S8 upload hook selects the dedicated Image transfer method.
+
+### Missing items
+
+- General async image download/rescaling remain incomplete. Fermi2D runtime
+  blits were connected by the later BlitImage slice below.
+- Gameplay performance/parity remains unverified by the packed-conversion tests.
+
+## 2026-09-05 - src/video_core/src/engines/sw_blitter/converter.rs vs eden/src/video_core/engines/sw_blitter/converter.h/.cpp
+
+### Intentional differences
+
+- Existing runtime format dispatch remains. Upstream's per-format stack word
+  array becomes a four-word Rust stack array, sized for the largest supported
+  128-bit format. A construction-time invariant checks the maximum. No
+  allocation is performed inside either pixel loop.
+
+### Unintentional differences (to fix)
+
+- Fixed 226 erroneous RGB_TO_SRGB_LUT literals using Eden's exact table;
+  independently rechecked all 256 literals. SRGB_TO_RGB_LUT already matched.
+- Fixed per-pixel Vec allocation in ConvertTo/ConvertFrom. Factory-owned
+  format metadata is unchanged. This audit does not certify every old format.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_blit_helper.rs vs eden/src/video_core/renderer_vulkan/blit_image.h/.cpp and host_shaders/blit_*.frag
+
+### Intentional differences
+
+- Native MSL render pipelines implement region scaling/filtering, depth/stencil
+  export and MSAA copies: Metal's blit encoder cannot express all these Vulkan
+  blit operations. Helper ownership and the BlitColor, BlitColorMSAA,
+  BlitDepthStencil and ResolveDepthStencil boundaries follow Eden.
+- Pixel-space rectangles are normalized against the selected source view for
+  Metal sampling; nearest/linear samplers retain white border color, mip zero
+  and disabled anisotropy. The existing float fragment now uses explicit LOD 0,
+  as does Eden's blit_color_float.frag.
+- Pipeline identity uses native attachment formats/sample count, source MSAA,
+  numeric category, aspect and operation instead of a Vulkan render-pass handle.
+  Operation remains in the key; color blending is disabled as in Eden's helper.
+- Integer color copies use typed texture reads instead of float conversion.
+  MSAA color resolves average float samples (integer resolves select sample 0);
+  depth/stencil resolve selects sample 0 as in blit_depth_stencil_msaa.frag.
+- Native stencil-only resolve and same-count MSAA depth/stencil copies are
+  implemented instead of inheriting Vulkan driver-dependent rejection.
+- New encoders end the previous producer encoder and record on the same native
+  command buffer, using tracked-resource ordering. No per-copy CPU finish or
+  readback is introduced. Guest draws rebind state after the helper encoder ends.
+- The shared recording helper is a mechanical factorization of native encoder
+  setup within the same owning module, not a new cross-module dispatcher.
+
+### Missing items
+
+- This slice does not implement every ConvertImage helper in Eden's class.
+  Dark Souls remains unverified; matched gameplay performance remains pending.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_image_view.rs vs eden/src/video_core/renderer_vulkan/vk_texture_cache.h/.cpp (ImageView)
+
+### Intentional differences
+
+- DepthView/StencilView equivalents for blits are lazy OnceCell-owned native
+  2D/2DMS views. Existing array attachment views are retained for layered draws.
+  Levels/slices are relative to the already restricted source view; a selected
+  nonzero guest mip/layer must not accidentally become base image mip/layer 0.
+
+### Unintentional differences (to fix)
+
+- Fixed the Metal validation error caused by binding a 2DArray attachment view
+  to a depth2d/texture2d shader. Native partial mip/layer tests now pass.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_texture_cache.rs vs eden/src/video_core/renderer_vulkan/vk_texture_cache.h/.cpp (BlitImage)
+
+### Intentional differences
+
+- Runtime receives the independently boxed rasterizer-owned blit helper and
+  scheduler. Params::blit_image consumes common image-view/framebuffer slots,
+  synchronizes native/compatibility storage and marks the written storage.
+  No second CPU-address image store or copied GetBlitImages implementation.
+- FRAMEBUFFER_BLITS is enabled only with its concrete backend hook. Metal
+  shader operations replace Vulkan transfer commands where Metal has no
+  equivalent filtering/scaling encoder operation.
+- Invalid aspect/numeric/sample combinations are reported explicitly;
+  non-color/MSAA copies require matching formats and SrcCopy. Integer and
+  depth/stencil blits require point filtering. The existing common void-hook
+  interface logs runtime failures, like the Vulkan backend.
+
+### Missing items
+
+- General image rescaling and async download policy are not completed by this
+  slice. Implement their prerequisites if a gameplay trace requires them.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_rasterizer.rs vs eden/src/video_core/renderer_vulkan/vk_rasterizer.h/.cpp (AccelerateSurfaceCopy)
+
+### Intentional differences
+
+- Blit helper is boxed to keep the runtime's owner pointer stable across moves.
+  AccelerateSurfaceCopy holds the cache mutex and forwards dst/src/config to
+  the common cache, matching Eden's lock and argument ordering.
+
+### Missing items
+
+- Matched release gameplay performance/rendering measurements still required.
+
+## 2026-09-05 - src/shader_recompiler/src/backend/msl/msl_emit_context.rs and emit_msl.rs vs eden/src/shader_recompiler/backend/glsl/emit_glsl.cpp (DefineVariables/EmitCode)
+
+### Intentional differences
+
+- Eden has no direct MSL emitter. The relevant source-language contract is
+  GLSL DefineVariables: declare temporaries in function scope, separately from
+  assignments emitted in the structured control-flow walk. MSL retains its
+  existing per-InstRef names, not GLSL's reusable register allocator.
+- Structured MSL programs now accumulate typed, zero-initialized declarations
+  in the context and insert them at the start of the function body. Expression
+  evaluation and stores remain at their original positions. Straight-line
+  programs without a syntax list keep inline declarations; no nested syntax
+  scopes exist in that path. Phi declarations retain their existing behavior.
+
+### Unintentional differences (to fix)
+
+- Fixed loop-local SSA definitions becoming out-of-scope C++ identifiers in
+  loop exits. IR dominance does not imply visibility across source-language
+  braces. The native compiler regression failed with an undeclared identifier
+  before this change. No failed pipeline caching or draw suppression is used.
+
+### Missing items
+
+- Matched gameplay timing remains pending. The synthetic compiler regression
+  and the exercised game shaders do not establish complete shader coverage.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_shader.rs (native compiler regression)
+
+### Intentional differences
+
+- Native Metal-only test constructs an IR loop whose computed value is used
+  by the exit block, emits direct MSL, and compiles through MTLDevice. Eden has
+  no Metal counterpart; GLSL's DefineVariables establishes the scope contract.
+
+### Unintentional differences (to fix)
+
+- No production behavior changed in this file. The regression fails before
+  the context fix with an undeclared loop value, as observed in Harbinger.

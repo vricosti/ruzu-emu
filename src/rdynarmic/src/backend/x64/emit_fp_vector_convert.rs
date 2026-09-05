@@ -467,7 +467,7 @@ fn emit_fp_vector_muladd(
                 {
                     dctx.asm
                         .mov(
-                            Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().index()),
+                            rxbyak::Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().index()),
                             fpcr_value as i32,
                         )
                         .unwrap();

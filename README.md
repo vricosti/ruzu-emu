@@ -239,6 +239,11 @@ the submodules match the commits recorded by Ruzu. The advanced staging-only
 and existing-binary modes remain available by invoking
 `dist\package-windows.ps1` directly with `-StageOnly` or `-SkipBuild`.
 
+Package names use `workspace.package.version` from `Cargo.toml`. When the
+checked-out commit has the matching exact tag (for example `v0.0.1` for version
+`0.0.1`), Ruzu also displays that tag as its build version. Untagged builds keep
+the development identity `<short-commit>-<branch>`.
+
 There is also a headless command-line frontend:
 
 ```sh

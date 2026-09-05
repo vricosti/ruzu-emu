@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "audio_core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "common",
  "core",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "capture_harness"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -375,7 +375,7 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aes",
  "bitflags 2.13.1",
@@ -512,7 +512,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aes",
  "cipher",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "dedicated_room"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "common",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "frontend_common"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "common",
  "core",
@@ -1215,7 +1215,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hid_core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bitflags 2.13.1",
  "common",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "input_common"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bitflags 2.13.1",
  "common",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "network"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "common",
  "log",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "ruzu"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ash",
  "audio_core",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "ruzu_cmd"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ash",
  "audio_core",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "shader_recompiler"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bitflags 2.13.1",
  "common",
@@ -2777,7 +2777,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video_core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -2951,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "web_service"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "common",
  "log",

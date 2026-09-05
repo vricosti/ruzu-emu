@@ -203,6 +203,12 @@ fn git_common_directory(repository: &Path) -> Option<PathBuf> {
     })
 }
 
+fn exact_release_tag(repository: &Path, package_version: &str) -> Option<String> {
+    let expected = format!("v{package_version}");
+    git_value(repository, &["describe", "--tags", "--exact-match", "HEAD"])
+        .filter(|tag| tag == &expected)
+}
+
 fn track_git_head(repository: &Path) {
     let Some(dot_git) = git_directory(repository) else {
         return;
@@ -212,6 +218,10 @@ fn track_git_head(repository: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         common_git.join("packed-refs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        common_git.join("refs/tags").display()
     );
     if let Ok(head) = std::fs::read_to_string(dot_git.join("HEAD")) {
         if let Some(reference) = head.trim().strip_prefix("ref: ") {
@@ -234,6 +244,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=VSWHERE");
     println!("cargo:rerun-if-env-changed=GIT_REV");
     println!("cargo:rerun-if-env-changed=GIT_BRANCH");
+    println!("cargo:rerun-if-env-changed=GIT_TAG");
 
     let revision = env::var("GIT_REV")
         .ok()
@@ -247,7 +258,12 @@ fn main() {
         .or_else(|| git_value(repository, &["branch", "--show-current"]))
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "detached".to_owned());
-    let build_version = format!("{short_revision}-{branch}");
+    let package_version = env::var("CARGO_PKG_VERSION").unwrap();
+    let release_tag = env::var("GIT_TAG")
+        .ok()
+        .filter(|tag| tag == &format!("v{package_version}"))
+        .or_else(|| exact_release_tag(repository, &package_version));
+    let build_version = release_tag.unwrap_or_else(|| format!("{short_revision}-{branch}"));
 
     println!("cargo:rustc-env=GIT_REV={revision}");
     println!("cargo:rustc-env=GIT_BRANCH={branch}");

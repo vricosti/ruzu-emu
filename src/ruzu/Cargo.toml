@@ -63,7 +63,7 @@ frontend_common = { path = "../frontend_common" }
 video_core = { workspace = true }
 audio_core = { path = "../audio_core" }
 parking_lot = { workspace = true }
-network = { version = "0.1.0", path = "../network" }
+network = { version = "0.0.1", path = "../network" }
 web_service.workspace = true
 
 # macOS-only: embed a CAMetalLayer into the GTK window's NSView so the Vulkan

@@ -20201,3 +20201,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: this is host-side frontend behavior and introduces no serialized or guest-visible structure.
+
+## 2026-09-05 — `src/common/{build.rs,src/scm_rev.rs}` vs Eden `CMakeModules/GenerateSCMRev.cmake` and `src/common/scm_rev.cpp.in`
+
+### Intentional differences
+
+- Eden selects release formatting when its packaging pipeline provides a `GIT-RELEASE` file and
+  then exposes `GIT_TAG` as `BUILD_VERSION`. Ruzu has no CMake release-file generation step, so
+  Cargo recognizes an exact `v<workspace-version>` tag at `HEAD`; source-package builders can
+  provide the same value through `GIT_TAG`. Both expose the tag alone for release builds and
+  retain `<ten-character-commit>-<branch>` for development builds.
+- The workspace version is `0.0.1`; Windows staging and NSIS already consume that single Cargo
+  version source, producing `Ruzu-Windows-0.0.1-x64-msvc` and the matching installer name.
+
+### Unintentional differences (to fix)
+
+- None in release-versus-development build-version selection.
+
+### Missing items
+
+- Eden's stable/nightly update-feed metadata remains outside Ruzu's current frontend scope.
+
+### Binary layout verification
+
+- N/A: version and compiler identities are build-time UTF-8 metadata and are not guest-visible.

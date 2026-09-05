@@ -18,9 +18,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn development_build_version_contains_short_revision_and_branch() {
-        assert!(BUILD_VERSION.starts_with(&SCM_REV[..SCM_REV.len().min(10)]));
-        assert!(BUILD_VERSION.ends_with(SCM_BRANCH));
+    fn build_version_matches_release_or_development_identity() {
+        let release_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        if BUILD_VERSION.starts_with('v') {
+            assert_eq!(BUILD_VERSION, release_version);
+        } else {
+            assert!(BUILD_VERSION.starts_with(&SCM_REV[..SCM_REV.len().min(10)]));
+            assert!(BUILD_VERSION.ends_with(SCM_BRANCH));
+        }
+        assert_eq!(SCM_DESC, BUILD_VERSION);
         assert!(!COMPILER_ID.is_empty());
         assert_ne!(COMPILER_ID, "Unknown compiler");
         #[cfg(target_env = "msvc")]

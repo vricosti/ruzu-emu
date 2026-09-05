@@ -8,4 +8,4 @@ common.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 rusty_enet = "0.4"
-web_service = { version = "0.1.0", path = "../web_service" }
+web_service = { version = "0.0.1", path = "../web_service" }

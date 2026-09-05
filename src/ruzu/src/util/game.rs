@@ -14,6 +14,36 @@ use ruzu_core::file_sys::patch_manager::PatchManager;
 use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
 use ruzu_core::loader::loader::{get_loader, ResultStatus, System as LoaderSystem};
 
+/// Eden `QtCommon::Game::OpenRootDataFolder`.
+pub fn open_root_data_folder() {
+    let path = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::RuzuDir);
+    if let Err(error) = open_folder(&path) {
+        log::error!("Failed to open ruzu folder {}: {error}", path.display());
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_folder(path: &Path) -> std::io::Result<()> {
+    // GIO's Windows build does not necessarily ship a default `file://` URI
+    // handler. `QDesktopServices::openUrl(QUrl::fromLocalFile(...))` reaches
+    // Explorer through the native shell in Eden; invoke Explorer directly here.
+    windows_open_folder_command(path).spawn().map(drop)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_open_folder_command(path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("explorer.exe");
+    command.arg(path);
+    command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_folder(path: &Path) -> std::io::Result<()> {
+    let directory = gtk::gio::File::for_path(path);
+    gtk::gio::AppInfo::launch_default_for_uri(&directory.uri(), gtk::gio::AppLaunchContext::NONE)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum ShortcutTarget {
@@ -448,6 +478,18 @@ mod tests {
     #[test]
     fn shortcut_title_removes_edens_illegal_characters() {
         assert_eq!(sanitize_shortcut_name("A<B>:C\"/D\\E|F?G*H.I"), "ABCDEFGHI");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn root_data_folder_uses_explorer_with_a_single_native_path_argument() {
+        use std::ffi::OsStr;
+
+        let path = Path::new(r"C:\Users\Ruzu User\AppData\Roaming\ruzu");
+        let command = windows_open_folder_command(path);
+
+        assert_eq!(command.get_program(), OsStr::new("explorer.exe"));
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [path.as_os_str()]);
     }
 
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]

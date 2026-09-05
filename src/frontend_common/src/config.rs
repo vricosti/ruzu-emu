@@ -2256,15 +2256,17 @@ mod tests {
 
         let mut config = BaseConfig::new(ConfigType::GlobalConfig);
         config.load_ini(
-            "[Services]\nnetwork_interface\\default=false\nnetwork_interface=wlo1\nairplane_mode\\default=false\nairplane_mode=true\n",
+            "[Services]\nnetwork_interface\\default=false\nnetwork_interface=wlo1\nairplane_mode\\default=false\nairplane_mode=false\n",
         );
         config.read_values();
 
         {
             let values = common::settings::values();
             assert_eq!(values.network_interface.get_value(), "wlo1");
-            assert!(*values.airplane_mode.get_value());
+            assert!(!*values.airplane_mode.get_value());
         }
+
+        common::settings::values_mut().airplane_mode.set_value(true);
 
         config.save_values();
         assert_eq!(
@@ -2274,6 +2276,14 @@ mod tests {
                 .and_then(|section| section.get("network_interface"))
                 .map(String::as_str),
             Some("wlo1")
+        );
+        assert_eq!(
+            config
+                .ini
+                .get("Services")
+                .and_then(|section| section.get("airplane_mode"))
+                .map(String::as_str),
+            Some("true")
         );
         assert!(!config.ini.contains_key("Network"));
 

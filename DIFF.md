@@ -20011,3 +20011,120 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: frontend renderer handles are host-only and no serialized layout changed.
+
+## 2026-09-05 — `src/core/src/internal_network/network_interface.rs` vs Eden `src/core/internal_network/network_interface.{h,cpp}` (`GetAvailableNetworkInterfaces`, Windows)
+
+### Intentional differences
+
+- Eden stores the `GetAdaptersAddresses` result in a zeroed `std::vector<u8>`. Rust uses a zeroed
+  `Vec<usize>` with the same requested byte capacity so the FFI buffer is explicitly aligned for
+  `IP_ADAPTER_ADDRESSES` before it is cast.
+- Eden converts `FriendlyName` with `Common::UTF16ToUTF8`; Rust uses the Windows `OsStringExt`
+  conversion and a lossy UTF-8 representation for malformed host UTF-16. Valid Windows adapter
+  names are identical.
+- The required IP Helper declarations are enabled as target-specific `winapi` features in
+  `src/core/Cargo.toml`; this replaces Eden's Windows SDK includes without changing ownership.
+
+### Unintentional differences (to fix)
+
+- None in the Windows enumeration path. The former unconditional empty result has been replaced by
+  Eden's two-call `GetAdaptersAddresses` flow, flags, filters, first-unicast selection, prefix-mask
+  conversion, gateway lookup, friendly name, enumeration order, and Wi-Fi classification.
+
+### Missing items
+
+- None in Eden's Windows `GetAvailableNetworkInterfaces` implementation.
+
+### Binary layout verification
+
+- PASS: the FFI structures come directly from `winapi`; IPv4 addresses and masks preserve the four
+  network-order bytes. The Windows regression test confirms that active adapters are returned with
+  non-empty names and nonzero IPv4 addresses.
+
+## 2026-09-05 — `src/core/src/internal_network/network_interface.rs` vs Eden `src/core/internal_network/network_interface.cpp` (`GetSelectedNetworkInterface`, `SelectFirstNetworkInterface`)
+
+### Intentional differences
+
+- At the user's request, an empty setting no longer selects the first enumerated adapter blindly.
+  Ruzu first selects an IPv4 interface that is usable, appears physical, and has a gateway; it then
+  falls back to a usable physical interface without a gateway.
+- Loopback/link-local/multicast/unspecified addresses and names identifying common virtual-machine,
+  container, tunnel, or VPN adapters are not automatic candidates. They remain in the enumerated
+  list and an exact stored interface name still selects them, preserving explicit user choice.
+- If only excluded adapters exist, Ruzu leaves the automatic selection empty instead of falling
+  back to Eden's first entry.
+
+### Unintentional differences (to fix)
+
+- None in the requested default-selection policy.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- PASS: selection examines host-side strings and `Ipv4Addr` values only; no layout changed.
+
+## 2026-09-05 — `src/ruzu/src/configuration/configure_network.rs` vs Eden `src/yuzu/configuration/configure_network.{h,cpp}` (`SetConfiguration`)
+
+### Intentional differences
+
+- When no interface is configured, the GTK dropdown displays the core-selected probable physical
+  interface instead of GTK's implicit first row. If core intentionally finds no automatic
+  candidate, the dropdown is explicitly left unselected; selecting any listed virtual/VPN adapter
+  manually is still supported and saved normally.
+
+### Unintentional differences (to fix)
+
+- None in network-interface selection.
+
+### Missing items
+
+- None in this selection slice.
+
+### Binary layout verification
+
+- PASS: the frontend stores only the selected host interface name.
+
+## 2026-09-05 — `src/ruzu/src/util/game.rs` vs Eden `src/qt_common/util/game.{h,cpp}` (`OpenRootDataFolder`)
+
+### Intentional differences
+
+- Eden delegates a local-file URL to `QDesktopServices`. Ruzu keeps GIO's default URI launcher on
+  non-Windows hosts, but invokes `explorer.exe` directly on Windows because the bundled GTK/GIO
+  runtime does not reliably provide a default `file://` URI handler there.
+- The Windows command is built through a small mechanical helper so the exact executable and the
+  single native path argument can be regression-tested without opening an Explorer window.
+
+### Unintentional differences (to fix)
+
+- None in `OpenRootDataFolder`; the former Windows GIO-only path has been replaced.
+
+### Missing items
+
+- The other Eden standard-folder helpers remain outside this focused root-data-folder slice.
+
+### Binary layout verification
+
+- PASS: this change only launches a host process and does not alter serialized or guest-visible
+  data.
+
+## 2026-09-05 — `src/ruzu/src/file_menu.rs` vs Eden `src/yuzu/main_window.{h,cpp}` (`OnOpenRootDataFolder`)
+
+### Intentional differences
+
+- GTK registers an application-scoped `gio::SimpleAction`; its activation now delegates to the
+  matching `util/game.rs` owner just as Eden's main-window slot delegates to `QtCommon::Game`.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None in this menu-action wrapper.
+
+### Binary layout verification
+
+- PASS: menu callbacks are host-side frontend state only.

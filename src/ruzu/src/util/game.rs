@@ -23,7 +23,7 @@ pub fn open_root_data_folder() {
 }
 
 #[cfg(target_os = "windows")]
-fn open_folder(path: &Path) -> std::io::Result<()> {
+pub(crate) fn open_folder(path: &Path) -> std::io::Result<()> {
     // GIO's Windows build does not necessarily ship a default `file://` URI
     // handler. `QDesktopServices::openUrl(QUrl::fromLocalFile(...))` reaches
     // Explorer through the native shell in Eden; invoke Explorer directly here.
@@ -38,7 +38,7 @@ fn windows_open_folder_command(path: &Path) -> std::process::Command {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn open_folder(path: &Path) -> std::io::Result<()> {
+pub(crate) fn open_folder(path: &Path) -> std::io::Result<()> {
     let directory = gtk::gio::File::for_path(path);
     gtk::gio::AppInfo::launch_default_for_uri(&directory.uri(), gtk::gio::AppLaunchContext::NONE)
         .map_err(|error| std::io::Error::other(error.to_string()))
@@ -482,7 +482,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn root_data_folder_uses_explorer_with_a_single_native_path_argument() {
+    fn windows_folder_launcher_uses_explorer_with_a_single_native_path_argument() {
         use std::ffi::OsStr;
 
         let path = Path::new(r"C:\Users\Ruzu User\AppData\Roaming\ruzu");

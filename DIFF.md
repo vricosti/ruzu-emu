@@ -20179,3 +20179,22 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: URL launching is host-side frontend behavior only.
+
+## 2026-09-05 — `src/ruzu/src/{game_list.rs,util/game.rs}` vs Eden `src/yuzu/game/game_list.{h,cpp}`, `src/yuzu/main_window.{h,cpp}` (`AddPermDirPopup`, `OnGameListOpenDirectory`)
+
+### Intentional differences
+
+- Eden routes the game-list signal through `QDesktopServices::openUrl`. Ruzu keeps the action in `game_list.rs` and reuses the platform folder adapter in `util/game.rs`: `explorer.exe` receives one native path argument on Windows, while GIO remains the launcher on non-Windows hosts. This is required because the packaged Windows GIO runtime does not reliably register a `file://` URI handler.
+- Ruzu uses a fixed translated error-dialog title; Eden includes the rejected path in its title. The path is still written to the log together with the platform error.
+
+### Unintentional differences (to fix)
+
+- None in the directory existence check or platform file-manager launch.
+
+### Missing items
+
+- None for opening configured game-directory, save-data, mod-data, and pipeline-cache locations.
+
+### Binary layout verification
+
+- PASS: this is host-side frontend behavior and introduces no serialized or guest-visible structure.

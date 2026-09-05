@@ -1078,7 +1078,12 @@ impl GameListView {
         let open_directory = gio::SimpleAction::new("open-directory", None);
         {
             let path = path.clone();
-            open_directory.connect_activate(move |_, _| open_directory_location(Path::new(&path)));
+            let view = Rc::downgrade(self);
+            open_directory.connect_activate(move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    open_directory_location(Path::new(&path), view.parent_window().as_ref());
+                }
+            });
         }
         actions.add_action(&open_directory);
 
@@ -1495,7 +1500,7 @@ impl GameListView {
             );
             return;
         }
-        open_directory_location(&path);
+        open_directory_location(&path, self.parent_window().as_ref());
     }
 
     /// `GMainWindow::OnGameListOpenFolder`, `GameListOpenTarget::ModData`.
@@ -1510,7 +1515,7 @@ impl GameListView {
             );
             return;
         }
-        open_directory_location(&path);
+        open_directory_location(&path, self.parent_window().as_ref());
     }
 
     /// `GMainWindow::OnTransferableShaderCacheOpenFile`.
@@ -1529,7 +1534,7 @@ impl GameListView {
             );
             return;
         }
-        open_directory_location(&path);
+        open_directory_location(&path, self.parent_window().as_ref());
     }
 
     fn parent_window(&self) -> Option<gtk::Window> {
@@ -2222,13 +2227,20 @@ fn find_directory_named(root: &Path, name: &str, remaining_depth: usize) -> Opti
     None
 }
 
-/// `GMainWindow::OnGameListOpenDirectory` using GTK/GIO's desktop launcher.
-fn open_directory_location(path: &Path) {
-    let directory = gio::File::for_path(path);
-    if let Err(error) =
-        gio::AppInfo::launch_default_for_uri(&directory.uri(), gio::AppLaunchContext::NONE)
-    {
+/// Upstream `GMainWindow::OnGameListOpenDirectory`.
+fn open_directory_location(path: &Path, parent: Option<&gtk::Window>) {
+    if !path.is_dir() {
+        crate::gtk_compat::show_warning(parent, "Error Opening Folder", "Folder does not exist!");
+        return;
+    }
+
+    if let Err(error) = crate::util::game::open_folder(path) {
         log::error!("Failed to open directory {}: {error}", path.display());
+        crate::gtk_compat::show_warning(
+            parent,
+            "Error Opening Folder",
+            "The folder could not be opened in the system file manager.",
+        );
     }
 }
 

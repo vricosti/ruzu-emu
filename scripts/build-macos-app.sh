@@ -64,6 +64,28 @@ mkdir -p "$macos" "$frameworks" "$resources" "$iconset"
 install -m 755 "$binary" "$macos/ruzu"
 install -m 644 "$plist" "$contents/Info.plist"
 
+if [[ -n "${RUZU_FREE_GAMES_ROOT:-}" ]]; then
+    freebrick_source="$RUZU_FREE_GAMES_ROOT/freebrick"
+    freebrick_resources="$resources/freegames/freebrick"
+    required_freebrick_files=(
+        "$freebrick_source/switch/freebrick.nro"
+        "$freebrick_source/LICENSE"
+        "$freebrick_source/ASSET_LICENSES.md"
+        "$freebrick_source/README.md"
+    )
+    for required_file in "${required_freebrick_files[@]}"; do
+        if [[ ! -f "$required_file" ]]; then
+            echo "Required FreeBrick package file is missing: $required_file" >&2
+            exit 1
+        fi
+    done
+    mkdir -p "$freebrick_resources"
+    install -m 644 "$freebrick_source/switch/freebrick.nro" "$freebrick_resources/freebrick.nro"
+    install -m 644 "$freebrick_source/LICENSE" "$freebrick_resources/LICENSE.txt"
+    install -m 644 "$freebrick_source/ASSET_LICENSES.md" "$freebrick_resources/ASSET_LICENSES.md"
+    install -m 644 "$freebrick_source/README.md" "$freebrick_resources/README.md"
+fi
+
 make_icon() {
     sips -z "$1" "$1" "$icon_source" --out "$iconset/$2" >/dev/null
 }

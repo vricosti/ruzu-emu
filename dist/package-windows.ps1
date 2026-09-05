@@ -6,8 +6,9 @@ Builds a self-contained Ruzu Windows directory and NSIS installer.
 
 .DESCRIPTION
 The script stages the Rust executables, the dynamic vcpkg runtime, GTK/GLib
-data files, licenses and documentation under target\package. It then invokes
-the Ruzu NSIS installer definition in this directory.
+data files, licenses and documentation under target\package. When
+FreeGamesRoot or RUZU_FREE_GAMES_ROOT is set, it also stages FreeBrick and its
+license notices. It then invokes the Ruzu NSIS installer definition here.
 
 Run build.bat once before this script so the x64 MSVC and vcpkg environment is
 available. Cargo builds SDL3 statically; GTK, FFmpeg, OpenSSL and their runtime
@@ -19,6 +20,7 @@ param(
     [string]$Version,
     [ValidateSet("release", "release-lto")]
     [string]$Profile = "release",
+    [string]$FreeGamesRoot = $env:RUZU_FREE_GAMES_ROOT,
     [switch]$ForcePackage,
     [switch]$SkipBuild,
     [switch]$StageOnly,
@@ -141,16 +143,42 @@ function Assert-MainBranch {
     }
 }
 
+function Assert-PublishedOnMain {
+    param(
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string]$GitExecutable
+    )
+
+    & $GitExecutable -C $Repository show-ref --verify --quiet refs/remotes/origin/main
+    if ($LASTEXITCODE -ne 0) {
+        throw "$DisplayName has no origin/main reference. Run the superproject setup after fetching its submodules."
+    }
+    & $GitExecutable -C $Repository merge-base --is-ancestor HEAD refs/remotes/origin/main
+    if ($LASTEXITCODE -ne 0) {
+        throw "$DisplayName must point to a commit published on origin/main before packaging."
+    }
+}
+
 function Assert-ReleaseBranches {
     $git = Get-Command git.exe -ErrorAction SilentlyContinue
     if (-not $git) {
         throw "git.exe was not found; Git is required to verify release branches."
     }
 
-    Assert-MainBranch `
-        -Repository $ProjectRoot `
-        -DisplayName "Ruzu" `
-        -GitExecutable $git.Source
+    $pinnedRelease = [bool]$env:RUZU_RELEASE_SUPERPROJECT_ROOT
+    if ($pinnedRelease) {
+        Assert-PublishedOnMain `
+            -Repository $ProjectRoot `
+            -DisplayName "Ruzu" `
+            -GitExecutable $git.Source
+    }
+    else {
+        Assert-MainBranch `
+            -Repository $ProjectRoot `
+            -DisplayName "Ruzu" `
+            -GitExecutable $git.Source
+    }
 
     $submoduleEntries = @(
         & $git.Source -C $ProjectRoot config --file .gitmodules --get-regexp '^submodule\..*\.path$'
@@ -176,10 +204,18 @@ function Assert-ReleaseBranches {
         if ($status[0].StartsWith("+") -or $status[0].StartsWith("U")) {
             throw "Git submodule $relativePath must match the commit recorded by Ruzu before packaging."
         }
-        Assert-MainBranch `
-            -Repository $repository `
-            -DisplayName "Git submodule $relativePath" `
-            -GitExecutable $git.Source
+        if ($pinnedRelease) {
+            Assert-PublishedOnMain `
+                -Repository $repository `
+                -DisplayName "Git submodule $relativePath" `
+                -GitExecutable $git.Source
+        }
+        else {
+            Assert-MainBranch `
+                -Repository $repository `
+                -DisplayName "Git submodule $relativePath" `
+                -GitExecutable $git.Source
+        }
     }
 }
 
@@ -206,6 +242,29 @@ function Copy-RequiredFile {
         throw "Required build output is missing: $Source"
     }
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
+function Copy-BundledFreeBrick {
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$StageRoot
+    )
+
+    $sourceDirectory = Join-Path $SourceRoot "freebrick"
+    $destinationDirectory = Join-Path $StageRoot "share\ruzu\freegames\freebrick"
+    $files = @(
+        @("switch\freebrick.nro", "freebrick.nro"),
+        @("LICENSE", "LICENSE.txt"),
+        @("ASSET_LICENSES.md", "ASSET_LICENSES.md"),
+        @("README.md", "README.md")
+    )
+
+    New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+    foreach ($file in $files) {
+        Copy-RequiredFile `
+            -Source (Join-Path $sourceDirectory $file[0]) `
+            -Destination (Join-Path $destinationDirectory $file[1])
+    }
 }
 
 Assert-PackagingSources
@@ -296,6 +355,11 @@ Copy-RequiredFile `
 Copy-RequiredFile `
     -Source (Join-Path $ProjectRoot "README.md") `
     -Destination (Join-Path $stageDirectory "README.md")
+
+if ($FreeGamesRoot) {
+    Copy-BundledFreeBrick -SourceRoot $FreeGamesRoot -StageRoot $stageDirectory
+    Write-Host "Bundled FreeBrick from $FreeGamesRoot."
+}
 
 $vcpkgBin = Join-Path $vcpkgInstalled "bin"
 $runtimeDlls = @(Get-ChildItem -LiteralPath $vcpkgBin -Filter "*.dll" -File)

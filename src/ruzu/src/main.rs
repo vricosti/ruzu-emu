@@ -22,6 +22,7 @@ mod boot;
 mod configuration;
 mod emu_window;
 mod file_menu;
+mod free_games;
 mod game_list;
 mod gtk_compat;
 #[cfg(target_os = "linux")]

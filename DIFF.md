@@ -20182,7 +20182,6 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: URL launching is host-side frontend behavior only.
-
 ## 2026-09-05 — `src/ruzu/src/{game_list.rs,util/game.rs}` vs Eden `src/yuzu/game/game_list.{h,cpp}`, `src/yuzu/main_window.{h,cpp}` (`AddPermDirPopup`, `OnGameListOpenDirectory`)
 
 ### Intentional differences
@@ -20201,3 +20200,20 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: this is host-side frontend behavior and introduces no serialized or guest-visible structure.
+
+## 2026-09-05 — `src/ruzu/src/{free_games.rs,game_list.rs,boot.rs}` vs `eden/src/yuzu/game/game_list.{h,cpp}`, `eden/src/qt_common/game_list/{worker.h,worker.cpp,game_list_p.h}`, and `eden/src/yuzu/main_window.{h,cpp}`
+
+### Intentional differences
+- Ruzu optionally appends a `Free Games` scan target resolved from the running executable. Eden only scans `UISettings::GameDir` entries and does not distribute homebrew with the emulator. The packaged directory is kept outside `UISettings::values.game_dirs`, so it remains relocatable and is never serialized into the user's configuration.
+- The packaged directory has a dedicated read-only row kind. Its context menu only opens the installed location; Eden's `CustomDir` actions for moving, changing recursive scanning, and removal remain available only for user-configured directories.
+- Packaged NRO files do not populate the frontend manual content provider. Eden's fill pass only contributes NCA/NSP/XCI content, so skipping that no-op pass preserves provider behavior while the ordinary game-list loader still inspects the NRO.
+- A packaged NRO keeps Eden's normal configured SDMC instead of enabling Ruzu's standalone-homebrew writable package overlay. This keeps saves in user-owned storage and treats the signed application/package directory as immutable.
+
+### Unintentional differences (to fix)
+- None for this Ruzu-specific distribution slice.
+
+### Missing items
+- None for executable-relative bundled-game discovery.
+
+### Binary layout verification
+- PASS: no shared binary structure or raw-memory payload is introduced; the packaged `.nro` is copied byte-for-byte.

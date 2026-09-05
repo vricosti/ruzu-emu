@@ -220,6 +220,9 @@ mod imp {
         /// The first group is upstream's `GameListFavorites`, not a filesystem
         /// directory even though it is expandable like one.
         pub is_favorites: Cell<bool>,
+        /// Ruzu packages may expose a read-only group of bundled homebrew.
+        /// Unlike a configured directory, this row cannot be moved or removed.
+        pub is_built_in: Cell<bool>,
         /// Whether this directory is scanned recursively (directory rows only).
         pub deep_scan: Cell<bool>,
         /// Child rows, for directory rows.
@@ -269,18 +272,26 @@ impl GameEntry {
         imp.program_id.set(program_id);
         imp.is_folder.set(false);
         imp.is_favorites.set(false);
+        imp.is_built_in.set(false);
         obj
     }
 
     /// A directory row, holding the games found under it.
-    fn new_folder(path: &str, deep_scan: bool, children: gio::ListStore) -> Self {
+    fn new_folder(
+        name: &str,
+        path: &str,
+        deep_scan: bool,
+        is_built_in: bool,
+        children: gio::ListStore,
+    ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
-        *imp.name.borrow_mut() = path.to_owned();
+        *imp.name.borrow_mut() = name.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
         *imp.icon.borrow_mut() = embedded_icon(folder_icon_png(path));
         imp.is_folder.set(true);
         imp.is_favorites.set(false);
+        imp.is_built_in.set(is_built_in);
         imp.deep_scan.set(deep_scan);
         *imp.children.borrow_mut() = Some(children);
         obj
@@ -294,6 +305,7 @@ impl GameEntry {
         *imp.icon.borrow_mut() = embedded_icon(FAVORITES_ICON_PNG);
         imp.is_folder.set(true);
         imp.is_favorites.set(true);
+        imp.is_built_in.set(false);
         *imp.children.borrow_mut() = Some(children);
         obj
     }
@@ -355,6 +367,9 @@ impl GameEntry {
     fn is_favorites(&self) -> bool {
         self.imp().is_favorites.get()
     }
+    fn is_built_in(&self) -> bool {
+        self.imp().is_built_in.get()
+    }
     fn deep_scan(&self) -> bool {
         self.imp().deep_scan.get()
     }
@@ -413,9 +428,39 @@ struct GameListView {
 }
 
 struct ScannedDirectory {
+    name: String,
     path: String,
     deep_scan: bool,
+    is_built_in: bool,
     games: Vec<GameFile>,
+}
+
+#[derive(Clone)]
+struct ScanDirectory {
+    name: String,
+    path: String,
+    deep_scan: bool,
+    is_built_in: bool,
+}
+
+impl ScanDirectory {
+    fn configured(directory: GameDir) -> Self {
+        Self {
+            name: directory.path.clone(),
+            path: directory.path,
+            deep_scan: directory.deep_scan,
+            is_built_in: false,
+        }
+    }
+
+    fn packaged_free_games(path: PathBuf) -> Self {
+        Self {
+            name: crate::i18n::tr("Free Games"),
+            path: path.to_string_lossy().into_owned(),
+            deep_scan: true,
+            is_built_in: true,
+        }
+    }
 }
 
 struct GameListScanResult {
@@ -984,11 +1029,40 @@ impl GameListView {
     ) {
         if entry.is_favorites() {
             self.popup_favorites_context_menu(anchor, x, y);
+        } else if entry.is_built_in() {
+            self.popup_built_in_directory_context_menu(entry, anchor, x, y);
         } else if entry.is_folder() {
             self.popup_directory_context_menu(entry, anchor, x, y);
         } else {
             self.popup_game_context_menu(entry, anchor, x, y, on_activate);
         }
+    }
+
+    /// Ruzu-specific menu for the read-only packaged free-game directory.
+    fn popup_built_in_directory_context_menu(
+        self: &Rc<Self>,
+        entry: &GameEntry,
+        anchor: &gtk::Widget,
+        x: f64,
+        y: f64,
+    ) {
+        let menu = gio::Menu::new();
+        menu.append(
+            Some(&crate::i18n::tr("Open Directory Location")),
+            Some("game-list.open-directory"),
+        );
+
+        let actions = gio::SimpleActionGroup::new();
+        let open_directory = gio::SimpleAction::new("open-directory", None);
+        let path = entry.path();
+        let view = Rc::downgrade(self);
+        open_directory.connect_activate(move |_, _| {
+            if let Some(view) = view.upgrade() {
+                open_directory_location(Path::new(&path), view.parent_window().as_ref());
+            }
+        });
+        actions.add_action(&open_directory);
+        show_context_menu(anchor, &menu, &actions, x, y);
     }
 
     /// Upstream `GameList::AddFavoritesPopup`.
@@ -1661,10 +1735,14 @@ impl GameListView {
         let previously_selected = selected_directory_path(&self.selection);
 
         let dirs = uisettings::with(|v| v.game_dirs.clone());
-        let scannable: Vec<GameDir> = dirs
+        let mut scannable: Vec<ScanDirectory> = dirs
             .into_iter()
             .filter(GameDir::is_filesystem_path)
+            .map(ScanDirectory::configured)
             .collect();
+        if let Some(directory) = crate::free_games::packaged_directory() {
+            scannable.push(ScanDirectory::packaged_free_games(directory));
+        }
         let directory_to_select =
             preferred_directory_path(previously_selected.as_deref(), &scannable);
 
@@ -1672,8 +1750,10 @@ impl GameListView {
         self.all_games.borrow_mut().clear();
         for dir in &scannable {
             self.store.append(&GameEntry::new_folder(
+                &dir.name,
                 &dir.path,
                 dir.deep_scan,
+                dir.is_built_in,
                 gio::ListStore::new::<GameEntry>(),
             ));
         }
@@ -1707,15 +1787,23 @@ impl GameListView {
                     if current_generation.load(Ordering::Acquire) != generation {
                         return;
                     }
-                    populate_frontend_manual_content_provider(std::slice::from_ref(&directory));
+                    if !directory.is_built_in {
+                        populate_frontend_manual_content_provider(&[GameDir {
+                            path: directory.path.clone(),
+                            deep_scan: directory.deep_scan,
+                            expanded: true,
+                        }]);
+                    }
                     let games = scan_dir_games(
                         Path::new(&directory.path),
                         directory.deep_scan,
                         &mut metadata_reader,
                     );
                     directories.push(ScannedDirectory {
+                        name: directory.name,
                         path: directory.path,
                         deep_scan: directory.deep_scan,
+                        is_built_in: directory.is_built_in,
                         games,
                     });
                 }
@@ -1771,8 +1859,10 @@ impl GameListView {
             }
             self.all_games.borrow_mut().push(all_games);
             self.store.append(&GameEntry::new_folder(
+                &directory.name,
                 &directory.path,
                 directory.deep_scan,
+                directory.is_built_in,
                 children,
             ));
         }
@@ -1949,7 +2039,7 @@ fn store_contains_entry(store: &gio::ListStore, expected: &GameEntry) -> bool {
 /// so the toolbar actions target it immediately.
 fn preferred_directory_path(
     previously_selected: Option<&str>,
-    directories: &[GameDir],
+    directories: &[ScanDirectory],
 ) -> Option<String> {
     if let Some(path) = previously_selected {
         if directories.iter().any(|directory| directory.path == path) {
@@ -3026,10 +3116,11 @@ mod tests {
 
     #[test]
     fn sole_directory_is_selected_after_reload() {
-        let directory = GameDir {
+        let directory = ScanDirectory {
+            name: String::from(r"D:\Games\Switch"),
             path: String::from(r"D:\Games\Switch"),
             deep_scan: false,
-            expanded: true,
+            is_built_in: false,
         };
 
         assert_eq!(
@@ -3041,6 +3132,28 @@ mod tests {
             Some(directory.path)
         );
         assert_eq!(preferred_directory_path(Some("removed"), &[]), None);
+    }
+
+    #[test]
+    fn packaged_free_games_are_named_and_marked_read_only() {
+        let directory = ScanDirectory::packaged_free_games(PathBuf::from("/opt/freegames"));
+
+        assert_eq!(directory.name, "Free Games");
+        assert_eq!(directory.path, "/opt/freegames");
+        assert!(directory.deep_scan);
+        assert!(directory.is_built_in);
+
+        let entry = GameEntry::new_folder(
+            &directory.name,
+            &directory.path,
+            directory.deep_scan,
+            directory.is_built_in,
+            gio::ListStore::new::<GameEntry>(),
+        );
+        assert!(entry.is_folder());
+        assert!(entry.is_built_in());
+        assert!(!entry.is_favorites());
+        assert_eq!(entry.name(), "Free Games");
     }
 
     #[test]

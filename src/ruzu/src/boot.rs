@@ -544,18 +544,25 @@ fn run_boot(
         let filesystem_controller = system.get_filesystem_controller();
         let mut filesystem_controller = filesystem_controller.lock().unwrap();
         filesystem_controller.create_factories(Arc::clone(&vfs), false);
-        if let Ok(sdmc_root) = filesystem_controller.open_sdmc() {
-            if let Some(homebrew_sdmc) = crate::homebrew_vfs::make_homebrew_sdmc_view(
-                vfs,
-                std::path::Path::new(&filepath),
-                sdmc_root,
-            ) {
-                log::info!(
-                    "Using the standalone NRO package root as the writable SDMC layer for {}",
-                    filepath
-                );
-                filesystem_controller.set_sdmc_open_override(Some(homebrew_sdmc));
+        let executable_path = std::path::Path::new(&filepath);
+        let is_packaged_free_game = crate::free_games::contains(executable_path);
+        if !is_packaged_free_game {
+            if let Ok(sdmc_root) = filesystem_controller.open_sdmc() {
+                if let Some(homebrew_sdmc) =
+                    crate::homebrew_vfs::make_homebrew_sdmc_view(vfs, executable_path, sdmc_root)
+                {
+                    log::info!(
+                        "Using the standalone NRO package root as the writable SDMC layer for {}",
+                        filepath
+                    );
+                    filesystem_controller.set_sdmc_open_override(Some(homebrew_sdmc));
+                }
             }
+        } else {
+            log::info!(
+                "Using the configured writable SDMC for packaged free game {}",
+                filepath
+            );
         }
         drop(filesystem_controller);
         system.clear_user_channel();

@@ -10,6 +10,44 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk::{gio, glib, ButtonsType, FileChooserAction, MessageType, ResponseType};
 
+/// Open an external URI using the platform's default application.
+///
+/// GIO's Windows build does not always provide a launcher for `https` URIs.
+/// Eden reaches the default browser through `QDesktopServices`; use the
+/// equivalent native Windows shell path there and retain GIO elsewhere.
+#[cfg(target_os = "windows")]
+pub fn open_external_uri(uri: &str) -> Result<(), String> {
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    if uri.encode_utf16().any(|unit| unit == 0) {
+        return Err("URI contains an embedded NUL character".to_owned());
+    }
+    let uri: Vec<u16> = uri.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            ptr::null(),
+            uri.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        Err(format!("Windows ShellExecuteW failed with code {result}"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_external_uri(uri: &str) -> Result<(), String> {
+    gio::AppInfo::launch_default_for_uri(uri, gio::AppLaunchContext::NONE)
+        .map_err(|error| error.to_string())
+}
+
 /// Show a modal informational message using the GTK 4.0 MessageDialog API.
 pub fn show_message<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
     show_message_with_type(parent, message, detail, MessageType::Info, false);
@@ -240,6 +278,12 @@ fn complete_question(callback: &QuestionCallback, accepted: bool) {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_uri_launcher_rejects_embedded_nul() {
+        assert!(open_external_uri("https://example.invalid/\0suffix").is_err());
+    }
 
     #[test]
     fn question_completion_is_one_shot_when_response_closes_dialog() {

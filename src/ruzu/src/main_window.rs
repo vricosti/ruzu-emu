@@ -74,7 +74,7 @@ const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
 /// Upstream `status_bar_update_timer` interval.
 const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 
-const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md";
+const QUICKSTART_URL: &str = "https://yuzu-mirror.github.io/help/quickstart/";
 const MISSING_KEYS_TITLE: &str = "Derivation Components Missing";
 const MISSING_KEYS_DETAIL: &str = "Decryption keys are missing. Install them now?";
 
@@ -897,6 +897,10 @@ mod help_menu_tests {
 
     #[test]
     fn help_menu_only_exposes_quickstart_and_about() {
+        assert_eq!(
+            QUICKSTART_URL,
+            "https://yuzu-mirror.github.io/help/quickstart/"
+        );
         assert!(MENU_ACTION_NAMES.contains(&"open_quickstart_guide"));
         assert!(MENU_ACTION_NAMES.contains(&"about"));
         for removed in ["report_compatibility", "open_mods_page", "open_faq"] {
@@ -2217,9 +2221,7 @@ impl GMainWindow {
 
     /// Upstream `GMainWindow::OnOpenQuickstartGuide`.
     fn on_open_quickstart_guide(&self) {
-        if let Err(error) =
-            gio::AppInfo::launch_default_for_uri(QUICKSTART_URL, gio::AppLaunchContext::NONE)
-        {
+        if let Err(error) = crate::gtk_compat::open_external_uri(QUICKSTART_URL) {
             log::error!("Failed to open quickstart guide: {error}");
             let detail = crate::i18n::tr_args(
                 "Unable to open the URL \"%1\".",

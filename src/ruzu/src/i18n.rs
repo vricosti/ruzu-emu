@@ -243,6 +243,43 @@ fn resolve_catalog_locale(locale: &str) -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
+fn replace_brand_outside_urls(
+    text: &str,
+    lower_from: &str,
+    lower_to: &str,
+    title_from: &str,
+    title_to: &str,
+) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.starts_with("https://") || remaining.starts_with("http://") {
+            let url_end = remaining
+                .char_indices()
+                .find_map(|(index, character)| {
+                    (index > 0
+                        && (character.is_whitespace()
+                            || matches!(character, '\'' | '"' | '<' | '>')))
+                    .then_some(index)
+                })
+                .unwrap_or(remaining.len());
+            output.push_str(&remaining[..url_end]);
+            remaining = &remaining[url_end..];
+        } else if let Some(rest) = remaining.strip_prefix(title_from) {
+            output.push_str(title_to);
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix(lower_from) {
+            output.push_str(lower_to);
+            remaining = rest;
+        } else {
+            let character = remaining.chars().next().unwrap();
+            output.push(character);
+            remaining = &remaining[character.len_utf8()..];
+        }
+    }
+    output
+}
+
 fn normalize_for_catalog(text: &str) -> (String, bool) {
     if catalog_source(text).is_some()
         || AVAILABLE_LANGUAGES
@@ -252,7 +289,7 @@ fn normalize_for_catalog(text: &str) -> (String, bool) {
         return (text.to_string(), false);
     }
 
-    let branded = text.replace("ruzu", "yuzu").replace("Ruzu", "Yuzu");
+    let branded = replace_brand_outside_urls(text, "ruzu", "yuzu", "Ruzu", "Yuzu");
     if catalog_source(&branded).is_some()
         || AVAILABLE_LANGUAGES
             .iter()
@@ -287,7 +324,7 @@ pub fn tr(text: &str) -> String {
     } else {
         translated.to_string()
     };
-    translated.replace("yuzu", "ruzu").replace("Yuzu", "Ruzu")
+    replace_brand_outside_urls(&translated, "yuzu", "ruzu", "Yuzu", "Ruzu")
 }
 
 /// Translate a Qt-style `%1`, `%2`, ... template and substitute its values.
@@ -395,10 +432,9 @@ mod tests {
         assert_eq!(tr("Add Game Directory"), "Ajouter un répertoire de jeux");
         assert_eq!(tr("Favorites"), "Favoris");
         let quickstart = tr(
-            "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.",
+            "Encryption keys are missing. <br>Please follow <a href='https://yuzu-mirror.github.io/help/quickstart/'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.",
         );
-        assert!(quickstart
-            .contains("https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md"));
+        assert!(quickstart.contains("https://yuzu-mirror.github.io/help/quickstart/"));
         assert!(quickstart.contains("guide de démarrage rapide ruzu"));
         assert_eq!(tr("_File"), "_Fichier");
         assert_eq!(tr("About ruzu"), "À propos de ruzu");
@@ -406,6 +442,20 @@ mod tests {
         assert_eq!(tr("Annuler"), "Abbrechen");
         set_language("en");
         assert_eq!(tr("Annuler"), "Cancel");
+    }
+
+    #[test]
+    fn brand_normalization_does_not_rewrite_urls() {
+        assert_eq!(
+            replace_brand_outside_urls(
+                "Yuzu: https://yuzu-mirror.github.io/help/quickstart/",
+                "yuzu",
+                "ruzu",
+                "Yuzu",
+                "Ruzu"
+            ),
+            "Ruzu: https://yuzu-mirror.github.io/help/quickstart/"
+        );
     }
 
     #[test]

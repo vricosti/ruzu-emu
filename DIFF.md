@@ -20128,3 +20128,54 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 ### Binary layout verification
 
 - PASS: menu callbacks are host-side frontend state only.
+
+## 2026-09-05 — `src/ruzu/src/about_dialog.rs` vs Eden `src/yuzu/about_dialog.{h,cpp}` and `src/yuzu/aboutdialog.ui`
+
+### Intentional differences
+
+- The Qt Designer form is represented directly by GTK widgets in the matching `about_dialog.rs`
+  owner. It preserves Eden's dedicated 700x385 dialog, 200px logo, two-column content, build
+  identity, wrapped description, external-link row, trademark notice, and OK response.
+- Ruzu-specific copy identifies the project as a yuzu-to-Rust port produced through AI agents.
+- At the user's request, Website, Source Code, Contributors, and License point to Ruzu's GitHub
+  repository; Eden's Discord, Stoat, and Twitter links are deliberately omitted.
+- The packaged Ruzu logo is always used instead of first looking up Eden's Qt theme icon.
+
+### Unintentional differences (to fix)
+
+- None in the requested About-dialog layout and link behavior.
+
+### Missing items
+
+- Eden appends its UTC build date and supports a custom idle-title format. Ruzu's generated
+  `common::scm_rev` metadata does not currently expose either value, so this dialog shows the same
+  build name, version, and compiler triplet used in Ruzu's main-window title.
+
+### Binary layout verification
+
+- PASS: this frontend-only widget change does not alter serialized or guest-visible data.
+
+## 2026-09-05 — `src/ruzu/src/{main_window.rs,gtk_compat.rs,i18n.rs}` vs Eden `src/yuzu/main_window.{h,cpp}` (`OpenURL`, `OnOpenQuickstartGuide`)
+
+### Intentional differences
+
+- Eden delegates every external URL to `QDesktopServices`. Ruzu preserves GIO on non-Windows
+  systems but uses native `ShellExecuteW` on Windows because the bundled GTK/GIO runtime does not
+  reliably provide an `https` URI launcher there.
+- The quickstart destination exactly matches Eden's yuzu mirror guide. About-dialog hyperlinks use
+  the same platform launcher.
+- Ruzu's context-free translation layer still changes visible yuzu branding to ruzu, but now skips
+  URI spans so the upstream `yuzu-mirror.github.io` host remains byte-for-byte intact.
+
+### Unintentional differences (to fix)
+
+- None in URL-launch success/failure handling: both implementations open the platform browser and
+  display an error dialog when the platform rejects the URL.
+
+### Missing items
+
+- None in this URL-launching slice.
+
+### Binary layout verification
+
+- PASS: URL launching is host-side frontend behavior only.

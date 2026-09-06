@@ -16,11 +16,26 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+mod linux_input;
+mod renderdoc;
+mod session;
+
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn cancelled() -> bool {
+    CANCELLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[derive(Parser)]
 #[command(about = "Launch a process and capture reproducible X11 reference images/video")]
 struct Cli {
     /// TOML capture configuration.
-    config: PathBuf,
+    config: Option<PathBuf>,
+
+    /// List Linux input devices without recording or injecting anything.
+    #[arg(long, conflicts_with = "config")]
+    list_input_devices: bool,
 
     /// Parse and validate the configuration without launching anything.
     #[arg(long)]
@@ -38,6 +53,10 @@ struct Config {
     capture: CaptureConfig,
     #[serde(default)]
     video: Option<VideoConfig>,
+    #[serde(default)]
+    session: Option<session::Config>,
+    #[serde(default)]
+    renderdoc: Option<renderdoc::Config>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,10 +295,18 @@ fn default_crf() -> u8 {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli
+    if cli.list_input_devices {
+        #[cfg(target_os = "linux")]
+        return linux_input::list_devices();
+        #[cfg(not(target_os = "linux"))]
+        bail!("raw input recording/replay currently requires Linux");
+    }
+    let config_arg = cli
         .config
+        .context("provide a TOML configuration or --list-input-devices")?;
+    let config_path = config_arg
         .canonicalize()
-        .with_context(|| format!("cannot resolve {}", cli.config.display()))?;
+        .with_context(|| format!("cannot resolve {}", config_arg.display()))?;
     let config_directory = config_path
         .parent()
         .context("configuration has no parent directory")?;
@@ -306,6 +333,9 @@ struct PreparedRun {
     window_timeout: Duration,
     video_times: Option<(Duration, Duration)>,
     stop_at: Option<Duration>,
+    session_duration: Duration,
+    renderdoc_end: Duration,
+    needs_x11: bool,
     display: String,
 }
 
@@ -334,9 +364,37 @@ impl PreparedRun {
             .input
             .as_ref()
             .is_some_and(|input| !input.events.is_empty());
+        if has_input_events && config.session.is_some() {
+            bail!("session and input.events are mutually exclusive; raw sessions preserve frontend settings");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if config.session.is_some() {
+            bail!("raw input sessions require Linux");
+        }
+        let session_duration = config
+            .session
+            .as_ref()
+            .map(session::Config::validate)
+            .transpose()?
+            .unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        if config.renderdoc.is_some() {
+            bail!("the RenderDoc preload bridge currently requires Linux");
+        }
+        let renderdoc_end = config
+            .renderdoc
+            .as_ref()
+            .map(renderdoc::Config::end)
+            .transpose()?
+            .unwrap_or_default();
+        let needs_x11 = has_input_events
+            || !config.capture.times.is_empty()
+            || config.video.as_ref().is_some_and(|video| video.enabled);
         if config.capture.times.is_empty()
             && !config.video.as_ref().is_some_and(|video| video.enabled)
             && !has_input_events
+            && config.session.is_none()
+            && config.renderdoc.is_none()
         {
             bail!("capture.times is empty, video is disabled, and no input events are configured");
         }
@@ -392,7 +450,9 @@ impl PreparedRun {
             .unwrap_or_default();
         let required_end = video_times
             .map_or(last_capture, |(_, end)| end.max(last_capture))
-            .max(last_input);
+            .max(last_input)
+            .max(session_duration);
+        let required_end = required_end.max(renderdoc_end);
         if stop_at.is_some_and(|stop| stop < required_end) {
             bail!("process.stop_at is earlier than the last capture/video event");
         }
@@ -402,8 +462,11 @@ impl PreparedRun {
             .environment
             .get("DISPLAY")
             .cloned()
-            .or_else(|| std::env::var("DISPLAY").ok())
-            .context("DISPLAY is not set; this harness currently requires X11/XWayland")?;
+            .or_else(|| std::env::var("DISPLAY").ok());
+        if needs_x11 && display.is_none() {
+            bail!("DISPLAY is required for X11 screenshots/video/logical input");
+        }
+        let display = display.unwrap_or_default();
 
         let prepared = Self {
             config,
@@ -414,10 +477,50 @@ impl PreparedRun {
             window_timeout,
             video_times,
             stop_at,
+            session_duration,
+            renderdoc_end,
+            needs_x11,
             display,
         };
+        prepared.validate_session_output_paths()?;
         prepared.validate_cleanup_targets()?;
         Ok(prepared)
+    }
+
+    fn validate_session_output_paths(&self) -> Result<()> {
+        let Some(session) = &self.config.session else {
+            return Ok(());
+        };
+        let directory = &self.config.capture.output_directory;
+        let mut outputs = vec![
+            directory.join("capture-manifest.json"),
+            directory.join("input-replay.json"),
+            directory.join("renderdoc-manifest.json"),
+        ];
+        if let Some(log) = &self.config.process.log_file {
+            outputs.push(log.clone());
+        }
+        if let Some(video) = self.config.video.as_ref().filter(|video| video.enabled) {
+            outputs.push(video_output_path(video, directory));
+        }
+        for (index, &at) in self.screenshot_times.iter().enumerate() {
+            outputs.push(screenshot_path(
+                directory,
+                &self.config.capture.screenshot_prefix,
+                index,
+                at,
+            ));
+        }
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        if outputs
+            .iter()
+            .any(|path| canonical(path) == canonical(&session.file))
+        {
+            bail!(
+                "session.file must differ from logs, screenshots, video and manifest output paths"
+            );
+        }
+        Ok(())
     }
 
     fn print_summary(&self) {
@@ -427,6 +530,14 @@ impl PreparedRun {
         println!("target: {:?}", self.config.capture.target);
         println!("screenshots: {}", self.screenshot_times.len());
         println!("input events: {}", self.input_events.len());
+        if let Some(session) = &self.config.session {
+            println!(
+                "raw input: {:?}; file: {}; duration: {:?}",
+                session.mode,
+                session.file.display(),
+                self.session_duration
+            );
+        }
         if let Some(input) = &self.input_config {
             println!(
                 "input frontend: {:?}; config: {}",
@@ -435,12 +546,19 @@ impl PreparedRun {
             );
         }
         println!("video: {}", self.video_times.is_some());
+        println!("RenderDoc: {}", self.config.renderdoc.is_some());
         println!("output: {}", self.config.capture.output_directory.display());
     }
 
     fn run(self) -> Result<()> {
-        require_command("xdotool")?;
-        require_command("import")?;
+        ctrlc::set_handler(|| CANCELLED.store(true, std::sync::atomic::Ordering::Release))
+            .context("cannot install cancellation handler")?;
+        if self.needs_x11 {
+            require_command("xdotool")?;
+        }
+        if !self.screenshot_times.is_empty() {
+            require_command("import")?;
+        }
         if self.video_times.is_some() {
             require_command("ffmpeg")?;
         }
@@ -448,7 +566,11 @@ impl PreparedRun {
         // ruzu-cmd run can leave its `A` key held; that same physical key is Reden's left-stick
         // left binding. Clear every key owned by the harness before changing frontend configs,
         // and release them again on every Rust-controlled exit path.
-        let _input_release_guard = InputReleaseGuard::install(&self.display)?;
+        let _input_release_guard = if self.input_events.is_empty() {
+            None
+        } else {
+            Some(InputReleaseGuard::install(&self.display)?)
+        };
         let cleanup = self.perform_cleanup()?;
         fs::create_dir_all(&self.config.capture.output_directory).with_context(|| {
             format!(
@@ -462,38 +584,102 @@ impl PreparedRun {
             .as_ref()
             .map(KeyboardConfigGuard::install)
             .transpose()?;
-        let mut target = spawn_target(&self.config.process)?;
+        #[cfg(target_os = "linux")]
+        let prepared_session = self
+            .config
+            .session
+            .as_ref()
+            .map(|config| {
+                linux_input::Prepared::new(
+                    config,
+                    &self
+                        .config
+                        .capture
+                        .output_directory
+                        .join("input-replay.json"),
+                )
+            })
+            .transpose()?;
+        #[cfg(target_os = "linux")]
+        let prepared_renderdoc = self
+            .config
+            .renderdoc
+            .as_ref()
+            .map(|config| {
+                renderdoc::Prepared::new(
+                    config,
+                    &self
+                        .config
+                        .capture
+                        .output_directory
+                        .join("renderdoc-manifest.json"),
+                )
+            })
+            .transpose()?;
+        let mut target = TargetGuard(
+            spawn_target(
+                &self.config.process,
+                #[cfg(target_os = "linux")]
+                prepared_renderdoc
+                    .as_ref()
+                    .zip(self.config.renderdoc.as_ref()),
+            )?,
+            Duration::from_millis(self.config.process.termination_grace_ms),
+        );
         // This is the sole timer origin: immediately after the OS accepted the
         // child process. All waits below use absolute offsets from this Instant.
         let origin = Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut session_worker = prepared_session
+            .map(|session| {
+                session.start(
+                    origin,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+            })
+            .transpose()?;
+        #[cfg(target_os = "linux")]
+        let mut renderdoc_worker = prepared_renderdoc
+            .map(|capture| capture.start(origin))
+            .transpose()?;
         let pid = target.id();
         println!("launched pid={pid}; monotonic timer started");
 
-        let (window_id, geometry) = match self.config.capture.target {
-            CaptureTarget::Window => match find_window(
-                pid,
-                &self.config.capture,
-                &self.display,
-                origin,
-                self.window_timeout,
-                &mut target,
-            ) {
-                Ok(found) => (Some(found.0), found.1),
-                Err(error) => {
-                    terminate_child(
-                        &mut target,
-                        Duration::from_millis(self.config.process.termination_grace_ms),
-                    );
-                    return Err(error);
-                }
-            },
-            CaptureTarget::Screen => (None, display_geometry(&self.display)?),
+        let (window_id, geometry) = if !self.needs_x11 {
+            (
+                None,
+                WindowGeometry {
+                    width: 0,
+                    height: 0,
+                },
+            )
+        } else {
+            match self.config.capture.target {
+                CaptureTarget::Window => match find_window(
+                    pid,
+                    &self.config.capture,
+                    &self.display,
+                    origin,
+                    self.window_timeout,
+                    &mut target,
+                ) {
+                    Ok(found) => (Some(found.0), found.1),
+                    Err(error) => {
+                        terminate_child(
+                            &mut target,
+                            Duration::from_millis(self.config.process.termination_grace_ms),
+                        );
+                        return Err(error);
+                    }
+                },
+                CaptureTarget::Screen => (None, display_geometry(&self.display)?),
+            }
         };
 
         // The pre-spawn cleanup resets XTEST globally, but the newly-created input frontend has
         // not observed those release events. Focus the emulation window and deliver a neutral
         // state before the first scheduled input.
-        if let Some(window_id) = window_id {
+        if let Some(window_id) = window_id.filter(|_| !self.input_events.is_empty()) {
             neutralize_window_input(window_id, &self.display)?;
         }
 
@@ -510,6 +696,9 @@ impl PreparedRun {
         for event in events {
             if target_exit.is_none() {
                 target_exit = wait_until(&mut target, origin, event.at)?;
+            }
+            if cancelled() {
+                break;
             }
             let actual = origin.elapsed();
             let mut record = ManifestEvent {
@@ -603,14 +792,44 @@ impl PreparedRun {
             stop_video(&mut child)?;
             let _ = child.wait();
         }
-        if target_exit.is_none() && self.config.process.terminate_after_timeline {
+        #[cfg(target_os = "linux")]
+        let session_result = session_worker
+            .as_mut()
+            .map(|worker| {
+                if target_exit.is_some() || cancelled() {
+                    worker.finish()
+                } else {
+                    worker.complete()
+                }
+            })
+            .transpose();
+        #[cfg(target_os = "linux")]
+        let renderdoc_result = renderdoc_worker
+            .as_mut()
+            .map(|worker| {
+                if target_exit.is_some() || cancelled() {
+                    worker.finish()
+                } else {
+                    worker.complete()
+                }
+            })
+            .transpose();
+        if target_exit.is_none() && (self.config.process.terminate_after_timeline || cancelled()) {
             terminate_child(
                 &mut target,
                 Duration::from_millis(self.config.process.termination_grace_ms),
             );
             target_exit = target.try_wait().context("cannot query target status")?;
         } else if target_exit.is_none() {
-            target_exit = Some(target.wait().context("cannot wait for target process")?);
+            while !cancelled() {
+                target_exit = target
+                    .try_wait()
+                    .context("cannot wait for target process")?;
+                if target_exit.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
         }
 
         let manifest = Manifest {
@@ -632,6 +851,10 @@ impl PreparedRun {
         fs::write(&manifest_path, manifest_json)
             .with_context(|| format!("cannot write {}", manifest_path.display()))?;
         println!("manifest: {}", manifest_path.display());
+        #[cfg(target_os = "linux")]
+        session_result?;
+        #[cfg(target_os = "linux")]
+        renderdoc_result?;
         Ok(())
     }
 
@@ -696,6 +919,22 @@ impl PreparedRun {
         if let Some(input) = &self.input_config {
             paths.push(input.path.clone());
         }
+        if let Some(session) = &self.config.session {
+            paths.push(session.file.clone());
+            if let Some(device) = &session.device {
+                paths.push(device.clone());
+            }
+        }
+        if let Some(renderdoc) = &self.config.renderdoc {
+            paths.extend([
+                renderdoc.library.clone(),
+                renderdoc.helper.clone(),
+                renderdoc.capture_prefix.clone(),
+            ]);
+            if let Some(path) = &renderdoc.vulkan_layer_manifest {
+                paths.push(path.clone());
+            }
+        }
         if let Some(home) = std::env::var_os("HOME") {
             paths.push(PathBuf::from(home));
         }
@@ -751,7 +990,9 @@ impl PreparedRun {
             .iter()
             .map(|event| event.at)
             .max()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .max(self.session_duration)
+            .max(self.renderdoc_end);
         events.push(Event {
             at: self.stop_at.unwrap_or(natural_end),
             priority: 5,
@@ -1176,6 +1417,20 @@ fn replace_ini_section(
 }
 
 fn resolve_paths(config: &mut Config, base: &Path) {
+    if let Some(renderdoc) = &mut config.renderdoc {
+        renderdoc.library = resolve_relative(&renderdoc.library, base);
+        renderdoc.helper = resolve_relative(&renderdoc.helper, base);
+        renderdoc.capture_prefix = resolve_relative(&renderdoc.capture_prefix, base);
+        if let Some(path) = &mut renderdoc.vulkan_layer_manifest {
+            *path = resolve_relative(path, base);
+        }
+    }
+    if let Some(session) = &mut config.session {
+        session.file = resolve_relative(&session.file, base);
+        if let Some(device) = &mut session.device {
+            *device = resolve_relative(device, base);
+        }
+    }
     config.process.executable = resolve_executable(&config.process.executable, base);
     config.process.rom_path = resolve_relative(&config.process.rom_path, base);
     if let Some(path) = config.process.working_directory.as_mut() {
@@ -1315,7 +1570,30 @@ fn target_arguments(config: &ProcessConfig) -> Vec<OsString> {
     arguments
 }
 
-fn spawn_target(config: &ProcessConfig) -> Result<Child> {
+/// A failed screenshot/window lookup must not leave a launched target behind.
+struct TargetGuard(Child, Duration);
+
+impl std::ops::Deref for TargetGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TargetGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+impl Drop for TargetGuard {
+    fn drop(&mut self) {
+        terminate_child(&mut self.0, self.1);
+    }
+}
+
+fn spawn_target(
+    config: &ProcessConfig,
+    #[cfg(target_os = "linux")] renderdoc: Option<(&renderdoc::Prepared, &renderdoc::Config)>,
+) -> Result<Child> {
     let mut command = Command::new(&config.executable);
     command.args(target_arguments(config));
     if let Some(directory) = &config.working_directory {
@@ -1325,6 +1603,10 @@ fn spawn_target(config: &ProcessConfig) -> Result<Child> {
         command.env_clear();
     }
     command.envs(&config.environment);
+    #[cfg(target_os = "linux")]
+    if let Some((prepared, renderdoc_config)) = renderdoc {
+        prepared.configure_command(&mut command, renderdoc_config, !config.clear_environment)?;
+    }
     command.stdin(Stdio::null());
     if let Some(log_path) = &config.log_file {
         if let Some(parent) = log_path.parent() {
@@ -1357,6 +1639,9 @@ fn find_window(
     }
     let deadline = origin + timeout;
     loop {
+        if cancelled() {
+            bail!("cancelled while waiting for target window");
+        }
         if let Some(status) = child.try_wait().context("cannot query target status")? {
             bail!("target exited with {status} before its X11 window appeared");
         }
@@ -1612,6 +1897,9 @@ fn stop_video(child: &mut Child) -> Result<()> {
 fn wait_until(child: &mut Child, origin: Instant, target: Duration) -> Result<Option<ExitStatus>> {
     let deadline = origin + target;
     loop {
+        if cancelled() {
+            return Ok(None);
+        }
         if let Some(status) = child.try_wait().context("cannot query target status")? {
             return Ok(Some(status));
         }
@@ -1740,6 +2028,32 @@ fn format_timecode_filename(value: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn raw_session_needs_no_x11_and_cannot_overwrite_its_own_recording() {
+        let mut config: Config = toml::from_str(include_str!("../input-session.toml")).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        config.process.rom_path = root.join("Cargo.toml");
+        let session_file =
+            std::env::temp_dir().join(format!("capture-session-test-{}.json", std::process::id()));
+        config.session.as_mut().unwrap().file = session_file.clone();
+        let mut prepared = PreparedRun::new(config, root.join("input-session.toml")).unwrap();
+        assert!(!prepared.needs_x11);
+        assert_eq!(
+            prepared.events().last().unwrap().at,
+            Duration::from_secs(300)
+        );
+        prepared.config.process.log_file = Some(session_file);
+        assert!(prepared.validate_session_output_paths().is_err());
+        prepared.config.process.log_file = None;
+        prepared.config.session.as_mut().unwrap().file = prepared
+            .config
+            .capture
+            .output_directory
+            .join("capture-manifest.json");
+        assert!(prepared.validate_session_output_paths().is_err());
+    }
 
     fn test_process_config(rom_path: PathBuf) -> ProcessConfig {
         ProcessConfig {

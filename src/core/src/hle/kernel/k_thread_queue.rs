@@ -24,7 +24,7 @@ pub struct KThreadQueue {
     // In upstream: KernelCore& m_kernel; KHardwareTimer* m_hardware_timer;
     pub hardware_timer: Option<Arc<KHardwareTimer>>,
     pub end_wait_allowed: bool,
-    pub notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+    pub notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, *const super::k_synchronization_object::SynchronizationObjectState, u32) -> bool>,
     pub cancel_wait_impl: Option<CancelWaitCallback>,
     pub pinned_wait_owner: Option<Weak<KThreadLock>>,
 }
@@ -41,7 +41,7 @@ impl KThreadQueue {
     }
 
     pub fn with_callbacks(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, *const super::k_synchronization_object::SynchronizationObjectState, u32) -> bool>,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         let cancel_wait_impl = cancel_wait_impl.map(|callback| {
@@ -59,7 +59,7 @@ impl KThreadQueue {
     /// This is the Rust equivalent of a C++ derived queue retaining pointers
     /// to its owning wait structure.
     pub fn with_cancel_wait_callback(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, *const super::k_synchronization_object::SynchronizationObjectState, u32) -> bool>,
         cancel_wait_impl: Option<CancelWaitCallback>,
     ) -> Self {
         Self {
@@ -72,7 +72,7 @@ impl KThreadQueue {
     }
 
     pub fn without_end_wait(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, *const super::k_synchronization_object::SynchronizationObjectState, u32) -> bool>,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         let mut queue = Self::with_callbacks(notify_available_impl, cancel_wait_impl);
@@ -81,7 +81,7 @@ impl KThreadQueue {
     }
 
     pub fn without_end_wait_callback(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, *const super::k_synchronization_object::SynchronizationObjectState, u32) -> bool>,
         cancel_wait_impl: Option<CancelWaitCallback>,
     ) -> Self {
         Self {
@@ -102,7 +102,7 @@ impl KThreadQueue {
     pub fn notify_available(
         &self,
         thread: &mut KThread,
-        signaled_object_id: u64,
+        signaled_object: *const super::k_synchronization_object::SynchronizationObjectState,
         wait_result: u32,
     ) -> bool {
         if thread.get_state() != super::k_thread::ThreadState::WAITING {
@@ -110,7 +110,7 @@ impl KThreadQueue {
         }
 
         if let Some(notify_impl) = self.notify_available_impl {
-            notify_impl(self, thread, signaled_object_id, wait_result)
+            notify_impl(self, thread, signaled_object, wait_result)
         } else {
             // Base KThreadQueue::NotifyAvailable is UNREACHABLE in upstream.
             // If we reach here, a queue was used without a notify_available impl.
@@ -227,7 +227,7 @@ impl KThreadQueueWithoutEndWait {
     }
 
     pub fn with_callbacks(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, *const super::k_synchronization_object::SynchronizationObjectState, u32) -> bool>,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {

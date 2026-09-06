@@ -680,9 +680,10 @@ pub struct KThread {
     pub context_guard_trace: parking_lot::Mutex<ContextGuardTrace>,
     pub thread_type: ThreadType,
     pub step_state: StepState,
-    pub dummy_thread_runnable: AtomicBool,
-    pub dummy_thread_mutex: Mutex<()>,
-    pub dummy_thread_cv: Condvar,
+    /// Upstream's dummy mutex, runnable predicate and condition variable.
+    /// A separate allocation lets the host block without borrowing KThread
+    /// while the signaling core mutates its kernel wait state.
+    pub(crate) dummy_thread_wait: Arc<(Mutex<bool>, Condvar)>,
 
     // Debugging fields
     pub wait_reason_for_debugging: ThreadWaitReasonForDebugging,
@@ -805,9 +806,7 @@ impl KThread {
             context_guard_trace: parking_lot::Mutex::new(ContextGuardTrace::default()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
-            dummy_thread_runnable: AtomicBool::new(true),
-            dummy_thread_mutex: Mutex::new(()),
-            dummy_thread_cv: Condvar::new(),
+            dummy_thread_wait: Arc::new((Mutex::new(true), Condvar::new())),
             wait_reason_for_debugging: ThreadWaitReasonForDebugging::default(),
             argument: 0,
             stack_top: KProcessAddress::default(),
@@ -2277,16 +2276,31 @@ impl KThread {
                 .global_scheduler_context
                 .as_ref()
                 .map(Arc::downgrade)
+        }).or_else(|| {
+            // A host dummy does not need a process or a per-core scheduler,
+            // but its WAITING/RUNNABLE transitions still belong to the kernel's
+            // global scheduler (upstream KThread always has KernelCore access).
+            super::kernel::get_kernel_ref()
+                .and_then(|kernel| kernel.global_scheduler_context())
+                .map(Arc::downgrade)
         });
-        self.scheduler_lock_ptr = self
-            .global_scheduler_context
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .map(|gsc| {
-                let guard = gsc.lock().unwrap();
-                std::ptr::addr_of!(guard.m_scheduler_lock) as usize
-            })
-            .unwrap_or(0);
+        // Upstream obtains the scheduler lock directly from KernelCore. A
+        // parentless host identity can be created inside a scheduler callback
+        // which already holds the GSC mutex; do not reacquire it here.
+        self.scheduler_lock_ptr = if owner.is_none() {
+            super::kernel::scheduler_lock()
+                .map(|lock| lock as *const _ as usize)
+                .unwrap_or(0)
+        } else {
+            self.global_scheduler_context
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map(|gsc| {
+                    let guard = gsc.lock().unwrap();
+                    std::ptr::addr_of!(guard.m_scheduler_lock) as usize
+                })
+                .unwrap_or(0)
+        };
         self.process_schedule_count =
             owner.map(|process| Arc::clone(&process.lock().unwrap().schedule_count));
         self.core_id = core;
@@ -3264,12 +3278,12 @@ impl KThread {
     /// Mirrors upstream `KThread::NotifyAvailable`. Delegates to the thread's
     /// wait_queue `NotifyAvailable` under scheduler lock. Only touches `self`
     /// and its `sync_wait_context` — never the process.
-    pub fn notify_available(&mut self, signaled_object_id: u64, result: u32) -> bool {
+    pub fn notify_available(&mut self, signaled_object: *const SynchronizationObjectState, result: u32) -> bool {
         let _scheduler_lock = self.lock_scheduler();
         let Some(wait_queue) = self.wait_queue.clone() else {
             return false;
         };
-        wait_queue.notify_available(self, signaled_object_id, result)
+        wait_queue.notify_available(self, signaled_object, result)
     }
 
     /// End wait with a result.
@@ -3923,34 +3937,35 @@ impl KThread {
     /// Request that this dummy thread block on next DummyThreadBeginWait.
     /// Port of upstream `KThread::RequestDummyThreadWait`.
     pub fn request_dummy_thread_wait(&self) {
-        let _guard = self.dummy_thread_mutex.lock().unwrap();
-        self.dummy_thread_runnable.store(false, Ordering::Relaxed);
+        *self.dummy_thread_wait.0.lock().unwrap() = false;
     }
 
     /// Block the dummy thread until DummyThreadEndWait is called.
     /// Port of upstream `KThread::DummyThreadBeginWait`.
-    pub fn dummy_thread_begin_wait(&self) {
-        if !self.is_dummy_thread() {
+    pub fn dummy_thread_begin_wait(thread: &Arc<KThreadLock>) {
+        if super::kernel::get_kernel_ref()
+            .is_some_and(|kernel| kernel.is_phantom_mode_for_single_core())
+        {
             return;
         }
-        // Block until dummy_thread_runnable becomes true.
-        let guard = self.dummy_thread_mutex.lock().unwrap();
-        let _guard = self
-            .dummy_thread_cv
-            .wait_while(guard, |_| {
-                !self.dummy_thread_runnable.load(Ordering::Relaxed)
-            })
-            .unwrap();
+        let wait = {
+            let thread = thread.lock().unwrap();
+            if !thread.is_dummy_thread() {
+                return;
+            }
+            Arc::clone(&thread.dummy_thread_wait)
+        };
+        // Do not retain a KThread reference across this host suspension.
+        // Only the predicate mutex is held, and Condvar releases it to sleep.
+        let guard = wait.0.lock().unwrap();
+        let _guard = wait.1.wait_while(guard, |runnable| !*runnable).unwrap();
     }
 
     /// Wake the dummy thread from DummyThreadBeginWait.
     /// Port of upstream `KThread::DummyThreadEndWait`.
     pub fn dummy_thread_end_wait(&self) {
-        {
-            let _guard = self.dummy_thread_mutex.lock().unwrap();
-            self.dummy_thread_runnable.store(true, Ordering::Relaxed);
-        }
-        self.dummy_thread_cv.notify_one();
+        *self.dummy_thread_wait.0.lock().unwrap() = true;
+        self.dummy_thread_wait.1.notify_one();
     }
 
     /// Set condition variable state.

@@ -133,7 +133,8 @@ pub struct Alarms {
     inner: Mutex<AlarmsInner>,
     /// Kernel event signaled when the closest alarm changes.
     /// Corresponds to `Kernel::KEvent* m_event` in upstream.
-    event: Arc<Event>,
+    event: u32,
+    ctx: crate::hle::service::kernel_helpers::ServiceContext,
 }
 
 struct AlarmsInner {
@@ -155,6 +156,8 @@ impl Alarms {
     ///
     /// `get_raw_time` provides the steady clock's raw time in nanoseconds.
     pub fn new(get_raw_time: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        let mut ctx = crate::hle::service::kernel_helpers::ServiceContext::new("Psc:Alarms".into());
+        let event = ctx.create_event("Psc:Alarms:Event".into());
         Self {
             inner: Mutex::new(AlarmsInner {
                 entries: Vec::new(),
@@ -162,7 +165,8 @@ impl Alarms {
                 steady_clock_initialized: false,
                 get_raw_time,
             }),
-            event: Arc::new(Event::new()),
+            event,
+            ctx,
         }
     }
 
@@ -218,7 +222,7 @@ impl Alarms {
         alarm.linked = true;
 
         // Signal the closest-alarm-updated event
-        self.event.signal();
+        self.get_event().signal();
 
         RESULT_SUCCESS
     }
@@ -241,7 +245,7 @@ impl Alarms {
         // m_closest_alarm pointer and signals the event if any alarms remain.
         // We signal the event unconditionally (matching upstream behavior
         // when the list is non-empty; when empty, the signal is harmless).
-        self.event.signal();
+        self.get_event().signal();
     }
 
     /// Check all alarms against the current steady clock time and signal
@@ -284,7 +288,7 @@ impl Alarms {
 
         // Upstream calls UpdateClosestAndSignal, which updates
         // m_closest_alarm and signals the event if alarms remain.
-        self.event.signal();
+        self.get_event().signal();
     }
 
     /// Get the closest (soonest) alarm.
@@ -305,7 +309,7 @@ impl Alarms {
     }
 
     pub fn get_event(&self) -> Arc<Event> {
-        Arc::clone(&self.event)
+        self.ctx.get_event(self.event).expect("closest alarm event must exist")
     }
 }
 

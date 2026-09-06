@@ -26,16 +26,20 @@ pub struct StandardUserSystemClockCore {
     initialized: bool,
     /// Kernel event signaled when automatic correction changes.
     /// Corresponds to `Kernel::KEvent* m_event` in upstream.
-    event: Arc<Event>,
+    event: u32,
+    ctx: crate::hle::service::kernel_helpers::ServiceContext,
 }
 
 impl StandardUserSystemClockCore {
     pub fn new() -> Self {
+        let mut ctx = crate::hle::service::kernel_helpers::ServiceContext::new("Psc:StandardUserSystemClockCore".into());
+        let event = ctx.create_event("Psc:StandardUserSystemClockCore:Event".into());
         Self {
             automatic_correction: false,
             time_point: SteadyClockTimePoint::default(),
             initialized: false,
-            event: Arc::new(Event::new()),
+            event,
+            ctx,
         }
     }
 
@@ -52,7 +56,7 @@ impl StandardUserSystemClockCore {
     }
 
     pub fn get_event(&self) -> Arc<Event> {
-        Arc::clone(&self.event)
+        self.ctx.get_event(self.event).expect("automatic correction event must exist")
     }
 
     /// Set automatic correction mode.
@@ -124,6 +128,6 @@ impl StandardUserSystemClockCore {
 
     pub fn set_time_point_and_signal(&mut self, time_point: &SteadyClockTimePoint) {
         self.time_point = *time_point;
-        self.event.signal();
+        self.get_event().signal();
     }
 }

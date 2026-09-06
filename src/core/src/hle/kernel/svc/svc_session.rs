@@ -186,17 +186,15 @@ pub fn accept_session(system: &System, out: &mut Handle, port_handle: Handle) ->
         None => return RESULT_INVALID_HANDLE,
     };
 
-    let mut port_guard = port.lock().unwrap();
-    let server_session_object_id = if port_guard.is_light() {
-        port_guard.server.accept_light_session()
+    let is_light = port.lock().unwrap().is_light();
+    let server_session_object_id = if is_light {
+        crate::hle::kernel::k_server_port::KServerPort::accept_light_session_arc(&port)
     } else {
-        port_guard.server.accept_session()
+        crate::hle::kernel::k_server_port::KServerPort::accept_session_arc(&port)
     };
     let Some(server_session_object_id) = server_session_object_id else {
         return RESULT_NOT_FOUND;
     };
-    drop(port_guard);
-
     let handle = match process.handle_table.add(server_session_object_id) {
         Ok(h) => h,
         Err(_) => return RESULT_OUT_OF_HANDLES,

@@ -20,6 +20,7 @@ use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::engines::maxwell_dma::dma;
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
+use crate::guest_memory::{GpuGuestMemory, GpuMemoryManagerHandle, GuestMemoryFlags};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerDownloadArea;
 use crate::surface;
@@ -161,11 +162,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
-        self.swizzle_data_buffer
-            .resize_destructive(guest_size_bytes);
-        gpu_memory
-            .lock()
-            .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
+        let memory_manager = GpuMemoryManagerHandle::new(gpu_memory);
+        let swizzle_data = GpuGuestMemory::<u8>::new_with_backup(
+            &memory_manager,
+            gpu_addr,
+            guest_size_bytes,
+            GuestMemoryFlags::UNSAFE_READ,
+            &mut self.swizzle_data_buffer,
+        );
+        // SAFETY: the accessor owns the fallback borrow and retains the channel
+        // memory owner for the synchronous unswizzle, like upstream's local
+        // GpuGuestMemory. No guest span escapes into backend upload work.
+        let input = unsafe { swizzle_data.as_slice() };
 
         let copies = if flags.contains(ImageFlagBits::CONVERTED) {
             self.unswizzle_data_buffer
@@ -174,7 +182,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 &(),
                 gpu_addr,
                 &info,
-                &self.swizzle_data_buffer,
+                input,
                 &mut self.unswizzle_data_buffer,
             );
             convert_image(
@@ -189,10 +197,11 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 &(),
                 gpu_addr,
                 &info,
-                &self.swizzle_data_buffer,
+                input,
                 P::staging_mapped_span(staging),
             )
         };
+        drop(swizzle_data);
         P::upload_image(self, image_id, staging, &copies);
     }
 
@@ -221,21 +230,27 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::QueueAsyncDecode requires bound channel GPU memory");
-        self.swizzle_data_buffer
-            .resize_destructive(guest_size_bytes);
-        gpu_memory
-            .lock()
-            .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
+        let memory_manager = GpuMemoryManagerHandle::new(gpu_memory);
+        let swizzle_data = GpuGuestMemory::<u8>::new_with_backup(
+            &memory_manager,
+            gpu_addr,
+            guest_size_bytes,
+            GuestMemoryFlags::UNSAFE_READ,
+            &mut self.swizzle_data_buffer,
+        );
         let mut local_unswizzle_data_buffer = vec![0; unswizzled_size_bytes];
         let mut copies: SmallVec<[BufferImageCopy; 16]> = unswizzle_image(
             &(),
             gpu_addr,
             &info,
-            &self.swizzle_data_buffer,
+            // SAFETY: consumed synchronously while the accessor and its memory
+            // owner live. The worker below receives only the owned linear copy.
+            unsafe { swizzle_data.as_slice() },
             &mut local_unswizzle_data_buffer,
         )
         .into_iter()
         .collect();
+        drop(swizzle_data);
         let out_size = map_size_bytes(&self.slot_images[image_id]) as usize;
         self.texture_decode_worker.queue_stateless_work(move || {
             let mut decoded_data = common::scratch_buffer::ScratchBuffer::<u8>::new();
@@ -7439,6 +7454,81 @@ mod tests {
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
         assert_eq!(cache.slot_images[image_id].modification_tick, 1);
+    }
+
+    #[test]
+    fn upload_image_contents_borrows_contiguous_memory_and_copies_fragmented_ranges() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::textures::decoders::swizzle_texture;
+
+        for fragmented in [false, true] {
+            let mut backing = vec![0u8; 0x3000];
+            let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+            device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+            device_memory.smmu_map_with_cpu_backing(
+                0x9000_0000,
+                backing.as_ptr(),
+                0x4000_0000,
+                backing.len(),
+                3,
+                true,
+            );
+            device_memory.set_flush_region(Box::new(|_, _| {
+                panic!("UnsafeRead must not flush guest caches");
+            }));
+            let mut memory = MemoryManager::new_with_geometry_and_device_memory(
+                17,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            );
+            let second_page = if fragmented { 0x2000 } else { 0x1000 };
+            memory.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+            memory.map(0x21000, 0x9000_0000 + second_page, 0x1000, 0, false);
+            assert_eq!(memory.get_span(0x20000, 0x2000).is_null(), fragmented);
+
+            let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(device_memory);
+            cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(memory)));
+            let image_id = cache.insert_typed_image(ImageBase::new(
+                ImageInfo {
+                    format: surface::PixelFormat::A8B8G8R8Unorm,
+                    image_type: ImageType::E2D,
+                    resources: SubresourceExtent { levels: 1, layers: 1 },
+                    size: Extent3D { width: 64, height: 32, depth: 1 },
+                    ..ImageInfo::default()
+                },
+                0x20000,
+                0x9000_0000,
+            ));
+            assert_eq!(cache.slot_images[image_id].guest_size_bytes, 0x2000);
+            let mut staging = vec![0u8; map_size_bytes(&cache.slot_images[image_id]) as usize];
+
+            // A pre-existing scratch allocation must remain untouched on the
+            // direct-span path, including when guest data changes between uploads.
+            cache.swizzle_data_buffer.resize_destructive(16);
+            cache.swizzle_data_buffer.fill(0xa5);
+            for seed in [7usize, 29] {
+                let linear: Vec<u8> = (0..0x2000usize)
+                    .map(|index| (index.wrapping_mul(seed) ^ (index >> 8)) as u8)
+                    .collect();
+                let mut tiled = vec![0u8; 0x2000];
+                swizzle_texture(&mut tiled, &linear, 4, 64, 32, 1, 0, 0, 0);
+                backing[..0x1000].copy_from_slice(&tiled[..0x1000]);
+                let second_page = second_page as usize;
+                backing[second_page..second_page + 0x1000].copy_from_slice(&tiled[0x1000..]);
+
+                cache.upload_image_contents(image_id, &mut staging);
+
+                assert_eq!(&staging[..linear.len()], linear.as_slice());
+                if fragmented {
+                    assert_eq!(cache.swizzle_data_buffer.data(), tiled.as_slice());
+                } else {
+                    assert_eq!(cache.swizzle_data_buffer.data(), &[0xa5; 16]);
+                }
+            }
+        }
     }
 
     #[test]

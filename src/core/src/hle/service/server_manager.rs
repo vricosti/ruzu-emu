@@ -18,7 +18,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+#[cfg(test)]
+use std::time::Duration;
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_event::KEvent;
@@ -628,11 +630,15 @@ impl ServerManager {
                 Arc::downgrade(&self.pending_session_closures),
                 Arc::downgrade(&self.wakeup_event),
             );
-        session
+        session.server_session.lock().unwrap().manager_registration_queued = true;
+        #[cfg(test)]
+        if self.system.is_null() {
+            session
             .server_session
             .lock()
             .unwrap()
             .set_manager_wakeup(Arc::downgrade(&self.wakeup_event));
+        }
         self.link_to_deferred_list_holder(&mut session.holder);
         self.sessions.push(session);
         RESULT_SUCCESS
@@ -1016,7 +1022,7 @@ impl ServerManager {
         let _selection_guard = selection_mutex.lock().unwrap();
 
         loop {
-            let (multi_wait, kernel, wakeup_event) = {
+            let (multi_wait, kernel) = {
                 let mut owner = manager.lock().unwrap();
 
                 if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_LOOP").is_some() {
@@ -1050,7 +1056,6 @@ impl ServerManager {
                 (
                     &owner.multi_wait as *const MultiWait,
                     kernel,
-                    Arc::clone(&owner.wakeup_event),
                 )
             };
 
@@ -1060,13 +1065,19 @@ impl ServerManager {
             let selected = if let Some(kernel) = kernel {
                 unsafe { (&*multi_wait).wait_any(&*kernel) }
             } else {
-                let selected = unsafe { (&*multi_wait).try_wait_any_local() };
-                if selected.is_some() {
-                    selected
-                } else {
-                    wakeup_event.wait_timeout(Duration::from_millis(100));
-                    continue;
+                #[cfg(test)]
+                {
+                    let selected = unsafe { (&*multi_wait).try_wait_any_local() };
+                    if selected.is_some() {
+                        selected
+                    } else {
+                        let wakeup_event = Arc::clone(&manager.lock().unwrap().wakeup_event);
+                        wakeup_event.wait();
+                        continue;
+                    }
                 }
+                #[cfg(not(test))]
+                { panic!("ServerManager requires a live System") }
             };
             let Some(selected) = selected else {
                 continue;
@@ -1620,8 +1631,9 @@ impl ServerManager {
         }
 
         let server_session_object_id = {
-            let mut port_guard = self.ports[port_index].port.lock().unwrap();
-            let Some(server_session_object_id) = port_guard.server.accept_session() else {
+            let Some(server_session_object_id) = crate::hle::kernel::k_server_port::KServerPort::accept_session_arc(
+                &self.ports[port_index].port,
+            ) else {
                 let holder_ptr = self.ports[port_index].holder_ptr() as *mut MultiWaitHolder;
                 self.link_holder_ptr_to_deferred_list(holder_ptr);
                 return;

@@ -34,54 +34,6 @@ where
     fp != 0 && (fp % 4 == 0) && is_valid_range(fp, record_size)
 }
 
-fn is_mapped_process_range(
-    process: &crate::hle::kernel::k_process::KProcess,
-    base: u64,
-    size: u64,
-) -> bool {
-    if size == 0 {
-        return false;
-    }
-
-    let start = match usize::try_from(base) {
-        Ok(start) => start,
-        Err(_) => return false,
-    };
-
-    let info = match process.page_table.query_info(start) {
-        Some(info) => info,
-        None => return false,
-    };
-
-    range_fits_memory_info(base, size, &info)
-}
-
-fn range_fits_memory_info(
-    base: u64,
-    size: u64,
-    info: &crate::hle::kernel::k_memory_block::KMemoryInfo,
-) -> bool {
-    let start = match usize::try_from(base) {
-        Ok(start) => start,
-        Err(_) => return false,
-    };
-    let end = match start.checked_add(size as usize) {
-        Some(end) => end,
-        None => return false,
-    };
-
-    if start < info.get_address() || end > info.get_end_address() {
-        return false;
-    }
-
-    if (info.get_state() & KMemoryState::MASK).bits() == 0 {
-        return false;
-    }
-
-    let permission = info.get_permission();
-    permission != KMemoryPermission::NONE && !permission.contains(KMemoryPermission::NOT_MAPPED)
-}
-
 /// Get the name of a thread from its nnsdk thread type structure.
 ///
 /// Corresponds to upstream `Core::GetThreadName` (debug.cpp).
@@ -94,8 +46,8 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
     if tls_addr == 0 {
         return None;
     }
-    let memory = process.get_shared_memory();
-    let mem = memory.read().unwrap();
+    let memory = process.get_memory()?;
+    let mem = memory.lock().unwrap();
 
     // Upstream: reads thread type pointer from TLS+0x1F8 (64-bit) or TLS+0x1FC (32-bit)
     // then reads version and name pointer from the thread type struct.
@@ -336,8 +288,8 @@ pub fn get_backtrace_from_context(
     ctx: &ThreadContext,
 ) -> Vec<BacktraceEntry> {
     let is_64bit = process.is_64bit();
-    let memory = process.get_shared_memory();
-    let mem = memory.read().unwrap();
+    let memory = process.get_memory();
+    let mem = memory.as_ref().map(|memory| memory.lock().unwrap());
 
     let mut entries = Vec::new();
     let pc = ctx.pc;
@@ -364,41 +316,39 @@ pub fn get_backtrace_from_context(
             name: String::new(),
         });
 
+        let Some(mem) = mem.as_ref() else {
+            break;
+        };
         if is_64bit {
             if !can_walk_frame_record(fp, 16, |base, size| {
-                is_mapped_process_range(process, base, size)
+                base.checked_add(size).is_some() && mem.is_valid_virtual_address_range(base, size)
             }) {
                 break;
             }
-            let new_fp = mem.read_64(fp);
             lr = mem.read_64(fp + 8);
-            fp = new_fp;
+            fp = mem.read_64(fp);
         } else {
             if !can_walk_frame_record(fp, 8, |base, size| {
-                is_mapped_process_range(process, base, size)
+                base.checked_add(size).is_some() && mem.is_valid_virtual_address_range(base, size)
             }) {
                 break;
             }
-            let new_fp = mem.read_32(fp) as u64;
             lr = mem.read_32(fp + 4) as u64;
-            fp = new_fp;
+            fp = mem.read_32(fp) as u64;
         }
     }
 
-    // Symbolicate.
+    // Module discovery reads the same process memory; release its non-reentrant lock.
+    drop(mem);
     symbolicate_backtrace(process, &mut entries, is_64bit);
     entries
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        can_walk_frame_record, find_main_module_entrypoint, find_modules, get_module_end,
-        range_fits_memory_info,
-    };
+    use super::{can_walk_frame_record, find_main_module_entrypoint, find_modules, get_module_end};
     use crate::hle::kernel::k_memory_block::{
-        KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryInfo, KMemoryPermission,
-        KMemoryState,
+        KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryPermission, KMemoryState,
     };
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_typed_address::KProcessAddress;
@@ -418,37 +368,114 @@ mod tests {
             && size == 8));
     }
 
-    fn mapped_info(address: usize, size: usize, permission: KMemoryPermission) -> KMemoryInfo {
-        KMemoryInfo {
-            m_address: address,
-            m_size: size,
-            m_state: KMemoryState::NORMAL,
-            m_device_disable_merge_left_count: 0,
-            m_device_disable_merge_right_count: 0,
-            m_ipc_lock_count: 0,
-            m_device_use_count: 0,
-            m_ipc_disable_merge_count: 0,
-            m_permission: permission,
-            m_attribute: KMemoryAttribute::NONE,
-            m_original_permission: permission,
-            m_disable_merge_attribute: KMemoryBlockDisableMergeAttribute::NONE,
+    #[test]
+    fn backtrace_reads_live_process_pages_in_both_execution_modes() {
+        use crate::core::SystemRef;
+        use crate::device_memory::{dram_memory_map, DeviceMemory};
+        use crate::memory::memory::Memory;
+        use common::host_memory::MemoryPermission;
+        use common::page_table::PageTable;
+        use std::sync::{Arc, Mutex};
+
+        // Keep the backing allocations stable and alive until Memory is dropped.
+        let device = Box::new(DeviceMemory::with_size(0x20_000));
+        let mut pages = Box::new(PageTable::new());
+        pages.resize(32, 12);
+        let mut memory = unsafe { Memory::new(SystemRef::null(), &*device, &device.buffer) };
+        memory.set_current_page_table(&mut *pages, false);
+        memory.map_memory_region(
+            &mut pages,
+            0x4000,
+            0x2000,
+            dram_memory_map::BASE + 0x2000,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+        let mut process = KProcess::new();
+        process
+            .page_table
+            .configure_address_space(KProcessAddress::new(0), 0x1_0000_0000, 32);
+        process.memory = Some(Arc::new(Mutex::new(memory)));
+
+        for is_64bit in [false, true] {
+            process.flags = u32::from(is_64bit);
+            let memory = process.get_memory().unwrap();
+            let mem = memory.lock().unwrap();
+            // The first frame straddles two live pages; the legacy shadow stays zero.
+            if is_64bit {
+                mem.write_64(0x4ffc, 0x5040);
+                mem.write_64(0x5004, 0x1234_5678_9abc_def0);
+                mem.write_64(0x5040, 0);
+                mem.write_64(0x5048, 0x2345_6789_abcd_ef00);
+            } else {
+                mem.write_32(0x4ffc, 0x5040);
+                mem.write_32(0x5000, 0x9abc_def0);
+                mem.write_32(0x5040, 0);
+                mem.write_32(0x5044, 0xabcd_ef00);
+            }
+            drop(mem);
+            assert_eq!(
+                process.get_shared_memory().read().unwrap().read_64(0x4ffc),
+                0
+            );
+            let mut context = crate::arm::arm_interface::ThreadContext {
+                pc: 0x1000,
+                lr: 0x2000,
+                fp: 0x4ffc,
+                ..Default::default()
+            };
+            let entries = super::get_backtrace_from_context(&process, &context);
+            let expected = if is_64bit {
+                [0x1000, 0x2000, 0x1234_5678_9abc_def0, 0x2345_6789_abcd_ef00]
+            } else {
+                [0x1000, 0x2000, 0x9abc_def0, 0xabcd_ef00]
+            };
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.original_address)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+
+            for invalid_fp in [0, 3, 0x6000, u64::MAX - 3] {
+                context.fp = invalid_fp;
+                assert_eq!(
+                    super::get_backtrace_from_context(&process, &context).len(),
+                    2
+                );
+            }
         }
-    }
 
-    #[test]
-    fn range_fits_memory_info_requires_backed_readable_region() {
-        let info = mapped_info(0x2000, 0x1000, KMemoryPermission::USER_READ_WRITE);
-
-        assert!(range_fits_memory_info(0x2000, 8, &info));
-        assert!(!range_fits_memory_info(0x1FFC, 8, &info));
-        assert!(!range_fits_memory_info(0x3000, 8, &info));
-    }
-
-    #[test]
-    fn range_fits_memory_info_rejects_unmapped_permissions() {
-        let info = mapped_info(0x2000, 0x1000, KMemoryPermission::NOT_MAPPED);
-
-        assert!(!range_fits_memory_info(0x2000, 8, &info));
+        let process = Arc::new(crate::hle::kernel::k_process::ProcessLock::new(process));
+        let mut thread = crate::hle::kernel::k_thread::KThread::new();
+        thread.parent = Some(Arc::downgrade(&process));
+        thread.tls_address = KProcessAddress::new(0x4000);
+        thread.argument = 0x4400;
+        for is_64bit in [false, true] {
+            for version in [1, 2] {
+                let mut owner = process.lock().unwrap();
+                owner.flags = u32::from(is_64bit);
+                let memory = owner.get_memory().unwrap();
+                let mem = memory.lock().unwrap();
+                assert!(mem.write_block(0x4800, b"worker\0"));
+                if is_64bit {
+                    mem.write_64(0x41f8, 0x4400);
+                    mem.write_16(0x4446, version);
+                    mem.write_64(0x4400 + if version == 1 { 0x1a0 } else { 0x1a8 }, 0x4800);
+                } else {
+                    mem.write_32(0x41fc, 0x4400);
+                    mem.write_16(0x4426, version);
+                    mem.write_32(0x4400 + if version == 1 { 0xe4 } else { 0xe8 }, 0x4800);
+                }
+                drop(mem);
+                drop(owner);
+                assert_eq!(super::get_thread_name(&thread).as_deref(), Some("worker"));
+                thread.argument = 0x4500;
+                assert_eq!(super::get_thread_name(&thread), None);
+                thread.argument = 0x4400;
+            }
+        }
     }
 
     fn module_process() -> KProcess {

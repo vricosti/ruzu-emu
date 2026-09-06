@@ -34,13 +34,13 @@ use super::metal_buffer_cache::{
 };
 use super::metal_device::MetalDevice;
 use super::metal_pipeline_cache::MetalGraphicsShaderStages;
-use super::metal_shader::{
-    MetalResourceBinding, MetalResourceKind, MetalShaderBindingLayout, MetalShaderModule,
-};
+use super::metal_shader::{MetalResourceBinding, MetalResourceKind, MetalShaderBindingLayout};
 use super::metal_texture_cache::MetalTextureCache;
 
 #[derive(Debug, Error)]
 pub enum MetalGraphicsPipelineError {
+    #[error(transparent)]
+    Descriptor(#[from] super::metal_update_descriptor::MetalDescriptorError),
     #[error("graphics descriptor references disabled constant buffer stage={stage} index={index}")]
     DisabledConstantBuffer { stage: usize, index: u32 },
     #[error("graphics image view {0} was not materialized")]
@@ -91,11 +91,13 @@ pub struct MetalPreparedStage {
     pub buffers: Vec<MetalStageBufferBinding>,
     pub textures: Vec<MetalStageTextureBinding>,
     pub samplers: Vec<MetalStageSamplerBinding>,
+    pub samplers_in_argument_buffer: bool,
     pub push_constants: Option<(u32, [u8; 32])>,
 }
 
 pub struct MetalPreparedGraphics {
     pub vertex: MetalPreparedStage,
+    pub geometry: MetalPreparedStage,
     pub fragment: MetalPreparedStage,
     pub vertex_buffers: Vec<Option<MetalVertexBinding>>,
     pub index_buffer: Option<MetalIndexBinding>,
@@ -341,7 +343,7 @@ pub fn configure_graphics_resources(
         device,
         0,
         stages.stage_infos(),
-        stages.vertex(),
+        stages.vertex_bindings(),
         texture_cache,
         &graphics_buffers,
         &null_buffer,
@@ -351,7 +353,7 @@ pub fn configure_graphics_resources(
         &mut rescaling,
         &mut descriptor_binding,
     )?;
-    for stage in 1..4 {
+    for stage in 1..3 {
         advance_empty_native_stage(
             stage,
             &stages.stage_infos()[stage],
@@ -360,12 +362,37 @@ pub fn configure_graphics_resources(
             &mut descriptor_binding,
         );
     }
+    let geometry = if let Some(geometry) = stages.geometry() {
+        prepare_stage(
+            device,
+            3,
+            stages.stage_infos(),
+            geometry.shader.bindings(),
+            texture_cache,
+            &graphics_buffers,
+            &null_buffer,
+            &views,
+            &sampler_ids,
+            &mut cursors,
+            &mut rescaling,
+            &mut descriptor_binding,
+        )?
+    } else {
+        advance_empty_native_stage(
+            3,
+            &stages.stage_infos()[3],
+            &mut cursors,
+            &mut rescaling,
+            &mut descriptor_binding,
+        );
+        MetalPreparedStage::default()
+    };
     let fragment = if let Some(module) = stages.fragment() {
         prepare_stage(
             device,
             4,
             stages.stage_infos(),
-            module,
+            module.bindings(),
             texture_cache,
             &graphics_buffers,
             &null_buffer,
@@ -381,6 +408,7 @@ pub fn configure_graphics_resources(
 
     Ok(MetalPreparedGraphics {
         vertex,
+        geometry,
         fragment,
         vertex_buffers,
         index_buffer,
@@ -477,7 +505,7 @@ fn prepare_stage(
     device: &MetalDevice,
     stage: usize,
     stage_infos: &[ShaderInfo; 5],
-    module: &MetalShaderModule,
+    layout: &MetalShaderBindingLayout,
     texture_cache: &mut MetalTextureCache,
     graphics_buffers: &super::metal_buffer_cache::MetalGraphicsBufferBindings,
     null_buffer: &Arc<MetalBuffer>,
@@ -662,8 +690,16 @@ fn prepare_stage(
 
     *descriptor_binding = binding;
 
-    let mut prepared = bind_reflected_layout(module.bindings(), declarations)?;
-    if let Some(index) = module.bindings().push_constant_buffer_index {
+    let mut prepared = bind_reflected_layout(layout, declarations)?;
+    if let Some(arguments) = super::metal_update_descriptor::MetalSamplerArgumentBuffer::new(
+        device, layout, prepared.samplers.iter().map(|sampler| (sampler.index, &sampler.sampler)),
+    )? {
+        prepared.buffers.push(MetalStageBufferBinding {
+            index: arguments.index, buffer: arguments.buffer, offset: 0,
+        });
+        prepared.samplers_in_argument_buffer = true;
+    }
+    if let Some(index) = layout.push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, rescaling)));
     }
     Ok(prepared)

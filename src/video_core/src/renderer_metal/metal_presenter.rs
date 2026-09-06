@@ -7,11 +7,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions, MTLDevice, MTLDrawable,
+    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions, MTLDevice, MTLDrawable,
     MTLLanguageVersion, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLRenderCommandEncoder,
     MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
     MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState,
-    MTLStoreAction, MTLTexture,
+    MTLStoreAction, MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use thiserror::Error;
@@ -131,11 +131,48 @@ fragment float4 present_fragment(PresentOut input [[stage_in]],
             .nextDrawable()
             .ok_or(MetalPresenterError::NoDrawable)?;
         let command_buffer = scheduler.begin()?;
+        let target = drawable.texture();
+        self.draw_to_texture(
+            &command_buffer,
+            source,
+            &target,
+            MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: target.width() as f64,
+                height: target.height() as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            },
+            None,
+        )?;
+
+        let metal_drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
+        command_buffer.presentDrawable(metal_drawable);
+        scheduler.commit_presentation(command_buffer)?;
+        Ok(())
+    }
+
+    /// The same source-image pass serves presentation and offscreen capture.
+    /// The caller owns target lifetime, command submission and any readback.
+    pub fn draw_to_texture(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        source: &ProtocolObject<dyn MTLTexture>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        viewport: MTLViewport,
+        clear: Option<MTLClearColor>,
+    ) -> Result<(), MetalPresenterError> {
         let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
         let color_attachments = descriptor.colorAttachments();
         let color = unsafe { color_attachments.objectAtIndexedSubscript(0) };
-        color.setTexture(Some(&drawable.texture()));
-        color.setLoadAction(MTLLoadAction::DontCare);
+        color.setTexture(Some(target));
+        if let Some(clear) = clear {
+            color.setLoadAction(MTLLoadAction::Clear);
+            color.setClearColor(clear);
+        } else {
+            color.setLoadAction(MTLLoadAction::DontCare);
+        }
         color.setStoreAction(MTLStoreAction::Store);
 
         let encoder = command_buffer
@@ -143,6 +180,7 @@ fragment float4 present_fragment(PresentOut input [[stage_in]],
             .ok_or(MetalPresenterError::NoRenderEncoder)?;
         encoder.setRenderPipelineState(&self.pipeline);
         unsafe {
+            encoder.setViewport(viewport);
             encoder.setFragmentTexture_atIndex(Some(source), 0);
             encoder.setFragmentSamplerState_atIndex(Some(&self.sampler), 0);
             encoder.drawPrimitives_vertexStart_vertexCount(
@@ -153,9 +191,6 @@ fragment float4 present_fragment(PresentOut input [[stage_in]],
         }
         encoder.endEncoding();
 
-        let metal_drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
-        command_buffer.presentDrawable(metal_drawable);
-        scheduler.commit(command_buffer)?;
         Ok(())
     }
 

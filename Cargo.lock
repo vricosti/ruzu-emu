@@ -2873,6 +2873,7 @@ dependencies = [
  "anyhow",
  "ash",
  "bitflags 2.13.1",
+ "block2",
  "bytemuck",
  "cc",
  "common",

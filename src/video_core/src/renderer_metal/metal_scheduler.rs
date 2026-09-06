@@ -4,17 +4,24 @@
 //! Metal command-buffer submission and completion ordering.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Instant;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSCopying;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLBlitCommandEncoder, MTLBlitPassDescriptor, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLSamplerState,
 };
+use parking_lot::Mutex;
 use thiserror::Error;
 
 use super::metal_device::MetalDevice;
 use super::metal_framebuffer::MetalRenderPassKey;
+use super::metal_gpu_profiler::{MetalGpuProfiler, StageSamples};
 
 #[derive(Debug, Error)]
 pub enum MetalSchedulerError {
@@ -43,9 +50,13 @@ pub struct MetalScheduler {
     active: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     active_encoder: Option<ActiveEncoder>,
     active_render_pass_key: Option<MetalRenderPassKey>,
+    active_sampler_states: Option<Arc<Mutex<Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>>>>,
     in_flight: VecDeque<InFlightCommandBuffer>,
     next_tick: u64,
     known_gpu_tick: u64,
+    submission_profiler: Option<SubmissionProfiler>,
+    stage_profiler: Option<MetalGpuProfiler>,
+    active_stage_samples: Option<StageSamples>,
 }
 
 enum ActiveEncoder {
@@ -67,6 +78,75 @@ impl ActiveEncoder {
 struct InFlightCommandBuffer {
     tick: u64,
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    kind: SubmissionKind,
+    stage_samples: Option<StageSamples>,
+}
+
+#[derive(Clone, Copy)]
+enum SubmissionKind {
+    Guest,
+    Presentation,
+    External,
+    Synchronous,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SubmissionTiming {
+    completed: u64,
+    measured: u64,
+    gpu_ms: f64,
+    peak_ms: f64,
+    peak_tick: u64,
+}
+
+impl SubmissionTiming {
+    fn observe(&mut self, tick: u64, start: f64, end: f64) {
+        self.completed += 1;
+        // Metal reports zero until its GPU completion timestamps are available.
+        if !start.is_finite() || !end.is_finite() || start <= 0.0 || end < start {
+            return;
+        }
+        let elapsed_ms = (end - start) * 1_000.0;
+        self.measured += 1;
+        self.gpu_ms += elapsed_ms;
+        if elapsed_ms > self.peak_ms {
+            self.peak_ms = elapsed_ms;
+            self.peak_tick = tick;
+        }
+    }
+}
+
+struct SubmissionProfiler {
+    interval_start: Instant,
+    timings: [SubmissionTiming; 4],
+    total_completed: u64,
+}
+
+impl SubmissionProfiler {
+    fn new() -> Self {
+        Self {
+            interval_start: Instant::now(),
+            timings: [SubmissionTiming::default(); 4],
+            total_completed: 0,
+        }
+    }
+
+    fn observe(&mut self, kind: SubmissionKind, tick: u64, start: f64, end: f64) {
+        self.timings[kind as usize].observe(tick, start, end);
+        self.total_completed += 1;
+        let elapsed = self.interval_start.elapsed();
+        if elapsed.as_secs() >= 1 {
+            // Intervals describe completions observed by the CPU, not GPU busy
+            // percentages; command-buffer execution spans may overlap.
+            log::info!(
+                "[METAL_GPU_TIME] observation_s={:.3} total_completed={} guest={:?} presentation={:?} external={:?} synchronous={:?}",
+                elapsed.as_secs_f64(), self.total_completed, self.timings[0], self.timings[1],
+                self.timings[2], self.timings[3],
+            );
+            self.timings = [SubmissionTiming::default(); 4];
+            self.interval_start = Instant::now();
+        }
+    }
 }
 
 impl MetalScheduler {
@@ -76,9 +156,18 @@ impl MetalScheduler {
             active: None,
             active_encoder: None,
             active_render_pass_key: None,
+            active_sampler_states: None,
             in_flight: VecDeque::new(),
             next_tick: 1,
             known_gpu_tick: 0,
+            submission_profiler: std::env::var_os("RUZU_PROFILE_METAL_SUBMISSIONS")
+                .is_some()
+                .then(SubmissionProfiler::new),
+            stage_profiler: std::env::var_os("RUZU_PROFILE_METAL_STAGES")
+                .is_some()
+                .then(|| MetalGpuProfiler::new(device.device()))
+                .flatten(),
+            active_stage_samples: None,
         }
     }
 
@@ -115,9 +204,14 @@ impl MetalScheduler {
         if !matches!(self.active_encoder.as_ref(), Some(ActiveEncoder::Blit(_))) {
             self.end_active_encoder();
             let command_buffer = self.active_command_buffer()?;
-            let encoder = command_buffer
-                .blitCommandEncoder()
-                .ok_or(MetalSchedulerError::NoBlitEncoder)?;
+            let encoder = if let Some(samples) = self.active_stage_samples.as_mut() {
+                let descriptor = MTLBlitPassDescriptor::new();
+                samples.attach_blit(&descriptor);
+                command_buffer.blitCommandEncoderWithDescriptor(&descriptor)
+            } else {
+                command_buffer.blitCommandEncoder()
+            }
+            .ok_or(MetalSchedulerError::NoBlitEncoder)?;
             self.active_encoder = Some(ActiveEncoder::Blit(encoder));
         }
         let Some(ActiveEncoder::Blit(encoder)) = self.active_encoder.as_ref() else {
@@ -137,9 +231,15 @@ impl MetalScheduler {
         ) {
             self.end_active_encoder();
             let command_buffer = self.active_command_buffer()?;
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or(MetalSchedulerError::NoComputeEncoder)?;
+            self.acquire_stage_samples();
+            let encoder = if let Some(samples) = self.active_stage_samples.as_mut() {
+                let descriptor = MTLComputePassDescriptor::new();
+                samples.attach_compute(&descriptor);
+                command_buffer.computeCommandEncoderWithDescriptor(&descriptor)
+            } else {
+                command_buffer.computeCommandEncoder()
+            }
+            .ok_or(MetalSchedulerError::NoComputeEncoder)?;
             self.active_encoder = Some(ActiveEncoder::Compute(encoder));
         }
         let Some(ActiveEncoder::Compute(encoder)) = self.active_encoder.as_ref() else {
@@ -182,11 +282,31 @@ impl MetalScheduler {
         descriptor: &MTLRenderPassDescriptor,
     ) -> Result<(), MetalSchedulerError> {
         let command_buffer = self.active_command_buffer()?;
+        self.acquire_stage_samples();
+        // Never leave diagnostic attachments on a descriptor reused by callers.
+        let profiled_descriptor = self.active_stage_samples.as_mut().map(|samples| {
+            let copy = descriptor.copy();
+            samples.attach_render(&copy);
+            copy
+        });
         let encoder = command_buffer
-            .renderCommandEncoderWithDescriptor(descriptor)
+            .renderCommandEncoderWithDescriptor(
+                profiled_descriptor.as_deref().unwrap_or(descriptor),
+            )
             .ok_or(MetalSchedulerError::NoRenderEncoder)?;
         self.active_encoder = Some(ActiveEncoder::Render(encoder));
         Ok(())
+    }
+
+    fn acquire_stage_samples(&mut self) {
+        // Start on real compute/render work, not a tiny transfer-only batch
+        // that can phase-lock to the once-per-second sampling cadence.
+        if self.active_stage_samples.is_none() {
+            self.active_stage_samples = self
+                .stage_profiler
+                .as_mut()
+                .and_then(MetalGpuProfiler::acquire);
+        }
     }
 
     pub fn with_render_encoder<R>(
@@ -197,6 +317,36 @@ impl MetalScheduler {
             return Err(MetalSchedulerError::NoActiveRenderEncoder);
         };
         Ok(record(encoder))
+    }
+
+    /// Unlike directly bound resources, argument-buffer samplers are not retained
+    /// by an encoder or covered by useResource. The command buffer owns this
+    /// cohort through its completion handler, even if the scheduler is dropped.
+    pub fn retain_sampler_states(
+        &mut self,
+        states: impl IntoIterator<Item = Retained<ProtocolObject<dyn MTLSamplerState>>>,
+    ) -> Result<(), MetalSchedulerError> {
+        if self.active_sampler_states.is_none() {
+            let states = Arc::new(Mutex::new(Vec::new()));
+            let completed = Arc::clone(&states);
+            let handler = RcBlock::new(
+                move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    completed.lock().clear();
+                },
+            );
+            // Metal copies this block before the call returns.
+            unsafe {
+                self.active_command_buffer()?
+                    .addCompletedHandler(RcBlock::as_ptr(&handler))
+            };
+            self.active_sampler_states = Some(states);
+        }
+        self.active_sampler_states
+            .as_ref()
+            .unwrap()
+            .lock()
+            .extend(states);
+        Ok(())
     }
 
     pub fn end_render_pass(&mut self) {
@@ -222,12 +372,29 @@ impl MetalScheduler {
         let Some(command_buffer) = self.active.take() else {
             return Ok(None);
         };
-        self.commit(command_buffer).map(Some)
+        self.active_sampler_states = None;
+        self.commit_with_kind(command_buffer, SubmissionKind::Guest)
+            .map(Some)
     }
 
     pub fn commit(
         &mut self,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    ) -> Result<u64, MetalSchedulerError> {
+        self.commit_with_kind(command_buffer, SubmissionKind::External)
+    }
+
+    pub fn commit_presentation(
+        &mut self,
+        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    ) -> Result<u64, MetalSchedulerError> {
+        self.commit_with_kind(command_buffer, SubmissionKind::Presentation)
+    }
+
+    fn commit_with_kind(
+        &mut self,
+        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        kind: SubmissionKind,
     ) -> Result<u64, MetalSchedulerError> {
         self.poll_completed()?;
         let tick = self.next_tick;
@@ -236,6 +403,12 @@ impl MetalScheduler {
         self.in_flight.push_back(InFlightCommandBuffer {
             tick,
             command_buffer,
+            kind,
+            stage_samples: if matches!(kind, SubmissionKind::Guest) {
+                self.active_stage_samples.take()
+            } else {
+                None
+            },
         });
         Ok(tick)
     }
@@ -253,6 +426,7 @@ impl MetalScheduler {
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
         Self::check_completed(&command_buffer)?;
+        self.profile_completed(&command_buffer, tick, SubmissionKind::Synchronous);
         self.known_gpu_tick = self.known_gpu_tick.max(tick);
         self.poll_completed()?;
         Ok(tick)
@@ -297,6 +471,12 @@ impl MetalScheduler {
             let completed = self.in_flight.pop_front().unwrap();
             completed.command_buffer.waitUntilCompleted();
             Self::check_completed(&completed.command_buffer)?;
+            if let (Some(profiler), Some(samples)) =
+                (&mut self.stage_profiler, completed.stage_samples)
+            {
+                profiler.completed(completed.tick, samples);
+            }
+            self.profile_completed(&completed.command_buffer, completed.tick, completed.kind);
             self.known_gpu_tick = self.known_gpu_tick.max(completed.tick);
         }
         Ok(())
@@ -307,6 +487,12 @@ impl MetalScheduler {
         while let Some(in_flight) = self.in_flight.pop_front() {
             in_flight.command_buffer.waitUntilCompleted();
             Self::check_completed(&in_flight.command_buffer)?;
+            if let (Some(profiler), Some(samples)) =
+                (&mut self.stage_profiler, in_flight.stage_samples)
+            {
+                profiler.completed(in_flight.tick, samples);
+            }
+            self.profile_completed(&in_flight.command_buffer, in_flight.tick, in_flight.kind);
             self.known_gpu_tick = self.known_gpu_tick.max(in_flight.tick);
         }
         Ok(())
@@ -320,9 +506,31 @@ impl MetalScheduler {
         {
             let completed = self.in_flight.pop_front().unwrap();
             Self::check_completed(&completed.command_buffer)?;
+            if let (Some(profiler), Some(samples)) =
+                (&mut self.stage_profiler, completed.stage_samples)
+            {
+                profiler.completed(completed.tick, samples);
+            }
+            self.profile_completed(&completed.command_buffer, completed.tick, completed.kind);
             self.known_gpu_tick = self.known_gpu_tick.max(completed.tick);
         }
         Ok(())
+    }
+
+    fn profile_completed(
+        &mut self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        tick: u64,
+        kind: SubmissionKind,
+    ) {
+        if let Some(profiler) = self.submission_profiler.as_mut() {
+            profiler.observe(
+                kind,
+                tick,
+                command_buffer.GPUStartTime(),
+                command_buffer.GPUEndTime(),
+            );
+        }
     }
 
     fn check_completed(
@@ -352,6 +560,98 @@ fn is_terminal_status(status: MTLCommandBufferStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_timing_excludes_unavailable_and_invalid_timestamps() {
+        let mut timing = SubmissionTiming::default();
+        for (start, end) in [
+            (0.0, 0.0),
+            (0.0, 2.0),
+            (2.0, 1.0),
+            (f64::NAN, 3.0),
+            (1.0, f64::INFINITY),
+        ] {
+            timing.observe(1, start, end);
+        }
+        assert_eq!(timing.completed, 5);
+        assert_eq!(timing.measured, 0);
+        assert_eq!(timing.gpu_ms, 0.0);
+        timing.observe(12, 4.0, 4.125);
+        timing.observe(13, 5.0, 5.0625);
+        assert_eq!(timing.completed, 7);
+        assert_eq!(timing.measured, 2);
+        assert_eq!(timing.gpu_ms, 187.5);
+        assert_eq!(timing.peak_ms, 125.0);
+        assert_eq!(timing.peak_tick, 12);
+    }
+
+    #[test]
+    fn submission_profiling_preserves_ticks_and_observes_each_completion_once() {
+        let device = MetalDevice::new().expect("Metal device");
+        let mut scheduler = MetalScheduler::new(&device);
+        scheduler.submission_profiler = Some(SubmissionProfiler::new());
+        scheduler.active_command_buffer().unwrap();
+        assert_eq!(scheduler.flush().unwrap(), Some(1));
+        let present = scheduler.begin().unwrap();
+        assert_eq!(scheduler.commit_presentation(present).unwrap(), 2);
+        let external = scheduler.begin().unwrap();
+        assert_eq!(scheduler.commit(external).unwrap(), 3);
+        let synchronous = scheduler.begin().unwrap();
+        assert_eq!(scheduler.finish(synchronous).unwrap(), 4);
+        scheduler.finish_all().unwrap();
+        assert_eq!(scheduler.known_gpu_tick().unwrap(), 4);
+        assert_eq!(
+            scheduler
+                .submission_profiler
+                .as_ref()
+                .unwrap()
+                .total_completed,
+            4
+        );
+        scheduler.wait(4).unwrap();
+        assert_eq!(
+            scheduler
+                .submission_profiler
+                .as_ref()
+                .unwrap()
+                .total_completed,
+            4
+        );
+    }
+
+    #[test]
+    fn native_stage_counters_preserve_passes_descriptors_and_submission_ticks() {
+        use objc2_metal::MTLLoadAction;
+        let device = MetalDevice::new().unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        let Some(profiler) = MetalGpuProfiler::new(device.device()) else {
+            return;
+        };
+        scheduler.stage_profiler = Some(profiler);
+        scheduler.with_blit_encoder(|_| {}).unwrap();
+        assert!(scheduler.active_stage_samples.is_none());
+        assert_eq!(scheduler.flush().unwrap(), Some(1));
+        assert!(scheduler.in_flight.front().unwrap().stage_samples.is_none());
+        scheduler.with_compute_encoder(|_| {}).unwrap();
+        let (descriptor, _texture) = render_pass_descriptor(&device);
+        unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) }
+            .setLoadAction(MTLLoadAction::Clear);
+        scheduler.begin_render_pass(&descriptor).unwrap();
+        assert!(scheduler.active_stage_samples.is_some());
+        let original = unsafe {
+            descriptor
+                .sampleBufferAttachments()
+                .objectAtIndexedSubscript(0)
+        };
+        assert!(original.sampleBuffer().is_none());
+        assert_eq!(scheduler.current_tick(), 2);
+        assert_eq!(scheduler.flush().unwrap(), Some(2));
+        assert!(scheduler.active_stage_samples.is_none());
+        assert!(scheduler.in_flight.back().unwrap().stage_samples.is_some());
+        scheduler.wait(2).unwrap();
+        assert_eq!(scheduler.known_gpu_tick().unwrap(), 2);
+        assert!(scheduler.in_flight.is_empty());
+    }
 
     fn render_pass_descriptor(
         device: &MetalDevice,
@@ -383,6 +683,32 @@ mod tests {
         color.setLoadAction(MTLLoadAction::DontCare);
         color.setStoreAction(MTLStoreAction::DontCare);
         (descriptor, texture)
+    }
+
+    #[test]
+    fn indirect_sampler_cohort_survives_flush_and_clears_after_gpu_completion() {
+        use objc2_metal::{MTLDevice, MTLSamplerDescriptor};
+        let device = MetalDevice::new().unwrap();
+        let descriptor = MTLSamplerDescriptor::new();
+        descriptor.setSupportArgumentBuffers(true);
+        let sampler = device
+            .device()
+            .newSamplerStateWithDescriptor(&descriptor)
+            .unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        scheduler.retain_sampler_states([sampler.clone()]).unwrap();
+        scheduler.retain_sampler_states([sampler]).unwrap();
+        let cohort = Arc::clone(scheduler.active_sampler_states.as_ref().unwrap());
+        assert_eq!(cohort.lock().len(), 2);
+        scheduler.flush().unwrap();
+        assert!(scheduler.active_sampler_states.is_none());
+        scheduler.finish_all().unwrap();
+        // Completed handlers may run just after waitUntilCompleted returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !cohort.lock().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(cohort.lock().is_empty());
     }
 
     #[test]

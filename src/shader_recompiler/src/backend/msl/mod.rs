@@ -17,6 +17,7 @@ mod emit_msl_context_get_set;
 mod emit_msl_control_flow;
 mod emit_msl_convert;
 mod emit_msl_floating_point;
+pub mod emit_msl_geometry;
 mod emit_msl_image;
 mod emit_msl_image_atomic;
 mod emit_msl_integer;
@@ -28,6 +29,7 @@ mod emit_msl_special;
 mod emit_msl_undefined;
 mod emit_msl_warp;
 pub mod msl_emit_context;
+pub mod msl_function;
 
 use std::num::NonZeroU32;
 
@@ -74,6 +76,9 @@ pub struct MslOptions {
     /// pipeline has rasterization disabled. Metal requires this shader
     /// specialization instead of accepting unused stage outputs.
     pub disable_rasterization: bool,
+    /// Geometry output assembly implements the guest provoking-vertex mode;
+    /// Metal's triangle-list rasterizer takes flat data from the first index.
+    pub geometry_provoking_vertex_last: bool,
 }
 
 impl Default for MslOptions {
@@ -86,6 +91,7 @@ impl Default for MslOptions {
             supports_texture_atomics: false,
             enable_point_size_builtin: true,
             disable_rasterization: false,
+            geometry_provoking_vertex_last: false,
         }
     }
 }
@@ -113,7 +119,10 @@ pub struct MslResourceBinding {
     pub count: Option<NonZeroU32>,
 }
 
-/// Complete direct-binding ABI for one MSL entry point.
+/// Metal's direct sampler argument table has 16 entries on every GPU family.
+pub const MAX_DIRECT_SAMPLERS: u32 = 16;
+
+/// Complete binding ABI for one MSL entry point.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MslBindingLayout {
     pub resources: Vec<MslResourceBinding>,
@@ -121,6 +130,9 @@ pub struct MslBindingLayout {
     pub buffer_count: u32,
     pub texture_count: u32,
     pub sampler_count: u32,
+    /// When present, sampler_index addresses an argument-buffer member ID,
+    /// not the direct sampler table. Textures and data buffers stay direct.
+    pub sampler_argument_buffer_index: Option<u32>,
 }
 
 /// Backend output before native Metal library compilation.
@@ -153,6 +165,9 @@ pub struct MslShaderArtifact {
     pub entry_point: String,
     pub language_version: MslVersion,
     pub execution: MslExecutionInfo,
+    /// Native emission supplies its exact parameter ABI. Compatibility modules
+    /// translated by SPIRV-Cross do not expose this callable-function interface.
+    pub interface: Option<msl_function::MslFunctionInterface>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

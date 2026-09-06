@@ -22,6 +22,7 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::PixelFormat;
 
 use super::metal_buffer::MetalBuffer;
+use super::metal_compute_pass::{QuadIndexedPass, Uint8Pass};
 use super::metal_device::MetalDevice;
 use super::metal_scheduler::MetalScheduler;
 use super::metal_staging_buffer_pool::{MetalStagingBufferPool, StagingBufferRef};
@@ -226,6 +227,8 @@ pub struct BufferCacheRuntime {
     compute: MetalComputeBufferBindings,
     quad_array_index_buffer: Option<(Arc<MetalBuffer>, u32)>,
     quad_strip_index_buffer: Option<(Arc<MetalBuffer>, u32)>,
+    uint8_pass: Option<Uint8Pass>,
+    quad_index_pass: Option<QuadIndexedPass>,
 }
 
 impl BufferCacheRuntime {
@@ -248,6 +251,8 @@ impl BufferCacheRuntime {
             compute: MetalComputeBufferBindings::default(),
             quad_array_index_buffer: None,
             quad_strip_index_buffer: None,
+            uint8_pass: None,
+            quad_index_pass: None,
         }
     }
 
@@ -341,43 +346,29 @@ impl BufferCacheRuntime {
         topology: PrimitiveTopology,
         base_vertex: u32,
         num_indices: u32,
-    ) -> Arc<MetalBuffer> {
-        // The source is shared storage but may have prior GPU writers. Waiting
-        // before the CPU conversion preserves Eden's compute-pass ordering.
-        self.scheduler()
-            .finish_all()
-            .expect("Metal index source synchronization failed");
-        let element_size = index_format_size(index_format);
-        let mut input = vec![0; num_indices as usize * element_size];
-        source
-            .allocation
-            .read(source_offset as usize, &mut input)
-            .expect("Metal index source range");
-        let swizzle = if topology == PrimitiveTopology::QuadStrip {
-            [0usize, 3, 1, 0, 2, 3]
-        } else {
-            [0usize, 1, 2, 0, 2, 3]
-        };
-        let primitives = quad_count_for_topology(topology, num_indices);
-        let mut output = Vec::with_capacity(primitives as usize * 6 * 4);
-        for primitive in 0..primitives as usize {
-            for vertex in swizzle {
-                let source_index = if topology == PrimitiveTopology::QuadStrip {
-                    primitive * 2 + vertex
-                } else {
-                    primitive * 4 + vertex
-                };
-                let value =
-                    read_index(&input, index_format, source_index).wrapping_add(base_vertex);
-                output.extend_from_slice(&value.to_ne_bytes());
-            }
+    ) -> StagingBufferRef {
+        if self.quad_index_pass.is_none() {
+            self.quad_index_pass = Some(
+                QuadIndexedPass::new(&self.device)
+                    .expect("Metal quad index pass compilation failed"),
+            );
         }
-        let result = Arc::new(
-            MetalBuffer::new(&self.device, output.len().max(4))
-                .expect("Metal converted index allocation"),
-        );
-        result.write(0, &output).expect("Metal converted indices");
-        result
+        // SAFETY: the runtime's scheduler/pool are distinct stable allocations
+        // owned by the rasterizer; cache callers hold the runtime's mutex.
+        self.quad_index_pass
+            .as_ref()
+            .unwrap()
+            .assemble(
+                unsafe { self.scheduler.as_mut() },
+                unsafe { self.staging_pool.as_mut() },
+                index_format,
+                num_indices,
+                base_vertex,
+                &source.allocation,
+                source_offset as usize,
+                topology == PrimitiveTopology::QuadStrip,
+            )
+            .expect("Metal quad index assembly failed")
     }
 
     fn uint8_index_buffer(
@@ -385,30 +376,24 @@ impl BufferCacheRuntime {
         source: &Buffer,
         source_offset: u32,
         num_indices: u32,
-    ) -> Arc<MetalBuffer> {
-        self.scheduler()
-            .finish_all()
-            .expect("Metal uint8 index source synchronization failed");
-        let mut input = vec![0; num_indices as usize];
-        source
-            .allocation
-            .read(source_offset as usize, &mut input)
-            .expect("Metal uint8 index source range");
-        let mut output = Vec::with_capacity(input.len() * 2);
-        for index in input {
-            let index = if index == u8::MAX {
-                u16::MAX
-            } else {
-                index as u16
-            };
-            output.extend_from_slice(&index.to_ne_bytes());
+    ) -> StagingBufferRef {
+        if self.uint8_pass.is_none() {
+            self.uint8_pass = Some(
+                Uint8Pass::new(&self.device).expect("Metal uint8 index pass compilation failed"),
+            );
         }
-        let result = Arc::new(
-            MetalBuffer::new(&self.device, output.len().max(4))
-                .expect("Metal uint8 index allocation"),
-        );
-        result.write(0, &output).expect("Metal uint8 indices");
-        result
+        // SAFETY: same stable scheduler/pool ownership as the quad pass above.
+        self.uint8_pass
+            .as_ref()
+            .unwrap()
+            .assemble(
+                unsafe { self.scheduler.as_mut() },
+                unsafe { self.staging_pool.as_mut() },
+                num_indices,
+                &source.allocation,
+                source_offset as usize,
+            )
+            .expect("Metal uint8 index assembly failed")
     }
 
     fn update_quad_lut(&mut self, topology: PrimitiveTopology, num_indices: u32) {
@@ -598,40 +583,32 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         offset: u32,
         _size: u32,
     ) {
-        let (buffer, index_type) = if matches!(
+        let (buffer, index_type, binding_offset) = if matches!(
             topology,
             PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
         ) {
-            (
-                self.converted_index_buffer(
-                    buffer,
-                    offset,
-                    index_format,
-                    topology,
-                    base_vertex,
-                    num_indices,
-                ),
-                MTLIndexType::UInt32,
-            )
+            let staging = self.converted_index_buffer(
+                buffer,
+                offset,
+                index_format,
+                topology,
+                base_vertex,
+                num_indices,
+            );
+            (staging.buffer, MTLIndexType::UInt32, staging.offset)
         } else if index_format == IndexFormat::UnsignedByte {
-            (
-                self.uint8_index_buffer(buffer, offset, num_indices),
-                MTLIndexType::UInt16,
-            )
+            let staging = self.uint8_index_buffer(buffer, offset, num_indices);
+            (staging.buffer, MTLIndexType::UInt16, staging.offset)
         } else {
-            (buffer.handle(), metal_index_type(index_format))
+            (
+                buffer.handle(),
+                metal_index_type(index_format),
+                offset as usize,
+            )
         };
         self.index_binding = Some(MetalIndexBinding {
             buffer,
-            offset: if matches!(
-                topology,
-                PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
-            ) || index_format == IndexFormat::UnsignedByte
-            {
-                0
-            } else {
-                offset as usize
-            },
+            offset: binding_offset,
             index_type,
         });
     }
@@ -849,27 +826,6 @@ fn metal_index_type(format: IndexFormat) -> MTLIndexType {
     }
 }
 
-fn index_format_size(format: IndexFormat) -> usize {
-    match format {
-        IndexFormat::UnsignedByte => 1,
-        IndexFormat::UnsignedShort => 2,
-        IndexFormat::UnsignedInt => 4,
-    }
-}
-
-fn read_index(input: &[u8], format: IndexFormat, index: usize) -> u32 {
-    let offset = index * index_format_size(format);
-    match format {
-        IndexFormat::UnsignedByte => input[offset] as u32,
-        IndexFormat::UnsignedShort => {
-            u16::from_ne_bytes(input[offset..offset + 2].try_into().unwrap()) as u32
-        }
-        IndexFormat::UnsignedInt => {
-            u32::from_ne_bytes(input[offset..offset + 4].try_into().unwrap())
-        }
-    }
-}
-
 fn quad_count_for_topology(topology: PrimitiveTopology, num_indices: u32) -> u32 {
     match topology {
         PrimitiveTopology::Quads => num_indices / 4,
@@ -992,7 +948,7 @@ mod tests {
     fn runtime_expands_uint8_restart_for_metal() {
         use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime as _;
 
-        let (_device, _scheduler, _staging_pool, mut runtime) = runtime();
+        let (device, mut scheduler, _staging_pool, mut runtime) = runtime();
         let mut source = Buffer::new(&mut runtime, 0x1000, 4);
         source.immediate_upload(0, &[1, 0xff, 9, 3]);
         runtime.bind_index_buffer(
@@ -1006,8 +962,14 @@ mod tests {
         );
         let binding = runtime.index_binding().unwrap();
         assert_eq!(binding.index_type, MTLIndexType::UInt16);
+        let download = MetalBuffer::new(&device, 8).unwrap();
+        binding
+            .buffer
+            .encode_copy(&mut scheduler, &download, binding.offset, 0, 8)
+            .unwrap();
+        scheduler.finish_all().unwrap();
         let mut bytes = [0; 8];
-        binding.buffer.read(0, &mut bytes).unwrap();
+        download.read(0, &mut bytes).unwrap();
         assert_eq!(
             bytes
                 .chunks_exact(2)

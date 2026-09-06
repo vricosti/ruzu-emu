@@ -1743,6 +1743,17 @@ fn test_viewport_default() {
 }
 
 #[test]
+fn viewport_swizzle_encodings_match_maxwell_registers() {
+    assert_eq!(std::mem::size_of::<ViewportSwizzle>(), 4);
+    assert_eq!([
+        ViewportSwizzle::PositiveX as u32, ViewportSwizzle::NegativeX as u32,
+        ViewportSwizzle::PositiveY as u32, ViewportSwizzle::NegativeY as u32,
+        ViewportSwizzle::PositiveZ as u32, ViewportSwizzle::NegativeZ as u32,
+        ViewportSwizzle::PositiveW as u32, ViewportSwizzle::NegativeW as u32,
+    ], [0, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+#[test]
 fn test_scissor_default() {
     let sc = ScissorInfo::default();
     assert!(!sc.enabled);

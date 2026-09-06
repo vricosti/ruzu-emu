@@ -26,7 +26,11 @@ use objc2_metal::{
     MTLStencilDescriptor, MTLStencilOperation, MTLVertexDescriptor, MTLVertexFormat,
     MTLVertexStepFunction,
 };
+use shader_recompiler::backend::msl::{
+    emit_msl::{emit_msl_vertex_function, emit_msl_geometry_function}, emit_msl_geometry::GeometryLayout,
+};
 use shader_recompiler::host_translate_info::HostTranslateInfo;
+use shader_recompiler::ir::types::OutputTopology;
 use shader_recompiler::profile::Profile;
 use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::stage::Stage;
@@ -38,7 +42,7 @@ use crate::buffer_cache::buffer_cache_base::{
 };
 use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::{
-    BlendEquation, BlendFactor, ComparisonOp, DepthStencilInfo, PrimitiveTopology, StencilOp,
+    BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthStencilInfo, PrimitiveTopology, StencilOp,
     VertexAttribSize, VertexAttribType,
 };
 use crate::rasterizer_interface::{
@@ -59,9 +63,12 @@ use crate::shader_environment::{
 
 use super::metal_device::{MetalDevice, MetalDeviceProfile};
 use super::metal_framebuffer::MetalFramebuffer;
+use super::metal_geometry_pipeline::{
+    MetalGeometryPipeline, MetalGeometryPipelineError, MetalGeometryShaderStages,
+};
 use super::metal_shader::{
-    compile_direct_msl_shader_with_bindings, DirectMslCompileError, MetalShaderCompileOptions,
-    MetalShaderError, MetalShaderModule,
+    compile_direct_msl_shader_with_bindings, direct_msl_options, DirectMslCompileError,
+    MetalShaderBindingLayout, MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
 };
 #[cfg(feature = "metal-spirv-validation")]
 use super::metal_shader::{
@@ -146,7 +153,7 @@ pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
         // Metal has fixed [0,w] depth and cannot switch to guest [-w,w].
         support_native_ndc: false,
         support_scaled_attributes: false,
-        support_multi_viewport: false,
+        support_multi_viewport: device.max_viewports() > 1,
         support_geometry_streams: false,
         support_sampled_image_array_nonuniform_indexing: false,
         support_storage_image_array_nonuniform_indexing: false,
@@ -534,11 +541,17 @@ pub struct MetalComputePipeline {
 #[derive(Clone)]
 pub struct MetalGraphicsShaderStages {
     key: GraphicsPipelineKey,
-    vertex: Arc<MetalShaderModule>,
+    vertex: MetalVertexShader,
     fragment: Option<Arc<MetalShaderModule>>,
     stage_infos: Arc<[ShaderInfo; 5]>,
     enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
     uniform_buffer_sizes: Arc<UniformBufferSizes>,
+}
+
+#[derive(Clone)]
+enum MetalVertexShader {
+    Native(Arc<MetalShaderModule>),
+    Geometry(Arc<MetalGeometryShaderStages>),
 }
 
 impl MetalGraphicsShaderStages {
@@ -550,8 +563,25 @@ impl MetalGraphicsShaderStages {
         self.key.hash_value()
     }
 
-    pub fn vertex(&self) -> &MetalShaderModule {
-        &self.vertex
+    pub fn vertex(&self) -> Option<&MetalShaderModule> {
+        match &self.vertex {
+            MetalVertexShader::Native(module) => Some(module),
+            MetalVertexShader::Geometry(_) => None,
+        }
+    }
+
+    pub fn vertex_bindings(&self) -> &MetalShaderBindingLayout {
+        match &self.vertex {
+            MetalVertexShader::Native(module) => module.bindings(),
+            MetalVertexShader::Geometry(stages) => &stages.vertex.bindings,
+        }
+    }
+
+    pub fn geometry(&self) -> Option<&MetalGeometryShaderStages> {
+        match &self.vertex {
+            MetalVertexShader::Geometry(stages) => Some(stages),
+            MetalVertexShader::Native(_) => None,
+        }
     }
 
     pub fn fragment(&self) -> Option<&MetalShaderModule> {
@@ -603,6 +633,8 @@ impl MetalComputePipeline {
 
 #[derive(Debug, Error)]
 pub enum MetalPipelineError {
+    #[error(transparent)]
+    Geometry(#[from] MetalGeometryPipelineError),
     #[error("expected {expected} shader, got {actual:?}")]
     InvalidShaderStage {
         expected: &'static str,
@@ -694,6 +726,7 @@ pub struct MetalPipelineCache {
     profile: Profile,
     host_info: HostTranslateInfo,
     render_pipelines: HashMap<MetalRenderPipelineKey, MetalRenderPipeline>,
+    geometry_pipelines: HashMap<MetalRenderPipelineKey, Arc<MetalGeometryPipeline>>,
     depth_stencil_states:
         HashMap<MetalDepthStencilKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     compute_pipelines: HashMap<MetalComputePipelineKey, MetalComputePipeline>,
@@ -720,6 +753,7 @@ impl MetalPipelineCache {
             profile,
             host_info,
             render_pipelines: HashMap::new(),
+            geometry_pipelines: HashMap::new(),
             depth_stencil_states: HashMap::new(),
             compute_pipelines: HashMap::new(),
             graphics_shader_modules: HashMap::new(),
@@ -746,6 +780,19 @@ impl MetalPipelineCache {
 
     pub fn host_info(&self) -> &HostTranslateInfo {
         &self.host_info
+    }
+
+    fn graphics_features_for_stages(&self) -> DynamicFeatures {
+        let mut features = self.dynamic_features;
+        if self.graphics_key.unique_hashes[4] != 0 {
+            // Native geometry assembly implements both modes by selecting the
+            // first rasterized index. This is not a Metal device feature, and
+            // must not change the fixed-function non-geometry path's policy.
+            features.has_provoking_vertex = true;
+            features.has_provoking_vertex_first_mode = true;
+            features.has_provoking_vertex_last_mode = true;
+        }
+        features
     }
 
     fn build_graphics_shader_stages(
@@ -780,8 +827,10 @@ impl MetalPipelineCache {
                 "tessellation evaluation",
             ));
         }
-        if translated[3].is_some() {
-            return Err(MetalPipelineError::UnsupportedGraphicsStage("geometry"));
+        if translated[3].is_some() && !device.profile().supports_mesh_shaders() {
+            return Err(MetalPipelineError::UnsupportedGraphicsStage(
+                "geometry on this Metal device",
+            ));
         }
         let stage_infos: [ShaderInfo; NUM_GRAPHICS_STAGES] = std::array::from_fn(|index| {
             translated[index]
@@ -792,18 +841,61 @@ impl MetalPipelineCache {
         let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
             buffer_cache_metadata(&stage_infos);
         let mut vertex = None;
+        let mut callable_vertex = None;
+        let mut geometry = None;
         let mut fragment = None;
         let mut options = MetalShaderCompileOptions::for_device(device.profile());
         options.enable_point_size_builtin = key.fixed_state.topology() == PrimitiveTopology::Points;
-        options.disable_rasterization = !key.fixed_state.dynamic_state.rasterize_enable();
+        options.disable_rasterization = !metal_rasterization_enabled(
+            &key.fixed_state,
+            translated[3].as_ref().map(|stage| stage.program.output_topology),
+        );
+        options.geometry_provoking_vertex_last = key.fixed_state.provoking_vertex_last();
         let mut direct_bindings = Bindings::default();
         for translated_stage in translated.iter().flatten() {
+            let mut stage_options = options.clone();
+            if translated[3].is_some() && translated_stage.program.stage == Stage::VertexB {
+                // The vertex stage produces retained records, not rasterized primitives.
+                stage_options.enable_point_size_builtin = false;
+                stage_options.disable_rasterization = false;
+                callable_vertex = Some(
+                    emit_msl_vertex_function(
+                        &translated_stage.program,
+                        profile,
+                        &translated_stage.runtime_info,
+                        &direct_msl_options(device.device(), &stage_options),
+                        &mut direct_bindings,
+                    )
+                    .map_err(DirectMslCompileError::from)?,
+                );
+                continue;
+            }
+            if translated_stage.program.stage == Stage::Geometry {
+                stage_options.enable_point_size_builtin = translated_stage.program.output_topology
+                    == shader_recompiler::ir::types::OutputTopology::PointList;
+                let msl_options = direct_msl_options(device.device(), &stage_options);
+                let layout = GeometryLayout::new(&translated_stage.program,
+                    &translated_stage.runtime_info, &msl_options).map_err(DirectMslCompileError::from)?;
+                use super::metal_geometry_pipeline::MetalGeometryShader;
+                let shader = if layout.has_primitive_outputs() {
+                    MetalGeometryShader::Capture(emit_msl_geometry_function(&translated_stage.program,
+                        profile, &translated_stage.runtime_info, &msl_options, &mut direct_bindings)
+                        .map_err(DirectMslCompileError::from)?)
+                } else {
+                    MetalGeometryShader::Mesh(Arc::new(compile_direct_msl_shader_with_bindings(
+                        device.device(), &translated_stage.program, profile,
+                        &translated_stage.runtime_info, &stage_options, &mut direct_bindings)?))
+                };
+                geometry = Some((shader, translated_stage.runtime_info.clone(), layout,
+                    translated_stage.program.invocations));
+                continue;
+            }
             let active = Arc::new(compile_direct_msl_shader_with_bindings(
                 device.device(),
                 &translated_stage.program,
                 profile,
                 &translated_stage.runtime_info,
-                &options,
+                &stage_options,
                 &mut direct_bindings,
             )?);
             match translated_stage.program.stage {
@@ -814,8 +906,8 @@ impl MetalPipelineCache {
                         Stage::VertexA => "unmerged vertex A",
                         Stage::TessellationControl => "tessellation control",
                         Stage::TessellationEval => "tessellation evaluation",
-                        Stage::Geometry => "geometry",
                         Stage::Compute => "compute in graphics pipeline",
+                        Stage::Geometry => "geometry bypassed geometry stage compilation",
                         Stage::VertexB | Stage::Fragment => unreachable!(),
                     }))
                 }
@@ -823,7 +915,7 @@ impl MetalPipelineCache {
         }
 
         #[cfg(feature = "metal-spirv-validation")]
-        if validate_direct_msl_enabled() {
+        if validate_direct_msl_enabled() && geometry.is_none() {
             let validation = catch_shader_exception(|| {
                 let mut bindings = Bindings::default();
                 translated
@@ -884,7 +976,17 @@ impl MetalPipelineCache {
                 ),
             }
         }
-        let vertex = vertex.ok_or(MetalPipelineError::MissingVertexStage)?;
+        let vertex = if let Some((shader, runtime, layout, invocations)) = geometry {
+            MetalVertexShader::Geometry(Arc::new(MetalGeometryShaderStages {
+                vertex: callable_vertex.ok_or(MetalPipelineError::MissingVertexStage)?,
+                shader,
+                runtime,
+                layout,
+                invocations,
+            }))
+        } else {
+            MetalVertexShader::Native(vertex.ok_or(MetalPipelineError::MissingVertexStage)?)
+        };
         Ok(Some(MetalGraphicsShaderStages {
             key: key.clone(),
             vertex,
@@ -905,9 +1007,8 @@ impl MetalPipelineCache {
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             return Ok(None);
         }
-        self.graphics_key
-            .fixed_state
-            .refresh(draw, &self.dynamic_features);
+        let features = self.graphics_features_for_stages();
+        self.graphics_key.fixed_state.refresh(draw, &features);
         let key = self.graphics_key.clone();
         if !self.graphics_shader_modules.contains_key(&key) {
             let mut environments = GraphicsEnvironments::default();
@@ -934,6 +1035,30 @@ impl MetalPipelineCache {
             self.graphics_shader_modules.insert(key.clone(), stages);
         }
         Ok(self.graphics_shader_modules.get(&key).cloned())
+    }
+
+    pub fn get_or_create_geometry_pipeline(
+        &mut self,
+        key: MetalRenderPipelineKey,
+        stages: &MetalGeometryShaderStages,
+        fragment: Option<&MetalShaderModule>,
+    ) -> Result<Arc<MetalGeometryPipeline>, MetalPipelineError> {
+        if !self
+            .device
+            .profile()
+            .supports_sample_count(key.sample_count)
+        {
+            return Err(MetalPipelineError::UnsupportedSampleCount(key.sample_count));
+        }
+        if !self.geometry_pipelines.contains_key(&key) {
+            let pipeline = MetalGeometryPipeline::new(&self.device, &key, stages, fragment)?;
+            self.geometry_pipelines.insert(key, Arc::new(pipeline));
+        }
+        Ok(Arc::clone(
+            self.geometry_pipelines
+                .get(&key)
+                .expect("pipeline inserted above"),
+        ))
     }
 
     pub fn get_or_create_render_pipeline(
@@ -966,7 +1091,11 @@ impl MetalPipelineCache {
         if !self.render_pipelines.contains_key(&key) {
             let descriptor = MTLRenderPipelineDescriptor::new();
             descriptor.setVertexFunction(Some(vertex.function()));
-            descriptor.setFragmentFunction(fragment.map(MetalShaderModule::function));
+            descriptor.setFragmentFunction(
+                fragment
+                    .filter(|_| key.rasterization_enabled)
+                    .map(MetalShaderModule::function),
+            );
             descriptor.setRasterSampleCount(key.sample_count as usize);
             descriptor.setAlphaToCoverageEnabled(key.alpha_to_coverage);
             descriptor.setAlphaToOneEnabled(key.alpha_to_one);
@@ -1016,7 +1145,7 @@ impl MetalPipelineCache {
         MetalVertexInputState::from_fixed_state(
             &stages.key.fixed_state,
             &stages.stage_infos[0],
-            stages.vertex.bindings().buffer_count,
+            stages.vertex_bindings().buffer_count,
             self.device.profile().max_buffer_bindings_per_stage,
         )
     }
@@ -1041,7 +1170,8 @@ impl MetalPipelineCache {
         key.topology = metal_topology_class(fixed.topology());
         key.alpha_to_coverage = fixed.alpha_to_coverage_enabled();
         key.alpha_to_one = fixed.alpha_to_one_enabled();
-        key.rasterization_enabled = fixed.dynamic_state.rasterize_enable();
+        key.rasterization_enabled =
+            metal_rasterization_enabled(fixed, stages.geometry().map(|stage| stage.layout.topology));
         Ok(key)
     }
 
@@ -1614,6 +1744,23 @@ fn metal_blend_factor(factor: BlendFactor) -> MTLBlendFactor {
     }
 }
 
+/// Metal has no front-and-back cull mode. Keep executing pre-raster shaders,
+/// selecting a non-rasterizing PSO (and a void native vertex entry point).
+/// Culling applies to the last stage's triangle output, not its input topology.
+pub(crate) fn metal_rasterization_enabled(
+    fixed: &FixedPipelineState,
+    geometry_output: Option<OutputTopology>,
+) -> bool {
+    let triangles = geometry_output.map_or_else(
+        || metal_topology_class(fixed.topology()) == MTLPrimitiveTopologyClass::Triangle,
+        |topology| topology == OutputTopology::TriangleStrip,
+    );
+    fixed.dynamic_state.rasterize_enable()
+        && !(triangles
+            && fixed.dynamic_state.cull_enable()
+            && fixed.dynamic_state.cull_face() == CullFace::FrontAndBack)
+}
+
 fn metal_topology_class(topology: PrimitiveTopology) -> MTLPrimitiveTopologyClass {
     match topology {
         PrimitiveTopology::Points | PrimitiveTopology::Patches => MTLPrimitiveTopologyClass::Point,
@@ -1760,6 +1907,112 @@ mod tests {
 
     use super::*;
     use crate::renderer_metal::metal_shader::{compile_native_shader, MetalShaderCompileOptions};
+
+    #[test]
+    fn front_and_back_culling_only_disables_triangle_output_rasterization() {
+        let mut fixed = FixedPipelineState::default();
+        fixed.dynamic_state.set_rasterize_enable(true);
+        fixed.dynamic_state.set_cull_enable(true);
+        fixed.dynamic_state.set_cull_face(CullFace::FrontAndBack);
+        for (topology, triangle) in [
+            (PrimitiveTopology::Points, false),
+            (PrimitiveTopology::Lines, false),
+            (PrimitiveTopology::LineStrip, false),
+            (PrimitiveTopology::Triangles, true),
+            (PrimitiveTopology::TriangleStrip, true),
+            (PrimitiveTopology::TriangleFan, true),
+            (PrimitiveTopology::Quads, true),
+            (PrimitiveTopology::QuadStrip, true),
+        ] {
+            fixed.set_topology(topology);
+            assert_eq!(metal_rasterization_enabled(&fixed, None), !triangle);
+            // A line input can emit triangles, and a triangle input can emit points.
+            assert!(!metal_rasterization_enabled(&fixed, Some(OutputTopology::TriangleStrip)));
+            assert!(metal_rasterization_enabled(&fixed, Some(OutputTopology::LineStrip)));
+            assert!(metal_rasterization_enabled(&fixed, Some(OutputTopology::PointList)));
+        }
+        fixed.set_topology(PrimitiveTopology::Triangles);
+        for face in [CullFace::Front, CullFace::Back] {
+            fixed.dynamic_state.set_cull_face(face);
+            assert!(metal_rasterization_enabled(&fixed, None));
+        }
+        fixed.dynamic_state.set_cull_face(CullFace::FrontAndBack);
+        fixed.dynamic_state.set_cull_enable(false);
+        assert!(metal_rasterization_enabled(&fixed, None));
+        fixed.dynamic_state.set_rasterize_enable(false);
+        for output in [None, Some(OutputTopology::PointList), Some(OutputTopology::LineStrip)] {
+            assert!(!metal_rasterization_enabled(&fixed, output));
+        }
+    }
+
+    #[test]
+    fn non_rasterizing_native_pipeline_preserves_vertex_stores() {
+        use crate::renderer_metal::{metal_buffer::MetalBuffer, metal_scheduler::MetalScheduler};
+        use crate::renderer_metal::metal_shader::compile_direct_msl_shader_with_bindings;
+        use objc2_metal::{MTLLoadAction, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLStoreAction, MTLTextureDescriptor, MTLTextureUsage};
+        use shader_recompiler::ir::{opcodes::Opcode, SyntaxNode};
+        use shader_recompiler::ir_opt::collect_shader_info_pass::collect_shader_info_pass;
+        use shader_recompiler::shader_info::StorageBufferDescriptor;
+
+        let device = MetalDevice::new().unwrap();
+        let mut cache = MetalPipelineCache::new(device.clone());
+        let mut fixed = FixedPipelineState::default();
+        fixed.set_topology(PrimitiveTopology::Triangles);
+        fixed.dynamic_state.set_rasterize_enable(true);
+        fixed.dynamic_state.set_cull_enable(true);
+        fixed.dynamic_state.set_cull_face(CullFace::FrontAndBack);
+        let enabled = metal_rasterization_enabled(&fixed, None);
+        assert!(!enabled);
+        let mut program = Program::new(Stage::VertexB);
+        program.add_block();
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicIAdd32,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)],
+        );
+        collect_shader_info_pass(&mut program);
+        program.info.storage_buffers_descriptors.push(StorageBufferDescriptor {
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
+        });
+        let options = MetalShaderCompileOptions {
+            disable_rasterization: !enabled,
+            ..MetalShaderCompileOptions::for_device(device.profile())
+        };
+        let vertex = compile_direct_msl_shader_with_bindings(
+            device.device(), &program, cache.profile(), &RuntimeInfo::default(), &options,
+            &mut Bindings::default(),
+        ).unwrap();
+        assert!(vertex.source().source.contains("vertex void main0("));
+        let mut key = MetalRenderPipelineKey::new(1, 0);
+        key.rasterization_enabled = enabled;
+        key.color_attachments[0].format = MTLPixelFormat::RGBA8Unorm;
+        let state = cache.get_or_create_render_pipeline(key, &vertex, None).unwrap().retained_state();
+        let td = MTLTextureDescriptor::new();
+        td.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        td.setUsage(MTLTextureUsage::RenderTarget);
+        unsafe { td.setWidth(4); td.setHeight(4); }
+        let texture = device.device().newTextureWithDescriptor(&td).unwrap();
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&texture));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let counter = MetalBuffer::new(&device, 4).unwrap();
+        counter.write(0, &[0; 4]).unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        scheduler.begin_render_pass(&pass).unwrap();
+        scheduler.with_render_encoder(|encoder| {
+            encoder.setRenderPipelineState(&state);
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(Some(counter.handle()), 0, 0);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }).unwrap();
+        scheduler.finish_all().unwrap();
+        let mut bytes = [0; 4];
+        counter.read(0, &mut bytes).unwrap();
+        assert_eq!(u32::from_ne_bytes(bytes), 3);
+    }
 
     #[test]
     fn native_profile_matches_direct_metal_binding_model() {
@@ -2118,6 +2371,66 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// Manual offline validation; no game assets are embedded in the test suite.
+    /// This compiles all captured shader stages, not a rendered-frame oracle.
+    #[test]
+    #[ignore = "requires RUZU_REPLAY_GEOMETRY_PIPELINE pointing to a captured .bin"]
+    fn native_geometry_shader_stages_from_capture() {
+        use super::super::metal_geometry_pipeline::{MetalGeometryObject, MetalGeometryVertexPipeline};
+        use crate::renderer_vulkan::pipeline_cache::GEOMETRY_CAPTURE_VERSION;
+
+        let source = std::env::var_os("RUZU_REPLAY_GEOMETRY_PIPELINE")
+            .expect("set RUZU_REPLAY_GEOMETRY_PIPELINE to a geometry capture .bin");
+        // LoadPipelines deletes invalid files. Never give it the original capture
+        // or a user's live shader cache, even for this read-only investigation.
+        let copy = std::env::temp_dir().join(format!(
+            "ruzu-geometry-replay-{}-{}.bin", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::copy(source, &copy).unwrap();
+        let mut entries = Vec::new();
+        load_pipelines(
+            || false, &copy, GEOMETRY_CAPTURE_VERSION,
+            Box::new(|_, _| panic!("expected graphics environments")),
+            Box::new(|file, envs| {
+                let key = GraphicsPipelineKey::read_from_file(file)?;
+                entries.push((key, envs));
+                Ok(())
+            }),
+        );
+        let valid = copy.exists();
+        if valid {
+            std::fs::remove_file(copy).unwrap();
+        }
+        assert!(valid, "capture was rejected by the cache reader");
+        assert_eq!(entries.len(), 1, "expected one complete pipeline capture");
+        let (key, envs) = entries.pop().unwrap();
+        assert!(
+            key.fixed_state.serialized_size() >= FixedPipelineState::XFB_STATE_OFFSET,
+            "this cache key omits dynamic vertex formats/strides; capture the Metal path or supply a draw-state snapshot",
+        );
+        let device = MetalDevice::new().unwrap();
+        let cache = MetalPipelineCache::new(device.clone());
+        let mut environments = MetalPipelineCache::graphics_environments_from_files(envs);
+        let started = std::time::Instant::now();
+        let stages = MetalPipelineCache::build_graphics_shader_stages(
+            &device, cache.profile(), cache.host_info(), &key, &mut environments,
+        ).unwrap().expect("pipeline must have a vertex stage");
+        let geometry = stages.geometry().expect("capture must translate a geometry stage");
+        let input = cache.make_vertex_input_state(&stages).unwrap();
+        let _vertex = MetalGeometryVertexPipeline::new(
+            &device, &geometry.vertex, &input, &geometry.runtime,
+        ).expect("captured callable vertex shader must compile as a native producer");
+        let _object = MetalGeometryObject::new(
+            &device, &geometry.layout, &geometry.runtime, geometry.invocations,
+            geometry.shader.language_version(),
+        ).expect("captured geometry interface must compile as a native object shader");
+        eprintln!(
+            "Native geometry shader stages compiled: key={:016x}, elapsed={:?}, layout={:?}",
+            key.hash_value(), started.elapsed(), geometry.layout,
+        );
+    }
+
     #[test]
     fn direct_integer_fragment_output_matches_integer_color_attachment() {
         let device = MetalDevice::new().expect("Metal device must exist on macOS test hosts");
@@ -2141,6 +2454,26 @@ mod tests {
         variant.shader_variant_hash = 0x3333;
 
         assert_ne!(base, variant);
+    }
+
+    #[test]
+    fn provoking_vertex_modes_are_owned_only_by_geometry_assembly() {
+        let device = MetalDevice::new().unwrap();
+        let mut cache = MetalPipelineCache::new(device);
+        assert!(!cache.graphics_features_for_stages().has_provoking_vertex);
+        cache.graphics_key.unique_hashes[4] = 1;
+        let features = cache.graphics_features_for_stages();
+        assert!(features.has_provoking_vertex);
+        assert!(features.has_provoking_vertex_first_mode);
+        assert!(features.has_provoking_vertex_last_mode);
+        assert!(!features.has_provoking_vertex_tf_preserve);
+        assert!(!cache.dynamic_features.has_provoking_vertex);
+        let first_key = cache.graphics_key.clone();
+        cache.graphics_key.fixed_state.set_provoking_vertex_last(true);
+        assert_ne!(first_key.hash_value(), cache.graphics_key.hash_value());
+        assert_ne!(first_key.to_cache_bytes(), cache.graphics_key.to_cache_bytes());
+        cache.graphics_key.unique_hashes[4] = 0;
+        assert!(!cache.graphics_features_for_stages().has_provoking_vertex);
     }
 
     #[test]

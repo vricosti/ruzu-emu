@@ -13,6 +13,43 @@ use crate::ir::value::{InstRef, Value};
 use super::msl_emit_context::MslEmitContext;
 use super::MslError;
 
+/// Eden EmitSetAttribute: select the output interface and preserve raw integer
+/// bit patterns when the IR value is carried as a float.
+pub fn emit_set_attribute(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &ir::Inst,
+) -> Result<(), MslError> {
+    let Value::Attribute(attribute) = inst.arg(0) else {
+        return Err(MslError::ExpectedImmediate {
+            opcode: inst.opcode,
+            arg: 0,
+            expected: "attribute",
+        });
+    };
+    // Eden's EmitSetAttribute ignores vertex: these writes update the current
+    // output record, and GS EmitVertex captures that record separately.
+    if attribute.is_generic() {
+        return context.emit_set_generic(inst_ref, *attribute, inst.arg(1));
+    }
+    if attribute.is_position() {
+        return context.emit_set_position(inst_ref, attribute.position_element(), inst.arg(1));
+    }
+    if *attribute == crate::ir::value::Attribute::POINT_SIZE {
+        return context.emit_set_point_size(inst_ref, inst.arg(1));
+    }
+    if attribute.is_clip_distance() {
+        return context.emit_set_clip_distance(inst_ref, attribute.clip_distance_index(), inst.arg(1));
+    }
+    if *attribute == crate::ir::value::Attribute::LAYER {
+        return context.emit_set_layer(inst_ref, inst.arg(1));
+    }
+    if *attribute == crate::ir::value::Attribute::VIEWPORT_INDEX {
+        return context.emit_set_viewport_index(inst_ref, inst.arg(1));
+    }
+    Err(MslError::UnsupportedAttribute(attribute.0))
+}
+
 /// Emit the non-aliasing `uint4` CBUF path used by the Metal profile.
 pub fn emit_get_cbuf(
     context: &mut MslEmitContext,
@@ -74,6 +111,30 @@ pub fn emit_local_invocation_id(
         inst_ref,
         ir::Type::U32x3,
         "local_invocation_id".to_owned(),
+        false,
+    )
+}
+
+/// Geometry InvocationInfo follows Eden: input vertex count in bits 16..31.
+pub fn emit_invocation_info(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+) -> Result<(), MslError> {
+    let vertices = context.geometry_input_vertices()?;
+    context.define(
+        inst_ref,
+        ir::Type::U32,
+        format!("{}u", vertices << 16),
+        false,
+    )
+}
+
+pub fn emit_invocation_id(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
+    context.geometry_input_vertices()?;
+    context.define(
+        inst_ref,
+        ir::Type::U32,
+        "geometry_group.x".to_owned(),
         false,
     )
 }
@@ -171,6 +232,17 @@ pub fn emit_get_attribute(
             expected: "attribute",
         });
     };
+    if context.stage() == crate::stage::Stage::Geometry {
+        let expression = if *attribute == crate::ir::value::Attribute::PRIMITIVE_ID {
+            "as_type<float>(geometry_input.primitive_id)".to_owned()
+        } else if attribute.is_generic() || attribute.is_position() {
+            let vertex = context.value_expression(inst.arg(1), inst_ref, 1)?;
+            context.geometry_input_expression(*attribute, &vertex)
+        } else {
+            return Err(MslError::UnsupportedAttribute(attribute.0));
+        };
+        return context.define(inst_ref, ir::Type::F32, expression, false);
+    }
     if !matches!(inst.arg(1), Value::ImmU32(0)) {
         return Err(MslError::UnsupportedProgramFeature(
             "per-vertex input indexing",
@@ -228,6 +300,16 @@ pub fn emit_get_attribute_u32(
             expected: "attribute",
         });
     };
+    if context.stage() == crate::stage::Stage::Geometry
+        && *attribute == crate::ir::value::Attribute::PRIMITIVE_ID
+    {
+        return context.define(
+            inst_ref,
+            ir::Type::U32,
+            "geometry_input.primitive_id".to_owned(),
+            false,
+        );
+    }
     if !matches!(inst.arg(1), Value::ImmU32(0)) {
         return Err(MslError::UnsupportedProgramFeature(
             "per-vertex input indexing",

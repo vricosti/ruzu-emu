@@ -330,9 +330,11 @@ fn dump_a64_break_context(system: &System, info1: u64, info2: u64) {
 
     if info1 != 0 && info2 > 0 && info2 < 0x200 {
         let len = info2 as usize;
-        let memory = process.get_shared_memory();
-        let mem = memory.read().unwrap();
-        if mem.is_valid_range(info1, len) {
+        let Some(memory) = process.get_memory() else {
+            return;
+        };
+        let mem = memory.lock().unwrap();
+        if info1.checked_add(info2).is_some() && mem.is_valid_virtual_address_range(info1, info2) {
             let mut hexdump = String::new();
             for index in 0..len {
                 let byte = mem.read_8(info1 + index as u64);
@@ -349,16 +351,20 @@ fn dump_a64_stack_scan(process: &crate::hle::kernel::k_process::KProcess, sp: u6
     const STACK_SCAN_BYTES: usize = 0x400;
     const STACK_DUMP_BYTES: usize = 0x100;
 
-    let memory = process.get_shared_memory();
-    let mem = memory.read().unwrap();
-    if !mem.is_valid_range(sp, 8) {
+    let Some(memory) = process.get_memory() else {
+        return;
+    };
+    let mem = memory.lock().unwrap();
+    if sp.checked_add(STACK_SCAN_BYTES as u64).is_none()
+        || !mem.is_valid_virtual_address_range(sp, 8)
+    {
         log::error!("  break_stack: sp=0x{:016X} is not mapped", sp);
         return;
     }
 
     let dump_len = (0..STACK_DUMP_BYTES)
         .step_by(8)
-        .take_while(|offset| mem.is_valid_range(sp + *offset as u64, 8))
+        .take_while(|offset| mem.is_valid_virtual_address_range(sp + *offset as u64, 8))
         .count()
         * 8;
     log::error!(
@@ -370,7 +376,7 @@ fn dump_a64_stack_scan(process: &crate::hle::kernel::k_process::KProcess, sp: u6
         let mut values = [0u64; 4];
         for (index, value) in values.iter_mut().enumerate() {
             let addr = sp + offset as u64 + (index as u64 * 8);
-            if mem.is_valid_range(addr, 8) {
+            if mem.is_valid_virtual_address_range(addr, 8) {
                 *value = mem.read_64(addr);
             }
         }
@@ -386,7 +392,7 @@ fn dump_a64_stack_scan(process: &crate::hle::kernel::k_process::KProcess, sp: u6
 
     for offset in (0..STACK_SCAN_BYTES).step_by(8) {
         let addr = sp + offset as u64;
-        if !mem.is_valid_range(addr, 8) {
+        if !mem.is_valid_virtual_address_range(addr, 8) {
             break;
         }
         let value = mem.read_64(addr);

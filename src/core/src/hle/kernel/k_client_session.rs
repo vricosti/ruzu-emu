@@ -217,8 +217,8 @@ impl KClientSession {
 
         let should_finalize =
             if let Some(parent_session) = process.get_session_by_object_id(parent_id) {
+                KSession::on_client_closed(&parent_session);
                 let mut parent = parent_session.lock().unwrap();
-                parent.on_client_closed_with_process(process);
                 parent.close_client_endpoint()
             } else {
                 false
@@ -243,6 +243,65 @@ mod tests {
     use crate::hle::kernel::k_session::KSession;
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn client_close_releases_parent_before_waiting_for_server() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let session = Arc::new(Mutex::new(KSession::new()));
+        let (client, server) = {
+            let mut parent = session.lock().unwrap();
+            parent.initialize(None, 0);
+            parent.client.lock().unwrap().initialize(0x1000);
+            (parent.client.clone(), parent.server.clone())
+        };
+        let server_guard = server.lock().unwrap();
+        let closing_session = session.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            let mut process = KProcess::new();
+            process.register_session_object(0x1000, closing_session);
+            started_tx.send(()).unwrap();
+            client.lock().unwrap().destroy_with_process(&mut process);
+            process.get_session_by_object_id(0x1000).is_none()
+        });
+        started_rx.recv().unwrap();
+
+        // Hold the server endpoint as the concurrent server destroy does.
+        // Even while its notification is blocked, client close must release
+        // the parent and retain its parent reference until notification ends.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut parent_available = false;
+        let mut finalized_early = false;
+        while Instant::now() < deadline {
+            if let Ok(mut parent) = session.try_lock() {
+                if parent.is_client_closed() {
+                    // Both closed predicates mean non-Normal upstream. Here
+                    // only the client destroy can have made that transition.
+                    parent_available = true;
+                    parent.on_server_closed();
+                    finalized_early = parent.close_server_endpoint();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Always unblock and join before asserting, including on the old bug.
+        drop(server_guard);
+        let finalized_after_notification = close_thread.join().unwrap();
+        assert!(
+            parent_available,
+            "client close held parent while waiting for server"
+        );
+        assert!(
+            !finalized_early,
+            "client reference released before notification"
+        );
+        assert!(server.lock().unwrap().client_closed);
+        assert!(finalized_after_notification);
+    }
 
     fn install_test_current_thread(thread_id: u64) -> Arc<KThreadLock> {
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));

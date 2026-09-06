@@ -90,14 +90,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         };
-        let time_manager_user = Arc::clone(&time_manager);
+        let time_manager_user = Arc::downgrade(&time_manager);
         let system_user = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
                 system_user,
                 user_setup,
                 "time:u",
-                Arc::clone(&time_manager_user),
+                time_manager_user
+                    .upgrade()
+                    .expect("Glue time lifetime has ended"),
             ))
         });
         server_manager.register_named_service("time:u", factory, 64);
@@ -112,14 +114,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         };
-        let time_manager_admin = Arc::clone(&time_manager);
+        let time_manager_admin = Arc::downgrade(&time_manager);
         let system_admin = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
                 system_admin,
                 admin_setup,
                 "time:a",
-                Arc::clone(&time_manager_admin),
+                time_manager_admin
+                    .upgrade()
+                    .expect("Glue time lifetime has ended"),
             ))
         });
         server_manager.register_named_service("time:a", factory, 64);
@@ -134,14 +138,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
             can_write_steady_clock: true,
             can_write_uninitialized_clock: false,
         };
-        let time_manager_repair = Arc::clone(&time_manager);
+        let time_manager_repair = Arc::downgrade(&time_manager);
         let system_repair = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
                 system_repair,
                 repair_setup,
                 "time:r",
-                Arc::clone(&time_manager_repair),
+                time_manager_repair
+                    .upgrade()
+                    .expect("Glue time lifetime has ended"),
             ))
         });
         server_manager.register_named_service("time:r", factory, 64);
@@ -157,14 +163,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         };
-        let time_manager_psc = Arc::clone(&time_manager);
+        let time_manager_psc = Arc::downgrade(&time_manager);
         let system_psc = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
                 system_psc,
                 psc_setup,
                 "time:s",
-                Arc::clone(&time_manager_psc),
+                time_manager_psc
+                    .upgrade()
+                    .expect("Glue time lifetime has ended"),
             ))
         });
         server_manager.register_named_service("time:s", factory, 64);
@@ -174,6 +182,19 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         "Glue::LoopProcess: registered arp, bgtc, ectx, notif, time services \
          (time:s temporary, belongs to PSC)"
     );
+
+    // Upstream keeps `time` on LoopProcess's native stack. A stopped Rust
+    // guest fiber can discard that stack without running local destructors.
+    // Transfer the strong owner to the existing post-fiber service lifecycle
+    // (as AM does for WindowSystem). Factories above only borrow this lifetime:
+    // a retained ServerManager must not keep TimeWorker running after shutdown.
+    if !system.is_null() {
+        system
+            .get()
+            .kernel()
+            .expect("Glue requires an initialized kernel")
+            .retain_service_lifetime_owner(time_manager);
+    }
 
     // Upstream: ServerManager::RunServer(std::move(server_manager));
     ServerManager::run_server_shared(server_manager);

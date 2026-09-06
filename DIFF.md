@@ -12908,3 +12908,97 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 - No production behavior changed in this file. The regression fails before
   the context fix with an undeclared loop value, as observed in Harbinger.
+
+## 2026-09-05 — src/core/src/arm/dynarmic/arm_dynarmic_64.rs vs core/arm/dynarmic/arm_dynarmic_64.{h,cpp}
+
+### Intentional differences
+
+- GetContext/SetContext now use the existing bulk JIT register accessors, in
+  upstream order. The remaining representation adaptation is explicit conversion
+  between Dynarmic `[lo, hi]` vector lanes and ThreadContext `u128` values;
+  no pointer cast or struct layout assumption is introduced. The regression
+  checks every register and both halves of every vector against scalar JIT
+  accessors, along with status registers, TLS and untouched padding.
+
+## 2026-09-05 — src/core/src/cpu_manager.rs vs core/cpu_manager.{h,cpp}
+
+### Intentional differences
+
+- The Rust-only SVC trace remains available, but its context snapshot is now
+  guarded by the logger's enabled check. Eden's MultiCoreRunGuestThread does
+  not prepare this diagnostic snapshot. The separate snapshot used by the
+  SIGUSR1 diagnostic and optional SVC ring is unchanged; this slice does not
+  alter scheduling, IPC dispatch, or guest-visible register state.
+
+## 2026-09-06 — src/core/src/hle/service/glue/glue.rs vs core/hle/service/glue/glue.{h,cpp}
+
+### Intentional differences
+
+- Upstream's local shared TimeManager survives throughout LoopProcess and is
+  destroyed when the service thread returns. Cooperative Rust fiber shutdown
+  can discard that stack without running its local destructors. Glue now
+  transfers its strong TimeManager owner to KernelCore's existing post-fiber
+  service lifecycle, as AM already does for WindowSystem. Lazy service factories
+  retain weak references and only upgrade while constructing StaticService;
+  they cannot prolong TimeWorker's host thread after CPU shutdown. StaticService
+  already owns the resource Arcs it needs, not the TimeManager itself.
+- The TimeWorker destructor and clock/event dispatch order are unchanged.
+  Its synthetic dispatch test additionally verifies release through the real
+  post-fiber owner mechanism with a weak reference still retained.
+
+### Missing items
+
+- This fixes Glue's worker lifetime, not general unwinding of abandoned guest
+  fiber stacks. Other server-manager references retained on such stacks require
+  a separate lifecycle audit.
+
+## 2026-09-06 — src/core/src/hle/service/os/{event,multi_wait,multi_wait_holder}.rs vs core/hle/service/os/{event,multi_wait,multi_wait_holder}.{h,cpp}
+
+### Intentional differences
+
+- Eden waits through KSynchronizationObject's wait list. Rust's existing fallback
+  for host threads without an emulated thread context cannot enter that scheduler
+  wait. When all holders wrap service Events, it now registers a shared host
+  notification token and blocks on a condition variable rather than polling
+  every 100 microseconds. Event holds only weak tokens in a lazily allocated list;
+  the blocking caller owns its token. Events without host waiters acquire no
+  additional mutex during Signal.
+- Registration precedes a fresh ordered signaled-state scan, and the token
+  remembers notification between scan and sleep. Wakeup always rescans the
+  whole set and does not reset events. Timeout accounting uses elapsed host
+  time for this fallback, not emulated hardware ticks. The native kernel wait
+  path and non-Event holder fallback remain separate and unchanged, except
+  that finite timeouts are now honored by the latter too.
+- TimeWorker's null-System test path uses the same local blocking wait as the
+  runtime host fallback. Its destructor already signals Exit after requesting
+  stop, so no polling cancellation loop is required. Clock dispatch and its
+  event priority order remain unchanged from worker.cpp.
+- Regressions cover ordered/manual-reset selection, two simultaneous waiters,
+  the scan-to-sleep notification window, finite timeout and weak-token cleanup.
+
+### Missing items
+
+- Host waits containing native Process/Port/Session/ReadableEvent holders still
+  use the previous polling fallback when no guest scheduler context exists;
+  TimeWorker's set contains only service Event holders. This is not a replacement
+  for all kernel synchronization infrastructure.
+
+## 2026-09-06 — src/video_core/src/texture_cache/texture_cache.rs vs video_core/texture_cache/texture_cache.{h,cpp}
+
+### Intentional differences
+
+- UploadImageContents and QueueAsyncDecode now use the existing GpuGuestMemory
+  UnsafeRead accessor, including upstream's caller-owned scratch fallback for
+  non-contiguous memory, instead of always copying the entire guest image.
+  The existing GpuMemoryManagerHandle retains the channel memory owner and
+  acquires its mutex only during memory operations; no channel mutex is held
+  during conversion or backend calls.
+- Rust ends the scratch-buffer borrow after synchronous unswizzling and before
+  the mutable backend upload call. Unlike the scoped write accessor, this read
+  accessor has no writeback on destruction. Async conversion still receives an
+  owned linear buffer, never a guest pointer. Cache flags, flush policy, copy
+  descriptors, conversion order and accelerated upload selection are unchanged.
+- The synthetic upload regression checks identical block-linear output for
+  contiguous and fragmented GPU mappings across successive guest writes, no
+  scratch mutation for direct spans, fallback scratch contents, and no cache
+  flush under UnsafeRead.

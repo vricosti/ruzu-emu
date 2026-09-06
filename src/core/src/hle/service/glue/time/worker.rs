@@ -356,7 +356,7 @@ impl TimeWorker {
                                 .kernel()
                                 .and_then(|kernel| multi_wait.wait_any(kernel))
                         } else {
-                            wait_any_local(&multi_wait, &stop_requested)
+                            multi_wait.wait_any_local()
                         };
                         let Some(signaled) = signaled else {
                             continue;
@@ -551,19 +551,6 @@ fn duration_from_positive_ns(nanoseconds: i64) -> Duration {
     )
 }
 
-fn wait_any_local(
-    multi_wait: &MultiWait,
-    stop_requested: &AtomicBool,
-) -> Option<*mut MultiWaitHolder> {
-    while !stop_requested.load(Ordering::Acquire) {
-        if let Some(holder) = multi_wait.try_wait_any_local() {
-            return Some(holder);
-        }
-        std::thread::sleep(Duration::from_micros(100));
-    }
-    None
-}
-
 fn encode_system_clock_context(context: &SystemClockContext) -> [u8; 0x20] {
     let mut out = [0u8; 0x20];
     unsafe {
@@ -712,6 +699,15 @@ mod tests {
             observed,
             "TimeWorker did not dispatch the local-clock event"
         );
-        drop(worker);
+        // Glue's guest service stack may be abandoned during shutdown. The
+        // kernel's post-fiber owner must still destroy the worker and join its
+        // host thread, even while weak factory references remain alive.
+        let kernel = crate::hle::kernel::kernel::KernelCore::new();
+        let owner = Arc::new(Mutex::new(worker));
+        let factory_reference = Arc::downgrade(&owner);
+        kernel.retain_service_lifetime_owner(owner);
+        assert!(factory_reference.upgrade().is_some());
+        kernel.finalize_services_after_cpu_shutdown();
+        assert!(factory_reference.upgrade().is_none());
     }
 }

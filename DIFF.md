@@ -13299,3 +13299,22 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The GTK dialog persists its four Controls keys plus TAS directory on acceptance;
   Eden applies through its long-lived Qt configuration owner. No serialized binary
   payloads are changed by this UI/settings slice.
+
+## 2026-09-06 — tools/capture_harness/{src,rdc_trigger.c} (diagnostic tooling; no Eden counterpart)
+
+### Intentional differences
+
+- This is project-owned tooling, not an emulation port. No matching capture harness or uinput
+  timeline helper was found in Eden. Linux recording/replay lives in `linux_input.rs`; versioned
+  input data and worker lifetime live in `session.rs`; RenderDoc launch/control lives in
+  `renderdoc.rs`. The existing screenshot/logical-button orchestration remains in `main.rs`.
+- The earlier diagnostic C uinput helpers are replaced by Rust evdev/uinput recording and replay,
+  with explicit device selection and monotonic packet timestamps. RenderDoc retains a small C
+  preload bridge compiled against the SDK's `renderdoc_app.h`, avoiding a duplicated API-table ABI.
+  Review against that header preserves TriggerMultiFrameCapture's active API/window semantics and
+  checks GetNumCaptures/GetCapture completion; it does not assume the GTK window is the Vulkan target.
+- This changes no emulator scheduling or controller settings. Raw input workers are independent of
+  screenshot delays, and normal timeline completion joins them without cancelling an event exactly
+  at the deadline. Input loss invalidates a recording; replay releases virtual keys and restores
+  initial axes on controlled exit. Force feedback, multitouch and interactive replay checkpoints
+  are outside this tooling version, documented in its README.

@@ -203,10 +203,12 @@ pub struct KServerSession {
     pub manager: Option<Arc<Mutex<SessionRequestManager>>>,
     /// Waitable synchronization state owned by KSynchronizationObject upstream.
     pub sync_object: SynchronizationObjectState,
-    /// Weak back-pointer to the owning ServerManager's wakeup event. The
-    /// session holder is temporarily unlinked while its request is handled, so
-    /// this event closes the interval in which a new request cannot notify a
-    /// waiter on the session object itself.
+    /// The existing asynchronous ServerManager registration has been queued
+    /// or completed. This marker does not carry a second wakeup mechanism.
+    pub manager_registration_queued: bool,
+    /// Null-kernel ServerManager fixture notification. Runtime managers wait
+    /// directly on this session's native synchronization object.
+    #[cfg(test)]
     pub manager_wakeup: Option<std::sync::Weak<Event>>,
     /// Rust bridge for endpoint-close ownership. Closure notifications return
     /// to the owning ServerManager through this queue so destruction remains
@@ -2029,15 +2031,16 @@ impl KServerSession {
             client_closed: false,
             manager: None,
             sync_object: SynchronizationObjectState::new(),
+            manager_registration_queued: false,
+            #[cfg(test)]
             manager_wakeup: None,
             manager_close_queue: None,
             manager_close_wakeup: None,
         }
     }
 
-    /// Wire the ServerManager's wakeup_event so that `notify_available` reacts
-    /// in microseconds instead of the host-thread loop's 100 ms idle timeout.
-    /// Called by `ServerManager::register_session`.
+    /// Connect a null-kernel ServerManager unit-test fixture.
+    #[cfg(test)]
     pub fn set_manager_wakeup(&mut self, wakeup: std::sync::Weak<Event>) {
         self.manager_wakeup = Some(wakeup);
     }
@@ -2808,12 +2811,10 @@ impl KServerSession {
         if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
             common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[28, object_id]);
         }
-        // The session synchronization object above is the kernel wakeup used
-        // by Eden's ServerManager. Ruzu also has a host Condvar fallback, so
-        // wake that side without recursively signaling the manager's kernel
-        // KEvent while the scheduler lock is held. ServerManager signals its
-        // kernel wakeup event itself when it links deferred holders, matching
-        // Eden's `LinkToDeferredList` ownership.
+        // Only null-kernel unit-test managers need a second notification.
+        // Runtime managers use the native session wait list above; deferred
+        // holders are rescanned after relinking, so arrivals are not lost.
+        #[cfg(test)]
         if let Some(weak) = self.manager_wakeup.as_ref() {
             if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
                 common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[29, object_id]);

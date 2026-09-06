@@ -142,6 +142,7 @@ impl MultiWaitHolder {
     }
 
     /// Host counterpart of GetNativeHandle for the local Event wait path.
+    #[cfg(test)]
     pub(super) fn host_event(&self) -> Option<&Event> {
         match &self.native_handle {
             WaitableHandle::Event(event) => Some(event),

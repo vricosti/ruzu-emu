@@ -647,7 +647,7 @@ impl Sm {
                 }
 
                 let (session_object_id, client_session_object_id, server_session) = {
-                    let mut port_guard = port.lock().unwrap();
+                    let port_guard = port.lock().unwrap();
                     if port_guard.is_light() {
                         log::error!("  GetService(\"{}\"): light ports not yet ported", name);
                         return (RESULT_INVALID_STATE, None);
@@ -696,7 +696,8 @@ impl Sm {
                             );
                             panic!("created server session must be registered");
                         });
-                    let enqueue_result = port_guard.enqueue_session(session_object_id);
+                    drop(port_guard);
+                    let enqueue_result = crate::hle::kernel::k_port::KPort::enqueue_session_arc(&port, session_object_id);
                     if enqueue_result.is_error() {
                         process.unregister_client_session_object_by_object_id(
                             client_session_object_id,

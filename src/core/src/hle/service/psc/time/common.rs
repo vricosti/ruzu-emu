@@ -158,7 +158,8 @@ pub struct OperationEvent {
     id: u64,
     /// Kernel event for signaling context changes.
     /// Corresponds to `Kernel::KEvent* m_event` in upstream.
-    event: std::sync::Arc<crate::hle::service::os::event::Event>,
+    event: u32,
+    ctx: std::sync::Arc<crate::hle::service::kernel_helpers::ServiceContext>,
 }
 
 static NEXT_OPERATION_EVENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -169,9 +170,12 @@ impl OperationEvent {
     /// Corresponds to `OperationEvent::OperationEvent(Core::System&)` in upstream.
     pub fn new() -> Self {
         let id = NEXT_OPERATION_EVENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut ctx = crate::hle::service::kernel_helpers::ServiceContext::new("Time:OperationEvent".into());
+        let event = ctx.create_event("Time:OperationEvent:Event".into());
         Self {
             id,
-            event: std::sync::Arc::new(crate::hle::service::os::event::Event::new()),
+            event,
+            ctx: std::sync::Arc::new(ctx),
         }
     }
 
@@ -184,11 +188,11 @@ impl OperationEvent {
     ///
     /// Corresponds to `m_event->Signal()` in upstream.
     pub fn signal(&self) {
-        self.event.signal();
+        self.get_event().signal();
     }
 
     pub fn get_event(&self) -> std::sync::Arc<crate::hle::service::os::event::Event> {
-        std::sync::Arc::clone(&self.event)
+        self.ctx.get_event(self.event).expect("operation event must exist")
     }
 }
 

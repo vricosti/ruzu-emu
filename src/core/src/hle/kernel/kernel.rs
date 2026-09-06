@@ -1630,6 +1630,7 @@ std::thread_local! {
     static CURRENT_THREAD: RefCell<Option<Weak<KThreadLock>>> = RefCell::new(None);
     static CURRENT_THREAD_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CURRENT_THREAD_PTR: std::cell::Cell<*mut KThread> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static CURRENT_THREAD_IS_CACHED_HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static HOST_DUMMY_THREAD: RefCell<Option<Arc<KThreadLock>>> = const { RefCell::new(None) };
 }
 
@@ -1637,7 +1638,19 @@ std::thread_local! {
 fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
     HOST_DUMMY_THREAD.with(|cell| {
         if let Some(thread) = cell.borrow().as_ref() {
-            return Arc::clone(thread);
+            let belongs_to_kernel = match (
+                thread.lock().unwrap().global_scheduler_context.as_ref(),
+                kernel.global_scheduler_context(),
+            ) {
+                (Some(owner), Some(current)) => owner.ptr_eq(&Arc::downgrade(current)),
+                // Constructor/null-scheduler fixtures still need a stable
+                // identity: KLightLock encodes the owner's thread pointer.
+                (None, None) => true,
+                _ => false,
+            };
+            if belongs_to_kernel {
+                return Arc::clone(thread);
+            }
         }
 
         let thread = Arc::new(KThreadLock::new(KThread::new()));
@@ -1660,16 +1673,21 @@ fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
 #[inline(never)]
 pub fn get_current_emu_thread() -> Option<Arc<KThreadLock>> {
     let current = CURRENT_THREAD.with(|cell| cell.borrow().as_ref().and_then(Weak::upgrade));
-    if current.is_some() {
-        return current;
+    if let Some(thread) = current.as_ref() {
+        let cached_host = HOST_DUMMY_THREAD.with(|cell| {
+            cell.borrow().as_ref().is_some_and(|cached| Arc::ptr_eq(cached, thread))
+        });
+        if !cached_host {
+            return current;
+        }
+        // A persistent host worker can survive Stop/Start. Revalidate its own
+        // cached dummy against the current kernel before entering a new wait;
+        // explicit guest/service-thread identities are not substituted here.
     }
 
-    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
-    if kernel_ptr.is_null() {
-        return None;
-    }
-
-    let kernel = unsafe { &*kernel_ptr };
+    // Use the same kernel owner as dummy initialization. This also respects
+    // the explicit thread-local kernel owner of isolated unit-test fixtures.
+    let kernel = get_kernel_ref()?;
     let dummy = get_or_create_host_dummy_thread(kernel);
     set_current_emu_thread(Some(&dummy));
     Some(dummy)
@@ -1679,6 +1697,13 @@ pub fn get_current_emu_thread() -> Option<Arc<KThreadLock>> {
 /// Upstream: `KernelCore::Impl::SetCurrentEmuThread(KThread*)`.
 #[inline(never)]
 pub fn set_current_emu_thread(thread: Option<&Arc<KThreadLock>>) {
+    CURRENT_THREAD_IS_CACHED_HOST.with(|current| {
+        current.set(HOST_DUMMY_THREAD.with(|cached| {
+            thread.is_some_and(|thread| {
+                cached.borrow().as_ref().is_some_and(|cached| Arc::ptr_eq(cached, thread))
+            })
+        }));
+    });
     CURRENT_THREAD.with(|cell| {
         *cell.borrow_mut() = thread.map(Arc::downgrade);
     });
@@ -1710,7 +1735,12 @@ pub fn set_current_emu_thread(thread: Option<&Arc<KThreadLock>>) {
 /// Returns `false` only when the kernel itself has not been initialized
 /// (`KERNEL_PTR` is null, e.g., in unit tests with no kernel).
 fn ensure_current_thread_populated() -> bool {
-    if CURRENT_THREAD_ID.with(|cell| cell.get()) != 0 {
+    // A persistent host worker may still cache the previous kernel's dummy.
+    // Refresh on fast access too, before scheduler-lock entry increments its
+    // dispatch count. Explicit guest identities retain their direct fast path.
+    if CURRENT_THREAD_ID.with(|cell| cell.get()) != 0
+        && !CURRENT_THREAD_IS_CACHED_HOST.with(|cell| cell.get())
+    {
         return true;
     }
     // get_current_emu_thread lazily creates the dummy and calls
@@ -1725,7 +1755,7 @@ pub fn get_current_thread_id_fast() -> Option<u64> {
     // CPU execution. Populate lazily via the dummy-thread fallback if
     // the thread-local hasn't been set yet on this host thread.
     let thread_id = CURRENT_THREAD_ID.with(|cell| cell.get());
-    if thread_id != 0 {
+    if thread_id != 0 && !CURRENT_THREAD_IS_CACHED_HOST.with(|cell| cell.get()) {
         return Some(thread_id);
     }
     if !ensure_current_thread_populated() {
@@ -1743,7 +1773,7 @@ pub fn get_current_thread_id_fast() -> Option<u64> {
 pub fn with_current_thread_fast_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> Option<R> {
     // Same totality semantics as get_current_thread_id_fast.
     let ptr = CURRENT_THREAD_PTR.with(|cell| cell.get());
-    if !ptr.is_null() {
+    if !ptr.is_null() && !CURRENT_THREAD_IS_CACHED_HOST.with(|cell| cell.get()) {
         return Some(unsafe { f(&mut *ptr) });
     }
     if !ensure_current_thread_populated() {
@@ -2500,6 +2530,10 @@ impl KernelCore {
         // `System::shutdown_main_process`, so callback globals can no longer
         // safely expose this kernel while the scheduler owners are released.
         self.shutdown_threads.clear();
+        // Host TLS survives a Stop/Start on the GUI thread. Do not reuse a
+        // dummy whose global scheduler has just been destroyed.
+        set_current_emu_thread(None);
+        HOST_DUMMY_THREAD.with(|thread| *thread.borrow_mut() = None);
         KERNEL_PTR.store(std::ptr::null_mut(), Ordering::Release);
         SCHEDULER_LOCK_PTR.store(std::ptr::null_mut(), Ordering::Release);
         PENDING_ACTIVE_CORE_UPDATES.lock().unwrap().clear();
@@ -4116,6 +4150,86 @@ mod tests {
                 .get_current_value(LimitableResource::ThreadCountMax),
             0
         );
+    }
+
+    #[test]
+    fn parentless_host_identity_initialization_does_not_relock_scheduler_context() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut kernel = Box::new(KernelCore::new());
+        kernel.initialize();
+        let gsc = Arc::clone(kernel.global_scheduler_context().unwrap());
+        let guard = gsc.lock().unwrap();
+        let expected_lock = std::ptr::addr_of!(guard.m_scheduler_lock) as usize;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let thread = get_current_emu_thread().unwrap();
+            let thread = thread.lock().unwrap();
+            ready_tx.send((thread.parent.is_none(), thread.scheduler_lock_ptr)).unwrap();
+        });
+        // Holding this mutex reproduces identity creation from the scheduler's
+        // priority-update callback. Release it even on failure so the test can
+        // report a regression rather than leaving a blocked worker behind.
+        let result = ready_rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        kernel.shutdown();
+        assert_eq!(result.unwrap(), (true, expected_lock));
+    }
+
+    #[test]
+    fn parentless_host_identity_is_replaced_after_kernel_restart() {
+        let mut kernel = Box::new(KernelCore::new());
+        kernel.initialize();
+        let first = kernel.get_current_emu_thread().unwrap();
+        assert!(first.lock().unwrap().parent.is_none());
+        kernel.shutdown();
+        kernel.initialize();
+        let second = kernel.get_current_emu_thread().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second.lock().unwrap().parent.is_none());
+        assert!(second.lock().unwrap().global_scheduler_context.as_ref().unwrap()
+            .ptr_eq(&Arc::downgrade(kernel.global_scheduler_context().unwrap())));
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn persistent_host_waiter_refreshes_its_own_identity_after_restart() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut kernel = Box::new(KernelCore::new());
+        kernel.initialize();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(get_current_emu_thread().unwrap()).unwrap();
+            resume_rx.recv().unwrap();
+            // Scheduler-lock entry uses the fast identity/dispatch cache.
+            // It must refresh before disabling dispatch, not halfway through
+            // unlock when the normal current-thread accessor is called.
+            let fast_id = get_current_thread_id_fast().unwrap();
+            let lock = scheduler_lock().unwrap();
+            {
+                let _guard = super::super::k_scheduler_lock::KScopedSchedulerLock::new(lock);
+                assert_eq!(with_current_thread_fast_mut(|thread| {
+                    thread.get_disable_dispatch_count()
+                }), Some(1));
+                assert_eq!(get_current_emu_thread().unwrap().lock().unwrap().get_thread_id(), fast_id);
+            }
+            let current = get_current_emu_thread().unwrap();
+            assert_eq!(current.lock().unwrap().get_disable_dispatch_count(), 0);
+            ready_tx.send(current).unwrap();
+        });
+        let first = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        kernel.shutdown();
+        kernel.initialize();
+        resume_tx.send(()).unwrap();
+        let second = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second.lock().unwrap().global_scheduler_context.as_ref().unwrap()
+            .ptr_eq(&Arc::downgrade(kernel.global_scheduler_context().unwrap())));
+        worker.join().unwrap();
+        kernel.shutdown();
     }
 
     #[test]

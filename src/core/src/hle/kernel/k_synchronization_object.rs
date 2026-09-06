@@ -43,8 +43,8 @@ pub struct ThreadListNode {
     pub next: *mut ThreadListNode,
     /// Weak ref to the waiter. Upgraded on signal to call notify_available.
     pub thread: Weak<KThreadLock>,
-    /// Object id this node is linked into — used to compute the synced_index
-    /// in the queue callback when the thread is notified.
+    /// Diagnostic ID of the object this node is linked into. Wait selection
+    /// compares native synchronization-state pointers, not numeric IDs.
     pub object_id: u64,
     _pin: PhantomPinned,
 }
@@ -198,6 +198,9 @@ impl Default for SynchronizationObjectState {
 pub struct SynchronizationWaitContext {
     pub nodes: Box<[ThreadListNode]>,
     pub object_ids: Vec<u64>,
+    /// Keep native objects alive until all nodes have been unlinked, including
+    /// when an IPC transaction defers the guest fiber switch past Wait's return.
+    objects: Vec<WaitableObject>,
     /// Raw pointers to the SynchronizationObjectState each node is linked into.
     /// SAFETY: only dereferenced under the scheduler lock.
     pub object_states: Vec<*mut SynchronizationObjectState>,
@@ -209,6 +212,7 @@ impl SynchronizationWaitContext {
         Self {
             nodes: Box::new([]),
             object_ids: Vec::new(),
+            objects: Vec::new(),
             object_states: Vec::new(),
             active: false,
         }
@@ -227,13 +231,15 @@ impl SynchronizationWaitContext {
         self.object_ids.clear();
         self.object_states.clear();
         self.active = false;
+        self.objects.clear();
     }
 
-    /// Match a signaled object_id against the object list; return wait_index.
-    pub fn synced_index_for(&self, signaled_object_id: u64) -> Option<usize> {
-        self.object_ids
+    /// Compare native object identity, as upstream compares object pointers.
+    /// IDs from process/session/event namespaces need not be distinct.
+    pub fn synced_index_for(&self, signaled_object: *const SynchronizationObjectState) -> Option<usize> {
+        self.object_states
             .iter()
-            .position(|&oid| oid == signaled_object_id)
+            .position(|&state| std::ptr::eq(state, signaled_object))
     }
 }
 
@@ -267,7 +273,7 @@ impl ThreadQueueImplForKSynchronizationObjectWait {
     fn notify_available(
         wait_queue: &KThreadQueue,
         thread: &mut KThread,
-        signaled_object_id: u64,
+        signaled_object: *const SynchronizationObjectState,
         wait_result: u32,
     ) -> bool {
         if !thread.sync_wait_context.is_active() {
@@ -277,7 +283,7 @@ impl ThreadQueueImplForKSynchronizationObjectWait {
         // Compute synced_index.
         let synced_index = thread
             .sync_wait_context
-            .synced_index_for(signaled_object_id)
+            .synced_index_for(signaled_object)
             .map(|i| i as i32)
             .unwrap_or(-1);
 
@@ -568,13 +574,13 @@ impl KSynchronizationObject {
 /// Walk a sync object's waiter list and call `notify_available` on each
 /// thread. Mirrors upstream `KSynchronizationObject::NotifyAvailable`.
 ///
-/// Collects waiters first, then drops the scheduler lock before calling
-/// `thread.notify_available` on each (because that method re-acquires the
-/// scheduler lock internally — upstream uses a recursive scoped lock).
+/// Collects strong waiter references before invoking queue callbacks, which
+/// unlink their nodes. The caller's recursive scheduler lock stays held during
+/// both traversal and notification, as upstream requires.
 ///
 /// # Safety
 /// The caller must guarantee `state` remains live for the duration of this
-/// call (it's behind an Arc held by the signaler).
+/// call (it's behind an Arc held by the signaler), and hold the scheduler lock.
 pub unsafe fn notify_waiters_on_state(
     state: &SynchronizationObjectState,
     signaled_object_id: u64,
@@ -607,7 +613,7 @@ pub unsafe fn notify_waiters_on_state(
                 &[34, signaled_object_id],
             );
         }
-        if guard.notify_available(signaled_object_id, result) {
+        if guard.notify_available(state, result) {
             woke_any = true;
         }
     }
@@ -625,7 +631,7 @@ pub unsafe fn notify_waiters_on_state(
 pub fn wait(
     process: &Arc<ProcessLock>,
     current_thread: &Arc<KThreadLock>,
-    scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
+    _scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
     out_index: &mut i32,
     object_ids: Vec<u64>,
     timeout_ns: i64,
@@ -636,7 +642,6 @@ pub fn wait(
 
     wait_on_objects(
         current_thread,
-        scheduler,
         out_index,
         object_ids,
         waitable_objects,
@@ -653,7 +658,6 @@ pub fn wait(
 /// calls this function without a second process-table lookup.
 pub(crate) fn wait_on_objects(
     current_thread: &Arc<KThreadLock>,
-    _scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
     out_index: &mut i32,
     object_ids: Vec<u64>,
     waitable_objects: Vec<WaitableObject>,
@@ -752,6 +756,7 @@ pub(crate) fn wait_on_objects(
             guard.sync_wait_context = SynchronizationWaitContext {
                 nodes,
                 object_ids: object_ids.clone(),
+                objects: waitable_objects,
                 object_states: state_ptrs,
                 active: true,
             };
@@ -782,8 +787,343 @@ pub(crate) fn wait_on_objects(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn await_kernel_registration(thread: &Arc<KThreadLock>) {
+        use super::super::{kernel, k_scheduler_lock::KScopedSchedulerLock};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let linked = {
+                let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+                thread.lock().unwrap().sync_wait_context.is_active()
+            };
+            if linked { return; }
+            assert!(std::time::Instant::now() < deadline, "waiter did not link");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn host_early_signals_preserve_order_and_pending_cancellation() {
+        let mut kernel = Box::new(super::super::kernel::KernelCore::new());
+        kernel.initialize();
+        let thread = kernel.get_current_emu_thread().unwrap();
+        let first = Arc::new(Mutex::new(KReadableEvent::new()));
+        let second = Arc::new(Mutex::new(KReadableEvent::new()));
+        first.lock().unwrap().initialize(0, 1);
+        second.lock().unwrap().initialize(0, 2);
+        second.lock().unwrap().signal();
+        first.lock().unwrap().signal();
+        thread.lock().unwrap().wait_cancel();
+        let mut index = -1;
+        let result = wait_on_objects(&thread, &mut index, vec![1, 2], vec![
+            WaitableObject::from_readable_event(Arc::clone(&first)),
+            WaitableObject::from_readable_event(Arc::clone(&second)),
+        ], -1);
+        assert_eq!((result, index), (crate::hle::result::RESULT_SUCCESS, 0));
+        assert!(thread.lock().unwrap().is_wait_cancelled());
+        first.lock().unwrap().clear();
+        second.lock().unwrap().clear();
+        index = -1;
+        let result = wait_on_objects(&thread, &mut index, vec![1],
+            vec![WaitableObject::from_readable_event(Arc::clone(&first))], -1);
+        assert_eq!((result, index), (RESULT_CANCELLED, -1));
+        assert!(!thread.lock().unwrap().is_wait_cancelled());
+        assert!(first.lock().unwrap().sync_object.is_empty());
+        assert!(second.lock().unwrap().sync_object.is_empty());
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn dummy_wakeup_before_condition_variable_sleep_is_remembered() {
+        let mut kernel = Box::new(super::super::kernel::KernelCore::new());
+        kernel.initialize();
+        let thread = kernel.get_current_emu_thread().unwrap();
+        {
+            let _lock = super::super::k_scheduler_lock::KScopedSchedulerLock::new(
+                super::super::kernel::scheduler_lock().unwrap());
+            let thread = thread.lock().unwrap();
+            thread.request_dummy_thread_wait();
+            thread.dummy_thread_end_wait();
+        }
+        KThread::dummy_thread_begin_wait(&thread);
+        assert!(*thread.lock().unwrap().dummy_thread_wait.0.lock().unwrap());
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn native_thread_completion_wakes_parentless_host() {
+        use super::super::{kernel, k_scheduler_lock::KScopedSchedulerLock};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut kernel = Box::new(kernel::KernelCore::new());
+        kernel.initialize();
+        let target = Arc::new(KThreadLock::new(KThread::new()));
+        let worker_target = Arc::clone(&target);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let thread = kernel::get_current_emu_thread().unwrap();
+            ready_tx.send(Arc::clone(&thread)).unwrap();
+            let mut index = -1;
+            let result = wait_on_objects(&thread, &mut index, vec![42],
+                vec![WaitableObject::Thread(worker_target)], -1);
+            done_tx.send((result, index)).unwrap();
+        });
+        let waiter = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        await_kernel_registration(&waiter);
+        {
+            let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+            target.lock().unwrap().finish_termination();
+        }
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (crate::hle::result::RESULT_SUCCESS, 0));
+        worker.join().unwrap();
+        assert!(target.lock().unwrap().sync_object.is_empty());
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn host_deadline_delivery_pauses_but_explicit_stop_signal_does_not() {
+        use super::super::kernel;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let mut kernel = Box::new(kernel::KernelCore::new());
+        kernel.initialize();
+        let timing = Arc::new(crate::core_timing::CoreTiming::new());
+        timing.set_multicore(true);
+        kernel.wire_hardware_timer(Arc::clone(&timing));
+        timing.initialize(|| kernel::get_kernel_ref().unwrap().register_host_thread());
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        while !timing.has_started() {
+            assert!(Instant::now() < start_deadline);
+            std::thread::yield_now();
+        }
+        for stop_signal in [false, true] {
+            timing.sync_pause(true);
+            let event = Arc::new(Mutex::new(KReadableEvent::new()));
+            event.lock().unwrap().initialize(0, 42);
+            let worker_event = Arc::clone(&event);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let deadline = kernel.hardware_timer().unwrap().get_tick() + 20_000_000;
+            let worker = std::thread::spawn(move || {
+                let thread = kernel::get_current_emu_thread().unwrap();
+                ready_tx.send(Arc::clone(&thread)).unwrap();
+                let mut index = -1;
+                let result = wait_on_objects(&thread, &mut index, vec![42],
+                    vec![WaitableObject::from_readable_event(worker_event)], deadline);
+                done_tx.send((result, index)).unwrap();
+            });
+            let thread = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            await_kernel_registration(&thread);
+            assert!(matches!(done_rx.recv_timeout(Duration::from_millis(40)), Err(mpsc::RecvTimeoutError::Timeout)));
+            assert!(kernel.hardware_timer().unwrap().get_tick() >= deadline);
+            let expected = if stop_signal {
+                event.lock().unwrap().signal();
+                (crate::hle::result::RESULT_SUCCESS, 0)
+            } else {
+                timing.sync_pause(false);
+                (RESULT_TIMED_OUT, -1)
+            };
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(), expected);
+            worker.join().unwrap();
+            assert!(event.lock().unwrap().sync_object.is_empty());
+        }
+        timing.reset();
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn guest_wait_context_retains_native_object_until_unlink() {
+        // Exercise the guest queue lifetime independently of the host
+        // suspension primitive. A deferred IPC return can drop the caller's
+        // object references while this context is still WAITING.
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        let event = Arc::new(Mutex::new(KReadableEvent::new()));
+        event.lock().unwrap().initialize(0, 42);
+        let weak_event = Arc::downgrade(&event);
+        let object = WaitableObject::from_readable_event(event);
+        let state = object.sync_state_ptr();
+        let mut nodes = vec![ThreadListNode::new()].into_boxed_slice();
+        nodes[0].thread = Arc::downgrade(&thread);
+        unsafe { (*state).link_node(&mut nodes[0]); }
+        {
+            let mut thread = thread.lock().unwrap();
+            assert!(!thread.is_dummy_thread());
+            thread.sync_wait_context = SynchronizationWaitContext {
+                nodes, object_ids: vec![42], objects: vec![object],
+                object_states: vec![state], active: true,
+            };
+            thread.set_cancellable();
+            thread.begin_wait_with_queue(ThreadQueueImplForKSynchronizationObjectWait::queue());
+        }
+        let event = weak_event.upgrade().expect("guest queue must retain its object");
+        event.lock().unwrap().signal();
+        assert!(event.lock().unwrap().sync_object.is_empty());
+        assert_eq!(thread.lock().unwrap().get_synced_index(), 0);
+        assert!(!thread.lock().unwrap().sync_wait_context.is_active());
+        drop(event);
+        assert!(weak_event.upgrade().is_none(), "completed guest wait retained the object");
+    }
+
+    #[test]
+    fn native_server_port_arrival_wakes_host_by_object_identity() {
+        use super::super::kernel;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut kernel = Box::new(kernel::KernelCore::new());
+        kernel.initialize();
+        for light in [false, true] {
+            let port = Arc::new(Mutex::new(KPort::new()));
+            port.lock().unwrap().initialize(2, light, 0);
+            let worker_port = Arc::clone(&port);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let thread = kernel::get_current_emu_thread().unwrap();
+                let event = Arc::new(Mutex::new(KReadableEvent::new()));
+                event.lock().unwrap().initialize(0, 42);
+                ready_tx.send(Arc::clone(&thread)).unwrap();
+                let mut index = -1;
+                // Distinct native objects may have equal numeric IDs. Only
+                // the port at index 1 becomes signaled, not the event at 0.
+                let result = wait_on_objects(&thread, &mut index, vec![42, 42], vec![
+                    WaitableObject::from_readable_event(event),
+                    WaitableObject::from_server_port(worker_port),
+                ], -1);
+                done_tx.send((result, index)).unwrap();
+            });
+            let thread = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            await_kernel_registration(&thread);
+            let result = if light {
+                KPort::enqueue_light_session_arc(&port, 123)
+            } else {
+                KPort::enqueue_session_arc(&port, 123)
+            };
+            assert_eq!(result, crate::hle::result::RESULT_SUCCESS);
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (crate::hle::result::RESULT_SUCCESS, 1));
+            worker.join().unwrap();
+            assert!(port.lock().unwrap().server.sync_object.is_empty());
+        }
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn parentless_host_cancellation_and_hardware_deadline_unlink_nodes() {
+        use super::super::{kernel, k_scheduler_lock::KScopedSchedulerLock};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut kernel = Box::new(kernel::KernelCore::new());
+        kernel.initialize();
+        // Deterministic guest clock: advance explicitly, no host sleeps/timer
+        // polling. The same hardware callback is used by the runtime timer.
+        let timing = Arc::new(crate::core_timing::CoreTiming::new());
+        kernel.wire_hardware_timer(Arc::clone(&timing));
+        for expected in [RESULT_CANCELLED, RESULT_TIMED_OUT, RESULT_TERMINATION_REQUESTED] {
+            let event = Arc::new(Mutex::new(KReadableEvent::new()));
+            event.lock().unwrap().initialize(0, 0x1234);
+            let worker_event = Arc::clone(&event);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let deadline = kernel.hardware_timer().unwrap().get_tick() + 1_000_000;
+            let worker = std::thread::spawn(move || {
+                let thread = kernel::get_current_emu_thread().unwrap();
+                ready_tx.send(Arc::clone(&thread)).unwrap();
+                let mut index = -1;
+                let result = wait_on_objects(&thread, &mut index, vec![0x1234],
+                    vec![WaitableObject::from_readable_event(worker_event)], deadline);
+                done_tx.send((result, index)).unwrap();
+            });
+            let thread = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            await_kernel_registration(&thread);
+            {
+                let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+                assert_eq!(thread.lock().unwrap().get_timer_task_time(), deadline);
+                if expected == RESULT_CANCELLED {
+                    thread.lock().unwrap().wait_cancel();
+                } else if expected == RESULT_TERMINATION_REQUESTED {
+                    thread.lock().unwrap().request_terminate();
+                }
+            }
+            if expected == RESULT_TIMED_OUT {
+                assert!(done_rx.try_recv().is_err());
+                timing.add_ticks(10_000_000);
+                timing.advance();
+            }
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(), (expected, -1));
+            worker.join().unwrap();
+            {
+                let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+                assert!(event.lock().unwrap().sync_object.is_empty());
+                assert_eq!(thread.lock().unwrap().get_timer_task_time(), 0);
+                assert!(!thread.lock().unwrap().is_cancellable());
+            }
+        }
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn parentless_host_dummy_wait_uses_kernel_queue_and_wakeup() {
+        use super::super::kernel::{self, KernelCore};
+        use super::super::k_scheduler_lock::KScopedSchedulerLock;
+        use super::super::k_thread::ThreadState;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // KernelCore's scheduler callbacks retain its address.
+        let mut kernel = Box::new(KernelCore::new());
+        kernel.initialize();
+        kernel.register_host_thread();
+        let event = Arc::new(Mutex::new(KReadableEvent::new()));
+        event.lock().unwrap().initialize(0, 0x1234);
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_event = Arc::clone(&event);
+        let worker = std::thread::spawn(move || {
+            let thread = kernel::get_current_emu_thread().unwrap();
+            {
+                let thread = thread.lock().unwrap();
+                assert!(thread.is_dummy_thread());
+                assert!(thread.parent.is_none());
+                assert!(thread.scheduler.is_none());
+                assert!(thread.global_scheduler_context.as_ref().unwrap().upgrade().is_some());
+            }
+            registered_tx.send(Arc::clone(&thread)).unwrap();
+            let mut index = -1;
+            let result = wait_on_objects(&thread, &mut index, vec![0x1234],
+                vec![WaitableObject::from_readable_event(worker_event)], -1);
+            done_tx.send((result, index)).unwrap();
+        });
+        let thread = registered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sleeping = {
+                let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+                let thread = thread.lock().unwrap();
+                thread.get_state() == ThreadState::WAITING && thread.sync_wait_context.is_active()
+            };
+            if sleeping { break; }
+            assert!(Instant::now() < deadline, "host never entered the kernel wait queue");
+            std::thread::yield_now();
+        }
+        assert!(done_rx.try_recv().is_err(), "wait returned without a signal");
+        event.lock().unwrap().signal();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (crate::hle::result::RESULT_SUCCESS, 0));
+        worker.join().unwrap();
+        {
+            let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+            assert!(event.lock().unwrap().sync_object.is_empty());
+            let thread = thread.lock().unwrap();
+            assert!(!thread.sync_wait_context.is_active());
+            assert_eq!(thread.get_disable_dispatch_count(), 0);
+        }
+        kernel.shutdown();
+    }
 
     #[test]
     fn link_and_unlink_single_node() {
@@ -865,6 +1205,7 @@ mod tests {
         thread.sync_wait_context = SynchronizationWaitContext {
             nodes,
             object_ids: vec![1, 2],
+            objects: Vec::new(),
             object_states: vec![&mut first_state, &mut second_state],
             active: true,
         };

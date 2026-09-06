@@ -178,7 +178,12 @@ impl KHardwareTimer {
         });
     }
 
-    pub fn register_absolute_task_by_id(&self, thread_id: u64, thread_ptr: usize, task_time: i64) {
+    /// Register the KThread used by KScopedSchedulerLockAndSleep.
+    ///
+    /// # Safety
+    /// The scheduler lock must be held and thread_ptr must identify thread_id
+    /// and remain alive until cancellation or timer delivery.
+    pub(crate) unsafe fn register_absolute_task_by_id(&self, thread_id: u64, thread_ptr: usize, task_time: i64) {
         static TRACE_WAIT_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *TRACE_WAIT_SYNC.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()) {
             log::info!(
@@ -205,6 +210,12 @@ impl KHardwareTimer {
                 thread_id,
                 state.m_wakeup_time
             );
+            // Upstream RegisterAbsoluteTaskImpl sets KTimerTask::m_time.
+            // Keep the thread's intrusive-task counterpart in sync so the
+            // queue's CancelTask can actually remove this deadline.
+            let thread = unsafe { &mut *(thread_ptr as *mut KThread) };
+            debug_assert_eq!(thread.get_thread_id(), thread_id);
+            thread.set_timer_task_time(task_time);
             state.thread_ptrs.insert(thread_id, thread_ptr);
 
             if state.base.register_absolute_task_impl(thread_id, task_time) {
@@ -515,6 +526,21 @@ mod tests {
     use crate::core_timing::CoreTiming;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_thread::ThreadState;
+
+    #[test]
+    fn scoped_wait_registration_records_deadline_for_cancellation() {
+        let timer = KHardwareTimer::new();
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().thread_id = 23;
+        // Isolated fixture: neither the thread nor timer has another user.
+        unsafe { timer.register_absolute_task_by_id(23, thread.as_ptr() as usize, 500); }
+        assert_eq!(thread.lock().unwrap().get_timer_task_time(), 500);
+        timer.cancel_task(&thread);
+        assert_eq!(thread.lock().unwrap().get_timer_task_time(), 0);
+        let mut state = timer.state.lock().unwrap();
+        assert!(state.thread_ptrs.is_empty());
+        assert_eq!(state.base.collect_expired_tasks(1_000), (Vec::new(), 0));
+    }
 
     /// Upstream owns the timer through a `std::unique_ptr` and calls
     /// `Finalize()` through it no matter how many `KHardwareTimer*` raw

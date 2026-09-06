@@ -356,7 +356,10 @@ impl TimeWorker {
                                 .kernel()
                                 .and_then(|kernel| multi_wait.wait_any(kernel))
                         } else {
-                            multi_wait.wait_any_local()
+                            #[cfg(test)]
+                            { multi_wait.wait_any_local() }
+                            #[cfg(not(test))]
+                            { panic!("TimeWorker requires a live System") }
                         };
                         let Some(signaled) = signaled else {
                             continue;

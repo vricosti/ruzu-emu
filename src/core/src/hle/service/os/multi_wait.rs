@@ -7,25 +7,27 @@
 //! MultiWait — waits on multiple synchronization objects.
 //! Upstream wraps svcWaitSynchronization/KSynchronizationObject::Wait.
 
-use std::ffi::OsStr;
+#[cfg(test)]
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::kernel::KernelCore;
-use crate::hle::result::RESULT_SUCCESS;
 
 use super::multi_wait_holder::MultiWaitHolder;
 
-/// Host-side notification token for the local wait-many fallback. Unlike an
-/// emulated thread, an unregistered host worker cannot use the guest scheduler's
-/// wait queue. Remember notifications between the signaled scan and host sleep.
+/// Notification token used only by null-kernel unit-test fixtures. Production
+/// host workers use their own dummy KThread and the native synchronization list.
+/// Remember notifications between the fixture's signaled scan and host sleep.
 #[derive(Default)]
+#[cfg(test)]
 pub(super) struct HostMultiWaitSignal {
     notified: Mutex<bool>,
     cv: Condvar,
 }
 
+#[cfg(test)]
 impl HostMultiWaitSignal {
     pub(super) fn signal(&self) {
         *self.notified.lock().unwrap() = true;
@@ -56,10 +58,6 @@ unsafe impl Send for MultiWait {}
 unsafe impl Sync for MultiWait {}
 
 impl MultiWait {
-    fn boot_trace_enabled() -> bool {
-        std::env::var_os("RUZU_APPLET_BOOT_TRACE").is_some_and(|value| value != OsStr::new("0"))
-    }
-
     pub fn new() -> Self {
         Self {
             holders: Vec::new(),
@@ -116,17 +114,23 @@ impl MultiWait {
         self.timed_wait_impl(kernel, 0)
     }
 
-    /// Rust-only helper for host-side service threads that must avoid the
-    /// kernel-backed wait path entirely.
-    ///
-    /// This performs the same non-blocking signaled scan as the local fallback
-    /// path without consulting `KernelCore` or `WaitSynchronization`.
+    /// Relative nanoseconds converted to the kernel hardware timer's absolute
+    /// global-time deadline, as in upstream TimedWaitAny. Both host and guest
+    /// suspension are expired by that timer, not by a second host wall clock.
+    pub fn timed_wait_any(&self, kernel: &KernelCore, timeout_ns: i64) -> Option<*mut MultiWaitHolder> {
+        let now = kernel.hardware_timer().expect("MultiWait requires a hardware timer").get_tick();
+        self.timed_wait_impl(kernel, now.saturating_add(timeout_ns))
+    }
+
+    /// Non-blocking scan for null-kernel unit-test fixtures only.
+    #[cfg(test)]
     pub fn try_wait_any_local(&self) -> Option<*mut MultiWaitHolder> {
         let holders = self.holders_snapshot();
         self.local_try_wait_any(&holders)
     }
 
-    /// Wait without a guest-thread context, using host notifications for Events.
+    /// Block a null-kernel unit-test fixture on its local Event notifications.
+    #[cfg(test)]
     pub fn wait_any_local(&self) -> Option<*mut MultiWaitHolder> {
         self.local_timed_wait(&self.holders, -1)
     }
@@ -136,7 +140,6 @@ impl MultiWait {
         kernel: &KernelCore,
         timeout_ns: i64,
     ) -> Option<*mut MultiWaitHolder> {
-        let trace_boot = Self::boot_trace_enabled();
         let trace_wait = std::env::var_os("RUZU_TRACE_MULTI_WAIT").is_some();
         let holders = self.holders_snapshot();
         assert!(
@@ -150,57 +153,8 @@ impl MultiWait {
             return None;
         }
 
-        let current_thread = match kernel.get_current_emu_thread() {
-            Some(thread) => thread,
-            None => {
-                if trace_boot {
-                    log::info!(
-                        "MultiWait::timed_wait_impl: falling back local (no current_emu_thread)"
-                    );
-                }
-                return self.local_timed_wait(&holders, timeout_ns);
-            }
-        };
-        let process = match current_thread
-            .lock()
-            .unwrap()
-            .parent
-            .as_ref()
-            .and_then(|parent| parent.upgrade())
-        {
-            Some(process) => process,
-            None => {
-                if trace_boot {
-                    log::info!("MultiWait::timed_wait_impl: falling back local (no process)");
-                }
-                return self.local_timed_wait(&holders, timeout_ns);
-            }
-        };
-        let scheduler = kernel
-            .current_scheduler()
-            .cloned()
-            .or_else(|| {
-                current_thread
-                    .lock()
-                    .unwrap()
-                    .scheduler
-                    .as_ref()
-                    .and_then(|scheduler| scheduler.upgrade())
-            })
-            .or_else(|| {
-                process
-                    .lock()
-                    .unwrap()
-                    .scheduler
-                    .as_ref()
-                    .and_then(|scheduler| scheduler.upgrade())
-            });
-        let Some(scheduler) = scheduler else {
-            if trace_boot {
-                log::info!("MultiWait::timed_wait_impl: falling back local (no scheduler)");
-            }
-            return self.local_timed_wait(&holders, timeout_ns);
-        };
+        let current_thread = kernel.get_current_emu_thread()
+            .expect("MultiWait requires an initialized kernel thread identity");
 
         let mut object_ids = Vec::with_capacity(holders.len());
         let mut waitable_objects = Vec::with_capacity(holders.len());
@@ -210,17 +164,8 @@ impl MultiWait {
             Vec::new()
         };
         for holder in &holders {
-            let Some((object_id, waitable_object)) =
-                (unsafe { &**holder }).native_waitable_object()
-            else {
-                if trace_boot || trace_wait {
-                    eprintln!(
-                        "[MULTI_WAIT] holders={} → falling back local (holder missing native object)",
-                        holders.len()
-                    );
-                }
-                return self.local_timed_wait(&holders, timeout_ns);
-            };
+            let (object_id, waitable_object) = (unsafe { &**holder }).native_waitable_object()
+                .expect("MultiWait holder must own a native kernel synchronization object");
             if trace_wait {
                 kinds.push((unsafe { &**holder }).kind_name());
             }
@@ -236,7 +181,6 @@ impl MultiWait {
         };
         let result = k_synchronization_object::wait_on_objects(
             &current_thread,
-            &scheduler,
             &mut out_index,
             object_ids,
             waitable_objects,
@@ -259,13 +203,14 @@ impl MultiWait {
             );
         }
 
-        if result == RESULT_SUCCESS && out_index >= 0 {
+        if out_index >= 0 {
             holders.get(out_index as usize).copied()
         } else {
             None
         }
     }
 
+    #[cfg(test)]
     fn local_timed_wait(
         &self,
         holders: &[*mut MultiWaitHolder],
@@ -283,17 +228,13 @@ impl MultiWait {
         // Register on the whole set before rescanning it. An event signaled
         // before registration is found by the scan; one signaled after it
         // remembers a notification even if it precedes the condvar wait.
-        let notification = if holders.iter().all(|holder| unsafe {
-            (**holder).host_event().is_some()
-        }) {
-            let notification = Arc::new(HostMultiWaitSignal::default());
-            for &holder in holders {
-                unsafe { (*holder).host_event().unwrap() }.register_host_waiter(&notification);
-            }
-            Some(notification)
-        } else {
-            None
-        };
+        // Only null-kernel Event fixtures use this harness. Native object
+        // tests must exercise the real kernel queues, never polling.
+        let notification = Arc::new(HostMultiWaitSignal::default());
+        for &holder in holders {
+            unsafe { (*holder).host_event().expect("local test wait requires service Events") }
+                .register_host_waiter(&notification);
+        }
         let timeout = (timeout_ns > 0).then(|| Duration::from_nanos(timeout_ns as u64));
         loop {
             if let Some(holder) = self.local_try_wait_any(holders) {
@@ -303,17 +244,11 @@ impl MultiWait {
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 return None;
             }
-            if let Some(notification) = &notification {
-                notification.wait(remaining);
-            } else {
-                // Other native holder types still use their kernel wait path
-                // when a guest context exists; preserve the legacy host fallback.
-                let interval = Duration::from_micros(100);
-                std::thread::sleep(remaining.map_or(interval, |left| left.min(interval)));
-            }
+            notification.wait(remaining);
         }
     }
 
+    #[cfg(test)]
     fn local_try_wait_any(&self, holders: &[*mut MultiWaitHolder]) -> Option<*mut MultiWaitHolder> {
         for &holder in holders {
             unsafe {
@@ -337,6 +272,104 @@ mod tests {
     use super::*;
     use super::super::event::Event;
     use std::sync::mpsc;
+
+    #[test]
+    fn native_process_and_closed_session_wake_host_selection() {
+        use crate::hle::kernel::{kernel, k_process::{KProcess, ProcessLock, ProcessState},
+            k_server_session::KServerSession, k_scheduler_lock::KScopedSchedulerLock,
+            k_synchronization_object::tests::await_kernel_registration};
+
+        let mut kernel = Box::new(KernelCore::new());
+        kernel.initialize();
+        for session_case in [false, true] {
+            let process = Arc::new(ProcessLock::new(KProcess::new()));
+            process.lock().unwrap().process_id = 42;
+            process.lock().unwrap().state = ProcessState::RunningAttached;
+            let session = Arc::new(Mutex::new(KServerSession::new()));
+            session.lock().unwrap().initialize(42);
+            let worker_process = Arc::clone(&process);
+            let worker_session = Arc::clone(&session);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let kernel = kernel::get_kernel_ref().unwrap();
+                let thread = kernel.get_current_emu_thread().unwrap();
+                let mut holder = if session_case {
+                    MultiWaitHolder::from_server_session(worker_session)
+                } else {
+                    MultiWaitHolder::from_process(worker_process)
+                };
+                let mut wait = MultiWait::new();
+                wait.link_holder(&mut holder);
+                ready_tx.send(thread).unwrap();
+                done_tx.send(wait.wait_any(kernel) == Some(&mut holder as *mut _)).unwrap();
+            });
+            let thread = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            await_kernel_registration(&thread);
+            {
+                let _lock = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+                if session_case {
+                    // The kernel result is SessionClosed, but the selected
+                    // native object still must be delivered to ServerManager.
+                    session.lock().unwrap().on_client_closed();
+                } else {
+                    process.lock().unwrap().set_debug_break();
+                }
+            }
+            assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            worker.join().unwrap();
+            assert!(session.lock().unwrap().sync_object.is_empty());
+            assert!(process.lock().unwrap().sync_object.is_empty());
+        }
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn native_time_events_support_parentless_host_waits() {
+        use crate::hle::kernel::kernel;
+        use crate::hle::service::psc::time::common::OperationEvent;
+        use crate::hle::service::psc::time::alarms::Alarms;
+        use crate::hle::service::psc::time::clocks::standard_user_system_clock_core::StandardUserSystemClockCore;
+
+        let mut kernel = Box::new(KernelCore::new());
+        kernel.initialize();
+        {
+            let operation = OperationEvent::new();
+            let alarms = Alarms::new(Box::new(|| 0));
+            let correction = StandardUserSystemClockCore::new();
+            let events = [operation.get_event(), alarms.get_event(), correction.get_event()];
+            for event in &events {
+                assert!(event.readable_event().is_some(), "time event missing native owner");
+            }
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let workers: Vec<_> = (0..2).map(|_| {
+                let events = events.clone();
+                let ready_tx = ready_tx.clone();
+                std::thread::spawn(move || {
+                    let kernel = kernel::get_kernel_ref().unwrap();
+                    let thread = kernel.get_current_emu_thread().unwrap();
+                    assert!(thread.lock().unwrap().parent.is_none());
+                    let mut holders: Vec<_> = events.into_iter().map(MultiWaitHolder::from_event).collect();
+                    let mut wait = MultiWait::new();
+                    for holder in &mut holders { wait.link_holder(holder); }
+                    let expected = &mut holders[1] as *mut _;
+                    ready_tx.send(thread).unwrap();
+                    assert_eq!(wait.wait_any(kernel), Some(expected));
+                    // Manual-reset: a second wait must still observe the event.
+                    assert_eq!(wait.try_wait_any(kernel), Some(expected));
+                })
+            }).collect();
+            let first = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let second = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!Arc::ptr_eq(&first, &second), "host threads must have their own identity");
+            crate::hle::kernel::k_synchronization_object::tests::await_kernel_registration(&first);
+            crate::hle::kernel::k_synchronization_object::tests::await_kernel_registration(&second);
+            events[1].signal();
+            for worker in workers { worker.join().unwrap(); }
+            assert!(events[1].readable_event().unwrap().lock().unwrap().sync_object.is_empty());
+        }
+        kernel.shutdown();
+    }
 
     #[test]
     fn local_event_wait_keeps_order_and_manual_reset_state() {

@@ -13002,3 +13002,200 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   contiguous and fragmented GPU mappings across successive guest writes, no
   scratch mutation for direct spans, fallback scratch contents, and no cache
   flush under UnsafeRead.
+
+## 2026-09-06 — src/core/src/hle/kernel/{k_thread,k_scheduler,kernel}.rs vs core/hle/kernel/{k_thread,k_scheduler,kernel}.{h,cpp}
+
+### Intentional differences
+
+- Dummy-thread initialization obtains a weak global-scheduler reference even
+  without a parent process. Eden reaches this context through KernelCore;
+  Rust stores the explicit dependency on KThread. No guest process, per-core
+  scheduler assignment or IPC-client impersonation is required for host waits.
+- KThread owns its dummy runnable predicate, mutex and condition variable in
+  one Arc allocation. DummyThreadBeginWait clones this allocation and releases
+  the KThread borrow before blocking; Eden accesses members through a raw this
+  pointer while other cores update the thread's wait state. The predicate is
+  protected by the mutex, including signals preceding the actual sleep.
+- KernelCore invalidates the calling thread's cached dummy during shutdown and
+  checks scheduler ownership before reusing a cached dummy during registration.
+  Rust host TLS can survive a Stop/Start and must not retain the previous
+  kernel's scheduler dependency. The synthetic parentless-host regression uses
+  actual scheduler callbacks, verifies blocking, wakeup, node removal and
+  balanced dispatch, rather than substituting a host-only notification list.
+- GetCurrentEmuThread also revalidates a persistent host worker's cached dummy
+  before a new native wait after restart. Explicit guest/service identities
+  remain unchanged. When neither the cached dummy nor a constructor fixture
+  has a scheduler yet, the identity remains stable: KLightLock owner tags must
+  not change between lock and unlock. Separate tests cover calling-thread and
+  persistent-worker restart; existing transfer-memory cleanup tests cover the
+  constructor/null-scheduler case.
+
+## 2026-09-06 — src/core/src/hle/service/psc/time/{common,alarms,clocks/standard_user_system_clock_core}.rs vs core/hle/service/psc/time/{common,alarms,clocks/standard_user_system_clock_core}.{h,cpp}
+
+### Intentional differences
+
+- OperationEvent, Alarms and StandardUserSystemClockCore now retain their
+  upstream-owned ServiceContext and create their notification event there.
+  The existing Rust ServiceContext uses local event handles instead of KEvent
+  pointers; its Drop closes the owned events. OperationEvent clones share an
+  Arc<ServiceContext> so context-writer registrations retain the same owner
+  instead of closing the event while a registered clone still exists.
+- Null-kernel unit fixtures continue to use ServiceContext's standalone Event
+  construction. The runtime objects have native readable ends immediately;
+  copying a guest IPC handle is no longer a prerequisite for a time worker wait.
+
+### Unintentional differences (to fix)
+
+- The pre-existing Alarms container stores metadata entries rather than the
+  upstream intrusive Alarm objects. Its expiry and closest-alarm handling need
+  a separate ownership slice; this wait-infrastructure change does not certify
+  the alarm-delivery implementation as equivalent. The interrupted work is
+  tracked in UNIFIED_WAITS_STATE.md.
+
+## 2026-09-06 — src/core/src/hle/kernel/{k_hardware_timer,k_scoped_scheduler_lock_and_sleep}.rs vs core/hle/kernel/{k_hardware_timer,k_hardware_timer_base,k_scoped_scheduler_lock_and_sleep}.{h,cpp}
+
+### Intentional differences
+
+- The scoped-wait timer registration uses a KThread pointer plus its ID instead
+  of an inherited KTimerTask pointer. It now updates the thread's scheduled
+  time as RegisterAbsoluteTaskImpl does upstream, allowing queue cancellation
+  to remove the deadline, rather than just dropping the ID-to-pointer entry.
+  This internal raw-pointer entry point explicitly requires the scheduler lock
+  and a live thread until cancellation or delivery. A synthetic test verifies
+  the scheduled time and an empty timer tree after cancellation.
+
+## 2026-09-06 — src/core/src/hle/kernel/{k_synchronization_object,k_thread_queue}.rs vs core/hle/kernel/{k_synchronization_object,k_thread_queue}.{h,cpp}
+
+### Intentional differences
+
+- Direct waits accept already-owned native objects without a per-core scheduler
+  argument. The process-table adapter remains for guest handles. Kernel queues
+  own Arc references to their objects alongside the pinned node allocation;
+  this preserves their lifetime even when Ruzu's deferred IPC boundary lets the
+  Rust Wait call return before the eventual guest fiber switch. Both wake and
+  cancellation unlink every node before releasing those references.
+- Wait callbacks use a pointer to the embedded SynchronizationObjectState in
+  place of C++ base-class pointer identity. Numeric IDs remain diagnostic only:
+  IDs from different object registries can collide. The regression waits on an
+  event and a port with equal numeric IDs and selects only the signaled port.
+  KThreadQueue and KThread forward that native identity without reinterpretation.
+
+## 2026-09-06 — src/core/src/hle/service/os/{multi_wait,multi_wait_holder,event}.rs vs core/hle/service/os/{multi_wait,multi_wait_holder,event}.{h,cpp}
+
+### Intentional differences
+
+- Native MultiWait no longer requires a parent process or a per-core scheduler.
+  The kernel supplies the host's own dummy identity and uses the same native
+  lists and queue callbacks as a guest thread. Missing native objects are an
+  invariant violation, not a reason to select a periodic polling fallback.
+- The standalone Event notification token and local wait-many helper are now
+  compiled only for null-kernel unit fixtures. Native production waits do not
+  register in that separate list. Relative finite waits use the hardware
+  timer's absolute global-time nanosecond deadline; overflow is saturated at
+  i64::MAX instead of overflowing signed C++ arithmetic.
+- Event's local condition variable and ServerSession's additional manager
+  notification are test-only. Runtime sessions signal their native wait list.
+  A boolean retains the pre-existing asynchronous-registration marker formerly
+  encoded by the presence of the manager wakeup Weak; no extra notification is
+  carried by this marker. The check-and-mark in svc_ipc is one critical section.
+- Event still has a pending-signaled mirror for service owners that lazily
+  create their IPC event bridge. It is not a production wait source. The
+  migrated time events and observer have their native objects at construction;
+  ServerManager still attaches its native wakeup event during loop preparation.
+  This slice does not port every unrelated service's lazy event owner.
+- CoreTiming's existing global nanosecond clock is shared by host and guest
+  finite waits. In multicore mode the wall-clock-derived value advances during
+  pause, but timer callback delivery is paused; overdue waits expire on resume.
+  A synthetic test checks this and an explicit stop signal while paused. In
+  single-core mode tests advance emulated CPU ticks through CoreTiming instead.
+
+## 2026-09-06 — src/core/src/hle/service/{glue/time/worker,server_manager}.rs vs core/hle/service/{glue/time/worker,server_manager}.{h,cpp}
+
+### Intentional differences
+
+- Null-System loop branches are explicitly test-only. TimeWorker fixtures use
+  the standalone Event wait harness; ServerManager fixtures use their wakeup
+  event with a blocking wait instead of a 100 ms retry. Runtime loops require
+  a live System and route through native MultiWait. Shared-manager selection
+  still releases the manager mutex before blocking, retaining only the
+  selection mutex as upstream does. Deferred IPC transaction boundaries are
+  unchanged by this routing change.
+
+## 2026-09-06 — src/core/src/hle/service/am/event_observer.rs vs core/hle/service/am/event_observer.{h,cpp}
+
+### Intentional differences
+
+- The observer retains ServiceContext and its event handle explicitly; its
+  shared Arc state keeps the wakeup Event and boxed process holders stable while
+  the host thread runs. The wakeup holder is linked after moving into that final
+  owner. Stop signals the event and joins before closing its context-owned event.
+- WaitSignaled releases the Rust state mutex before entering native MultiWait;
+  only the observer mutates the active list, while producers append to the
+  separate deferred list. It uses the observer's own dummy identity, not a
+  borrowed applet thread. The previous process-state scan and 100 ms timed host
+  event retry are removed. Process notifications now use the kernel wait list.
+
+## 2026-09-06 — src/core/src/hle/kernel/{k_server_port,k_port}.rs vs core/hle/kernel/{k_server_port,k_port}.{h,cpp}
+
+### Intentional differences
+
+- Rust ports retain numeric session queues rather than intrusive session
+  members. Both normal and light enqueue paths notify the native server-port
+  synchronization state on the empty-to-nonempty transition. The trace-only
+  numeric ID is zero because the Rust endpoint has no ID member; native pointer
+  identity determines wait selection.
+- Arc entry points in KPort (enqueue) and KServerPort (accept) release the
+  enclosing KPort mutex before the outer scheduler guard can switch fibers.
+  The inner queue mutation and notifications remain in KServerPort, with the
+  scheduler lock also covering removal during AcceptSession/AcceptLightSession.
+  The SVC and service-manager call sites use those lifetime wrappers.
+
+### Unintentional differences (to fix)
+
+- The pre-existing Rust KClientPort has no parent back-pointer; its callers in
+  svc_port and sm still explicitly enqueue after CreateSession, whereas C++
+  KClientPort owns that final delegation. Restoring the complete port endpoint
+  ownership/close lifecycle is a separate structural slice, not claimed here.
+  Pending queues and synchronization-node lifetimes in this slice are retained
+  by the wait context's Arc<KPort> until node removal.
+
+## 2026-09-06 — src/core/src/hle/kernel/{k_server_session,svc/svc_ipc,svc/svc_port,svc/svc_session}.rs and src/core/src/hle/service/sm/sm.rs vs corresponding core/hle C++ files
+
+### Intentional differences
+
+- The existing asynchronous ServerManager registration bridge remains in
+  svc_ipc. Its registration marker is now an explicit session boolean instead
+  of relying on the optional host-fallback event; normal request notification
+  remains on KServerSession's native synchronization object. Null-kernel
+  ServerManager tests alone retain the local notification hook. The IPC
+  transaction scope, reply write-back and deferred fiber switch are unchanged.
+- Port call sites release their enclosing Rust mutex before entering the Arc
+  queue wrappers. The wrappers preserve the native endpoint as the owner of
+  enqueue/dequeue and release the mutex before scheduler-unlock rescheduling.
+  This adapts the non-embedded Rust owner without borrowing a client identity.
+
+## 2026-09-06 — src/core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.{h,cpp}
+
+### Intentional differences
+
+- Parentless dummy initialization copies the kernel's already-published
+  scheduler-lock address instead of locking the Rust GlobalSchedulerContext
+  wrapper to derive that address. Upstream accesses the kernel-owned scheduler
+  lock directly. The Rust priority-update callback already holds this wrapper
+  mutex when it may first request a host identity; reacquiring it deadlocked
+  the timing thread and blocked service initialization. A synthetic test holds
+  the wrapper locked while a fresh host initializes its identity, and verifies
+  that initialization completes with the same scheduler-lock address.
+
+## 2026-09-06 — src/core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.{h,cpp}
+
+### Intentional differences
+
+- Rust keeps ID/pointer fast-access caches alongside its current-thread Weak
+  reference. Cached parentless host identities are now generation-checked on
+  both fast and ordinary access; explicit guest/service identities retain the
+  direct fast path. Otherwise, after kernel replacement, scheduler-lock entry
+  could disable dispatch on the old dummy and unlock enable it on a fresh
+  dummy. The persistent-worker restart regression covers this lock/unlock
+  sequence and checks the dispatch count returns to zero. Upstream uses one
+  current KThread pointer rather than these separate Rust caches.

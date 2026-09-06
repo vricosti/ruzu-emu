@@ -966,7 +966,7 @@ mod tests {
             let mut guard = current_thread.lock().unwrap();
             guard.initialize_dummy_thread(None, 99, 99);
             guard.set_state(ThreadState::WAITING);
-            guard.dummy_thread_runnable.store(true, Ordering::Relaxed);
+            *guard.dummy_thread_wait.0.lock().unwrap() = true;
         }
         crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
 
@@ -980,11 +980,7 @@ mod tests {
         let _ = KScheduler::update_highest_priority_threads_impl(&mut schedulers, &mut gsc);
         gsc.m_scheduler_lock.unlock();
 
-        assert!(!current_thread
-            .lock()
-            .unwrap()
-            .dummy_thread_runnable
-            .load(Ordering::Relaxed));
+        assert!(!*current_thread.lock().unwrap().dummy_thread_wait.0.lock().unwrap());
 
         crate::hle::kernel::kernel::set_current_emu_thread(None);
     }
@@ -1804,15 +1800,13 @@ impl KScheduler {
     /// Called when no scheduler is available (non-core threads, phantom mode).
     pub fn reschedule_current_hle_thread() {
         if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
-            let mut t = cur_thread.lock().unwrap();
-            debug_assert!(t.get_disable_dispatch_count() == 1);
+            debug_assert!(cur_thread.lock().unwrap().get_disable_dispatch_count() == 1);
 
             // Upstream: GetCurrentThread(kernel).DummyThreadBeginWait();
             // Ensure dummy threads that are waiting block.
-            if t.is_dummy_thread() {
-                t.dummy_thread_begin_wait();
-            }
+            super::k_thread::KThread::dummy_thread_begin_wait(&cur_thread);
 
+            let mut t = cur_thread.lock().unwrap();
             debug_assert!(t.get_state() != ThreadState::WAITING);
             t.enable_dispatch();
         }

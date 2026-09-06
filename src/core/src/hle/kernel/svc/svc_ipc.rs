@@ -466,13 +466,12 @@ fn send_sync_request_impl(
         // pending-registration drain.
         let needs_setup = {
             let _lo_ss = common::lock_order::guard("server_session");
-            server_session.lock().unwrap().manager_wakeup.is_none()
+            let mut session = server_session.lock().unwrap();
+            let needs_setup = !session.manager_registration_queued;
+            session.manager_registration_queued = true;
+            needs_setup
         };
         if needs_setup {
-            server_session
-                .lock()
-                .unwrap()
-                .set_manager_wakeup(Arc::downgrade(&wakeup));
             queue
                 .lock()
                 .unwrap()

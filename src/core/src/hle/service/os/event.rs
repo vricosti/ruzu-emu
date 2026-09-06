@@ -6,8 +6,11 @@
 //!
 //! Event wrapper for kernel KEvent.
 
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
+#[cfg(test)]
+use std::sync::{Condvar, OnceLock};
 
+#[cfg(test)]
 use super::multi_wait::HostMultiWaitSignal;
 
 use crate::hle::kernel::k_event::KEvent;
@@ -35,10 +38,12 @@ struct KernelEventBridge {
 /// which wakes threads blocked in WaitSynchronization on the event handle.
 pub struct Event {
     signaled: Arc<Mutex<bool>>,
+    #[cfg(test)]
     cv: Arc<Condvar>,
     kernel_bridge: Mutex<Option<KernelEventBridge>>,
     // Host-only counterpart of the kernel's synchronization wait list. Most
     // events never need it, so signaling them requires no additional mutex.
+    #[cfg(test)]
     host_waiters: OnceLock<Mutex<Vec<Weak<HostMultiWaitSignal>>>>,
 }
 
@@ -46,8 +51,10 @@ impl Event {
     pub fn new() -> Self {
         Self {
             signaled: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
             cv: Arc::new(Condvar::new()),
             kernel_bridge: Mutex::new(None),
+            #[cfg(test)]
             host_waiters: OnceLock::new(),
         }
     }
@@ -63,12 +70,14 @@ impl Event {
     ) -> Self {
         Self {
             signaled: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
             cv: Arc::new(Condvar::new()),
             kernel_bridge: Mutex::new(Some(KernelEventBridge {
                 event,
                 readable_event,
                 process: Arc::downgrade(&process),
             })),
+            #[cfg(test)]
             host_waiters: OnceLock::new(),
         }
     }
@@ -216,7 +225,7 @@ impl Event {
     /// Signal the event. Wakes all waiters.
     /// Port of upstream `Event::Signal()` → `m_event->Signal()`.
     pub fn signal(&self) {
-        self.signal_host_only();
+        self.signal_pending_state();
 
         // Bridge to kernel: signal the KEvent owner, which wakes the readable end.
         let bridge = self.kernel_bridge.lock().unwrap().clone();
@@ -246,19 +255,24 @@ impl Event {
         }
     }
 
-    /// Wake only host-side waiters on this service event.
-    ///
-    /// This is used by internal `ServerManager` wakeup paths that only need to
-    /// poke the host service thread's condvar. Calling full `signal()` there can
-    /// re-enter the owning `KProcess` while the caller already holds its mutex.
+    /// Wake a null-kernel unit-test fixture without signaling a kernel object.
+    #[cfg(test)]
     pub fn signal_host_only(&self) {
+        self.signal_pending_state();
+    }
+
+    // Keep early signals for owners that still materialize their kernel event
+    // lazily at IPC handle creation. Production waits never use this mirror.
+    fn signal_pending_state(&self) {
         let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
             .is_some_and(|value| value != std::ffi::OsStr::new("0"));
         {
             let mut signaled = self.signaled.lock().unwrap();
             *signaled = true;
+            #[cfg(test)]
             self.cv.notify_all();
         }
+        #[cfg(test)]
         if let Some(waiters) = self.host_waiters.get() {
             waiters.lock().unwrap().retain(|waiter| {
                 if let Some(waiter) = waiter.upgrade() {
@@ -270,7 +284,7 @@ impl Event {
             });
         }
         if trace_boot {
-            log::info!("Service::Event::signal_host_only: host condvar signaled");
+            log::info!("Service::Event::signal_pending_state: recorded signal");
         }
     }
 
@@ -297,19 +311,22 @@ impl Event {
         *self.signaled.lock().unwrap()
     }
 
+    #[cfg(test)]
     pub(super) fn register_host_waiter(&self, waiter: &Arc<HostMultiWaitSignal>) {
         let mut waiters = self.host_waiters.get_or_init(Mutex::default).lock().unwrap();
         waiters.retain(|waiter| waiter.strong_count() != 0);
         waiters.push(Arc::downgrade(waiter));
     }
 
-    /// Wait for the event to be signaled.
+    /// Wait for a null-kernel unit-test fixture to be signaled.
+    #[cfg(test)]
     pub fn wait(&self) {
         let guard = self.signaled.lock().unwrap();
         let _guard = self.cv.wait_while(guard, |s| !*s).unwrap();
     }
 
-    /// Wait for the event with a timeout. Returns true if signaled, false if timed out.
+    /// Timed wait for a null-kernel unit-test fixture, in host wall-clock time.
+    #[cfg(test)]
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
         let guard = self.signaled.lock().unwrap();
         let (guard, _result) = self.cv.wait_timeout_while(guard, timeout, |s| !*s).unwrap();

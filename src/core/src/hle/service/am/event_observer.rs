@@ -26,6 +26,8 @@ pub enum UserDataTag {
 pub struct EventObserver {
     shared: Arc<SharedState>,
     thread: Option<std::thread::JoinHandle<()>>,
+    context: crate::hle::service::kernel_helpers::ServiceContext,
+    wakeup_event_handle: u32,
 }
 
 struct SharedState {
@@ -49,7 +51,9 @@ impl EventObserver {
     /// The WindowSystem pointer must remain valid for the lifetime of this
     /// EventObserver (matching upstream lifetime contract).
     pub fn new(window_system: *const WindowSystem) -> Self {
-        let wakeup_event = Arc::new(Event::new());
+        let mut context = crate::hle::service::kernel_helpers::ServiceContext::new("am:EventObserver".into());
+        let wakeup_event_handle = context.create_event("Event".into());
+        let wakeup_event = context.get_event(wakeup_event_handle).expect("observer wakeup event must exist");
         let mut observer_state = ObserverState {
             process_holder_list: Vec::new(),
             wakeup_holder: Box::new(MultiWaitHolder::from_event(wakeup_event.clone())),
@@ -59,16 +63,19 @@ impl EventObserver {
         observer_state
             .wakeup_holder
             .set_user_data(UserDataTag::WakeupEvent as usize);
-        observer_state
-            .wakeup_holder
-            .link_to_multi_wait(&mut observer_state.multi_wait as *mut MultiWait);
-
         let shared = Arc::new(SharedState {
             window_system: window_system as usize,
             wakeup_event,
             stop_requested: AtomicBool::new(false),
             state: Mutex::new(observer_state),
         });
+        // Link after the Rust move into its stable owner, as upstream's
+        // constructor links members at their final addresses.
+        {
+            let mut state = shared.state.lock().unwrap();
+            let multi_wait = &mut state.multi_wait as *mut MultiWait;
+            state.wakeup_holder.link_to_multi_wait(multi_wait);
+        }
 
         let shared_clone = shared.clone();
 
@@ -82,6 +89,8 @@ impl EventObserver {
         Self {
             shared,
             thread: Some(thread),
+            context,
+            wakeup_event_handle,
         }
     }
 
@@ -161,32 +170,23 @@ impl EventObserver {
                 return None;
             }
 
-            let holders = {
+            let multi_wait = {
                 let state = shared.state.lock().unwrap();
-                state.multi_wait.holders_snapshot()
+                &state.multi_wait as *const MultiWait
             };
-
-            for holder in holders {
-                let is_signaled = unsafe { (*holder).is_signaled() };
-                if !is_signaled {
-                    continue;
-                }
-
-                let tag = unsafe { (*holder).get_user_data() };
-                if tag != UserDataTag::WakeupEvent as usize {
-                    let mut state = shared.state.lock().unwrap();
-                    state.multi_wait.unlink_holder(holder);
-                }
-                return Some(holder);
+            let kernel = crate::hle::kernel::kernel::get_kernel_ref()
+                .expect("EventObserver requires a live kernel");
+            // SharedState has a stable Arc owner. Only this observer thread
+            // mutates multi_wait; producers modify the separate deferred list.
+            // Release state before blocking so producers can link and signal.
+            let Some(holder) = (unsafe { (&*multi_wait).wait_any(kernel) }) else {
+                continue;
+            };
+            let tag = unsafe { (*holder).get_user_data() };
+            if tag != UserDataTag::WakeupEvent as usize {
+                shared.state.lock().unwrap().multi_wait.unlink_holder(holder);
             }
-
-            // Block on the wakeup event with a long timeout instead of a 100µs
-            // sleep loop. Do not clear before waiting: Event signal is sticky,
-            // and clearing here would create a lost-wakeup race if another
-            // thread signals between the last poll above and this wait.
-            shared
-                .wakeup_event
-                .wait_timeout(std::time::Duration::from_millis(100));
+            return Some(holder);
         }
     }
 
@@ -270,5 +270,6 @@ impl Drop for EventObserver {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.context.close_event(self.wakeup_event_handle);
     }
 }

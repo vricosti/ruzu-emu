@@ -117,7 +117,7 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     };
 
     let (session_object_id, client_session_object_id, server_session) = {
-        let mut port_guard = port.lock().unwrap();
+        let port_guard = port.lock().unwrap();
         if port_guard.is_light() {
             process.handle_table.unreserve(reserved_handle);
             log::warn!(
@@ -144,7 +144,8 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
             .get_server_session_by_object_id(session_object_id)
             .expect("created server session must be registered");
 
-        let enqueue_result = port_guard.enqueue_session(session_object_id);
+        drop(port_guard);
+        let enqueue_result = KPort::enqueue_session_arc(&port, session_object_id);
         if enqueue_result.is_error() {
             process.handle_table.unreserve(reserved_handle);
             process.unregister_client_session_object_by_object_id(client_session_object_id);
@@ -339,7 +340,7 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
     };
 
     let created_session = {
-        let mut port_guard = port.lock().unwrap();
+        let port_guard = port.lock().unwrap();
         if port_guard.is_light() {
             let port_name = port_guard.get_name();
             let (light_session_object_id, server_session_object_id, client_session_object_id) =
@@ -354,7 +355,8 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
                     }
                 };
 
-            let enqueue_result = port_guard.enqueue_light_session(server_session_object_id);
+            drop(port_guard);
+            let enqueue_result = KPort::enqueue_light_session_arc(&port, server_session_object_id);
             if enqueue_result.is_error() {
                 process.handle_table.unreserve(reserved_handle);
                 process
@@ -387,7 +389,8 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
                 }
             };
 
-            let enqueue_result = port_guard.enqueue_session(session_object_id);
+            drop(port_guard);
+            let enqueue_result = KPort::enqueue_session_arc(&port, session_object_id);
             if enqueue_result.is_error() {
                 process.handle_table.unreserve(reserved_handle);
                 process.unregister_client_session_object_by_object_id(client_session_object_id);

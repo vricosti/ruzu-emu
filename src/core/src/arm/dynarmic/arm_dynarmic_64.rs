@@ -2634,22 +2634,18 @@ impl ArmInterface for ArmDynarmic64 {
             }
         };
 
-        // Upstream: GPRs[0..29] -> ctx.r[0..29], GPR[29] -> ctx.fp, GPR[30] -> ctx.lr
-        for i in 0..29 {
-            ctx.r[i] = jit.get_register(i);
-        }
-        ctx.fp = jit.get_register(29);
-        ctx.lr = jit.get_register(30);
+        // Upstream GetContext snapshots the register banks through bulk accessors.
+        let gpr = jit.get_registers();
+        let fpr = jit.get_vectors();
+        ctx.r.copy_from_slice(&gpr[..29]);
+        ctx.fp = gpr[29];
+        ctx.lr = gpr[30];
 
         ctx.sp = jit.get_sp();
         ctx.pc = jit.get_pc();
         ctx.pstate = jit.get_pstate();
 
-        // Vector registers
-        for i in 0..32 {
-            let (lo, hi) = jit.get_vector_parts(i);
-            ctx.v[i] = (lo as u128) | ((hi as u128) << 64);
-        }
+        ctx.v = fpr.map(|[lo, hi]| (lo as u128) | ((hi as u128) << 64));
 
         ctx.fpcr = jit.get_fpcr();
         ctx.fpsr = jit.get_fpsr();
@@ -2665,23 +2661,17 @@ impl ArmInterface for ArmDynarmic64 {
             }
         };
 
-        // Upstream: ctx.r[0..29] -> GPRs[0..29], ctx.fp -> GPR[29], ctx.lr -> GPR[30]
-        for i in 0..29 {
-            jit.set_register(i, ctx.r[i]);
-        }
-        jit.set_register(29, ctx.fp);
-        jit.set_register(30, ctx.lr);
+        let mut gpr = [0; 31];
+        gpr[..29].copy_from_slice(&ctx.r);
+        gpr[29] = ctx.fp;
+        gpr[30] = ctx.lr;
+        jit.set_registers(gpr);
 
         jit.set_sp(ctx.sp);
         jit.set_pc(ctx.pc);
         jit.set_pstate(ctx.pstate);
 
-        // Vector registers
-        for i in 0..32 {
-            let lo = ctx.v[i] as u64;
-            let hi = (ctx.v[i] >> 64) as u64;
-            jit.set_vector_parts(i, lo, hi);
-        }
+        jit.set_vectors(ctx.v.map(|vector| [vector as u64, (vector >> 64) as u64]));
 
         jit.set_fpcr(ctx.fpcr);
         jit.set_fpsr(ctx.fpsr);
@@ -2907,6 +2897,91 @@ mod tests {
         assert_eq!(ctx.fpcr, jit_state.get_fpcr());
         assert_eq!(ctx.fpsr, jit_state.get_fpsr());
         assert_eq!(ctx.tpidr, 0x3333);
+    }
+
+    #[test]
+    fn bulk_context_transfer_preserves_all_registers_and_vector_halves() {
+        use super::{A64UserConfig, ArmDynarmic64, ArmInterface, ThreadContext};
+
+        let base = ArmInterfaceBase::new(false);
+        let svc = Arc::new(AtomicU32::new(0));
+        let last_exception_address = Arc::new(AtomicU64::new(0));
+        let breakpoint_context = Arc::new(Mutex::new(ThreadContext::default()));
+        let halted_watchpoint = Arc::new(Mutex::new(None));
+        let callbacks = DynarmicCallbacks64::new(
+            Arc::new(RwLock::new(ProcessMemoryData::new())),
+            None,
+            Arc::clone(&svc),
+            false,
+            Arc::new(CoreTiming::new()),
+            Arc::clone(&last_exception_address),
+            Arc::clone(&breakpoint_context),
+            0,
+            false,
+            base.shared_watchpoint_array(),
+            Arc::clone(&halted_watchpoint),
+            None,
+        );
+        let mut config = A64UserConfig::new(Box::new(callbacks));
+        config.code_cache_size = 8 * 1024 * 1024;
+        let mut arm = ArmDynarmic64 {
+            base,
+            svc,
+            halted_watchpoint,
+            breakpoint_context,
+            jit: Some(rdynarmic::A64Jit::new(config).unwrap()),
+            tpidrro_el0: Box::new(0x1234),
+            tpidr_el0: Box::new(0),
+            last_exception_address,
+        };
+        let input = ThreadContext {
+            r: std::array::from_fn(|i| 0xFEDC_BA98_0000_0000 | i as u64),
+            fp: 0x1234_5678_ABCD_EF29,
+            lr: 0xABCD_EF01_2345_6730,
+            sp: 0x6789_0000,
+            pc: 0x1234_0000,
+            pstate: 0xA000_0000,
+            v: std::array::from_fn(|i| {
+                ((0xFEDC_BA98_7654_0000u128 | i as u128) << 64)
+                    | (0x0123_4567_89AB_0000u128 | (31 - i) as u128)
+            }),
+            fpcr: 0x0100_0000,
+            fpsr: 0x0800_001F,
+            tpidr: 0x1234_5678_9ABC_DEF0,
+            ..Default::default()
+        };
+        arm.set_context(&input);
+        // Check against individual JIT accessors, not only a round trip: symmetric
+        // lane/register permutation errors in the bulk paths must also fail.
+        let jit = arm.jit.as_ref().unwrap();
+        for i in 0..29 {
+            assert_eq!(jit.get_register(i), input.r[i]);
+        }
+        assert_eq!(jit.get_register(29), input.fp);
+        assert_eq!(jit.get_register(30), input.lr);
+        for i in 0..32 {
+            assert_eq!(
+                jit.get_vector_parts(i),
+                (input.v[i] as u64, (input.v[i] >> 64) as u64)
+            );
+        }
+        let mut output = ThreadContext {
+            padding: 0xA5A5_A5A5,
+            ..Default::default()
+        };
+        arm.get_context(&mut output);
+        assert_eq!(output.r, input.r);
+        assert_eq!(output.fp, input.fp);
+        assert_eq!(output.lr, input.lr);
+        assert_eq!(output.sp, input.sp);
+        assert_eq!(output.pc, input.pc);
+        assert_eq!(output.pstate, input.pstate);
+        assert_eq!(output.v, input.v);
+        assert_eq!(output.fpcr, input.fpcr);
+        assert_eq!(output.fpsr, input.fpsr);
+        assert_eq!(output.tpidr, input.tpidr);
+        assert_eq!(output.padding, 0xA5A5_A5A5);
+        assert_eq!(arm.get_tpidrro_el0(), 0x1234);
     }
 
     #[test]

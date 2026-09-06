@@ -6,7 +6,9 @@
 //!
 //! Event wrapper for kernel KEvent.
 
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+
+use super::multi_wait::HostMultiWaitSignal;
 
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::ProcessLock;
@@ -35,6 +37,9 @@ pub struct Event {
     signaled: Arc<Mutex<bool>>,
     cv: Arc<Condvar>,
     kernel_bridge: Mutex<Option<KernelEventBridge>>,
+    // Host-only counterpart of the kernel's synchronization wait list. Most
+    // events never need it, so signaling them requires no additional mutex.
+    host_waiters: OnceLock<Mutex<Vec<Weak<HostMultiWaitSignal>>>>,
 }
 
 impl Event {
@@ -43,6 +48,7 @@ impl Event {
             signaled: Arc::new(Mutex::new(false)),
             cv: Arc::new(Condvar::new()),
             kernel_bridge: Mutex::new(None),
+            host_waiters: OnceLock::new(),
         }
     }
 
@@ -63,6 +69,7 @@ impl Event {
                 readable_event,
                 process: Arc::downgrade(&process),
             })),
+            host_waiters: OnceLock::new(),
         }
     }
 
@@ -252,6 +259,16 @@ impl Event {
             *signaled = true;
             self.cv.notify_all();
         }
+        if let Some(waiters) = self.host_waiters.get() {
+            waiters.lock().unwrap().retain(|waiter| {
+                if let Some(waiter) = waiter.upgrade() {
+                    waiter.signal();
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         if trace_boot {
             log::info!("Service::Event::signal_host_only: host condvar signaled");
         }
@@ -280,6 +297,12 @@ impl Event {
         *self.signaled.lock().unwrap()
     }
 
+    pub(super) fn register_host_waiter(&self, waiter: &Arc<HostMultiWaitSignal>) {
+        let mut waiters = self.host_waiters.get_or_init(Mutex::default).lock().unwrap();
+        waiters.retain(|waiter| waiter.strong_count() != 0);
+        waiters.push(Arc::downgrade(waiter));
+    }
+
     /// Wait for the event to be signaled.
     pub fn wait(&self) {
         let guard = self.signaled.lock().unwrap();
@@ -304,6 +327,21 @@ impl Default for Event {
 mod tests {
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
+
+    #[test]
+    fn host_wait_registration_does_not_retain_finished_waiters() {
+        let event = Event::new();
+        for _ in 0..8 {
+            let notification = Arc::new(HostMultiWaitSignal::default());
+            event.register_host_waiter(&notification);
+            assert_eq!(event.host_waiters.get().unwrap().lock().unwrap().len(), 1);
+            let weak = Arc::downgrade(&notification);
+            drop(notification);
+            assert!(weak.upgrade().is_none());
+        }
+        event.signal_host_only();
+        assert!(event.host_waiters.get().unwrap().lock().unwrap().is_empty());
+    }
 
     #[test]
     fn clear_bridges_to_kernel_readable_event() {

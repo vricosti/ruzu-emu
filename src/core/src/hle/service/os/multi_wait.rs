@@ -8,12 +8,40 @@
 //! Upstream wraps svcWaitSynchronization/KSynchronizationObject::Wait.
 
 use std::ffi::OsStr;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::result::RESULT_SUCCESS;
 
 use super::multi_wait_holder::MultiWaitHolder;
+
+/// Host-side notification token for the local wait-many fallback. Unlike an
+/// emulated thread, an unregistered host worker cannot use the guest scheduler's
+/// wait queue. Remember notifications between the signaled scan and host sleep.
+#[derive(Default)]
+pub(super) struct HostMultiWaitSignal {
+    notified: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl HostMultiWaitSignal {
+    pub(super) fn signal(&self) {
+        *self.notified.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    fn wait(&self, timeout: Option<Duration>) {
+        let notified = self.notified.lock().unwrap();
+        let mut notified = if let Some(timeout) = timeout {
+            self.cv.wait_timeout_while(notified, timeout, |v| !*v).unwrap().0
+        } else {
+            self.cv.wait_while(notified, |v| !*v).unwrap()
+        };
+        *notified = false;
+    }
+}
 
 /// MultiWait — manages a list of MultiWaitHolders to wait on.
 ///
@@ -96,6 +124,11 @@ impl MultiWait {
     pub fn try_wait_any_local(&self) -> Option<*mut MultiWaitHolder> {
         let holders = self.holders_snapshot();
         self.local_try_wait_any(&holders)
+    }
+
+    /// Wait without a guest-thread context, using host notifications for Events.
+    pub fn wait_any_local(&self) -> Option<*mut MultiWaitHolder> {
+        self.local_timed_wait(&self.holders, -1)
     }
 
     fn timed_wait_impl(
@@ -238,19 +271,46 @@ impl MultiWait {
         holders: &[*mut MultiWaitHolder],
         timeout_ns: i64,
     ) -> Option<*mut MultiWaitHolder> {
+        let start = Instant::now();
         if let Some(holder) = self.local_try_wait_any(holders) {
             return Some(holder);
         }
 
-        if timeout_ns == 0 {
+        if timeout_ns == 0 || holders.is_empty() {
             return None;
         }
 
+        // Register on the whole set before rescanning it. An event signaled
+        // before registration is found by the scan; one signaled after it
+        // remembers a notification even if it precedes the condvar wait.
+        let notification = if holders.iter().all(|holder| unsafe {
+            (**holder).host_event().is_some()
+        }) {
+            let notification = Arc::new(HostMultiWaitSignal::default());
+            for &holder in holders {
+                unsafe { (*holder).host_event().unwrap() }.register_host_waiter(&notification);
+            }
+            Some(notification)
+        } else {
+            None
+        };
+        let timeout = (timeout_ns > 0).then(|| Duration::from_nanos(timeout_ns as u64));
         loop {
             if let Some(holder) = self.local_try_wait_any(holders) {
                 return Some(holder);
             }
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            let remaining = timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return None;
+            }
+            if let Some(notification) = &notification {
+                notification.wait(remaining);
+            } else {
+                // Other native holder types still use their kernel wait path
+                // when a guest context exists; preserve the legacy host fallback.
+                let interval = Duration::from_micros(100);
+                std::thread::sleep(remaining.map_or(interval, |left| left.min(interval)));
+            }
         }
     }
 
@@ -269,5 +329,90 @@ impl MultiWait {
 impl Default for MultiWait {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::event::Event;
+    use std::sync::mpsc;
+
+    #[test]
+    fn local_event_wait_keeps_order_and_manual_reset_state() {
+        let first = Arc::new(Event::new());
+        let second = Arc::new(Event::new());
+        let mut first_holder = MultiWaitHolder::from_event(Arc::clone(&first));
+        let mut second_holder = MultiWaitHolder::from_event(Arc::clone(&second));
+        let mut wait = MultiWait::new();
+        wait.link_holder(&mut first_holder);
+        wait.link_holder(&mut second_holder);
+        assert!(wait.local_timed_wait(&wait.holders, 0).is_none());
+        second.signal_host_only();
+        first.signal_host_only();
+        assert_eq!(wait.wait_any_local(), Some(&mut first_holder as *mut _));
+        assert!(first.is_signaled());
+        first.clear();
+        assert_eq!(wait.wait_any_local(), Some(&mut second_holder as *mut _));
+        assert!(second.is_signaled());
+    }
+
+    #[test]
+    fn local_event_wait_wakes_all_waiters_without_consuming_event() {
+        let event = Arc::new(Event::new());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let threads: Vec<_> = (0..2).map(|_| {
+            let event = Arc::clone(&event);
+            let ready = ready_tx.clone();
+            let done = done_tx.clone();
+            std::thread::spawn(move || {
+                let never_signaled = Arc::new(Event::new());
+                let mut first = MultiWaitHolder::from_event(never_signaled);
+                let mut second = MultiWaitHolder::from_event(event);
+                let mut wait = MultiWait::new();
+                wait.link_holder(&mut first);
+                wait.link_holder(&mut second);
+                ready.send(()).unwrap();
+                assert_eq!(wait.wait_any_local(), Some(&mut second as *mut _));
+                done.send(()).unwrap();
+            })
+        }).collect();
+        for _ in 0..2 {
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        event.signal_host_only();
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(event.is_signaled());
+    }
+
+    #[test]
+    fn host_notification_between_scan_and_sleep_is_retained() {
+        let event = Event::new();
+        let notification = Arc::new(HostMultiWaitSignal::default());
+        event.register_host_waiter(&notification);
+        assert!(!event.is_signaled());
+        // Simulate the exact lost-wakeup window, not a sleep-based race.
+        event.signal_host_only();
+        assert!(*notification.notified.lock().unwrap());
+        notification.wait(None);
+        assert!(!*notification.notified.lock().unwrap());
+        assert!(event.is_signaled());
+    }
+
+    #[test]
+    fn local_event_wait_honors_finite_timeout() {
+        let mut holder = MultiWaitHolder::from_event(Arc::new(Event::new()));
+        let mut wait = MultiWait::new();
+        wait.link_holder(&mut holder);
+        let start = Instant::now();
+        assert!(wait.local_timed_wait(&wait.holders, 2_000_000).is_none());
+        assert!(start.elapsed() >= Duration::from_millis(2));
+        assert!(MultiWait::new().wait_any_local().is_none());
     }
 }

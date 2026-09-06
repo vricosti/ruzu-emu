@@ -1087,7 +1087,8 @@ impl CpuManager {
                         let thread = thread_arc.lock().unwrap();
                         (thread.get_thread_id(), thread.get_priority())
                     };
-                    if current_thread_id == 17 || current_thread_id >= 18 {
+                    // Diagnostic-only context copies must not run when the trace is disabled.
+                    if log::log_enabled!(log::Level::Trace) && current_thread_id >= 17 {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
                         log::trace!(

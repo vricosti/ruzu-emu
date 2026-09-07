@@ -226,8 +226,14 @@ impl Default for Values {
             show_filter_bar: Setting::new(true, "showFilterBar", Ui),
             show_status_bar: Setting::new(true, "showStatusBar", Ui),
 
-            confirm_before_stopping: Setting::new(ConfirmStop::AskAlways, "confirmStop", UiGeneral),
-            pause_when_in_background: Setting::new(false, "pauseWhenInBackground", UiGeneral),
+            confirm_before_stopping: Setting::with_options(
+                ConfirmStop::AskAlways, "confirmStop", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
+            pause_when_in_background: Setting::with_options(
+                false, "pauseWhenInBackground", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
             mute_when_in_background: Setting::with_options(
                 false,
                 "muteWhenInBackground",
@@ -236,9 +242,15 @@ impl Default for Values {
                 true,
                 true,
             ),
-            hide_mouse: Setting::new(true, "hideInactiveMouse", UiGeneral),
-            controller_applet_disabled: Setting::new(false, "disableControllerApplet", Ui),
-            select_user_on_boot: Setting::new(false, "select_user_on_boot", UiGeneral),
+            hide_mouse: Setting::with_options(
+                true, "hideInactiveMouse", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
+            controller_applet_disabled: Setting::new(false, "disableControllerApplet", UiGeneral),
+            select_user_on_boot: Setting::with_options(
+                false, "select_user_on_boot", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
             enable_gamemode: SwitchableSetting::new(
                 !cfg!(target_env = "msvc"),
                 "enable_gamemode",

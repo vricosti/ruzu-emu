@@ -29,6 +29,26 @@ pub struct SettingEditPolicy {
 }
 
 impl SettingEditPolicy {
+    /// Non-switchable Widget settings only exist in global configuration.
+    pub fn for_setting<T: Clone>(
+        setting: &common::settings_common::Setting<T>,
+        runtime_lock: bool,
+        configuring_global: bool,
+    ) -> Self {
+        let allowed = configuring_global && (runtime_lock || setting.runtime_modifiable);
+        Self { sensitive: allowed, allow_apply: allowed }
+    }
+
+    pub fn apply_setting<T: Clone + PartialOrd>(
+        self,
+        setting: &mut common::settings_common::Setting<T>,
+        value: T,
+    ) {
+        if self.allow_apply {
+            setting.set_value(value);
+        }
+    }
+
     pub fn new<T: Clone>(
         setting: &common::settings_common::SwitchableSetting<T>,
         runtime_lock: bool,
@@ -58,6 +78,22 @@ mod setting_edit_tests {
     use super::SettingEditPolicy;
     use common::settings_common::SwitchableSetting;
     use common::settings_enums::Category;
+
+    #[test]
+    fn non_switchable_settings_require_global_configuration() {
+        let mut setting = common::settings_common::Setting::with_options(
+            false, "synthetic", Category::UiGeneral,
+            common::settings_common::Specialization::DEFAULT, true, true,
+        );
+        let custom = SettingEditPolicy::for_setting(&setting, true, false);
+        assert!(!custom.sensitive);
+        custom.apply_setting(&mut setting, true);
+        assert!(!*setting.get_value());
+        let global = SettingEditPolicy::for_setting(&setting, false, true);
+        assert!(global.sensitive);
+        global.apply_setting(&mut setting, true);
+        assert!(*setting.get_value());
+    }
 
     #[test]
     fn startup_only_setting_rejects_runtime_writes() {

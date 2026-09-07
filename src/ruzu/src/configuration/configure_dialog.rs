@@ -145,7 +145,7 @@ impl ConfigureDialog {
             Section {
                 name: "General",
                 pages: vec![
-                    configure_general::page(),
+                    configure_general::page(runtime_lock),
                     configure_hotkeys::page(),
                     configure_ui::page(),
                     configure_web::page(),

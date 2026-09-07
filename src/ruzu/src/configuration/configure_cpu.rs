@@ -84,6 +84,10 @@ pub fn page() -> Page {
     unsafe_note.set_xalign(0.0);
     unsafe_content.append(&unsafe_note);
 
+    let host_mmu = w::check_row(
+        "Enable Host MMU Emulation (fastmem)",
+        *common::settings::values().cpuopt_unsafe_host_mmu.get_value(),
+    );
     let unfuse_fma = w::check_row(
         "Unfuse FMA (improve performance on CPUs without FMA)",
         *common::settings::values()
@@ -121,6 +125,7 @@ pub fn page() -> Page {
             .get_value(),
     );
     for check in [
+        &host_mmu,
         &unfuse_fma,
         &reduce_fp_error,
         &ignore_standard_fpcr,
@@ -163,6 +168,7 @@ pub fn page() -> Page {
         values.cpu_accuracy.set_value(accuracy_value);
         values.use_custom_cpu_ticks.set_value(custom_ticks_enabled);
         values.cpu_ticks.set_value(ticks_value);
+        values.cpuopt_unsafe_host_mmu.set_value(host_mmu.is_active());
         values.cpuopt_unsafe_unfuse_fma.set_value(unfuse);
         values.cpuopt_unsafe_reduce_fp_error.set_value(fp_error);
         values.cpuopt_unsafe_ignore_standard_fpcr.set_value(fpcr);

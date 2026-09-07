@@ -1569,6 +1569,10 @@ impl RasterizerInterface for MetalRasterizer {
     }
 
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
+        // Match RasterizerInterface's setting gate despite overriding its body.
+        if *common::settings::values().skip_cpu_inner_invalidation.get_value() {
+            return;
+        }
         let texture_mutex: *const _ = &self.texture_cache.base.mutex;
         let _texture_guard = unsafe { (*texture_mutex).lock() };
         for &(addr, size) in sequences {

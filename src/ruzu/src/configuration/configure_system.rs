@@ -183,7 +183,7 @@ pub fn page() -> Page {
     let limit_enabled = *common::settings::values().use_speed_limit.get_value();
     let speed_check = gtk::CheckButton::with_label("Limit Speed Percent");
     speed_check.set_active(limit_enabled);
-    let speed_spin = gtk::SpinButton::with_range(1.0, 9999.0, 1.0);
+    let speed_spin = gtk::SpinButton::with_range(0.0, 9999.0, 1.0);
     speed_spin.set_value(*common::settings::values().speed_limit.get_value() as f64);
     speed_spin.set_hexpand(true);
     let speed_suffix = gtk::Label::new(Some("%"));

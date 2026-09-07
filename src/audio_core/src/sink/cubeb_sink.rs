@@ -258,7 +258,7 @@ impl CubebSink {
         };
 
         let mut output_device = cubeb::DeviceId::default();
-        let input_device = cubeb::DeviceId::default();
+        let mut input_device = cubeb::DeviceId::default();
         let mut device_channels = 2u32;
 
         if let Some(ref ctx) = ctx {
@@ -269,19 +269,26 @@ impl CubebSink {
                 device_channels = if max_channels >= 6 { 6 } else { 2 };
             }
 
-            // Find specific output device if requested
+            // Separate AudioCore sinks receive the configured input/output name.
+            // Resolve both directions instead of leaving capture on the default
+            // device, an omission also present in Eden's constructor.
             if target_device_name != AUTO_DEVICE_NAME && !target_device_name.is_empty() {
-                if let Ok(devices) = ctx.enumerate_devices(DeviceType::OUTPUT) {
-                    for device in devices.iter() {
-                        if let Some(friendly_name) = device.friendly_name() {
-                            if friendly_name == target_device_name {
-                                output_device = device.devid();
-                                break;
+                for (device_type, selected_device) in [
+                    (DeviceType::OUTPUT, &mut output_device),
+                    (DeviceType::INPUT, &mut input_device),
+                ] {
+                    if let Ok(devices) = ctx.enumerate_devices(device_type) {
+                        for device in devices.iter() {
+                            if let Some(friendly_name) = device.friendly_name() {
+                                if friendly_name == target_device_name {
+                                    *selected_device = device.devid();
+                                    break;
+                                }
                             }
                         }
+                    } else {
+                        warn!("Audio {device_type:?} device enumeration not supported");
                     }
-                } else {
-                    warn!("Audio output device enumeration not supported");
                 }
             }
         }

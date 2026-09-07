@@ -153,6 +153,7 @@ pub const CPU_ACCURACY: &[(CpuAccuracy, &str)] = &[
         CpuAccuracy::Paranoid,
         "Paranoid (disables most optimizations)",
     ),
+    (CpuAccuracy::Debugging, "Debugging"),
 ];
 
 /// Upstream's `configure_cpu.ui` only shows the "Backend:" row on targets where

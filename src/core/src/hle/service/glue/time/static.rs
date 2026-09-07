@@ -877,15 +877,20 @@ mod tests {
 
     #[test]
     fn get_time_zone_service_returns_glue_service_object() {
-        let service = StaticService::new(
-            crate::core::SystemRef::null(),
-            user_setup(),
-            "time:u",
-            make_time_manager(),
-        );
-        let time_zone_service = service.get_time_zone_service().unwrap();
-
-        assert_eq!(time_zone_service.service_name(), "ITimeZoneService");
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let system = Box::new(crate::core::System::new_for_test());
+                let system_ref = crate::core::SystemRef::from_ref(system.as_ref());
+                let set_sys = Arc::new(crate::hle::service::set::system_settings_server::SystemSettingsService::new_for_test());
+                assert!(system.service_manager().unwrap().lock().unwrap().register_service(
+                    "set:sys".to_string(), 64, Box::new(move || set_sys.clone()),
+                ).is_success());
+                let service = StaticService::new(system_ref, user_setup(), "time:u", make_time_manager());
+                let time_zone_service = service.get_time_zone_service().unwrap();
+                assert_eq!(time_zone_service.service_name(), "ITimeZoneService");
+            })
+            .unwrap().join().unwrap();
     }
 
     fn admin_setup() -> StaticServiceSetupInfo {

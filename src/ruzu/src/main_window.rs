@@ -317,12 +317,53 @@ mod render_geometry_tests {
     }
 }
 
+// Mechanical extraction of the two identical automatic-state branches in
+// Eden's OnAppFocusStateChanged, kept in the owning module for regression tests.
+fn background_setting_transition(
+    active: bool,
+    enabled: bool,
+    current: bool,
+    automatic: bool,
+) -> (bool, bool) {
+    if enabled && !active && !current {
+        (true, true)
+    } else if active && automatic {
+        // Also release an automatic state if its option was disabled meanwhile.
+        (false, false)
+    } else {
+        (current, automatic)
+    }
+}
+
+#[cfg(test)]
+mod background_setting_tests {
+    use super::background_setting_transition as transition;
+
+    #[test]
+    fn automatic_state_round_trip_is_idempotent() {
+        assert_eq!(transition(false, true, false, false), (true, true));
+        assert_eq!(transition(false, true, true, true), (true, true));
+        assert_eq!(transition(true, true, true, true), (false, false));
+        assert_eq!(transition(true, true, false, false), (false, false));
+    }
+
+    #[test]
+    fn manual_pause_or_mute_is_not_undone() {
+        assert_eq!(transition(false, true, true, false), (true, false));
+        assert_eq!(transition(true, true, true, false), (true, false));
+        assert_eq!(transition(false, false, false, false), (false, false));
+    }
+
+    #[test]
+    fn disabling_option_does_not_leave_automatic_state_stuck() {
+        assert_eq!(transition(true, false, true, true), (false, false));
+    }
+}
+
 /// The main launcher window.
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
-/// `gtk::ApplicationWindow`. Kept as a thin newtype so future state (game list
-/// model, status labels, emulation handles) can hang off it the way the
-/// upstream class members do.
+/// `gtk::ApplicationWindow` and retain the frontend session state.
 pub struct GMainWindow {
     window: ApplicationWindow,
     /// Multiplayer client. Upstream keeps it in `Core::System`'s room network;
@@ -340,6 +381,8 @@ pub struct GMainWindow {
     /// The active emulation session, if a game is running (upstream keeps the
     /// `System` + emu thread on `GMainWindow`).
     session: RefCell<Option<EmulationSession>>,
+    auto_paused: Cell<bool>,
+    auto_muted: Cell<bool>,
     /// Upstream `GMainWindow::current_game_path` and the copy retained by
     /// `OnRestartGame` while `ShutdownGame` clears the current path.
     current_game_path: RefCell<Option<String>>,
@@ -1204,6 +1247,8 @@ impl GMainWindow {
             stack,
             loading_screen,
             session: RefCell::new(None),
+            auto_paused: Cell::new(false),
+            auto_muted: Cell::new(false),
             current_game_path: RefCell::new(None),
             pending_restart_path: RefCell::new(None),
             close_confirmation_pending: Cell::new(false),
@@ -1227,6 +1272,30 @@ impl GMainWindow {
         });
 
         controller_applet_frontend.start();
+        // Qt reports application focus, not just focus of the main window.
+        // Defer until GTK has completed a focus transfer to another dialog.
+        this.window.connect_is_active_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| {
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    this,
+                    move || this.on_app_focus_state_changed(),
+                ));
+            }
+        ));
+        app.connect_active_window_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| {
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    this,
+                    move || this.on_app_focus_state_changed(),
+                ));
+            }
+        ));
         error_applet_frontend.start();
         software_keyboard_frontend.start();
 
@@ -4389,6 +4458,36 @@ impl GMainWindow {
         }
     }
 
+    /// Upstream MainWindow::OnAppFocusStateChanged. GTK windows include modal
+    /// frontend dialogs, so moving focus within Ruzu is not backgrounding it.
+    fn on_app_focus_state_changed(&self) {
+        let Some(paused) = self.session.borrow().as_ref().map(EmulationSession::is_paused) else {
+            return;
+        };
+        let active = gtk::Window::list_toplevels().iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Window>())
+            .any(|window| window.is_active());
+        let (pause_background, mute_background) = crate::uisettings::with(|v| (
+            *v.pause_when_in_background.get_value(),
+            *v.mute_when_in_background.get_value(),
+        ));
+        let (pause, auto_pause) = background_setting_transition(active, pause_background, paused, self.auto_paused.get());
+        if pause != paused {
+            if pause { self.on_pause_game(); } else { self.on_start_game(); }
+            if self.session.borrow().as_ref().is_some_and(|session| session.is_paused() == pause) {
+                self.auto_paused.set(auto_pause);
+            }
+        } else {
+            self.auto_paused.set(auto_pause);
+        }
+        let mut values = common::settings::values_mut();
+        let (muted, auto_mute) = background_setting_transition(active, mute_background, *values.audio_muted.get_value(), self.auto_muted.get());
+        values.audio_muted.set_value(muted);
+        self.auto_muted.set(auto_mute);
+        drop(values);
+        self.status_bar.refresh();
+    }
+
     /// Resume the emulation thread — upstream `GMainWindow::OnStartGame`.
     fn on_start_game(&self) {
         let resumed = self
@@ -4606,6 +4705,10 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        self.auto_paused.set(false);
+        if self.auto_muted.replace(false) {
+            common::settings::values_mut().audio_muted.set_value(false);
+        }
         self.play_time_manager.stop();
         let close_after_stop = self.close_confirmed.get();
         let restart_path = restart_path_after_shutdown(

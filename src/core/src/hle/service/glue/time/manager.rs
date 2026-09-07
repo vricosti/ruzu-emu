@@ -49,7 +49,7 @@ impl TimeManager {
             system.get().core_timing()
         };
         let file_timestamp_worker = Arc::new(Mutex::new(FileTimestampWorker::new()));
-        let steady_clock_resource = Arc::new(Mutex::new(StandardSteadyClockResource::new()));
+        let steady_clock_resource = Arc::new(Mutex::new(StandardSteadyClockResource::new(system)));
         let time_zone_binary = Arc::new(Mutex::new(TimeZoneBinary::new(system)));
 
         Self {

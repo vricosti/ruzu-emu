@@ -113,7 +113,7 @@ fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
 fn upstream_optimization_config_from_settings(
     settings: &common::settings::Values,
 ) -> (OptimizationFlag, bool) {
-    if *settings.cpu_debug_mode.get_value() {
+    if common::settings::is_cpu_debug_enabled(&settings) {
         let mut flags = optimization_flags_from_mask(0x3F);
         if !*settings.cpuopt_block_linking.get_value() {
             flags = flags & !OptimizationFlag::BLOCK_LINKING;
@@ -168,7 +168,7 @@ fn upstream_optimization_config_from_settings(
             flags = OptimizationFlag::NO_OPTIMIZATIONS;
             unsafe_optimizations = false;
         }
-        CpuAccuracy::Accurate => {}
+        CpuAccuracy::Accurate | CpuAccuracy::Debugging => {}
     }
 
     (flags, unsafe_optimizations)
@@ -2493,7 +2493,7 @@ impl ArmDynarmic32 {
         let mut recompile_on_exclusive_fastmem_failure = true;
         let mut only_detect_misalignment_via_page_table_on_page_boundary = true;
 
-        if *settings.cpu_debug_mode.get_value() {
+        if common::settings::is_cpu_debug_enabled(&settings) {
             if !*settings.cpuopt_page_tables.get_value() {
                 page_table_pointer = None;
             }
@@ -2516,7 +2516,7 @@ impl ArmDynarmic32 {
             fastmem_exclusive_access = false;
         }
         let check_halt_on_memory_access = debugger_enabled
-            || (*settings.cpu_debug_mode.get_value()
+            || (common::settings::is_cpu_debug_enabled(&settings)
                 && !*settings.cpuopt_ignore_memory_aborts.get_value());
 
         let mut coprocessors = empty_coprocessors();
@@ -3098,6 +3098,17 @@ mod tests {
             translate_halt_reason(rdynarmic::HaltReason::MEMORY_ABORT),
             HaltReason::DATA_ABORT
         );
+    }
+
+    #[test]
+    fn debugging_accuracy_applies_individual_optimization_toggles() {
+        let mut settings = common::settings::Values::default();
+        settings.cpu_accuracy.set_value(CpuAccuracy::Debugging);
+        settings.cpuopt_block_linking.set_value(false);
+        let (flags, unsafe_optimizations) = upstream_optimization_config_from_settings(&settings);
+        assert!(!unsafe_optimizations);
+        assert!(!flags.contains(OptimizationFlag::BLOCK_LINKING));
+        assert!(flags.contains(OptimizationFlag::CONST_PROP));
     }
 
     #[test]

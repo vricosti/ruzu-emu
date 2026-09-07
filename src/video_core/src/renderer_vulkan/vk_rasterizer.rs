@@ -3535,6 +3535,11 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
+        // This override bypasses RasterizerInterface's default implementation,
+        // so it must honor the same opt-in invalidation setting explicitly.
+        if *common::settings::values().skip_cpu_inner_invalidation.get_value() {
+            return;
+        }
         unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();

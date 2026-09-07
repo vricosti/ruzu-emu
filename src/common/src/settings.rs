@@ -794,7 +794,7 @@ impl Default for Values {
             cpu_accuracy: SwitchableSetting::ranged(
                 CpuAccuracy::Auto,
                 CpuAccuracy::Auto,
-                CpuAccuracy::Paranoid,
+                CpuAccuracy::Debugging,
                 "cpu_accuracy",
                 Cpu,
             ),
@@ -1611,9 +1611,16 @@ pub fn is_opengl() -> bool {
     )
 }
 
+/// Eden selects debug optimizations through CpuAccuracy::Debugging. Preserve
+/// the older Ruzu checkbox/config key as an explicit compatibility alias.
+pub fn is_cpu_debug_enabled(values: &Values) -> bool {
+    *values.cpu_accuracy.get_value() == CpuAccuracy::Debugging
+        || *values.cpu_debug_mode.get_value()
+}
+
 /// Returns true if fastmem is effectively enabled.
 pub fn is_fastmem_enabled(values: &Values) -> bool {
-    if *values.cpu_debug_mode.get_value() {
+    if is_cpu_debug_enabled(values) {
         return *values.cpuopt_fastmem.get_value();
     }
     if *values.cpu_accuracy.get_value() == CpuAccuracy::Unsafe {
@@ -2115,6 +2122,25 @@ mod tests {
 
         values.current_gpu_accuracy = GpuAccuracy::Low;
         assert!(!is_gpu_level_high(&values));
+    }
+
+    #[test]
+    fn debugging_accuracy_preserves_upstream_value_and_legacy_alias() {
+        let mut values = Values::default();
+        assert_eq!(CpuAccuracy::Debugging as u32, 4);
+        assert_eq!(CpuAccuracy::from_u32(4), Some(CpuAccuracy::Debugging));
+        assert!(!is_cpu_debug_enabled(&values));
+        values.cpu_accuracy.set_value(CpuAccuracy::Debugging);
+        assert_eq!(*values.cpu_accuracy.get_value(), CpuAccuracy::Debugging);
+        assert!(is_cpu_debug_enabled(&values));
+        values.cpuopt_fastmem.set_value(false);
+        assert!(!is_fastmem_enabled(&values));
+        values.cpuopt_fastmem.set_value(true);
+        assert!(is_fastmem_enabled(&values));
+        values.cpu_accuracy.set_value(CpuAccuracy::Auto);
+        assert!(!is_cpu_debug_enabled(&values));
+        values.cpu_debug_mode.set_value(true);
+        assert!(is_cpu_debug_enabled(&values));
     }
 
     #[test]

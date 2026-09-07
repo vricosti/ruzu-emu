@@ -442,6 +442,7 @@ settings_enum! {
         Accurate,
         Unsafe,
         Paranoid,
+        Debugging,
     }
 }
 

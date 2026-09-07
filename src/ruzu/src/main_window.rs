@@ -3259,11 +3259,77 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             self,
             move || {
-                this.configure_dialog.borrow_mut().take();
+                let dialog = this.configure_dialog.borrow_mut().take();
+                if dialog.as_ref().is_some_and(|dialog| dialog.reset_requested()) {
+                    if let Err(error) = this.reset_configuration() {
+                        crate::gtk_compat::show_warning(
+                            Some(&this.window), "Unable to reset settings",
+                            &format!("The reset could not finish. Some settings may already have been reset. {error}"),
+                        );
+                    }
+                }
             }
         ));
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
+    }
+
+    /// MainWindow::OnConfigure's reset branch. The dialog has stopped input
+    /// configuration and closed without applying any pending page values.
+    fn reset_configuration(&self) -> std::io::Result<()> {
+        use common::fs::path_util::{get_ruzu_path, RuzuPath};
+        use crate::configuration::qt_config as config;
+        reset_configuration_files(
+            &get_ruzu_path(RuzuPath::ConfigDir),
+            &get_ruzu_path(RuzuPath::CacheDir),
+        )?;
+        let (game_dirs, favorites) = crate::uisettings::with(|values| {
+            (values.game_dirs.clone(), values.favorited_ids.clone())
+        });
+        common::settings::values_mut().disabled_addons.clear();
+        config::reload_all_values();
+        crate::uisettings::with_mut(|values| {
+            values.game_dirs = game_dirs.clone();
+            values.favorited_ids = favorites.clone();
+        });
+        config::save_game_dirs(&game_dirs)?;
+        config::save_favorited_ids(&favorites)?;
+        config::save_global_values()?;
+        config::save_control_values()?;
+        config::save_shortcut_values()?;
+        config::save_view_values()?;
+        config::save_ui_language()?;
+        #[cfg(target_os = "linux")]
+        crate::gui_settings::set_force_x11(crate::uisettings::with(|values| {
+            *values.gui_force_x11.get_value()
+        }))?;
+        let language = crate::uisettings::with(|values| values.language.get_value().clone());
+        crate::i18n::set_language(&language);
+        update_ui_theme();
+        self.hid_core.lock().reload_input_devices();
+        if let Some(app) = self.window.application() {
+            crate::hotkeys::apply_accelerators(&app);
+            for (name, enabled) in [
+                ("show_filter_bar", crate::uisettings::with(|v| *v.show_filter_bar.get_value())),
+                ("show_status_bar", crate::uisettings::with(|v| *v.show_status_bar.get_value())),
+            ] {
+                if let Some(action) = app.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+                    action.set_state(&enabled.to_variant());
+                }
+            }
+        }
+        self.refresh_menu_model();
+        self.status_bar.refresh();
+        self.window.set_default_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        self.window.set_fullscreened(false);
+        self.window.unmaximize();
+        self.window.set_decorated(true);
+        self.update_fullscreen_chrome(false);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.set_filter_visible(crate::uisettings::with(|v| *v.show_filter_bar.get_value()));
+            game_list.reload();
+        }
+        Ok(())
     }
 
     /// Upstream `GMainWindow::OnMenuInstallToNAND`: select one or more
@@ -5321,6 +5387,97 @@ fn blue_accent_theme_variant(theme_name: &str, dark: bool) -> Option<&'static st
     }
 
     Some(if dark { "Yaru-blue-dark" } else { "Yaru-blue" })
+}
+
+// Files owned by MainWindow::OnConfigure's defaults reset. Never traverse
+// a symlink at a reset target, which might refer to another emulator's data.
+fn reset_configuration_files(config_dir: &std::path::Path, cache_dir: &std::path::Path) -> std::io::Result<()> {
+    for root in [config_dir, cache_dir] {
+        if std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(std::io::Error::other("Refusing to reset a linked configuration/cache directory"));
+        }
+    }
+    for (path, directory, keep_directory) in [
+        (config_dir.join("qt-config.ini"), false, false),
+        (config_dir.join("custom"), true, true),
+        (cache_dir.join("game_list"), true, false),
+    ] {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if directory && metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            #[cfg(windows)]
+            if directory && metadata.file_type().is_symlink() {
+                std::fs::remove_dir(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+            #[cfg(not(windows))]
+            std::fs::remove_file(&path)?;
+        }
+        if keep_directory {
+            std::fs::create_dir(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod reset_configuration_tests {
+    use super::reset_configuration_files;
+
+    #[test]
+    fn reset_removes_only_configuration_and_game_list_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        for directory in [config.join("custom"), config.join("input"), cache.join("game_list"), cache.join("shader")] {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("synthetic"), "preserve or remove by owner").unwrap();
+        }
+        std::fs::write(config.join("qt-config.ini"), "[UI]").unwrap();
+        std::fs::write(config.join("prod.keys"), "synthetic, not a key").unwrap();
+        reset_configuration_files(&config, &cache).unwrap();
+        assert!(!config.join("qt-config.ini").exists());
+        assert_eq!(std::fs::read_dir(config.join("custom")).unwrap().count(), 0);
+        assert!(!cache.join("game_list").exists());
+        assert!(config.join("input/synthetic").exists());
+        assert!(cache.join("shader/synthetic").exists());
+        assert!(config.join("prod.keys").exists());
+        reset_configuration_files(&config, &cache).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_unlinks_target_without_deleting_shared_source() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let source = root.path().join("shared");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("synthetic"), "keep").unwrap();
+        std::os::unix::fs::symlink(&source, config.join("custom")).unwrap();
+        reset_configuration_files(&config, &root.path().join("cache")).unwrap();
+        assert!(source.join("synthetic").exists());
+        assert!(!std::fs::symlink_metadata(config.join("custom")).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_root_is_rejected_before_any_configuration_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("qt-config.ini"), "keep").unwrap();
+        let link = root.path().join("linked-config");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(reset_configuration_files(&link, &root.path().join("cache")).is_err());
+        assert_eq!(std::fs::read_to_string(source.join("qt-config.ini")).unwrap(), "keep");
+    }
 }
 
 #[cfg(test)]

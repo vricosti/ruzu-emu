@@ -28,7 +28,7 @@ use super::shared_translation as tr;
 use super::shared_widget as w;
 
 /// Build the General tab — upstream `ConfigureGeneral`.
-pub fn page(runtime_lock: bool) -> Page {
+pub fn page(runtime_lock: bool, on_reset: impl Fn() + 'static) -> Page {
     let (scroller, column) = w::page();
 
     // --- "General" group -------------------------------------------------
@@ -186,13 +186,31 @@ pub fn page(runtime_lock: bool) -> Page {
     reset.set_margin_top(8);
     reset.set_margin_bottom(10);
     reset.set_margin_start(10);
-    reset.connect_clicked(|_| {
-        // Upstream pops a confirmation, resets `Settings` + `UISettings` to
-        // their defaults, and closes the dialog via the callback installed by
-        // `ConfigureDialog` (`general_tab->SetResetCallback`). Wiring the reset
-        // itself needs the config writer, which is a separate slice; log until
-        // then rather than silently doing nothing.
-        log::info!("Reset All Settings requested (config writer not yet wired)");
+    let on_reset = Rc::new(on_reset);
+    reset.connect_clicked(move |button| {
+        let question = gtk::MessageDialog::builder()
+            .modal(true)
+            .message_type(gtk::MessageType::Question)
+            .text(crate::i18n::tr("Reset All Settings"))
+            .secondary_text(crate::i18n::tr(
+                "This resets all settings and removes all per-game configurations. Game directories, profiles, and input profiles will not be deleted. Proceed?",
+            ))
+            .build();
+        if let Some(parent) = button.root().and_downcast::<gtk::Window>() {
+            question.set_transient_for(Some(&parent));
+            question.set_destroy_with_parent(true);
+        }
+        question.add_button(&crate::i18n::tr("No"), gtk::ResponseType::No);
+        question.add_button(&crate::i18n::tr("Yes"), gtk::ResponseType::Yes);
+        question.set_default_response(gtk::ResponseType::No);
+        let on_reset = Rc::clone(&on_reset);
+        question.connect_response(move |question, response| {
+            question.close();
+            if response == gtk::ResponseType::Yes {
+                on_reset();
+            }
+        });
+        question.present();
     });
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);

@@ -1129,13 +1129,10 @@ impl Default for Values {
                 true,
                 true,
             ),
-            use_vulkan_driver_pipeline_cache: SwitchableSetting::with_options(
+            use_vulkan_driver_pipeline_cache: SwitchableSetting::new(
                 true,
                 "use_vulkan_driver_pipeline_cache",
                 RendererAdvanced,
-                Specialization::DEFAULT,
-                true,
-                true,
             ),
             enable_compute_pipelines: SwitchableSetting::new(
                 false,
@@ -2141,6 +2138,38 @@ mod tests {
         assert!(!is_cpu_debug_enabled(&values));
         values.cpu_debug_mode.set_value(true);
         assert!(is_cpu_debug_enabled(&values));
+    }
+
+    #[test]
+    fn advanced_renderer_runtime_metadata_matches_upstream() {
+        let values = Values::default();
+        for runtime_modifiable in [
+            values.gpu_accuracy.setting.runtime_modifiable,
+            values.dma_accuracy.setting.runtime_modifiable,
+            values.gpu_fence_behavior.setting.runtime_modifiable,
+            values.frame_pacing_mode.setting.runtime_modifiable,
+            values.sync_memory_operations.setting.runtime_modifiable,
+            values.enable_buffer_history.setting.runtime_modifiable,
+            values.enable_gpu_buffer_readback.setting.runtime_modifiable,
+        ] {
+            assert!(runtime_modifiable);
+        }
+        for runtime_modifiable in [
+            values.vram_usage_mode.setting.runtime_modifiable,
+            values.nvdec_emulation.setting.runtime_modifiable,
+            values.max_anisotropy.setting.runtime_modifiable,
+            values.accelerate_astc.setting.runtime_modifiable,
+            values.astc_recompression.setting.runtime_modifiable,
+            values.renderer_force_max_clock.setting.runtime_modifiable,
+            values.use_disk_shader_cache.setting.runtime_modifiable,
+            values.use_vulkan_driver_pipeline_cache.setting.runtime_modifiable,
+            values.enable_compute_pipelines.setting.runtime_modifiable,
+            values.use_video_framerate.setting.runtime_modifiable,
+            values.use_reactive_flushing.setting.runtime_modifiable,
+            values.barrier_feedback_loops.setting.runtime_modifiable,
+        ] {
+            assert!(!runtime_modifiable);
+        }
     }
 
     #[test]

@@ -136,7 +136,7 @@ impl ConfigureDialog {
 
         // Upstream constructs Advanced Graphics first and gives Graphics a
         // callback to `ExposeComputeOption` when a Vulkan device requires it.
-        let advanced_graphics = configure_graphics_advanced::page();
+        let advanced_graphics = configure_graphics_advanced::page(runtime_lock);
         let graphics =
             configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
 

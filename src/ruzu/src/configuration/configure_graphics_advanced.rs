@@ -26,7 +26,7 @@ pub struct BuildResult {
 }
 
 /// Build the Graphics "Advanced" tab — upstream `ConfigureGraphicsAdvanced`.
-pub fn page() -> BuildResult {
+pub fn page(runtime_lock: bool) -> BuildResult {
     let (scroller, column) = w::page();
 
     let (group, content) = w::group("Advanced Graphics Settings");
@@ -179,6 +179,124 @@ pub fn page() -> BuildResult {
     );
     content.append(&gpu_buffer_readback);
 
+    // Apply the same per-setting policy as Eden's shared Widget builder.
+    // Snapshot before ConfigurePerGame prepares its custom values for saving.
+    let configuring_global = common::settings::is_configuring_global();
+    let accuracy_policy = w::SettingEditPolicy::new(
+        &common::settings::values().gpu_accuracy,
+        runtime_lock,
+        configuring_global,
+    );
+    accuracy_row.set_sensitive(accuracy_policy.sensitive);
+    let dma_policy = w::SettingEditPolicy::new(
+        &common::settings::values().dma_accuracy,
+        runtime_lock,
+        configuring_global,
+    );
+    dma_row.set_sensitive(dma_policy.sensitive);
+    let fence_behavior_policy = w::SettingEditPolicy::new(
+        &common::settings::values().gpu_fence_behavior,
+        runtime_lock,
+        configuring_global,
+    );
+    fence_behavior_row.set_sensitive(fence_behavior_policy.sensitive);
+    let vram_policy = w::SettingEditPolicy::new(
+        &common::settings::values().vram_usage_mode,
+        runtime_lock,
+        configuring_global,
+    );
+    vram_row.set_sensitive(vram_policy.sensitive);
+    let nvdec_policy = w::SettingEditPolicy::new(
+        &common::settings::values().nvdec_emulation,
+        runtime_lock,
+        configuring_global,
+    );
+    nvdec_row.set_sensitive(nvdec_policy.sensitive);
+    let aniso_policy = w::SettingEditPolicy::new(
+        &common::settings::values().max_anisotropy,
+        runtime_lock,
+        configuring_global,
+    );
+    aniso_row.set_sensitive(aniso_policy.sensitive);
+    let astc_policy = w::SettingEditPolicy::new(
+        &common::settings::values().accelerate_astc,
+        runtime_lock,
+        configuring_global,
+    );
+    astc_row.set_sensitive(astc_policy.sensitive);
+    let frame_pacing_policy = w::SettingEditPolicy::new(
+        &common::settings::values().frame_pacing_mode,
+        runtime_lock,
+        configuring_global,
+    );
+    frame_pacing_row.set_sensitive(frame_pacing_policy.sensitive);
+    let recompression_policy = w::SettingEditPolicy::new(
+        &common::settings::values().astc_recompression,
+        runtime_lock,
+        configuring_global,
+    );
+    recompression_row.set_sensitive(recompression_policy.sensitive);
+    let sync_memory_policy = w::SettingEditPolicy::new(
+        &common::settings::values().sync_memory_operations,
+        runtime_lock,
+        configuring_global,
+    );
+    sync_memory.set_sensitive(sync_memory_policy.sensitive);
+    let max_clock_policy = w::SettingEditPolicy::new(
+        &common::settings::values().renderer_force_max_clock,
+        runtime_lock,
+        configuring_global,
+    );
+    force_max_clock.set_sensitive(max_clock_policy.sensitive);
+    let disk_cache_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_disk_shader_cache,
+        runtime_lock,
+        configuring_global,
+    );
+    disk_pipeline_cache.set_sensitive(disk_cache_policy.sensitive);
+    let pipeline_cache_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_vulkan_driver_pipeline_cache,
+        runtime_lock,
+        configuring_global,
+    );
+    vulkan_pipeline_cache.set_sensitive(pipeline_cache_policy.sensitive);
+    let compute_policy = w::SettingEditPolicy::new(
+        &common::settings::values().enable_compute_pipelines,
+        runtime_lock,
+        configuring_global,
+    );
+    compute_pipelines.set_sensitive(compute_policy.sensitive);
+    let framerate_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_video_framerate,
+        runtime_lock,
+        configuring_global,
+    );
+    video_framerate.set_sensitive(framerate_policy.sensitive);
+    let reactive_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_reactive_flushing,
+        runtime_lock,
+        configuring_global,
+    );
+    reactive_flushing.set_sensitive(reactive_policy.sensitive);
+    let barriers_policy = w::SettingEditPolicy::new(
+        &common::settings::values().barrier_feedback_loops,
+        runtime_lock,
+        configuring_global,
+    );
+    barrier_feedback_loops.set_sensitive(barriers_policy.sensitive);
+    let history_policy = w::SettingEditPolicy::new(
+        &common::settings::values().enable_buffer_history,
+        runtime_lock,
+        configuring_global,
+    );
+    buffer_history.set_sensitive(history_policy.sensitive);
+    let readback_policy = w::SettingEditPolicy::new(
+        &common::settings::values().enable_gpu_buffer_readback,
+        runtime_lock,
+        configuring_global,
+    );
+    gpu_buffer_readback.set_sensitive(readback_policy.sensitive);
+
     column.append(&group);
 
     let expose_compute_pipelines = compute_pipelines.clone();
@@ -204,27 +322,25 @@ pub fn page() -> BuildResult {
         let readback = gpu_buffer_readback.is_active();
 
         let mut values = common::settings::values_mut();
-        values.gpu_accuracy.set_value(accuracy_value);
-        values.dma_accuracy.set_value(dma_value);
-        values.gpu_fence_behavior.set_value(fence_behavior_value);
-        values.vram_usage_mode.set_value(vram_value);
-        values.nvdec_emulation.set_value(nvdec_value);
-        values.max_anisotropy.set_value(aniso_value);
-        values.accelerate_astc.set_value(astc_value);
-        values.frame_pacing_mode.set_value(frame_pacing_value);
-        values.astc_recompression.set_value(recompression_value);
-        values.sync_memory_operations.set_value(sync_memory_value);
-        values.renderer_force_max_clock.set_value(max_clock);
-        values.use_disk_shader_cache.set_value(disk_cache);
-        values
-            .use_vulkan_driver_pipeline_cache
-            .set_value(pipeline_cache);
-        values.enable_compute_pipelines.set_value(compute);
-        values.use_video_framerate.set_value(framerate);
-        values.use_reactive_flushing.set_value(reactive);
-        values.barrier_feedback_loops.set_value(barriers);
-        values.enable_buffer_history.set_value(history);
-        values.enable_gpu_buffer_readback.set_value(readback);
+        accuracy_policy.apply(&mut values.gpu_accuracy, accuracy_value);
+        dma_policy.apply(&mut values.dma_accuracy, dma_value);
+        fence_behavior_policy.apply(&mut values.gpu_fence_behavior, fence_behavior_value);
+        vram_policy.apply(&mut values.vram_usage_mode, vram_value);
+        nvdec_policy.apply(&mut values.nvdec_emulation, nvdec_value);
+        aniso_policy.apply(&mut values.max_anisotropy, aniso_value);
+        astc_policy.apply(&mut values.accelerate_astc, astc_value);
+        frame_pacing_policy.apply(&mut values.frame_pacing_mode, frame_pacing_value);
+        recompression_policy.apply(&mut values.astc_recompression, recompression_value);
+        sync_memory_policy.apply(&mut values.sync_memory_operations, sync_memory_value);
+        max_clock_policy.apply(&mut values.renderer_force_max_clock, max_clock);
+        disk_cache_policy.apply(&mut values.use_disk_shader_cache, disk_cache);
+        pipeline_cache_policy.apply(&mut values.use_vulkan_driver_pipeline_cache, pipeline_cache);
+        compute_policy.apply(&mut values.enable_compute_pipelines, compute);
+        framerate_policy.apply(&mut values.use_video_framerate, framerate);
+        reactive_policy.apply(&mut values.use_reactive_flushing, reactive);
+        barriers_policy.apply(&mut values.barrier_feedback_loops, barriers);
+        history_policy.apply(&mut values.enable_buffer_history, history);
+        readback_policy.apply(&mut values.enable_gpu_buffer_readback, readback);
     });
 
     BuildResult {

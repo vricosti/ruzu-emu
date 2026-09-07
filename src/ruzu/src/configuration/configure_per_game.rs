@@ -87,7 +87,7 @@ impl ConfigurePerGame {
         config.initialize(&config_path);
         qt_config::load_per_game_control_values(&config_path);
 
-        let advanced_graphics = configure_graphics_advanced::page();
+        let advanced_graphics = configure_graphics_advanced::page(runtime_lock);
         let graphics =
             configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
         let pages = vec![

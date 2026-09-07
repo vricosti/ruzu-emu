@@ -1,6 +1,6 @@
 [submodule "externals/rxbyak"]
 	path = externals/rxbyak
-	url = git@github.com:vricosti/rxbyak.git
+	url = https://github.com/vricosti/rxbyak.git
 [submodule "externals/rhazel"]
 	path = externals/rhazel
-	url = git@github.com:vricosti/rhazel.git
+	url = https://github.com/vricosti/rhazel.git
